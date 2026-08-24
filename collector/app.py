@@ -48,6 +48,10 @@ def _read_body():
     truncated = len(head) > BODY_LOG_LIMIT
     drain_aborted = False
     if truncated:
+        # Drains and discards any body bytes beyond BODY_LOG_LIMIT so a large
+        # body doesn't leave unread bytes that could still affect request
+        # handling; DRAIN_MAX bounds how long a slow-body client can occupy
+        # this thread.
         while True:
             if total >= DRAIN_MAX:
                 drain_aborted = True
@@ -129,7 +133,7 @@ def _log_event(endpoint):
 
     line = json.dumps(record, ensure_ascii=False)
     event_log.info(line)
-    print(("[ALERT] " if severity == "alert" else "") + line, flush=True)
+    print(line, flush=True)
     if severity == "alert":
         alert_log.info(line)
 
@@ -138,12 +142,13 @@ def _check_token():
     """Return None when authorised, else a Response to return immediately."""
     expected = os.environ.get("COLLECTOR_TOKEN", "")
     if not expected:
+        _log_event("viewer_denied")
         return Response(
             json.dumps({"error": "COLLECTOR_TOKEN is not set; viewer routes disabled"}),
             status=503, mimetype="application/json",
         )
     supplied = request.headers.get(TOKEN_HEADER, "")
-    if not hmac.compare_digest(supplied, expected):
+    if not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
         _log_event("viewer_denied")
         return Response(
             json.dumps({"error": "unauthorized"}),
