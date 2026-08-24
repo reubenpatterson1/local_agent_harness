@@ -1,0 +1,30 @@
+services:
+  testsite:
+    build: ./testsite
+    networks:
+      - redteam-net
+
+  collector:
+    build: ./collector
+    networks:
+      - redteam-net
+
+  agent:
+    build: ./agent
+    networks:
+      - redteam-net
+    depends_on:
+      - testsite
+      - collector
+
+  llm-proxy:
+    image: alpine/socat
+    command: "TCP-LISTEN:8177,fork,reuseaddr TCP:host.docker.internal:8177"
+    networks:
+      - redteam-net
+      - llm-bridge-net
+
+networks:
+  redteam-net:
+    internal: true
+  llm-bridge-net: {}
