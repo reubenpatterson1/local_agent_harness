@@ -6,8 +6,17 @@ services:
 
   collector:
     build: ./collector
+    environment:
+      COLLECTOR_TOKEN: "${COLLECTOR_TOKEN:-redteam-local-dev-token}"
+    volumes:
+      - ./collector-data:/data
     networks:
       - redteam-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   agent:
     build: ./agent
