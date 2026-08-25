@@ -27,7 +27,7 @@ WORKSPACE="/Users/reubenpatterson/qwen-agent-workspace"
 
 USAGE="Usage: ltx-generate [--keep-down] [--no-prep] [--force] [--last-frame PATH]
        [--keyframe PATH:INDEX[:STRENGTH]]... [--width N] [--height N] [--num-frames N]
-       [--fps N] [--frame-rate N] [--wide] [--allow-override]
+       [--fps N] [--frame-rate N] [--wide] [--allow-override] [--chain N]
        <image_path> \"<prompt>\" [output_path]
        ltx-generate --restore-only
 
@@ -60,7 +60,8 @@ Options:
   --fps N         container playback rate
   --frame-rate N  motion-conditioning rate -- keep equal to --fps
   --wide          use the 0.87 memory budget, skips the 0.82 ceiling gate
-  --allow-override  bypass the measured ceiling pre-check (the watermark cap + sentinel still protect the host; an over-budget run fails cleanly)"
+  --allow-override  bypass the measured ceiling pre-check (the watermark cap + sentinel still protect the host; an over-budget run fails cleanly)
+  --chain N       after the base clip, generate N additional continuation segments seeded from the base's last frame; output is base+N segments concatenated (N+1 clips total). Reuses bin/ltx-chain --continue-from. Cannot combine with --resume."
 
 KEEP_DOWN=0
 NO_PREP=0
@@ -76,6 +77,7 @@ ALLOW_OVERRIDE=""
 WIDTH=""
 HEIGHT=""
 NUM_FRAMES=""
+CHAIN=""
 IMAGE=""
 PROMPT=""
 OUTPUT=""
@@ -139,6 +141,10 @@ while [ $# -gt 0 ]; do
             NUM_FRAMES="$2"
             shift 2
             ;;
+        --chain)
+            CHAIN="$2"
+            shift 2
+            ;;
         --help)
             echo "$USAGE"
             exit 0
@@ -165,6 +171,23 @@ done
 if [ "$RESTORE_ONLY" -eq 1 ]; then
     bash "$WORKSPACE/bin/ltx-host-restore"
     exit $?
+fi
+
+if [ -n "$CHAIN" ]; then
+    case "$CHAIN" in
+        ''|*[!0-9]*)
+            echo "Error: --chain requires an integer >= 1" >&2
+            exit 2
+            ;;
+    esac
+    if [ "$CHAIN" -lt 1 ]; then
+        echo "Error: --chain requires an integer >= 1" >&2
+        exit 2
+    fi
+    if [ -n "$RESUME" ]; then
+        echo "Error: --chain cannot be combined with --resume" >&2
+        exit 2
+    fi
 fi
 
 if [ -z "$IMAGE" ]; then
@@ -200,7 +223,9 @@ if [ "$KEEP_DOWN" -eq 1 ]; then
     echo "NOTE: host left prepped (servers down). Run: bin/ltx-generate --restore-only"
 else
     # Install the trap BEFORE prep runs so a failure during prep still restores.
-    trap _restore EXIT INT TERM
+    trap '_restore; exit 130' INT
+    trap '_restore; exit 143' TERM
+    trap _restore EXIT
 fi
 
 if [ "$NO_PREP" -eq 0 ]; then
@@ -243,21 +268,66 @@ for kf in "${KEYFRAMES[@]:-}"; do [ -n "$kf" ] && EXTRA_ARGS+=(--keyframe "$kf")
 [ -n "$WIDE" ] && EXTRA_ARGS+=(--wide)
 [ -n "$ALLOW_OVERRIDE" ] && EXTRA_ARGS+=(--allow-override)
 
-echo "=== generate ==="
-if [ -n "$RESUME" ]; then
-    python3 "$WORKSPACE/ltx_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
-else
-    python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
-fi
-GEN_RC=$?
+if [ -z "$CHAIN" ]; then
+    echo "=== generate ==="
+    if [ -n "$RESUME" ]; then
+        python3 "$WORKSPACE/ltx_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+    else
+        python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+    fi
+    GEN_RC=$?
 
-echo "=== result ==="
-if [ "$GEN_RC" -eq 0 ]; then
-    ls -lh "$OUTPUT"
-    ls -dt "$WORKSPACE/generated/ltx_runs"/*/ 2>/dev/null | head -1
-else
-    echo "generation FAILED with exit code $GEN_RC"
-    echo "The run directory retains stage*.log, mem_stage*.jsonl and peaks_stage*.json for diagnosis."
-fi
+    echo "=== result ==="
+    if [ "$GEN_RC" -eq 0 ]; then
+        ls -lh "$OUTPUT"
+        ls -dt "$WORKSPACE/generated/ltx_runs"/*/ 2>/dev/null | head -1
+    else
+        echo "generation FAILED with exit code $GEN_RC"
+        echo "The run directory retains stage*.log, mem_stage*.jsonl and peaks_stage*.json for diagnosis."
+    fi
 
-exit $GEN_RC
+    exit $GEN_RC
+else
+    BASE_OUT="$WORKSPACE/generated/.ltx_chain_base_$$.mp4"
+    BASE_LOG="$WORKSPACE/generated/.ltx_chain_base_$$.log"
+
+    python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$BASE_OUT" 2>&1 | tee "$BASE_LOG"
+    GEN_RC=${PIPESTATUS[0]}
+
+    if [ "$GEN_RC" -ne 0 ]; then
+        echo "chain: base generation FAILED with exit code $GEN_RC"
+        rm -f "$BASE_OUT" "$BASE_LOG"
+        exit $GEN_RC
+    fi
+
+    BASE_RUN_DIR=$(grep '\[ltx_video_skill\] run_dir:' "$BASE_LOG" | tail -1)
+    BASE_RUN_DIR="${BASE_RUN_DIR##*run_dir: }"
+    if [ -z "$BASE_RUN_DIR" ]; then
+        echo "Error: could not determine base run directory from generation output" >&2
+        rm -f "$BASE_OUT" "$BASE_LOG"
+        exit 1
+    fi
+
+    CHAIN_ARGS=()
+    [ -n "$WIDTH" ] && CHAIN_ARGS+=(--width "$WIDTH")
+    [ -n "$HEIGHT" ] && CHAIN_ARGS+=(--height "$HEIGHT")
+    [ -n "$NUM_FRAMES" ] && CHAIN_ARGS+=(--num-frames "$NUM_FRAMES")
+    [ -n "$FPS" ] && CHAIN_ARGS+=(--fps "$FPS")
+    [ -n "$FRAME_RATE" ] && CHAIN_ARGS+=(--frame-rate "$FRAME_RATE")
+    [ -n "$WIDE" ] && CHAIN_ARGS+=(--wide)
+    [ -n "$ALLOW_OVERRIDE" ] && CHAIN_ARGS+=(--allow-override)
+
+    python3 "$WORKSPACE/bin/ltx-chain" --continue-from "$BASE_RUN_DIR" --segments "$CHAIN" --no-prep --keep-down --force ${CHAIN_ARGS[@]+"${CHAIN_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+    CHAIN_RC=$?
+
+    rm -f "$BASE_OUT" "$BASE_LOG"
+
+    if [ "$CHAIN_RC" -eq 0 ]; then
+        echo "=== result ==="
+        ls -lh "$OUTPUT"
+    else
+        echo "chain: stopped early / failed with exit code $CHAIN_RC (if any continuations completed, a partial base+segments clip was written to $OUTPUT; otherwise no output was written -- see generated/ltx_chains/*/chain_summary.json)"
+    fi
+
+    exit $CHAIN_RC
+fi

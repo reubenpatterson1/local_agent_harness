@@ -141,12 +141,88 @@ def test_segment_image():
     )
 
 
+# ---------------------------------------------------------------------------
+# --continue-from: argparse default and representative parsing
+# ---------------------------------------------------------------------------
+
+def test_continue_from_argparse():
+    args = chain.build_parser().parse_args(["img.png", "a prompt", "out.mp4"])
+    check("T32 continue_from default is None", args.continue_from is None,
+          "got %r" % args.continue_from)
+
+    args = chain.build_parser().parse_args([
+        "img.png", "a prompt", "out.mp4",
+        "--continue-from", "/x/generated/ltx_runs/20260101T000000Z-abcd1234",
+    ])
+    check(
+        "T33 continue_from parses to the given path",
+        args.continue_from == "/x/generated/ltx_runs/20260101T000000Z-abcd1234",
+        "got %r" % args.continue_from,
+    )
+
+
+# ---------------------------------------------------------------------------
+# _continue_settings_mismatch: pure settings-match check against a
+# --continue-from base run's request.json
+# ---------------------------------------------------------------------------
+
+def _make_args(**overrides):
+    argv = ["img.png", "a prompt", "out.mp4"]
+    args = chain.build_parser().parse_args(argv)
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _matching_base_request():
+    args = _make_args(prompt="a prompt")
+    return {
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "width": args.width,
+        "height": args.height,
+        "num_frames": args.num_frames,
+        "fps": args.fps,
+        "frame_rate": args.frame_rate,
+        "wide": args.wide,
+        "seed": args.seed,
+    }
+
+
+def test_continue_settings_mismatch():
+    args = _make_args(prompt="a prompt")
+    base_request = _matching_base_request()
+    check(
+        "T34 matching settings -> None",
+        chain._continue_settings_mismatch(base_request, args) is None,
+    )
+
+    mismatched_args = _make_args(prompt="a prompt", width=999)
+    result = chain._continue_settings_mismatch(base_request, mismatched_args)
+    check(
+        "T35 width mismatch names the field and both values",
+        result is not None and "width" in result and "999" in result
+        and str(base_request["width"]) in result,
+        "got %r" % result,
+    )
+
+    mismatched_seed = _make_args(prompt="a prompt", seed=42)
+    result2 = chain._continue_settings_mismatch(base_request, mismatched_seed)
+    check(
+        "T36 seed mismatch names the field",
+        result2 is not None and "seed" in result2,
+        "got %r" % result2,
+    )
+
+
 if __name__ == "__main__":
     test_argparse_defaults()
     test_argparse_representative()
     test_segment_seed()
     test_segments_zero_rejected()
     test_segment_image()
+    test_continue_from_argparse()
+    test_continue_settings_mismatch()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

@@ -86,6 +86,16 @@ def build_parser():
                          help="do not restore servers on exit (for stacking runs)")
     parser.add_argument("--force", action="store_true",
                          help="overwrite output_path if it exists")
+    parser.add_argument("--continue-from", dest="continue_from", default=None,
+                         help=("continuation mode: BASE_RUN_DIR of an already-generated "
+                               "base clip (a generated/ltx_runs/<ts>/ dir with frames/ and "
+                               "embeds.pt). Segment 1 conditions on that run's last frame; "
+                               "the base frames are prepended so the output is "
+                               "base+segments. Skips ltx-chain's own stage-1 encode "
+                               "(reuses the base embeds.pt) and the ceiling pre-check (the "
+                               "base already gated this geometry). The positional "
+                               "image_path is used only for validation/logging in this "
+                               "mode."))
     return parser
 
 
@@ -129,6 +139,30 @@ def _build_request(image_path, prompt, negative_prompt, width, height, num_frame
         "allow_override": allow_override,
         "conditions": [{"image_path": image_path, "frame_index": 0, "strength": 1.0}],
     }
+
+
+_CONTINUE_CHECKED_FIELDS = [
+    "prompt", "negative_prompt", "width", "height", "num_frames", "fps",
+    "frame_rate", "wide", "seed",
+]
+
+
+def _continue_settings_mismatch(base_request, args):
+    """Return an error message if a --continue-from base run's settings don't
+    match the requested args, else None. A continuation must use the same
+    settings as its base (prompt, negative_prompt, width, height, num_frames,
+    fps, frame_rate, wide, seed); this checks each in turn and reports only
+    the first mismatch found."""
+    for field in _CONTINUE_CHECKED_FIELDS:
+        base_val = base_request.get(field)
+        arg_val = getattr(args, field)
+        if base_val != arg_val:
+            return (
+                "Error: --continue-from base run %s=%s does not match requested "
+                "%s=%s (continuation must use the same settings as the base)"
+                % (field, base_val, field, arg_val)
+            )
+    return None
 
 
 def _port_open(port, host="127.0.0.1", timeout=1.0):
@@ -195,8 +229,37 @@ def main(argv=None):
     if args.segments < 1:
         parser.error("--segments must be >= 1")
 
+    if args.continue_from:
+        base_run_dir = os.path.abspath(args.continue_from)
+        base_embeds = os.path.join(base_run_dir, "embeds.pt")
+        if not os.path.isfile(base_embeds):
+            print("Error: --continue-from run has no embeds.pt: %s" % base_embeds,
+                  file=sys.stderr)
+            return 2
+        base_frames = sorted(glob.glob(os.path.join(base_run_dir, "frames", "frame_*.png")))
+        if not base_frames:
+            print("Error: --continue-from run has no frames: %s"
+                  % os.path.join(base_run_dir, "frames"), file=sys.stderr)
+            return 2
+        base_request_path = os.path.join(base_run_dir, "request.json")
+        if not os.path.isfile(base_request_path):
+            print("Error: --continue-from run has no request.json: %s" % base_request_path,
+                  file=sys.stderr)
+            return 2
+        try:
+            with open(base_request_path) as f:
+                base_request_dict = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print("Error: --continue-from run has an unreadable request.json: %s (%s)"
+                  % (base_request_path, e), file=sys.stderr)
+            return 2
+        mismatch = _continue_settings_mismatch(base_request_dict, args)
+        if mismatch:
+            print(mismatch, file=sys.stderr)
+            return 2
+
     # --- step 2: ceiling pre-check (once; all segments share this geometry) ---
-    if not args.wide and not args.allow_override:
+    if not args.continue_from and not args.wide and not args.allow_override:
         try:
             L._check_ceiling(
                 args.width, args.height, args.num_frames,
@@ -206,6 +269,9 @@ def main(argv=None):
         except mps_guard.HostSafetyError as e:
             print(str(e), file=sys.stderr)
             return 2
+    elif args.continue_from:
+        print("note: ceiling pre-check skipped (base generation already gated this "
+              "geometry; mps_guard remains the backstop)", file=sys.stderr)
 
     restored = [False]
 
@@ -244,7 +310,10 @@ def main(argv=None):
                       file=sys.stderr)
                 return 1
 
-        input_image = _abspath_or_url(args.image_path)
+        input_image = (
+            os.path.abspath(base_frames[-1]) if args.continue_from
+            else _abspath_or_url(args.image_path)
+        )
         negative_prompt = args.negative_prompt
 
         run_id = "%s-%s" % (
@@ -256,27 +325,30 @@ def main(argv=None):
         print("run root: %s" % run_root)
 
         # --- step 5: stage 1 once (prompt-only encode, reused by every segment) ---
-        base = os.path.join(run_root, "_base")
-        os.makedirs(base)
-        base_request = _build_request(
-            input_image, args.prompt, negative_prompt, args.width, args.height,
-            args.num_frames, args.fps, args.frame_rate, args.wide, args.allow_override,
-            args.seed,
-        )
-        with open(os.path.join(base, "request.json"), "w") as f:
-            json.dump(base_request, f, indent=2)
+        if args.continue_from:
+            print("=== continuation mode: reusing base run embeds.pt (skipping stage 1) ===")
+        else:
+            base = os.path.join(run_root, "_base")
+            os.makedirs(base)
+            base_request = _build_request(
+                input_image, args.prompt, negative_prompt, args.width, args.height,
+                args.num_frames, args.fps, args.frame_rate, args.wide, args.allow_override,
+                args.seed,
+            )
+            with open(os.path.join(base, "request.json"), "w") as f:
+                json.dump(base_request, f, indent=2)
 
-        print("=== stage 1: encoding prompt ===")
-        rc1, log1 = _spawn_stage(1, base)
-        if rc1 != 0:
-            tail = "\n".join(log1.splitlines()[-40:])
-            print("stage1 FAILED rc=%d\n%s" % (rc1, tail), file=sys.stderr)
-            raise RuntimeError("stage1 failed with exit code %d" % rc1)
-        base_embeds = os.path.join(base, "embeds.pt")
-        print("stage 1 ok")
+            print("=== stage 1: encoding prompt ===")
+            rc1, log1 = _spawn_stage(1, base)
+            if rc1 != 0:
+                tail = "\n".join(log1.splitlines()[-40:])
+                print("stage1 FAILED rc=%d\n%s" % (rc1, tail), file=sys.stderr)
+                raise RuntimeError("stage1 failed with exit code %d" % rc1)
+            base_embeds = os.path.join(base, "embeds.pt")
+            print("stage 1 ok")
 
         # --- step 6: segment loop ---
-        all_frames = []
+        all_frames = list(base_frames) if args.continue_from else []
         segment_results = []
         completed = 0
         prev_last = None
@@ -336,7 +408,7 @@ def main(argv=None):
 
         # --- step 7: concatenate ---
         wrote_output = False
-        if all_frames:
+        if all_frames and (not args.continue_from or completed >= 1):
             from diffusers.utils import export_to_video
             from PIL import Image
 
@@ -348,6 +420,9 @@ def main(argv=None):
             print("CHAINED %d/%d segments, %d frames, %.2fs -> %s (%dKB)"
                   % (completed, args.segments, len(all_frames), duration,
                      args.output_path, size_kb))
+        elif args.continue_from and completed == 0:
+            print("no continuation segments completed; not writing %s (base clip unchanged in %s)"
+                  % (args.output_path, base_run_dir), file=sys.stderr)
         else:
             print("No segments completed; no output written.")
 
@@ -358,6 +433,8 @@ def main(argv=None):
             "segments": segment_results,
             "total_frames": len(all_frames),
             "output_path": args.output_path if wrote_output else None,
+            "continue_from": base_run_dir if args.continue_from else None,
+            "base_frames": len(base_frames) if args.continue_from else 0,
         }
         with open(os.path.join(run_root, "chain_summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
