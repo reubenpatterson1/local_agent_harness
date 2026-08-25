@@ -1,0 +1,263 @@
+#!/bin/bash
+#
+# ltx-generate -- wrapper that enforces the correct prep -> generate -> restore
+# order for an LTX-Video run.
+#
+# Why the trap exists: generation requires bin/ltx-host-prep BEFORE the run
+# (stops both vLLM servers, sets the watchdog stand-down file) and
+# bin/ltx-host-restore AFTER it. Running prep and restore back-to-back returns
+# the host to the blocking state, and forgetting restore silently leaves the
+# inference stack down. Installing the restore trap on EXIT/INT/TERM before
+# prep even runs guarantees restore happens even if prep itself fails or the
+# run is interrupted.
+#
+# Why prep's non-zero rc is tolerated but closed ports are verified instead:
+# bin/ltx-host-prep exits non-zero on its own memory-readiness check, which is
+# advisory (it's a warning, not a hard failure of the stop-the-servers step).
+# What actually matters for safety is that both vLLM ports are closed before
+# we proceed, so we poll for that directly instead of trusting prep's rc.
+#
+# Why prep is run with `< /dev/null`: bin/ltx-host-prep runs `sudo purge`,
+# and without a closed stdin, sudo blocks waiting for a password that will
+# never arrive in this non-interactive context.
+#
+set -u
+
+WORKSPACE="/Users/reubenpatterson/qwen-agent-workspace"
+
+USAGE="Usage: ltx-generate [--keep-down] [--no-prep] [--force] [--last-frame PATH]
+       [--keyframe PATH:INDEX[:STRENGTH]]... [--width N] [--height N] [--num-frames N]
+       [--fps N] [--frame-rate N] [--wide] [--allow-override]
+       <image_path> \"<prompt>\" [output_path]
+       ltx-generate --restore-only
+
+Runs prep -> generate -> restore in the correct order. Restore is guaranteed
+by an EXIT trap, so an interrupted or failed run still brings the vLLM
+servers back up.
+
+Single run:
+  ltx-generate z_image_test.png \"make it jump\" generated/ltx_jump.mp4
+
+Resume a run whose stage 1 already succeeded (skips re-encoding):
+  ltx-generate --resume generated/ltx_runs/<RUN_ID> z_image_test.png \"make it jump\" out.mp4
+
+Batch (one prep for the whole batch, one restore at the end):
+  ltx-generate --keep-down            a.png \"prompt one\"   out1.mp4
+  ltx-generate --no-prep --keep-down  b.png \"prompt two\"   out2.mp4
+  ltx-generate --no-prep              c.png \"prompt three\" out3.mp4
+
+Options:
+  --keep-down     leave the servers down on exit (for chaining)
+  --no-prep       skip prep; the host is already prepped
+  --force         overwrite output_path if it exists
+  --restore-only  just restore the host and exit
+  --resume PATH   resume an existing run dir (see ltx_video_skill.py --resume)
+  --last-frame PATH                 condition the last frame on PATH (see ltx_video_skill.py --last-frame)
+  --keyframe PATH:INDEX[:STRENGTH]  add a keyframe condition, repeatable (see ltx_video_skill.py --keyframe)
+  --width N       output width in pixels (must be a multiple of 32)
+  --height N      output height in pixels (must be a multiple of 32)
+  --num-frames N  number of frames (must satisfy (n-1) % 8 == 0)
+  --fps N         container playback rate
+  --frame-rate N  motion-conditioning rate -- keep equal to --fps
+  --wide          use the 0.87 memory budget, skips the 0.82 ceiling gate
+  --allow-override  bypass the measured ceiling pre-check (the watermark cap + sentinel still protect the host; an over-budget run fails cleanly)"
+
+KEEP_DOWN=0
+NO_PREP=0
+FORCE=0
+RESTORE_ONLY=0
+RESUME=""
+LAST_FRAME=""
+KEYFRAMES=()
+FPS=""
+FRAME_RATE=""
+WIDE=""
+ALLOW_OVERRIDE=""
+WIDTH=""
+HEIGHT=""
+NUM_FRAMES=""
+IMAGE=""
+PROMPT=""
+OUTPUT=""
+POSITIONAL_COUNT=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep-down)
+            KEEP_DOWN=1
+            shift
+            ;;
+        --no-prep)
+            NO_PREP=1
+            shift
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --restore-only)
+            RESTORE_ONLY=1
+            shift
+            ;;
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
+        --last-frame)
+            LAST_FRAME="$2"
+            shift 2
+            ;;
+        --keyframe)
+            KEYFRAMES+=("$2")
+            shift 2
+            ;;
+        --fps)
+            FPS="$2"
+            shift 2
+            ;;
+        --frame-rate)
+            FRAME_RATE="$2"
+            shift 2
+            ;;
+        --wide)
+            WIDE="1"
+            shift
+            ;;
+        --allow-override)
+            ALLOW_OVERRIDE="1"
+            shift
+            ;;
+        --width)
+            WIDTH="$2"
+            shift 2
+            ;;
+        --height)
+            HEIGHT="$2"
+            shift 2
+            ;;
+        --num-frames)
+            NUM_FRAMES="$2"
+            shift 2
+            ;;
+        --help)
+            echo "$USAGE"
+            exit 0
+            ;;
+        --*)
+            echo "Unknown flag: $1" >&2
+            echo "$USAGE" >&2
+            exit 2
+            ;;
+        *)
+            POSITIONAL_COUNT=$((POSITIONAL_COUNT + 1))
+            if [ "$POSITIONAL_COUNT" -eq 1 ]; then
+                IMAGE="$1"
+            elif [ "$POSITIONAL_COUNT" -eq 2 ]; then
+                PROMPT="$1"
+            elif [ "$POSITIONAL_COUNT" -eq 3 ]; then
+                OUTPUT="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ "$RESTORE_ONLY" -eq 1 ]; then
+    bash "$WORKSPACE/bin/ltx-host-restore"
+    exit $?
+fi
+
+if [ -z "$IMAGE" ]; then
+    echo "$USAGE" >&2
+    exit 2
+fi
+
+if [ ! -f "$IMAGE" ]; then
+    echo "Error: image not found: $IMAGE" >&2
+    exit 2
+fi
+
+if [ -z "$OUTPUT" ]; then
+    OUTPUT="ltx_video_output.mp4"
+fi
+
+if [ -e "$OUTPUT" ] && [ "$FORCE" -ne 1 ]; then
+    echo "Error: output already exists: $OUTPUT (use --force to overwrite)" >&2
+    exit 2
+fi
+
+_RESTORED=0
+_restore() {
+    if [ "$_RESTORED" -eq 1 ]; then
+        return
+    fi
+    _RESTORED=1
+    echo "=== restoring host ==="
+    bash "$WORKSPACE/bin/ltx-host-restore"
+}
+
+if [ "$KEEP_DOWN" -eq 1 ]; then
+    echo "NOTE: host left prepped (servers down). Run: bin/ltx-generate --restore-only"
+else
+    # Install the trap BEFORE prep runs so a failure during prep still restores.
+    trap _restore EXIT INT TERM
+fi
+
+if [ "$NO_PREP" -eq 0 ]; then
+    echo "=== prep ==="
+    # The < /dev/null is load-bearing: prep runs `sudo purge`, and without a
+    # closed stdin sudo blocks waiting for a password that never arrives here.
+    bash "$WORKSPACE/bin/ltx-host-prep" < /dev/null
+
+    # Prep's own exit code reflects an advisory memory-readiness check, not
+    # whether the servers actually stopped, so verify the ports directly.
+    i=0
+    while [ "$i" -lt 60 ]; do
+        if ! nc -z 127.0.0.1 8177 2>/dev/null && ! nc -z 127.0.0.1 8178 2>/dev/null; then
+            break
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+
+    if nc -z 127.0.0.1 8177 2>/dev/null || nc -z 127.0.0.1 8178 2>/dev/null; then
+        echo "Error: ports 8177/8178 still open after prep; refusing to generate." >&2
+        exit 1
+    fi
+fi
+
+# Build the passthrough args once. Expanded below via
+# ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} rather than a bare "${EXTRA_ARGS[@]}":
+# this script runs under `set -u`, and this shell's bash (3.2) treats
+# expanding an empty array as an unbound-variable error under `set -u`,
+# which would break every plain (no --last-frame/--keyframe) invocation.
+# The same reason KEYFRAMES is iterated below via "${KEYFRAMES[@]:-}".
+EXTRA_ARGS=()
+[ -n "$LAST_FRAME" ] && EXTRA_ARGS+=(--last-frame "$LAST_FRAME")
+for kf in "${KEYFRAMES[@]:-}"; do [ -n "$kf" ] && EXTRA_ARGS+=(--keyframe "$kf"); done
+[ -n "$WIDTH" ] && EXTRA_ARGS+=(--width "$WIDTH")
+[ -n "$HEIGHT" ] && EXTRA_ARGS+=(--height "$HEIGHT")
+[ -n "$NUM_FRAMES" ] && EXTRA_ARGS+=(--num-frames "$NUM_FRAMES")
+[ -n "$FPS" ] && EXTRA_ARGS+=(--fps "$FPS")
+[ -n "$FRAME_RATE" ] && EXTRA_ARGS+=(--frame-rate "$FRAME_RATE")
+[ -n "$WIDE" ] && EXTRA_ARGS+=(--wide)
+[ -n "$ALLOW_OVERRIDE" ] && EXTRA_ARGS+=(--allow-override)
+
+echo "=== generate ==="
+if [ -n "$RESUME" ]; then
+    python3 "$WORKSPACE/ltx_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+else
+    python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+fi
+GEN_RC=$?
+
+echo "=== result ==="
+if [ "$GEN_RC" -eq 0 ]; then
+    ls -lh "$OUTPUT"
+    ls -dt "$WORKSPACE/generated/ltx_runs"/*/ 2>/dev/null | head -1
+else
+    echo "generation FAILED with exit code $GEN_RC"
+    echo "The run directory retains stage*.log, mem_stage*.jsonl and peaks_stage*.json for diagnosis."
+fi
+
+exit $GEN_RC

@@ -1,0 +1,86 @@
+#!/bin/bash
+#
+# ltx-host-prep -- OPERATOR script, run by a human before an LTX-Video run.
+# This is never invoked from Python; the skill only ever detects and refuses.
+#
+set -u
+
+STATE_DIR="/Users/reubenpatterson/.qwen-serve-guard"
+STANDDOWN_FILE="$STATE_DIR/stand-down"
+
+echo "=== ltx-host-prep ==="
+
+# 1. Stand-down file -- stops qwen-serve-guard from restarting the 27B server.
+mkdir -p "$STATE_DIR"
+printf 'reason=ltx-video-run started=%s by=ltx-host-prep\n' "$(/bin/date "+%Y-%m-%dT%H:%M:%S%z")" > "$STANDDOWN_FILE"
+echo "Created stand-down file: $STANDDOWN_FILE"
+
+# 2. Bootout the embed server -- required because that plist sets KeepAlive
+#    SuccessfulExit=false, so a plain kill respawns it.
+echo "Attempting: launchctl bootout gui/$(id -u)/com.reubenpatterson.qwen-embed-server"
+launchctl bootout "gui/$(id -u)/com.reubenpatterson.qwen-embed-server"
+echo "  (return code ignored)"
+
+# 3. Stop the 27B server.
+echo "Stopping 27B server (pkill vllm on 8177, pkill VLLM::EngineCore)..."
+pkill -f 'vllm.*8177'
+pkill -f 'VLLM::EngineCore'
+
+i=0
+while [ "$i" -lt 60 ]; do
+    if ! nc -z 127.0.0.1 8177 2>/dev/null; then
+        break
+    fi
+    i=$((i + 1))
+    if [ $((i % 10)) -eq 0 ]; then
+        echo "  still waiting for 127.0.0.1:8177 to close (${i}s)..."
+    fi
+    sleep 1
+done
+
+if nc -z 127.0.0.1 8177 2>/dev/null; then
+    echo "WARNING: 127.0.0.1:8177 is still open after 60s."
+else
+    echo "127.0.0.1:8177 is closed."
+fi
+
+# 4. Manual checklist -- not automated.
+echo ""
+echo "MANUAL CHECKLIST (not automated):"
+echo "  [ ] Quit Docker Desktop (~8 GiB)"
+echo "  [ ] Quit Google Chrome if available memory is short"
+echo "  [ ] Quit Slack if available memory is short"
+echo ""
+
+# 5. Purge disk cache if available.
+if command -v purge >/dev/null; then
+    echo "Running: sudo purge (will prompt for a password)"
+    sudo purge
+else
+    echo "purge command not found; skipped."
+fi
+
+# 6. Memory report and readiness verdict.
+#
+# All thresholds live in mps_guard.py (the readiness/preflight gates,
+# G1a/G1b/G2) -- this script must never re-implement them, to avoid
+# drifting out of sync with the real gates stage2 will actually be
+# checked against.
+echo ""
+echo "=== memory report ==="
+READINESS_JSON="$(python3 /Users/reubenpatterson/qwen-agent-workspace/mps_guard.py readiness stage2 0.82)"
+READINESS_RC=$?
+echo "$READINESS_JSON"
+
+if [ "$READINESS_RC" -eq 0 ]; then
+    echo "READY"
+else
+    FAILURES="$(echo "$READINESS_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('; '.join(d['failures']))
+")"
+    echo "NOT READY: $FAILURES"
+fi
+
+exit "$READINESS_RC"

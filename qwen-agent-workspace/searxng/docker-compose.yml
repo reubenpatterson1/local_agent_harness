@@ -1,0 +1,46 @@
+# Local SearXNG for the qwen-agent `search` tool.
+# See ../docs/specs/2026-08-21-qwen-agent-search-grounding-design.md
+#
+# This directory is self-contained: nothing here references an external drive.
+# Bring up:   cd ~/qwen-agent-workspace/searxng && docker compose up -d
+# Verify:     curl -s 'http://127.0.0.1:8888/search?q=test&format=json' | head -c 200
+# Logs:       cd ~/qwen-agent-workspace/searxng && docker compose logs --tail 50
+# Tear down:  cd ~/qwen-agent-workspace/searxng && docker compose down
+#
+# Offline / air-gapped bring-up: the image is vendored at
+# image/searxng-11a9b34c.tar. Load it first, then `up -d` needs no network:
+#   docker load -i image/searxng-11a9b34c.tar
+# See README.md in this directory.
+#
+# The image is pinned BY DIGEST, not by :latest. A floating tag means a silent
+# upstream change can break the two load-bearing settings in settings.yml
+# (limiter: false, formats: json) between one bring-up and the next.
+#
+# Port 8888 was chosen because it is free on this host and does not collide with
+# vLLM (8177), the embedding server (8178), Okta (8769), Adobe (15292),
+# ControlCenter (5000/7000), mediasharing (3689), or the macOS ephemeral range
+# (>= 49152). The publish spec is bound to 127.0.0.1 on purpose: this instance has
+# no authentication and must never be reachable from the LAN.
+
+services:
+  searxng:
+    image: searxng/searxng@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e
+    container_name: qwen-agent-searxng
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - searxng-config:/etc/searxng
+      - searxng-cache:/var/cache/searxng
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  searxng-config:
+  searxng-cache:

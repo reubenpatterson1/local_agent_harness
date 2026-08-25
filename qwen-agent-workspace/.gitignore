@@ -1,0 +1,16 @@
+# Generated media & run artifacts — never commit (contains an open content finding, large blobs)
+generated/
+# Runtime logs (may contain raw prompts)
+logs/
+*.log
+# Local snapshots and caches
+.snapshots/
+__pycache__/
+*.pyc
+.DS_Store
+# Model / embedding blobs and the vendored searxng image tar
+*.pt
+*.safetensors
+searxng/image/
+# Local test asset (binary)
+z_image_test.png

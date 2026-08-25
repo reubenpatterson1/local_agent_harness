@@ -1,0 +1,38 @@
+# SearXNG settings for the qwen-agent `search` tool.
+# See ../docs/specs/2026-08-21-qwen-agent-search-grounding-design.md
+#
+# Two settings here are load-bearing and were the difference between "works" and
+# "silently returns nothing" when this was tested live:
+#   server.limiter: false  -- the default limiter (botdetection) rejects the
+#                             instance's own loopback callers.
+#   search.formats         -- must include `json`; JSON output is DISABLED by
+#                             default and /search?format=json returns HTTP 403
+#                             without it.
+# Everything else inherits SearXNG's shipped defaults via use_default_settings.
+
+use_default_settings: true
+
+general:
+  instance_name: "qwen-agent-search"
+  enable_metrics: false
+
+server:
+  # Not a secret. This instance is published only on 127.0.0.1 and has no
+  # accounts; the key signs per-session CSRF tokens for a single local user.
+  # It is a fixed literal so this file is reproducible.
+  secret_key: "qwen-agent-local-loopback-only"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en-US"
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: true

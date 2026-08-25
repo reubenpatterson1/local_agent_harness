@@ -1,0 +1,29 @@
+{
+  "meta": {
+    "generated_from": "generated/ltx_ceiling/results.jsonl",
+    "generated_at": "2026-08-25T18:56:24.050600+00:00",
+    "fraction": 0.82,
+    "wide": false,
+    "conditioning": "frame0-only",
+    "cap_gib": 30.7,
+    "safety_margin_frac": 0.98,
+    "host_total_gib": 48.0,
+    "diffusers_version": "0.40.0",
+    "measured_resolutions": [
+      "384x384",
+      "448x448",
+      "512x512",
+      "576x576",
+      "640x640",
+      "704x480",
+      "704x704"
+    ]
+  },
+  "ceiling": {
+    "384x384": 97,
+    "448x448": 73,
+    "512x512": 73,
+    "576x576": 57,
+    "640x640": 49
+  }
+}

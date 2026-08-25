@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# ltx-host-restore -- OPERATOR script, run by a human after an LTX-Video run
+# to bring the vLLM servers back up.
+#
+set -u
+
+STATE_DIR="/Users/reubenpatterson/.qwen-serve-guard"
+STANDDOWN_FILE="$STATE_DIR/stand-down"
+
+echo "=== ltx-host-restore ==="
+
+# 1. Remove the stand-down file.
+rm -f "$STANDDOWN_FILE"
+echo "Removed stand-down file: $STANDDOWN_FILE"
+
+# 2. Bootstrap the embed server.
+echo "Attempting: launchctl bootstrap gui/$(id -u) /Users/reubenpatterson/Library/LaunchAgents/com.reubenpatterson.qwen-embed-server.plist"
+launchctl bootstrap "gui/$(id -u)" /Users/reubenpatterson/Library/LaunchAgents/com.reubenpatterson.qwen-embed-server.plist
+echo "  (return code ignored)"
+
+# 3. Restart the 27B server via qwen-serve-guard.
+/Users/reubenpatterson/.local/bin/qwen-serve-guard restart
+echo "qwen-serve-guard restart rc=$?"
+
+# 4. Poll until both ports are up.
+i=0
+while [ "$i" -lt 300 ]; do
+    if nc -z 127.0.0.1 8177 2>/dev/null && nc -z 127.0.0.1 8178 2>/dev/null; then
+        break
+    fi
+    i=$((i + 1))
+    if [ $((i % 15)) -eq 0 ]; then
+        echo "  still waiting for 8177/8178 (${i}s)..."
+    fi
+    sleep 1
+done
+
+if nc -z 127.0.0.1 8177 2>/dev/null; then
+    echo "127.0.0.1:8177 is up."
+else
+    echo "127.0.0.1:8177 is still down."
+fi
+
+if nc -z 127.0.0.1 8178 2>/dev/null; then
+    echo "127.0.0.1:8178 is up."
+else
+    echo "127.0.0.1:8178 is still down."
+fi
