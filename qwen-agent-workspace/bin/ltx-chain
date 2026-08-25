@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""ltx-chain -- grow one longer video by W1 chaining N LTX-Video segments.
+
+The text prompt is encoded once (stage 1). Segment 1 conditions on the
+input image at frame 0; each later segment conditions on the PREVIOUS
+segment's last frame at frame 0. Once all requested segments (or as many
+as complete before a stop) are generated, their frames are concatenated,
+in order, into one mp4.
+
+This script does its own prep -> chain -> restore, with restore guaranteed
+via a try/finally: it runs on success, on exception, on SIGINT (Ctrl-C),
+and on SIGTERM (kill) via an installed signal handler that converts
+SIGTERM into a normal SystemExit so the finally still unwinds -- now
+genuinely matching bin/ltx-generate's `trap EXIT INT TERM` contract.
+
+Content safety: every segment's frames are screened by
+ltx_video_skill._stage3_screen_and_export's call to
+content_safety.assert_frames_safe before that segment is accepted. A
+blocked segment has its frames deleted by stage 3 itself and stops the
+chain (prior completed segments are kept). ltx-chain does not add,
+duplicate, or bypass that screening -- it only detects the block in
+stage 3's log so it can stop cleanly and report which segment was
+blocked.
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+WS = "/Users/reubenpatterson/qwen-agent-workspace"
+sys.path.insert(0, WS)
+
+import ltx_video_skill as L  # noqa: E402
+import mps_guard  # noqa: E402
+
+CHAINS_SUBDIR = os.path.join("generated", "ltx_chains")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-chain",
+        description=(
+            "Chain N LTX-Video segments into one longer clip (W1). Segment 1 "
+            "conditions on <image_path>; each later segment conditions on the "
+            "previous segment's last frame. Does its own prep/restore and "
+            "screens every segment for content safety."
+        ),
+    )
+    parser.add_argument("image_path")
+    parser.add_argument("prompt")
+    parser.add_argument("output_path")
+    parser.add_argument("--segments", type=int, default=3,
+                         help="number of segments to chain (default 3)")
+    parser.add_argument("--width", type=int, default=L.DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=L.DEFAULT_HEIGHT)
+    parser.add_argument("--num-frames", type=int, default=L.DEFAULT_NUM_FRAMES)
+    parser.add_argument("--fps", type=int, default=L.DEFAULT_FPS)
+    parser.add_argument("--frame-rate", type=int, default=L.DEFAULT_FRAME_RATE)
+    parser.add_argument("--seed", type=int, default=0,
+                         help="base seed; segment i uses seed S+i (default 0)")
+    parser.add_argument("--wide", action="store_true",
+                         help="use the 0.87 budget for every segment")
+    parser.add_argument("--allow-override", action="store_true",
+                         help="skip the ceiling pre-check")
+    parser.add_argument("--negative-prompt", default=L.DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument("--settle", type=float, default=6,
+                         help="settle pause in seconds between segments (default 6)")
+    parser.add_argument("--relax-supply", action="store_true",
+                         help=("opt-in: relax only the G1b supply gate for segments "
+                               "(sets LTX_SWEEP_RELAX_SUPPLY=1 in the stage-2 child env) "
+                               "for a known-capacity host whose stage-1 cache depresses "
+                               "psutil-available. The watermark cap and sentinel still "
+                               "apply. Default off (full gate)."))
+    parser.add_argument("--no-prep", action="store_true",
+                         help="assume the host is already prepped; skip bin/ltx-host-prep")
+    parser.add_argument("--keep-down", action="store_true",
+                         help="do not restore servers on exit (for stacking runs)")
+    parser.add_argument("--force", action="store_true",
+                         help="overwrite output_path if it exists")
+    return parser
+
+
+def _segment_image(i, input_image, prev_last):
+    """Return the frame-0 conditioning image path for segment i.
+
+    Segment 1 conditions on the original input image; every later segment
+    conditions on the previous segment's last generated frame.
+    """
+    if i == 1:
+        return input_image
+    return prev_last
+
+
+def _segment_seed(base_seed, i):
+    """Segment i uses seed base_seed + i, so segments vary rather than repeat."""
+    return base_seed + i
+
+
+def _abspath_or_url(path):
+    return path if "://" in path else os.path.abspath(path)
+
+
+def _build_request(image_path, prompt, negative_prompt, width, height, num_frames,
+                    fps, frame_rate, wide, allow_override, seed):
+    """Build a request.json-shaped dict for one stage1/stage2/stage3 cell."""
+    return {
+        "image_path": image_path,
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "output_path": None,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "num_inference_steps": L.DEFAULT_STEPS,
+        "guidance_scale": L.DEFAULT_GUIDANCE,
+        "fps": fps,
+        "frame_rate": frame_rate,
+        "seed": seed,
+        "wide": wide,
+        "allow_override": allow_override,
+        "conditions": [{"image_path": image_path, "frame_index": 0, "strength": 1.0}],
+    }
+
+
+def _port_open(port, host="127.0.0.1", timeout=1.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _await_gpu_reclaim(timeout=40, poll=2):
+    """Poll mps_guard._mem_census()['gpu_other_gib'] until it drops back
+    under the preflight threshold (a prior stage's process has fully
+    exited and its GPU memory has been reclaimed), or timeout elapses."""
+    start = time.monotonic()
+    while True:
+        gpu_other = mps_guard._mem_census()["gpu_other_gib"]
+        if gpu_other <= mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB or time.monotonic() - start > timeout:
+            return gpu_other
+        time.sleep(poll)
+
+
+def _spawn_stage(stage_num, run_dir, env_overrides=None):
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+    proc = subprocess.run(
+        [sys.executable, L.__file__, "--stage", str(stage_num), "--run-dir", run_dir],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    return proc.returncode, proc.stdout or ""
+
+
+def main(argv=None):
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # --- step 1: validation ---
+    if "://" not in args.image_path and not os.path.isfile(args.image_path):
+        print("Error: image not found: %s" % args.image_path, file=sys.stderr)
+        return 2
+
+    out_dir = os.path.dirname(os.path.abspath(args.output_path)) or "."
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        print("Error: output directory not writable: %s" % out_dir, file=sys.stderr)
+        return 2
+
+    if os.path.exists(args.output_path) and not args.force:
+        print("Error: output already exists: %s (use --force to overwrite)" % args.output_path,
+              file=sys.stderr)
+        return 2
+
+    try:
+        L._validate_geometry(args.width, args.height, args.num_frames)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    if args.segments < 1:
+        parser.error("--segments must be >= 1")
+
+    # --- step 2: ceiling pre-check (once; all segments share this geometry) ---
+    if not args.wide and not args.allow_override:
+        try:
+            L._check_ceiling(
+                args.width, args.height, args.num_frames,
+                [{"image_path": args.image_path, "frame_index": 0, "strength": 1.0}],
+                False,
+            )
+        except mps_guard.HostSafetyError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+
+    restored = [False]
+
+    def _restore():
+        if restored[0]:
+            return
+        restored[0] = True
+        if args.keep_down:
+            print("servers left down; run: bash bin/ltx-host-restore")
+            return
+        print("=== restoring host ===")
+        try:
+            rc = subprocess.run(["bash", os.path.join(WS, "bin", "ltx-host-restore")]).returncode
+            if rc != 0:
+                print("WARNING: ltx-host-restore exited %d; the host may still be DOWN. "
+                      "Run: bash %s/bin/ltx-host-restore" % (rc, WS), file=sys.stderr)
+        except Exception as e:
+            print("WARNING: ltx-host-restore failed to run (%s); the host may still be DOWN. "
+                  "Run: bash %s/bin/ltx-host-restore" % (e, WS), file=sys.stderr)
+
+    try:
+        # --- step 3: prep ---
+        if not args.no_prep:
+            print("=== prep ===")
+            subprocess.run(
+                ["bash", os.path.join(WS, "bin", "ltx-host-prep")],
+                stdin=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if not _port_open(8177) and not _port_open(8178):
+                    break
+                time.sleep(1)
+            if _port_open(8177) or _port_open(8178):
+                print("Error: ports 8177/8178 still open after prep; refusing to run.",
+                      file=sys.stderr)
+                return 1
+
+        input_image = _abspath_or_url(args.image_path)
+        negative_prompt = args.negative_prompt
+
+        run_id = "%s-%s" % (
+            datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            uuid.uuid4().hex[:8],
+        )
+        run_root = os.path.join(WS, CHAINS_SUBDIR, run_id)
+        os.makedirs(run_root)
+        print("run root: %s" % run_root)
+
+        # --- step 5: stage 1 once (prompt-only encode, reused by every segment) ---
+        base = os.path.join(run_root, "_base")
+        os.makedirs(base)
+        base_request = _build_request(
+            input_image, args.prompt, negative_prompt, args.width, args.height,
+            args.num_frames, args.fps, args.frame_rate, args.wide, args.allow_override,
+            args.seed,
+        )
+        with open(os.path.join(base, "request.json"), "w") as f:
+            json.dump(base_request, f, indent=2)
+
+        print("=== stage 1: encoding prompt ===")
+        rc1, log1 = _spawn_stage(1, base)
+        if rc1 != 0:
+            tail = "\n".join(log1.splitlines()[-40:])
+            print("stage1 FAILED rc=%d\n%s" % (rc1, tail), file=sys.stderr)
+            raise RuntimeError("stage1 failed with exit code %d" % rc1)
+        base_embeds = os.path.join(base, "embeds.pt")
+        print("stage 1 ok")
+
+        # --- step 6: segment loop ---
+        all_frames = []
+        segment_results = []
+        completed = 0
+        prev_last = None
+
+        for i in range(1, args.segments + 1):
+            cell = os.path.join(run_root, "seg%d" % i)
+            os.makedirs(cell)
+            cur_img = _segment_image(i, input_image, prev_last)
+            seg_seed = _segment_seed(args.seed, i)
+
+            request = _build_request(
+                cur_img, args.prompt, negative_prompt, args.width, args.height,
+                args.num_frames, args.fps, args.frame_rate, args.wide, args.allow_override,
+                seg_seed,
+            )
+            with open(os.path.join(cell, "request.json"), "w") as f:
+                json.dump(request, f, indent=2)
+            shutil.copyfile(base_embeds, os.path.join(cell, "embeds.pt"))
+
+            print("segment %d/%d starting (conditioning on %s, seed=%d)"
+                  % (i, args.segments, cur_img, seg_seed))
+
+            _await_gpu_reclaim()
+            time.sleep(args.settle)
+
+            stage2_env = {"LTX_SWEEP_RELAX_SUPPLY": "1"} if args.relax_supply else None
+            rc2, log2 = _spawn_stage(2, cell, stage2_env)
+            if rc2 != 0:
+                reason = L._sentinel_abort_line(cell, "stage2")
+                status = "sentinel_abort" if rc2 == mps_guard.SENTINEL_EXIT_CODE else "stage2_error"
+                print("segment %d/%d FAILED (%s, rc=%d): %s"
+                      % (i, args.segments, status, rc2, reason))
+                segment_results.append({"segment": i, "status": status, "rc": rc2, "reason": reason})
+                break
+            print("segment %d/%d stage2 ok" % (i, args.segments))
+
+            rc3, log3 = _spawn_stage(3, cell)
+            blocked = ("ContentSafetyError" in log3) or ("CONTENT SAFETY" in log3)
+            frames = sorted(glob.glob(os.path.join(cell, "frames", "frame_*.png")))
+
+            if blocked:
+                print("segment %d/%d BLOCKED by content safety (frames deleted by stage 3)"
+                      % (i, args.segments))
+                segment_results.append({"segment": i, "status": "content_blocked"})
+                break
+            if rc3 != 0 or not frames:
+                print("segment %d/%d FAILED (stage3_error, rc=%d, frames=%d)"
+                      % (i, args.segments, rc3, len(frames)))
+                segment_results.append({"segment": i, "status": "stage3_error", "rc": rc3})
+                break
+
+            all_frames.extend(frames)
+            prev_last = frames[-1]
+            completed += 1
+            segment_results.append({"segment": i, "status": "ok", "frames": len(frames)})
+            print("segment %d/%d ok: %d frames" % (i, args.segments, len(frames)))
+
+        # --- step 7: concatenate ---
+        wrote_output = False
+        if all_frames:
+            from diffusers.utils import export_to_video
+            from PIL import Image
+
+            images = [Image.open(f).convert("RGB") for f in all_frames]
+            export_to_video(images, args.output_path, fps=args.fps)
+            wrote_output = True
+            duration = len(all_frames) / args.fps
+            size_kb = os.path.getsize(args.output_path) // 1024
+            print("CHAINED %d/%d segments, %d frames, %.2fs -> %s (%dKB)"
+                  % (completed, args.segments, len(all_frames), duration,
+                     args.output_path, size_kb))
+        else:
+            print("No segments completed; no output written.")
+
+        # --- step 8: chain_summary.json ---
+        summary = {
+            "requested_segments": args.segments,
+            "completed_segments": completed,
+            "segments": segment_results,
+            "total_frames": len(all_frames),
+            "output_path": args.output_path if wrote_output else None,
+        }
+        with open(os.path.join(run_root, "chain_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+        # --- step 9: final status / exit code ---
+        if completed == args.segments and wrote_output:
+            print("DONE: all %d segments completed -> %s" % (args.segments, args.output_path))
+            return 0
+        print("STOPPED EARLY: %d/%d segments completed" % (completed, args.segments))
+        return 1
+    finally:
+        _restore()
+
+
+if __name__ == "__main__":
+    try:
+        _rc = main()
+    except KeyboardInterrupt:
+        _rc = 130
+    except Exception as _e:
+        print("ltx-chain failed: %s" % _e, file=sys.stderr)
+        _rc = 1
+    sys.exit(_rc)
