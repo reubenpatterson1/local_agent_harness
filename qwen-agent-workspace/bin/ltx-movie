@@ -1,0 +1,654 @@
+#!/usr/bin/env python3
+"""ltx-movie -- single end-to-end orchestrator for the narrative-to-movie
+pipeline: bin/qwen-agent (story authoring), bin/ltx-story-images (panel
+stills), bin/ltx-story-manifest (frame-allocation manifest), and
+bin/ltx-story-video (render). See
+docs/specs/2026-08-27-narrative-movie-pipeline-design.md for the
+underlying four-phase runbook this consolidates; the ronin_return story
+under generated/stories/ronin_return/ is a reference execution of that
+same runbook, run by hand before this wrapper existed.
+
+None of the three wrapped phase tools (bin/ltx-story-images,
+bin/ltx-story-manifest, bin/ltx-story-video) nor bin/qwen-agent are
+modified by this script -- each remains independently runnable and
+unchanged; this script only sequences them, adds a few safety gates
+around the sequence, and writes to the same output paths (story.md,
+images/, manifest.json, movie.mp4, movie.log) the manual runbook already
+used.
+
+Four phases and host state:
+  Phase 1 (story)    -- calls bin/qwen-agent in one-shot mode; needs the
+                         27B vLLM server UP (qwen-agent talks to it).
+  Phase 2 (stills)    -- calls bin/ltx-story-images; needs the same server
+                         stack UP (it renders through z_image_skill).
+  Phase 3 (manifest)  -- calls bin/ltx-story-manifest and then
+                         bin/ltx-story-video --dry-run; both are offline
+                         and never touch the servers.
+  Phase 4 (render)    -- calls bin/ltx-story-video for real; that tool
+                         takes the vLLM servers DOWN itself
+                         (bin/ltx-host-prep) before rendering and brings
+                         them back UP again (bin/ltx-host-restore) in its
+                         own try/finally, whether it succeeds, fails, or
+                         is interrupted.
+
+Three design problems this wrapper solves, on top of the (unchanged)
+phase tools:
+  1. Sudo keepalive -- phase 4's page-cache purge needs a cached sudo
+     ticket that can otherwise expire during a long unattended run; a
+     daemon thread refreshes it via a non-interactive `sudo -n true`
+     every 60s for the life of the process (never a password-reading
+     invocation).
+  2. Review gates -- between the cheap/offline phases (1-3) and the
+     expensive GPU phase (4), the operator is shown story.md and the
+     frame-allocation dry-run and asked to confirm before any GPU time is
+     spent; --no-review skips these for unattended runs (which then
+     requires a non-interactive stdin, checked up front).
+  3. Avail-memory gate -- phase 4 will not launch bin/ltx-story-video
+     until psutil reports at least --min-avail-gib available memory. This
+     encodes the 2026-08-27 lesson (docs/specs/2026-08-27-narrative-movie-
+     pipeline-design.md Section 4): a batch launched at 30.4 GiB available
+     failed 14/14 at the stage-2 supply gate; idle settling alone did not
+     clear it -- only quitting memory-heavy apps (Chrome/Slack/Docker) did.
+
+--length SECONDS is an alternate way to size the movie: it derives
+--panels and --target-seconds from a single number, treating 2 seconds as
+the per-panel chunk basis (panels = max(2, round(SECONDS / 2.0)); the
+per-clip lengths that actually get rendered stay narration-paced by the
+existing bin/ltx-story-manifest allocator around that 2s average, not
+locked to exactly 2s each). --length is mutually exclusive with both
+--panels and --target-seconds. Because the qwen-agent story-authoring
+call's --max-tokens 4096 default only ever fit ~15 panels, both its
+--max-tokens and its subprocess timeout scale with the resolved panel
+count: max(4096, panels*350) tokens, max(900, panels*60)s.
+"""
+
+import argparse
+import glob
+import importlib.machinery
+import json
+import os
+import re  # noqa: F401 -- kept for parity with the workspace's stdlib-only import convention
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+MAX_TOTAL_FRAMES = 2000
+CONCAT_FRAME_SAFETY_CAP = 1990  # headroom under bin/ltx-story-video's own MAX_TOTAL_FRAMES
+
+STORY_PROMPT_TEMPLATE = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
+
+Narrative to adapt:
+{narrative}
+
+Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file must contain EXACTLY {panels} panel sections, numbered 1 through {panels} in order, each in exactly this format:
+
+## Panel N — <short title>
+Image: <a single still-image prompt, 70-90 words, describing the panel's visual composition, setting, lighting, and lens/shot choice>
+Motion: <15-40 words describing ONLY the camera motion and the subject's motion within the shot -- no new plot information>
+Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
+
+The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Image: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
+
+Do not verify the file with run_python or any other tool. Emit no other text."""
+
+
+def build_story_prompt(narrative, story_id, panels):
+    return STORY_PROMPT_TEMPLATE.format(narrative=narrative, story_id=story_id, panels=panels)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-movie",
+        description=(
+            "End-to-end orchestrator for the narrative-to-movie pipeline: story "
+            "authoring (bin/qwen-agent), panel stills (bin/ltx-story-images), "
+            "manifest + allocation dry-run (bin/ltx-story-manifest, "
+            "bin/ltx-story-video --dry-run), and render (bin/ltx-story-video). "
+            "The three wrapped phase tools are unchanged and remain individually "
+            "usable."
+        ),
+    )
+    parser.add_argument("narrative", help="the story narrative to adapt into panels")
+    parser.add_argument("--story-id", dest="story_id", required=True)
+    parser.add_argument("--panels", type=int, default=15,
+                         help="mutually exclusive with --length")
+    parser.add_argument("--target-seconds", dest="target_seconds", type=float, default=30.0,
+                         help="mutually exclusive with --length")
+    parser.add_argument("--length", type=float, default=None,
+                         help="total movie length in seconds; mutually exclusive with "
+                              "--panels/--target-seconds. The 2s chunk is the division "
+                              "basis for how many images/scenes get generated; per-clip "
+                              "lengths remain narration-paced by the existing allocator "
+                              "around that 2s average.")
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--min-frames", dest="min_frames", type=int, default=25)
+    parser.add_argument("--max-frames", dest="max_frames", type=int, default=57)
+    parser.add_argument("--image-width", dest="image_width", type=int, default=1024)
+    parser.add_argument("--image-height", dest="image_height", type=int, default=1024)
+    parser.add_argument("--image-seed", dest="image_seed", type=int, default=0)
+    parser.add_argument("--no-review", dest="no_review", action="store_true", default=False)
+    parser.add_argument("--force-story", dest="force_story", action="store_true", default=False)
+    parser.add_argument("--force", action="store_true", default=False)
+    parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=34.0)
+    parser.add_argument("--avail-timeout", dest="avail_timeout", type=int, default=1800)
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
+    return parser
+
+
+def _flag_explicit(raw_argv, flag):
+    return any(a == flag or a.startswith(flag + "=") for a in raw_argv)
+
+
+def _resolve_length(args, raw_argv):
+    """If --length was given, resolve it into args.panels/args.target_seconds
+    (mutating args in place) and validate it. No-op when --length is None.
+    Exits the process (code 2) on any validation failure."""
+    if args.length is None:
+        return
+
+    if _flag_explicit(raw_argv, "--panels"):
+        print("Error: --length is mutually exclusive with --panels", file=sys.stderr)
+        sys.exit(2)
+    if _flag_explicit(raw_argv, "--target-seconds"):
+        print("Error: --length is mutually exclusive with --target-seconds", file=sys.stderr)
+        sys.exit(2)
+
+    # "too short": validated against the raw (pre-rounding) quotient rather
+    # than round(length/2) itself, so an exact 2s-boundary length like 3.0s
+    # (which rounds to 2 either way) is still rejected as implying fewer
+    # than 2 full panel-chunks.
+    if args.length / 2.0 < 2:
+        print("Error: --length %.1f is too short; the minimum is 4.0s (2 panels at "
+              "the 2s-per-panel chunk basis)" % args.length, file=sys.stderr)
+        sys.exit(2)
+
+    implied_frames = args.length * args.fps
+    if implied_frames > CONCAT_FRAME_SAFETY_CAP:
+        max_length = CONCAT_FRAME_SAFETY_CAP / args.fps
+        print(
+            "Error: --length %.1f at --fps %d implies %.0f frames, exceeding the "
+            "downstream %d-frame concat cap (limit ~%d frames); max supported "
+            "--length at fps=%d is %.2fs"
+            % (args.length, args.fps, implied_frames, MAX_TOTAL_FRAMES,
+               CONCAT_FRAME_SAFETY_CAP, args.fps, max_length),
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    args.panels = max(2, round(args.length / 2.0))
+    args.target_seconds = args.length
+
+
+def _phase1_max_tokens(panels):
+    # 4096 only ever fit ~15 panels (~2500 tokens); scale for larger casts.
+    return max(4096, panels * 350)
+
+
+def _phase1_timeout(panels):
+    return max(900, panels * 60)
+
+
+def _story_dir(story_id):
+    return os.path.join(WS, "generated", "stories", story_id)
+
+
+def _story_paths(story_id):
+    story_dir = _story_dir(story_id)
+    return {
+        "story_dir": story_dir,
+        "story_md": os.path.join(story_dir, "story.md"),
+        "images_dir": os.path.join(story_dir, "images"),
+        "manifest_path": os.path.join(story_dir, "manifest.json"),
+        "movie_path": os.path.join(story_dir, "movie.mp4"),
+        "movie_log_path": os.path.join(story_dir, "movie.log"),
+        "lock_path": os.path.join(story_dir, ".movie.lock"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# lockfile
+# ---------------------------------------------------------------------------
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _lock_state(lock_path):
+    """Return ("absent", None), ("active", pid), or ("stale", pid)."""
+    if not os.path.exists(lock_path):
+        return ("absent", None)
+    try:
+        with open(lock_path) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return ("stale", None)
+    if _pid_alive(pid):
+        return ("active", pid)
+    return ("stale", pid)
+
+
+# ---------------------------------------------------------------------------
+# story.md validation
+# ---------------------------------------------------------------------------
+
+def _validate_story_md(story_md_path, expected_panels):
+    """Load bin/ltx-story-manifest via SourceFileLoader and validate
+    story_md_path against it: exactly expected_panels panels, each with a
+    non-empty Image:/Motion:/Narration: field. Returns a list of violation
+    strings (empty list == valid)."""
+    violations = []
+    manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
+    try:
+        story_manifest = importlib.machinery.SourceFileLoader(
+            "ltx_story_manifest_for_movie", manifest_tool_path
+        ).load_module()
+        _narrative, panels = story_manifest._parse_prompts_md(story_md_path)
+    except OSError as e:
+        return ["cannot read story.md: %s" % e]
+
+    if len(panels) != expected_panels:
+        violations.append(
+            "expected exactly %d panels, found %d" % (expected_panels, len(panels))
+        )
+
+    for p in panels:
+        num = p["number"]
+        for label, key in (("Image", "image"), ("Motion", "motion"), ("Narration", "narration")):
+            if not p[key].strip():
+                violations.append("panel %d: missing/empty %s: field" % (num, label))
+
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# sudo keepalive
+# ---------------------------------------------------------------------------
+
+def _check_sudo_and_start_keepalive():
+    """Requires a cached sudo credential up front (`sudo -n true`); on
+    success, starts a daemon thread that refreshes it every 60s for the
+    life of the process. Returns None on success, or an exit code."""
+    rc = subprocess.run(
+        ["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ).returncode
+    if rc != 0:
+        print("no cached sudo credential. Run `sudo -v` in this terminal, then relaunch.",
+              file=sys.stderr)
+        return 2
+    _start_sudo_keepalive_thread()
+    return None
+
+
+def _start_sudo_keepalive_thread():
+    warned = [False]
+
+    def _loop():
+        while True:
+            time.sleep(60)
+            # Refresh the cached credential the same way as the initial
+            # check above: `sudo -n true` (non-interactive; must never
+            # read a password for the whole life of the process).
+            rc = subprocess.run(
+                ["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            ).returncode
+            if rc != 0 and not warned[0]:
+                warned[0] = True
+                print("WARNING: sudo credential refresh failed; later page-cache purges "
+                      "will degrade gracefully instead of hard-failing.", file=sys.stderr)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    return t
+
+
+# ---------------------------------------------------------------------------
+# phase 1: story
+# ---------------------------------------------------------------------------
+
+def phase1_story(args):
+    paths = _story_paths(args.story_id)
+    story_md = paths["story_md"]
+
+    if os.path.exists(story_md) and not args.force_story:
+        print("note: %s already exists; skipping Phase 1 (pass --force-story to regenerate)"
+              % story_md)
+    else:
+        print("=== Phase 1: story ===")
+        prompt = build_story_prompt(args.narrative, args.story_id, args.panels)
+        max_tokens = _phase1_max_tokens(args.panels)
+        timeout = _phase1_timeout(args.panels)
+        cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
+               "--max-tokens", str(max_tokens), "--max-rounds", "4",
+               "--request-timeout", "600", "--user-prompt", prompt]
+        print("Running (timeout %ds): %s" % (
+            timeout, shlex.join(cmd[:-1] + ["--user-prompt", "<%d chars>" % len(prompt)])
+        ))
+
+        proc = subprocess.Popen(cmd, cwd=WS, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True)
+        try:
+            out, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+            tail = "\n".join((out or "").splitlines()[-40:])
+            print("Error: qwen-agent timed out after %ds writing story.md (known hang mode: "
+                  "attempting to self-verify, which the prompt forbids); log tail:\n%s"
+                  % (timeout, tail), file=sys.stderr)
+            return 1
+        if proc.returncode != 0:
+            tail = "\n".join((out or "").splitlines()[-40:])
+            print("Error: qwen-agent exited %d while authoring story.md\n%s"
+                  % (proc.returncode, tail), file=sys.stderr)
+            return 1
+
+    violations = _validate_story_md(story_md, args.panels)
+    if violations:
+        print("Error: story.md failed validation:", file=sys.stderr)
+        for v in violations:
+            print("  - %s" % v, file=sys.stderr)
+        print("Hand-edit %s to fix the violations above and rerun; story.md already exists "
+              "so Phase 1 will be skipped next time (pass --force-story to regenerate it "
+              "instead)." % story_md, file=sys.stderr)
+        return 1
+
+    if not args.no_review:
+        with open(story_md) as f:
+            content = f.read()
+        print("=== story.md ===")
+        print(content)
+        input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# phase 2: stills
+# ---------------------------------------------------------------------------
+
+def phase2_stills(args):
+    paths = _story_paths(args.story_id)
+    print("=== Phase 2: stills ===")
+    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-images"),
+           "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
+           "--width", str(args.image_width), "--height", str(args.image_height),
+           "--seed", str(args.image_seed)]
+    print("Running: %s" % shlex.join(cmd))
+    proc = subprocess.run(cmd, cwd=WS)
+    if proc.returncode != 0:
+        images_json = os.path.join(paths["images_dir"], "images.json")
+        print("Error: ltx-story-images exited %d; see %s for which panels failed/were blocked"
+              % (proc.returncode, images_json), file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# phase 3: manifest + dry-run
+# ---------------------------------------------------------------------------
+
+def phase3_manifest(args):
+    paths = _story_paths(args.story_id)
+    print("=== Phase 3: manifest + dry-run ===")
+
+    cmd_manifest = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
+                     "--story-id", args.story_id, "--prompts-md", paths["story_md"],
+                     "--glob", "panel_*.png", "--images-dir", paths["images_dir"],
+                     "--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
+                     "--min-frames", str(args.min_frames), "--max-frames", str(args.max_frames),
+                     "--force"]
+    print("Running: %s" % shlex.join(cmd_manifest))
+    proc = subprocess.run(cmd_manifest, cwd=WS)
+    if proc.returncode != 0:
+        print("Error: ltx-story-manifest exited %d" % proc.returncode, file=sys.stderr)
+        return 1
+
+    cmd_dryrun = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
+                  paths["manifest_path"], paths["movie_path"],
+                  "--mode", "per-panel", "--dry-run"]
+    print("Running: %s" % shlex.join(cmd_dryrun))
+    proc = subprocess.run(cmd_dryrun, cwd=WS)
+    if proc.returncode != 0:
+        print("Error: ltx-story-video --dry-run exited %d" % proc.returncode, file=sys.stderr)
+        return 1
+
+    if not args.no_review:
+        input("Review the allocation above. Enter to render, Ctrl-C to abort: ")
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# phase 4: render
+# ---------------------------------------------------------------------------
+
+def _top5_rss():
+    import psutil
+    procs = []
+    for p in psutil.process_iter(["name", "memory_info"]):
+        try:
+            rss_gib = p.info["memory_info"].rss / (2 ** 30)
+            procs.append((p.info["name"] or str(p.pid), rss_gib))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    procs.sort(key=lambda item: item[1], reverse=True)
+    return procs[:5]
+
+
+def _wait_for_avail(min_avail_gib, avail_timeout):
+    import psutil
+    start = time.monotonic()
+    last_print = None
+    while True:
+        avail_gib = psutil.virtual_memory().available / (2 ** 30)
+        if avail_gib >= min_avail_gib:
+            return True
+        now = time.monotonic()
+        elapsed = now - start
+        if last_print is None or now - last_print >= 120:
+            last_print = now
+            print("avail %.2f GiB (< %.2f GiB required, %.0fs elapsed); top-5 RSS processes:"
+                  % (avail_gib, min_avail_gib, elapsed))
+            for name, rss_gib in _top5_rss():
+                print("  %-30s %.2f GiB" % (name, rss_gib))
+            print("hint: quit Chrome/Slack/Docker to free memory")
+        if elapsed >= avail_timeout:
+            print("Error: avail memory did not reach %.2f GiB within %ds (last reading %.2f GiB)"
+                  % (min_avail_gib, avail_timeout, avail_gib), file=sys.stderr)
+            return False
+        time.sleep(5)
+
+
+def _stream_and_tee(cmd, log_path):
+    with open(log_path, "w") as logf:
+        proc = subprocess.Popen(cmd, cwd=WS, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            logf.write(line)
+            logf.flush()
+        proc.wait()
+        return proc.returncode
+
+
+def _report_summary(args, movie_path, story_dir):
+    matches = glob.glob(os.path.join(story_dir, "runs", "*", "story_summary.json"))
+    if not matches:
+        print("Error: no runs/*/story_summary.json found after render", file=sys.stderr)
+        return 1
+    newest = max(matches, key=os.path.getmtime)
+    with open(newest) as f:
+        summary = json.load(f)
+
+    completed = summary.get("completed_units")
+    requested = summary.get("requested_units")
+    intended = summary.get("intended_total_frames")
+    actual = summary.get("actual_total_frames")
+    fps = summary.get("fps", args.fps)
+    retried = [u.get("unit") for u in summary.get("units", []) if u.get("attempts", 1) > 1]
+
+    print("=== render summary (%s) ===" % newest)
+    print("completed: %s/%s units" % (completed, requested))
+    print("frames: intended=%s actual=%s" % (intended, actual))
+    print("retried units: %r" % retried)
+
+    if os.path.exists(movie_path):
+        size_bytes = os.path.getsize(movie_path)
+        duration = (actual or 0) / fps if fps else 0.0
+        print("movie: %s (%d bytes, %.2fs @ %d fps)" % (movie_path, size_bytes, duration, fps))
+
+    return 0 if completed == requested else 1
+
+
+def phase4_render(args):
+    paths = _story_paths(args.story_id)
+    movie_path = paths["movie_path"]
+
+    print("=== Phase 4: render ===")
+    if os.path.exists(movie_path) and not args.force:
+        print("Error: %s already exists; pass --force to overwrite" % movie_path,
+              file=sys.stderr)
+        return 2
+
+    if not _wait_for_avail(args.min_avail_gib, args.avail_timeout):
+        return 1
+
+    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
+           paths["manifest_path"], movie_path, "--mode", "per-panel",
+           "--on-unit-failure", "skip", "--retry-failed", "1",
+           "--retry-idle", "120", "--max-consecutive-failures", "3"]
+    if args.force:
+        cmd.append("--force")
+    print("Running: %s" % shlex.join(cmd))
+
+    rc = _stream_and_tee(cmd, paths["movie_log_path"])
+    if rc != 0:
+        print("Error: ltx-story-video exited %d" % rc, file=sys.stderr)
+        return rc
+
+    return _report_summary(args, movie_path, paths["story_dir"])
+
+
+# ---------------------------------------------------------------------------
+# dry-run plan
+# ---------------------------------------------------------------------------
+
+def _print_dry_run_plan(args):
+    paths = _story_paths(args.story_id)
+    max_tokens = _phase1_max_tokens(args.panels)
+    timeout = _phase1_timeout(args.panels)
+    prompt = build_story_prompt(args.narrative, args.story_id, args.panels)
+
+    print("=== DRY RUN: ltx-movie phase plan (story-id=%s) ===" % args.story_id)
+    print()
+    print("--- Phase 1: story ---")
+    print("Would skip if %s already exists (pass --force-story to regenerate)."
+          % paths["story_md"])
+    phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
+                  "--max-tokens", str(max_tokens), "--max-rounds", "4",
+                  "--request-timeout", "600", "--user-prompt", prompt]
+    print("Command (subprocess timeout %ds): %s" % (timeout, shlex.join(phase1_cmd)))
+    print()
+    print("Rendered story prompt:")
+    print(prompt)
+    print()
+
+    print("--- Phase 2: stills ---")
+    phase2_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-images"),
+                  "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
+                  "--width", str(args.image_width), "--height", str(args.image_height),
+                  "--seed", str(args.image_seed)]
+    print("Command: %s" % shlex.join(phase2_cmd))
+    print()
+
+    print("--- Phase 3: manifest + dry-run ---")
+    phase3_manifest_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
+                            "--story-id", args.story_id, "--prompts-md", paths["story_md"],
+                            "--glob", "panel_*.png", "--images-dir", paths["images_dir"],
+                            "--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
+                            "--min-frames", str(args.min_frames),
+                            "--max-frames", str(args.max_frames), "--force"]
+    print("Command: %s" % shlex.join(phase3_manifest_cmd))
+    phase3_video_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
+                        paths["manifest_path"], paths["movie_path"],
+                        "--mode", "per-panel", "--dry-run"]
+    print("Command: %s" % shlex.join(phase3_video_cmd))
+    print()
+
+    print("--- Phase 4: render ---")
+    print("Avail gate: wait until psutil.virtual_memory().available/2**30 >= %.1f GiB "
+          "(timeout %ds)." % (args.min_avail_gib, args.avail_timeout))
+    phase4_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
+                  paths["manifest_path"], paths["movie_path"], "--mode", "per-panel",
+                  "--on-unit-failure", "skip", "--retry-failed", "1",
+                  "--retry-idle", "120", "--max-consecutive-failures", "3"]
+    if args.force:
+        phase4_cmd.append("--force")
+    print("Command: %s" % shlex.join(phase4_cmd))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _resolve_length(args, raw_argv)
+
+    if args.dry_run:
+        return _print_dry_run_plan(args)
+
+    paths = _story_paths(args.story_id)
+    os.makedirs(paths["story_dir"], exist_ok=True)
+    lock_path = paths["lock_path"]
+
+    state, pid = _lock_state(lock_path)
+    if state == "active":
+        print("another ltx-movie run for this story is active, pid %d" % pid, file=sys.stderr)
+        return 2
+    if state == "stale":
+        print("note: removing stale lockfile for story %s (dead pid %s)" % (args.story_id, pid))
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+    with open(lock_path, "w") as f:
+        f.write(str(os.getpid()))
+
+    try:
+        rc = _check_sudo_and_start_keepalive()
+        if rc is not None:
+            return rc
+
+        if not args.no_review and not sys.stdin.isatty():
+            print("Error: review gates require an interactive terminal. Run this "
+                  "interactively, or pass --no-review for unattended operation.",
+                  file=sys.stderr)
+            return 2
+
+        for phase_fn in (phase1_story, phase2_stills, phase3_manifest, phase4_render):
+            rc = phase_fn(args)
+            if rc != 0:
+                return rc
+        return 0
+    finally:
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -17,6 +17,7 @@ allocation genuinely fit, since the stage-2 cap is 30.70 GiB. G1 is now
 `mem_supply_gib()`, built from a `vm_stat` census (see _mem_census()).
 """
 
+import collections
 import json
 import os
 import re
@@ -42,6 +43,43 @@ SENTINEL_ABORT_SWAP_GROWTH_GIB = 2.0
 # above that known-good peak with margin, so the trigger now fires only on growth that
 # is both large AND has carried absolute usage past anything observed in a healthy run.
 SENTINEL_ABORT_SWAP_FLOOR_GIB = 6.5
+# Immediate-abort tier. 8.0 GiB is 2.03x the largest transient load step ever
+# observed (3.93 GiB, run 20260827T013142Z panel-1) and bounds worst-case
+# runaway latency for the sustained tier below.
+SENTINEL_ABORT_SWAP_SPIKE_GIB = 8.0
+# Persistence requirement for the growth tier. Measured 2026-08-27 across three
+# 10-unit ltx-story-video runs: EVERY swap abort (13 of them) fired on the ONE
+# sample where pipeline.to("mps") finished wiring LTX's 26.61 GiB of weights --
+# t=17-18s, mps_driver_gib=27.08, compressor 25-28 GiB -- never during denoise.
+# Units that survived show the SAME step and then recede (panel-9: 13.15 ->
+# 11.16 -> 9.27 over 15 s; panel-5 stepped exactly +2.00 and only survived
+# because the comparison is a strict `>`). No healthy trace in that corpus has
+# more than ONE consecutive sample above start+2.0 GiB, so requiring five
+# separates the load transient from a genuine monotonic climb while still
+# aborting a real runaway within ~10 s. The old conjunction could not tell them
+# apart: host baseline swap is 9-13 GiB by unit 2 of any batch, so the 6.5 GiB
+# floor was always already satisfied and the trigger degenerated to a bare
+# "growth > 2.0 GiB" -- which a normal weight load exceeds by construction.
+# CAVEAT recorded deliberately: the 8.0 spike threshold rests on truncated
+# data -- every observed load step was measured at the sample the sentinel
+# killed the process, so the true completed-transient peak is unknown until
+# the first post-fix run observes one. Revisit if that observation exceeds
+# ~5 GiB. This is the single weakest number in this design.
+# 2026-08-27 (same day, post-smoke): widened 5->7 samples / 8->12 s after the
+# first live run under the two-tier design. The window proved right in KIND
+# but too short in DURATION: a unit starting from a LOW swap baseline (6.50
+# GiB -- a healthy host) was killed by the load step's natural decay tail
+# (step to 11.18, decaying ~0.55 GiB/sample through 10.80/10.17/9.63/9.08,
+# all still above baseline+2.0 when the 5-sample window filled), while a
+# sibling unit with baseline 8.71 sailed through because its threshold sat
+# higher. Ironically, the cleaner the host, the likelier the misfire. Seven
+# samples (~12 s) outlast the measured ~12-14 s decay tail. Runaway latency
+# impact: the synthetic +0.5 GiB/s climb now first aborts at ~18 s instead of
+# ~14 s; the 8.0 GiB spike tier, the avail<4.0 trigger and the MPS watermark
+# cap bound the added exposure. Also observed that run: max single-sample
+# load step is now 4.19 GiB (was 3.93) -- still 1.9x under the spike tier.
+SENTINEL_SWAP_WINDOW_SAMPLES = 7
+SENTINEL_SWAP_WINDOW_MIN_S = 12.0
 SENTINEL_EXIT_CODE = 75
 # Fail-safe posture: if the sentinel loses its ability to sample memory
 # (an ioreg/vm_stat parse failure raises HostSafetyError inside the daemon
@@ -301,29 +339,90 @@ def _supply_gate_ok(avail_gib, supply_gib, required_gib):
     return (True, [])
 
 
-def _swap_abort(swap_used_gib, swap_start_gib):
-    """Sentinel's third abort decision, factored out as a pure function (no
+def _swap_abort(swap_used_gib, swap_start_gib, window=()):
+    """Sentinel's swap abort decision, factored out as a pure function (no
     I/O, no host access) purely so it is unit-testable without a live host --
-    see tests/test_mps_guard_metric.py T21-T25. Sentinel._loop calls this so
-    the abort logic can never drift from what is tested here.
+    see tests/test_mps_guard_metric.py T21-T25, T28-T32. Sentinel._loop calls
+    this so the abort logic can never drift from what is tested here.
+
+    Two tiers, both gated on the absolute floor:
+
+    Tier 1 (spike): an immediate abort if swap growth exceeds
+    SENTINEL_ABORT_SWAP_SPIKE_GIB in a single sample. Bounds worst-case
+    runaway latency.
+
+    Tier 2 (sustained): `window` is the oldest-first sequence of
+    `(elapsed_s, swap_used_gib)` pairs for the most recent samples,
+    INCLUDING the current one (`()` means tier-1-only behavior). This tier
+    aborts only if the window has at least SENTINEL_SWAP_WINDOW_SAMPLES
+    samples, those samples span at least SENTINEL_SWAP_WINDOW_MIN_S
+    seconds, and even the LOWEST (trough) sample in that window still sits
+    above max(swap_start_gib, SENTINEL_ABORT_SWAP_FLOOR_GIB) +
+    SENTINEL_ABORT_SWAP_GROWTH_GIB -- i.e. growth that never receded, not a
+    transient load step. Clamping the baseline up to the floor before adding
+    the growth margin means a unit that starts BELOW the floor (e.g. right
+    after a fresh `sudo purge`) merely climbing to the normal post-model-load
+    steady state is not mistaken for a runaway, since the floor already
+    declares that absolute level unremarkable. See the comment above
+    SENTINEL_SWAP_WINDOW_SAMPLES for why five samples/eight seconds
+    separates a genuine runaway from the one-sample load-step transient
+    measured on 2026-08-27.
 
     Returns (should_abort, reason).
     """
     swap_growth = swap_used_gib - swap_start_gib
-    if swap_growth > SENTINEL_ABORT_SWAP_GROWTH_GIB and swap_used_gib > SENTINEL_ABORT_SWAP_FLOOR_GIB:
+
+    if swap_used_gib <= SENTINEL_ABORT_SWAP_FLOOR_GIB:
+        return (False, "")
+
+    if swap_growth > SENTINEL_ABORT_SWAP_SPIKE_GIB:
         reason = (
-            "swap grew %.2f GiB (from %.2f to %.2f), above %.1f, and absolute usage "
-            "%.2f exceeds floor %.1f"
+            "swap spike: grew %.2f GiB (from %.2f to %.2f), above spike threshold %.1f, "
+            "floor %.1f"
             % (
                 swap_growth,
                 swap_start_gib,
                 swap_used_gib,
-                SENTINEL_ABORT_SWAP_GROWTH_GIB,
-                swap_used_gib,
+                SENTINEL_ABORT_SWAP_SPIKE_GIB,
                 SENTINEL_ABORT_SWAP_FLOOR_GIB,
             )
         )
         return (True, reason)
+
+    # Growth for the SUSTAINED tier is measured from max(baseline, floor):
+    # a unit that starts below SENTINEL_ABORT_SWAP_FLOOR_GIB (e.g. first
+    # unit after a fresh `sudo purge`, baseline 4.83 measured 2026-08-27
+    # smoke take 2) merely climbing up to the ~6.9-7.1 GiB post-model-load
+    # steady state is returning to NORMAL operating swap, not running
+    # away -- the floor constant already declares that absolute level
+    # unremarkable. Measured that run: a sibling unit with baseline 8.71
+    # settled at ~7.1, BELOW its own baseline; the steady state is an
+    # absolute property of having the model loaded, not growth. The
+    # SPIKE tier deliberately keeps the RAW baseline: a single-sample
+    # +8 GiB jump is alarming from anywhere.
+    effective_start_gib = max(swap_start_gib, SENTINEL_ABORT_SWAP_FLOOR_GIB)
+
+    w = list(window)[-SENTINEL_SWAP_WINDOW_SAMPLES:]
+    if len(w) >= SENTINEL_SWAP_WINDOW_SAMPLES:
+        span_s = w[-1][0] - w[0][0]
+        trough_gib = min(s for _, s in w)
+        if span_s >= SENTINEL_SWAP_WINDOW_MIN_S and trough_gib - effective_start_gib > SENTINEL_ABORT_SWAP_GROWTH_GIB:
+            reason = (
+                "swap sustained: window trough %.2f GiB over %d samples spanning %.1f s "
+                "stayed above effective baseline %.2f (raw %.2f) + %.1f (current %.2f), floor %.1f"
+                % (
+                    trough_gib,
+                    len(w),
+                    span_s,
+                    effective_start_gib,
+                    swap_start_gib,
+                    SENTINEL_ABORT_SWAP_GROWTH_GIB,
+                    swap_used_gib,
+                    SENTINEL_ABORT_SWAP_FLOOR_GIB,
+                )
+            )
+            return (True, reason)
+
     return (False, "")
 
 
@@ -655,21 +754,35 @@ class Sentinel:
     max_compressor_gib is recorded without a trigger of its own because
     the compressor grew 8.27 GiB during a bounded, survivable allocation.
 
-    The third trigger (swap) is a CONJUNCTION, not growth alone: growth-only
-    misfired on a run aborted at 4.00 GiB absolute swap (growth +2.73 from a
-    `sudo purge`-shrunk 1.27 GiB baseline) while a run that COMPLETED reached
-    ~5.4 GiB absolute -- i.e. the aborted run never exceeded a known-good
-    peak. It now fires only when growth is large AND absolute swap usage has
-    passed SENTINEL_ABORT_SWAP_FLOOR_GIB. This deliberately makes the trigger
-    LESS likely to fire, which is safe because: the MPS watermark cap (30.70
-    GiB for stage 2) bounds GPU allocation regardless; the avail_gib < 4.0
-    trigger is unchanged and was far from firing when this misfire occurred
-    (avail was 16.32 at abort); and the disk trigger is unchanged. Residual
-    uncertainty, noted honestly: the misfiring run showed compressor_gib at
-    19.82, which may indicate genuine compression pressure, but this could
-    not be compared against the successful run because that run's samples
-    predate the compressor_gib field. max_compressor_gib is already recorded
-    in peaks so a future comparison becomes possible.
+    The third trigger (swap) is now TWO TIERS, both still gated on the
+    absolute SENTINEL_ABORT_SWAP_FLOOR_GIB precondition: an immediate spike
+    tier (SENTINEL_ABORT_SWAP_SPIKE_GIB) and a sustained tier that requires
+    SENTINEL_SWAP_WINDOW_SAMPLES consecutive samples spanning at least
+    SENTINEL_SWAP_WINDOW_MIN_S seconds whose TROUGH still exceeds
+    baseline + SENTINEL_ABORT_SWAP_GROWTH_GIB. This replaces the old
+    single-sample growth-AND-floor conjunction, which measurement on
+    2026-08-27 across three real 10-unit ltx-story-video runs showed had
+    degenerated: EVERY one of 13 swap aborts fired on the single sample
+    where pipeline.to("mps") finished wiring LTX's 26.61 GiB of weights (t
+    approx 17-18s, mps_driver_gib=27.08), never during denoising, because
+    host baseline swap is 9-13 GiB by unit 2 of any batch -- so the 6.5 GiB
+    floor was always already satisfied and the trigger was, in practice, a
+    bare "growth > 2.0 GiB" that a normal weight load exceeds by
+    construction. See the comments above SENTINEL_ABORT_SWAP_SPIKE_GIB and
+    SENTINEL_SWAP_WINDOW_SAMPLES for the full derivation, including the
+    honestly-recorded caveat that the 8.0 GiB spike threshold rests on
+    truncated data (every observed load step was measured at the sample
+    that killed the process).
+
+    Residual uncertainty, noted honestly: the misfiring run showed
+    compressor_gib at 19.82, which may indicate genuine compression
+    pressure, but this could not be compared against the successful run
+    because that run's samples predate the compressor_gib field.
+    max_compressor_gib is already recorded in peaks so a future comparison
+    becomes possible. Residual risk: in the first ~10 s of a stage no
+    window exists, so only the 8.0 GiB spike tier is live there;
+    avail_gib < 4.0, disk_free_gib < 5.0 and the MPS watermark cap remain in
+    force throughout.
     """
 
     def __init__(self, stage_name, run_dir):
@@ -682,14 +795,19 @@ class Sentinel:
             "min_swap_free_gib": float("inf"),
             "max_compressor_gib": 0.0,
             "min_supply_gib": float("inf"),
+            "max_swap_used_gib": 0.0,
+            "max_swap_growth_gib": 0.0,
         }
         self._swap_used_start_gib = None
+        self._swap_window = collections.deque(maxlen=SENTINEL_SWAP_WINDOW_SAMPLES)
+        self._monotonic_start = None
         self._stop_event = threading.Event()
         self._thread = None
 
     def start(self):
         os.makedirs(self.run_dir, exist_ok=True)
         self._swap_used_start_gib = psutil.swap_memory().used / GIB
+        self._monotonic_start = time.monotonic()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -700,6 +818,11 @@ class Sentinel:
         self.peak["min_swap_free_gib"] = min(self.peak["min_swap_free_gib"], s["swap_free_gib"])
         self.peak["max_compressor_gib"] = max(self.peak["max_compressor_gib"], s["compressor_gib"])
         self.peak["min_supply_gib"] = min(self.peak["min_supply_gib"], s["mem_supply_gib"])
+        if self._swap_used_start_gib is not None:
+            self.peak["max_swap_used_gib"] = max(self.peak["max_swap_used_gib"], s["swap_used_gib"])
+            self.peak["max_swap_growth_gib"] = max(
+                self.peak["max_swap_growth_gib"], s["swap_used_gib"] - self._swap_used_start_gib
+            )
 
     def _append_record(self, record):
         try:
@@ -728,6 +851,7 @@ class Sentinel:
                 s = snapshot()
                 self._update_peak(s)
                 self._append_record(s)
+                self._swap_window.append((time.monotonic() - self._monotonic_start, s["swap_used_gib"]))
 
                 # avail_gib is lagging and non-monotonic in GPU residency -- in
                 # run 20260825T145741Z-dance01 it read 8.45 at 23.17 GiB driver
@@ -740,7 +864,9 @@ class Sentinel:
                 # allocation growth that neither of the other two sees.
                 # Swap decision is factored into _swap_abort() so it is
                 # unit-testable offline (see tests/test_mps_guard_metric.py).
-                swap_should_abort, swap_reason = _swap_abort(s["swap_used_gib"], self._swap_used_start_gib)
+                swap_should_abort, swap_reason = _swap_abort(
+                    s["swap_used_gib"], self._swap_used_start_gib, tuple(self._swap_window)
+                )
                 if (
                     s["avail_gib"] < SENTINEL_ABORT_AVAIL_GIB
                     or s["disk_free_gib"] < SENTINEL_ABORT_DISK_GIB

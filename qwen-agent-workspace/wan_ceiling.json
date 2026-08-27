@@ -1,0 +1,32 @@
+{
+  "meta": {
+    "measured": false,
+    "provenance": "HAND-AUTHORED BOOTSTRAP plus two single-point real-run measurements (see measured_runs). Not a sweep -- replace with tests/measure_wan_ceiling.py --reduce output before raising any entry beyond what measured_runs supports.",
+    "model_id": "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers",
+    "fraction": 0.65,
+    "cap_gib": 24.34,
+    "host_total_gib": 48.0,
+    "diffusers_version": "0.40.0",
+    "token_law": "tokens = ((F-1)/4 + 1) * (H/32) * (W/32); this is ~2x LTX at identical geometry, so attention cost is ~4x. ltx_ceiling.json is NOT a valid prior for Wan.",
+    "measured_resolutions": ["256x256", "512x512"],
+    "measured_runs": {
+      "256x256x9": {
+        "date": "2026-08-26",
+        "mps_driver_gib_stage2": 18.75,
+        "note": "Pre-decode-split smoke test: stage 2 then included the fp32 decode, so 18.75 of the old 20.59 GiB cap is not comparable to post-split numbers."
+      },
+      "512x512x49": {
+        "date": "2026-08-27",
+        "mps_driver_gib_stage2": 17.02,
+        "mps_current_gib_stage2": 12.66,
+        "mps_driver_gib_stage3": 24.07,
+        "mps_current_gib_stage3": 3.46,
+        "note": "First successful 512x512x49 (run 20260827T035654Z-e1a58899), post decode-split, stage-3 decode at bf16 under torch.no_grad(). Stage-3 driver pool peaked 24.07 of the 24.34 cap -- only 1.1% margin -- while LIVE tensors were just 3.46 GiB: the MPS caching allocator retains freed per-frame decode buffers for the life of the process. FRACTION_STAGE3=0.65 is therefore genuinely required for 512px decode as implemented; do not trim it without re-measuring. Took FIVE failed decode attempts to get here; root cause of all of them was a missing torch.no_grad() around the direct vae.decode() call (linear ~3.7 GiB/2s autograd-graph growth that filled any cap), NOT fragmentation, dtype, tiling, or transformer residency -- see wan_video_skill.py stage-3 comments."
+      }
+    }
+  },
+  "ceiling": {
+    "256x256": 9,
+    "512x512": 49
+  }
+}

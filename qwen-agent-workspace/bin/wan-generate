@@ -1,0 +1,292 @@
+#!/bin/bash
+#
+# wan-generate -- wrapper that enforces the correct prep -> generate -> restore
+# order for a Wan-Video run.
+#
+# Why the trap exists: generation requires bin/ltx-host-prep BEFORE the run
+# (stops both vLLM servers, sets the watchdog stand-down file) and
+# bin/ltx-host-restore AFTER it. Running prep and restore back-to-back returns
+# the host to the blocking state, and forgetting restore silently leaves the
+# inference stack down. Installing the restore trap on EXIT/INT/TERM before
+# prep even runs guarantees restore happens even if prep itself fails or the
+# run is interrupted.
+#
+# Why prep's non-zero rc is tolerated but closed ports are verified instead:
+# bin/ltx-host-prep exits non-zero on its own memory-readiness check, which is
+# advisory (it's a warning, not a hard failure of the stop-the-servers step).
+# What actually matters for safety is that both vLLM ports are closed before
+# we proceed, so we poll for that directly instead of trusting prep's rc.
+#
+# bin/ltx-host-prep's own readiness check uses a stricter memory fraction
+# (0.82) than Wan needs (0.55), so prep printing "NOT READY" can be a false
+# alarm for a Wan run -- the authoritative gate is mps_guard.preflight inside
+# each Wan stage subprocess (in wan_video_skill.py), which is why this script
+# (like ltx-generate) treats prep's exit code as advisory and polls the actual
+# ports directly rather than trusting it.
+#
+# Why prep is run with `< /dev/null`: bin/ltx-host-prep runs `sudo purge`,
+# and without a closed stdin, sudo blocks waiting for a password that will
+# never arrive in this non-interactive context.
+#
+set -u
+
+WORKSPACE="/Users/reubenpatterson/qwen-agent-workspace"
+
+USAGE="Usage: wan-generate [--keep-down] [--no-prep] [--force] [--restore-only] [--resume PATH]
+       [--model NAME] [--width N] [--height N] [--num-frames N] [--steps N]
+       [--guidance F] [--fps N] [--seed N] [--allow-override] [--t2v]
+       <image_path> \"<prompt>\" [output_path]
+       wan-generate --restore-only
+
+Runs prep -> generate -> restore in the correct order. Restore is guaranteed
+by an EXIT trap, so an interrupted or failed run still brings the vLLM
+servers back up.
+
+When --t2v is used, the positional form becomes \"<prompt>\" [output_path]
+(with no image_path).
+
+Single run:
+  wan-generate z_image_test.png \"make it jump\" generated/wan_jump.mp4
+
+Resume a run whose stage 1 already succeeded (skips re-encoding):
+  wan-generate --resume generated/wan_runs/<RUN_ID> z_image_test.png \"make it jump\" out.mp4
+
+Batch (one prep for the whole batch, one restore at the end):
+  wan-generate --keep-down            a.png \"prompt one\"   out1.mp4
+  wan-generate --no-prep --keep-down  b.png \"prompt two\"   out2.mp4
+  wan-generate --no-prep              c.png \"prompt three\" out3.mp4
+
+Options:
+  --keep-down         leave the servers down on exit (for chaining)
+  --no-prep           skip prep; the host is already prepped
+  --force             overwrite output_path if it exists
+  --restore-only      just restore the host and exit
+  --resume PATH       resume an existing run dir (see wan_video_skill.py --resume)
+  --model NAME        model name to use
+  --width N           output width in pixels (must be a multiple of 32)
+  --height N          output height in pixels (must be a multiple of 32)
+  --num-frames N      number of frames (must satisfy (n-1) % 4 == 0)
+  --steps N           number of diffusion steps
+  --guidance F        guidance scale
+  --fps N             container playback rate
+  --seed N            random seed
+  --allow-override    bypass the measured ceiling pre-check (the watermark cap + sentinel still protect the host; an over-budget run fails cleanly)
+  --t2v               text-to-video mode: no conditioning image; positionals become \"<prompt>\" [output_path]
+  --help              display this help and exit"
+
+KEEP_DOWN=0
+NO_PREP=0
+FORCE=0
+RESTORE_ONLY=0
+RESUME=""
+MODEL=""
+WIDTH=""
+HEIGHT=""
+NUM_FRAMES=""
+STEPS=""
+GUIDANCE=""
+FPS=""
+SEED=""
+ALLOW_OVERRIDE=""
+T2V=""
+IMAGE=""
+PROMPT=""
+OUTPUT=""
+POSITIONALS=()
+POSITIONAL_COUNT=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep-down)
+            KEEP_DOWN=1
+            shift
+            ;;
+        --no-prep)
+            NO_PREP=1
+            shift
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --restore-only)
+            RESTORE_ONLY=1
+            shift
+            ;;
+        --resume)
+            RESUME="$2"
+            shift 2
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --width)
+            WIDTH="$2"
+            shift 2
+            ;;
+        --height)
+            HEIGHT="$2"
+            shift 2
+            ;;
+        --num-frames)
+            NUM_FRAMES="$2"
+            shift 2
+            ;;
+        --steps)
+            STEPS="$2"
+            shift 2
+            ;;
+        --guidance)
+            GUIDANCE="$2"
+            shift 2
+            ;;
+        --fps)
+            FPS="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
+            shift 2
+            ;;
+        --allow-override)
+            ALLOW_OVERRIDE="1"
+            shift
+            ;;
+        --t2v)
+            T2V="1"
+            shift
+            ;;
+        --help)
+            echo "$USAGE"
+            exit 0
+            ;;
+        --*)
+            echo "Unknown flag: $1" >&2
+            echo "$USAGE" >&2
+            exit 2
+            ;;
+        *)
+            POSITIONALS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Resolve positional arguments based on mode
+if [ -n "$T2V" ]; then
+    PROMPT="${POSITIONALS[0]:-}"
+    OUTPUT="${POSITIONALS[1]:-}"
+    IMAGE=""
+else
+    IMAGE="${POSITIONALS[0]:-}"
+    PROMPT="${POSITIONALS[1]:-}"
+    OUTPUT="${POSITIONALS[2]:-}"
+fi
+
+if [ "$RESTORE_ONLY" -eq 1 ]; then
+    # Restore is model-agnostic; we reuse the existing ltx-host-restore script.
+    bash "$WORKSPACE/bin/ltx-host-restore"
+    exit $?
+fi
+
+if [ -n "$T2V" ]; then
+    if [ -z "$PROMPT" ]; then
+        echo "$USAGE" >&2
+        exit 2
+    fi
+else
+    if [ -z "$IMAGE" ]; then
+        echo "$USAGE" >&2
+        exit 2
+    fi
+
+    if [ ! -f "$IMAGE" ]; then
+        echo "Error: image not found: $IMAGE" >&2
+        exit 2
+    fi
+fi
+
+if [ -z "$OUTPUT" ]; then
+    OUTPUT="wan_video_output.mp4"
+fi
+
+if [ -e "$OUTPUT" ] && [ "$FORCE" -ne 1 ]; then
+    echo "Error: output already exists: $OUTPUT (use --force to overwrite)" >&2
+    exit 2
+fi
+
+_RESTORED=0
+_restore() {
+    if [ "$_RESTORED" -eq 1 ]; then
+        return
+    fi
+    _RESTORED=1
+    echo "=== restoring host ==="
+    bash "$WORKSPACE/bin/ltx-host-restore"
+}
+
+if [ "$KEEP_DOWN" -eq 1 ]; then
+    echo "NOTE: host left prepped (servers down). Run: bin/wan-generate --restore-only"
+else
+    trap '_restore; exit 130' INT
+    trap '_restore; exit 143' TERM
+    trap _restore EXIT
+fi
+
+if [ "$NO_PREP" -eq 0 ]; then
+    echo "=== prep ==="
+    bash "$WORKSPACE/bin/ltx-host-prep" < /dev/null
+
+    i=0
+    while [ "$i" -lt 60 ]; do
+        if ! nc -z 127.0.0.1 8177 2>/dev/null && ! nc -z 127.0.0.1 8178 2>/dev/null; then
+            break
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+
+    if nc -z 127.0.0.1 8177 2>/dev/null || nc -z 127.0.0.1 8178 2>/dev/null; then
+        echo "Error: ports 8177/8178 still open after prep; refusing to generate." >&2
+        exit 1
+    fi
+fi
+
+EXTRA_ARGS=()
+[ -n "$MODEL" ] && EXTRA_ARGS+=(--model "$MODEL")
+[ -n "$WIDTH" ] && EXTRA_ARGS+=(--width "$WIDTH")
+[ -n "$HEIGHT" ] && EXTRA_ARGS+=(--height "$HEIGHT")
+[ -n "$NUM_FRAMES" ] && EXTRA_ARGS+=(--num-frames "$NUM_FRAMES")
+[ -n "$STEPS" ] && EXTRA_ARGS+=(--steps "$STEPS")
+[ -n "$GUIDANCE" ] && EXTRA_ARGS+=(--guidance "$GUIDANCE")
+[ -n "$FPS" ] && EXTRA_ARGS+=(--fps "$FPS")
+[ -n "$SEED" ] && EXTRA_ARGS+=(--seed "$SEED")
+[ -n "$ALLOW_OVERRIDE" ] && EXTRA_ARGS+=(--allow-override)
+[ -n "$T2V" ] && EXTRA_ARGS+=(--t2v)
+
+echo "=== generate ==="
+# Build positional argument array for the python call
+if [ -n "$T2V" ]; then
+    POSITIONAL_ARGS=("$PROMPT" "$OUTPUT")
+else
+    POSITIONAL_ARGS=("$IMAGE" "$PROMPT" "$OUTPUT")
+fi
+
+if [ -n "$RESUME" ]; then
+    python3 "$WORKSPACE/wan_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "${POSITIONAL_ARGS[@]}"
+else
+    python3 "$WORKSPACE/wan_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "${POSITIONAL_ARGS[@]}"
+fi
+GEN_RC=$?
+
+echo "=== result ==="
+if [ "$GEN_RC" -eq 0 ]; then
+    ls -lh "$OUTPUT"
+    ls -dt "$WORKSPACE/generated/wan_runs"/*/ 2>/dev/null | head -1
+else
+    echo "generation FAILED with exit code $GEN_RC"
+    echo "The run directory retains stage*.log, mem_stage*.jsonl and peaks_stage*.json for diagnosis."
+fi
+
+exit $GEN_RC

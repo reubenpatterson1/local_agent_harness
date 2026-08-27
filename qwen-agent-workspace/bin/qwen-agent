@@ -910,7 +910,7 @@ def exec_generate_image(args):
         return "ERROR: z_image_skill.py not found in the workspace at %s." % image_script
     out_dir = WORKSPACE / GENERATED_IMAGES_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower())[:40].strip("-") or "image"
+    slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower())[:60].strip("-") or "image"
     out_path = out_dir / ("%s-%s.png" % (slug, uuid.uuid4().hex[:8]))
     code = (
         "from z_image_skill import generate_image\n"
@@ -1890,28 +1890,86 @@ RESTART_COMMAND = """\
     --enable-auto-tool-choice \\
     --tool-call-parser qwen3_xml"""
 
+GUARD_PATH = os.path.expanduser("~/.local/bin/qwen-serve-guard")
+GUARD_HOST_PORT = ("127.0.0.1", 8177)  # qwen-serve-guard's fixed target; it cannot manage a remote server
+GUARD_STANDDOWN_FILE = os.path.expanduser("~/.qwen-serve-guard/stand-down")
+
+
+def _autostart_local_server(base_url):
+    """If base_url points at qwen-serve-guard's fixed target (127.0.0.1:8177) and
+    the guard script is present, run `qwen-serve-guard restart` to bring the local
+    vLLM server up and return whether it's worth retrying the reachability check.
+    Never touches a remote base_url -- qwen-serve-guard only knows how to manage
+    the local server. Respects the guard's own stand-down circuit breaker: that
+    marker means repeated auto-restarts already failed, and only a human overriding
+    on purpose (via `qwen-serve-guard restart` or `/stop` + manual restart) should
+    proceed past it.
+    """
+    try:
+        parts = urllib.parse.urlsplit(base_url)
+        host_port = (parts.hostname, parts.port)
+    except ValueError:
+        return False
+    if host_port != GUARD_HOST_PORT:
+        return False
+    if not os.path.exists(GUARD_PATH):
+        return False
+    if os.path.exists(GUARD_STANDDOWN_FILE):
+        sys.stderr.write(
+            "qwen-agent: qwen-serve-guard is standing down (%s exists) after "
+            "repeated restart failures -- not auto-starting. Remove that file once "
+            "you've fixed the underlying issue, or start the server yourself:\n%s\n"
+            % (GUARD_STANDDOWN_FILE, RESTART_COMMAND)
+        )
+        return False
+    sys.stderr.write(
+        "qwen-agent: vLLM server not reachable at %s -- starting it via "
+        "`qwen-serve-guard restart` (this can take a few minutes) ...\n" % base_url
+    )
+    try:
+        result = subprocess.run([GUARD_PATH, "restart"], timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write("qwen-agent: qwen-serve-guard restart failed to run: %s\n" % e)
+        return False
+    if result.returncode != 0:
+        sys.stderr.write(
+            "qwen-agent: qwen-serve-guard restart exited with status %d.\n"
+            % result.returncode
+        )
+        return False
+    sys.stderr.write(
+        "qwen-agent: qwen-serve-guard restart finished; re-checking %s ...\n" % base_url
+    )
+    return True
+
 
 def preflight(base_url, model, api_key, skip_tool_probe=False):
     auth_headers = {"Authorization": "Bearer %s" % api_key} if api_key else {}
 
     # Check A: server reachable and model present.
-    try:
-        req = urllib.request.Request(base_url + "/models", headers=auth_headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            status = resp.status if hasattr(resp, "status") else resp.getcode()
-            body = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        code = e.code
-        body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
-        sys.stderr.write("qwen-agent: %s/models returned HTTP %s.\n" % (base_url, code))
-        sys.exit(2)
-    except (urllib.error.URLError, OSError) as e:
-        sys.stderr.write(
-            "qwen-agent: cannot reach vLLM at %s (%s: %s).\n"
-            "Is the server running? See the restart command in\n%s\n"
-            % (base_url, type(e).__name__, e, TOOL_HARNESS_SPEC)
-        )
-        sys.exit(2)
+    auto_started = False
+    while True:
+        try:
+            req = urllib.request.Request(base_url + "/models", headers=auth_headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.status if hasattr(resp, "status") else resp.getcode()
+                body = resp.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as e:
+            code = e.code
+            body = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""
+            sys.stderr.write("qwen-agent: %s/models returned HTTP %s.\n" % (base_url, code))
+            sys.exit(2)
+        except (urllib.error.URLError, OSError) as e:
+            if not auto_started and _autostart_local_server(base_url):
+                auto_started = True
+                continue
+            sys.stderr.write(
+                "qwen-agent: cannot reach vLLM at %s (%s: %s).\n"
+                "Is the server running? See the restart command in\n%s\n"
+                % (base_url, type(e).__name__, e, TOOL_HARNESS_SPEC)
+            )
+            sys.exit(2)
 
     if status != 200:
         sys.stderr.write("qwen-agent: %s/models returned HTTP %s.\n" % (base_url, status))

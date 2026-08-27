@@ -508,31 +508,73 @@ def _stage2_denoise(run_dir):
         #except content_safety.ContentSafetyError:
         #    raise
 
-        result = pipeline(
-            conditions=[
-                LTXVideoCondition(
-                    image=load_image(c["image_path"]),
-                    frame_index=c["frame_index"],
-                    strength=c["strength"],
-                )
-                for c in _normalized_conditions(request)
-            ],
-            prompt=None,
-            negative_prompt=None,
-            prompt_embeds=prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            width=request["width"],
-            height=request["height"],
-            num_frames=request["num_frames"],
-            num_inference_steps=request["num_inference_steps"],
-            guidance_scale=request["guidance_scale"],
-            frame_rate=request["frame_rate"],
-            generator=torch.Generator("cpu").manual_seed(request["seed"]),
-            output_type="pil",
-            max_sequence_length=MAX_SEQUENCE_LENGTH,
-        )
+        mode = request.get("mode", "i2v")
+        if mode == "t2v":
+            # Pure text-to-video, same LTXConditionPipeline as the i2v branch
+            # below -- no separate pipeline class needed. Verified against
+            # the installed diffusers/pipelines/ltx/pipeline_ltx_condition.py
+            # (LTXConditionPipeline.__call__ and .check_inputs): passing
+            # conditions=None, image=None, video=None (all simply omitted
+            # here, their defaults) is a supported, native T2V path --
+            # check_inputs never requires any of the three, and __call__ sets
+            # is_conditioning_image_or_video = image is not None or video is
+            # not None = False, which skips every conditioning-shaped branch
+            # in the denoising loop.
+            #
+            # conditions=[] (an empty LIST, as opposed to leaving conditions
+            # at its None default) is NOT equivalent and must never be passed
+            # here: __call__ normalizes an empty `image`/`video` list to
+            # is_conditioning_image_or_video = True (an empty list is "not
+            # None"), while prepare_latents' own `len(conditions) > 0` check
+            # (on the already-empty conditioning_tensors list) still sets
+            # conditioning_mask = None. The denoising loop then evaluates
+            # `1 - conditioning_mask` with conditioning_mask=None, raising
+            # TypeError. So conditions=None (the parameter's own default) is
+            # the only correct way to invoke pure T2V.
+            result = pipeline(
+                conditions=None,
+                prompt=None,
+                negative_prompt=None,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                width=request["width"],
+                height=request["height"],
+                num_frames=request["num_frames"],
+                num_inference_steps=request["num_inference_steps"],
+                guidance_scale=request["guidance_scale"],
+                frame_rate=request["frame_rate"],
+                generator=torch.Generator("cpu").manual_seed(request["seed"]),
+                output_type="pil",
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+            )
+        else:
+            result = pipeline(
+                conditions=[
+                    LTXVideoCondition(
+                        image=load_image(c["image_path"]),
+                        frame_index=c["frame_index"],
+                        strength=c["strength"],
+                    )
+                    for c in _normalized_conditions(request)
+                ],
+                prompt=None,
+                negative_prompt=None,
+                prompt_embeds=prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                width=request["width"],
+                height=request["height"],
+                num_frames=request["num_frames"],
+                num_inference_steps=request["num_inference_steps"],
+                guidance_scale=request["guidance_scale"],
+                frame_rate=request["frame_rate"],
+                generator=torch.Generator("cpu").manual_seed(request["seed"]),
+                output_type="pil",
+                max_sequence_length=MAX_SEQUENCE_LENGTH,
+            )
         # The pipeline internally does latents = latents.to(prompt_embeds.dtype),
         # so the persisted bf16 dtype from stage1 governs the decode dtype.
         # This is load-bearing, not cosmetic.
@@ -580,8 +622,8 @@ def _stage3_screen_and_export(run_dir):
             )
         except content_safety.ContentSafetyError:
             # No flagged pixels persist -- honours the "saves nothing" contract.
-            shutil.rmtree(frames_dir)
-            raise
+                        shutil.rmtree(frames_dir)
+                        raise
 
         if request["output_path"] is not None:
             # imageio / imageio_ffmpeg are NOT installed (cv2 4.12.0 and av
@@ -657,11 +699,17 @@ def _release_page_cache(run_dir, image_path, prompt, output_path):
                 )
             )
         else:
-            resume_line = '  python3 ltx_video_skill.py --resume %s %s "%s"' % (
-                run_dir,
-                image_path,
-                prompt,
-            )
+            if image_path is None:
+                resume_line = '  python3 ltx_video_skill.py --t2v --resume %s "%s"' % (
+                    run_dir,
+                    prompt,
+                )
+            else:
+                resume_line = '  python3 ltx_video_skill.py --resume %s %s "%s"' % (
+                    run_dir,
+                    image_path,
+                    prompt,
+                )
             if output_path:
                 resume_line += " %s" % output_path
             sys.stderr.write(
@@ -684,8 +732,12 @@ def generate_video(image_path: str, prompt: str = "", output_path: str = None, *
     docstring for why.
 
     Args:
-        image_path: Path to the input image (local file path or URL).
+        image_path: Path to the input image (local file path or URL), or
+            None for text-to-video mode (no conditioning image at all --
+            requires a non-empty prompt, and is incompatible with
+            last_frame_path/keyframes).
         prompt: Optional text description guiding the motion/content.
+            Required (non-empty) when image_path is None.
         output_path: Optional file path to save the MP4. If given, the video
             is saved there.
         **kwargs: width, height, num_frames, num_inference_steps,
@@ -702,6 +754,16 @@ def generate_video(image_path: str, prompt: str = "", output_path: str = None, *
     Returns:
         list[PIL.Image.Image]: the generated video frames.
     """
+    if image_path is None:
+        # Text-to-video: no conditioning image at all. Checked here, before
+        # any run dir creation or torch/diffusers import, so an empty prompt
+        # fails fast and cheaply.
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                "prompt must be a non-empty string when image_path is None "
+                "(text-to-video mode)"
+            )
+
     width = kwargs.get("width", DEFAULT_WIDTH)
     height = kwargs.get("height", DEFAULT_HEIGHT)
     num_frames = kwargs.get("num_frames", DEFAULT_NUM_FRAMES)
@@ -719,39 +781,50 @@ def generate_video(image_path: str, prompt: str = "", output_path: str = None, *
 
     _validate_geometry(width, height, num_frames)
 
-    # Assemble the conditions list: primary (frame 0), then last-frame (if
-    # any), then keyframes in the order given. URL image paths must not be
-    # passed through os.path.abspath -- guard each abspath call so today's
-    # URL support for the primary image keeps working.
-    conditions = [
-        {
-            "image_path": image_path if "://" in image_path else os.path.abspath(image_path),
-            "frame_index": 0,
-            "strength": 1.0,
-        }
-    ]
-    if last_frame_path is not None:
-        conditions.append(
+    if image_path is None:
+        # Text-to-video: no conditioning image at all. last_frame_path and
+        # keyframes have no meaning without a primary image and are refused
+        # rather than silently accepted or silently dropped.
+        if last_frame_path is not None or keyframes:
+            raise ValueError(
+                "last_frame_path/keyframes are not supported when image_path is None "
+                "(text-to-video mode has no conditioning images at all)"
+            )
+        conditions = []
+    else:
+        # Assemble the conditions list: primary (frame 0), then last-frame (if
+        # any), then keyframes in the order given. URL image paths must not be
+        # passed through os.path.abspath -- guard each abspath call so today's
+        # URL support for the primary image keeps working.
+        conditions = [
             {
-                "image_path": last_frame_path
-                if "://" in last_frame_path
-                else os.path.abspath(last_frame_path),
-                "frame_index": num_frames - 1,
+                "image_path": image_path if "://" in image_path else os.path.abspath(image_path),
+                "frame_index": 0,
                 "strength": 1.0,
             }
-        )
-    for kf in (keyframes or []):
-        kf_image_path = kf["image_path"]
-        conditions.append(
-            {
-                "image_path": kf_image_path
-                if "://" in kf_image_path
-                else os.path.abspath(kf_image_path),
-                "frame_index": int(kf["frame_index"]),
-                "strength": float(kf.get("strength", 1.0)),
-            }
-        )
-    _validate_conditions(conditions, num_frames)
+        ]
+        if last_frame_path is not None:
+            conditions.append(
+                {
+                    "image_path": last_frame_path
+                    if "://" in last_frame_path
+                    else os.path.abspath(last_frame_path),
+                    "frame_index": num_frames - 1,
+                    "strength": 1.0,
+                }
+            )
+        for kf in (keyframes or []):
+            kf_image_path = kf["image_path"]
+            conditions.append(
+                {
+                    "image_path": kf_image_path
+                    if "://" in kf_image_path
+                    else os.path.abspath(kf_image_path),
+                    "frame_index": int(kf["frame_index"]),
+                    "strength": float(kf.get("strength", 1.0)),
+                }
+            )
+        _validate_conditions(conditions, num_frames)
     # --allow-override bypasses ONLY this advisory ceiling-table pre-check.
     # It does not touch mps_guard.preflight (G0/G0b/G1a/G1b/G2), the MPS
     # watermark cap (set_per_process_memory_fraction), or the stage-2
@@ -796,14 +869,24 @@ def generate_video(image_path: str, prompt: str = "", output_path: str = None, *
                 "the given prompt=%r -- refusing rather than silently generating from "
                 "stale embeds" % (run_dir, request["prompt"], prompt)
             )
-        abs_request_image_path = os.path.abspath(request["image_path"])
-        abs_image_path = os.path.abspath(image_path)
-        if abs_request_image_path != abs_image_path:
-            raise ValueError(
-                "resume_run_dir=%r request.json has image_path=%r, which does not match "
-                "the given image_path=%r -- refusing rather than silently generating from "
-                "stale embeds" % (run_dir, abs_request_image_path, abs_image_path)
-            )
+        if request["image_path"] is None or image_path is None:
+            # t2v run (image_path is None on one or both sides): os.path.abspath
+            # would crash on None, so compare the raw values directly instead.
+            if request["image_path"] != image_path:
+                raise ValueError(
+                    "resume_run_dir=%r request.json has image_path=%r, which does not match "
+                    "the given image_path=%r -- refusing rather than silently generating from "
+                    "stale embeds" % (run_dir, request["image_path"], image_path)
+                )
+        else:
+            abs_request_image_path = os.path.abspath(request["image_path"])
+            abs_image_path = os.path.abspath(image_path)
+            if abs_request_image_path != abs_image_path:
+                raise ValueError(
+                    "resume_run_dir=%r request.json has image_path=%r, which does not match "
+                    "the given image_path=%r -- refusing rather than silently generating from "
+                    "stale embeds" % (run_dir, abs_request_image_path, abs_image_path)
+                )
 
         embeds_path = os.path.join(run_dir, "embeds.pt")
         if os.path.exists(embeds_path):
@@ -831,7 +914,8 @@ def generate_video(image_path: str, prompt: str = "", output_path: str = None, *
         os.makedirs(run_dir)
 
         request = {
-            "image_path": conditions[0]["image_path"],
+            "image_path": None if image_path is None else conditions[0]["image_path"],
+            "mode": "t2v" if image_path is None else "i2v",
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "output_path": output_path,
@@ -935,8 +1019,17 @@ if __name__ == "__main__":
         'Usage: python3 ltx_video_skill.py [--resume RUN_DIR] [--last-frame PATH]\n'
         '       [--keyframe PATH:INDEX[:STRENGTH]]... [--width N] [--height N]\n'
         '       [--num-frames N] [--fps N] [--frame-rate N] [--wide] [--allow-override]\n'
-        '       <image_path> ["<prompt>"] [output_path]'
+        '       [--t2v]\n'
+        '       <image_path> ["<prompt>"] [output_path]\n'
+        '       (with --t2v: "<prompt>" [output_path] -- no image_path)'
     )
+
+    # --t2v is scanned and stripped BEFORE the positional handling below, in
+    # the same style as --wide/--allow-override.
+    t2v_arg = False
+    if "--t2v" in sys.argv:
+        t2v_arg = True
+        sys.argv.remove("--t2v")
 
     # --resume is only valid in this positional form (never with --stage,
     # handled above). Scanned and stripped BEFORE the positional handling
@@ -1056,9 +1149,14 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(USAGE)
         sys.exit(1)
-    image_path = sys.argv[1]
-    prompt = sys.argv[2] if len(sys.argv) > 2 else ""
-    out = sys.argv[3] if len(sys.argv) > 3 else "ltx_video_output.mp4"
+    if t2v_arg:
+        image_path = None
+        prompt = sys.argv[1]
+        out = sys.argv[2] if len(sys.argv) > 2 else "ltx_video_output.mp4"
+    else:
+        image_path = sys.argv[1]
+        prompt = sys.argv[2] if len(sys.argv) > 2 else ""
+        out = sys.argv[3] if len(sys.argv) > 3 else "ltx_video_output.mp4"
     extra = {
         "resume_run_dir": resume_run_dir,
         "last_frame_path": last_frame_path,

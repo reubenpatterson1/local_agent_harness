@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""ltx-story-images -- generate one Z-Image-Turbo panel image per prompts.md
+`Image:` field, for a story.md destined for bin/ltx-story-manifest.
+
+This tool never invents creative content -- it renders exactly the Image:
+prompt text already written in the story.md. It reuses
+bin/ltx-story-manifest's own prompts.md parser (see the load-bearing
+comment in main(), below) so a manifest built from the same story.md never
+drifts out of sync with the images rendered here.
+
+Usage:
+    ltx-story-images --story-md path/to/story.md --out-dir path/to/panels
+        [--width 1024] [--height 1024] [--seed 0] [--force] [--dry-run]
+        [--only 3,7]
+
+Content safety: z_image_skill.generate_image screens every generated image
+*before* it is ever saved -- nothing unsafe ever hits disk. A blocked panel
+is recorded (status "blocked") and generation continues; one blocked panel
+out of a 15-image batch must not lose the other 14.
+
+images.json schema (schema_version 1):
+{
+  "schema_version": 1,
+  "story_md": "/absolute/path/to/story.md",
+  "width": 1024,
+  "height": 1024,
+  "seed": 0,
+  "panels": [
+    {"index": 1, "path": "/abs/panel_01.png", "prompt": "...",
+     "status": "ok" | "blocked" | "error", "seconds": 4.2}
+  ]
+}
+
+Dependencies: stdlib only at import time. torch/z_image_skill/content_safety
+are imported inside main(), after arg parsing and the --dry-run exit, so a
+--dry-run invocation never touches the GPU/model stack.
+"""
+
+import argparse
+import importlib.machinery
+import json
+import os
+import sys
+import time
+
+WS = "/Users/reubenpatterson/qwen-agent-workspace"
+sys.path.insert(0, WS)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-story-images",
+        description="Generate one Z-Image-Turbo panel image per prompts.md Image: field.",
+    )
+    parser.add_argument("--story-md", dest="story_md", required=True)
+    parser.add_argument("--out-dir", dest="out_dir", required=True)
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--only", dest="only", default=None,
+                         help="comma-separated 1-based panel indices, e.g. 3,7 "
+                              "(default: every panel)")
+    return parser
+
+
+def _parse_only(only, n_panels):
+    """Return the list of 1-based panel indices to process. Raises
+    ValueError on a malformed --only value."""
+    if only is None:
+        return list(range(1, n_panels + 1))
+    return [int(x) for x in only.split(",") if x.strip()]
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # LOAD-BEARING: exactly one story.md parser exists in this workspace
+    # (bin/ltx-story-manifest's _parse_prompts_md). Duplicating it here
+    # would let the two tools' parsing rules drift apart over time, so a
+    # manifest built from a story.md would no longer match the images
+    # rendered from that same story.md. Always reuse it, never reimplement.
+    story_manifest = importlib.machinery.SourceFileLoader(
+        "ltx_story_manifest", os.path.join(WS, "bin", "ltx-story-manifest")
+    ).load_module()
+
+    try:
+        _narrative, panels = story_manifest._parse_prompts_md(args.story_md)
+    except OSError as e:
+        print("Error: cannot read --story-md file: %s" % e, file=sys.stderr)
+        return 2
+
+    if not panels:
+        print("Error: --story-md has no panels", file=sys.stderr)
+        return 2
+
+    try:
+        selected_indices = _parse_only(args.only, len(panels))
+    except ValueError:
+        print("Error: --only must be a comma-separated list of ints, got %r" % args.only,
+              file=sys.stderr)
+        return 2
+
+    for i in selected_indices:
+        if i < 1 or i > len(panels):
+            print("Error: --only index %d out of range (1..%d)" % (i, len(panels)), file=sys.stderr)
+            return 2
+
+    for i in selected_indices:
+        if not panels[i - 1]["image"].strip():
+            print("Error: panel %d has no Image: field" % i, file=sys.stderr)
+            return 2
+
+    # panel_%02d.png matches bin/ltx-story-manifest's own _PANEL_NUM_RE, so
+    # a later `--glob 'panel_*.png'` sorts numerically and never falls back
+    # to the (order-fragile) mtime heuristic.
+    out_paths = {i: os.path.join(args.out_dir, "panel_%02d.png" % i) for i in selected_indices}
+
+    if args.dry_run:
+        for i in selected_indices:
+            print("%d | %s | %r" % (i, out_paths[i], panels[i - 1]["image"][:100]))
+        return 0
+
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # Heavy imports deferred until after all arg/parse validation and the
+    # --dry-run exit above, so a --dry-run invocation never touches torch.
+    import torch
+    import z_image_skill
+    from content_safety import ContentSafetyError
+
+    results = []
+    any_bad = False
+    for i in selected_indices:
+        prompt = panels[i - 1]["image"]
+        path = out_paths[i]
+
+        if os.path.exists(path) and not args.force:
+            print("panel %d -> %s (skipped, exists)" % (i, path))
+            results.append({"index": i, "path": path, "prompt": prompt, "status": "ok", "seconds": 0.0})
+            continue
+
+        start = time.monotonic()
+        try:
+            z_image_skill.generate_image(
+                prompt,
+                output_path=path,
+                width=args.width,
+                height=args.height,
+                generator=torch.Generator("cpu").manual_seed(args.seed + i),
+            )
+            elapsed = time.monotonic() - start
+            print("panel %d -> %s (%.1fs)" % (i, path, elapsed))
+            results.append({"index": i, "path": path, "prompt": prompt,
+                             "status": "ok", "seconds": round(elapsed, 1)})
+        except ContentSafetyError as e:
+            # A block on one panel must not lose the rest of a 15-image
+            # batch -- record and continue. z_image_skill screens before
+            # save, so nothing unsafe is ever written to disk.
+            elapsed = time.monotonic() - start
+            print("panel %d BLOCKED: %s" % (i, e))
+            results.append({"index": i, "path": path, "prompt": prompt,
+                             "status": "blocked", "seconds": round(elapsed, 1)})
+            any_bad = True
+        except Exception as e:
+            elapsed = time.monotonic() - start
+            print("panel %d ERROR: %s" % (i, e), file=sys.stderr)
+            results.append({"index": i, "path": path, "prompt": prompt,
+                             "status": "error", "seconds": round(elapsed, 1)})
+            any_bad = True
+
+    with open(os.path.join(args.out_dir, "images.json"), "w") as f:
+        json.dump({
+            "schema_version": 1,
+            "story_md": os.path.abspath(args.story_md),
+            "width": args.width,
+            "height": args.height,
+            "seed": args.seed,
+            "panels": results,
+        }, f, indent=2)
+
+    if any_bad:
+        bad = [r["index"] for r in results if r["status"] != "ok"]
+        print("FAILED/BLOCKED panels: %r" % bad, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

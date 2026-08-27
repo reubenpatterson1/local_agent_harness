@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""ltx-story-video -- turn a generated/stories/<story_id>/manifest.json into
+one longer clip, in one of two modes:
+
+  --mode per-panel: one LTX-Video unit per manifest panel, each seeded from
+  that panel's own image at frame 0 (motion_prompt, or panel_text if
+  motion_prompt is null). N panels -> N units, concatenated in order.
+
+  --mode transitions: one LTX-Video unit per adjacent panel PAIR, using TWO
+  conditions -- the earlier panel's image at frame 0 and the later panel's
+  image at frame (num_frames - 1) -- so the unit visually bridges from one
+  panel to the next (transition_to_next, or a deterministic template if
+  null). N panels -> N-1 units. If --hold-frames is non-zero, each panel's
+  own image is repeated as a still "hold" before/between/after the
+  transition units in the final concat.
+
+Unlike bin/ltx-chain (which only ever seeds segment 1 from an externally
+given image -- every later segment conditions on the PREVIOUS segment's own
+last generated frame), every unit here is seeded from panel images given
+directly by the manifest, so a later unit can always be re-anchored on a
+new externally supplied image.
+
+This script does its own prep -> generate -> restore, with restore
+guaranteed via a try/finally (runs on success, on exception, on SIGINT, and
+on SIGTERM via an installed signal handler that converts SIGTERM into a
+normal SystemExit), matching bin/ltx-chain's contract. Unlike ltx-chain,
+that trap and the host teardown are only installed/invoked AFTER manifest
+validation, geometry/ceiling checks, unit derivation, and the input-image
+content screen all pass -- so a bad manifest or a bad input image never
+touches the running servers.
+
+Content safety: this script screens every INPUT image referenced by the
+manifest (via a throwaway subprocess calling content_safety.assert_image_safe)
+before ltx-host-prep ever runs. Separately, and unchanged from
+ltx_video_skill's own pipeline, stage 3 screens each unit's *generated*
+frames; a detected block there is always a terminal failure for the whole
+run, regardless of --on-unit-failure.
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+
+import psutil
+
+WS = "/Users/reubenpatterson/qwen-agent-workspace"
+sys.path.insert(0, WS)
+
+import ltx_video_skill as L  # noqa: E402
+import mps_guard  # noqa: E402
+
+MAX_TOTAL_FRAMES = 2000
+MAX_PROMPT_WORDS = 150
+
+EPILOG = """\
+Run detached (this teardown kills the vLLM server on 8177 that qwen-agent needs):
+  cd /Users/reubenpatterson/qwen-agent-workspace && \\
+  nohup python3 bin/ltx-story-video generated/stories/<story_id>/manifest.json \\
+      generated/stories/<story_id>/story_per_panel.mp4 --mode per-panel \\
+      > generated/stories/<story_id>/per_panel.log 2>&1 & disown
+Run `sudo -v` first so stage 1's page-cache purge can run non-interactively.
+"""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-story-video",
+        description=(
+            "Generate one longer clip from a story manifest, either one unit "
+            "per panel (--mode per-panel) or one unit per adjacent panel pair "
+            "(--mode transitions). Does its own prep/restore and screens both "
+            "input images (up front) and generated frames (stage 3)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=EPILOG,
+    )
+    parser.add_argument("manifest_path", metavar="MANIFEST")
+    parser.add_argument("output_path", metavar="OUTPUT_MP4")
+    parser.add_argument("--mode", choices=["per-panel", "transitions"], required=True)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--num-frames", type=int, default=49)
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--frame-rate", type=int, default=24)
+    parser.add_argument("--seed", type=int, default=0,
+                         help="base seed; unit i uses seed S+i (default 0)")
+    parser.add_argument("--negative-prompt", default=L.DEFAULT_NEGATIVE_PROMPT)
+    parser.add_argument("--hold-frames", type=int, default=30,
+                         help="transitions mode only; 0 disables (default 30)")
+    parser.add_argument("--settle", type=float, default=6,
+                         help="settle pause in seconds between stage1 and stage2 (default 6)")
+    parser.add_argument("--on-unit-failure", choices=["skip", "stop"], default="stop")
+    parser.add_argument("--wide", action="store_true",
+                         help="use the wider stage-2 budget for every unit")
+    parser.add_argument("--allow-override", action="store_true",
+                         help="skip the ceiling pre-check")
+    parser.add_argument("--relax-supply", action="store_true",
+                         help="sets LTX_SWEEP_RELAX_SUPPLY=1 in the stage-2 child env only")
+    parser.add_argument("--no-prep", action="store_true",
+                         help="assume the host is already prepped; skip bin/ltx-host-prep")
+    parser.add_argument("--keep-down", action="store_true",
+                         help="do not restore servers on exit")
+    parser.add_argument("--force", action="store_true",
+                         help="overwrite OUTPUT_MP4 if it exists")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="resolve and print the full plan; touches nothing else")
+    parser.add_argument("--skip-input-screen", action="store_true",
+                         help="skip the up-front content screen of manifest input images")
+    parser.add_argument("--max-consecutive-failures", dest="max_consecutive_failures",
+                         type=int, default=3,
+                         help="only meaningful with --on-unit-failure skip; 0 disables "
+                              "(default 3)")
+    parser.add_argument("--retry-failed", dest="retry_failed", type=int, choices=[0, 1], default=0,
+                         help="after the main loop, retry failed units once (default 0)")
+    parser.add_argument("--retry-idle", dest="retry_idle", type=float, default=120,
+                         help="seconds to idle before the retry pass, to let swap reclaim "
+                              "(default 120; unproven benefit -- see --unit-pause)")
+    parser.add_argument("--unit-pause", dest="unit_pause", type=float, default=0,
+                         help="seconds to idle between units, to let swap reclaim (default 0; "
+                              "benefit is UNPROVEN -- the only supporting datum is a 6.6->3.3 "
+                              "GiB reclaim observed over hours of idle, while in-stage traces "
+                              "show swap receding ~2 GiB within 15s on its own)")
+    return parser
+
+
+def load_manifest(path):
+    """Load and schema-validate a manifest.json. Raises ValueError naming
+    the exact violation on any schema problem. schema_version 1 manifests
+    (no per-panel num_frames) are still accepted unchanged; schema_version
+    2+ manifests additionally require a valid per-panel num_frames."""
+    with open(path) as f:
+        data = json.load(f)
+
+    panels = data.get("panels") or []
+    if not panels:
+        raise ValueError("manifest has no panels")
+
+    schema_version = data.get("schema_version", 1)
+
+    expected_index = 1
+    for panel in panels:
+        index = panel.get("index")
+        if index != expected_index:
+            raise ValueError(
+                "panels must be indexed contiguously from 1 with no gaps; "
+                "expected index %d, got %r" % (expected_index, index)
+            )
+        expected_index += 1
+
+        image_path = panel.get("image_path")
+        if not image_path or not os.path.isfile(image_path) or not os.access(image_path, os.R_OK):
+            raise ValueError(
+                "panel %d: image_path does not exist or is not readable: %r"
+                % (index, image_path)
+            )
+
+        panel_text = panel.get("panel_text")
+        if not isinstance(panel_text, str) or not panel_text.strip():
+            raise ValueError("panel %d: panel_text is required and must be a non-empty string" % index)
+
+        if schema_version >= 2:
+            num_frames = panel.get("num_frames")
+            if not isinstance(num_frames, int) or isinstance(num_frames, bool) or num_frames <= 0:
+                raise ValueError(
+                    "panel %d: num_frames is required and must be a positive int "
+                    "(schema_version >= 2)" % index
+                )
+            if (num_frames - 1) % 8 != 0:
+                raise ValueError(
+                    "panel %d: num_frames=%d must satisfy (num_frames - 1) %% 8 == 0"
+                    % (index, num_frames)
+                )
+
+    return data
+
+
+def _resolve_motion_prompt(panel):
+    return panel.get("motion_prompt") or panel["panel_text"]
+
+
+def _resolve_transition_prompt(panel, next_panel):
+    transition = panel.get("transition_to_next")
+    if transition:
+        return transition
+    return "%s The scene transitions smoothly into: %s" % (panel["panel_text"], next_panel["panel_text"])
+
+
+def build_units(panels, mode, num_frames, seed):
+    """Return the ordered list of unit dicts for `mode`.
+
+    `num_frames` is the fallback default used when a panel carries no
+    per-panel num_frames of its own (schema_version 1 manifests).
+
+    Each unit: {"index": int, "label": str, "seed": int, "prompt": str,
+    "num_frames": int, "conditions": [{"image_path", "frame_index",
+    "strength"}, ...]}.
+
+    Raises ValueError if mode == "transitions" and len(panels) < 2.
+    """
+    if mode == "transitions" and len(panels) < 2:
+        raise ValueError("transitions mode requires at least 2 panels, got %d" % len(panels))
+
+    units = []
+    if mode == "per-panel":
+        for i, panel in enumerate(panels, start=1):
+            unit_num_frames = panel.get("num_frames") or num_frames
+            units.append({
+                "index": i,
+                "label": "panel-%d" % i,
+                "seed": seed + i,
+                "prompt": _resolve_motion_prompt(panel),
+                "num_frames": unit_num_frames,
+                "conditions": [
+                    {"image_path": panel["image_path"], "frame_index": 0, "strength": 1.0},
+                ],
+            })
+    else:
+        for i in range(1, len(panels)):
+            panel = panels[i - 1]
+            next_panel = panels[i]
+            # The unit's frame count is taken from the EARLIER panel of
+            # the pair (the one the unit's own image-at-frame-0 comes
+            # from); the second condition's frame_index is therefore this
+            # unit's own num_frames - 1, not the global fallback.
+            unit_num_frames = panel.get("num_frames") or num_frames
+            units.append({
+                "index": i,
+                "label": "trans-%d-%d" % (i, i + 1),
+                "seed": seed + i,
+                "prompt": _resolve_transition_prompt(panel, next_panel),
+                "num_frames": unit_num_frames,
+                "conditions": [
+                    {"image_path": panel["image_path"], "frame_index": 0, "strength": 1.0},
+                    {"image_path": next_panel["image_path"], "frame_index": unit_num_frames - 1, "strength": 1.0},
+                ],
+            })
+    return units
+
+
+def build_frame_sequence(units_frames, mode, hold_frames, holds=None):
+    """Return the flat, ordered list of frame sources for the final concat.
+
+    units_frames: list of per-unit frame lists, in unit order.
+    holds: for transitions mode with hold_frames > 0, a list of one
+    hold-frame object per PANEL (len(panels) == len(units_frames) + 1),
+    each repeated `hold_frames` times and built once (never re-opened).
+
+    per-panel mode: unit_1.frames + ... + unit_N.frames (holds are always
+    ignored in this mode, with a printed note if hold_frames is non-zero).
+
+    transitions mode: [hold_1]*H + unit_1.frames + [hold_2]*H +
+    unit_2.frames + ... + unit_{N-1}.frames + [hold_N]*H.
+    """
+    if mode == "per-panel":
+        if hold_frames:
+            print("note: --hold-frames is ignored in per-panel mode")
+        sequence = []
+        for frames in units_frames:
+            sequence.extend(frames)
+        return sequence
+
+    sequence = []
+    n_units = len(units_frames)
+    for i, frames in enumerate(units_frames):
+        if hold_frames:
+            sequence.extend([holds[i]] * hold_frames)
+        sequence.extend(frames)
+    if hold_frames:
+        sequence.extend([holds[n_units]] * hold_frames)
+    return sequence
+
+
+def _build_request(prompt, negative_prompt, width, height, num_frames, fps, frame_rate,
+                    wide, allow_override, seed, conditions):
+    """Build a request.json-shaped dict for one unit's stage1/stage2/stage3 cell."""
+    return {
+        "image_path": conditions[0]["image_path"],
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "output_path": None,
+        "width": width,
+        "height": height,
+        "num_frames": num_frames,
+        "num_inference_steps": L.DEFAULT_STEPS,
+        "guidance_scale": L.DEFAULT_GUIDANCE,
+        "fps": fps,
+        "frame_rate": frame_rate,
+        "seed": seed,
+        "wide": wide,
+        "allow_override": allow_override,
+        "conditions": conditions,
+    }
+
+
+def _port_open(port, host="127.0.0.1", timeout=1.0):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _await_gpu_reclaim(timeout=40, poll=2):
+    """Poll mps_guard._mem_census()['gpu_other_gib'] until it drops back
+    under the preflight threshold (a prior stage's process has fully
+    exited and its GPU memory has been reclaimed), or timeout elapses."""
+    start = time.monotonic()
+    while True:
+        gpu_other = mps_guard._mem_census()["gpu_other_gib"]
+        if gpu_other <= mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB or time.monotonic() - start > timeout:
+            return gpu_other
+        time.sleep(poll)
+
+
+def _log_swap_used():
+    """Print and return the current swap used, in GiB. Never imports/calls
+    mps_guard.snapshot() (that imports torch; this process must stay
+    torch-free -- see the module docstring and T18)."""
+    used = psutil.swap_memory().used / (1024 ** 3)
+    print("unit-boundary swap_used=%.2f GiB" % used)
+    return used
+
+
+def _unit_boundary_pause(unit_pause_seconds):
+    """Always logs swap-used at the unit boundary. When unit_pause_seconds
+    > 0, additionally sleeps that long and logs+prints the delta.
+
+    --unit-pause's benefit is UNPROVEN: the only supporting datum is a
+    6.6->3.3 GiB swap reclaim observed over HOURS of host idle, whereas
+    in-stage traces show swap receding ~2 GiB within 15s on its own with
+    no pause at all.
+    """
+    before = _log_swap_used()
+    if unit_pause_seconds > 0:
+        time.sleep(unit_pause_seconds)
+        after = _log_swap_used()
+        print("unit-pause delta: %.2f -> %.2f GiB (%+.2f)" % (before, after, after - before))
+
+
+def _spawn_stage(stage_num, run_dir, env_overrides=None):
+    env = os.environ.copy()
+    if env_overrides:
+        env.update(env_overrides)
+    proc = subprocess.run(
+        [sys.executable, L.__file__, "--stage", str(stage_num), "--run-dir", run_dir],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    return proc.returncode, proc.stdout or ""
+
+
+def _run_input_content_screen(image_paths):
+    """Screen every input image in one throwaway subprocess (never imports
+    content_safety, or torch by extension, into this process). Prints
+    SCREEN_OK <path> per pass; exits 3 from the child on the first
+    ContentSafetyError. Returns the child's exit code."""
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import content_safety\n"
+        "from PIL import Image\n"
+        "for p in sys.argv[1:]:\n"
+        "    img = Image.open(p).convert('RGB')\n"
+        "    try:\n"
+        "        content_safety.assert_image_safe(img, skill='ltx-story-video', prompt=p)\n"
+        "    except content_safety.ContentSafetyError as e:\n"
+        "        print('SCREEN_BLOCKED %%s: %%s' %% (p, e))\n"
+        "        sys.exit(3)\n"
+        "    print('SCREEN_OK %%s' %% p)\n"
+    ) % WS
+    proc = subprocess.run(
+        [sys.executable, "-c", script] + image_paths,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    print(proc.stdout)
+    return proc.returncode
+
+
+def _concat_and_export(frame_sequence, output_path, fps):
+    """frame_sequence: list whose items are either a str frame-PNG path
+    (opened here) or an already-loaded PIL.Image (a pre-built hold frame).
+    diffusers.utils is imported locally so this process never imports it
+    (or torch) unless/until this function actually runs."""
+    from diffusers.utils import export_to_video
+    from PIL import Image
+
+    images = []
+    for item in frame_sequence:
+        if isinstance(item, str):
+            images.append(Image.open(item).convert("RGB"))
+        else:
+            images.append(item)
+    export_to_video(images, output_path, fps=fps)
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # --- step 1: load + schema-validate the manifest ---
+    try:
+        manifest = load_manifest(args.manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    panels = manifest["panels"]
+
+    # --- step 2: output path checks ---
+    out_dir = os.path.dirname(os.path.abspath(args.output_path)) or "."
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        print("Error: output directory not writable: %s" % out_dir, file=sys.stderr)
+        return 2
+    if os.path.exists(args.output_path) and not args.force:
+        print("Error: output already exists: %s (use --force to overwrite)" % args.output_path,
+              file=sys.stderr)
+        return 2
+
+    # --- step 3: build the unit list. Reordered ahead of the geometry/
+    # ceiling pre-check (moved to step 4, below) so that check can run
+    # per-unit -- schema_version 2 manifests give each unit its own
+    # num_frames, so a single global pre-check is no longer sufficient. ---
+    try:
+        units = build_units(panels, args.mode, args.num_frames, args.seed)
+    except ValueError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+
+    # --- step 4: per-unit geometry + ceiling pre-check. Servers are still
+    # untouched at this point -- this ordering property (bad geometry never
+    # touches the running servers) is preserved from before the reorder. ---
+    for unit in units:
+        try:
+            L._validate_geometry(args.width, args.height, unit["num_frames"])
+        except ValueError as e:
+            print("unit %s: %s" % (unit["label"], e), file=sys.stderr)
+            return 2
+
+        if not args.wide and not args.allow_override:
+            try:
+                L._check_ceiling(args.width, args.height, unit["num_frames"], unit["conditions"], False)
+            except mps_guard.HostSafetyError as e:
+                print("unit %s: %s" % (unit["label"], e), file=sys.stderr)
+                return 2
+
+    # --- step 5: total assembled frame count ---
+    if args.mode == "per-panel":
+        if args.hold_frames:
+            print("note: --hold-frames is ignored in per-panel mode")
+        total_holds = 0
+    else:
+        total_holds = args.hold_frames * len(panels)
+    total_frames = sum(u["num_frames"] for u in units) + total_holds
+    if total_frames > MAX_TOTAL_FRAMES:
+        breakdown = ", ".join("%s=%d" % (u["label"], u["num_frames"]) for u in units)
+        print(
+            "Error: %d total frames would be held in memory at concat time (limit %d). "
+            "Reduce panel frame counts or the panel count. Per-unit: %s"
+            % (total_frames, MAX_TOTAL_FRAMES, breakdown),
+            file=sys.stderr,
+        )
+        return 2
+
+    # --- step 6: prompt-length warnings ---
+    for unit in units:
+        words = len(unit["prompt"].split())
+        if words > MAX_PROMPT_WORDS:
+            print("WARNING: unit %d prompt is %d words (>150); T5 may truncate at 256 tokens"
+                  % (unit["index"], words))
+
+    # --- step 7: --dry-run exits here, before any prep/screen/GPU code ---
+    if args.dry_run:
+        print("=== dry run: %d unit(s), mode=%s ===" % (len(units), args.mode))
+        for unit in units:
+            conds = ", ".join(
+                "(%s, frame_index=%d)" % (c["image_path"], c["frame_index"])
+                for c in unit["conditions"]
+            )
+            print("%d | %s | seed=%d | frames=%d (%.2fs) | conditions=[%s] | prompt=%r"
+                  % (unit["index"], unit["label"], unit["seed"], unit["num_frames"],
+                     unit["num_frames"] / args.fps, conds, unit["prompt"][:120]))
+        print("TOTAL %d frames, %.2fs" % (total_frames, total_frames / args.fps))
+        return 0
+
+    # --- step 8: up-front input-image content screen ---
+    unique_images = []
+    seen = set()
+    for unit in units:
+        for c in unit["conditions"]:
+            p = c["image_path"]
+            if p not in seen:
+                seen.add(p)
+                unique_images.append(p)
+
+    if not args.skip_input_screen:
+        rc = _run_input_content_screen(unique_images)
+        if rc != 0:
+            print("Error: input image content screen failed; refusing to run (servers untouched)",
+                  file=sys.stderr)
+            return 2
+
+    # --- step 9: only now install the SIGTERM trap and (maybe) prep ---
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+    restored = [False]
+
+    def _restore():
+        if restored[0]:
+            return
+        restored[0] = True
+        if args.keep_down:
+            print("servers left down; run: bash bin/ltx-host-restore")
+            return
+        print("=== restoring host ===")
+        try:
+            rc = subprocess.run(["bash", os.path.join(WS, "bin", "ltx-host-restore")]).returncode
+            if rc != 0:
+                print("WARNING: ltx-host-restore exited %d; the host may still be DOWN. "
+                      "Run: bash %s/bin/ltx-host-restore" % (rc, WS), file=sys.stderr)
+        except Exception as e:
+            print("WARNING: ltx-host-restore failed to run (%s); the host may still be DOWN. "
+                  "Run: bash %s/bin/ltx-host-restore" % (e, WS), file=sys.stderr)
+
+    try:
+        if not args.no_prep:
+            print("=== prep ===")
+            # stdin=DEVNULL: prep may run interactively from a terminal, but
+            # spawned from here there is no terminal to read from -- without
+            # this, a stray read (e.g. a stalled `sudo purge` prompt) would
+            # block forever instead of failing fast.
+            subprocess.run(
+                ["bash", os.path.join(WS, "bin", "ltx-host-prep")],
+                stdin=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline:
+                if not _port_open(8177) and not _port_open(8178):
+                    break
+                time.sleep(1)
+            if _port_open(8177) or _port_open(8178):
+                print("Error: ports 8177/8178 still open after prep; refusing to run.",
+                      file=sys.stderr)
+                return 1
+
+        run_id = "%s-%s" % (
+            datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+            uuid.uuid4().hex[:8],
+        )
+        run_root = os.path.join(WS, "generated", "stories", manifest.get("story_id", "story"),
+                                 "runs", run_id)
+        os.makedirs(run_root)
+        print("run root: %s" % run_root)
+
+        # ORDER-SAFE (load-bearing for the concat below): keyed on
+        # unit["index"] rather than appended in loop order, because the
+        # retry pass below fills these in out of order (only failed
+        # units, in their own subset order) -- list-append ordering would
+        # silently scramble the movie.
+        unit_frames_by_index = {}
+        unit_results = {}
+        completed = 0
+        content_blocked = False
+        consecutive_failures = 0
+        stopped_reason = None
+
+        for unit in units:
+            cell = os.path.join(run_root, unit["label"])
+            os.makedirs(cell)
+
+            request = _build_request(
+                unit["prompt"], args.negative_prompt, args.width, args.height, unit["num_frames"],
+                args.fps, args.frame_rate, args.wide, args.allow_override, unit["seed"],
+                unit["conditions"],
+            )
+            with open(os.path.join(cell, "request.json"), "w") as f:
+                json.dump(request, f, indent=2)
+
+            print("unit %d/%d (%s) starting, seed=%d"
+                  % (unit["index"], len(units), unit["label"], unit["seed"]))
+
+            gpu_other = _await_gpu_reclaim()
+            if gpu_other > mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB:
+                print("unit %s: gpu_other still %.2f GiB after reclaim wait (threshold %.2f); "
+                      "proceeding anyway, stage1 preflight will refuse if still too high"
+                      % (unit["label"], gpu_other, mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB))
+
+            rc1, log1 = _spawn_stage(1, cell)
+            if rc1 != 0:
+                with open(os.path.join(cell, "stage1.log"), "w") as f:
+                    f.write(log1)
+                tail = "\n".join(log1.splitlines()[-40:])
+                print("unit %s stage1 FAILED rc=%d\n%s" % (unit["label"], rc1, tail),
+                      file=sys.stderr)
+                unit_results[unit["index"]] = {"unit": unit["label"], "status": "stage1_error", "rc": rc1}
+                consecutive_failures += 1
+                if args.on_unit_failure == "stop":
+                    break
+                if args.max_consecutive_failures > 0 and consecutive_failures >= args.max_consecutive_failures:
+                    never_attempted = len(units) - len(unit_results)
+                    print("STOPPING: %d consecutive unit failures (host likely degraded); "
+                          "%d unit(s) never attempted" % (consecutive_failures, never_attempted))
+                    stopped_reason = "consecutive_failures"
+                    break
+                _unit_boundary_pause(args.unit_pause)
+                continue
+
+            # Load-bearing per unit (not just once, unlike ltx-chain): each
+            # unit runs its own stage 1, so the T5-shard page-cache pressure
+            # this evicts accumulates once per unit, not once per run.
+            L._release_page_cache(cell, request["image_path"], unit["prompt"], None)
+
+            _await_gpu_reclaim()
+            time.sleep(args.settle)
+
+            stage2_env = {"LTX_SWEEP_RELAX_SUPPLY": "1"} if args.relax_supply else None
+            rc2, log2 = _spawn_stage(2, cell, stage2_env)
+            if rc2 != 0:
+                reason = L._sentinel_abort_line(cell, "stage2")
+                status = "sentinel_abort" if rc2 == mps_guard.SENTINEL_EXIT_CODE else "stage2_error"
+                with open(os.path.join(cell, "stage2.log"), "w") as f:
+                    f.write(log2)
+                if status == "stage2_error":
+                    tail = "\n".join(log2.splitlines()[-40:])
+                    print("unit %s FAILED (%s, rc=%d): %s\n%s"
+                          % (unit["label"], status, rc2, reason, tail), file=sys.stderr)
+                else:
+                    print("unit %s FAILED (%s, rc=%d): %s" % (unit["label"], status, rc2, reason))
+                unit_results[unit["index"]] = {"unit": unit["label"], "status": status, "rc": rc2, "reason": reason}
+                consecutive_failures += 1
+                if args.on_unit_failure == "stop":
+                    break
+                if args.max_consecutive_failures > 0 and consecutive_failures >= args.max_consecutive_failures:
+                    never_attempted = len(units) - len(unit_results)
+                    print("STOPPING: %d consecutive unit failures (host likely degraded); "
+                          "%d unit(s) never attempted" % (consecutive_failures, never_attempted))
+                    stopped_reason = "consecutive_failures"
+                    break
+                _unit_boundary_pause(args.unit_pause)
+                continue
+            print("unit %s stage2 ok" % unit["label"])
+
+            rc3, log3 = _spawn_stage(3, cell)
+            blocked = ("ContentSafetyError" in log3) or ("CONTENT SAFETY" in log3)
+            frames = sorted(glob.glob(os.path.join(cell, "frames", "frame_*.png")))
+
+            if blocked:
+                # A content block is always terminal, regardless of
+                # --on-unit-failure -- this is a deliberate policy carried
+                # over from bin/ltx-chain, never skippable.
+                print("unit %s BLOCKED by content safety (frames deleted by stage 3)"
+                      % unit["label"])
+                unit_results[unit["index"]] = {"unit": unit["label"], "status": "content_blocked"}
+                content_blocked = True
+                break
+            if rc3 != 0 or not frames:
+                with open(os.path.join(cell, "stage3.log"), "w") as f:
+                    f.write(log3)
+                tail = "\n".join(log3.splitlines()[-40:])
+                print("unit %s FAILED (stage3_error, rc=%d, frames=%d)\n%s"
+                      % (unit["label"], rc3, len(frames), tail), file=sys.stderr)
+                unit_results[unit["index"]] = {"unit": unit["label"], "status": "stage3_error", "rc": rc3}
+                consecutive_failures += 1
+                if args.on_unit_failure == "stop":
+                    break
+                if args.max_consecutive_failures > 0 and consecutive_failures >= args.max_consecutive_failures:
+                    never_attempted = len(units) - len(unit_results)
+                    print("STOPPING: %d consecutive unit failures (host likely degraded); "
+                          "%d unit(s) never attempted" % (consecutive_failures, never_attempted))
+                    stopped_reason = "consecutive_failures"
+                    break
+                _unit_boundary_pause(args.unit_pause)
+                continue
+
+            unit_frames_by_index[unit["index"]] = frames
+            completed += 1
+            unit_results[unit["index"]] = {"unit": unit["label"], "status": "ok", "frames": len(frames)}
+            print("unit %s ok: %d frames" % (unit["label"], len(frames)))
+            consecutive_failures = 0
+            _unit_boundary_pause(args.unit_pause)
+
+        # --- retry pass (opt-in, --retry-failed 1): one extra attempt for
+        # units that failed in the main loop above, after an idle pause to
+        # let swap reclaim. Never runs when the run was already terminated
+        # by a content-safety block (content_blocked, checked below) or by
+        # the consecutive-failure circuit breaker (stopped_reason). ---
+        failed_units = [u for u in units
+                        if unit_results.get(u["index"], {}).get("status") not in (None, "ok")]
+        if args.retry_failed and failed_units and stopped_reason is None and not content_blocked:
+            print("=== retry pass: %d unit(s) ===" % len(failed_units))
+            print(", ".join(u["label"] for u in failed_units))
+
+            before = _log_swap_used()
+            print("retrying in %.0fs..." % args.retry_idle)
+            time.sleep(args.retry_idle)
+            after = _log_swap_used()
+            print("retry-idle delta: %.2f -> %.2f GiB (%+.2f)" % (before, after, after - before))
+
+            for unit in failed_units:
+                cell = os.path.join(run_root, unit["label"])
+                prior_status = unit_results[unit["index"]]["status"]
+                shutil.rmtree(os.path.join(cell, "frames"), ignore_errors=True)
+
+                embeds_path = os.path.join(cell, "embeds.pt")
+                if os.path.exists(embeds_path):
+                    # Valid to skip: embeds are text-only, unaffected by
+                    # the swap/GPU state that caused the earlier failure.
+                    print("unit %s retry: reusing embeds.pt" % unit["label"])
+                else:
+                    rc1, log1 = _spawn_stage(1, cell)
+                    if rc1 != 0:
+                        with open(os.path.join(cell, "stage1.log"), "w") as f:
+                            f.write(log1)
+                        tail = "\n".join(log1.splitlines()[-40:])
+                        print("unit %s retry stage1 FAILED rc=%d\n%s" % (unit["label"], rc1, tail),
+                              file=sys.stderr)
+                        unit_results[unit["index"]] = {
+                            "unit": unit["label"], "status": "stage1_error", "rc": rc1, "attempts": 2,
+                        }
+                        continue
+
+                with open(os.path.join(cell, "request.json")) as f:
+                    request = json.load(f)
+
+                # Load-bearing per unit, same as the main loop above (T21).
+                L._release_page_cache(cell, request["image_path"], unit["prompt"], None)
+
+                _await_gpu_reclaim()
+                time.sleep(args.settle)
+
+                stage2_env = {"LTX_SWEEP_RELAX_SUPPLY": "1"} if args.relax_supply else None
+                rc2, log2 = _spawn_stage(2, cell, stage2_env)
+                if rc2 != 0:
+                    reason = L._sentinel_abort_line(cell, "stage2")
+                    status = "sentinel_abort" if rc2 == mps_guard.SENTINEL_EXIT_CODE else "stage2_error"
+                    with open(os.path.join(cell, "stage2.log"), "w") as f:
+                        f.write(log2)
+                    if status == "stage2_error":
+                        tail = "\n".join(log2.splitlines()[-40:])
+                        print("unit %s retry FAILED (%s, rc=%d): %s\n%s"
+                              % (unit["label"], status, rc2, reason, tail), file=sys.stderr)
+                    else:
+                        print("unit %s retry FAILED (%s, rc=%d): %s" % (unit["label"], status, rc2, reason))
+                    unit_results[unit["index"]] = {
+                        "unit": unit["label"], "status": status, "rc": rc2, "reason": reason, "attempts": 2,
+                    }
+                    continue
+                print("unit %s retry stage2 ok" % unit["label"])
+
+                rc3, log3 = _spawn_stage(3, cell)
+                blocked = ("ContentSafetyError" in log3) or ("CONTENT SAFETY" in log3)
+                frames = sorted(glob.glob(os.path.join(cell, "frames", "frame_*.png")))
+
+                if blocked:
+                    # Terminal regardless of --on-unit-failure, same as the
+                    # main loop -- ends the retry pass immediately.
+                    print("unit %s retry BLOCKED by content safety (frames deleted by stage 3)"
+                          % unit["label"])
+                    unit_results[unit["index"]] = {
+                        "unit": unit["label"], "status": "content_blocked", "attempts": 2,
+                    }
+                    content_blocked = True
+                    break
+                if rc3 != 0 or not frames:
+                    with open(os.path.join(cell, "stage3.log"), "w") as f:
+                        f.write(log3)
+                    tail = "\n".join(log3.splitlines()[-40:])
+                    print("unit %s retry FAILED (stage3_error, rc=%d, frames=%d)\n%s"
+                          % (unit["label"], rc3, len(frames), tail), file=sys.stderr)
+                    unit_results[unit["index"]] = {
+                        "unit": unit["label"], "status": "stage3_error", "rc": rc3, "attempts": 2,
+                    }
+                    continue
+
+                unit_frames_by_index[unit["index"]] = frames
+                completed += 1
+                unit_results[unit["index"]] = {
+                    "unit": unit["label"], "status": "ok", "frames": len(frames),
+                    "attempts": 2, "first_failure": prior_status,
+                }
+                print("unit %s retry ok: %d frames" % (unit["label"], len(frames)))
+
+        # --- concatenate ---
+        wrote_output = False
+        hold_frames_for_concat = 0
+        if unit_frames_by_index and not content_blocked:
+            holds = None
+            if args.mode == "transitions" and args.hold_frames and completed == len(units):
+                from PIL import Image
+                hold_frames_for_concat = args.hold_frames
+                holds = [
+                    Image.open(p["image_path"]).convert("RGB").resize(
+                        (args.width, args.height), Image.LANCZOS)
+                    for p in panels
+                ]
+            # ORDER-SAFE: rebuild the concat input by iterating `units` (the
+            # canonical order) and indexing unit_frames_by_index, never by
+            # relying on append order (see the comment where the dict is
+            # created, above).
+            all_unit_frames = [unit_frames_by_index[u["index"]] for u in units
+                                if u["index"] in unit_frames_by_index]
+            sequence = build_frame_sequence(all_unit_frames, args.mode, hold_frames_for_concat, holds)
+            _concat_and_export(sequence, args.output_path, args.fps)
+            wrote_output = True
+            duration = len(sequence) / args.fps
+            size_kb = os.path.getsize(args.output_path) // 1024
+            print("STORY %d/%d units, %d frames, %.2fs -> %s (%dKB)"
+                  % (completed, len(units), len(sequence), duration, args.output_path, size_kb))
+        else:
+            sequence = []
+            print("No units completed; no output written.")
+
+        summary = {
+            "schema_version": 2,
+            "mode": args.mode,
+            "story_id": manifest.get("story_id", "story"),
+            "manifest_path": os.path.abspath(args.manifest_path),
+            "manifest_schema_version": manifest.get("schema_version", 1),
+            "requested_units": len(units),
+            "completed_units": completed,
+            "units": [unit_results[u["index"]] for u in units if u["index"] in unit_results],
+            "unit_frames": {u["label"]: u["num_frames"] for u in units},
+            "hold_frames": hold_frames_for_concat if wrote_output else 0,
+            "total_frames": len(sequence) if wrote_output else 0,
+            "intended_total_frames": total_frames,
+            "actual_total_frames": len(sequence) if wrote_output else 0,
+            "width": args.width,
+            "height": args.height,
+            "num_frames": args.num_frames,
+            "fps": args.fps,
+            "output_path": os.path.abspath(args.output_path) if wrote_output else None,
+            "on_unit_failure": args.on_unit_failure,
+            "content_blocked": content_blocked,
+            "stopped_reason": stopped_reason,
+        }
+        with open(os.path.join(run_root, "story_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+        if content_blocked:
+            print("STOPPED: content safety block")
+            return 1
+        if completed == len(units) and wrote_output:
+            print("DONE: all %d units completed -> %s" % (len(units), args.output_path))
+            return 0
+        print("STOPPED EARLY: %d/%d units completed" % (completed, len(units)))
+        if stopped_reason == "consecutive_failures":
+            relaunch_argv = argv if argv is not None else sys.argv[1:]
+            print("relaunch: %s %s %s"
+                  % (sys.executable, os.path.abspath(__file__),
+                     " ".join(shlex.quote(a) for a in relaunch_argv)))
+        return 1
+    finally:
+        _restore()
+
+
+if __name__ == "__main__":
+    try:
+        _rc = main()
+    except KeyboardInterrupt:
+        _rc = 130
+    except Exception as _e:
+        print("ltx-story-video failed: %s" % _e, file=sys.stderr)
+        _rc = 1
+    sys.exit(_rc)

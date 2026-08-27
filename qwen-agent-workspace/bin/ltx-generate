@@ -27,8 +27,9 @@ WORKSPACE="/Users/reubenpatterson/qwen-agent-workspace"
 
 USAGE="Usage: ltx-generate [--keep-down] [--no-prep] [--force] [--last-frame PATH]
        [--keyframe PATH:INDEX[:STRENGTH]]... [--width N] [--height N] [--num-frames N]
-       [--fps N] [--frame-rate N] [--wide] [--allow-override] [--chain N]
+       [--fps N] [--frame-rate N] [--wide] [--allow-override] [--t2v] [--chain N]
        <image_path> \"<prompt>\" [output_path]
+       (with --t2v: \"<prompt>\" [output_path] -- no image_path)
        ltx-generate --restore-only
 
 Runs prep -> generate -> restore in the correct order. Restore is guaranteed
@@ -61,6 +62,7 @@ Options:
   --frame-rate N  motion-conditioning rate -- keep equal to --fps
   --wide          use the 0.87 memory budget, skips the 0.82 ceiling gate
   --allow-override  bypass the measured ceiling pre-check (the watermark cap + sentinel still protect the host; an over-budget run fails cleanly)
+  --t2v           text-to-video mode: no conditioning image; positionals become \"<prompt>\" [output_path]; cannot combine with --chain
   --chain N       after the base clip, generate N additional continuation segments seeded from the base's last frame; output is base+N segments concatenated (N+1 clips total). Reuses bin/ltx-chain --continue-from. Cannot combine with --resume."
 
 KEEP_DOWN=0
@@ -74,6 +76,7 @@ FPS=""
 FRAME_RATE=""
 WIDE=""
 ALLOW_OVERRIDE=""
+T2V=""
 WIDTH=""
 HEIGHT=""
 NUM_FRAMES=""
@@ -82,6 +85,7 @@ IMAGE=""
 PROMPT=""
 OUTPUT=""
 POSITIONAL_COUNT=0
+POSITIONALS=()
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -129,6 +133,10 @@ while [ $# -gt 0 ]; do
             ALLOW_OVERRIDE="1"
             shift
             ;;
+        --t2v)
+            T2V="1"
+            shift
+            ;;
         --width)
             WIDTH="$2"
             shift 2
@@ -155,18 +163,22 @@ while [ $# -gt 0 ]; do
             exit 2
             ;;
         *)
-            POSITIONAL_COUNT=$((POSITIONAL_COUNT + 1))
-            if [ "$POSITIONAL_COUNT" -eq 1 ]; then
-                IMAGE="$1"
-            elif [ "$POSITIONAL_COUNT" -eq 2 ]; then
-                PROMPT="$1"
-            elif [ "$POSITIONAL_COUNT" -eq 3 ]; then
-                OUTPUT="$1"
-            fi
+            POSITIONALS+=("$1")
             shift
             ;;
     esac
 done
+
+# Resolve positional arguments based on mode
+if [ -n "$T2V" ]; then
+    PROMPT="${POSITIONALS[0]:-}"
+    OUTPUT="${POSITIONALS[1]:-}"
+    IMAGE=""
+else
+    IMAGE="${POSITIONALS[0]:-}"
+    PROMPT="${POSITIONALS[1]:-}"
+    OUTPUT="${POSITIONALS[2]:-}"
+fi
 
 if [ "$RESTORE_ONLY" -eq 1 ]; then
     bash "$WORKSPACE/bin/ltx-host-restore"
@@ -190,14 +202,26 @@ if [ -n "$CHAIN" ]; then
     fi
 fi
 
-if [ -z "$IMAGE" ]; then
-    echo "$USAGE" >&2
+if [ -n "$T2V" ] && [ -n "$CHAIN" ]; then
+    echo "Error: --t2v cannot be combined with --chain" >&2
     exit 2
 fi
 
-if [ ! -f "$IMAGE" ]; then
-    echo "Error: image not found: $IMAGE" >&2
-    exit 2
+if [ -n "$T2V" ]; then
+    if [ -z "$PROMPT" ]; then
+        echo "$USAGE" >&2
+        exit 2
+    fi
+else
+    if [ -z "$IMAGE" ]; then
+        echo "$USAGE" >&2
+        exit 2
+    fi
+
+    if [ ! -f "$IMAGE" ]; then
+        echo "Error: image not found: $IMAGE" >&2
+        exit 2
+    fi
 fi
 
 if [ -z "$OUTPUT" ]; then
@@ -267,13 +291,19 @@ for kf in "${KEYFRAMES[@]:-}"; do [ -n "$kf" ] && EXTRA_ARGS+=(--keyframe "$kf")
 [ -n "$FRAME_RATE" ] && EXTRA_ARGS+=(--frame-rate "$FRAME_RATE")
 [ -n "$WIDE" ] && EXTRA_ARGS+=(--wide)
 [ -n "$ALLOW_OVERRIDE" ] && EXTRA_ARGS+=(--allow-override)
+[ -n "$T2V" ] && EXTRA_ARGS+=(--t2v)
 
 if [ -z "$CHAIN" ]; then
     echo "=== generate ==="
-    if [ -n "$RESUME" ]; then
-        python3 "$WORKSPACE/ltx_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+    if [ -n "$T2V" ]; then
+        POSITIONAL_ARGS=("$PROMPT" "$OUTPUT")
     else
-        python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "$IMAGE" "$PROMPT" "$OUTPUT"
+        POSITIONAL_ARGS=("$IMAGE" "$PROMPT" "$OUTPUT")
+    fi
+    if [ -n "$RESUME" ]; then
+        python3 "$WORKSPACE/ltx_video_skill.py" --resume "$RESUME" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "${POSITIONAL_ARGS[@]}"
+    else
+        python3 "$WORKSPACE/ltx_video_skill.py" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "${POSITIONAL_ARGS[@]}"
     fi
     GEN_RC=$?
 

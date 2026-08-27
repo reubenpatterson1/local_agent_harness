@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""ltx-story-manifest -- scaffold a generated/stories/<story_id>/manifest.json
+from a set of already-generated panel images (and, optionally, a prompts.md
+narration file).
+
+This tool never invents creative content. It only fills in structural
+fields: `index`, `image_path`, `title` (from a prompts.md header, when
+given), and `panel_text` (from a prompts.md body, when given, else a
+"panel N" placeholder). When a prompts.md panel section uses the v2
+`Image:`/`Motion:`/`Narration:` labels, `panel_text` and `motion_prompt`
+come from the `Image:` and `Motion:` fields respectively (`motion_prompt`
+is null only when the `Motion:` field is empty); for a v1 (unlabeled)
+section, `motion_prompt` is always written as null, same as before.
+`transition_to_next` is always written as null -- a human (or a later
+pass) fills it in by hand, or bin/ltx-story-video falls back to
+documented deterministic defaults when it is left null.
+
+Manifest schema (schema_version 2; bin/ltx-story-video still accepts
+schema_version 1 manifests written by earlier versions of this tool):
+{
+  "schema_version": 2,
+  "story_id": "string",
+  "title": "string",
+  "narrative": "string",
+  "created_at": "ISO8601 string",
+  "fps": 24,
+  "target_seconds": 30.0,
+  "pace": "proportional",
+  "total_num_frames": 720,
+  "total_duration_s": 30.0,
+  "panels": [
+    {
+      "index": 1,
+      "image_path": "/absolute/path.png",
+      "title": "string, may be empty",
+      "panel_text": "non-empty string, required",
+      "narration": "string, may be empty",
+      "narration_words": 0,
+      "num_frames": 49,
+      "duration_s": 2.042,
+      "motion_prompt": null,
+      "transition_to_next": null
+    }
+  ]
+}
+
+Dependencies: stdlib + Pillow only (for an image-openable sanity check on
+each selected file). No torch, no diffusers -- this tool must stay fast
+and lightweight.
+"""
+
+import argparse
+import datetime
+import glob as glob_module
+import json
+import os
+import re
+import sys
+
+from PIL import Image
+
+WS = "/Users/reubenpatterson/qwen-agent-workspace"
+
+_PANEL_NUM_RE = re.compile(r"panel[-_]?(\d+)", re.IGNORECASE)
+_PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
+_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration):\s*(.*)$")
+MAX_PROMPT_WORDS = 150
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-story-manifest",
+        description=(
+            "Scaffold generated/stories/<story_id>/manifest.json from a set "
+            "of panel images, optionally narrated by a prompts.md file. Only "
+            "fills in structural fields; never invents creative content."
+        ),
+    )
+    parser.add_argument("--story-id", required=True, dest="story_id")
+    parser.add_argument("--prompts-md", dest="prompts_md", default=None)
+    parser.add_argument("--glob", dest="glob", default=None,
+                         help="non-recursive glob pattern within --images-dir")
+    parser.add_argument("--image", dest="image", action="append", default=None,
+                         help="explicit image path, repeatable; order is used verbatim")
+    parser.add_argument("--images-dir", dest="images_dir", default=None,
+                         help="default: <workspace>/generated")
+    parser.add_argument("--title", dest="title", default="")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--target-seconds", dest="target_seconds", type=float, default=30.0)
+    parser.add_argument("--min-frames", dest="min_frames", type=int, default=25)
+    parser.add_argument("--max-frames", dest="max_frames", type=int, default=57)
+    parser.add_argument("--pace", choices=["proportional", "equal"], default=None,
+                         help="default proportional (weighted by Narration word count); "
+                              "mutually exclusive with --frames")
+    parser.add_argument("--frames", dest="frames", type=int, action="append", default=None,
+                         help="explicit per-panel num_frames override, repeatable; "
+                              "count must equal panel count; mutually exclusive with --pace")
+    return parser
+
+
+def _select_images_glob(images_dir, pattern):
+    matched = glob_module.glob(os.path.join(images_dir, pattern))
+    if not matched:
+        return None, "Error: no images matched pattern %r in %s" % (pattern, images_dir)
+
+    nums = []
+    for path in matched:
+        m = _PANEL_NUM_RE.search(os.path.basename(path))
+        nums.append(int(m.group(1)) if m else None)
+
+    if all(n is not None for n in nums):
+        matched = [p for _, p in sorted(zip(nums, matched))]
+    else:
+        matched.sort(key=lambda p: os.stat(p).st_mtime)
+        print("NOTE: no panel-N key in filenames; ordered by mtime "
+              "— VERIFY manifest.json before running.")
+    return matched, None
+
+
+def _sanity_check_image(path):
+    try:
+        with Image.open(path) as img:
+            img.verify()
+    except Exception as e:
+        return "Error: cannot open image %s: %s" % (path, e)
+    return None
+
+
+def _extract_narrative(lines):
+    heading_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            heading_idx = i
+            break
+    if heading_idx is None:
+        return ""
+    for line in lines[heading_idx + 1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") or stripped.startswith("-"):
+            continue
+        return stripped
+    return ""
+
+
+def _parse_prompts_md(path):
+    """Return (narrative, [{'title': str, 'text': str, 'image': str,
+    'motion': str, 'narration': str}, ...]) parsed from a prompts.md file.
+    Raises OSError if the file cannot be read.
+
+    v2: inside a panel section, a line matching `Image:`/`Motion:`/
+    `Narration:` opens that field; subsequent non-blank unlabeled lines
+    append to whichever field is currently open, space-joined. `image`,
+    `motion`, `narration` are "" when the corresponding label never
+    appears in the section.
+
+    BACK-COMPAT, LOAD-BEARING: `text` is always the v1 whole-body join
+    (unchanged), regardless of whether labels are present -- callers
+    decide whether to use `text` or the labeled fields by checking
+    whether any of `image`/`motion`/`narration` is non-empty. This keeps
+    v1 prompts.md files (no labels) parsing exactly as before.
+    """
+    with open(path) as f:
+        lines = f.read().splitlines()
+
+    narrative = _extract_narrative(lines)
+
+    panels = []
+    current = None
+    for line in lines:
+        m = _PANEL_HEADER_RE.match(line)
+        if m:
+            if current is not None:
+                panels.append(current)
+            current = {"number": int(m.group(1)), "title": m.group(2).strip(), "body": []}
+            continue
+        if line.startswith("##"):
+            if current is not None:
+                panels.append(current)
+                current = None
+            continue
+        if current is not None:
+            current["body"].append(line)
+    if current is not None:
+        panels.append(current)
+
+    for p in panels:
+        p["text"] = " ".join(s.strip() for s in p["body"] if s.strip())
+
+        fields = {"Image": [], "Motion": [], "Narration": []}
+        open_field = None
+        for line in p["body"]:
+            m = _PANEL_LABEL_RE.match(line)
+            if m:
+                open_field = m.group(1)
+                value = m.group(2).strip()
+                if value:
+                    fields[open_field].append(value)
+                continue
+            if open_field is not None and line.strip():
+                fields[open_field].append(line.strip())
+        p["image"] = " ".join(fields["Image"])
+        p["motion"] = " ".join(fields["Motion"])
+        p["narration"] = " ".join(fields["Narration"])
+
+    return narrative, panels
+
+
+def _prompt_length_warning(unit_index, prompt):
+    words = len(prompt.split())
+    if words > MAX_PROMPT_WORDS:
+        print("WARNING: unit %d prompt is %d words (>150); T5 may truncate at 256 tokens"
+              % (unit_index, words))
+
+
+def _snap_frames(x):
+    """Nearest n with (n-1)%8==0 and n>=9; exact ties resolve DOWN."""
+    # Find the nearest lattice point n = 1 + 8*k (k >= 1) to the real value x.
+    k = int((x - 1) // 8)                 # floor division gives the lower k
+    lower = 1 + 8 * k
+    if lower < 9:                         # enforce the n>=9 constraint
+        lower = 9
+    upper = lower + 8                     # the next point on the lattice
+
+    # Choose the nearer one; tie -> lower.
+    if abs(upper - x) < abs(x - lower):
+        return upper
+    return lower
+
+
+def _allocate_frames(weights, target_frames, min_frames, max_frames):
+    """weights: list of ints >=1. Returns list of ints, each ==1 (mod 8),
+    min_frames <= f <= max_frames, whose sum is the closest value to
+    target_frames reachable on the lattice within that envelope."""
+    assert (min_frames - 1) % 8 == 0 and (max_frames - 1) % 8 == 0, \
+        "min/max frames must each satisfy (n-1)%8==0"
+    assert 9 <= min_frames <= max_frames, "min_frames/max_frames out of range"
+
+    total = sum(weights)
+    raw = [w / total * target_frames for w in weights]
+    f = [min(max(_snap_frames(r), min_frames), max_frames) for r in raw]
+
+    # Reconciliation (bounded at 1000 iterations). Every f is congruent to
+    # 1 mod 8, which makes sum(f) mod 8 invariant across N panels, so
+    # |diff| < 8 is the exact optimum reachable on this lattice -- this is
+    # NOT a bug to "fix" into an exact-target search (an exact-target
+    # search would not terminate on this lattice).
+    for _ in range(1000):
+        diff = target_frames - sum(f)
+        if diff >= 8:
+            candidates = [i for i, val in enumerate(f) if val + 8 <= max_frames]
+            if not candidates:
+                break
+            idx = min(candidates, key=lambda i: (f[i], i))
+            f[idx] += 8
+        elif diff <= -8:
+            candidates = [i for i, val in enumerate(f) if val - 8 >= min_frames]
+            if not candidates:
+                break
+            idx = max(candidates, key=lambda i: (f[i], -i))
+            f[idx] -= 8
+        else:
+            break
+
+    return f
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not ((args.min_frames - 1) % 8 == 0 and (args.max_frames - 1) % 8 == 0
+            and 9 <= args.min_frames <= args.max_frames):
+        parser.error(
+            "--min-frames/--max-frames must each satisfy (n-1)%%8==0 and "
+            "9 <= min-frames <= max-frames; got --min-frames %d --max-frames %d"
+            % (args.min_frames, args.max_frames)
+        )
+    if args.frames is not None and args.pace is not None:
+        parser.error("--frames and --pace are mutually exclusive")
+
+    if args.glob and args.image:
+        parser.error("--glob and --image are mutually exclusive")
+    if not args.glob and not args.image:
+        parser.error("one of --glob or --image is required")
+
+    images_dir = args.images_dir or os.path.join(WS, "generated")
+
+    if args.glob:
+        matched, err = _select_images_glob(images_dir, args.glob)
+        if err:
+            print(err, file=sys.stderr)
+            return 2
+    else:
+        matched = list(args.image)
+
+    for path in matched:
+        err = _sanity_check_image(path)
+        if err:
+            print(err, file=sys.stderr)
+            return 2
+
+    narrative = ""
+    prompt_texts = None
+    if args.prompts_md:
+        try:
+            narrative, parsed_panels = _parse_prompts_md(args.prompts_md)
+        except OSError as e:
+            print("Error: cannot read --prompts-md file: %s" % e, file=sys.stderr)
+            return 2
+        if len(parsed_panels) != len(matched):
+            print("Error: prompts.md has %d panels but %d images were selected"
+                  % (len(parsed_panels), len(matched)), file=sys.stderr)
+            return 2
+        prompt_texts = parsed_panels
+    else:
+        print("WARNING: no --prompts-md; panel_text is a placeholder "
+              "— edit manifest.json before running")
+
+    n_panels = len(matched)
+
+    # --- frame allocation: either an explicit --frames override, or
+    # weighted allocation (proportional to Narration word count, or
+    # equal) across --target-seconds @ --fps, driven by --prompts-md ---
+    if args.frames is not None:
+        if len(args.frames) != n_panels:
+            print("Error: --frames given %d time(s) but there are %d panels"
+                  % (len(args.frames), n_panels), file=sys.stderr)
+            return 2
+        frame_counts = list(args.frames)
+        pace = "explicit"
+    elif prompt_texts is None:
+        # BACK-COMPAT, LOAD-BEARING: the --target-seconds allocator is a
+        # v2 feature driven entirely by --prompts-md Narration text; the
+        # pre-v2 "just scaffold from a folder of images, no narration"
+        # workflow (see T6/T7) has no duration information to allocate
+        # against at all, so it keeps the pre-v2 per-panel frame count
+        # (49 -- the same system-wide default used elsewhere in this
+        # codebase, e.g. bin/ltx-story-video's own --num-frames default)
+        # instead of running the new allocator.
+        pace = "legacy"
+        frame_counts = [49] * n_panels
+    else:
+        pace = args.pace or "proportional"
+        target_frames = round(args.target_seconds * args.fps)
+        if pace == "proportional":
+            weights = []
+            for i in range(1, n_panels + 1):
+                narration = prompt_texts[i - 1]["narration"]
+                if not narration.strip():
+                    print("Error: --pace proportional requires every panel to have a "
+                          "non-empty Narration field; panel %d has none" % i, file=sys.stderr)
+                    return 2
+                weights.append(max(len(narration.split()), 1))
+        else:
+            weights = [1] * n_panels
+        frame_counts = _allocate_frames(weights, target_frames, args.min_frames, args.max_frames)
+        achieved = sum(frame_counts)
+        if abs(target_frames - achieved) > 8:
+            lo = n_panels * args.min_frames
+            hi = n_panels * args.max_frames
+            print(
+                "Error: target_frames=%d not achievable within 8 frames using %d panel(s) "
+                "in [%d, %d] frames each; achievable range is [%d, %d] frames "
+                "(sum ≡ %d (mod 8)); change panel count or --min-frames/--max-frames."
+                % (target_frames, n_panels, args.min_frames, args.max_frames, lo, hi, n_panels),
+                file=sys.stderr,
+            )
+            return 2
+
+    panels = []
+    for i, image_path in enumerate(matched, start=1):
+        pt = prompt_texts[i - 1] if prompt_texts is not None else None
+        has_labels = pt is not None and (pt["image"] or pt["motion"] or pt["narration"])
+        if has_labels:
+            title = pt["title"]
+            panel_text = pt["image"] or ("panel %d" % i)
+            motion_prompt = pt["motion"] or None
+            narration = pt["narration"]
+        elif pt is not None:
+            title = pt["title"]
+            panel_text = pt["text"] or ("panel %d" % i)
+            motion_prompt = None
+            narration = ""
+        else:
+            title = ""
+            panel_text = "panel %d" % i
+            motion_prompt = None
+            narration = ""
+        num_frames = frame_counts[i - 1]
+        panels.append({
+            "index": i,
+            "image_path": os.path.abspath(image_path),
+            "title": title,
+            "panel_text": panel_text,
+            "narration": narration,
+            "narration_words": len(narration.split()),
+            "num_frames": num_frames,
+            "duration_s": round(num_frames / args.fps, 3),
+            "motion_prompt": motion_prompt,
+            "transition_to_next": None,
+        })
+
+    for p in panels:
+        _prompt_length_warning(p["index"], p["panel_text"])
+
+    story_dir = os.path.join(WS, "generated", "stories", args.story_id)
+    manifest_path = os.path.join(story_dir, "manifest.json")
+    os.makedirs(story_dir, exist_ok=True)
+
+    if os.path.exists(manifest_path) and not args.force:
+        print("Error: manifest already exists: %s (use --force to overwrite)"
+              % manifest_path, file=sys.stderr)
+        return 2
+
+    total_num_frames = sum(p["num_frames"] for p in panels)
+    manifest = {
+        "schema_version": 2,
+        "story_id": args.story_id,
+        "title": args.title or "",
+        "narrative": narrative,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "fps": args.fps,
+        "target_seconds": args.target_seconds,
+        "pace": pace,
+        "total_num_frames": total_num_frames,
+        "total_duration_s": round(total_num_frames / args.fps, 3),
+        "panels": panels,
+    }
+
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print("wrote %s (%d panels)" % (manifest_path, len(panels)))
+    print("%-6s %-30s %-8s %-8s %s" % ("index", "basename", "frames", "secs", "title"))
+    for p in panels:
+        print("%-6d %-30s %-8d %-8.2f %s"
+              % (p["index"], os.path.basename(p["image_path"]), p["num_frames"],
+                 p["duration_s"], p["title"]))
+    print("TOTAL %d frames = %.2f s @ %d fps" % (total_num_frames, total_num_frames / args.fps, args.fps))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
