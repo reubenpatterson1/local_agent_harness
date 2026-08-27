@@ -263,6 +263,23 @@ def test_length_40_panels_and_tokens():
         check("L11 --max-tokens >= 7000", int(m.group(1)) >= 7000, "got %s" % m.group(1))
 
 
+# ---------------------------------------------------------------------------
+# L12 (addendum): source guard -- Phase 1 nonzero-rc handling checks
+# os.path.isfile(story_md) before any return 1 in that block, so a valid
+# story.md on disk survives a nonzero qwen-agent exit
+# ---------------------------------------------------------------------------
+
+def test_phase1_nonzero_rc_checks_story_md_before_failing():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L12 source references os.path.isfile(story_md)",
+          "os.path.isfile(story_md)" in text)
+    check("L12 source contains the story.md-exists warning",
+          "qwen-agent exited %d but story.md exists" in text)
+    check("L12 source contains the validate-instead-of-fail message",
+          "validating the file instead of failing" in text)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -275,6 +292,7 @@ if __name__ == "__main__":
     test_length_conflicts()
     test_length_bounds()
     test_length_40_panels_and_tokens()
+    test_phase1_nonzero_rc_checks_story_md_before_failing()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

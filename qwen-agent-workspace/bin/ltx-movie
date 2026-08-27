@@ -346,9 +346,22 @@ def phase1_story(args):
             return 1
         if proc.returncode != 0:
             tail = "\n".join((out or "").splitlines()[-40:])
-            print("Error: qwen-agent exited %d while authoring story.md\n%s"
-                  % (proc.returncode, tail), file=sys.stderr)
-            return 1
+            if os.path.isfile(story_md):
+                # qwen-agent can finish writing story.md and STILL exit
+                # nonzero (e.g. it hits its round/tool limit after the
+                # write -- observed 2026-08-27, story sisters_sorrow: 30
+                # valid panels on disk, rc != 0, and this branch killed the
+                # run). The file on disk, validated below, is the evidence
+                # that matters; the exit code is not. Same lesson as
+                # qwen-serve-guard's restart rc: never trust an exit code
+                # over a direct check of the outcome.
+                print("Warning: qwen-agent exited %d but story.md exists -- "
+                      "validating the file instead of failing. Log tail:\n%s"
+                      % (proc.returncode, tail))
+            else:
+                print("Error: qwen-agent exited %d while authoring story.md\n%s"
+                      % (proc.returncode, tail), file=sys.stderr)
+                return 1
 
     violations = _validate_story_md(story_md, args.panels)
     if violations:
