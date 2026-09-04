@@ -338,7 +338,7 @@ def main(argv=None):
         print("run root: %s" % run_root)
 
         # --- step 5: stage 1 once (prompt-only encode, reused by every segment) ---
-        if args.continue_from:
+        if args.continue_from and args.prompt == base_request_dict["prompt"]:
             print("=== continuation mode: reusing base run embeds.pt (skipping stage 1) ===")
         else:
             base = os.path.join(run_root, "_base")
@@ -351,7 +351,10 @@ def main(argv=None):
             with open(os.path.join(base, "request.json"), "w") as f:
                 json.dump(base_request, f, indent=2)
 
-            print("=== stage 1: encoding prompt ===")
+            if args.continue_from and args.prompt != base_request_dict["prompt"]:
+                print("=== continuation mode: prompt differs from base; encoding this continuation's own prompt (stage 1) ===")
+            else:
+                print("=== stage 1: encoding prompt ===")
             rc1, log1 = _spawn_stage(1, base)
             if rc1 != 0:
                 tail = "\n".join(log1.splitlines()[-40:])
@@ -359,6 +362,14 @@ def main(argv=None):
                 raise RuntimeError("stage1 failed with exit code %d" % rc1)
             base_embeds = os.path.join(base, "embeds.pt")
             print("stage 1 ok")
+
+            # Load-bearing (spec C6): stage 1 mmaps ~18 GiB of T5 shards, which
+            # depresses psutil-available and fails stage 2's G1b gate. The
+            # fresh-chain path is always preceded by bin/ltx-host-prep's own
+            # `sudo purge`, but a nested continuation runs with --no-prep, so
+            # nothing else evicts it. Same call bin/ltx-story-video makes after
+            # every unit's stage 1.
+            L._release_page_cache(base, None, args.prompt, None)
 
         # --- step 6: segment loop ---
         all_frames = list(base_frames) if args.continue_from else []

@@ -272,6 +272,28 @@ def test_continue_remaining_fields_still_checked():
               "got %r" % result)
 
 
+# ---------------------------------------------------------------------------
+# T40: continuation mode re-encodes stage 1 when the requested prompt differs
+# from the base's (D8/A1) -- source guard: both branches present, the
+# same-prompt branch still prints the reuse line and skips stage 1, and the
+# differing-prompt branch releases the page cache before stage 2 (C6)
+# ---------------------------------------------------------------------------
+
+def test_continuation_reencode_branch_present():
+    with open(_CHAIN_PATH) as f:
+        text = f.read()
+    check("T40a same-prompt branch keeps the reuse line",
+          "=== continuation mode: reusing base run embeds.pt (skipping stage 1) ===" in text)
+    check("T40b differing-prompt branch has its own banner",
+          "=== continuation mode: prompt differs from base; encoding this "
+          "continuation's own prompt (stage 1) ===" in text)
+    check("T40c the branch is keyed on the base request's prompt",
+          'base_request_dict["prompt"] != args.prompt' in text
+          or 'args.prompt != base_request_dict["prompt"]' in text)
+    check("T40d the re-encode releases the page cache (C6)",
+          "L._release_page_cache(" in text)
+
+
 if __name__ == "__main__":
     test_argparse_defaults()
     test_argparse_representative()
@@ -283,6 +305,7 @@ if __name__ == "__main__":
     test_continue_checked_fields_exact_set()
     test_continue_relaxed_prompt_and_num_frames()
     test_continue_remaining_fields_still_checked()
+    test_continuation_reencode_branch_present()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

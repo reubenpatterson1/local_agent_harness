@@ -680,6 +680,21 @@ Everything else about continuation mode is unchanged: base-artifact existence ch
 os.path.abspath(base_frames[-1])`, the skipped ceiling pre-check and its printed note, base-frame prepending
 in the output mp4, `chain_summary.json`, and the exit-code contract.
 
+**C6 correction:** `bin/ltx-chain` had no `L._release_page_cache(...)` call anywhere before this task
+(`git show HEAD:qwen-agent-workspace/bin/ltx-chain | grep -n "_release_page_cache"` returns nothing). The
+differing-prompt branch above adds one, immediately after its stage-1 `_spawn_stage(1, base)` call succeeds:
+`L._release_page_cache(base, None, args.prompt, None)`. This is load-bearing for the same reason
+`bin/ltx-story-video` already calls it after every unit's stage 1 (that script's own "Load-bearing per unit
+(not just once, unlike ltx-chain)" comment, `bin/ltx-story-video` lines 620-623 and 737-738): stage 1 mmaps
+~18 GiB of T5 shards, which depresses `psutil.virtual_memory().available` and can fail stage 2's G1b gate
+(`mps_guard._supply_gate_ok`, `mps_guard.py` line 317) — that gate refuses if *either* the `avail_gib` arm or
+the `supply_gib` arm falls short of `required_gib` (a conjunction of both metrics, not either alone; see the
+function's own docstring and inline comment on the `or`). The fresh-chain (non-continuation) path is always
+preceded by `bin/ltx-host-prep`'s own `sudo purge`, which evicts the mmap'd pages before stage 2 ever runs, so
+it never needed this call. A nested continuation, however, is typically invoked with `--no-prep` (the base run
+already prepped the host), so nothing else evicts those pages before this continuation's own stage 2 runs —
+hence the explicit release here.
+
 ### 6.3 Geometry gating after D7
 
 Once a continuation may carry its own `num_frames`, continuation mode's "the base already gated this
