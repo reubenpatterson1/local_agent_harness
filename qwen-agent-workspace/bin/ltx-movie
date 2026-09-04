@@ -130,6 +130,17 @@ def build_parser():
     parser.add_argument("--image-width", dest="image_width", type=int, default=1024)
     parser.add_argument("--image-height", dest="image_height", type=int, default=1024)
     parser.add_argument("--image-seed", dest="image_seed", type=int, default=0)
+    parser.add_argument("--no-stills", dest="no_stills", action="store_true", default=False,
+                         help="text-to-video chain mode: skip Phase 2 entirely (no anchor "
+                              "stills are generated), author story.md with a collapsed "
+                              "Prompt: field, and render with bin/ltx-story-video "
+                              "--engine chain. See docs/specs/2026-09-04-ltx-text-to-"
+                              "video-chain-pipeline-design.md.")
+    parser.add_argument("--reanchor-every", dest="reanchor_every", type=int, default=5,
+                         help="--no-stills only: chain-group size threaded to "
+                              "bin/ltx-story-video --reanchor-every. Panel i is a "
+                              "text-to-video opener iff (i-1) %% N == 0. Requires "
+                              "--no-stills.")
     parser.add_argument("--no-review", dest="no_review", action="store_true", default=False)
     parser.add_argument("--force-story", dest="force_story", action="store_true", default=False)
     parser.add_argument("--force", action="store_true", default=False)
@@ -618,6 +629,15 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     _resolve_length(args, raw_argv)
+
+    if _flag_explicit(raw_argv, "--reanchor-every") and not args.no_stills:
+        print("Error: --reanchor-every requires --no-stills (it only applies to the "
+              "chain engine)", file=sys.stderr)
+        sys.exit(2)
+    if args.reanchor_every < 1:
+        print("Error: --reanchor-every must be >= 1, got %d" % args.reanchor_every,
+              file=sys.stderr)
+        sys.exit(2)
 
     if args.dry_run:
         return _print_dry_run_plan(args)

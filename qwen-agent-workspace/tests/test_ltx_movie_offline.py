@@ -280,6 +280,58 @@ def test_phase1_nonzero_rc_checks_story_md_before_failing():
           "validating the file instead of failing" in text)
 
 
+# ---------------------------------------------------------------------------
+# L13: --no-stills / --reanchor-every defaults and validation
+# ---------------------------------------------------------------------------
+
+def test_no_stills_defaults_and_validation():
+    args = ltx_movie.build_parser().parse_args(["narrative", "--story-id", "x"])
+    check("L13a --no-stills default is False", args.no_stills is False,
+          "got %r" % args.no_stills)
+    check("L13b --reanchor-every default is 5", args.reanchor_every == 5,
+          "got %r" % args.reanchor_every)
+
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
+         "--reanchor-every", "3", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    check("L13c --reanchor-every without --no-stills exits 2", result.returncode == 2,
+          "rc=%r" % result.returncode)
+    check("L13d message is the spec's verbatim text",
+          "Error: --reanchor-every requires --no-stills (it only applies to the "
+          "chain engine)" in result.stderr, "stderr=%r" % result.stderr)
+
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
+         "--no-stills", "--reanchor-every", "0", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    check("L13e --reanchor-every 0 exits 2", result.returncode == 2,
+          "rc=%r" % result.returncode)
+    check("L13f message names the >= 1 rule",
+          "Error: --reanchor-every must be >= 1, got 0" in result.stderr,
+          "stderr=%r" % result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# L14: --no-stills is orthogonal to --length (spec 9.1 item 6)
+# ---------------------------------------------------------------------------
+
+def test_no_stills_orthogonal_to_length():
+    def _resolve(argv):
+        args = ltx_movie.build_parser().parse_args(argv)
+        ltx_movie._resolve_length(args, argv)
+        return args.panels, args.target_seconds
+
+    plain = _resolve(["narrative", "--story-id", "x", "--length", "30"])
+    with_flag = _resolve(["narrative", "--story-id", "x", "--no-stills", "--length", "30"])
+    check("L14a --no-stills does not change --length resolution", plain == with_flag,
+          "got %r vs %r" % (plain, with_flag))
+    check("L14b --length 30 still resolves to (15, 30.0)", plain == (15, 30.0),
+          "got %r" % (plain,))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -293,6 +345,8 @@ if __name__ == "__main__":
     test_length_bounds()
     test_length_40_panels_and_tokens()
     test_phase1_nonzero_rc_checks_story_md_before_failing()
+    test_no_stills_defaults_and_validation()
+    test_no_stills_orthogonal_to_length()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
