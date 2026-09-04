@@ -481,6 +481,27 @@ def test_default_dry_run_plan_unchanged():
           "--no-images" not in out and "--engine chain" not in out)
 
 
+# ---------------------------------------------------------------------------
+# L19 (Task 25.1, inserted fix): both qwen-agent invocation sites (phase1_story's
+# real cmd and _print_dry_run_plan's preview phase1_cmd) pass --workspace WS
+# immediately after the qwen-agent script path, so qwen-agent writes story.md
+# into the same repo copy that ltx-movie itself is running from.
+# ---------------------------------------------------------------------------
+
+def test_phase1_qwen_agent_gets_workspace_flag():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L19a exactly 2 qwen-agent invocations pass --workspace WS",
+          text.count('"--workspace", WS,') == 2,
+          "got %r occurrences" % text.count('"--workspace", WS,'))
+    check("L19b --workspace WS immediately follows the qwen-agent path in cmd",
+          'cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),\n'
+          '               "--workspace", WS,' in text)
+    check("L19c --workspace WS immediately follows the qwen-agent path in phase1_cmd",
+          'phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),\n'
+          '                  "--workspace", WS,' in text)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -501,6 +522,7 @@ if __name__ == "__main__":
     test_no_stills_phase_sequencing_source()
     test_no_stills_dry_run_plan()
     test_default_dry_run_plan_unchanged()
+    test_phase1_qwen_agent_gets_workspace_flag()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

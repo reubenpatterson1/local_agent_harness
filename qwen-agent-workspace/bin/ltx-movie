@@ -365,6 +365,7 @@ def phase1_story(args):
         max_tokens = _phase1_max_tokens(args.panels)
         timeout = _phase1_timeout(args.panels)
         cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
+               "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
                "--request-timeout", "600", "--user-prompt", prompt]
         print("Running (timeout %ds): %s" % (
@@ -613,6 +614,7 @@ def _print_dry_run_plan(args):
     print("Would skip if %s already exists (pass --force-story to regenerate)."
           % paths["story_md"])
     phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
+                  "--workspace", WS,
                   "--max-tokens", str(max_tokens), "--max-rounds", "4",
                   "--request-timeout", "600", "--user-prompt", prompt]
     print("Command (subprocess timeout %ds): %s" % (timeout, shlex.join(phase1_cmd)))
