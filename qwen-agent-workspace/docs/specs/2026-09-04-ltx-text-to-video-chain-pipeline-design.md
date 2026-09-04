@@ -652,6 +652,9 @@ Update the `--continue-from` help text's "The positional image_path is used only
 this mode." sentence to also state that the positional `prompt` is now the continuation's own prompt and need
 not match the base's, and that `--num-frames` may differ from the base's.
 
+`bin/ltx-generate --chain N` is unaffected by this change: it always passes a prompt identical to the base's,
+so it always takes Section 6.2's identical-prompt branch and its behavior is unchanged.
+
 ### 6.2 Encode the continuation's own prompt when it differs (mandatory companion change)
 
 Per G5, dropping the equality check alone would leave every follower dying in stage 2 with `stale

@@ -94,8 +94,12 @@ def build_parser():
                                "base+segments. Skips ltx-chain's own stage-1 encode "
                                "(reuses the base embeds.pt) and the ceiling pre-check (the "
                                "base already gated this geometry). The positional "
-                               "image_path is used only for validation/logging in this "
-                               "mode."))
+                               "image_path is used only for "
+                               "validation/logging in this mode. The positional "
+                               "prompt is the continuation's OWN prompt and need "
+                               "not match the base's (stage 1 is re-encoded when "
+                               "it differs); --num-frames may also differ from "
+                               "the base's."))
     return parser
 
 
@@ -142,7 +146,7 @@ def _build_request(image_path, prompt, negative_prompt, width, height, num_frame
 
 
 _CONTINUE_CHECKED_FIELDS = [
-    "prompt", "negative_prompt", "width", "height", "num_frames", "fps",
+    "negative_prompt", "width", "height", "fps",
     "frame_rate", "wide", "seed",
 ]
 
@@ -150,9 +154,18 @@ _CONTINUE_CHECKED_FIELDS = [
 def _continue_settings_mismatch(base_request, args):
     """Return an error message if a --continue-from base run's settings don't
     match the requested args, else None. A continuation must use the same
-    settings as its base (prompt, negative_prompt, width, height, num_frames,
-    fps, frame_rate, wide, seed); this checks each in turn and reports only
-    the first mismatch found."""
+    settings as its base (negative_prompt, width, height, fps, frame_rate,
+    wide, seed); this checks each in turn and reports only the first mismatch
+    found.
+
+    The prompt is deliberately NOT matched: a continuation is allowed to
+    describe new narrative content while still continuing visually from the
+    base's last frame. num_frames is deliberately NOT matched either: a
+    continuation is allowed its own length, because chaining conditions only
+    on the base's last frame and carries no dependency on matching segment
+    lengths (see docs/specs/2026-09-04-ltx-text-to-video-chain-pipeline-
+    design.md Section 6 and D7).
+    """
     for field in _CONTINUE_CHECKED_FIELDS:
         base_val = base_request.get(field)
         arg_val = getattr(args, field)

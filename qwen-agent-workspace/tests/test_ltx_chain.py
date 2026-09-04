@@ -216,6 +216,62 @@ def test_continue_settings_mismatch():
     )
 
 
+# ---------------------------------------------------------------------------
+# T37: _CONTINUE_CHECKED_FIELDS is exactly the seven still-validated fields
+# (D4 drops prompt, D7 drops num_frames -- asserted as an exact set so
+# neither a re-added field nor a newly dropped one passes silently)
+# ---------------------------------------------------------------------------
+
+def test_continue_checked_fields_exact_set():
+    expected = {"negative_prompt", "width", "height", "fps", "frame_rate", "wide", "seed"}
+    check("T37 _CONTINUE_CHECKED_FIELDS set equality",
+          set(chain._CONTINUE_CHECKED_FIELDS) == expected,
+          "got %r" % sorted(chain._CONTINUE_CHECKED_FIELDS))
+
+
+# ---------------------------------------------------------------------------
+# T38: a differing prompt, a differing num_frames, and both together are all
+# accepted; each of the seven remaining fields still hard-fails
+# ---------------------------------------------------------------------------
+
+def test_continue_relaxed_prompt_and_num_frames():
+    base_request = _matching_base_request()
+
+    args = _make_args(prompt="a COMPLETELY different prompt")
+    check("T38a prompt-only difference -> None",
+          chain._continue_settings_mismatch(base_request, args) is None,
+          "got %r" % chain._continue_settings_mismatch(base_request, args))
+
+    args = _make_args(prompt="a prompt", num_frames=25)
+    check("T38b num_frames-only difference -> None",
+          chain._continue_settings_mismatch(base_request, args) is None,
+          "got %r" % chain._continue_settings_mismatch(base_request, args))
+
+    args = _make_args(prompt="a new prompt", num_frames=25)
+    check("T38c prompt AND num_frames both differ -> None (the normal follower case)",
+          chain._continue_settings_mismatch(base_request, args) is None,
+          "got %r" % chain._continue_settings_mismatch(base_request, args))
+
+
+def test_continue_remaining_fields_still_checked():
+    base_request = _matching_base_request()
+    cases = [
+        ("negative_prompt", "something else"),
+        ("width", 999),
+        ("height", 999),
+        ("fps", 12),
+        ("frame_rate", 12),
+        ("wide", True),
+        ("seed", 42),
+    ]
+    for field, value in cases:
+        args = _make_args(prompt="a prompt", **{field: value})
+        result = chain._continue_settings_mismatch(base_request, args)
+        check("T39 %s mismatch is still a hard error naming the field" % field,
+              result is not None and field in result and "does not match requested" in result,
+              "got %r" % result)
+
+
 if __name__ == "__main__":
     test_argparse_defaults()
     test_argparse_representative()
@@ -224,6 +280,9 @@ if __name__ == "__main__":
     test_segment_image()
     test_continue_from_argparse()
     test_continue_settings_mismatch()
+    test_continue_checked_fields_exact_set()
+    test_continue_relaxed_prompt_and_num_frames()
+    test_continue_remaining_fields_still_checked()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
