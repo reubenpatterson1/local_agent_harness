@@ -1534,6 +1534,23 @@ def test_ast_guard_retry_pass_follower_branch():
           'result["attempts"] = 2' in source)
 
 
+# ---------------------------------------------------------------------------
+# C13: source guard -- the three summary keys, with per-panel nulls
+# ---------------------------------------------------------------------------
+
+def test_summary_engine_keys_present():
+    with open(_VIDEO_PATH) as f:
+        source = f.read()
+    check("C13a engine key", '"engine": args.engine,' in source)
+    check("C13b reanchor_every is null under per-panel",
+          '"reanchor_every": args.reanchor_every if args.engine == "chain" else None,' in source)
+    check("C13c groups is null under per-panel",
+          '"groups": _chain_groups(units) if args.engine == "chain" else None,' in source)
+    for key in ('"requested_units"', '"completed_units"', '"unit_frames"',
+                '"intended_total_frames"', '"actual_total_frames"', '"stopped_reason"'):
+        check("C13d %s not removed" % key, key in source)
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1586,6 +1603,7 @@ if __name__ == "__main__":
     test_render_chain_follower_single_hop()
     test_render_chain_follower_two_hop_uses_predecessor_seg1()
     test_ast_guard_retry_pass_follower_branch()
+    test_summary_engine_keys_present()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

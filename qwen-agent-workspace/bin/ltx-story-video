@@ -1194,6 +1194,9 @@ def main(argv=None):
         summary = {
             "schema_version": 2,
             "mode": args.mode,
+            "engine": args.engine,
+            "reanchor_every": args.reanchor_every if args.engine == "chain" else None,
+            "groups": _chain_groups(units) if args.engine == "chain" else None,
             "story_id": manifest.get("story_id", "story"),
             "manifest_path": os.path.abspath(args.manifest_path),
             "manifest_schema_version": manifest.get("schema_version", 1),
