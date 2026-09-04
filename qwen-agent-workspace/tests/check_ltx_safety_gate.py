@@ -17,10 +17,13 @@ satisfy the check.
 
 import ast
 import io
+import os
 import sys
 import tokenize
 
-DEFAULT_TARGET = "/Users/reubenpatterson/qwen-agent-workspace/ltx_video_skill.py"
+DEFAULT_TARGET = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "ltx_video_skill.py"
+)
 
 TARGET_FUNCTION = "_stage3_screen_and_export"
 REQUIRED_CALLEE = "assert_frames_safe"
