@@ -1059,6 +1059,81 @@ both on the `n = 1 + 8k` lattice), and inspect the frames and `peaks_stage2.json
 turns up, it is additional scope not yet designed, and OQ2 must be brought back to the user rather than
 worked around in code.
 
+**CLOSED-PASS 2026-09-04.**
+
+Static read (installed `diffusers/pipelines/ltx/pipeline_ltx_condition.py`,
+`/Users/reubenpatterson/Library/Python/3.13/lib/python/site-packages/diffusers/pipelines/ltx/pipeline_ltx_condition.py`,
+and `ltx_video_skill.py` / `bin/ltx-chain` in `/Users/reubenpatterson/qwen-agent-workspace`), answering the four
+concretely-unverified points above:
+
+1. **No shape/index/coordinate in the conditioning/latent path is derived from a base run's `num_frames`.**
+   `ltx_video_skill.py` lines 543 and 569 pass `num_frames=request["num_frames"]` — this call's own request
+   dict — into both stage-2 pipeline invocations. `pipeline_ltx_condition.py` line 689:
+   `num_latent_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1` is computed purely from
+   the `num_frames` argument of *this* call (threaded through from `__call__` line 1151, itself the caller's
+   own `num_frames`, line 862/916). The frame-0 image condition writes at
+   `latents[:, :, :num_cond_frames]` (lines 726–729, the `if frame_index == 0:` branch — the branch always
+   taken for a single-PNG image condition, since `ltx_video_skill.py` line 160 always sets
+   `"frame_index": 0` for image conditions), against `latents` allocated at lines 693–705 with shape
+   `(batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)` — entirely a function
+   of this call's own `num_frames`/`height`/`width`. `conditioning_mask` (line 792) is
+   `condition_latent_frames_mask.gather(1, video_ids[:, 0])`, where both operands (`condition_latent_frames_mask`,
+   lines 708–710; `video_ids`, lines 782–790) are sized from this call's own `num_latent_frames`. Nothing here
+   references a prior call.
+2. **`embeds.pt` carries no length-dependent state.** `ltx_video_skill.py` `_stage1_encode` (lines 334–412):
+   `_encode()` (lines 369–384) is a function of `request["prompt"]` / `request["negative_prompt"]` tokenized
+   with `max_length=MAX_SEQUENCE_LENGTH` (line 375; `MAX_SEQUENCE_LENGTH = 256` at line 96). The saved dict
+   (lines 394–411) contains only `prompt_embeds`, `prompt_attention_mask`, `negative_prompt_embeds`,
+   `negative_prompt_attention_mask`, and a `meta` block of `model_id`/`prompt`/`negative_prompt`/
+   `max_sequence_length`/`dtype`/`diffusers_version`/`transformers_version`. No `num_frames`, `width`,
+   `height`, `fps`, or `seed` appears anywhere in it.
+3. **A continuation reuses only a PNG path plus `embeds.pt` at generation time; `base_request_dict` has no
+   other reader.** `bin/ltx-chain` line 313–314: `input_image = os.path.abspath(base_frames[-1]) if
+   args.continue_from ...`, where `base_frames` is the sorted glob of the base run's `frames/frame_*.png`
+   (line 239). `grep -n "base_request_dict" bin/ltx-chain` returns exactly two lines: the assignment (line
+   251, `base_request_dict = json.load(f)`) and its single use (line 256,
+   `mismatch = _continue_settings_mismatch(base_request_dict, args)`) — a pure comparison against `args`
+   (`_CONTINUE_CHECKED_FIELDS`, lines 144–147: `prompt, negative_prompt, width, height, num_frames, fps,
+   frame_rate, wide, seed`) that only produces an error string on mismatch and feeds nothing from the base
+   into generation. This is precisely the check D7 removes.
+4. **`ltx-chain`'s geometry validation for the continuation's own length runs unconditionally.**
+   `bin/ltx-chain` line 224, `L._validate_geometry(args.width, args.height, args.num_frames)`, executes
+   inside the top-level `try` at lines 223–227, which precedes the `if args.continue_from:` block starting at
+   line 232 — it is not nested inside it, so a continuation's own requested length is still lattice-checked
+   regardless of `--continue-from`.
+
+Live probe, two directions, both on the `n = 1 + 8k` lattice at 512×512 (ceiling 73 frames per
+`ltx_ceiling.json` — neither 25 nor 49 tests a ceiling edge), executed against the unmodified,
+installed `bin/ltx-chain` (`base_request_dict`'s only reader per point 3 above is the mismatch
+comparison, so editing a copy's `request.json` `num_frames` to match the continuation's requested value —
+while the real on-disk frame count is left untouched — exercises "a continuation whose length differs
+from what the base actually generated" without any code change):
+
+- **Direction A, 25 → 49** (Task 4's real 25-frame T2V base, copy's `request.json` `num_frames` edited to
+  49, continuation run with `--num-frames 49`): run root
+  `/Users/reubenpatterson/qwen-agent-workspace/generated/ltx_chains/20260904T183130Z-40106346`. Exit 0.
+  `seg1/frames/` held **49** PNGs (the requested value, not the base's real 25).
+  `seg1/peaks_stage2.json`: `mps_driver_gib=28.95`, `mps_current_gib=27.19` (cap =
+  `mps_guard.FRACTION_STAGE2` (0.82) × host total 48.0 GiB = 39.36 GiB — well under). No
+  `sentinel_abort` line in `seg1/mem_stage2.jsonl`. Visual check of the base's last frame plus seg1's
+  first three and last three frames: continuous composition across the boundary, ordinary chaining
+  drift only, no seam/stutter/discontinuity attributable to the length change.
+- **Direction B, 49 → 25** (a fresh 49-frame T2V base generated via `bin/ltx-generate --t2v --num-frames
+  49 ...`, run dir `/Users/reubenpatterson/qwen-agent-workspace/generated/ltx_runs/20260904T183401Z-7e56a17b`;
+  copy's `request.json` `num_frames` edited to 25, continuation run with `--num-frames 25`): run root
+  `/Users/reubenpatterson/qwen-agent-workspace/generated/ltx_chains/20260904T185124Z-8483de07`. Exit 0.
+  `seg1/frames/` held **25** PNGs (the requested value, not the base's real 49).
+  `seg1/peaks_stage2.json`: `mps_driver_gib=28.37`, `mps_current_gib=26.94` (same 39.36 GiB cap — well
+  under). No `sentinel_abort` line in `seg1/mem_stage2.jsonl`. Visual check of the base's last frame plus
+  seg1's first three and last three frames: continuous, ordinary drift only, qualitatively the same as
+  Direction A — no direction-specific seam.
+
+Both directions exit 0, both `seg1` frame counts equal the requested value (not the base's actual
+generated length), no sentinel abort in either direction, both peaks well under cap, and neither
+direction shows a length-attributable seam. No real dependency on matching base/continuation
+`num_frames` turned up anywhere in the conditioning/latent path, `embeds.pt`, or `ltx-chain`'s
+continuation plumbing. OQ2 is closed; Task 6 (removing the `num_frames` equality check) may proceed.
+
 ### OQ3 — confirm the derived word band
 
 Section 12.2's DR6 (the `85-130` word band for the collapsed `Prompt:` field) was derived, not approved:
