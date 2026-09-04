@@ -1263,6 +1263,110 @@ def test_per_panel_dry_run_unchanged():
               "conditions=[" in text and "T2V opener" not in text, "got %r" % text)
 
 
+# ---------------------------------------------------------------------------
+# C9: nested ltx-chain command line (I4 + DR4) -- exact argv
+# ---------------------------------------------------------------------------
+
+def test_build_chain_follower_cmd():
+    args = story_video.build_parser().parse_args(
+        ["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain",
+         "--width", "512", "--height", "512", "--fps", "24", "--frame-rate", "24",
+         "--seed", "0", "--settle", "6", "--negative-prompt", "neg"])
+    unit = {"index": 3, "label": "panel-3", "seed": 3, "prompt": "shot three",
+            "num_frames": 49, "conditions": [], "role": "follower", "group": 1,
+            "continue_from_index": 2}
+    cmd = story_video._build_chain_follower_cmd(
+        args, unit, "/base/dir", "/base/dir/frames/frame_00032.png", "/cell/_chain_scratch.mp4")
+    check("C9a resolves ltx-chain next to this tool, not via WS",
+          cmd[1] == os.path.join(os.path.dirname(os.path.realpath(_VIDEO_PATH)), "ltx-chain"),
+          "got %r" % cmd[1])
+    for flag in ("--continue-from", "--segments", "--no-prep", "--keep-down", "--force"):
+        check("C9b %s present" % flag, flag in cmd, "got %r" % cmd)
+    check("C9c --segments is 1", cmd[cmd.index("--segments") + 1] == "1", "got %r" % cmd)
+    check("C9d --num-frames is the FOLLOWER's own length",
+          cmd[cmd.index("--num-frames") + 1] == "49", "got %r" % cmd)
+    check("C9e --seed is the PREDECESSOR's seed (args.seed + continue_from_index)",
+          cmd[cmd.index("--seed") + 1] == "2", "got %r" % cmd)
+    check("C9f --negative-prompt is passed explicitly",
+          cmd[cmd.index("--negative-prompt") + 1] == "neg", "got %r" % cmd)
+    check("C9g positionals are last: last frame, prompt, scratch mp4",
+          cmd[-3:] == ["/base/dir/frames/frame_00032.png", "shot three",
+                       "/cell/_chain_scratch.mp4"], "got %r" % cmd[-3:])
+    check("C9h --wide/--allow-override/--relax-supply absent when off",
+          not ({"--wide", "--allow-override", "--relax-supply"} & set(cmd)), "got %r" % cmd)
+
+    args2 = story_video.build_parser().parse_args(
+        ["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain",
+         "--wide", "--allow-override", "--relax-supply"])
+    cmd2 = story_video._build_chain_follower_cmd(args2, unit, "/b", "/b/f.png", "/c/s.mp4")
+    check("C9i pass-through flags forwarded when set",
+          {"--wide", "--allow-override", "--relax-supply"} <= set(cmd2), "got %r" % cmd2)
+
+
+# ---------------------------------------------------------------------------
+# C10: run-root parsing and stdout marker extraction
+# ---------------------------------------------------------------------------
+
+def test_chain_run_root_parsing():
+    out = ("=== prep ===\nrun root: /a/generated/ltx_chains/first\n"
+           "some noise\nrun root: /a/generated/ltx_chains/second\nDONE\n")
+    check("C10a the LAST run root wins",
+          story_video._chain_run_root_from_stdout(out) == "/a/generated/ltx_chains/second",
+          "got %r" % story_video._chain_run_root_from_stdout(out))
+    check("C10b None when absent",
+          story_video._chain_run_root_from_stdout("no root here\n") is None)
+    check("C10c marker line extracted",
+          story_video._find_stdout_line(
+              "x\nError: --continue-from base run width=512 does not match requested "
+              "width=704 (continuation must use the same settings as the base)\ny",
+              "does not match requested").startswith("Error: --continue-from base run width"))
+    check("C10d absent marker reports itself",
+          "not found" in story_video._find_stdout_line("nothing", "does not match requested"))
+
+
+# ---------------------------------------------------------------------------
+# C11: AST guards -- the I4 invariant and the seg1-only harvest (spec 9.1
+# items 13 and 14)
+# ---------------------------------------------------------------------------
+
+def _func_def(tree, name):
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def test_ast_guard_chain_follower_invocation():
+    with open(_VIDEO_PATH) as f:
+        source = f.read()
+    tree = ast.parse(source, filename=_VIDEO_PATH)
+    fn = _func_def(tree, "_build_chain_follower_cmd")
+    check("C11a _build_chain_follower_cmd exists", fn is not None)
+    consts = {n.value for n in ast.walk(fn)
+              if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    for flag in ("--no-prep", "--keep-down", "--segments", "--continue-from"):
+        check("C11b %s is a literal in the nested argv (I4)" % flag, flag in consts,
+              "got %r" % sorted(consts))
+
+
+def test_ast_guard_follower_harvests_seg1_only():
+    with open(_VIDEO_PATH) as f:
+        source = f.read()
+    tree = ast.parse(source, filename=_VIDEO_PATH)
+    fn = _func_def(tree, "_render_chain_follower")
+    check("C11c _render_chain_follower exists", fn is not None)
+    body = ast.get_source_segment(source, fn) or ""
+    check("C11d the base for the NEXT follower is the seg1 dir",
+          'seg_dir = os.path.join(chain_run_root, "seg1")' in body, "got %r" % body[:400])
+    check("C11e frames are globbed from seg1/frames only",
+          'glob.glob(os.path.join(seg_dir, "frames", "frame_*.png"))' in body)
+    check("C11f the throwaway mp4 is never a frame source",
+          "_chain_scratch.mp4" in body and ".mp4" not in body.split("frames")[0][-40:],
+          "got %r" % body[:400])
+    check("C11g the scratch mp4 is deleted on both paths",
+          body.count("os.remove(scratch_mp4)") >= 2, "got %r" % body.count("os.remove(scratch_mp4)"))
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1308,6 +1412,10 @@ if __name__ == "__main__":
     test_build_request_mode_field()
     test_chain_dry_run_output()
     test_per_panel_dry_run_unchanged()
+    test_build_chain_follower_cmd()
+    test_chain_run_root_parsing()
+    test_ast_guard_chain_follower_invocation()
+    test_ast_guard_follower_harvests_seg1_only()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

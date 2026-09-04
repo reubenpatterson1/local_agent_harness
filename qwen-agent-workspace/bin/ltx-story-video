@@ -432,6 +432,195 @@ def _spawn_stage(stage_num, run_dir, env_overrides=None):
     return proc.returncode, proc.stdout or ""
 
 
+def _chain_run_root_from_stdout(stdout):
+    """Return the LAST `run root: <path>` value a nested bin/ltx-chain printed,
+    or None if it never printed one."""
+    root = None
+    for line in (stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("run root: "):
+            root = stripped[len("run root: "):].strip()
+    return root
+
+
+def _find_stdout_line(stdout, needle):
+    """Return the first line of `stdout` containing `needle`, stripped."""
+    for line in (stdout or "").splitlines():
+        if needle in line:
+            return line.strip()
+    return "(marker %r not found in child output)" % needle
+
+
+def _write_chain_log(cell, stdout):
+    """Persist the last 40 lines of a failed nested ltx-chain's output."""
+    with open(os.path.join(cell, "chain.log"), "w") as f:
+        f.write("\n".join((stdout or "").splitlines()[-40:]))
+
+
+def _build_chain_follower_cmd(args, unit, base_dir, base_last_frame, scratch_mp4):
+    """Build the nested bin/ltx-chain command line for one follower panel.
+
+    --no-prep --keep-down are load-bearing (I4): bin/ltx-story-video already
+    prepped the host and owns the restore in its own try/finally. Without
+    them the child would prep again and, on exit, run bin/ltx-host-restore --
+    bringing the vLLM servers back UP mid-render. Same pairing
+    bin/ltx-generate line 350 already uses for nested chaining.
+
+    --force: _chain_scratch.mp4 may exist from a retry attempt.
+
+    --num-frames is the follower's OWN allocated length, legal because D7
+    removed num_frames from ltx-chain's validated set. --seed is the
+    PREDECESSOR's seed: ltx-chain validates it against the base
+    request.json and then uses seed+1 for its single segment, which equals
+    args.seed + unit["index"] -- exactly the seed the per-panel engine
+    would have used. Do NOT "simplify" this to args.seed + unit["index"];
+    that would fail the base-seed match.
+
+    The positional image_path is the predecessor's last frame: continuation
+    mode ignores it for conditioning but requires it to exist, and passing
+    the very image it will use keeps the log honest.
+
+    ltx-chain is resolved next to THIS file rather than via WS, so the chain
+    engine always runs the same copy of the tool it was developed and tested
+    against. The WS constant itself is deliberately left untouched.
+    """
+    chain_tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ltx-chain")
+    cmd = [
+        sys.executable, chain_tool,
+        "--continue-from", base_dir,
+        "--segments", "1",
+        "--no-prep", "--keep-down", "--force",
+        "--width", str(args.width),
+        "--height", str(args.height),
+        "--num-frames", str(unit["num_frames"]),
+        "--fps", str(args.fps),
+        "--frame-rate", str(args.frame_rate),
+        "--seed", str(args.seed + unit["continue_from_index"]),
+        "--settle", str(args.settle),
+        "--negative-prompt", args.negative_prompt,
+    ]
+    if args.wide:
+        cmd.append("--wide")
+    if args.allow_override:
+        cmd.append("--allow-override")
+    if args.relax_supply:
+        cmd.append("--relax-supply")
+    cmd.extend([base_last_frame, unit["prompt"], scratch_mp4])
+    return cmd
+
+
+def _render_chain_follower(args, unit, cell, chain_base_by_index):
+    """Render one follower panel by nesting bin/ltx-chain --continue-from.
+
+    Returns a dict with "status" in {"ok", "error", "content_blocked",
+    "hard_abort"} and always a "result" (the dict stored in unit_results):
+      ok             -> also "frames" (ordered PNG paths) and "base_for_next"
+                        (the dir a LATER follower continues from).
+      error          -> an ordinary unit failure; the caller applies
+                        --on-unit-failure / --max-consecutive-failures and
+                        retry eligibility.
+      content_blocked-> terminal for the whole run, never skippable.
+      hard_abort     -> a code bug; also "message" and "stopped_reason".
+
+    The base is NOT <run_root>/panel-<k>: when the predecessor is itself a
+    follower, its embeds.pt/request.json/frames/ live in the nested chain
+    run's seg1/ cell. chain_base_by_index records whichever it is.
+    """
+    label = unit["label"]
+    base_index = unit["continue_from_index"]
+    base_dir = chain_base_by_index.get(base_index)
+
+    if base_dir is None:
+        print("unit %s SKIPPED (chain base panel-%d did not complete)" % (label, base_index))
+        return {
+            "status": "error",
+            "result": {"unit": label, "status": "skipped_no_base",
+                       "base": "panel-%d" % base_index},
+        }
+
+    base_frames = sorted(glob.glob(os.path.join(base_dir, "frames", "frame_*.png")))
+    missing = [name for name in ("embeds.pt", "request.json")
+               if not os.path.isfile(os.path.join(base_dir, name))]
+    if not base_frames:
+        missing.append("frames/frame_*.png")
+    if missing:
+        return {
+            "status": "hard_abort",
+            "stopped_reason": "chain_base_incomplete",
+            "message": ("INTERNAL ERROR: chain follower %s cannot continue from %s: "
+                        "missing %s. Those artifacts are written by the predecessor's own "
+                        "stages, so this is a code bug, not an operator error."
+                        % (label, base_dir, ", ".join(missing))),
+            "result": {"unit": label, "status": "chain_base_incomplete", "base": base_dir},
+        }
+
+    scratch_mp4 = os.path.join(cell, "_chain_scratch.mp4")
+    if os.path.exists(scratch_mp4):
+        os.remove(scratch_mp4)
+    cmd = _build_chain_follower_cmd(args, unit, base_dir, base_frames[-1], scratch_mp4)
+    print("unit %s: nesting %s" % (label, shlex.join(cmd)))
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    out = proc.stdout or ""
+    sys.stdout.write(out)
+    if os.path.exists(scratch_mp4):
+        os.remove(scratch_mp4)
+
+    if "BLOCKED by content safety" in out:
+        return {"status": "content_blocked",
+                "result": {"unit": label, "status": "content_blocked"}}
+
+    if proc.returncode == 2 and "does not match requested" in out:
+        return {
+            "status": "hard_abort",
+            "stopped_reason": "chain_settings_mismatch",
+            "message": ("INTERNAL ERROR: chain follower %s failed --continue-from settings "
+                        "validation against panel-%d: %s. Every panel in one run shares "
+                        "these settings by construction, so this is a code bug, not an "
+                        "operator error."
+                        % (label, base_index, _find_stdout_line(out, "does not match requested"))),
+            "result": {"unit": label, "status": "chain_settings_mismatch", "rc": 2},
+        }
+    if proc.returncode == 2 and "--continue-from run has no" in out:
+        return {
+            "status": "hard_abort",
+            "stopped_reason": "chain_base_incomplete",
+            "message": ("INTERNAL ERROR: chain follower %s reported an incomplete "
+                        "--continue-from base %s: %s. Those artifacts are written by the "
+                        "predecessor's own stages, so this is a code bug, not an operator "
+                        "error."
+                        % (label, base_dir, _find_stdout_line(out, "--continue-from run has no"))),
+            "result": {"unit": label, "status": "chain_base_incomplete", "rc": 2},
+        }
+
+    chain_run_root = _chain_run_root_from_stdout(out)
+    if chain_run_root is None:
+        _write_chain_log(cell, out)
+        print("unit %s FAILED (chain_error, rc=%d): could not determine chain run root "
+              "from ltx-chain output" % (label, proc.returncode), file=sys.stderr)
+        return {"status": "error",
+                "result": {"unit": label, "status": "chain_error", "rc": proc.returncode,
+                           "reason": "could not determine chain run root from "
+                                     "ltx-chain output"}}
+
+    seg_dir = os.path.join(chain_run_root, "seg1")
+    frames = sorted(glob.glob(os.path.join(seg_dir, "frames", "frame_*.png")))
+    if proc.returncode != 0 or len(frames) != unit["num_frames"]:
+        _write_chain_log(cell, out)
+        print("unit %s FAILED (chain_error, rc=%d, frames=%d, expected=%d)"
+              % (label, proc.returncode, len(frames), unit["num_frames"]), file=sys.stderr)
+        return {"status": "error",
+                "result": {"unit": label, "status": "chain_error", "rc": proc.returncode,
+                           "frames": len(frames), "chain_run_root": chain_run_root}}
+
+    return {
+        "status": "ok",
+        "frames": frames,
+        "base_for_next": seg_dir,
+        "result": {"unit": label, "status": "ok", "frames": len(frames),
+                   "chain_run_root": chain_run_root},
+    }
+
+
 def _run_input_content_screen(image_paths):
     """Screen every input image in one throwaway subprocess (never imports
     content_safety, or torch by extension, into this process). Prints
@@ -673,9 +862,52 @@ def main(argv=None):
         consecutive_failures = 0
         stopped_reason = None
 
+        # --engine chain: the directory a LATER follower may use as its
+        # --continue-from base, keyed on the unit index that produced it. An
+        # opener publishes its in-process cell; a follower publishes the
+        # nested chain run's seg1/ cell, which is where that panel's
+        # request.json, embeds.pt and frames/ actually live (spec C5).
+        chain_base_by_index = {}
+
         for unit in units:
             cell = os.path.join(run_root, unit["label"])
             os.makedirs(cell)
+
+            if unit.get("role") == "follower":
+                print("unit %d/%d (%s) starting as a chain follower of panel-%d"
+                      % (unit["index"], len(units), unit["label"],
+                         unit["continue_from_index"]))
+                outcome = _render_chain_follower(args, unit, cell, chain_base_by_index)
+                unit_results[unit["index"]] = outcome["result"]
+                if outcome["status"] == "hard_abort":
+                    print(outcome["message"], file=sys.stderr)
+                    stopped_reason = outcome["stopped_reason"]
+                    break
+                if outcome["status"] == "content_blocked":
+                    print("unit %s BLOCKED by content safety (nested ltx-chain)"
+                          % unit["label"])
+                    content_blocked = True
+                    break
+                if outcome["status"] == "ok":
+                    unit_frames_by_index[unit["index"]] = outcome["frames"]
+                    chain_base_by_index[unit["index"]] = outcome["base_for_next"]
+                    completed += 1
+                    print("unit %s ok: %d frames (chain follower)"
+                          % (unit["label"], len(outcome["frames"])))
+                    consecutive_failures = 0
+                    _unit_boundary_pause(args.unit_pause)
+                    continue
+                consecutive_failures += 1
+                if args.on_unit_failure == "stop":
+                    break
+                if args.max_consecutive_failures > 0 and consecutive_failures >= args.max_consecutive_failures:
+                    never_attempted = len(units) - len(unit_results)
+                    print("STOPPING: %d consecutive unit failures (host likely degraded); "
+                          "%d unit(s) never attempted" % (consecutive_failures, never_attempted))
+                    stopped_reason = "consecutive_failures"
+                    break
+                _unit_boundary_pause(args.unit_pause)
+                continue
 
             request = _build_request(
                 unit["prompt"], args.negative_prompt, args.width, args.height, unit["num_frames"],
@@ -783,6 +1015,8 @@ def main(argv=None):
                 continue
 
             unit_frames_by_index[unit["index"]] = frames
+            if unit.get("role") == "opener":
+                chain_base_by_index[unit["index"]] = cell
             completed += 1
             unit_results[unit["index"]] = {"unit": unit["label"], "status": "ok", "frames": len(frames)}
             print("unit %s ok: %d frames" % (unit["label"], len(frames)))
