@@ -98,6 +98,64 @@ def test_multiline_body_joined():
 
 
 # ---------------------------------------------------------------------------
+# M1: _parse_prompts_md accepts a Prompt: label, space-joins its wrapped
+# continuation lines, and leaves image/motion empty (DR2)
+# ---------------------------------------------------------------------------
+
+def test_parse_prompts_md_prompt_label():
+    with tempfile.TemporaryDirectory() as tmp:
+        md = os.path.join(tmp, "story.md")
+        with open(md, "w") as f:
+            f.write(
+                "# Story\n\nA short narrative line.\n\n"
+                "## Panel 1 — Opening\n"
+                "Prompt: a wide establishing shot of a stone courtyard,\n"
+                "cold dawn light, slow drone push-in\n"
+                "Narration: The courtyard woke slowly.\n"
+            )
+        _narrative, panels = story_manifest._parse_prompts_md(md)
+        p = panels[0]
+        check("M1a prompt joins wrapped lines with single spaces",
+              p["prompt"] == "a wide establishing shot of a stone courtyard, "
+                             "cold dawn light, slow drone push-in",
+              "got %r" % p["prompt"])
+        check("M1b image is empty", p["image"] == "", "got %r" % p["image"])
+        check("M1c motion is empty", p["motion"] == "", "got %r" % p["motion"])
+        check("M1d narration parsed", p["narration"] == "The courtyard woke slowly.",
+              "got %r" % p["narration"])
+
+
+# ---------------------------------------------------------------------------
+# M2: back-compat -- an Image:/Motion: panel yields prompt == "" and
+# unchanged image/motion/narration/text
+# ---------------------------------------------------------------------------
+
+def test_parse_prompts_md_prompt_backcompat():
+    with tempfile.TemporaryDirectory() as tmp:
+        md = os.path.join(tmp, "story.md")
+        with open(md, "w") as f:
+            f.write(
+                "# Story\n\nA short narrative line.\n\n"
+                "## Panel 1 — Opening\n"
+                "Image: a stone courtyard at dawn\n"
+                "Motion: slow drone push-in\n"
+                "Narration: The courtyard woke slowly.\n"
+            )
+        _narrative, panels = story_manifest._parse_prompts_md(md)
+        p = panels[0]
+        check("M2a prompt is empty on an Image:/Motion: panel", p["prompt"] == "",
+              "got %r" % p["prompt"])
+        check("M2b image unchanged", p["image"] == "a stone courtyard at dawn",
+              "got %r" % p["image"])
+        check("M2c motion unchanged", p["motion"] == "slow drone push-in",
+              "got %r" % p["motion"])
+        check("M2d v1 whole-body text join preserved",
+              p["text"] == "Image: a stone courtyard at dawn Motion: slow drone push-in "
+                           "Narration: The courtyard woke slowly.",
+              "got %r" % p["text"])
+
+
+# ---------------------------------------------------------------------------
 # T3: narrative extraction picks the first non-blank prose line after
 # the leading "# " heading
 # ---------------------------------------------------------------------------
@@ -754,6 +812,8 @@ def test_load_manifest_rejects_bad_num_frames_v2():
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
+    test_parse_prompts_md_prompt_label()
+    test_parse_prompts_md_prompt_backcompat()
     test_narrative_extraction()
     test_glob_numeric_sort()
     test_glob_mtime_fallback()

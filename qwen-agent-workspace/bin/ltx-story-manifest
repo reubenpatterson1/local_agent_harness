@@ -63,7 +63,7 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 _PANEL_NUM_RE = re.compile(r"panel[-_]?(\d+)", re.IGNORECASE)
 _PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
-_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration):\s*(.*)$")
+_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt):\s*(.*)$")
 MAX_PROMPT_WORDS = 150
 
 
@@ -147,8 +147,8 @@ def _extract_narrative(lines):
 
 def _parse_prompts_md(path):
     """Return (narrative, [{'title': str, 'text': str, 'image': str,
-    'motion': str, 'narration': str}, ...]) parsed from a prompts.md file.
-    Raises OSError if the file cannot be read.
+    'motion': str, 'narration': str, 'prompt': str}, ...]) parsed from a
+    prompts.md file. Raises OSError if the file cannot be read.
 
     v2: inside a panel section, a line matching `Image:`/`Motion:`/
     `Narration:` opens that field; subsequent non-blank unlabeled lines
@@ -161,6 +161,10 @@ def _parse_prompts_md(path):
     decide whether to use `text` or the labeled fields by checking
     whether any of `image`/`motion`/`narration` is non-empty. This keeps
     v1 prompts.md files (no labels) parsing exactly as before.
+
+    A `Prompt:` label is the collapsed form used by bin/ltx-movie
+    --no-stills: one field describing the shot's content, setting, and
+    motion together. `prompt` is "" when the label never appears.
     """
     with open(path) as f:
         lines = f.read().splitlines()
@@ -189,7 +193,7 @@ def _parse_prompts_md(path):
     for p in panels:
         p["text"] = " ".join(s.strip() for s in p["body"] if s.strip())
 
-        fields = {"Image": [], "Motion": [], "Narration": []}
+        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": []}
         open_field = None
         for line in p["body"]:
             m = _PANEL_LABEL_RE.match(line)
@@ -204,6 +208,7 @@ def _parse_prompts_md(path):
         p["image"] = " ".join(fields["Image"])
         p["motion"] = " ".join(fields["Motion"])
         p["narration"] = " ".join(fields["Narration"])
+        p["prompt"] = " ".join(fields["Prompt"])
 
     return narrative, panels
 
