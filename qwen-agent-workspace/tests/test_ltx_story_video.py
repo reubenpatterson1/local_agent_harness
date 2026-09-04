@@ -995,6 +995,37 @@ def test_load_manifest_rejects_bad_num_frames_v2():
               "got %r" % message)
 
 
+# ---------------------------------------------------------------------------
+# C1: --engine/--reanchor-every defaults, and the two parse-time rejections
+# ---------------------------------------------------------------------------
+
+def test_engine_flag_defaults_and_rejections():
+    args = story_video.build_parser().parse_args(["m.json", "o.mp4", "--mode", "per-panel"])
+    check("C1a engine default is per-panel", args.engine == "per-panel", "got %r" % args.engine)
+    check("C1b reanchor_every default is 5", args.reanchor_every == 5,
+          "got %r" % args.reanchor_every)
+
+    args = story_video.build_parser().parse_args(
+        ["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain",
+         "--reanchor-every", "3"])
+    check("C1c engine parses to chain", args.engine == "chain", "got %r" % args.engine)
+    check("C1d reanchor_every parses to 3", args.reanchor_every == 3,
+          "got %r" % args.reanchor_every)
+
+    for argv, name in (
+        (["m.json", "o.mp4", "--mode", "transitions", "--engine", "chain"],
+         "C1e --engine chain + --mode transitions exits 2"),
+        (["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain",
+          "--reanchor-every", "0"], "C1f --reanchor-every 0 exits 2"),
+    ):
+        rc = None
+        try:
+            rc = story_video.main(argv)
+        except SystemExit as e:
+            rc = e.code
+        check(name, rc == 2, "got %r" % rc)
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1032,6 +1063,7 @@ if __name__ == "__main__":
     test_build_units_v1_fallback_num_frames()
     test_build_units_transitions_v2_frame_index()
     test_load_manifest_rejects_bad_num_frames_v2()
+    test_engine_flag_defaults_and_rejections()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

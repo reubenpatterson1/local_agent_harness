@@ -87,6 +87,18 @@ def build_parser():
     parser.add_argument("manifest_path", metavar="MANIFEST")
     parser.add_argument("output_path", metavar="OUTPUT_MP4")
     parser.add_argument("--mode", choices=["per-panel", "transitions"], required=True)
+    parser.add_argument("--engine", choices=["per-panel", "chain"], default="per-panel",
+                         help="per-panel (default) renders one in-process unit per panel "
+                              "from that panel's own image. chain renders each group's "
+                              "first panel by text-to-video and every later panel in the "
+                              "group by nesting bin/ltx-chain --continue-from on the "
+                              "previous panel's last generated frame; requires --mode "
+                              "per-panel. See docs/specs/2026-09-04-ltx-text-to-video-"
+                              "chain-pipeline-design.md.")
+    parser.add_argument("--reanchor-every", dest="reanchor_every", type=int, default=5,
+                         help="--engine chain only: group size. Panel i is a text-to-video "
+                              "opener iff (i-1) %% N == 0, a chain follower otherwise. "
+                              "Ignored (not an error) under --engine per-panel.")
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--num-frames", type=int, default=49)
@@ -410,6 +422,12 @@ def _concat_and_export(frame_sequence, output_path, fps):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.engine == "chain" and args.mode != "per-panel":
+        parser.error("--engine chain requires --mode per-panel "
+                     "(the transitions engine needs a panel image per unit)")
+    if args.reanchor_every < 1:
+        parser.error("--reanchor-every must be >= 1")
 
     # --- step 1: load + schema-validate the manifest ---
     try:
