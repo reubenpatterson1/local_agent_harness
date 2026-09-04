@@ -494,7 +494,10 @@ def _top5_rss():
     procs = []
     for p in psutil.process_iter(["name", "memory_info"]):
         try:
-            rss_gib = p.info["memory_info"].rss / (2 ** 30)
+            mem_info = p.info["memory_info"]
+            if mem_info is None:
+                continue
+            rss_gib = mem_info.rss / (2 ** 30)
             procs.append((p.info["name"] or str(p.pid), rss_gib))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

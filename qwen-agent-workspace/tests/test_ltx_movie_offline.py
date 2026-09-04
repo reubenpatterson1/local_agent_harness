@@ -502,6 +502,52 @@ def test_phase1_qwen_agent_gets_workspace_flag():
           '                  "--workspace", WS,' in text)
 
 
+# ---------------------------------------------------------------------------
+# L20 (Task 25.2, inserted fix): _top5_rss() skips a process whose
+# memory_info is None instead of raising AttributeError
+# ---------------------------------------------------------------------------
+
+def test_top5_rss_skips_none_memory_info():
+    import psutil
+
+    class _FakeMemInfo(object):
+        def __init__(self, rss):
+            self.rss = rss
+
+    class _FakeProc(object):
+        def __init__(self, pid, name, memory_info):
+            self.pid = pid
+            self.info = {"name": name, "memory_info": memory_info}
+
+    fake_procs = [
+        _FakeProc(1, "proc-a", _FakeMemInfo(3 * (2 ** 30))),
+        _FakeProc(2, "proc-none", None),
+        _FakeProc(3, "proc-b", _FakeMemInfo(7 * (2 ** 30))),
+    ]
+
+    def _fake_process_iter(attrs):
+        return iter(fake_procs)
+
+    orig_process_iter = psutil.process_iter
+    psutil.process_iter = _fake_process_iter
+    try:
+        result = ltx_movie._top5_rss()
+    finally:
+        psutil.process_iter = orig_process_iter
+
+    check("L20a _top5_rss does not raise on memory_info=None", True)
+    check("L20b proc-none is excluded from the result",
+          not any(name == "proc-none" for name, _ in result), "got %r" % (result,))
+    names = [name for name, _ in result]
+    check("L20c proc-a and proc-b are both included",
+          "proc-a" in names and "proc-b" in names, "got %r" % (result,))
+    check("L20d result is sorted by RSS descending",
+          result == sorted(result, key=lambda item: item[1], reverse=True),
+          "got %r" % (result,))
+    check("L20e proc-b (7 GiB) sorts before proc-a (3 GiB)",
+          result[0][0] == "proc-b", "got %r" % (result,))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -523,6 +569,7 @@ if __name__ == "__main__":
     test_no_stills_dry_run_plan()
     test_default_dry_run_plan_unchanged()
     test_phase1_qwen_agent_gets_workspace_flag()
+    test_top5_rss_skips_none_memory_info()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
