@@ -1513,6 +1513,27 @@ def test_render_chain_follower_two_hop_uses_predecessor_seg1():
               "got %r" % outcome3.get("base_for_next"))
 
 
+# ---------------------------------------------------------------------------
+# C12: source guard -- the retry pass branches on role before touching the
+# in-process stage machinery, and a skipped_no_base follower becomes
+# retry-eligible only once its base has completed
+# ---------------------------------------------------------------------------
+
+def test_ast_guard_retry_pass_follower_branch():
+    with open(_VIDEO_PATH) as f:
+        source = f.read()
+    tree = ast.parse(source, filename=_VIDEO_PATH)
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+             and n.func.id == "_render_chain_follower"]
+    check("C12a _render_chain_follower is called from two places "
+          "(main loop + retry pass)", len(calls) == 2, "got %r" % len(calls))
+    check("C12b the retry pass still rmtree's frames/ only for in-process units",
+          source.count('shutil.rmtree(os.path.join(cell, "frames"), ignore_errors=True)') == 1)
+    check("C12c a retried follower records attempts=2",
+          'result["attempts"] = 2' in source)
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1564,6 +1585,7 @@ if __name__ == "__main__":
     test_ast_guard_follower_harvests_seg1_only()
     test_render_chain_follower_single_hop()
     test_render_chain_follower_two_hop_uses_predecessor_seg1()
+    test_ast_guard_retry_pass_follower_branch()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

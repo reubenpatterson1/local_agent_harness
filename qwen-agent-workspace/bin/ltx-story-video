@@ -1048,6 +1048,36 @@ def main(argv=None):
             for unit in failed_units:
                 cell = os.path.join(run_root, unit["label"])
                 prior_status = unit_results[unit["index"]]["status"]
+
+                if unit.get("role") == "follower":
+                    # A follower has no partial state to reuse: re-run the whole
+                    # nested ltx-chain. A skipped_no_base follower is attempted
+                    # again only if its base has completed by now -- failed_units
+                    # preserves `units` order, so a base retried earlier in this
+                    # same pass has already published itself.
+                    outcome = _render_chain_follower(args, unit, cell, chain_base_by_index)
+                    result = dict(outcome["result"])
+                    result["attempts"] = 2
+                    if outcome["status"] == "ok":
+                        result["first_failure"] = prior_status
+                    unit_results[unit["index"]] = result
+                    if outcome["status"] == "hard_abort":
+                        print(outcome["message"], file=sys.stderr)
+                        stopped_reason = outcome["stopped_reason"]
+                        break
+                    if outcome["status"] == "content_blocked":
+                        print("unit %s retry BLOCKED by content safety (nested ltx-chain)"
+                              % unit["label"])
+                        content_blocked = True
+                        break
+                    if outcome["status"] == "ok":
+                        unit_frames_by_index[unit["index"]] = outcome["frames"]
+                        chain_base_by_index[unit["index"]] = outcome["base_for_next"]
+                        completed += 1
+                        print("unit %s retry ok: %d frames (chain follower)"
+                              % (unit["label"], len(outcome["frames"])))
+                    continue
+
                 shutil.rmtree(os.path.join(cell, "frames"), ignore_errors=True)
 
                 embeds_path = os.path.join(cell, "embeds.pt")
@@ -1122,6 +1152,8 @@ def main(argv=None):
                     continue
 
                 unit_frames_by_index[unit["index"]] = frames
+                if unit.get("role") == "opener":
+                    chain_base_by_index[unit["index"]] = cell
                 completed += 1
                 unit_results[unit["index"]] = {
                     "unit": unit["label"], "status": "ok", "frames": len(frames),
