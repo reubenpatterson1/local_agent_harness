@@ -1105,6 +1105,76 @@ def test_load_manifest_allow_null_image_path():
         check("C2g a non-null path is still fully validated", raised)
 
 
+# ---------------------------------------------------------------------------
+# C3: chain-engine grouping arithmetic (spec criterion 5) and per-panel parity
+# ---------------------------------------------------------------------------
+
+def test_build_units_chain_grouping():
+    panels = _fake_panels_v2([41, 33, 49, 41, 33, 41, 33, 49, 41, 33, 41, 33])
+    chain = story_video.build_units(panels, "per-panel", 49, 0,
+                                    engine="chain", reanchor_every=5)
+    per = story_video.build_units(panels, "per-panel", 49, 0)
+
+    check("C3a openers are exactly {1, 6, 11}",
+          [u["index"] for u in chain if u["role"] == "opener"] == [1, 6, 11],
+          "got %r" % [u["index"] for u in chain if u["role"] == "opener"])
+    check("C3b group numbers", [u["group"] for u in chain] ==
+          [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3],
+          "got %r" % [u["group"] for u in chain])
+    check("C3c continue_from_index is None for openers, i-1 for followers",
+          all((u["continue_from_index"] is None) if u["role"] == "opener"
+              else (u["continue_from_index"] == u["index"] - 1) for u in chain))
+    check("C3d every unit's conditions == []",
+          all(u["conditions"] == [] for u in chain),
+          "got %r" % [u["conditions"] for u in chain])
+    for key in ("label", "seed", "prompt", "num_frames"):
+        check("C3e %s identical to the per-panel engine" % key,
+              [u[key] for u in chain] == [u[key] for u in per],
+              "got %r vs %r" % ([u[key] for u in chain], [u[key] for u in per]))
+
+    one = story_video.build_units(_fake_panels_v2([25] * 4), "per-panel", 49, 0,
+                                  engine="chain", reanchor_every=1)
+    check("C3f reanchor_every=1 makes every panel an opener",
+          all(u["role"] == "opener" and u["continue_from_index"] is None for u in one))
+    check("C3g reanchor_every=1 group numbers are 1..N",
+          [u["group"] for u in one] == [1, 2, 3, 4], "got %r" % [u["group"] for u in one])
+
+    exact = story_video.build_units(_fake_panels_v2([25] * 5), "per-panel", 49, 0,
+                                    engine="chain", reanchor_every=5)
+    check("C3h 5 panels at R=5 is exactly one group",
+          [u["group"] for u in exact] == [1, 1, 1, 1, 1], "got %r" % [u["group"] for u in exact])
+
+    short = story_video.build_units(_fake_panels_v2([25] * 6), "per-panel", 49, 0,
+                                    engine="chain", reanchor_every=5)
+    check("C3i 6 panels at R=5 gives a 1-panel final group",
+          [u["group"] for u in short] == [1, 1, 1, 1, 1, 2] and short[5]["role"] == "opener",
+          "got %r" % [(u["group"], u["role"]) for u in short])
+
+
+def test_build_units_per_panel_has_no_chain_keys():
+    per = story_video.build_units(_fake_panels_v2([25, 33]), "per-panel", 49, 0)
+    check("C4a per-panel units carry no role/group/continue_from_index keys",
+          all(not ({"role", "group", "continue_from_index"} & set(u)) for u in per),
+          "got %r" % [sorted(u) for u in per])
+    trans = story_video.build_units(_fake_panels_v2([25, 33]), "transitions", 49, 0)
+    check("C4b transitions units carry no chain keys",
+          all(not ({"role", "group", "continue_from_index"} & set(u)) for u in trans),
+          "got %r" % [sorted(u) for u in trans])
+
+
+def test_chain_groups_descriptors():
+    units = story_video.build_units(_fake_panels_v2([25] * 12), "per-panel", 49, 0,
+                                    engine="chain", reanchor_every=5)
+    groups = story_video._chain_groups(units)
+    check("C5a three groups", [g["group"] for g in groups] == [1, 2, 3],
+          "got %r" % groups)
+    check("C5b panel membership",
+          [g["panels"] for g in groups] == [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12]],
+          "got %r" % [g["panels"] for g in groups])
+    check("C5c openers", [g["opener"] for g in groups] == [1, 6, 11],
+          "got %r" % [g["opener"] for g in groups])
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1144,6 +1214,9 @@ if __name__ == "__main__":
     test_load_manifest_rejects_bad_num_frames_v2()
     test_engine_flag_defaults_and_rejections()
     test_load_manifest_allow_null_image_path()
+    test_build_units_chain_grouping()
+    test_build_units_per_panel_has_no_chain_keys()
+    test_chain_groups_descriptors()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

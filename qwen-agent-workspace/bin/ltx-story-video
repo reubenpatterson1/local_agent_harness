@@ -215,7 +215,7 @@ def _resolve_transition_prompt(panel, next_panel):
     return "%s The scene transitions smoothly into: %s" % (panel["panel_text"], next_panel["panel_text"])
 
 
-def build_units(panels, mode, num_frames, seed):
+def build_units(panels, mode, num_frames, seed, engine="per-panel", reanchor_every=5):
     """Return the ordered list of unit dicts for `mode`.
 
     `num_frames` is the fallback default used when a panel carries no
@@ -226,9 +226,36 @@ def build_units(panels, mode, num_frames, seed):
     "strength"}, ...]}.
 
     Raises ValueError if mode == "transitions" and len(panels) < 2.
+
+    engine == "chain" (which implies mode == "per-panel"): each unit gains
+    "role" ("opener" iff (i-1) % reanchor_every == 0, else "follower"),
+    "group" ((i-1) // reanchor_every + 1), and "continue_from_index" (None
+    for an opener, i-1 for a follower). "conditions" is ALWAYS [] in this
+    engine: an opener has no conditioning image at all, and a follower's
+    conditioning image is a generated frame path that does not exist until
+    the previous panel finishes, so it can never be part of a statically
+    built unit list. label/seed/prompt/num_frames are computed exactly as
+    the per-panel engine computes them.
     """
     if mode == "transitions" and len(panels) < 2:
         raise ValueError("transitions mode requires at least 2 panels, got %d" % len(panels))
+
+    if engine == "chain":
+        units = []
+        for i, panel in enumerate(panels, start=1):
+            is_opener = (i - 1) % reanchor_every == 0
+            units.append({
+                "index": i,
+                "label": "panel-%d" % i,
+                "seed": seed + i,
+                "prompt": _resolve_motion_prompt(panel),
+                "num_frames": panel.get("num_frames") or num_frames,
+                "conditions": [],
+                "role": "opener" if is_opener else "follower",
+                "group": (i - 1) // reanchor_every + 1,
+                "continue_from_index": None if is_opener else i - 1,
+            })
+        return units
 
     units = []
     if mode == "per-panel":
@@ -265,6 +292,20 @@ def build_units(panels, mode, num_frames, seed):
                 ],
             })
     return units
+
+
+def _chain_groups(units):
+    """Return ordered group descriptors for a chain-engine unit list:
+    [{"group": int, "panels": [int, ...], "opener": int}, ...]. Used by the
+    --engine chain dry-run header and story_summary.json's "groups" key."""
+    groups = []
+    for unit in units:
+        if not groups or groups[-1]["group"] != unit["group"]:
+            groups.append({"group": unit["group"], "panels": [], "opener": None})
+        groups[-1]["panels"].append(unit["index"])
+        if unit["role"] == "opener":
+            groups[-1]["opener"] = unit["index"]
+    return groups
 
 
 def build_frame_sequence(units_frames, mode, hold_frames, holds=None):
@@ -461,7 +502,8 @@ def main(argv=None):
     # per-unit -- schema_version 2 manifests give each unit its own
     # num_frames, so a single global pre-check is no longer sufficient. ---
     try:
-        units = build_units(panels, args.mode, args.num_frames, args.seed)
+        units = build_units(panels, args.mode, args.num_frames, args.seed,
+                            engine=args.engine, reanchor_every=args.reanchor_every)
     except ValueError as e:
         print("Error: %s" % e, file=sys.stderr)
         return 2
