@@ -145,11 +145,17 @@ def build_parser():
     return parser
 
 
-def load_manifest(path):
+def load_manifest(path, allow_null_image_path=False):
     """Load and schema-validate a manifest.json. Raises ValueError naming
     the exact violation on any schema problem. schema_version 1 manifests
     (no per-panel num_frames) are still accepted unchanged; schema_version
-    2+ manifests additionally require a valid per-panel num_frames."""
+    2+ manifests additionally require a valid per-panel num_frames.
+
+    allow_null_image_path: when True (--engine chain), a panel whose
+    image_path is None or absent is accepted and normalized to None; a
+    panel whose image_path is a non-empty string is still fully validated.
+    An empty string is not "absent" and is still rejected. Schema version
+    stays 2 either way (I6)."""
     with open(path) as f:
         data = json.load(f)
 
@@ -170,7 +176,9 @@ def load_manifest(path):
         expected_index += 1
 
         image_path = panel.get("image_path")
-        if not image_path or not os.path.isfile(image_path) or not os.access(image_path, os.R_OK):
+        if image_path is None and allow_null_image_path:
+            panel["image_path"] = None
+        elif not image_path or not os.path.isfile(image_path) or not os.access(image_path, os.R_OK):
             raise ValueError(
                 "panel %d: image_path does not exist or is not readable: %r"
                 % (index, image_path)
@@ -431,7 +439,8 @@ def main(argv=None):
 
     # --- step 1: load + schema-validate the manifest ---
     try:
-        manifest = load_manifest(args.manifest_path)
+        manifest = load_manifest(args.manifest_path,
+                                 allow_null_image_path=(args.engine == "chain"))
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print("Error: %s" % e, file=sys.stderr)
         return 2

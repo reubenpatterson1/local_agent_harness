@@ -1026,6 +1026,85 @@ def test_engine_flag_defaults_and_rejections():
         check(name, rc == 2, "got %r" % rc)
 
 
+# ---------------------------------------------------------------------------
+# C2: load_manifest(allow_null_image_path=True) accepts null image_path but
+# keeps every other check; the default still rejects null
+# ---------------------------------------------------------------------------
+
+def _v2_manifest(tmp, panels):
+    path = os.path.join(tmp, "manifest.json")
+    with open(path, "w") as f:
+        json.dump({"schema_version": 2, "story_id": "x", "title": "", "narrative": "",
+                   "created_at": "2026-01-01T00:00:00+00:00", "fps": 24,
+                   "panels": panels}, f)
+    return path
+
+
+def _null_panel(index, panel_text="a shot", num_frames=25):
+    return {"index": index, "image_path": None, "title": "", "panel_text": panel_text,
+            "narration": "", "narration_words": 0, "num_frames": num_frames,
+            "duration_s": 1.0, "motion_prompt": panel_text, "transition_to_next": None}
+
+
+def test_load_manifest_allow_null_image_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        ok = _v2_manifest(tmp, [_null_panel(1), _null_panel(2)])
+        data = story_video.load_manifest(ok, allow_null_image_path=True)
+        check("C2a null image_path accepted when allowed",
+              [p["image_path"] for p in data["panels"]] == [None, None],
+              "got %r" % [p["image_path"] for p in data["panels"]])
+
+        raised = False
+        try:
+            story_video.load_manifest(ok)
+        except ValueError as e:
+            raised = "image_path does not exist or is not readable" in str(e)
+        check("C2b default still rejects null with today's message", raised)
+
+        gap = _v2_manifest(tmp, [_null_panel(1), _null_panel(3)])
+        raised = False
+        try:
+            story_video.load_manifest(gap, allow_null_image_path=True)
+        except ValueError as e:
+            raised = "indexed contiguously" in str(e)
+        check("C2c index gap still rejected when null is allowed", raised)
+
+        empty_text = _v2_manifest(tmp, [_null_panel(1, panel_text="   ")])
+        raised = False
+        try:
+            story_video.load_manifest(empty_text, allow_null_image_path=True)
+        except ValueError as e:
+            raised = "panel_text is required" in str(e)
+        check("C2d empty panel_text still rejected", raised)
+
+        bad_frames = _v2_manifest(tmp, [_null_panel(1, num_frames=50)])
+        raised = False
+        try:
+            story_video.load_manifest(bad_frames, allow_null_image_path=True)
+        except ValueError as e:
+            raised = "% 8 == 0" in str(e)
+        check("C2e bad v2 num_frames still rejected", raised)
+
+        img = os.path.join(tmp, "real.png")
+        _make_png(img)
+        mixed_ok = _v2_manifest(tmp, [_null_panel(1),
+                                      dict(_null_panel(2), image_path=img)])
+        data = story_video.load_manifest(mixed_ok, allow_null_image_path=True)
+        check("C2f a mixed manifest is legal and the string path is kept",
+              data["panels"][1]["image_path"] == img,
+              "got %r" % data["panels"][1]["image_path"])
+
+        mixed_bad = _v2_manifest(tmp, [_null_panel(1),
+                                       dict(_null_panel(2),
+                                            image_path=os.path.join(tmp, "nope.png"))])
+        raised = False
+        try:
+            story_video.load_manifest(mixed_bad, allow_null_image_path=True)
+        except ValueError as e:
+            raised = "image_path does not exist or is not readable" in str(e)
+        check("C2g a non-null path is still fully validated", raised)
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1064,6 +1143,7 @@ if __name__ == "__main__":
     test_build_units_transitions_v2_frame_index()
     test_load_manifest_rejects_bad_num_frames_v2()
     test_engine_flag_defaults_and_rejections()
+    test_load_manifest_allow_null_image_path()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
