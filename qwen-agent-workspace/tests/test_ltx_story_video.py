@@ -20,8 +20,10 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import types
 
 from PIL import Image
 
@@ -1367,6 +1369,150 @@ def test_ast_guard_follower_harvests_seg1_only():
           body.count("os.remove(scratch_mp4)") >= 2, "got %r" % body.count("os.remove(scratch_mp4)"))
 
 
+# ---------------------------------------------------------------------------
+# C12: _render_chain_follower behavioral tests (real exercise of spec
+# correction C5, the plan's highest-risk correctness property: a follower
+# must read its predecessor's ACTUAL base -- an opener's own cell, or an
+# earlier follower's nested seg1/ dir -- never a panel-<k> path that a
+# follower predecessor never writes). No real subprocess is spawned:
+# story_video.subprocess is swapped for a fake module object whose .run
+# returns a canned CompletedProcess, then restored in a finally.
+# ---------------------------------------------------------------------------
+
+def _make_base_cell(tmp, name, num_frames):
+    """Build a fake completed unit cell: embeds.pt + request.json + frames/,
+    exactly what an opener's in-process cell (or a nested chain's seg1/
+    cell) looks like once a unit has finished."""
+    cell = os.path.join(tmp, name)
+    os.makedirs(os.path.join(cell, "frames"))
+    with open(os.path.join(cell, "embeds.pt"), "w") as f:
+        f.write("fake")
+    with open(os.path.join(cell, "request.json"), "w") as f:
+        json.dump({}, f)
+    for i in range(num_frames):
+        _make_png(os.path.join(cell, "frames", "frame_%05d.png" % i))
+    return cell
+
+
+def _canned_chain_run(tmp, name, num_frames):
+    """Build a fake nested-ltx-chain run root with a seg1/ cell (what a real
+    `ltx-chain --continue-from ... --segments 1` invocation writes on disk --
+    embeds.pt, request.json AND frames/, so a LATER follower's own
+    --continue-from validation against this seg1/ dir succeeds), and return
+    (chain_run_root, canned child stdout)."""
+    chain_run_root = os.path.join(tmp, name)
+    seg_dir = os.path.join(chain_run_root, "seg1")
+    os.makedirs(os.path.join(seg_dir, "frames"))
+    with open(os.path.join(seg_dir, "embeds.pt"), "w") as f:
+        f.write("fake")
+    with open(os.path.join(seg_dir, "request.json"), "w") as f:
+        json.dump({}, f)
+    for i in range(num_frames):
+        _make_png(os.path.join(seg_dir, "frames", "frame_%05d.png" % i))
+    stdout = "=== prep ===\nrun root: %s\nDONE\n" % chain_run_root
+    return chain_run_root, stdout
+
+
+def test_render_chain_follower_single_hop():
+    with tempfile.TemporaryDirectory() as tmp:
+        base_dir = _make_base_cell(tmp, "panel-2", num_frames=9)
+        chain_run_root, stdout = _canned_chain_run(tmp, "chain-3", num_frames=9)
+
+        real_subprocess = story_video.subprocess
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout)
+
+        story_video.subprocess = types.SimpleNamespace(
+            run=fake_run, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT)
+        try:
+            args = story_video.build_parser().parse_args(
+                ["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain"])
+            unit = {"index": 3, "label": "panel-3", "seed": 3, "prompt": "shot three",
+                    "num_frames": 9, "conditions": [], "role": "follower", "group": 1,
+                    "continue_from_index": 2}
+            cell = os.path.join(tmp, "panel-3")
+            chain_base_by_index = {2: base_dir}
+            outcome = story_video._render_chain_follower(args, unit, cell, chain_base_by_index)
+        finally:
+            story_video.subprocess = real_subprocess
+
+        check("C12a single-hop follower returns ok",
+              outcome["status"] == "ok", "got %r" % outcome)
+        check("C12b base_for_next is the nested chain's seg1 dir",
+              outcome.get("base_for_next") == os.path.join(chain_run_root, "seg1"),
+              "got %r" % outcome.get("base_for_next"))
+        check("C12c frames harvested from seg1/frames only",
+              len(outcome.get("frames") or []) == 9 and
+              all(os.path.join(chain_run_root, "seg1", "frames") in p for p in outcome["frames"]),
+              "got %r" % outcome.get("frames"))
+
+        # mirror what main()'s follower branch does on an "ok" outcome
+        chain_base_by_index[unit["index"]] = outcome["base_for_next"]
+        check("C12d chain_base_by_index gets populated for the follower's own index",
+              chain_base_by_index[3] == os.path.join(chain_run_root, "seg1"),
+              "got %r" % chain_base_by_index)
+
+
+def test_render_chain_follower_two_hop_uses_predecessor_seg1():
+    """Group-size >= 3 case: panel 3 continues from panel 2, and panel 2 is
+    ITSELF a follower -- so panel 3's --continue-from base must be panel 2's
+    nested-chain seg1/ dir, never a <run_root>/panel-2 path (panel 2's own
+    request.json/embeds.pt/frames/ were never written there)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        opener_cell = _make_base_cell(tmp, "panel-1", num_frames=9)
+        chain_run_root_2, stdout_2 = _canned_chain_run(tmp, "chain-2", num_frames=9)
+        chain_run_root_3, stdout_3 = _canned_chain_run(tmp, "chain-3", num_frames=9)
+        never_written_run_root_panel_2 = os.path.join(tmp, "run_root", "panel-2")
+
+        real_subprocess = story_video.subprocess
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            stdout = stdout_2 if len(calls) == 1 else stdout_3
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout)
+
+        story_video.subprocess = types.SimpleNamespace(
+            run=fake_run, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT)
+        try:
+            args = story_video.build_parser().parse_args(
+                ["m.json", "o.mp4", "--mode", "per-panel", "--engine", "chain"])
+            chain_base_by_index = {1: opener_cell}
+
+            unit2 = {"index": 2, "label": "panel-2", "seed": 2, "prompt": "shot two",
+                     "num_frames": 9, "conditions": [], "role": "follower", "group": 1,
+                     "continue_from_index": 1}
+            cell2 = os.path.join(tmp, "panel-2")
+            outcome2 = story_video._render_chain_follower(args, unit2, cell2, chain_base_by_index)
+            check("C12e panel-2 (follower of the opener) returns ok",
+                  outcome2["status"] == "ok", "got %r" % outcome2)
+            # mirror what main()'s follower branch does on an "ok" outcome
+            chain_base_by_index[2] = outcome2["base_for_next"]
+
+            unit3 = {"index": 3, "label": "panel-3", "seed": 3, "prompt": "shot three",
+                     "num_frames": 9, "conditions": [], "role": "follower", "group": 1,
+                     "continue_from_index": 2}
+            cell3 = os.path.join(tmp, "panel-3")
+            outcome3 = story_video._render_chain_follower(args, unit3, cell3, chain_base_by_index)
+        finally:
+            story_video.subprocess = real_subprocess
+
+        check("C12f panel-3 nests exactly 2 subprocess calls (panel-2 then panel-3)",
+              len(calls) == 2, "got %r" % len(calls))
+        check("C12g panel-3's --continue-from argv is panel-2's seg1 dir, "
+              "NOT <run_root>/panel-2",
+              calls[1][calls[1].index("--continue-from") + 1] == os.path.join(chain_run_root_2, "seg1")
+              and calls[1][calls[1].index("--continue-from") + 1] != never_written_run_root_panel_2,
+              "got %r" % calls[1])
+        check("C12h panel-3 returns ok",
+              outcome3["status"] == "ok", "got %r" % outcome3)
+        check("C12i panel-3's own base_for_next is ITS OWN nested chain's seg1 "
+              "(not panel-2's)",
+              outcome3.get("base_for_next") == os.path.join(chain_run_root_3, "seg1"),
+              "got %r" % outcome3.get("base_for_next"))
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1416,6 +1562,8 @@ if __name__ == "__main__":
     test_chain_run_root_parsing()
     test_ast_guard_chain_follower_invocation()
     test_ast_guard_follower_harvests_seg1_only()
+    test_render_chain_follower_single_hop()
+    test_render_chain_follower_two_hop_uses_predecessor_seg1()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

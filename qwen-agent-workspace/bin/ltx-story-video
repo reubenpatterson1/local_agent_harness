@@ -877,6 +877,11 @@ def main(argv=None):
                 print("unit %d/%d (%s) starting as a chain follower of panel-%d"
                       % (unit["index"], len(units), unit["label"],
                          unit["continue_from_index"]))
+                gpu_other = _await_gpu_reclaim()
+                if gpu_other > mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB:
+                    print("unit %s: gpu_other still %.2f GiB after reclaim wait (threshold %.2f); "
+                          "proceeding anyway, stage1 preflight will refuse if still too high"
+                          % (unit["label"], gpu_other, mps_guard.PREFLIGHT_MAX_OTHER_GPU_GIB))
                 outcome = _render_chain_follower(args, unit, cell, chain_base_by_index)
                 unit_results[unit["index"]] = outcome["result"]
                 if outcome["status"] == "hard_abort":
