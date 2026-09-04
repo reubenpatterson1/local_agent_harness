@@ -461,6 +461,24 @@ def test_no_images_panel_errors():
                   "panel 1 has both a Prompt: field and an Image:/Motion: field; "
                   "use one form or the other" in buf2.getvalue(),
                   "got %r" % buf2.getvalue())
+
+            # The both-forms check must fire in image-driven mode too (no
+            # --no-images), not just under --no-images -- it is unconditional
+            # inside `if args.prompts_md:`, ahead of the `if args.no_images:`
+            # branch, and a regression that moved it inside that branch
+            # would otherwise go undetected.
+            img = os.path.join(tmp, "a.png")
+            _make_png(img)
+            buf3 = io.StringIO()
+            with contextlib.redirect_stderr(buf3):
+                rc3 = story_manifest.main(["--story-id", sid, "--prompts-md", md2,
+                                           "--image", img, "--force"])
+            check("M5e both Prompt: and Image: exits 2 in image-driven mode",
+                  rc3 == 2, "got %r" % rc3)
+            check("M5f image-driven message names panel 1 and both forms",
+                  "panel 1 has both a Prompt: field and an Image:/Motion: field; "
+                  "use one form or the other" in buf3.getvalue(),
+                  "got %r" % buf3.getvalue())
     finally:
         _rm_story(sid)
 
