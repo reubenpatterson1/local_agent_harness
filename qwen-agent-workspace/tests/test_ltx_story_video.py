@@ -1204,6 +1204,65 @@ def test_build_request_mode_field():
               mode_field=None))
 
 
+# ---------------------------------------------------------------------------
+# C7: --engine chain --dry-run prints the group/role table and touches nothing
+# ---------------------------------------------------------------------------
+
+def test_chain_dry_run_output():
+    sid = "unittest-chain-dryrun"
+    with tempfile.TemporaryDirectory() as tmp:
+        panels = [_null_panel(i, panel_text="shot %d" % i,
+                              num_frames=[41, 33, 49, 41, 33, 41][i - 1])
+                  for i in range(1, 7)]
+        manifest_path = _v2_manifest(tmp, panels)
+        out_mp4 = os.path.join(tmp, "out.mp4")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = story_video.main([manifest_path, out_mp4, "--mode", "per-panel",
+                                   "--engine", "chain", "--reanchor-every", "5",
+                                   "--dry-run"])
+        text = buf.getvalue()
+        check("C7a exits 0", rc == 0, "got %r" % rc)
+        check("C7b header names the engine and group size",
+              "=== dry run: 6 unit(s), mode=per-panel, engine=chain, reanchor-every=5 ===" in text,
+              "got %r" % text)
+        check("C7c group 1 header spans panels 1-5", "--- group 1 (panels 1-5) ---" in text)
+        check("C7d short final group prints its real range",
+              "--- group 2 (panels 6-6) ---" in text)
+        check("C7e panel 1 is a T2V opener",
+              "1 | panel-1 | seed=1 | frames=41 (1.71s) | T2V opener | prompt=" in text,
+              "got %r" % text)
+        check("C7f panel 2 names the panel it continues from",
+              "2 | panel-2 | seed=2 | frames=33 (1.38s) | chain follower <- panel-1 | prompt=" in text)
+        check("C7g panel 6 is an opener again",
+              "6 | panel-6 | seed=6 | frames=41 (1.71s) | T2V opener | prompt=" in text)
+        check("C7h TOTAL line unchanged", "TOTAL 238 frames, 9.92s" in text,
+              "got %r" % text)
+        check("C7i conditions=[...] is dropped in this engine",
+              "conditions=[" not in text, "got %r" % text)
+        check("C7j no output file was written", not os.path.exists(out_mp4))
+    _rm_story(sid)
+
+
+def test_per_panel_dry_run_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        img = os.path.join(tmp, "p1.png")
+        _make_png(img)
+        manifest_path = _v2_manifest(
+            tmp, [dict(_null_panel(1, panel_text="shot 1", num_frames=25),
+                       image_path=img)])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = story_video.main([manifest_path, os.path.join(tmp, "o.mp4"),
+                                   "--mode", "per-panel", "--dry-run"])
+        text = buf.getvalue()
+        check("C8a per-panel dry-run exits 0", rc == 0, "got %r" % rc)
+        check("C8b per-panel header is unchanged",
+              "=== dry run: 1 unit(s), mode=per-panel ===" in text, "got %r" % text)
+        check("C8c per-panel line still shows conditions=[...]",
+              "conditions=[" in text and "T2V opener" not in text, "got %r" % text)
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1247,6 +1306,8 @@ if __name__ == "__main__":
     test_build_units_per_panel_has_no_chain_keys()
     test_chain_groups_descriptors()
     test_build_request_mode_field()
+    test_chain_dry_run_output()
+    test_per_panel_dry_run_unchanged()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

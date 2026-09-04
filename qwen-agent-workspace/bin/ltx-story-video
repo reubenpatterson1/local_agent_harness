@@ -562,6 +562,24 @@ def main(argv=None):
 
     # --- step 7: --dry-run exits here, before any prep/screen/GPU code ---
     if args.dry_run:
+        if args.engine == "chain":
+            print("=== dry run: %d unit(s), mode=%s, engine=chain, reanchor-every=%d ==="
+                  % (len(units), args.mode, args.reanchor_every))
+            for group in _chain_groups(units):
+                print("--- group %d (panels %d-%d) ---"
+                      % (group["group"], min(group["panels"]), max(group["panels"])))
+                for unit in units:
+                    if unit["group"] != group["group"]:
+                        continue
+                    if unit["role"] == "opener":
+                        role_text = "T2V opener"
+                    else:
+                        role_text = "chain follower <- panel-%d" % unit["continue_from_index"]
+                    print("%d | %s | seed=%d | frames=%d (%.2fs) | %s | prompt=%r"
+                          % (unit["index"], unit["label"], unit["seed"], unit["num_frames"],
+                             unit["num_frames"] / args.fps, role_text, unit["prompt"][:120]))
+            print("TOTAL %d frames, %.2fs" % (total_frames, total_frames / args.fps))
+            return 0
         print("=== dry run: %d unit(s), mode=%s ===" % (len(units), args.mode))
         for unit in units:
             conds = ", ".join(
