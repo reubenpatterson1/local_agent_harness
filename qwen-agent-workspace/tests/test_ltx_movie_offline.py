@@ -433,9 +433,52 @@ def test_no_stills_phase_sequencing_source():
     check("L17c phase 3 swaps --glob/--images-dir for --no-images",
           '"--no-images"' in text and '"--glob", "panel_*.png"' in text)
     check("L17d phase 3/4 thread --engine chain",
-          text.count('"--engine", "chain", "--reanchor-every", str(args.reanchor_every)') >= 2,
+          text.count('"--engine", "chain", "--reanchor-every", str(args.reanchor_every)') >= 4,
           "got %r occurrences" % text.count(
               '"--engine", "chain", "--reanchor-every", str(args.reanchor_every)'))
+
+
+# ---------------------------------------------------------------------------
+# L18: --no-stills --dry-run plan (spec 9.1 item 5, criterion 2)
+# ---------------------------------------------------------------------------
+
+def test_no_stills_dry_run_plan():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-nostills",
+         "--no-stills", "--panels", "6", "--reanchor-every", "3", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L18a exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
+                                                                      result.stderr))
+    check("L18b Phase 2 is a one-line SKIPPED banner",
+          "--- Phase 2: stills --- SKIPPED (--no-stills: no anchor stills are generated)"
+          in out, "got %r" % out)
+    check("L18c no ltx-story-images command anywhere in the plan",
+          "ltx-story-images" not in out, "got %r" % out)
+    check("L18d Phase 3 uses --no-images", "--no-images" in out)
+    check("L18e Phase 3 does not glob panel_*.png", "panel_*.png" not in out)
+    check("L18f the chain flags appear", "--engine chain" in out
+          and "--reanchor-every 3" in out, "got %r" % out)
+    check("L18g the rendered prompt is the no-stills template",
+          "Prompt: <a single video prompt, 85-130 words" in out
+          and "Image: <a single still-image prompt" not in out)
+    check("L18h no per-panel opener/follower table here (it comes from a real Phase 3)",
+          "T2V opener" not in out, "got %r" % out)
+
+
+def test_default_dry_run_plan_unchanged():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-default",
+         "--panels", "6", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L18i default plan still shows Phase 2", "--- Phase 2: stills ---" in out
+          and "SKIPPED" not in out, "got %r" % out)
+    check("L18j default plan still calls ltx-story-images", "ltx-story-images" in out)
+    check("L18k default plan has no --no-images / --engine chain",
+          "--no-images" not in out and "--engine chain" not in out)
 
 
 if __name__ == "__main__":
@@ -456,6 +499,8 @@ if __name__ == "__main__":
     test_no_stills_story_prompt_template()
     test_validate_story_md_no_stills()
     test_no_stills_phase_sequencing_source()
+    test_no_stills_dry_run_plan()
+    test_default_dry_run_plan_unchanged()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

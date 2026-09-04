@@ -605,7 +605,7 @@ def _print_dry_run_plan(args):
     paths = _story_paths(args.story_id)
     max_tokens = _phase1_max_tokens(args.panels)
     timeout = _phase1_timeout(args.panels)
-    prompt = build_story_prompt(args.narrative, args.story_id, args.panels)
+    prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills)
 
     print("=== DRY RUN: ltx-movie phase plan (story-id=%s) ===" % args.story_id)
     print()
@@ -621,25 +621,36 @@ def _print_dry_run_plan(args):
     print(prompt)
     print()
 
-    print("--- Phase 2: stills ---")
-    phase2_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-images"),
-                  "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
-                  "--width", str(args.image_width), "--height", str(args.image_height),
-                  "--seed", str(args.image_seed)]
-    print("Command: %s" % shlex.join(phase2_cmd))
-    print()
+    if args.no_stills:
+        print("--- Phase 2: stills --- SKIPPED (--no-stills: no anchor stills are generated)")
+        print()
+    else:
+        print("--- Phase 2: stills ---")
+        phase2_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-images"),
+                      "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
+                      "--width", str(args.image_width), "--height", str(args.image_height),
+                      "--seed", str(args.image_seed)]
+        print("Command: %s" % shlex.join(phase2_cmd))
+        print()
 
     print("--- Phase 3: manifest + dry-run ---")
     phase3_manifest_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
-                            "--story-id", args.story_id, "--prompts-md", paths["story_md"],
-                            "--glob", "panel_*.png", "--images-dir", paths["images_dir"],
-                            "--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
-                            "--min-frames", str(args.min_frames),
-                            "--max-frames", str(args.max_frames), "--force"]
+                            "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
+    if args.no_stills:
+        phase3_manifest_cmd += ["--no-images"]
+    else:
+        phase3_manifest_cmd += ["--glob", "panel_*.png", "--images-dir", paths["images_dir"]]
+    phase3_manifest_cmd += ["--fps", str(args.fps),
+                             "--target-seconds", str(args.target_seconds),
+                             "--min-frames", str(args.min_frames),
+                             "--max-frames", str(args.max_frames), "--force"]
     print("Command: %s" % shlex.join(phase3_manifest_cmd))
     phase3_video_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
                         paths["manifest_path"], paths["movie_path"],
-                        "--mode", "per-panel", "--dry-run"]
+                        "--mode", "per-panel"]
+    if args.no_stills:
+        phase3_video_cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
+    phase3_video_cmd += ["--dry-run"]
     print("Command: %s" % shlex.join(phase3_video_cmd))
     print()
 
@@ -647,9 +658,11 @@ def _print_dry_run_plan(args):
     print("Avail gate: wait until psutil.virtual_memory().available/2**30 >= %.1f GiB "
           "(timeout %ds)." % (args.min_avail_gib, args.avail_timeout))
     phase4_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-                  paths["manifest_path"], paths["movie_path"], "--mode", "per-panel",
-                  "--on-unit-failure", "skip", "--retry-failed", "1",
-                  "--retry-idle", "120", "--max-consecutive-failures", "3"]
+                  paths["manifest_path"], paths["movie_path"], "--mode", "per-panel"]
+    if args.no_stills:
+        phase4_cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
+    phase4_cmd += ["--on-unit-failure", "skip", "--retry-failed", "1",
+                   "--retry-idle", "120", "--max-consecutive-failures", "3"]
     if args.force:
         phase4_cmd.append("--force")
     print("Command: %s" % shlex.join(phase4_cmd))
