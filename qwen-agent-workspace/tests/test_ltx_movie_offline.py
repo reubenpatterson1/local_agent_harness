@@ -411,6 +411,33 @@ def test_validate_story_md_no_stills():
               len(ltx_movie._validate_story_md(good, 2)) > 0)
 
 
+# ---------------------------------------------------------------------------
+# L17: source guards -- Phase 2 is skipped by phase-tuple construction (not
+# by an early return inside phase2_stills), and the Phase 3/4 commands carry
+# the new flags in the specified positions
+# (Two occurrences at this point: phase3_manifest's dry-run command and
+# phase4_render's command. _print_dry_run_plan's Phase-3 and Phase-4 command
+# blocks -- both handled by Task 23 -- add two more, bringing the total to 4.)
+# ---------------------------------------------------------------------------
+
+def test_no_stills_phase_sequencing_source():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L17a the phase tuple is built conditionally",
+          "(phase1_story, phase3_manifest, phase4_render) if args.no_stills" in text,
+          "got no conditional phase tuple")
+    check("L17b phase2_stills has no --no-stills early return",
+          "def phase2_stills(args):" in text
+          and "no_stills" not in text.split("def phase2_stills(args):")[1]
+                                      .split("def phase3_manifest")[0])
+    check("L17c phase 3 swaps --glob/--images-dir for --no-images",
+          '"--no-images"' in text and '"--glob", "panel_*.png"' in text)
+    check("L17d phase 3/4 thread --engine chain",
+          text.count('"--engine", "chain", "--reanchor-every", str(args.reanchor_every)') >= 2,
+          "got %r occurrences" % text.count(
+              '"--engine", "chain", "--reanchor-every", str(args.reanchor_every)'))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -428,6 +455,7 @@ if __name__ == "__main__":
     test_no_stills_orthogonal_to_length()
     test_no_stills_story_prompt_template()
     test_validate_story_md_no_stills()
+    test_no_stills_phase_sequencing_source()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

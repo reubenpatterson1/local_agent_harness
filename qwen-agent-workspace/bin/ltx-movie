@@ -452,9 +452,12 @@ def phase3_manifest(args):
     print("=== Phase 3: manifest + dry-run ===")
 
     cmd_manifest = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
-                     "--story-id", args.story_id, "--prompts-md", paths["story_md"],
-                     "--glob", "panel_*.png", "--images-dir", paths["images_dir"],
-                     "--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
+                     "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
+    if args.no_stills:
+        cmd_manifest += ["--no-images"]
+    else:
+        cmd_manifest += ["--glob", "panel_*.png", "--images-dir", paths["images_dir"]]
+    cmd_manifest += ["--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
                      "--min-frames", str(args.min_frames), "--max-frames", str(args.max_frames),
                      "--force"]
     print("Running: %s" % shlex.join(cmd_manifest))
@@ -465,7 +468,10 @@ def phase3_manifest(args):
 
     cmd_dryrun = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
                   paths["manifest_path"], paths["movie_path"],
-                  "--mode", "per-panel", "--dry-run"]
+                  "--mode", "per-panel"]
+    if args.no_stills:
+        cmd_dryrun += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
+    cmd_dryrun += ["--dry-run"]
     print("Running: %s" % shlex.join(cmd_dryrun))
     proc = subprocess.run(cmd_dryrun, cwd=WS)
     if proc.returncode != 0:
@@ -574,9 +580,11 @@ def phase4_render(args):
         return 1
 
     cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-           paths["manifest_path"], movie_path, "--mode", "per-panel",
-           "--on-unit-failure", "skip", "--retry-failed", "1",
-           "--retry-idle", "120", "--max-consecutive-failures", "3"]
+           paths["manifest_path"], movie_path, "--mode", "per-panel"]
+    if args.no_stills:
+        cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
+    cmd += ["--on-unit-failure", "skip", "--retry-failed", "1",
+            "--retry-idle", "120", "--max-consecutive-failures", "3"]
     if args.force:
         cmd.append("--force")
     print("Running: %s" % shlex.join(cmd))
@@ -699,7 +707,9 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
 
-        for phase_fn in (phase1_story, phase2_stills, phase3_manifest, phase4_render):
+        phases = ((phase1_story, phase3_manifest, phase4_render) if args.no_stills
+                  else (phase1_story, phase2_stills, phase3_manifest, phase4_render))
+        for phase_fn in phases:
             rc = phase_fn(args)
             if rc != 0:
                 return rc
