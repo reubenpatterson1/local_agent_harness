@@ -25,7 +25,7 @@ import tempfile
 
 from PIL import Image
 
-WS = "/Users/reubenpatterson/qwen-agent-workspace"
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 
 _MANIFEST_PATH = os.path.join(WS, "bin", "ltx-story-manifest")
@@ -53,7 +53,8 @@ def _make_png(path, color=(120, 40, 200)):
 
 
 def _rm_story(story_id):
-    shutil.rmtree(os.path.join(WS, "generated", "stories", story_id), ignore_errors=True)
+    shutil.rmtree(os.path.join(story_manifest.WS, "generated", "stories", story_id),
+                  ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +216,8 @@ def test_overwrite_protection():
             rc1 = story_manifest.main(["--story-id", story_id, "--image", img1])
             check("T7 first write succeeds", rc1 == 0, "got %r" % rc1)
 
-            manifest_path = os.path.join(WS, "generated", "stories", story_id, "manifest.json")
+            manifest_path = os.path.join(story_manifest.WS, "generated", "stories",
+                                         story_id, "manifest.json")
             with open(manifest_path) as f:
                 first_content = f.read()
 

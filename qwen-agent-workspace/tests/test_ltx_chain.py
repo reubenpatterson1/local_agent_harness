@@ -14,9 +14,10 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/Users/reubenpatterson/qwen-agent-workspace")
+_WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, _WS)
 
-_CHAIN_PATH = "/Users/reubenpatterson/qwen-agent-workspace/bin/ltx-chain"
+_CHAIN_PATH = os.path.join(_WS, "bin", "ltx-chain")
 chain = importlib.machinery.SourceFileLoader("ltx_chain", _CHAIN_PATH).load_module()
 
 TOTAL = 0

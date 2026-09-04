@@ -15,7 +15,7 @@ import sys
 import tempfile
 import importlib.machinery
 
-WS = "/Users/reubenpatterson/qwen-agent-workspace"
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 
 _SCRIPT_PATH = os.path.join(WS, "bin", "ltx-movie")
