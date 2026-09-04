@@ -1175,6 +1175,35 @@ def test_chain_groups_descriptors():
           "got %r" % [g["opener"] for g in groups])
 
 
+# ---------------------------------------------------------------------------
+# C6: _build_request(mode_field=) -- opener vs today's shape
+# ---------------------------------------------------------------------------
+
+def test_build_request_mode_field():
+    opener = story_video._build_request(
+        "a shot", "neg", 512, 512, 25, 24, 24, False, False, 1, [], mode_field="t2v")
+    check("C6a opener image_path is None", opener["image_path"] is None,
+          "got %r" % opener["image_path"])
+    check("C6b opener mode == t2v", opener["mode"] == "t2v", "got %r" % opener.get("mode"))
+    check("C6c opener conditions == []", opener["conditions"] == [],
+          "got %r" % opener["conditions"])
+    check("C6d opener prompt/seed/num_frames unchanged",
+          (opener["prompt"], opener["seed"], opener["num_frames"]) == ("a shot", 1, 25),
+          "got %r" % [opener["prompt"], opener["seed"], opener["num_frames"]])
+
+    cond = [{"image_path": "/x/a.png", "frame_index": 0, "strength": 1.0}]
+    today = story_video._build_request(
+        "a shot", "neg", 512, 512, 25, 24, 24, False, False, 1, cond)
+    check("C6e no mode key without mode_field", "mode" not in today,
+          "got keys %r" % sorted(today))
+    check("C6f image_path still index-0s the conditions list",
+          today["image_path"] == "/x/a.png", "got %r" % today["image_path"])
+    check("C6g explicit mode_field=None also omits the key",
+          "mode" not in story_video._build_request(
+              "a shot", "neg", 512, 512, 25, 24, 24, False, False, 1, cond,
+              mode_field=None))
+
+
 if __name__ == "__main__":
     test_panel_header_variants()
     test_multiline_body_joined()
@@ -1217,6 +1246,7 @@ if __name__ == "__main__":
     test_build_units_chain_grouping()
     test_build_units_per_panel_has_no_chain_keys()
     test_chain_groups_descriptors()
+    test_build_request_mode_field()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

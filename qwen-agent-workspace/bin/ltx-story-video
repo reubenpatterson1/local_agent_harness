@@ -342,10 +342,17 @@ def build_frame_sequence(units_frames, mode, hold_frames, holds=None):
 
 
 def _build_request(prompt, negative_prompt, width, height, num_frames, fps, frame_rate,
-                    wide, allow_override, seed, conditions):
-    """Build a request.json-shaped dict for one unit's stage1/stage2/stage3 cell."""
-    return {
-        "image_path": conditions[0]["image_path"],
+                    wide, allow_override, seed, conditions, mode_field=None):
+    """Build a request.json-shaped dict for one unit's stage1/stage2/stage3 cell.
+
+    mode_field: when not None it is written as the request's "mode" key.
+    Openers in the chain engine pass "t2v", which selects
+    ltx_video_skill._stage2_denoise's text-to-video branch. Every other
+    caller passes None, so no "mode" key is written at all and
+    request.get("mode", "i2v") yields today's i2v behavior byte-for-byte.
+    """
+    request = {
+        "image_path": conditions[0]["image_path"] if conditions else None,
         "prompt": prompt,
         "negative_prompt": negative_prompt,
         "output_path": None,
@@ -361,6 +368,9 @@ def _build_request(prompt, negative_prompt, width, height, num_frames, fps, fram
         "allow_override": allow_override,
         "conditions": conditions,
     }
+    if mode_field is not None:
+        request["mode"] = mode_field
+    return request
 
 
 def _port_open(port, host="127.0.0.1", timeout=1.0):
@@ -653,6 +663,7 @@ def main(argv=None):
                 unit["prompt"], args.negative_prompt, args.width, args.height, unit["num_frames"],
                 args.fps, args.frame_rate, args.wide, args.allow_override, unit["seed"],
                 unit["conditions"],
+                mode_field=("t2v" if unit.get("role") == "opener" else None),
             )
             with open(os.path.join(cell, "request.json"), "w") as f:
                 json.dump(request, f, indent=2)
