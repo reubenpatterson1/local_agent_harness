@@ -359,6 +359,58 @@ def test_no_stills_story_prompt_template():
           ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=False) == d)
 
 
+# ---------------------------------------------------------------------------
+# L16: --no-stills story validation (spec 9.1 item 4)
+# ---------------------------------------------------------------------------
+
+def _write_md(td, name, body):
+    path = os.path.join(td, name)
+    with open(path, "w") as f:
+        f.write(body)
+    return path
+
+
+def test_validate_story_md_no_stills():
+    with tempfile.TemporaryDirectory() as td:
+        good = _write_md(td, "good.md",
+                         "# Story\n\nnarr\n\n"
+                         "## Panel 1 — A\nPrompt: shot one here\nNarration: one.\n\n"
+                         "## Panel 2 — B\nPrompt: shot two here\nNarration: two.\n")
+        check("L16a valid Prompt:/Narration: story returns []",
+              ltx_movie._validate_story_md(good, 2, no_stills=True) == [],
+              "got %r" % ltx_movie._validate_story_md(good, 2, no_stills=True))
+
+        missing = _write_md(td, "missing.md",
+                            "# Story\n\nnarr\n\n"
+                            "## Panel 1 — A\nPrompt: shot one here\nNarration: one.\n\n"
+                            "## Panel 2 — B\nNarration: two.\n")
+        v = ltx_movie._validate_story_md(missing, 2, no_stills=True)
+        check("L16b missing Prompt: is a violation naming panel 2",
+              any("panel 2: missing/empty Prompt: field" == s for s in v), "got %r" % v)
+
+        both = _write_md(td, "both.md",
+                         "# Story\n\nnarr\n\n"
+                         "## Panel 1 — A\nPrompt: shot one\nImage: also an image\n"
+                         "Narration: one.\n")
+        v = ltx_movie._validate_story_md(both, 1, no_stills=True)
+        check("L16c both forms is a violation naming panel 1",
+              any("panel 1: has both Prompt: and Image:/Motion: fields; "
+                  "--no-stills expects Prompt: only" == s for s in v), "got %r" % v)
+
+        check("L16d --no-stills does NOT require Image:/Motion:",
+              not any("Image" in s and "missing" in s
+                      for s in ltx_movie._validate_story_md(good, 2, no_stills=True)))
+
+        today = _write_md(td, "today.md",
+                          "# Story\n\nnarr\n\n"
+                          "## Panel 1 — A\nImage: a scene\nMotion: pan\nNarration: one.\n")
+        check("L16e the default path is unchanged (Image/Motion/Narration required)",
+              ltx_movie._validate_story_md(today, 1) == [],
+              "got %r" % ltx_movie._validate_story_md(today, 1))
+        check("L16f the default path still rejects a Prompt:-only story",
+              len(ltx_movie._validate_story_md(good, 2)) > 0)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -375,6 +427,7 @@ if __name__ == "__main__":
     test_no_stills_defaults_and_validation()
     test_no_stills_orthogonal_to_length()
     test_no_stills_story_prompt_template()
+    test_validate_story_md_no_stills()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

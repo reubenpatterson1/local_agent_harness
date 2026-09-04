@@ -266,11 +266,12 @@ def _lock_state(lock_path):
 # story.md validation
 # ---------------------------------------------------------------------------
 
-def _validate_story_md(story_md_path, expected_panels):
+def _validate_story_md(story_md_path, expected_panels, no_stills=False):
     """Load bin/ltx-story-manifest via SourceFileLoader and validate
     story_md_path against it: exactly expected_panels panels, each with a
-    non-empty Image:/Motion:/Narration: field. Returns a list of violation
-    strings (empty list == valid)."""
+    non-empty Image:/Motion:/Narration: field -- or, under no_stills, a
+    non-empty Prompt:/Narration: field and neither Image: nor Motion:.
+    Returns a list of violation strings (empty list == valid)."""
     violations = []
     manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
     try:
@@ -288,9 +289,20 @@ def _validate_story_md(story_md_path, expected_panels):
 
     for p in panels:
         num = p["number"]
-        for label, key in (("Image", "image"), ("Motion", "motion"), ("Narration", "narration")):
-            if not p[key].strip():
-                violations.append("panel %d: missing/empty %s: field" % (num, label))
+        if no_stills:
+            for label, key in (("Prompt", "prompt"), ("Narration", "narration")):
+                if not p[key].strip():
+                    violations.append("panel %d: missing/empty %s: field" % (num, label))
+            if p["prompt"].strip() and (p["image"].strip() or p["motion"].strip()):
+                violations.append(
+                    "panel %d: has both Prompt: and Image:/Motion: fields; "
+                    "--no-stills expects Prompt: only" % num
+                )
+        else:
+            for label, key in (("Image", "image"), ("Motion", "motion"),
+                               ("Narration", "narration")):
+                if not p[key].strip():
+                    violations.append("panel %d: missing/empty %s: field" % (num, label))
 
     return violations
 
@@ -349,7 +361,7 @@ def phase1_story(args):
               % story_md)
     else:
         print("=== Phase 1: story ===")
-        prompt = build_story_prompt(args.narrative, args.story_id, args.panels)
+        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills)
         max_tokens = _phase1_max_tokens(args.panels)
         timeout = _phase1_timeout(args.panels)
         cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
@@ -390,7 +402,7 @@ def phase1_story(args):
                       % (proc.returncode, tail), file=sys.stderr)
                 return 1
 
-    violations = _validate_story_md(story_md, args.panels)
+    violations = _validate_story_md(story_md, args.panels, args.no_stills)
     if violations:
         print("Error: story.md failed validation:", file=sys.stderr)
         for v in violations:
