@@ -196,7 +196,8 @@ def test_prompts_count_mismatch_exits_2():
                 "--image", img2,
             ])
             check("T6 prompts.md panel/image count mismatch exits 2", rc == 2, "got %r" % rc)
-            manifest_path = os.path.join(WS, "generated", "stories", story_id, "manifest.json")
+            manifest_path = os.path.join(story_manifest.WS, "generated", "stories",
+                                         story_id, "manifest.json")
             check("T6 no manifest written on mismatch", not os.path.exists(manifest_path))
     finally:
         _rm_story(story_id)
