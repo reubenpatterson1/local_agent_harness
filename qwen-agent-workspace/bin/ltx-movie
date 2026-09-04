@@ -95,9 +95,25 @@ The FIRST time a recurring character (or other recurring visual element) appears
 
 Do not verify the file with run_python or any other tool. Emit no other text."""
 
+STORY_PROMPT_TEMPLATE_NO_STILLS = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
-def build_story_prompt(narrative, story_id, panels):
-    return STORY_PROMPT_TEMPLATE.format(narrative=narrative, story_id=story_id, panels=panels)
+Narrative to adapt:
+{narrative}
+
+Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file must contain EXACTLY {panels} panel sections, numbered 1 through {panels} in order, each in exactly this format:
+
+## Panel N — <short title>
+Prompt: <a single video prompt, 85-130 words, describing the shot's visual content, setting, lighting, lens/shot choice, AND the camera motion and subject motion within the shot, together in one continuous description -- no new plot information beyond what this shot shows>
+Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
+
+The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Prompt: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
+
+Do not emit an Image: or Motion: field. Do not verify the file with run_python or any other tool. Emit no other text."""
+
+
+def build_story_prompt(narrative, story_id, panels, no_stills=False):
+    template = STORY_PROMPT_TEMPLATE_NO_STILLS if no_stills else STORY_PROMPT_TEMPLATE
+    return template.format(narrative=narrative, story_id=story_id, panels=panels)
 
 
 def build_parser():

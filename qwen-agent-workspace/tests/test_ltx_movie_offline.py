@@ -332,6 +332,33 @@ def test_no_stills_orthogonal_to_length():
           "got %r" % (plain,))
 
 
+# ---------------------------------------------------------------------------
+# L15: the --no-stills story template (spec 9.1 item 3)
+# ---------------------------------------------------------------------------
+
+def test_no_stills_story_prompt_template():
+    p = ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=True)
+    check("L15a contains Prompt:", "Prompt: <" in p, "got %r" % p[:400])
+    check("L15b contains Narration:", "Narration: <" in p)
+    check("L15c keeps the VERBATIM consistency rule", "VERBATIM" in p)
+    check("L15d states the rule applies to the Prompt: field",
+          "full visual description in the Prompt: field" in p)
+    check("L15e no Image: field", "Image: <" not in p)
+    check("L15f no Motion: field", "Motion: <" not in p)
+    check("L15g forbids emitting the old fields",
+          "Do not emit an Image: or Motion: field." in p)
+    check("L15h word band is 85-130", "85-130 words" in p)
+    check("L15i formats narrative/story_id/panels",
+          "some narrative" in p and "some_id" in p and "EXACTLY 7 panel sections" in p)
+
+    d = ltx_movie.build_story_prompt("some narrative", "some_id", 7)
+    check("L15j the three-argument call is unchanged from today's template",
+          d == ltx_movie.STORY_PROMPT_TEMPLATE.format(
+              narrative="some narrative", story_id="some_id", panels=7))
+    check("L15k no_stills=False is the same as the three-argument call",
+          ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=False) == d)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -347,6 +374,7 @@ if __name__ == "__main__":
     test_phase1_nonzero_rc_checks_story_md_before_failing()
     test_no_stills_defaults_and_validation()
     test_no_stills_orthogonal_to_length()
+    test_no_stills_story_prompt_template()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
