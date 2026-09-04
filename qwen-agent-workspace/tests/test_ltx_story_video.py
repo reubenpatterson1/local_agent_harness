@@ -297,6 +297,174 @@ def test_overwrite_protection():
         _rm_story(story_id)
 
 
+def _write_prompt_story(path, n_panels, narrations=None):
+    """Write a --no-stills-form story.md with n_panels Prompt:/Narration: panels."""
+    lines = ["# Story", "", "A short narrative line.", ""]
+    for i in range(1, n_panels + 1):
+        narration = (narrations[i - 1] if narrations
+                     else " ".join(["word"] * (5 + i)) + ".")
+        lines += [
+            "## Panel %d — Title %d" % (i, i),
+            "Prompt: shot %d of a stone courtyard, cold dawn light, slow push-in" % i,
+            "Narration: %s" % narration,
+            "",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+def _write_label_story(path, n_panels, narrations=None):
+    """Write today's Image:/Motion:/Narration: story.md with the same narrations."""
+    lines = ["# Story", "", "A short narrative line.", ""]
+    for i in range(1, n_panels + 1):
+        narration = (narrations[i - 1] if narrations
+                     else " ".join(["word"] * (5 + i)) + ".")
+        lines += [
+            "## Panel %d — Title %d" % (i, i),
+            "Image: shot %d of a stone courtyard, cold dawn light" % i,
+            "Motion: slow push-in",
+            "Narration: %s" % narration,
+            "",
+        ]
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# M3: --no-images is mutually exclusive with --glob/--image and requires
+# --prompts-md (all exit 2)
+# ---------------------------------------------------------------------------
+
+def test_no_images_argument_rejections():
+    with tempfile.TemporaryDirectory() as tmp:
+        img = os.path.join(tmp, "a.png")
+        _make_png(img)
+        md = os.path.join(tmp, "story.md")
+        _write_prompt_story(md, 2)
+        for argv, name in (
+            (["--story-id", "unittest-noimg-x", "--prompts-md", md,
+              "--no-images", "--glob", "*.png"], "M3a --no-images + --glob exits 2"),
+            (["--story-id", "unittest-noimg-x", "--prompts-md", md,
+              "--no-images", "--image", img], "M3b --no-images + --image exits 2"),
+            (["--story-id", "unittest-noimg-x", "--no-images"],
+             "M3c --no-images without --prompts-md exits 2"),
+        ):
+            rc = None
+            try:
+                rc = story_manifest.main(argv)
+            except SystemExit as e:
+                rc = e.code
+            check(name, rc == 2, "got %r" % rc)
+
+
+# ---------------------------------------------------------------------------
+# M4: --no-images writes a v2 manifest with null image_path, panel_text ==
+# motion_prompt == the collapsed prompt, and num_frames bit-identical to the
+# image-driven run over the same narrations (spec criterion 4)
+# ---------------------------------------------------------------------------
+
+def test_no_images_manifest_shape_and_frames():
+    narrations = ["One short line.", "A rather longer narration line with more words in it.",
+                  "Middling length here now."]
+    sid_a = "unittest-noimg-a"
+    sid_b = "unittest-noimg-b"
+    _rm_story(sid_a)
+    _rm_story(sid_b)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            md_prompt = os.path.join(tmp, "prompt_story.md")
+            md_label = os.path.join(tmp, "label_story.md")
+            _write_prompt_story(md_prompt, 3, narrations)
+            _write_label_story(md_label, 3, narrations)
+            imgs = []
+            for i in (1, 2, 3):
+                p = os.path.join(tmp, "panel_%d.png" % i)
+                _make_png(p)
+                imgs.append(p)
+
+            common = ["--fps", "24", "--target-seconds", "6.0",
+                      "--min-frames", "25", "--max-frames", "57", "--force"]
+            rc_a = story_manifest.main(["--story-id", sid_a, "--prompts-md", md_prompt,
+                                        "--no-images"] + common)
+            check("M4a --no-images run succeeds", rc_a == 0, "got %r" % rc_a)
+            rc_b = story_manifest.main(["--story-id", sid_b, "--prompts-md", md_label,
+                                        "--images-dir", tmp, "--glob", "panel_*.png"] + common)
+            check("M4b image-driven run succeeds", rc_b == 0, "got %r" % rc_b)
+
+            def _load(sid):
+                with open(os.path.join(story_manifest.WS, "generated", "stories", sid,
+                                       "manifest.json")) as f:
+                    return json.load(f)
+
+            a = _load(sid_a)
+            b = _load(sid_b)
+            check("M4c schema_version stays 2", a["schema_version"] == 2,
+                  "got %r" % a["schema_version"])
+            check("M4d panel count equals the story's", len(a["panels"]) == 3,
+                  "got %r" % len(a["panels"]))
+            check("M4e every image_path is null",
+                  all(p["image_path"] is None for p in a["panels"]),
+                  "got %r" % [p["image_path"] for p in a["panels"]])
+            check("M4f panel_text == motion_prompt == the collapsed prompt",
+                  all(p["panel_text"] == p["motion_prompt"]
+                      and p["panel_text"].startswith("shot ")
+                      for p in a["panels"]),
+                  "got %r" % [(p["panel_text"], p["motion_prompt"]) for p in a["panels"]])
+            check("M4g num_frames bit-identical to the image-driven run",
+                  [p["num_frames"] for p in a["panels"]] ==
+                  [p["num_frames"] for p in b["panels"]],
+                  "got %r vs %r" % ([p["num_frames"] for p in a["panels"]],
+                                    [p["num_frames"] for p in b["panels"]]))
+            check("M4h narration/narration_words preserved",
+                  [p["narration"] for p in a["panels"]] == narrations,
+                  "got %r" % [p["narration"] for p in a["panels"]])
+    finally:
+        _rm_story(sid_a)
+        _rm_story(sid_b)
+
+
+# ---------------------------------------------------------------------------
+# M5: the two Section-8 error rows
+# ---------------------------------------------------------------------------
+
+def test_no_images_panel_errors():
+    sid = "unittest-noimg-err"
+    _rm_story(sid)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            md = os.path.join(tmp, "missing_prompt.md")
+            with open(md, "w") as f:
+                f.write("# Story\n\nnarr\n\n"
+                        "## Panel 1 — A\nPrompt: shot one\nNarration: one.\n\n"
+                        "## Panel 2 — B\nNarration: two.\n")
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                rc = story_manifest.main(["--story-id", sid, "--prompts-md", md,
+                                          "--no-images", "--force"])
+            check("M5a missing Prompt: exits 2", rc == 2, "got %r" % rc)
+            check("M5b message names panel 2 and the Prompt: requirement",
+                  "--no-images requires every panel to have a non-empty Prompt: field; "
+                  "panel 2 has none" in buf.getvalue(),
+                  "got %r" % buf.getvalue())
+
+            md2 = os.path.join(tmp, "both_forms.md")
+            with open(md2, "w") as f:
+                f.write("# Story\n\nnarr\n\n"
+                        "## Panel 1 — A\nPrompt: shot one\nImage: also an image\n"
+                        "Narration: one.\n")
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                rc2 = story_manifest.main(["--story-id", sid, "--prompts-md", md2,
+                                           "--no-images", "--force"])
+            check("M5c both Prompt: and Image: exits 2", rc2 == 2, "got %r" % rc2)
+            check("M5d message names panel 1 and both forms",
+                  "panel 1 has both a Prompt: field and an Image:/Motion: field; "
+                  "use one form or the other" in buf2.getvalue(),
+                  "got %r" % buf2.getvalue())
+    finally:
+        _rm_story(sid)
+
+
 # ---------------------------------------------------------------------------
 # T8: build_parser() defaults
 # ---------------------------------------------------------------------------
@@ -819,6 +987,9 @@ if __name__ == "__main__":
     test_glob_mtime_fallback()
     test_prompts_count_mismatch_exits_2()
     test_overwrite_protection()
+    test_no_images_argument_rejections()
+    test_no_images_manifest_shape_and_frames()
+    test_no_images_panel_errors()
     test_video_parser_defaults()
     test_defaults_not_refused_geometry()
     test_build_units_per_panel()

@@ -13,7 +13,10 @@ is null only when the `Motion:` field is empty); for a v1 (unlabeled)
 section, `motion_prompt` is always written as null, same as before.
 `transition_to_next` is always written as null -- a human (or a later
 pass) fills it in by hand, or bin/ltx-story-video falls back to
-documented deterministic defaults when it is left null.
+documented deterministic defaults when it is left null. With --no-images
+there are no panel images at all: the panel list comes from
+--prompts-md's Prompt:/Narration: sections and every panel's image_path
+is null.
 
 Manifest schema (schema_version 2; bin/ltx-story-video still accepts
 schema_version 1 manifests written by earlier versions of this tool):
@@ -31,7 +34,7 @@ schema_version 1 manifests written by earlier versions of this tool):
   "panels": [
     {
       "index": 1,
-      "image_path": "/absolute/path.png",
+      "image_path": "/absolute/path.png",   // null under --no-images
       "title": "string, may be empty",
       "panel_text": "non-empty string, required",
       "narration": "string, may be empty",
@@ -82,6 +85,12 @@ def build_parser():
                          help="non-recursive glob pattern within --images-dir")
     parser.add_argument("--image", dest="image", action="append", default=None,
                          help="explicit image path, repeatable; order is used verbatim")
+    parser.add_argument("--no-images", dest="no_images", action="store_true", default=False,
+                         help="no panel images at all: derive the panel list from "
+                              "--prompts-md and write image_path: null for every panel "
+                              "(the bin/ltx-movie --no-stills / --engine chain mode). "
+                              "Mutually exclusive with --glob/--image; requires "
+                              "--prompts-md.")
     parser.add_argument("--images-dir", dest="images_dir", default=None,
                          help="default: <workspace>/generated")
     parser.add_argument("--title", dest="title", default="")
@@ -286,14 +295,22 @@ def main(argv=None):
     if args.frames is not None and args.pace is not None:
         parser.error("--frames and --pace are mutually exclusive")
 
-    if args.glob and args.image:
-        parser.error("--glob and --image are mutually exclusive")
-    if not args.glob and not args.image:
-        parser.error("one of --glob or --image is required")
+    if args.no_images:
+        if args.glob or args.image:
+            parser.error("--no-images is mutually exclusive with --glob and --image")
+        if not args.prompts_md:
+            parser.error("--no-images requires --prompts-md")
+    else:
+        if args.glob and args.image:
+            parser.error("--glob and --image are mutually exclusive")
+        if not args.glob and not args.image:
+            parser.error("one of --glob or --image is required")
 
     images_dir = args.images_dir or os.path.join(WS, "generated")
 
-    if args.glob:
+    if args.no_images:
+        matched = []
+    elif args.glob:
         matched, err = _select_images_glob(images_dir, args.glob)
         if err:
             print(err, file=sys.stderr)
@@ -315,16 +332,34 @@ def main(argv=None):
         except OSError as e:
             print("Error: cannot read --prompts-md file: %s" % e, file=sys.stderr)
             return 2
-        if len(parsed_panels) != len(matched):
+        if args.no_images and not parsed_panels:
+            print("Error: --no-images requires --prompts-md to contain at least one "
+                  "panel section; found 0", file=sys.stderr)
+            return 2
+        if not args.no_images and len(parsed_panels) != len(matched):
             print("Error: prompts.md has %d panels but %d images were selected"
                   % (len(parsed_panels), len(matched)), file=sys.stderr)
             return 2
+        # A panel must use one form or the other: the assembly below silently
+        # prefers Prompt: over Image:/Motion:, and a silent drop is worse than
+        # a refusal. Checked in both modes (spec Section 8).
+        for i, pt in enumerate(parsed_panels, start=1):
+            if pt["prompt"].strip() and (pt["image"].strip() or pt["motion"].strip()):
+                print("Error: panel %d has both a Prompt: field and an Image:/Motion: "
+                      "field; use one form or the other" % i, file=sys.stderr)
+                return 2
+        if args.no_images:
+            for i, pt in enumerate(parsed_panels, start=1):
+                if not pt["prompt"].strip():
+                    print("Error: --no-images requires every panel to have a non-empty "
+                          "Prompt: field; panel %d has none" % i, file=sys.stderr)
+                    return 2
         prompt_texts = parsed_panels
     else:
         print("WARNING: no --prompts-md; panel_text is a placeholder "
               "— edit manifest.json before running")
 
-    n_panels = len(matched)
+    n_panels = len(prompt_texts) if args.no_images else len(matched)
 
     # --- frame allocation: either an explicit --frames override, or
     # weighted allocation (proportional to Narration word count, or
@@ -376,10 +411,20 @@ def main(argv=None):
             return 2
 
     panels = []
-    for i, image_path in enumerate(matched, start=1):
+    for i in range(1, n_panels + 1):
+        image_path = matched[i - 1] if matched else None
         pt = prompt_texts[i - 1] if prompt_texts is not None else None
+        has_prompt = pt is not None and bool(pt["prompt"].strip())
         has_labels = pt is not None and (pt["image"] or pt["motion"] or pt["narration"])
-        if has_labels:
+        if has_prompt:
+            # Collapsed form (DR2): one field is both the panel text and the
+            # motion prompt. Checked FIRST, because a Prompt:-form panel also
+            # has a Narration: label and would otherwise fall into has_labels.
+            title = pt["title"]
+            panel_text = pt["prompt"]
+            motion_prompt = pt["prompt"]
+            narration = pt["narration"]
+        elif has_labels:
             title = pt["title"]
             panel_text = pt["image"] or ("panel %d" % i)
             motion_prompt = pt["motion"] or None
@@ -397,7 +442,7 @@ def main(argv=None):
         num_frames = frame_counts[i - 1]
         panels.append({
             "index": i,
-            "image_path": os.path.abspath(image_path),
+            "image_path": None if image_path is None else os.path.abspath(image_path),
             "title": title,
             "panel_text": panel_text,
             "narration": narration,
@@ -441,9 +486,9 @@ def main(argv=None):
     print("wrote %s (%d panels)" % (manifest_path, len(panels)))
     print("%-6s %-30s %-8s %-8s %s" % ("index", "basename", "frames", "secs", "title"))
     for p in panels:
+        basename = os.path.basename(p["image_path"]) if p["image_path"] else "(no image)"
         print("%-6d %-30s %-8d %-8.2f %s"
-              % (p["index"], os.path.basename(p["image_path"]), p["num_frames"],
-                 p["duration_s"], p["title"]))
+              % (p["index"], basename, p["num_frames"], p["duration_s"], p["title"]))
     print("TOTAL %d frames = %.2f s @ %d fps" % (total_num_frames, total_num_frames / args.fps, args.fps))
 
     return 0
