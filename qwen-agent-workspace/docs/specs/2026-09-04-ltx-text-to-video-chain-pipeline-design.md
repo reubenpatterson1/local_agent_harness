@@ -858,6 +858,76 @@ nohup python3 bin/ltx-movie "<short narrative>" --story-id t2v_chain_smoke \
     > generated/stories/t2v_chain_smoke/movie_launch.log 2>&1 & disown
 ```
 
+### 9.3.1 Live run outcome (2026-09-04/05) — criterion 7 confirmed live; criterion 10 NOT met
+
+Story: `t2v_chain_smoke`, narrative "A lighthouse keeper watches a storm roll in over three nights.",
+`--length 16 --reanchor-every 5` → 8 panels, 2 chain groups (openers at panel-1 and panel-6), naturally
+uneven follower boundaries in both directions (`[57, 49, 49, 49, 57, 41, 41, 41]` frames) — the manifest
+allocator required no hand-edit to exercise OQ2's boundary live, exactly as this section predicted.
+
+**Two real, pre-existing bugs (unrelated to `--no-stills`, both fixed and committed) blocked the run before
+any GPU work could start:**
+- `bin/ltx-movie`'s Phase 1 never passed `--workspace` to `qwen-agent`, so it silently wrote `story.md` into
+  `qwen-agent`'s own default workspace (the separate, hand-edited PATH copy) instead of the repo tree
+  `ltx-movie` itself reads from — `qwen-agent` exited 0 (it succeeded, just in the wrong tree), so no
+  diagnostic ever surfaced. Fixed: commit `6e5776e`.
+- `_top5_rss()` (a `bin/ltx-movie` memory-diagnostic helper called every 120 s by `_wait_for_avail`) crashed
+  with `AttributeError` whenever `psutil.process_iter` yielded a process with `memory_info=None` — a normal
+  occurrence, not just the `NoSuchProcess`/`AccessDenied` cases it already handled. Fixed: commit `687f83a`.
+
+**Host environment findings, all outside this feature's code:** the host runs an MTPLX or vLLM 27B model
+server on demand for other work (`qwen-agent`, interactive use), and it competes directly with LTX-Video
+generation for both host RAM and Metal/MPS GPU memory — confirmed via `mps_guard`'s own `gpu_other_gib`
+accounting (a resident MTPLX instance held 22–25 GiB of GPU memory, independent of host RAM being otherwise
+plentiful). `bin/ltx-host-prep`'s `pkill -f 'vllm.*8177'` does not match an MTPLX process, so it cannot stop
+one; `bin/ltx-story-video`'s own internal prep step hard-refuses (exit 2) if the port is still open after
+prep's 60 s wait, rather than retrying. Across many attempts, stage 1's ~18 GiB T5-shard page-cache growth
+consistently left available memory 4–8 GiB short of stage 2's 32.2 GiB gate; `sudo purge` cannot run
+non-interactively in this environment (no TTY/cached credential reachable from a spawned subprocess), so
+each recovery required a human running it directly, at the right moment, in their own terminal.
+
+**One deliberate, reverted experiment.** With explicit, informed user approval — after surfacing that this
+exact scenario (`avail` failing while `supply` alone passes) is the documented 2026-08-25 forced-reboot
+thrash incident `mps_guard.py`'s own comments warn against — the stage-2 `required_gib` gate was temporarily
+capped at 25 GiB to test whether the measured shortfall (consistently 27–29 GiB avail) was conservative. It
+was not: the very next attempt produced a real `sentinel_abort` (swap usage 96%, swap grew 3.83→16.32 GiB)
+before completing panel-1 — the exact failure mode the gate exists to prevent, caught by the sentinel rather
+than escalating to a freeze, but with zero forward progress gained. The edit was reverted immediately
+(`git diff mps_guard.py` confirmed byte-identical to its committed state afterward); this file was never
+committed to and remains completely unmodified by this feature.
+
+**What was, and was not, confirmed live, across roughly a dozen attempts:**
+- **Criterion 7 (a follower renders its own prompt, no stale-`embeds.pt` failure) — CONFIRMED.** In the one
+  attempt that got furthest (before the host-contention findings above were fully understood), panel-1 (T2V
+  opener, 57 frames) rendered to completion. Panel-2 (chain follower, 49 frames, `--continue-from` panel-1)
+  then completed **stage 1** cleanly: its `embeds.pt` was verified to encode its own prompt (distinct from
+  panel-1's), the `=== continuation mode: prompt differs from base; encoding this continuation's own
+  prompt (stage 1) ===` banner printed, and the C6 page-cache release fired (`avail 28.31 → 42.93 GiB`).
+  Panel-2 then failed at stage 2 to a genuine `sentinel_abort` (available memory collapsed to 0.84 GiB) —
+  a real host-capacity limit, not a code defect; the sentinel and the subsequent
+  `consecutive_failures` circuit breaker both fired exactly as designed.
+- **Criterion 10 (movie.mp4 exists, `completed_units == requested_units`) — NOT MET.** No attempt completed
+  more than 1 of 8 units; several completed 0. `story_summary.json`/`movie.mp4` reflecting a full run were
+  never produced.
+- **Criterion 12 (a follower renders at its own allocated length, differing from its predecessor's) —
+  PARTIALLY CONFIRMED.** Panel-2's stage 1 ran against its own 49-frame allocation (differing from panel-1's
+  57), but stage 2 never completed for any follower in any attempt, so no follower's final rendered frame
+  count was ever directly observed. OQ2's dedicated live probe (Task 5, both directions, `25→49` and
+  `49→25`) already closed this property with direct evidence independent of this run (Section 13, OQ2) — this
+  run's partial evidence is consistent with, but does not independently re-confirm, that closure.
+
+**Disposition, by explicit user decision (2026-09-05): accept the evidence gathered above in place of a
+full 8/8 completion.** OQ1 and OQ2 (Section 13) were already `CLOSED-PASS` from Tasks 4 and 5's dedicated
+live probes before this run began, and remain closed on that evidence — this run adds a second, independent,
+full-pipeline confirmation of the OQ1/criterion-7 property (a real `--engine chain` follower correctly
+re-encoding its own differing prompt) but does not itself close OQ1/OQ2. Criterion 10 is recorded as **not
+met on this host at this time**, for reasons entirely of host memory/GPU capacity and a competing model
+server, not of any defect found in this feature's code — every offline test (Task 24: 4 suites, 3 checks,
+zero findings) and every task-level and this-run's-own diagnostic evidence is consistent with the chain
+engine being correctly implemented. A future attempt on a host with more sustained memory/GPU headroom (or
+with the competing model server permanently unavailable rather than merely stopped) would be needed to
+produce a full completed run for criterion 10.
+
 ### 9.4 Not built
 
 No automated drift-quantification metric, no drift regression fixture, and no perceptual scoring. Drift is
