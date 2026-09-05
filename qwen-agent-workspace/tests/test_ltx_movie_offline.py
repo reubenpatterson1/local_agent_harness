@@ -548,6 +548,78 @@ def test_top5_rss_skips_none_memory_info():
           result[0][0] == "proc-b", "got %r" % (result,))
 
 
+# ---------------------------------------------------------------------------
+# L21: dynamic --min-frames/--max-frames (derived from target seconds/panel,
+# snapped to the n=1+8k lattice, clamped against ltx_ceiling.json's
+# measured 512x512 entry)
+# ---------------------------------------------------------------------------
+
+def test_dynamic_frame_bounds_default_2s_per_panel():
+    result = ltx_movie._dynamic_frame_bounds(30.0, 15, 24)
+    check("L21a default (2s/panel) result", result == (25, 73, False, 2.0, 48.0),
+          "got %r" % (result,))
+
+
+def test_dynamic_frame_bounds_clamped_by_ceiling():
+    result = ltx_movie._dynamic_frame_bounds(30.0, 6, 24)
+    check("L21b 5s/panel clamps max to the 512x512 ceiling (73)",
+          result == (57, 73, True, 5.0, 120.0), "got %r" % (result,))
+
+
+def test_dynamic_frame_bounds_tiny_target_floors_at_9():
+    result = ltx_movie._dynamic_frame_bounds(6.0, 30, 24)
+    min_frames, max_frames, ceiling_clamped, seconds_per_panel, target_frames_per_panel = result
+    check("L21c tiny target floors both bounds at 9, no clamp",
+          (min_frames, max_frames, ceiling_clamped) == (9, 9, False), "got %r" % (result,))
+    check("L21c seconds_per_panel == 0.2",
+          abs(seconds_per_panel - 0.2) < 1e-9, "got %r" % (seconds_per_panel,))
+    check("L21c target_frames_per_panel ~= 4.8 (float non-associativity, not exact)",
+          abs(target_frames_per_panel - 4.8) < 1e-9, "got %r" % (target_frames_per_panel,))
+
+
+def test_dynamic_frame_bounds_infeasible_clamp_exits():
+    try:
+        ltx_movie._dynamic_frame_bounds(40.0, 5, 24)
+        check("L21d infeasible clamp raises SystemExit", False, "did not raise")
+    except SystemExit as e:
+        check("L21d infeasible clamp raises SystemExit(2)", e.code == 2, "got code=%r" % e.code)
+
+
+def test_dynamic_frame_bounds_dry_run_banner():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-dynamic",
+         "--panels", "6", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L21e exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
+                                                                       result.stderr))
+    check("L21f banner printed", "Dynamic frame bounds:" in out, "got %r" % out)
+    check("L21g banner shows min=57", "min=57" in out, "got %r" % out)
+    check("L21h banner shows max=73", "max=73" in out, "got %r" % out)
+    check("L21i banner notes the ceiling clamp",
+          "[clamped to measured 512x512 ceiling]" in out, "got %r" % out)
+    check("L21j Phase 3 manifest command uses the computed bounds",
+          "--min-frames 57" in out and "--max-frames 73" in out, "got %r" % out)
+
+
+def test_dynamic_frame_bounds_explicit_min_disables_both():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-explicit",
+         "--panels", "6", "--min-frames", "41", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L21k exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
+                                                                       result.stderr))
+    check("L21l no dynamic banner when --min-frames is explicit",
+          "Dynamic frame bounds:" not in out, "got %r" % out)
+    check("L21m explicit --min-frames 41 passed through unchanged",
+          "--min-frames 41" in out, "got %r" % out)
+    check("L21n --max-frames falls back to its static default (57), not computed",
+          "--max-frames 57" in out, "got %r" % out)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -570,6 +642,12 @@ if __name__ == "__main__":
     test_default_dry_run_plan_unchanged()
     test_phase1_qwen_agent_gets_workspace_flag()
     test_top5_rss_skips_none_memory_info()
+    test_dynamic_frame_bounds_default_2s_per_panel()
+    test_dynamic_frame_bounds_clamped_by_ceiling()
+    test_dynamic_frame_bounds_tiny_target_floors_at_9()
+    test_dynamic_frame_bounds_infeasible_clamp_exits()
+    test_dynamic_frame_bounds_dry_run_banner()
+    test_dynamic_frame_bounds_explicit_min_disables_both()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
