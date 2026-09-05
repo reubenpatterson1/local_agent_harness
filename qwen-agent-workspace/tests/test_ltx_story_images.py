@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 
-WS = "/Users/reubenpatterson/qwen-agent-workspace"
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 
 _MANIFEST_PATH = os.path.join(WS, "bin", "ltx-story-manifest")
