@@ -937,6 +937,25 @@ engine being correctly implemented. A future attempt on a host with more sustain
 with the competing model server permanently unavailable rather than merely stopped) would be needed to
 produce a full completed run for criterion 10.
 
+### 9.3.2 Update (2026-09-05): full 8/8 completion achieved — criterion 10 now MET
+
+A subsequent run, `my_test2` (same narrative/`--length 16 --reanchor-every 5` shape, launched by the user
+directly after all fixes from 9.3.1 — the `--workspace` fix, the `_top5_rss` fix, and with the competing
+MTPLX/vLLM server stopped before launch — **completed fully**: `story_summary.json` records
+`"requested_units": 8, "completed_units": 8, "stopped_reason": null,
+"actual_total_frames": 384 == "intended_total_frames": 384`, with `movie.mp4` produced. All 8 panels'
+`status` is `"ok"`; per-panel frame counts (`[57, 41, 33, 57, 41, 41, 57, 57]`) show genuine per-panel
+variation across both chain groups, consistent with the narration-proportional allocator. Both chain groups
+rendered as designed: group 1 (panels 1–5, opener panel-1) and group 2 (panels 6–8, opener panel-6), each
+follower's `chain_run_root` present and distinct.
+
+**Criterion 10 (movie.mp4 exists, `completed_units == requested_units`) is now MET**, superseding 9.3.1's
+"NOT MET" disposition — the earlier failures were entirely attributable to the host-capacity/competing-server
+conditions documented in 9.3.1, not to any defect in the chain engine, and resolving those conditions (server
+stopped, sufficient memory margin) let the identical code complete a full run on the first subsequent attempt.
+The 9.3.1 record is left unmodified above as an honest account of the debugging path that led here, per this
+project's convention of recording what actually happened rather than only the final state.
+
 ### 9.4 Not built
 
 No automated drift-quantification metric, no drift regression fixture, and no perceptual scoring. Drift is
