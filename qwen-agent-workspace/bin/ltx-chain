@@ -364,11 +364,19 @@ def main(argv=None):
             print("stage 1 ok")
 
             # Load-bearing (spec C6): stage 1 mmaps ~18 GiB of T5 shards, which
-            # depresses psutil-available and fails stage 2's G1b gate. The
-            # fresh-chain path is always preceded by bin/ltx-host-prep's own
-            # `sudo purge`, but a nested continuation runs with --no-prep, so
-            # nothing else evicts it. Same call bin/ltx-story-video makes after
-            # every unit's stage 1.
+            # depresses psutil-available and fails stage 2's G1b gate. This
+            # call runs for BOTH cases that reach this else branch: a fresh
+            # chain with no --continue-from at all, and a continuation whose
+            # prompt differs from its base's. That's deliberate -- freeing the
+            # page cache here is beneficial regardless of which of the two
+            # cases triggered this encode. Same call bin/ltx-story-video makes
+            # after every unit's stage 1.
+            #
+            # If sudo purge fails, the shared helper's resume-hint advisory
+            # is phrased as a --t2v --resume command; that phrasing doesn't
+            # apply to bin/ltx-chain's own callers (both cases here are
+            # i2v-style, not t2v) and can be disregarded -- a known, cosmetic
+            # mismatch in a stderr-only diagnostic on a rare failure path.
             L._release_page_cache(base, None, args.prompt, None)
 
         # --- step 6: segment loop ---

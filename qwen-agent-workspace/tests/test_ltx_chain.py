@@ -9,6 +9,7 @@ single early-exit path (--segments 0) that returns before any subprocess
 is spawned.
 """
 
+import ast
 import importlib.machinery
 import os
 import sys
@@ -276,8 +277,35 @@ def test_continue_remaining_fields_still_checked():
 # T40: continuation mode re-encodes stage 1 when the requested prompt differs
 # from the base's (D8/A1) -- source guard: both branches present, the
 # same-prompt branch still prints the reuse line and skips stage 1, and the
-# differing-prompt branch releases the page cache before stage 2 (C6)
+# stage-1-runs branch (both the fresh-chain case and the differing-prompt
+# continuation case) releases the page cache before stage 2 (C6) -- AST
+# guard: the release call must fire unconditionally for that branch, not be
+# nested under some further if/else that would silently exclude either case
 # ---------------------------------------------------------------------------
+
+def _find_outer_continue_if(tree):
+    """The `if args.continue_from and args.prompt == base_request_dict["prompt"]:`
+    node from bin/ltx-chain's step-5 block, identified by its test shape."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If):
+            dump = ast.dump(node.test)
+            if "continue_from" in dump and "prompt" in dump and "Eq" in dump:
+                return node
+    return None
+
+
+def _orelse_has_direct_release_call(orelse):
+    """True if L._release_page_cache(...) is a direct top-level statement of
+    `orelse` -- i.e. not merely nested somewhere deeper inside a further if,
+    which would let it be silently gated on a condition (e.g. a future
+    `if args.continue_from:`) that excludes the fresh-chain case."""
+    for stmt in orelse:
+        if (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "_release_page_cache"):
+            return True
+    return False
+
 
 def test_continuation_reencode_branch_present():
     with open(_CHAIN_PATH) as f:
@@ -290,8 +318,14 @@ def test_continuation_reencode_branch_present():
     check("T40c the branch is keyed on the base request's prompt",
           'base_request_dict["prompt"] != args.prompt' in text
           or 'args.prompt != base_request_dict["prompt"]' in text)
-    check("T40d the re-encode releases the page cache (C6)",
-          "L._release_page_cache(" in text)
+
+    tree = ast.parse(text, filename=_CHAIN_PATH)
+    outer_if = _find_outer_continue_if(tree)
+    check("T40d the re-encode releases the page cache (C6), unconditionally "
+          "for both the fresh-chain case and the differing-prompt "
+          "continuation case (not gated by a further nested if)",
+          outer_if is not None and _orelse_has_direct_release_call(outer_if.orelse),
+          "got outer_if=%r" % (outer_if is not None))
 
 
 if __name__ == "__main__":

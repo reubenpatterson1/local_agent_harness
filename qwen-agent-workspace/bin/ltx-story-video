@@ -496,7 +496,9 @@ def _build_chain_follower_cmd(args, unit, base_dir, base_last_frame, scratch_mp4
 
     ltx-chain is resolved next to THIS file rather than via WS, so the chain
     engine always runs the same copy of the tool it was developed and tested
-    against. The WS constant itself is deliberately left untouched.
+    against. Task 5.5 later repointed WS to resolve relative to __file__ too,
+    so os.path.join(WS, "bin", "ltx-chain") would now be equivalent -- but
+    the next-to-THIS-file resolution is kept as-is.
     """
     chain_tool = os.path.join(os.path.dirname(os.path.realpath(__file__)), "ltx-chain")
     cmd = [

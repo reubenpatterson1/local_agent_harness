@@ -689,11 +689,20 @@ differing-prompt branch above adds one, immediately after its stage-1 `_spawn_st
 ~18 GiB of T5 shards, which depresses `psutil.virtual_memory().available` and can fail stage 2's G1b gate
 (`mps_guard._supply_gate_ok`, `mps_guard.py` line 317) — that gate refuses if *either* the `avail_gib` arm or
 the `supply_gib` arm falls short of `required_gib` (a conjunction of both metrics, not either alone; see the
-function's own docstring and inline comment on the `or`). The fresh-chain (non-continuation) path is always
-preceded by `bin/ltx-host-prep`'s own `sudo purge`, which evicts the mmap'd pages before stage 2 ever runs, so
-it never needed this call. A nested continuation, however, is typically invoked with `--no-prep` (the base run
-already prepped the host), so nothing else evicts those pages before this continuation's own stage 2 runs —
-hence the explicit release here.
+function's own docstring and inline comment on the `or`). The call is placed in the `else` branch of `if
+args.continue_from and args.prompt == base_request_dict["prompt"]:` inside `bin/ltx-chain`'s step-5 block, and
+that `else` branch is reached in two situations: (a) a fresh chain with no `--continue-from` at all, and (b) a
+continuation whose prompt differs from the base's. Consequently the release call fires for every stage-1
+encode in that block, not just the continuation case. This is intentional: on the fresh-chain path the extra
+purge is harmless (the prior `bin/ltx-host-prep` `sudo purge` already evicted the pages), while on the
+continuation path (typically invoked with `--no-prep`) it is strictly required, because nothing else evicts
+those pages before this continuation's own stage 2 runs.
+
+This broader-than-originally-described scope was found during the final whole-branch review (2026-09-05); the
+broader scope was confirmed benign and deliberately kept as-is (not narrowed to gate on `--continue-from`),
+because `bin/ltx-generate --chain N`'s same-prompt path never reaches this `else` branch at all — it always
+takes the other branch, reusing the base's `embeds.pt` — and is therefore provably unaffected by this call's
+placement.
 
 ### 6.3 Geometry gating after D7
 
