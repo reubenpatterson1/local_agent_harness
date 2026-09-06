@@ -163,6 +163,10 @@ def build_parser():
     parser.add_argument("--no-review", dest="no_review", action="store_true", default=False)
     parser.add_argument("--force-story", dest="force_story", action="store_true", default=False)
     parser.add_argument("--force", action="store_true", default=False)
+    parser.add_argument("--keep-down", dest="keep_down", action="store_true", default=False,
+                         help="pass --keep-down to bin/ltx-story-video's Phase 4 render: "
+                              "leave the MTPLX/vLLM servers down after the run instead of "
+                              "auto-relaunching them via bin/ltx-host-restore.")
     parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=34.0)
     parser.add_argument("--avail-timeout", dest="avail_timeout", type=int, default=1800)
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
@@ -652,6 +656,8 @@ def phase4_render(args):
             "--retry-idle", "120", "--max-consecutive-failures", "3"]
     if args.force:
         cmd.append("--force")
+    if args.keep_down:
+        cmd.append("--keep-down")
     print("Running: %s" % shlex.join(cmd))
 
     rc = _stream_and_tee(cmd, paths["movie_log_path"])
@@ -731,6 +737,8 @@ def _print_dry_run_plan(args):
                    "--retry-idle", "120", "--max-consecutive-failures", "3"]
     if args.force:
         phase4_cmd.append("--force")
+    if args.keep_down:
+        phase4_cmd.append("--keep-down")
     print("Command: %s" % shlex.join(phase4_cmd))
     return 0
 

@@ -620,6 +620,41 @@ def test_dynamic_frame_bounds_explicit_min_disables_both():
           "--max-frames 57" in out, "got %r" % out)
 
 
+# ---------------------------------------------------------------------------
+# L22: --keep-down passthrough to bin/ltx-story-video
+# ---------------------------------------------------------------------------
+
+def test_keep_down_defaults_false():
+    args = ltx_movie.build_parser().parse_args(["some narrative", "--story-id", "test"])
+    check("L22a keep_down defaults to False", args.keep_down is False, "got %r" % args.keep_down)
+
+
+def test_keep_down_absent_from_dry_run_plan_by_default():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-keepdown-off",
+         "--panels", "6", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L22b exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
+                                                                       result.stderr))
+    check("L22c --keep-down absent from Phase 4 command by default",
+          "--keep-down" not in out, "got %r" % out)
+
+
+def test_keep_down_present_in_dry_run_plan_when_passed():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-keepdown-on",
+         "--panels", "6", "--keep-down", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L22d exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
+                                                                       result.stderr))
+    check("L22e --keep-down present in Phase 4 command when passed",
+          "--keep-down" in out, "got %r" % out)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_dry_run_prints_phases_and_prompt()
@@ -648,6 +683,9 @@ if __name__ == "__main__":
     test_dynamic_frame_bounds_infeasible_clamp_exits()
     test_dynamic_frame_bounds_dry_run_banner()
     test_dynamic_frame_bounds_explicit_min_disables_both()
+    test_keep_down_defaults_false()
+    test_keep_down_absent_from_dry_run_plan_by_default()
+    test_keep_down_present_in_dry_run_plan_when_passed()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
