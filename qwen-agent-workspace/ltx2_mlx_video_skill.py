@@ -134,3 +134,53 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
     if quiet:
         cmd.append("--quiet")
     return cmd
+
+
+def _validate_generate_args(prompt, output_path, image_path, width, height,
+                            num_frames, tile_frames, tile_spatial, force):
+    """Every ValueError this module can raise is raised here, before any
+    subprocess is spawned. Order matches the design doc section 5.3 list."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be a non-empty string, got %r" % (prompt,))
+
+    validate_geometry(width, height, num_frames)
+
+    if not output_path.endswith(".mp4"):
+        raise ValueError("output_path must end in .mp4, got %r" % (output_path,))
+
+    out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        raise ValueError("output directory does not exist or is not writable: %s" % out_dir)
+
+    if os.path.exists(output_path) and not force:
+        raise ValueError("output already exists: %s (pass force=True to overwrite)"
+                         % output_path)
+
+    if image_path is not None:
+        if not os.path.isfile(image_path) or not os.access(image_path, os.R_OK):
+            raise ValueError("image_path is not a readable file: %r" % (image_path,))
+
+    if tile_frames < 1:
+        raise ValueError("tile_frames must be >= 1, got %d" % tile_frames)
+    if tile_spatial < 1:
+        raise ValueError("tile_spatial must be >= 1, got %d" % tile_spatial)
+
+
+def generate_video(prompt, output_path, image_path=None, *,
+                   width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
+                   num_frames=DEFAULT_NUM_FRAMES, frame_rate=DEFAULT_FRAME_RATE,
+                   seed=0, model=MODEL_ID, low_ram=DEFAULT_LOW_RAM,
+                   tile_frames=DEFAULT_TILE_FRAMES, tile_spatial=DEFAULT_TILE_SPATIAL,
+                   log_path=None, timeout_s=None, force=False, quiet=False):
+    """Render one clip and return the ABSOLUTE path of the written .mp4.
+
+    Never returns PIL images. There is no --resume, no three-stage split and
+    no embeds.pt staleness logic: MLX does not have the "only process exit
+    frees memory" problem that forced them on the old backend.
+
+    Raises ValueError (before any subprocess) for bad arguments; raises
+    Ltx2MlxError for a missing binary, a non-zero exit, a timeout, or the
+    jetsam signature (exit 0 with no usable output file)."""
+    _validate_generate_args(prompt, output_path, image_path, width, height,
+                            num_frames, tile_frames, tile_spatial, force)
+    raise NotImplementedError("subprocess execution lands in the next task")

@@ -239,6 +239,106 @@ def test_build_command_invariants():
               "got %r" % (cmd,))
 
 
+# ---------------------------------------------------------------------------
+# M5: the eight ValueError conditions, all raised BEFORE any subprocess
+# ---------------------------------------------------------------------------
+
+_STUB_SRC = '''#!/usr/bin/env python3
+import os, sys, time
+argv = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(repr(argv) + "\\n")
+if os.environ.get("STUB_PIDFILE"):
+    with open(os.environ["STUB_PIDFILE"], "w") as f:
+        f.write(str(os.getpid()))
+out = argv[argv.index("--output") + 1] if "--output" in argv else None
+sys.stdout.write("stub stdout line 1\\n")
+sys.stdout.flush()
+sys.stderr.write("stub stderr line 2\\n")
+sys.stderr.flush()
+mode = os.environ.get("STUB_MODE", "ok")
+if mode == "fail":
+    sys.stderr.write("stub failing on purpose\\n")
+    sys.exit(1)
+if mode == "sleep":
+    time.sleep(120)
+if mode == "empty":
+    open(out, "w").close()
+elif mode == "ok":
+    with open(out, "wb") as f:
+        f.write(b"\\x00" * 1024)
+sys.exit(0)
+'''
+
+
+def _install_stub(td, mode="ok"):
+    """Point the module at a stub CLI. Returns (stub_path, invocation_log)."""
+    stub = os.path.join(td, "stub-ltx-2-mlx")
+    with open(stub, "w") as f:
+        f.write(_STUB_SRC)
+    os.chmod(stub, 0o755)
+    log = os.path.join(td, "invocations.log")
+    skill.LTX2_MLX_BIN = stub
+    skill.LTX2_MLX_DIR = td
+    os.environ["STUB_LOG"] = log
+    os.environ["STUB_MODE"] = mode
+    return stub, log
+
+
+def _invocation_count(log):
+    if not os.path.exists(log):
+        return 0
+    with open(log) as f:
+        return len([ln for ln in f.read().splitlines() if ln.strip()])
+
+
+def test_generate_video_value_errors():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _stub, log = _install_stub(td)
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            out = os.path.join(td, "out.mp4")
+
+            def base(**over):
+                kw = dict(prompt="p", output_path=out, image_path=img)
+                kw.update(over)
+                return kw
+
+            cases = [
+                ("M5a empty prompt", "prompt", base(prompt="")),
+                ("M5b non-str prompt", "prompt", base(prompt=None)),
+                ("M5c width % 32", "width", base(width=700)),
+                ("M5d height % 32", "height", base(height=481)),
+                ("M5e num_frames lattice", "num_frames", base(num_frames=240)),
+                ("M5f num_frames < 9", "num_frames", base(num_frames=1)),
+                ("M5g output not .mp4", ".mp4",
+                 base(output_path=os.path.join(td, "out.mov"))),
+                ("M5h parent dir missing", "output directory",
+                 base(output_path=os.path.join(td, "nope", "out.mp4"))),
+                ("M5j image unreadable", "image_path",
+                 base(image_path=os.path.join(td, "missing.png"))),
+                ("M5k tile_frames < 1", "tile_frames", base(tile_frames=0)),
+                ("M5l tile_spatial < 1", "tile_spatial", base(tile_spatial=0)),
+            ]
+            for name, needle, kw in cases:
+                msg = _raises_value_error(skill.generate_video, **kw)
+                check(name, msg is not None and needle in msg, "got %r" % msg)
+
+            with open(out, "wb") as f:
+                f.write(b"existing")
+            msg = _raises_value_error(skill.generate_video, **base())
+            check("M5i existing output without force", msg is not None and "already exists" in msg,
+                  "got %r" % msg)
+
+            check("M5m no subprocess was ever spawned", _invocation_count(log) == 0,
+                  "got %d invocations" % _invocation_count(log))
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+
+
 if __name__ == "__main__":
     test_constants()
     test_error_type()
@@ -248,6 +348,7 @@ if __name__ == "__main__":
     test_build_command_t2v()
     test_build_command_flags()
     test_build_command_invariants()
+    test_generate_video_value_errors()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
