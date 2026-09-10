@@ -440,6 +440,102 @@ def test_assert_clips_uniform():
           msg is not None and "--force" in msg, "got %r" % msg)
 
 
+# ---------------------------------------------------------------------------
+# R9: REAL ffmpeg concat integration (fast, no GPU) -- required
+# ---------------------------------------------------------------------------
+
+def _ffprobe_json(path, *extra):
+    proc = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json"]
+                          + list(extra) + [path],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return json.loads(proc.stdout) if proc.returncode == 0 else None
+
+
+def test_real_ffmpeg_concat():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("SKIP R9 real-ffmpeg concat: ffmpeg/ffprobe not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        clips = []
+        for i in range(1, 4):
+            clip = os.path.join(td, "panel_%02d.mp4" % i)
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=704x480:rate=24",
+                 "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                 "-t", "1", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", clip],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if proc.returncode != 0:
+                check("R9a synthesized clip %d" % i, False, proc.stdout[-800:])
+                return
+            clips.append(clip)
+        check("R9a synthesized three 1s 704x480/24fps clips", len(clips) == 3)
+
+        counts = [render.clip_frame_count(c) for c in clips]
+        check("R9b clip_frame_count reads 24 packets per clip", counts == [24, 24, 24],
+              "got %r" % counts)
+
+        pairs = [(c, render.probe_streams(c)) for c in clips]
+        err = None
+        try:
+            render.assert_clips_uniform(pairs, 704, 480, 24)
+        except render.ConcatPreflightError as e:
+            err = str(e)
+        check("R9c real preflight passes on real clips", err is None, "got %r" % err)
+
+        list_path = os.path.join(td, "concat_list.txt")
+        with open(list_path, "w") as f:
+            f.write(render.build_concat_list(clips))
+        out = os.path.join(td, "movie.mp4")
+        proc = subprocess.run(render.build_concat_command(list_path, out),
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        check("R9d real concat exits 0", proc.returncode == 0, proc.stdout[-800:])
+        check("R9e movie.mp4 written non-empty",
+              os.path.isfile(out) and os.path.getsize(out) > 0)
+
+        info = _ffprobe_json(out, "-show_format", "-show_streams")
+        check("R9f ffprobe reads the result", info is not None)
+        if info:
+            duration = float(info["format"]["duration"])
+            check("R9g duration within 0.1s of 3.0s", abs(duration - 3.0) <= 0.1,
+                  "got %.3f" % duration)
+            v = [s for s in info["streams"] if s["codec_type"] == "video"]
+            a = [s for s in info["streams"] if s["codec_type"] == "audio"]
+            check("R9h exactly one video stream, h264", len(v) == 1
+                  and v[0]["codec_name"] == "h264", "got %r" % v)
+            check("R9i exactly one audio stream, aac", len(a) == 1
+                  and a[0]["codec_name"] == "aac", "got %r" % a)
+
+
+def test_real_clip_frame_count_smoke():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("SKIP R9j real clip_frame_count smoke: ffmpeg/ffprobe not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        clip = os.path.join(td, "smoke.mp4")
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24",
+             "-frames:v", "24", clip],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        check("R9j synthesized 24-frame clip", proc.returncode == 0, proc.stdout[-800:])
+        check("R9k clip_frame_count reads 24 on a real clip",
+              render.clip_frame_count(clip) == 24,
+              "got %r" % render.clip_frame_count(clip))
+
+
+def test_probe_timeout_kwarg_present():
+    import inspect
+    src = inspect.getsource(render.probe_streams)
+    check("R9l probe_streams handles subprocess.TimeoutExpired",
+          "TimeoutExpired" in src)
+    check("R9m probe_streams passes timeout=60", "timeout=60" in src)
+
+    src = inspect.getsource(render.clip_frame_count)
+    check("R9n clip_frame_count handles subprocess.TimeoutExpired",
+          "TimeoutExpired" in src)
+    check("R9o clip_frame_count passes timeout=60", "timeout=60" in src)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -454,6 +550,9 @@ if __name__ == "__main__":
     test_build_concat_list()
     test_build_concat_command()
     test_assert_clips_uniform()
+    test_real_ffmpeg_concat()
+    test_real_clip_frame_count_smoke()
+    test_probe_timeout_kwarg_present()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
