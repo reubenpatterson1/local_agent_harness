@@ -308,6 +308,10 @@ def test_generate_video_value_errors():
             with open(img, "wb") as f:
                 f.write(b"png")
             out = os.path.join(td, "out.mp4")
+            readonly_log = os.path.join(td, "readonly.log")
+            with open(readonly_log, "w") as f:
+                f.write("x")
+            os.chmod(readonly_log, 0o444)
 
             def base(**over):
                 kw = dict(prompt="p", output_path=out, image_path=img)
@@ -333,6 +337,9 @@ def test_generate_video_value_errors():
                 ("M5q log_path directory missing", "log_path",
                  base(log_path=os.path.join(td, "nope", "x.log"))),
                 ("M5r timeout_s not positive", "timeout_s", base(timeout_s=-5)),
+                ("M5s log_path is a directory", "log_path", base(log_path=td)),
+                ("M5t log_path exists but is not writable", "log_path",
+                 base(log_path=readonly_log)),
             ]
             for name, needle, kw in cases:
                 msg = _raises_value_error(skill.generate_video, **kw)
@@ -695,11 +702,13 @@ def test_cli_full_flag_wiring():
             with open(img, "wb") as f:
                 f.write(b"png")
             out = os.path.join(td, "wired.mp4")
+            cli_log = os.path.join(td, "wired.log")
             rc = skill.main([
                 "p", out, "--image", img,
                 "--width", "1024", "--height", "576", "--frames", "121",
                 "--frame-rate", "30", "--seed", "99", "--no-low-ram",
                 "--tile-frames", "3", "--tile-spatial", "2", "--quiet",
+                "--model", "Other/Model", "--log", cli_log,
                 "--timeout", "60",
             ])
             check("M11t full-flag CLI invocation exits 0", rc == 0, "got %r" % rc)
@@ -719,8 +728,75 @@ def test_cli_full_flag_wiring():
                   "--tile-frames 3" in argv_str and "--tile-spatial 2" in argv_str,
                   "got %r" % argv)
             check("M11y --quiet reached the child argv", "--quiet" in argv, "got %r" % argv)
+
+            i = argv.index("--image") if "--image" in argv else -1
+            check("M11z --image PATH 0 1.0 reached the child argv",
+                  i >= 0 and argv[i:i + 4] == ["--image", img, "0", "1.0"], "got %r" % argv)
+
+            mi = argv.index("--model") if "--model" in argv else -1
+            check("M11z1 --model Other/Model reached the child argv",
+                  mi >= 0 and argv[mi + 1] == "Other/Model", "got %r" % argv)
+
+            check("M11z2 --log path was created and is non-empty (--log reached generate_video)",
+                  os.path.isfile(cli_log) and os.path.getsize(cli_log) > 0,
+                  "cli_log=%r exists=%r" % (cli_log, os.path.exists(cli_log)))
     finally:
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+def test_cli_force_flag_wiring():
+    """M11: --force must actually reach generate_video's force parameter --
+    hardcoding force=False (or ignoring the flag) in main() must fail this
+    test (task 6 fix round 2, finding C)."""
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            out = os.path.join(td, "force.mp4")
+            with open(out, "wb") as f:
+                f.write(b"existing")
+
+            rc = skill.main(["p", out, "--image", img])
+            check("M11z3 without --force, an existing output_path exits 2",
+                  rc == 2, "got %r" % rc)
+
+            rc = skill.main(["p", out, "--image", img, "--force"])
+            check("M11z4 --force reached generate_video: existing output_path exits 0",
+                  rc == 0, "got %r" % rc)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+def test_cli_timeout_flag_wiring():
+    """M11: --timeout must actually reach generate_video's timeout_s
+    parameter -- hardcoding timeout_s=None (or ignoring the flag) in main()
+    would hang forever against the sleep-mode stub instead of returning 1
+    (task 6 fix round 2, finding C)."""
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="sleep")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            pidfile = os.path.join(td, "stub.pid")
+            os.environ["STUB_PIDFILE"] = pidfile
+            out = os.path.join(td, "timeout.mp4")
+
+            rc = skill.main(["p", out, "--image", img, "--timeout", "1"])
+            check("M11z5 --timeout reached generate_video: main() returns 1 "
+                  "(Ltx2MlxError, timed out) instead of hanging",
+                  rc == 1, "got %r" % rc)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_PIDFILE", None)
         os.environ.pop("STUB_MODE", None)
         os.environ.pop("STUB_LOG", None)
 
@@ -743,6 +819,8 @@ if __name__ == "__main__":
     test_cli_parser_defaults()
     test_cli_exit_codes()
     test_cli_full_flag_wiring()
+    test_cli_force_flag_wiring()
+    test_cli_timeout_flag_wiring()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

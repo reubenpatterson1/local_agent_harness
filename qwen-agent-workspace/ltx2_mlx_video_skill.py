@@ -160,6 +160,10 @@ def _validate_generate_args(prompt, output_path, image_path, width, height,
         log_dir = os.path.dirname(os.path.abspath(log_path)) or "."
         if not os.path.isdir(log_dir) or not os.access(log_dir, os.W_OK):
             raise ValueError("log_path directory does not exist or is not writable: %s" % log_dir)
+        if os.path.isdir(log_path):
+            raise ValueError("log_path is a directory: %s" % log_path)
+        if os.path.exists(log_path) and not os.access(log_path, os.W_OK):
+            raise ValueError("log_path exists but is not writable: %s" % log_path)
 
     if timeout_s is not None and timeout_s <= 0:
         raise ValueError("timeout_s must be positive, got %r" % (timeout_s,))
