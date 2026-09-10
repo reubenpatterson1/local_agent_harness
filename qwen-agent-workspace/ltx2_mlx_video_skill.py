@@ -205,7 +205,7 @@ def generate_video(prompt, output_path, image_path=None, *,
     print("[ltx2_mlx_video_skill] %s" % shlex.join(cmd))
     sys.stdout.flush()
 
-    returncode, tail, timed_out = _run_subprocess(cmd, log_path, timeout_s)
+    returncode, tail, timed_out = _run_subprocess(cmd, log_path, timeout_s, output_path)
 
     if timed_out:
         raise Ltx2MlxError(
@@ -229,7 +229,7 @@ def generate_video(prompt, output_path, image_path=None, *,
     return os.path.abspath(output_path)
 
 
-def _run_subprocess(cmd, log_path, timeout_s):
+def _run_subprocess(cmd, log_path, timeout_s, output_path):
     """Spawn cmd in its own process group with cwd=LTX2_MLX_DIR, stream its
     combined stdout/stderr line-by-line to this process's stdout (and to
     log_path when given), and return (returncode, stderr_tail, timed_out).
@@ -237,18 +237,28 @@ def _run_subprocess(cmd, log_path, timeout_s):
     Line-by-line streaming is not cosmetic: a render takes tens of minutes,
     and buffering the whole run would leave the operator staring at nothing.
     The timeout is a watchdog thread that SIGKILLs the whole process group,
-    because ltx-2-mlx spawns an ffmpeg child that would otherwise survive."""
+    because ltx-2-mlx spawns an ffmpeg child that would otherwise survive.
+    A failed spawn, or any other exception while the child is running, also
+    kills and reaps the whole process group so nothing is left orphaned."""
     logf = open(log_path, "a") if log_path else None
-    proc = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, bufsize=1,
-                            start_new_session=True)
+    try:
+        popen = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 start_new_session=True)
+    except OSError as e:
+        if logf:
+            logf.close()
+        raise Ltx2MlxError(
+            _format_error("failed to spawn: %s" % e, None, output_path, ""),
+            returncode=None, cmd=cmd, stderr_tail="", output_path=output_path)
+
     timed_out = [False]
     timer = None
     if timeout_s is not None:
         def _kill_group():
             timed_out[0] = True
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(popen.pid), signal.SIGKILL)
             except OSError:
                 pass
         timer = threading.Timer(timeout_s, _kill_group)
@@ -256,19 +266,27 @@ def _run_subprocess(cmd, log_path, timeout_s):
         timer.start()
 
     lines = []
-    try:
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+    with popen as proc:
+        try:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                if logf:
+                    logf.write(line)
+                    logf.flush()
+                lines.append(line)
+            proc.wait()
+        except BaseException:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+            proc.wait()
+            raise
+        finally:
+            if timer:
+                timer.cancel()
             if logf:
-                logf.write(line)
-                logf.flush()
-            lines.append(line)
-        proc.wait()
-    finally:
-        if timer:
-            timer.cancel()
-        if logf:
-            logf.close()
+                logf.close()
 
     return proc.returncode, "".join(lines[-STDERR_TAIL_LINES:]), timed_out[0]

@@ -244,7 +244,7 @@ def test_build_command_invariants():
 # ---------------------------------------------------------------------------
 
 _STUB_SRC = '''#!/usr/bin/env python3
-import os, sys, time
+import os, subprocess, sys, time
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(repr(argv) + "\\n")
@@ -261,7 +261,11 @@ if mode == "fail":
     sys.stderr.write("stub failing on purpose\\n")
     sys.exit(1)
 if mode == "sleep":
-    time.sleep(120)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    if os.environ.get("STUB_PIDFILE"):
+        with open(os.environ["STUB_PIDFILE"], "w") as f:
+            f.write(str(child.pid))
+    child.wait()
 if mode == "empty":
     open(out, "w").close()
 elif mode == "ok":
@@ -428,16 +432,19 @@ def test_generate_video_subprocess_outcomes():
             check("M6l timeout raises Ltx2MlxError", e is not None)
             check("M6m timed_out attribute is True", e is not None and e.timed_out is True,
                   "got %r" % (e.timed_out if e else None))
-            child_gone = True
-            if os.path.exists(pidfile):
+            pidfile_exists = os.path.exists(pidfile)
+            pid_not_running = True
+            if pidfile_exists:
                 with open(pidfile) as f:
                     child_pid = int(f.read().strip())
                 try:
                     os.kill(child_pid, 0)
-                    child_gone = False
+                    pid_not_running = False
                 except OSError:
-                    child_gone = True
-            check("M6n the child is no longer running", child_gone)
+                    pid_not_running = True
+            check("M6n the child is no longer running",
+                  pidfile_exists and pid_not_running,
+                  "pidfile_exists=%r pid_not_running=%r" % (pidfile_exists, pid_not_running))
             os.environ.pop("STUB_PIDFILE", None)
 
             skill.LTX2_MLX_BIN = os.path.join(td, "does-not-exist")
