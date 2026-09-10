@@ -186,4 +186,89 @@ def generate_video(prompt, output_path, image_path=None, *,
     jetsam signature (exit 0 with no usable output file)."""
     _validate_generate_args(prompt, output_path, image_path, width, height,
                             num_frames, tile_frames, tile_spatial, force)
-    raise NotImplementedError("subprocess execution lands in the next task")
+    resolved_bin = _resolve_bin()
+    if not os.path.isfile(resolved_bin) or not os.access(resolved_bin, os.X_OK):
+        raise Ltx2MlxError(
+            _format_error("binary not found or not executable: %s (set LTX2_MLX_BIN)"
+                          % resolved_bin, None, output_path, ""),
+            returncode=None, cmd=[resolved_bin], stderr_tail="", output_path=output_path)
+    if not os.path.isdir(LTX2_MLX_DIR):
+        raise Ltx2MlxError(
+            _format_error("LTX2_MLX_DIR is not a directory: %s (set LTX2_MLX_DIR)"
+                          % LTX2_MLX_DIR, None, output_path, ""),
+            returncode=None, cmd=[resolved_bin], stderr_tail="", output_path=output_path)
+
+    cmd = build_command(prompt=prompt, output_path=output_path, image_path=image_path,
+                        width=width, height=height, num_frames=num_frames,
+                        frame_rate=frame_rate, seed=seed, model=model, low_ram=low_ram,
+                        tile_frames=tile_frames, tile_spatial=tile_spatial, quiet=quiet)
+    print("[ltx2_mlx_video_skill] %s" % shlex.join(cmd))
+    sys.stdout.flush()
+
+    returncode, tail, timed_out = _run_subprocess(cmd, log_path, timeout_s)
+
+    if timed_out:
+        raise Ltx2MlxError(
+            _format_error("subprocess timed out after %ss" % timeout_s,
+                          returncode, output_path, tail),
+            returncode=returncode, cmd=cmd, stderr_tail=tail,
+            output_path=output_path, timed_out=True)
+    if returncode != 0:
+        raise Ltx2MlxError(
+            _format_error("subprocess failed", returncode, output_path, tail),
+            returncode=returncode, cmd=cmd, stderr_tail=tail, output_path=output_path)
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        # Jetsam signature: the OS killed the ffmpeg child, so there is no
+        # traceback anywhere and the parent still exits 0. Callers key their
+        # remediation message on returncode == 0 with timed_out False.
+        raise Ltx2MlxError(
+            _format_error("exited 0 but produced no usable output (missing or zero bytes)",
+                          returncode, output_path, tail),
+            returncode=0, cmd=cmd, stderr_tail=tail, output_path=output_path)
+
+    return os.path.abspath(output_path)
+
+
+def _run_subprocess(cmd, log_path, timeout_s):
+    """Spawn cmd in its own process group with cwd=LTX2_MLX_DIR, stream its
+    combined stdout/stderr line-by-line to this process's stdout (and to
+    log_path when given), and return (returncode, stderr_tail, timed_out).
+
+    Line-by-line streaming is not cosmetic: a render takes tens of minutes,
+    and buffering the whole run would leave the operator staring at nothing.
+    The timeout is a watchdog thread that SIGKILLs the whole process group,
+    because ltx-2-mlx spawns an ffmpeg child that would otherwise survive."""
+    logf = open(log_path, "a") if log_path else None
+    proc = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1,
+                            start_new_session=True)
+    timed_out = [False]
+    timer = None
+    if timeout_s is not None:
+        def _kill_group():
+            timed_out[0] = True
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except OSError:
+                pass
+        timer = threading.Timer(timeout_s, _kill_group)
+        timer.daemon = True
+        timer.start()
+
+    lines = []
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if logf:
+                logf.write(line)
+                logf.flush()
+            lines.append(line)
+        proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+        if logf:
+            logf.close()
+
+    return proc.returncode, "".join(lines[-STDERR_TAIL_LINES:]), timed_out[0]

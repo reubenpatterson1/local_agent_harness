@@ -365,6 +365,147 @@ def test_generate_video_value_errors():
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
 
 
+# ---------------------------------------------------------------------------
+# M6: subprocess outcomes, driven by the stub CLI
+# ---------------------------------------------------------------------------
+
+def _raises_ltx_error(fn, *a, **kw):
+    try:
+        fn(*a, **kw)
+    except skill.Ltx2MlxError as e:
+        return e
+    return None
+
+
+def test_generate_video_subprocess_outcomes():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _stub, log = _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+
+            out_ok = os.path.join(td, "ok.mp4")
+            got = skill.generate_video("p", out_ok, image_path=img, timeout_s=60)
+            check("M6a success returns the absolute output path", got == os.path.abspath(out_ok),
+                  "got %r" % got)
+            check("M6b the mp4 is non-empty", os.path.getsize(out_ok) > 0)
+            check("M6c exactly one invocation", _invocation_count(log) == 1,
+                  "got %d" % _invocation_count(log))
+
+            os.environ["STUB_MODE"] = "fail"
+            e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "f.mp4"),
+                                  image_path=img, timeout_s=60)
+            check("M6d non-zero rc raises Ltx2MlxError", e is not None)
+            check("M6e message names rc 1", e is not None and "returncode=1" in str(e),
+                  "got %r" % (str(e) if e else None))
+            check("M6f message carries the stderr tail",
+                  e is not None and "stub failing on purpose" in str(e),
+                  "got %r" % (str(e) if e else None))
+            check("M6g returncode attribute is 1", e is not None and e.returncode == 1,
+                  "got %r" % (e.returncode if e else None))
+
+            os.environ["STUB_MODE"] = "nofile"
+            e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "n.mp4"),
+                                  image_path=img, timeout_s=60)
+            check("M6h rc 0 with no file raises Ltx2MlxError", e is not None)
+            check("M6i jetsam signature carries returncode 0",
+                  e is not None and e.returncode == 0, "got %r" % (e.returncode if e else None))
+            check("M6j jetsam signature is not flagged as a timeout",
+                  e is not None and e.timed_out is False)
+
+            os.environ["STUB_MODE"] = "empty"
+            e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "z.mp4"),
+                                  image_path=img, timeout_s=60)
+            check("M6k rc 0 with a zero-byte file raises Ltx2MlxError", e is not None)
+
+            os.environ["STUB_MODE"] = "sleep"
+            pidfile = os.path.join(td, "stub.pid")
+            os.environ["STUB_PIDFILE"] = pidfile
+            e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "s.mp4"),
+                                  image_path=img, timeout_s=3)
+            check("M6l timeout raises Ltx2MlxError", e is not None)
+            check("M6m timed_out attribute is True", e is not None and e.timed_out is True,
+                  "got %r" % (e.timed_out if e else None))
+            child_gone = True
+            if os.path.exists(pidfile):
+                with open(pidfile) as f:
+                    child_pid = int(f.read().strip())
+                try:
+                    os.kill(child_pid, 0)
+                    child_gone = False
+                except OSError:
+                    child_gone = True
+            check("M6n the child is no longer running", child_gone)
+            os.environ.pop("STUB_PIDFILE", None)
+
+            skill.LTX2_MLX_BIN = os.path.join(td, "does-not-exist")
+            e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "m.mp4"),
+                                  image_path=img)
+            check("M6o missing binary raises Ltx2MlxError", e is not None)
+            check("M6p missing-binary message names the resolved path",
+                  e is not None and "does-not-exist" in str(e),
+                  "got %r" % (str(e) if e else None))
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+# ---------------------------------------------------------------------------
+# M7: log_path tee
+# ---------------------------------------------------------------------------
+
+def test_log_path_written():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            log_path = os.path.join(td, "panel.log")
+            skill.generate_video("p", os.path.join(td, "o.mp4"), image_path=img,
+                                 log_path=log_path, timeout_s=60)
+            check("M7a log file created", os.path.isfile(log_path))
+            with open(log_path) as f:
+                text = f.read()
+            check("M7b log contains the stub's stdout", "stub stdout line 1" in text,
+                  "got %r" % text)
+            check("M7c log contains the stub's stderr (merged)", "stub stderr line 2" in text,
+                  "got %r" % text)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+# ---------------------------------------------------------------------------
+# M8: the LTX2_MLX_BIN env seam actually works through a fresh import
+# ---------------------------------------------------------------------------
+
+def test_env_override_seam():
+    import importlib
+    with tempfile.TemporaryDirectory() as td:
+        marker = os.path.join(td, "marker-bin")
+        with open(marker, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(marker, 0o755)
+        os.environ["LTX2_MLX_BIN"] = marker
+        os.environ["LTX2_MLX_DIR"] = td
+        try:
+            reloaded = importlib.reload(skill)
+            check("M8a LTX2_MLX_BIN env override is honoured at import",
+                  reloaded.LTX2_MLX_BIN == marker, "got %r" % reloaded.LTX2_MLX_BIN)
+            check("M8b LTX2_MLX_DIR env override is honoured at import",
+                  reloaded.LTX2_MLX_DIR == td, "got %r" % reloaded.LTX2_MLX_DIR)
+        finally:
+            os.environ.pop("LTX2_MLX_BIN", None)
+            os.environ.pop("LTX2_MLX_DIR", None)
+            importlib.reload(skill)
+
+
 if __name__ == "__main__":
     test_constants()
     test_error_type()
@@ -375,6 +516,9 @@ if __name__ == "__main__":
     test_build_command_flags()
     test_build_command_invariants()
     test_generate_video_value_errors()
+    test_generate_video_subprocess_outcomes()
+    test_log_path_written()
+    test_env_override_seam()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
