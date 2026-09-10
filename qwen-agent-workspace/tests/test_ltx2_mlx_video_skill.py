@@ -827,6 +827,64 @@ def test_cli_timeout_flag_wiring():
         os.environ.pop("STUB_LOG", None)
 
 
+def test_cli_default_boolean_wiring():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            log = os.path.join(td, "invocations.log")
+            os.environ["STUB_LOG"] = log
+            out = os.path.join(td, "defaults.mp4")
+            rc = skill.main(["a prompt", out, "--image", img])
+            check("M11z8 default main() invocation exits 0", rc == 0, "got %r" % rc)
+            with open(log) as f:
+                argv = eval(f.readlines()[-1])
+            check("M11z9 --low-ram present by default (no --no-low-ram given)",
+                  "--low-ram" in argv, "got %r" % argv)
+            check("M11za --quiet absent by default (no --quiet given)",
+                  "--quiet" not in argv, "got %r" % argv)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+def test_log_path_open_failure_is_ltx_error():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            out = os.path.join(td, "o.mp4")
+            log_path = os.path.join(td, "dangling.log")
+            os.symlink(os.path.join(td, "no-such-dir", "target"), log_path)
+            raised = None
+            try:
+                skill.generate_video("p", out, image_path=img, log_path=log_path,
+                                     timeout_s=60)
+            except BaseException as e:
+                raised = e
+            check("M7d dangling-symlink log_path raises Ltx2MlxError (not a raw OSError)",
+                  isinstance(raised, skill.Ltx2MlxError),
+                  "got %r" % (type(raised).__name__ if raised else None))
+            check("M7e the error message names log_path",
+                  raised is not None and "log_path" in str(raised),
+                  "got %r" % (str(raised) if raised else None))
+            check("M7f no subprocess was spawned before the open() failure",
+                  _invocation_count(os.environ.get("STUB_LOG", "")) == 0
+                  or not os.path.exists(os.environ.get("STUB_LOG", "")),
+                  "an invocation occurred despite the log-open failure")
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
 if __name__ == "__main__":
     test_constants()
     test_error_type()
@@ -847,6 +905,8 @@ if __name__ == "__main__":
     test_cli_full_flag_wiring()
     test_cli_force_flag_wiring()
     test_cli_timeout_flag_wiring()
+    test_cli_default_boolean_wiring()
+    test_log_path_open_failure_is_ltx_error()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
