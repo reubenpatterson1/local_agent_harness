@@ -85,3 +85,52 @@ def validate_geometry(width, height, num_frames):
                          % num_frames)
     if num_frames < 9:
         raise ValueError("num_frames must be >= 9, got %d" % num_frames)
+
+
+def _resolve_bin():
+    """Absolute path to the ltx-2-mlx binary. A bare name (no path
+    separator) is resolved through PATH; anything else is used verbatim so
+    the pinned venv binary is never second-guessed."""
+    candidate = LTX2_MLX_BIN
+    if os.sep not in candidate:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return candidate
+
+
+def build_command(*, prompt, output_path, image_path=None, width, height,
+                  num_frames, frame_rate, seed, model=MODEL_ID, low_ram=True,
+                  tile_frames=1, tile_spatial=1, quiet=False):
+    """Emit the ltx-2-mlx argv in a fixed token order so golden tests can
+    assert on the list.
+
+    --distilled is unconditional: the pack ships no dev transformer, and
+    `generate` refuses to run without exactly one pipeline-mode flag.
+    --frame-rate is unconditional because the parser marks it required=True.
+    The explicit three-argument `--image PATH 0 1.0` form is preferred over
+    bare PATH so the anchor index and strength show up in the logged command
+    instead of depending on ImageAction's legacy defaulting; frame_idx 0
+    selects VideoConditionByLatentIndex, which replaces latent frame 0 --
+    the single-anchor I2V semantics this pipeline relies on."""
+    cmd = [_resolve_bin(), "generate",
+           "--model", str(model),
+           "--distilled",
+           "--prompt", prompt,
+           "--output", output_path]
+    if image_path is not None:
+        cmd += ["--image", image_path, "0", "1.0"]
+    cmd += ["-H", str(height),
+            "-W", str(width),
+            "-f", str(num_frames),
+            "--frame-rate", str(frame_rate),
+            "--seed", str(seed)]
+    if low_ram:
+        cmd.append("--low-ram")
+    if tile_frames > 1:
+        cmd += ["--tile-frames", str(tile_frames)]
+    if tile_spatial > 1:
+        cmd += ["--tile-spatial", str(tile_spatial)]
+    if quiet:
+        cmd.append("--quiet")
+    return cmd

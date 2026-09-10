@@ -112,10 +112,101 @@ def test_validate_geometry():
           "got %r" % _raises_value_error(skill.validate_geometry, 704, -32, 241))
 
 
+# ---------------------------------------------------------------------------
+# M4: build_command golden argv
+# ---------------------------------------------------------------------------
+
+def test_build_command_i2v_defaults():
+    cmd = skill.build_command(prompt="a prompt", output_path="/tmp/out.mp4",
+                              image_path="/tmp/in.png", width=704, height=480,
+                              num_frames=241, frame_rate=24, seed=0)
+    check("M4a I2V golden argv",
+          cmd == [skill._resolve_bin(), "generate",
+                  "--model", skill.MODEL_ID,
+                  "--distilled",
+                  "--prompt", "a prompt",
+                  "--output", "/tmp/out.mp4",
+                  "--image", "/tmp/in.png", "0", "1.0",
+                  "-H", "480", "-W", "704", "-f", "241",
+                  "--frame-rate", "24", "--seed", "0",
+                  "--low-ram"],
+          "got %r" % (cmd,))
+
+
+def test_build_command_t2v():
+    cmd = skill.build_command(prompt="p", output_path="/tmp/o.mp4", image_path=None,
+                              width=704, height=480, num_frames=241,
+                              frame_rate=24, seed=3)
+    check("M4b T2V has no --image token at all", "--image" not in cmd, "got %r" % (cmd,))
+    check("M4c T2V golden argv",
+          cmd == [skill._resolve_bin(), "generate",
+                  "--model", skill.MODEL_ID,
+                  "--distilled",
+                  "--prompt", "p",
+                  "--output", "/tmp/o.mp4",
+                  "-H", "480", "-W", "704", "-f", "241",
+                  "--frame-rate", "24", "--seed", "3",
+                  "--low-ram"],
+          "got %r" % (cmd,))
+
+
+def test_build_command_flags():
+    no_low = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                 height=480, num_frames=241, frame_rate=24, seed=0,
+                                 low_ram=False)
+    check("M4d low_ram=False omits --low-ram", "--low-ram" not in no_low, "got %r" % (no_low,))
+
+    tiled = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                height=480, num_frames=241, frame_rate=24, seed=0,
+                                tile_frames=2, tile_spatial=2)
+    check("M4e tiling emitted after --low-ram in order",
+          tiled[-4:] == ["--tile-frames", "2", "--tile-spatial", "2"], "got %r" % (tiled,))
+
+    untiled = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                  height=480, num_frames=241, frame_rate=24, seed=0,
+                                  tile_frames=1, tile_spatial=1)
+    check("M4f tiling at 1 emits nothing",
+          "--tile-frames" not in untiled and "--tile-spatial" not in untiled,
+          "got %r" % (untiled,))
+
+    custom = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=1024,
+                                 height=576, num_frames=121, frame_rate=30, seed=99,
+                                 model="Other/Model", quiet=True)
+    check("M4g custom seed/model/geometry/quiet",
+          custom[2:4] == ["--model", "Other/Model"]
+          and "--seed" in custom and custom[custom.index("--seed") + 1] == "99"
+          and custom[-1] == "--quiet"
+          and custom[custom.index("-W") + 1] == "1024"
+          and custom[custom.index("-H") + 1] == "576"
+          and custom[custom.index("-f") + 1] == "121"
+          and custom[custom.index("--frame-rate") + 1] == "30",
+          "got %r" % (custom,))
+
+
+def test_build_command_invariants():
+    for kw in ({"image_path": "/tmp/i.png"}, {}):
+        cmd = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                  height=480, num_frames=241, frame_rate=24, seed=0, **kw)
+        check("M4h --distilled always present (image_path=%r)" % kw.get("image_path"),
+              "--distilled" in cmd, "got %r" % (cmd,))
+        check("M4i --frame-rate always present (image_path=%r)" % kw.get("image_path"),
+              "--frame-rate" in cmd, "got %r" % (cmd,))
+        check("M4j no --negative-prompt (image_path=%r)" % kw.get("image_path"),
+              "--negative-prompt" not in cmd, "got %r" % (cmd,))
+        check("M4k no --steps / --lora / --two-stage (image_path=%r)" % kw.get("image_path"),
+              not any(t in cmd for t in ("--steps", "--lora", "--two-stage",
+                                         "--two-stages-hq", "--one-stage")),
+              "got %r" % (cmd,))
+
+
 if __name__ == "__main__":
     test_constants()
     test_error_type()
     test_validate_geometry()
+    test_build_command_i2v_defaults()
+    test_build_command_t2v()
+    test_build_command_flags()
+    test_build_command_invariants()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
