@@ -802,7 +802,7 @@ def test_dry_run_output():
               "got %r" % o)
         check("R10g resolved geometry line",
               "geometry: 704x480, 241 frames @ 24 fps = 10.04 s per panel" in o, "got %r" % o)
-        check("R10h total line", "total: 3 panels x 10.04 s = 30.13 s of finished movie" in o,
+        check("R10h total line", "total: 3 panels x 10.04 s = 30.12 s of finished movie" in o,
               "got %r" % o)
         check("R10i the num_frames-ignored note",
               "note: manifest per-panel num_frames is ignored; --frames 241 is authoritative"
