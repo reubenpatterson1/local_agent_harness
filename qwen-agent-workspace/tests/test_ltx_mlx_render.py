@@ -545,7 +545,7 @@ def _write_summary(story_dir, run_id, units, **over):
     os.makedirs(run_root, exist_ok=True)
     summary = {"schema_version": 3, "frames_per_panel": 241, "width": 704,
                "height": 480, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
-               "units": units}
+               "model": render.SKILL.MODEL_ID, "units": units}
     summary.update(over)
     with open(os.path.join(run_root, "story_summary.json"), "w") as f:
         json.dump(summary, f)
@@ -554,7 +554,8 @@ def _write_summary(story_dir, run_id, units, **over):
 
 def test_estimate_default_source():
     with tempfile.TemporaryDirectory() as td:
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
         check("R8a no summaries -> default constant",
               secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
         check("R8b default label",
@@ -567,7 +568,8 @@ def test_estimate_measured_source():
         units = [{"unit": "panel-%d" % i, "status": "ok", "resumed": False,
                   "seconds": s} for i, s in enumerate([1200.0, 1500.0, 1800.0], start=1)]
         _write_summary(td, "20260910T010101Z-aaaaaaaa", units)
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
         check("R8c measured mean of the three ok units", abs(secs - 1500.0) < 1e-9,
               "got %r" % secs)
         check("R8d measured label names the run id and panel count",
@@ -580,7 +582,8 @@ def test_estimate_excludes_resumed_and_mismatched():
                        [{"unit": "panel-1", "status": "ok", "resumed": False,
                          "seconds": 900.0}],
                        frames_per_panel=193)
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
         check("R8e a config-mismatched summary is ignored",
               secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
 
@@ -591,10 +594,46 @@ def test_estimate_excludes_resumed_and_mismatched():
                          "seconds": 2000.0},
                         {"unit": "panel-3", "status": "error", "resumed": False,
                          "seconds": 30.0}])
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
         check("R8f resumed (seconds 0.0) and error units are excluded from the mean",
               abs(secs - 2000.0) < 1e-9, "got %r" % secs)
         check("R8g label counts only the units used", "1 panels" in label, "got %r" % label)
+
+
+def test_estimate_prefers_newest_matching_summary():
+    with tempfile.TemporaryDirectory() as td:
+        older = _write_summary(td, "20260910T010101Z-aaaaaaaa",
+                               [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                 "seconds": 1000.0}])
+        os.utime(os.path.join(older, "story_summary.json"), (1000, 1000))
+        newer = _write_summary(td, "20260910T020202Z-bbbbbbbb",
+                               [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                 "seconds": 2000.0}])
+        os.utime(os.path.join(newer, "story_summary.json"), (2000, 2000))
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
+        check("R8m the newer matching summary wins over the older one",
+              abs(secs - 2000.0) < 1e-9, "got %r" % secs)
+        check("R8n the label names the newer run id",
+              "20260910T020202Z-bbbbbbbb" in label, "got %r" % label)
+
+
+def test_estimate_skips_corrupt_summary():
+    with tempfile.TemporaryDirectory() as td:
+        good = _write_summary(td, "20260910T040404Z-dddddddd",
+                              [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                "seconds": 1500.0}])
+        os.utime(os.path.join(good, "story_summary.json"), (1000, 1000))
+        corrupt_dir = os.path.join(td, "runs", "20260910T050505Z-eeeeeeee")
+        os.makedirs(corrupt_dir, exist_ok=True)
+        with open(os.path.join(corrupt_dir, "story_summary.json"), "w") as f:
+            f.write("[1, 2, 3]")
+        os.utime(os.path.join(corrupt_dir, "story_summary.json"), (2000, 2000))
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+                                                         render.SKILL.MODEL_ID)
+        check("R8o a corrupt (non-dict) summary is skipped without crashing",
+              abs(secs - 1500.0) < 1e-9, "got %r" % secs)
 
 
 def test_format_estimate_lines():
@@ -637,6 +676,8 @@ if __name__ == "__main__":
     test_estimate_default_source()
     test_estimate_measured_source()
     test_estimate_excludes_resumed_and_mismatched()
+    test_estimate_prefers_newest_matching_summary()
+    test_estimate_skips_corrupt_summary()
     test_format_estimate_lines()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))

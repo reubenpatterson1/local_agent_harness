@@ -349,31 +349,45 @@ def build_concat_command(list_path, output_path):
 
 
 def estimate_seconds_per_panel(story_dir, frames, width, height, low_ram,
-                               tile_frames, tile_spatial):
+                               tile_frames, tile_spatial, model):
     """Return (seconds_per_panel, label).
 
     Precedence: the newest story_summary.json under <story_dir>/runs/ whose
-    frames_per_panel/width/height/low_ram/tile_frames/tile_spatial all match
-    this invocation AND that has at least one unit with status "ok" and
-    resumed false -- mean of those units' seconds. Resumed units carry
+    frames_per_panel/width/height/low_ram/tile_frames/tile_spatial/model all
+    match this invocation AND that has at least one unit with status "ok"
+    and resumed false -- mean of those units' seconds. Resumed units carry
     seconds 0.0 and would poison the mean, so they are excluded. Otherwise
-    the SECONDS_PER_PANEL_ESTIMATE constant."""
+    the SECONDS_PER_PANEL_ESTIMATE constant.
+
+    A summary file that is valid JSON but the wrong shape (not a dict, a
+    non-list "units", a non-dict unit entry) is skipped rather than raising:
+    this is an advisory estimate feeding --dry-run, and a malformed old
+    summary must never be able to crash the plan review it supports."""
     matches = glob.glob(os.path.join(story_dir, "runs", "*", "story_summary.json"))
-    for path in sorted(matches, key=os.path.getmtime, reverse=True):
+    for path in sorted(matches, key=lambda p: (
+            os.path.getmtime(p) if os.path.exists(p) else -1.0,
+            os.path.dirname(p)), reverse=True):
         try:
             with open(path) as f:
                 summary = json.load(f)
         except (OSError, ValueError):
+            continue
+        if not isinstance(summary, dict):
+            continue
+        units = summary.get("units")
+        if not isinstance(units, list):
             continue
         if (summary.get("frames_per_panel") != frames
                 or summary.get("width") != width
                 or summary.get("height") != height
                 or summary.get("low_ram") != low_ram
                 or summary.get("tile_frames") != tile_frames
-                or summary.get("tile_spatial") != tile_spatial):
+                or summary.get("tile_spatial") != tile_spatial
+                or summary.get("model") != model):
             continue
-        seconds = [u.get("seconds") for u in summary.get("units", [])
-                   if u.get("status") == "ok" and u.get("resumed") is False
+        seconds = [u.get("seconds") for u in units
+                   if isinstance(u, dict) and u.get("status") == "ok"
+                   and u.get("resumed") is False
                    and isinstance(u.get("seconds"), (int, float))]
         if not seconds:
             continue
