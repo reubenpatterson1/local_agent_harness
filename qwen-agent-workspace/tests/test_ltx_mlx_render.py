@@ -192,12 +192,59 @@ def test_load_manifest():
               render.load_manifest(nokey)["panels"][0]["image_path"] is None)
 
 
+# ---------------------------------------------------------------------------
+# R4: per-panel unit derivation
+# ---------------------------------------------------------------------------
+
+def test_build_units():
+    panels = [
+        {"index": 1, "image_path": "/abs/p1.png", "panel_text": "text one",
+         "motion_prompt": "motion one"},
+        {"index": 2, "image_path": None, "panel_text": "text two",
+         "motion_prompt": None},
+        {"index": 3, "image_path": "/abs/p3.png", "panel_text": "text three",
+         "motion_prompt": ""},
+    ]
+    units = render.build_units(panels, seed=100, clips_dir="/clips", run_root="/runs/r1")
+
+    check("R4a one unit per panel", len(units) == 3, "got %d" % len(units))
+    check("R4b prompt prefers motion_prompt", units[0]["prompt"] == "motion one",
+          "got %r" % units[0]["prompt"])
+    check("R4c prompt falls back to panel_text when motion_prompt is None",
+          units[1]["prompt"] == "text two", "got %r" % units[1]["prompt"])
+    check("R4d prompt falls back to panel_text when motion_prompt is empty",
+          units[2]["prompt"] == "text three", "got %r" % units[2]["prompt"])
+    check("R4e seed is base + i", [u["seed"] for u in units] == [101, 102, 103],
+          "got %r" % [u["seed"] for u in units])
+    check("R4f label is panel-<i>", [u["label"] for u in units] == ["panel-1", "panel-2", "panel-3"],
+          "got %r" % [u["label"] for u in units])
+    check("R4g clip path is panel_%02d.mp4",
+          [os.path.basename(u["clip_path"]) for u in units]
+          == ["panel_01.mp4", "panel_02.mp4", "panel_03.mp4"],
+          "got %r" % [u["clip_path"] for u in units])
+    check("R4h clips live under clips_dir",
+          all(os.path.dirname(u["clip_path"]) == "/clips" for u in units))
+    check("R4i log path is <run_root>/panel_%02d.log",
+          units[1]["log_path"] == os.path.join("/runs/r1", "panel_02.log"),
+          "got %r" % units[1]["log_path"])
+    check("R4j image_path carried through, None stays None",
+          [u["image_path"] for u in units] == ["/abs/p1.png", None, "/abs/p3.png"],
+          "got %r" % [u["image_path"] for u in units])
+    check("R4k log_path is None when run_root is None",
+          render.build_units(panels, 0, "/clips")[0]["log_path"] is None)
+    check("R4l unit keys are exactly the documented set",
+          set(units[0]) == {"index", "label", "seed", "prompt", "image_path",
+                            "clip_path", "log_path"},
+          "got %r" % sorted(units[0]))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
     test_run_id_and_story_dir()
     test_render_script_has_no_heavy_imports()
     test_load_manifest()
+    test_build_units()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

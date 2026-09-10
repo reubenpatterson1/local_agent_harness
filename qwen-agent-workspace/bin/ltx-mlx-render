@@ -178,3 +178,35 @@ def load_manifest(path):
                              "non-empty string" % index)
 
     return data
+
+
+def resolve_prompt(panel):
+    """Identical to bin/ltx-story-video::_resolve_motion_prompt (:225-226)."""
+    return panel.get("motion_prompt") or panel["panel_text"]
+
+
+def build_units(panels, seed, clips_dir, run_root=None):
+    """Return the ordered per-panel unit list.
+
+    Each unit: {"index", "label", "seed", "prompt", "image_path",
+    "clip_path", "log_path"}. seed is base + i and label is "panel-<i>",
+    both identical to bin/ltx-story-video::build_units (:267) so the
+    story_summary.json unit labels read the same way in
+    bin/ltx-movie::_report_summary.
+
+    Every panel shares --frames/--width/--height/--frame-rate/--model and
+    the low-ram + tiling settings; that uniformity is exactly what makes
+    stream-copy concatenation valid, so it is NOT per-unit state."""
+    units = []
+    for i, panel in enumerate(panels, start=1):
+        units.append({
+            "index": i,
+            "label": "panel-%d" % i,
+            "seed": seed + i,
+            "prompt": resolve_prompt(panel),
+            "image_path": panel.get("image_path"),
+            "clip_path": os.path.join(clips_dir, "panel_%02d.mp4" % i),
+            "log_path": (os.path.join(run_root, "panel_%02d.log" % i)
+                         if run_root else None),
+        })
+    return units
