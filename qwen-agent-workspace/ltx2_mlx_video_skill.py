@@ -116,10 +116,10 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
     cmd = [_resolve_bin(), "generate",
            "--model", str(model),
            "--distilled",
-           "--prompt", prompt,
-           "--output", output_path]
+           "--prompt", str(prompt),
+           "--output", str(output_path)]
     if image_path is not None:
-        cmd += ["--image", image_path, "0", "1.0"]
+        cmd += ["--image", str(image_path), "0", "1.0"]
     cmd += ["-H", str(height),
             "-W", str(width),
             "-f", str(num_frames),

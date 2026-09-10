@@ -113,6 +113,46 @@ def test_validate_geometry():
 
 
 # ---------------------------------------------------------------------------
+# M3b: _resolve_bin
+# ---------------------------------------------------------------------------
+
+def test_resolve_bin():
+    saved_bin = skill.LTX2_MLX_BIN
+    saved_which = skill.shutil.which
+    try:
+        skill.LTX2_MLX_BIN = "ltx-2-mlx"
+        skill.shutil.which = lambda name: "/fake/found/path"
+        check("M3h bare name resolvable via PATH returns which() result",
+              skill._resolve_bin() == "/fake/found/path",
+              "got %r" % skill._resolve_bin())
+    finally:
+        skill.shutil.which = saved_which
+        skill.LTX2_MLX_BIN = saved_bin
+
+    try:
+        skill.LTX2_MLX_BIN = "totally-not-a-real-binary-xyz"
+        check("M3i bare name not resolvable via PATH returns name verbatim",
+              skill._resolve_bin() == "totally-not-a-real-binary-xyz",
+              "got %r" % skill._resolve_bin())
+    finally:
+        skill.LTX2_MLX_BIN = saved_bin
+
+    try:
+        skill.LTX2_MLX_BIN = "/some/explicit/path/ltx-2-mlx"
+
+        def _raise_if_called(name):
+            raise AssertionError("shutil.which should not be called for a path")
+
+        skill.shutil.which = _raise_if_called
+        check("M3j path containing os.sep returns unchanged without calling shutil.which",
+              skill._resolve_bin() == "/some/explicit/path/ltx-2-mlx",
+              "got %r" % skill._resolve_bin())
+    finally:
+        skill.shutil.which = saved_which
+        skill.LTX2_MLX_BIN = saved_bin
+
+
+# ---------------------------------------------------------------------------
 # M4: build_command golden argv
 # ---------------------------------------------------------------------------
 
@@ -203,6 +243,7 @@ if __name__ == "__main__":
     test_constants()
     test_error_type()
     test_validate_geometry()
+    test_resolve_bin()
     test_build_command_i2v_defaults()
     test_build_command_t2v()
     test_build_command_flags()
