@@ -328,16 +328,22 @@ def test_generate_video_value_errors():
                 msg = _raises_value_error(skill.generate_video, **kw)
                 check(name, msg is not None and needle in msg, "got %r" % msg)
 
-            try:
-                skill.generate_video(**base())
-            except NotImplementedError:
-                check("M5n valid args pass validation and reach the stub", True)
-            except ValueError as e:
-                check("M5n valid args pass validation and reach the stub", False,
-                      "over-rejected: %s" % e)
-            else:
-                check("M5n valid args pass validation and reach the stub", False,
-                      "no exception raised at all")
+            def _v(**over):
+                kw = dict(prompt="p", output_path=out, image_path=img, width=704,
+                          height=480, num_frames=241, tile_frames=1, tile_spatial=1,
+                          force=False)
+                kw.update(over)
+                return _raises_value_error(skill._validate_generate_args, **kw)
+
+            for label, over in [
+                ("I2V defaults", {}),
+                ("T2V image_path=None", dict(image_path=None)),
+                ("tiling > 1", dict(tile_frames=2, tile_spatial=2)),
+                ("non-default valid geometry", dict(width=1024, height=576, num_frames=121)),
+            ]:
+                m = _v(**over)
+                check("M5n negative control: %s accepted" % label, m is None,
+                      "over-rejected: %r" % m)
 
             with open(out, "wb") as f:
                 f.write(b"existing")
@@ -345,7 +351,15 @@ def test_generate_video_value_errors():
             check("M5i existing output without force", msg is not None and "already exists" in msg,
                   "got %r" % msg)
 
-            check("M5m no subprocess was ever spawned", _invocation_count(log) == 0,
+            msg = _raises_value_error(skill._validate_generate_args, prompt="p",
+                                      output_path=out, image_path=img, width=704,
+                                      height=480, num_frames=241, tile_frames=1,
+                                      tile_spatial=1, force=True)
+            check("M5p force=True accepts an existing output_path", msg is None,
+                  "over-rejected: %r" % msg)
+
+            check("M5m no subprocess was ever spawned by validation-only calls",
+                  _invocation_count(log) == 0,
                   "got %d invocations" % _invocation_count(log))
     finally:
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
