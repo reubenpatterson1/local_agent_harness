@@ -238,3 +238,102 @@ def clip_is_reusable(clip_path, expected_frames):
     if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
         return False
     return clip_frame_count(clip_path) == expected_frames
+
+
+_REMEDY = ("re-render that panel with --force (or delete the clip and rerun "
+           "with --resume)")
+
+
+def probe_streams(clip_path):
+    """ffprobe -show_streams as a parsed dict. Raises ConcatPreflightError if
+    ffprobe cannot read the clip."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", clip_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise ConcatPreflightError(
+            "clip %s: ffprobe failed (rc=%d): %s; %s"
+            % (clip_path, proc.returncode, proc.stderr.strip(), _REMEDY))
+    try:
+        return json.loads(proc.stdout)
+    except ValueError as e:
+        raise ConcatPreflightError("clip %s: ffprobe output is not JSON (%s); %s"
+                                   % (clip_path, e, _REMEDY))
+
+
+def assert_clips_uniform(clip_streams, width, height, frame_rate):
+    """clip_streams: ordered [(clip_path, probe_dict)]. Raise
+    ConcatPreflightError naming the clip and the exact differing field.
+
+    These properties hold BY CONSTRUCTION -- ltx-2-mlx's video_vae.py:538-561
+    hardcodes -c:v libx264 -pix_fmt yuv420p -crf 18 (-c:a aac when audio is
+    present), and every clip in one run shares geometry and frame rate. The
+    preflight turns that assumption into a checked precondition. A
+    concat-filter re-encode fallback is deliberately NOT provided: it would
+    be unreachable dead code that, if it ever fired, would paper over a real
+    bug at the cost of a crf 18 -> 18 generational quality loss."""
+    ref_rate = None
+    ref_channels = None
+    ref_clip = None
+    for clip_path, probe in clip_streams:
+        streams = probe.get("streams") or []
+        video = [s for s in streams if s.get("codec_type") == "video"]
+        audio = [s for s in streams if s.get("codec_type") == "audio"]
+
+        if len(video) != 1:
+            raise ConcatPreflightError(
+                "clip %s: expected exactly 1 video stream, found %d; %s"
+                % (clip_path, len(video), _REMEDY))
+        if len(audio) != 1:
+            raise ConcatPreflightError(
+                "clip %s: expected exactly 1 audio stream, found %d; %s"
+                % (clip_path, len(audio), _REMEDY))
+
+        v, a = video[0], audio[0]
+        checks = [
+            ("video codec_name", v.get("codec_name"), "h264"),
+            ("pix_fmt", v.get("pix_fmt"), "yuv420p"),
+            ("video width", v.get("width"), width),
+            ("video height", v.get("height"), height),
+            ("r_frame_rate", v.get("r_frame_rate"), "%d/1" % frame_rate),
+            ("audio codec_name", a.get("codec_name"), "aac"),
+        ]
+        for field, actual, expected in checks:
+            if actual != expected:
+                raise ConcatPreflightError(
+                    "clip %s: %s is %r, expected %r; %s"
+                    % (clip_path, field, actual, expected, _REMEDY))
+
+        if ref_clip is None:
+            ref_clip = clip_path
+            ref_rate = a.get("sample_rate")
+            ref_channels = a.get("channels")
+        else:
+            if a.get("sample_rate") != ref_rate:
+                raise ConcatPreflightError(
+                    "clip %s: audio sample_rate is %r, expected %r to match %s; %s"
+                    % (clip_path, a.get("sample_rate"), ref_rate, ref_clip, _REMEDY))
+            if a.get("channels") != ref_channels:
+                raise ConcatPreflightError(
+                    "clip %s: audio channels is %r, expected %r to match %s; %s"
+                    % (clip_path, a.get("channels"), ref_channels, ref_clip, _REMEDY))
+
+
+def build_concat_list(clip_paths):
+    """The concat demuxer's list file. Absolute paths, panel-index order, a
+    literal single quote escaped as '\\'' per ffmpeg's quoting rules."""
+    out = []
+    for path in clip_paths:
+        out.append("file '%s'\n" % os.path.abspath(path).replace("'", "'\\''"))
+    return "".join(out)
+
+
+def build_concat_command(list_path, output_path):
+    """Stream copy only. Per-segment AAC encoder priming adds ~23 ms of
+    lead-in silence at each join, but the concat demuxer re-bases timestamps
+    per segment, so it does not accumulate; the worst case is ~23 ms inside
+    one panel, landing on what is already a hard cut. ltx-2-mlx deliberately
+    omits -shortest (video_vae.py:555-559), so a clip's audio may end a hair
+    before its video -- a brief tail silence, not drift."""
+    return ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+            "-c", "copy", "-movflags", "+faststart", output_path]

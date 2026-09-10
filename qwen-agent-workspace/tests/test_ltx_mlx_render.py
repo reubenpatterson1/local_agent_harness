@@ -302,6 +302,112 @@ def test_clip_frame_count_survives_missing_ffprobe():
         render.subprocess.run = saved
 
 
+# ---------------------------------------------------------------------------
+# R6: concat list quoting and concat argv
+# ---------------------------------------------------------------------------
+
+def test_build_concat_list():
+    text = render.build_concat_list(["/abs/clips/panel_01.mp4", "/abs/clips/panel_02.mp4"])
+    check("R6a one 'file' line per clip, in order",
+          text == "file '/abs/clips/panel_01.mp4'\nfile '/abs/clips/panel_02.mp4'\n",
+          "got %r" % text)
+    quoted = render.build_concat_list(["/abs/o'brien/panel_01.mp4"])
+    check("R6b a single quote is escaped as '\\'' per the concat demuxer rules",
+          quoted == "file '/abs/o'\\''brien/panel_01.mp4'\n", "got %r" % quoted)
+
+
+def test_build_concat_command():
+    cmd = render.build_concat_command("/runs/r1/concat_list.txt", "/out/movie.mp4")
+    check("R6c golden concat argv",
+          cmd == ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                  "-i", "/runs/r1/concat_list.txt", "-c", "copy",
+                  "-movflags", "+faststart", "/out/movie.mp4"],
+          "got %r" % (cmd,))
+    check("R6d never re-encodes", "-c:v" not in cmd and "libx264" not in cmd
+          and "-filter_complex" not in cmd, "got %r" % (cmd,))
+
+
+# ---------------------------------------------------------------------------
+# R7: ffprobe uniformity checker, fed synthetic stream dicts
+# ---------------------------------------------------------------------------
+
+def _probe(width=704, height=480, rfr="24/1", vcodec="h264", pix="yuv420p",
+           acodec="aac", rate="48000", channels=2, n_video=1, n_audio=1):
+    streams = []
+    for _ in range(n_video):
+        streams.append({"codec_type": "video", "codec_name": vcodec, "pix_fmt": pix,
+                        "width": width, "height": height, "r_frame_rate": rfr})
+    for _ in range(n_audio):
+        streams.append({"codec_type": "audio", "codec_name": acodec,
+                        "sample_rate": rate, "channels": channels})
+    return {"streams": streams}
+
+
+def _uniform_error(pairs):
+    try:
+        render.assert_clips_uniform(pairs, 704, 480, 24)
+    except render.ConcatPreflightError as e:
+        return str(e)
+    return None
+
+
+def test_assert_clips_uniform():
+    good = [("/c/panel_01.mp4", _probe()), ("/c/panel_02.mp4", _probe())]
+    check("R7a uniform clips pass", _uniform_error(good) is None,
+          "got %r" % _uniform_error(good))
+
+    bad_w = [("/c/panel_01.mp4", _probe()), ("/c/panel_02.mp4", _probe(width=640))]
+    msg = _uniform_error(bad_w)
+    check("R7b differing width raises naming clip and field",
+          msg is not None and "panel_02.mp4" in msg and "width" in msg, "got %r" % msg)
+
+    bad_fr = [("/c/panel_01.mp4", _probe(rfr="30/1"))]
+    msg = _uniform_error(bad_fr)
+    check("R7c differing r_frame_rate raises naming clip and field",
+          msg is not None and "panel_01.mp4" in msg and "r_frame_rate" in msg,
+          "got %r" % msg)
+
+    no_audio = [("/c/panel_01.mp4", _probe(n_audio=0))]
+    msg = _uniform_error(no_audio)
+    check("R7d missing audio stream raises naming the clip",
+          msg is not None and "panel_01.mp4" in msg and "audio stream" in msg,
+          "got %r" % msg)
+
+    two_video = [("/c/panel_01.mp4", _probe(n_video=2))]
+    msg = _uniform_error(two_video)
+    check("R7e two video streams raises naming the clip",
+          msg is not None and "panel_01.mp4" in msg and "video stream" in msg,
+          "got %r" % msg)
+
+    bad_codec = [("/c/panel_01.mp4", _probe(vcodec="hevc"))]
+    msg = _uniform_error(bad_codec)
+    check("R7f wrong video codec raises", msg is not None and "codec_name" in msg,
+          "got %r" % msg)
+
+    bad_pix = [("/c/panel_01.mp4", _probe(pix="yuv444p"))]
+    check("R7g wrong pix_fmt raises", "pix_fmt" in (_uniform_error(bad_pix) or ""),
+          "got %r" % _uniform_error(bad_pix))
+
+    bad_acodec = [("/c/panel_01.mp4", _probe(acodec="mp3"))]
+    check("R7h wrong audio codec raises",
+          "audio codec_name" in (_uniform_error(bad_acodec) or ""),
+          "got %r" % _uniform_error(bad_acodec))
+
+    bad_rate = [("/c/panel_01.mp4", _probe()), ("/c/panel_02.mp4", _probe(rate="44100"))]
+    msg = _uniform_error(bad_rate)
+    check("R7i differing sample_rate raises naming the later clip",
+          msg is not None and "panel_02.mp4" in msg and "sample_rate" in msg, "got %r" % msg)
+
+    bad_ch = [("/c/panel_01.mp4", _probe()), ("/c/panel_02.mp4", _probe(channels=1))]
+    msg = _uniform_error(bad_ch)
+    check("R7j differing channel count raises naming the later clip",
+          msg is not None and "panel_02.mp4" in msg and "channels" in msg, "got %r" % msg)
+
+    msg = _uniform_error(bad_w)
+    check("R7k the error tells the operator to re-render with --force",
+          msg is not None and "--force" in msg, "got %r" % msg)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -312,6 +418,9 @@ if __name__ == "__main__":
     test_clip_is_reusable()
     test_clip_frame_count_argv()
     test_clip_frame_count_survives_missing_ffprobe()
+    test_build_concat_list()
+    test_build_concat_command()
+    test_assert_clips_uniform()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
