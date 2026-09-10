@@ -6,8 +6,10 @@ a stub CLI installed through the LTX2_MLX_BIN / LTX2_MLX_DIR seam.
 """
 
 import os
+import signal
 import sys
 import tempfile
+import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
@@ -427,11 +429,15 @@ def test_generate_video_subprocess_outcomes():
             os.environ["STUB_MODE"] = "sleep"
             pidfile = os.path.join(td, "stub.pid")
             os.environ["STUB_PIDFILE"] = pidfile
+            t0 = time.time()
             e = _raises_ltx_error(skill.generate_video, "p", os.path.join(td, "s.mp4"),
                                   image_path=img, timeout_s=3)
+            elapsed = time.time() - t0
             check("M6l timeout raises Ltx2MlxError", e is not None)
             check("M6m timed_out attribute is True", e is not None and e.timed_out is True,
                   "got %r" % (e.timed_out if e else None))
+            check("M6q killpg reaps the grandchild well within the timeout window (not by waiting it out)",
+                  elapsed < 3 + 5, "elapsed=%.1fs (grandchild likely survived and finished on its own)" % elapsed)
             pidfile_exists = os.path.exists(pidfile)
             pid_not_running = True
             if pidfile_exists:
@@ -458,6 +464,108 @@ def test_generate_video_subprocess_outcomes():
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
         os.environ.pop("STUB_MODE", None)
         os.environ.pop("STUB_LOG", None)
+
+
+# ---------------------------------------------------------------------------
+# M9: an exception during the render (not a timeout) must still kill and
+# reap the whole process group, not just the leader -- otherwise the
+# grandchild ffmpeg-style process is orphaned.
+# ---------------------------------------------------------------------------
+
+def test_exception_during_render_kills_process_group():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    saved_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="sleep")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            pidfile = os.path.join(td, "stub.pid")
+            os.environ["STUB_PIDFILE"] = pidfile
+
+            def _raise_keyboard_interrupt(signum, frame):
+                raise KeyboardInterrupt()
+
+            signal.signal(signal.SIGALRM, _raise_keyboard_interrupt)
+            signal.alarm(1)  # fires after the grandchild should be up
+            interrupted = False
+            try:
+                skill.generate_video("p", os.path.join(td, "orphan.mp4"), image_path=img,
+                                     timeout_s=None)
+            except KeyboardInterrupt:
+                interrupted = True
+            finally:
+                signal.alarm(0)
+
+            check("M9a KeyboardInterrupt during render propagates out of generate_video",
+                  interrupted)
+
+            grandchild_pid = None
+            for _ in range(50):
+                if os.path.exists(pidfile):
+                    with open(pidfile) as f:
+                        content = f.read().strip()
+                    if content:
+                        grandchild_pid = int(content)
+                        break
+                time.sleep(0.1)
+            check("M9b grandchild pidfile was written", grandchild_pid is not None,
+                  "pidfile=%r" % pidfile)
+
+            dead = False
+            if grandchild_pid is not None:
+                for _ in range(50):
+                    try:
+                        os.kill(grandchild_pid, 0)
+                    except ProcessLookupError:
+                        dead = True
+                        break
+                    except OSError:
+                        dead = True
+                        break
+                    time.sleep(0.1)
+            check("M9c grandchild is dead (not orphaned) after the exception cleanup path",
+                  dead, "grandchild_pid=%r" % grandchild_pid)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, saved_handler)
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_PIDFILE", None)
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+# ---------------------------------------------------------------------------
+# M10: a spawn failure (Popen raising OSError) must come out as Ltx2MlxError,
+# never as a raw OSError.
+# ---------------------------------------------------------------------------
+
+def test_spawn_failure_wrapped_as_ltx_error():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            garbage = os.path.join(td, "garbage-not-a-real-binary")
+            with open(garbage, "wb") as f:
+                f.write(b"\x7fELFgarbagenotarealexecutable")
+            os.chmod(garbage, 0o755)
+            skill.LTX2_MLX_BIN = garbage
+            skill.LTX2_MLX_DIR = td
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            out = os.path.join(td, "spawn-fail.mp4")
+
+            e = _raises_ltx_error(skill.generate_video, "p", out, image_path=img)
+            check("M10a spawn failure raises Ltx2MlxError (not a raw OSError)", e is not None)
+            check("M10b output_path matches the requested output path",
+                  e is not None and e.output_path == out,
+                  "got %r" % (e.output_path if e else None))
+            check("M10c message names 'failed to spawn'",
+                  e is not None and "failed to spawn" in str(e),
+                  "got %r" % (str(e) if e else None))
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +632,8 @@ if __name__ == "__main__":
     test_build_command_invariants()
     test_generate_video_value_errors()
     test_generate_video_subprocess_outcomes()
+    test_exception_during_render_kills_process_group()
+    test_spawn_failure_wrapped_as_ltx_error()
     test_log_path_written()
     test_env_override_seam()
 
