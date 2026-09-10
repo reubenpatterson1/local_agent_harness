@@ -636,6 +636,120 @@ def test_estimate_skips_corrupt_summary():
               abs(secs - 1500.0) < 1e-9, "got %r" % secs)
 
 
+def test_estimate_order_independent_of_glob_order():
+    with tempfile.TemporaryDirectory() as td:
+        old_dir = _write_summary(td, "20260910T010101Z-aaaaaaaa",
+                                 [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                   "seconds": 1000.0}])
+        old_path = os.path.join(old_dir, "story_summary.json")
+        os.utime(old_path, (1000, 1000))
+        new_dir = _write_summary(td, "20260910T020202Z-bbbbbbbb",
+                                 [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                   "seconds": 2000.0}])
+        new_path = os.path.join(new_dir, "story_summary.json")
+        os.utime(new_path, (2000, 2000))
+
+        real_glob = render.glob.glob
+        try:
+            for order in ([old_path, new_path], [new_path, old_path]):
+                render.glob.glob = lambda pat, _o=order: list(_o)
+                secs, label = render.estimate_seconds_per_panel(
+                    td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+                check("R8p newest wins regardless of glob order (%r)" % order,
+                      abs(secs - 2000.0) < 1e-9, "got %r for order %r" % (secs, order))
+        finally:
+            render.glob.glob = real_glob
+
+
+def test_estimate_dangling_path_sorts_last_not_fatal():
+    with tempfile.TemporaryDirectory() as td:
+        good_dir = _write_summary(td, "20260910T030303Z-cccccccc",
+                                  [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                    "seconds": 1234.0}])
+        good_path = os.path.join(good_dir, "story_summary.json")
+        os.utime(good_path, (1000, 1000))
+        dangling_path = os.path.join(td, "runs", "does-not-exist", "story_summary.json")
+
+        real_glob = render.glob.glob
+        try:
+            render.glob.glob = lambda pat: [dangling_path, good_path]
+            secs, label = render.estimate_seconds_per_panel(
+                td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+            check("R8q a dangling glob result does not crash and the real summary is used",
+                  abs(secs - 1234.0) < 1e-9, "got %r" % secs)
+        finally:
+            render.glob.glob = real_glob
+
+
+def test_estimate_mtime_tie_break_is_deterministic():
+    with tempfile.TemporaryDirectory() as td:
+        dir_a = _write_summary(td, "20260910T040404Z-dddddddd",
+                               [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                 "seconds": 111.0}])
+        path_a = os.path.join(dir_a, "story_summary.json")
+        dir_b = _write_summary(td, "20260910T050505Z-eeeeeeee",
+                               [{"unit": "panel-1", "status": "ok", "resumed": False,
+                                 "seconds": 222.0}])
+        path_b = os.path.join(dir_b, "story_summary.json")
+        os.utime(path_a, (5000, 5000))
+        os.utime(path_b, (5000, 5000))
+
+        real_glob = render.glob.glob
+        try:
+            results = set()
+            for order in ([path_a, path_b], [path_b, path_a]):
+                render.glob.glob = lambda pat, _o=order: list(_o)
+                secs, _ = render.estimate_seconds_per_panel(
+                    td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+                results.add(secs)
+            check("R8r identical mtimes resolve deterministically regardless of glob order",
+                  len(results) == 1, "got multiple results across glob orders: %r" % results)
+        finally:
+            render.glob.glob = real_glob
+
+
+def test_estimate_model_key_gates_reuse():
+    with tempfile.TemporaryDirectory() as td:
+        _write_summary(td, "20260910T060606Z-ffffffff",
+                       [{"unit": "panel-1", "status": "ok", "resumed": False,
+                         "seconds": 999.0}], model="some-other-model")
+        secs_same, _ = render.estimate_seconds_per_panel(
+            td, 241, 704, 480, True, 1, 1, "some-other-model")
+        check("R8s matching model reuses the measurement",
+              abs(secs_same - 999.0) < 1e-9, "got %r" % secs_same)
+        secs_diff, label_diff = render.estimate_seconds_per_panel(
+            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+        check("R8t mismatched model falls back to the default estimate",
+              secs_diff == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs_diff)
+
+
+def test_estimate_handles_null_units_and_non_dict_entries():
+    with tempfile.TemporaryDirectory() as td:
+        run_root = os.path.join(td, "runs", "20260910T070707Z-99999999")
+        os.makedirs(run_root, exist_ok=True)
+        with open(os.path.join(run_root, "story_summary.json"), "w") as f:
+            json.dump({"frames_per_panel": 241, "width": 704, "height": 480,
+                      "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
+                      "model": render.SKILL.MODEL_ID, "units": None}, f)
+        secs, label = render.estimate_seconds_per_panel(
+            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+        check("R8u units:null does not crash, falls back to default",
+              secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
+
+        run_root2 = os.path.join(td, "runs", "20260910T080808Z-88888888")
+        os.makedirs(run_root2, exist_ok=True)
+        with open(os.path.join(run_root2, "story_summary.json"), "w") as f:
+            json.dump({"frames_per_panel": 241, "width": 704, "height": 480,
+                      "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
+                      "model": render.SKILL.MODEL_ID,
+                      "units": ["not-a-dict", {"status": "ok", "resumed": False,
+                                                "seconds": 555.0}]}, f)
+        secs2, label2 = render.estimate_seconds_per_panel(
+            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+        check("R8v a non-dict unit entry alongside a good one does not crash",
+              abs(secs2 - 555.0) < 1e-9, "got %r" % secs2)
+
+
 def test_format_estimate_lines():
     lines = render.format_estimate_lines(2400.0, "default estimate (unmeasured for "
                                          "this configuration)", 3, 3)
@@ -678,6 +792,11 @@ if __name__ == "__main__":
     test_estimate_excludes_resumed_and_mismatched()
     test_estimate_prefers_newest_matching_summary()
     test_estimate_skips_corrupt_summary()
+    test_estimate_order_independent_of_glob_order()
+    test_estimate_dangling_path_sorts_last_not_fatal()
+    test_estimate_mtime_tie_break_is_deterministic()
+    test_estimate_model_key_gates_reuse()
+    test_estimate_handles_null_units_and_non_dict_entries()
     test_format_estimate_lines()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
