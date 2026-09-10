@@ -145,6 +145,9 @@ def _validate_generate_args(prompt, output_path, image_path, width, height,
 
     validate_geometry(width, height, num_frames)
 
+    if not isinstance(output_path, str) or not output_path:
+        raise ValueError("output_path must be a non-empty string, got %r" % (output_path,))
+
     if not output_path.endswith(".mp4"):
         raise ValueError("output_path must end in .mp4, got %r" % (output_path,))
 

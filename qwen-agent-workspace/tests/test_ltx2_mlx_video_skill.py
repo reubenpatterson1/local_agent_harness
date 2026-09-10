@@ -322,10 +322,22 @@ def test_generate_video_value_errors():
                  base(image_path=os.path.join(td, "missing.png"))),
                 ("M5k tile_frames < 1", "tile_frames", base(tile_frames=0)),
                 ("M5l tile_spatial < 1", "tile_spatial", base(tile_spatial=0)),
+                ("M5o non-str output_path", "output_path", base(output_path=None)),
             ]
             for name, needle, kw in cases:
                 msg = _raises_value_error(skill.generate_video, **kw)
                 check(name, msg is not None and needle in msg, "got %r" % msg)
+
+            try:
+                skill.generate_video(**base())
+            except NotImplementedError:
+                check("M5n valid args pass validation and reach the stub", True)
+            except ValueError as e:
+                check("M5n valid args pass validation and reach the stub", False,
+                      "over-rejected: %s" % e)
+            else:
+                check("M5n valid args pass validation and reach the stub", False,
+                      "no exception raised at all")
 
             with open(out, "wb") as f:
                 f.write(b"existing")
