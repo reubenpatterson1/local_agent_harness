@@ -74,8 +74,12 @@ def validate_geometry(width, height, num_frames):
     only thing standing between a typo and a silently shorter clip."""
     if width % 32 != 0:
         raise ValueError("width must be a multiple of 32, got %d" % width)
+    if width < 32:
+        raise ValueError("width must be >= 32, got %d" % width)
     if height % 32 != 0:
         raise ValueError("height must be a multiple of 32, got %d" % height)
+    if height < 32:
+        raise ValueError("height must be >= 32, got %d" % height)
     if (num_frames - 1) % 8 != 0:
         raise ValueError("num_frames must satisfy (num_frames - 1) %% 8 == 0, got %d"
                          % num_frames)

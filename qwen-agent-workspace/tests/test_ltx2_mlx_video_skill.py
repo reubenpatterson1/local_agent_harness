@@ -104,6 +104,12 @@ def test_validate_geometry():
     check("M3e num_frames < 9 rejected",
           ">= 9" in (_raises_value_error(skill.validate_geometry, 704, 480, 1) or ""),
           "got %r" % _raises_value_error(skill.validate_geometry, 704, 480, 1))
+    check("M3f width < 32 rejected",
+          "width" in (_raises_value_error(skill.validate_geometry, 0, 480, 241) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 0, 480, 241))
+    check("M3g height < 32 rejected",
+          "height" in (_raises_value_error(skill.validate_geometry, 704, -32, 241) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 704, -32, 241))
 
 
 if __name__ == "__main__":
