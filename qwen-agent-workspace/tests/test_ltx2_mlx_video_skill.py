@@ -625,6 +625,60 @@ def test_env_override_seam():
             importlib.reload(skill)
 
 
+# ---------------------------------------------------------------------------
+# M9: the skill CLI
+# ---------------------------------------------------------------------------
+
+def test_cli_parser_defaults():
+    a = skill.build_cli_parser().parse_args(["a prompt", "/tmp/o.mp4"])
+    check("M9a image default None", a.image is None, "got %r" % a.image)
+    check("M9b width 704", a.width == 704, "got %r" % a.width)
+    check("M9c height 480", a.height == 480, "got %r" % a.height)
+    check("M9d frames 241", a.frames == 241, "got %r" % a.frames)
+    check("M9e frame_rate 24", a.frame_rate == 24, "got %r" % a.frame_rate)
+    check("M9f seed 0", a.seed == 0, "got %r" % a.seed)
+    check("M9g model MODEL_ID", a.model == skill.MODEL_ID, "got %r" % a.model)
+    check("M9h no_low_ram False", a.no_low_ram is False, "got %r" % a.no_low_ram)
+    check("M9i tile_frames 1", a.tile_frames == 1, "got %r" % a.tile_frames)
+    check("M9j tile_spatial 1", a.tile_spatial == 1, "got %r" % a.tile_spatial)
+    check("M9k log None", a.log is None, "got %r" % a.log)
+    check("M9l timeout None", a.timeout is None, "got %r" % a.timeout)
+    check("M9m quiet False", a.quiet is False, "got %r" % a.quiet)
+    check("M9n force False", a.force is False, "got %r" % a.force)
+    check("M9o prompt/output positionals",
+          a.prompt == "a prompt" and a.output == "/tmp/o.mp4",
+          "got %r %r" % (a.prompt, a.output))
+    check("M9p there is no --t2v flag",
+          not any("--t2v" in a.option_strings for a in skill.build_cli_parser()._actions),
+          "found in: %r" % [a.option_strings for a in skill.build_cli_parser()._actions
+                            if "--t2v" in a.option_strings])
+
+
+def test_cli_exit_codes():
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            rc = skill.main(["p", os.path.join(td, "cli.mp4"), "--image", img,
+                             "--timeout", "60"])
+            check("M9q success exits 0", rc == 0, "got %r" % rc)
+
+            rc = skill.main(["p", os.path.join(td, "cli.mov"), "--image", img])
+            check("M9r ValueError exits 2", rc == 2, "got %r" % rc)
+
+            os.environ["STUB_MODE"] = "fail"
+            rc = skill.main(["p", os.path.join(td, "cli2.mp4"), "--image", img,
+                             "--timeout", "60"])
+            check("M9s Ltx2MlxError exits 1", rc == 1, "got %r" % rc)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
 if __name__ == "__main__":
     test_constants()
     test_error_type()
@@ -640,6 +694,8 @@ if __name__ == "__main__":
     test_spawn_failure_wrapped_as_ltx_error()
     test_log_path_written()
     test_env_override_seam()
+    test_cli_parser_defaults()
+    test_cli_exit_codes()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

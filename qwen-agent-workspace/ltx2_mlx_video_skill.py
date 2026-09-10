@@ -290,3 +290,57 @@ def _run_subprocess(cmd, log_path, timeout_s, output_path):
                 logf.close()
 
     return proc.returncode, "".join(lines[-STDERR_TAIL_LINES:]), timed_out[0]
+
+
+def build_cli_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx2_mlx_video_skill",
+        description=("Render one clip with ltx-2-mlx generate --distilled. "
+                     "Omitting --image is text-to-video; there is no separate "
+                     "--t2v flag."),
+    )
+    parser.add_argument("prompt")
+    parser.add_argument("output", metavar="OUTPUT_MP4")
+    parser.add_argument("--image", default=None)
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    parser.add_argument("--frames", type=int, default=DEFAULT_NUM_FRAMES)
+    parser.add_argument("--frame-rate", dest="frame_rate", type=int,
+                        default=DEFAULT_FRAME_RATE)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
+                        default=False)
+    parser.add_argument("--tile-frames", dest="tile_frames", type=int,
+                        default=DEFAULT_TILE_FRAMES)
+    parser.add_argument("--tile-spatial", dest="tile_spatial", type=int,
+                        default=DEFAULT_TILE_SPATIAL)
+    parser.add_argument("--log", default=None)
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--quiet", action="store_true", default=False)
+    parser.add_argument("--force", action="store_true", default=False)
+    return parser
+
+
+def main(argv=None):
+    args = build_cli_parser().parse_args(argv)
+    try:
+        path = generate_video(
+            args.prompt, args.output, image_path=args.image,
+            width=args.width, height=args.height, num_frames=args.frames,
+            frame_rate=args.frame_rate, seed=args.seed, model=args.model,
+            low_ram=(not args.no_low_ram), tile_frames=args.tile_frames,
+            tile_spatial=args.tile_spatial, log_path=args.log,
+            timeout_s=args.timeout, force=args.force, quiet=args.quiet)
+    except ValueError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    except Ltx2MlxError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 1
+    print("[ltx2_mlx_video_skill] wrote: %s" % path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
