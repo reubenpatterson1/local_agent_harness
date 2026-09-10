@@ -854,6 +854,13 @@ def test_cli_default_boolean_wiring():
 
 def test_log_path_open_failure_is_ltx_error():
     saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    saved_popen = skill.subprocess.Popen
+    spawned = []
+
+    def _recording_popen(*a, **kw):
+        spawned.append(a)
+        return saved_popen(*a, **kw)
+
     try:
         with tempfile.TemporaryDirectory() as td:
             _install_stub(td, mode="ok")
@@ -863,6 +870,8 @@ def test_log_path_open_failure_is_ltx_error():
             out = os.path.join(td, "o.mp4")
             log_path = os.path.join(td, "dangling.log")
             os.symlink(os.path.join(td, "no-such-dir", "target"), log_path)
+
+            skill.subprocess.Popen = _recording_popen
             raised = None
             try:
                 skill.generate_video("p", out, image_path=img, log_path=log_path,
@@ -876,10 +885,9 @@ def test_log_path_open_failure_is_ltx_error():
                   raised is not None and "log_path" in str(raised),
                   "got %r" % (str(raised) if raised else None))
             check("M7f no subprocess was spawned before the open() failure",
-                  _invocation_count(os.environ.get("STUB_LOG", "")) == 0
-                  or not os.path.exists(os.environ.get("STUB_LOG", "")),
-                  "an invocation occurred despite the log-open failure")
+                  spawned == [], "Popen was called %d time(s)" % len(spawned))
     finally:
+        skill.subprocess.Popen = saved_popen
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
         os.environ.pop("STUB_MODE", None)
         os.environ.pop("STUB_LOG", None)
