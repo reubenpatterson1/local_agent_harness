@@ -851,6 +851,37 @@ def test_dry_run_resume_lines():
         render.clip_frame_count = saved
 
 
+# ---------------------------------------------------------------------------
+# R11: the input content screen is a THROWAWAY SUBPROCESS, and it is live
+# ---------------------------------------------------------------------------
+
+def test_input_content_screen_shape():
+    import inspect
+    src = inspect.getsource(render.run_input_content_screen)
+    check("R11a screens in a child process, not in-process",
+          "sys.executable" in src and '"-c"' in src, "src=%r" % src)
+    check("R11b the child imports content_safety, this process never does",
+          "import content_safety" in src, "src=%r" % src)
+    check("R11c the child prints SCREEN_OK / SCREEN_BLOCKED",
+          "SCREEN_OK" in src and "SCREEN_BLOCKED" in src, "src=%r" % src)
+    check("R11d the child exits 3 on a block", "sys.exit(3)" in src, "src=%r" % src)
+    check("R11e the skill label is ltx-mlx-render", "ltx-mlx-render" in src, "src=%r" % src)
+
+    with open(_RENDER_PATH) as f:
+        text = f.read()
+    check("R11f the call site is LIVE, not commented out",
+          "rc = run_input_content_screen(" in text
+          and "#rc = run_input_content_screen(" not in text
+          and "# rc = run_input_content_screen(" not in text,
+          "the ported screen must actually run in this path")
+
+
+def test_input_content_screen_empty_list_is_cheap():
+    rc = render.run_input_content_screen([])
+    check("R11g screening zero images returns 0 without importing anything heavy",
+          rc == 0, "got %r" % rc)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -881,6 +912,8 @@ if __name__ == "__main__":
     test_format_estimate_lines()
     test_dry_run_output()
     test_dry_run_resume_lines()
+    test_input_content_screen_shape()
+    test_input_content_screen_empty_list_is_cheap()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

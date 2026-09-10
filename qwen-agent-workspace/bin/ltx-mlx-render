@@ -472,3 +472,36 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
         print(line)
 
     return 0
+
+
+def run_input_content_screen(image_paths):
+    """Screen every input image in ONE throwaway subprocess, so this process
+    never imports content_safety (or torch by extension). Ported from
+    bin/ltx-story-video::_run_input_content_screen (:644-670); the only
+    change is the skill label in the log line. Prints SCREEN_OK <path> per
+    pass; the child exits 3 on the first ContentSafetyError. Returns the
+    child's exit code (0 when there is nothing to screen)."""
+    if not image_paths:
+        return 0
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import content_safety\n"
+        "from PIL import Image\n"
+        "for p in sys.argv[1:]:\n"
+        "    img = Image.open(p).convert('RGB')\n"
+        "    try:\n"
+        "        content_safety.assert_image_safe(img, skill='ltx-mlx-render', prompt=p)\n"
+        "    except content_safety.ContentSafetyError as e:\n"
+        "        print('SCREEN_BLOCKED %%s: %%s' %% (p, e))\n"
+        "        sys.exit(3)\n"
+        "    print('SCREEN_OK %%s' %% p)\n"
+    ) % WS
+    proc = subprocess.run(
+        [sys.executable, "-c", script] + image_paths,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    print(proc.stdout)
+    return proc.returncode
