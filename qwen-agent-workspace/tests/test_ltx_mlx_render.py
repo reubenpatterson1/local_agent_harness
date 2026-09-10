@@ -770,6 +770,87 @@ def test_format_estimate_lines():
           "got %r" % lines[0])
 
 
+# ---------------------------------------------------------------------------
+# R10: --dry-run output (all seven items)
+# ---------------------------------------------------------------------------
+
+def _run_render(argv, cwd=None):
+    return subprocess.run([sys.executable, _RENDER_PATH] + argv,
+                          capture_output=True, text=True, cwd=cwd or WS)
+
+
+def test_dry_run_output():
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        manifest = _write_manifest(td, [_panel(1, img), _panel(2, None), _panel(3, img)],
+                                   story_id="drydemo")
+        clips = os.path.join(td, "clips")
+        os.makedirs(clips)
+        out = os.path.join(td, "movie.mp4")
+
+        r = _run_render([manifest, out, "--clips-dir", clips, "--dry-run"])
+        o = r.stdout
+        check("R10a exits 0", r.returncode == 0, "rc=%r stderr=%r" % (r.returncode, r.stderr))
+        check("R10b names the manifest path", os.path.abspath(manifest) in o, "got %r" % o)
+        check("R10c names the story id", "story id: drydemo" in o, "got %r" % o)
+        check("R10d names the panel count", "panels: 3" in o, "got %r" % o)
+        check("R10e marks I2V panels with their image path",
+              ("panel  1: I2V %s" % img) in o, "got %r" % o)
+        check("R10f marks T2V panels", "panel  2: T2V (no conditioning image)" in o,
+              "got %r" % o)
+        check("R10g resolved geometry line",
+              "geometry: 704x480, 241 frames @ 24 fps = 10.04 s per panel" in o, "got %r" % o)
+        check("R10h total line", "total: 3 panels x 10.04 s = 30.13 s of finished movie" in o,
+              "got %r" % o)
+        check("R10i the num_frames-ignored note",
+              "note: manifest per-panel num_frames is ignored; --frames 241 is authoritative"
+              in o, "got %r" % o)
+        check("R10j the first render command is shown, shlex-joined",
+              "first render command:" in o and "--distilled" in o and "--frame-rate 24" in o,
+              "got %r" % o)
+        check("R10k the estimate line is present",
+              "estimated render time: 3 panels x" in o and "[source: default estimate" in o,
+              "got %r" % o)
+        check("R10l nothing was written", not os.path.exists(out)
+              and os.listdir(clips) == [], "clips=%r" % os.listdir(clips))
+        check("R10m no runs/ directory was created",
+              not os.path.isdir(os.path.join(render.story_dir_for("drydemo"), "runs"))
+              or not glob_has_new_run("drydemo"), "a run root was created under --dry-run")
+
+
+def glob_has_new_run(story_id):
+    import glob as _g
+    return bool(_g.glob(os.path.join(render.story_dir_for(story_id), "runs", "*")))
+
+
+def test_dry_run_resume_lines():
+    saved = render.clip_frame_count
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "p1.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            manifest = _write_manifest(td, [_panel(1, img), _panel(2, img)],
+                                       story_id="resdemo")
+            clips = os.path.join(td, "clips")
+            os.makedirs(clips)
+            with open(os.path.join(clips, "panel_01.mp4"), "wb") as f:
+                f.write(b"\x00" * 64)
+            out = os.path.join(td, "movie.mp4")
+
+            r = _run_render([manifest, out, "--clips-dir", clips, "--resume",
+                             "--dry-run", "--frames", "241"])
+            o = r.stdout
+            check("R10n --resume dry-run exits 0", r.returncode == 0,
+                  "rc=%r stderr=%r" % (r.returncode, r.stderr))
+            check("R10o resume lines name skipped and rendering panels",
+                  "resume:" in o and "would render" in o, "got %r" % o)
+    finally:
+        render.clip_frame_count = saved
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -798,6 +879,8 @@ if __name__ == "__main__":
     test_estimate_model_key_gates_reuse()
     test_estimate_handles_null_units_and_non_dict_entries()
     test_format_estimate_lines()
+    test_dry_run_output()
+    test_dry_run_resume_lines()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

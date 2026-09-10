@@ -410,3 +410,65 @@ def format_estimate_lines(seconds_per_panel, label, to_render, total):
         lines.append("  (%d of %d panels already rendered and will be skipped)"
                      % (total - to_render, total))
     return lines
+
+
+def print_dry_run(args, manifest, units, story_id, clips_dir):
+    """Resolve everything, touch nothing, print the plan, return 0.
+
+    Deliberately does NOT check for the ltx-2-mlx binary or ffmpeg: a dry run
+    must be usable on a machine that cannot render."""
+    seconds_per_panel_play = args.frames / float(args.frame_rate)
+    total_panels = len(units)
+
+    print("manifest: %s" % os.path.abspath(args.manifest_path))
+    print("story id: %s" % story_id)
+    print("panels: %d" % total_panels)
+    for unit in units:
+        if unit["image_path"]:
+            print("  panel %2d: I2V %s" % (unit["index"], unit["image_path"]))
+        else:
+            print("  panel %2d: T2V (no conditioning image)" % unit["index"])
+    print("clips dir: %s" % clips_dir)
+    print("output: %s" % os.path.abspath(args.output_path))
+    print("geometry: %dx%d, %d frames @ %d fps = %.2f s per panel"
+          % (args.width, args.height, args.frames, args.frame_rate,
+             seconds_per_panel_play))
+    print("total: %d panels x %.2f s = %.2f s of finished movie"
+          % (total_panels, seconds_per_panel_play,
+             total_panels * seconds_per_panel_play))
+    print("note: manifest per-panel num_frames is ignored; --frames %d is authoritative"
+          % args.frames)
+
+    would_skip = []
+    would_render = []
+    for unit in units:
+        if args.resume and clip_is_reusable(unit["clip_path"], args.frames):
+            would_skip.append(unit)
+        else:
+            would_render.append(unit)
+
+    if would_render:
+        first = would_render[0]
+        cmd = SKILL.build_command(
+            prompt=first["prompt"], output_path=first["clip_path"],
+            image_path=first["image_path"], width=args.width, height=args.height,
+            num_frames=args.frames, frame_rate=args.frame_rate, seed=first["seed"],
+            model=args.model, low_ram=(not args.no_low_ram),
+            tile_frames=args.tile_frames, tile_spatial=args.tile_spatial)
+        print("first render command: %s" % shlex.join(cmd))
+    else:
+        print("first render command: (none; all panels would be skipped)")
+
+    if args.resume:
+        print("resume: %d panel(s) would be skipped: %r"
+              % (len(would_skip), [u["index"] for u in would_skip]))
+        print("resume: %d panel(s) would render: %r"
+              % (len(would_render), [u["index"] for u in would_render]))
+
+    secs, label = estimate_seconds_per_panel(
+        story_dir_for(story_id), args.frames, args.width, args.height,
+        (not args.no_low_ram), args.tile_frames, args.tile_spatial, args.model)
+    for line in format_estimate_lines(secs, label, len(would_render), total_panels):
+        print(line)
+
+    return 0
