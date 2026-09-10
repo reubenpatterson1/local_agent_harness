@@ -272,12 +272,34 @@ def test_clip_is_reusable():
         render.clip_frame_count = saved
 
 
-def test_clip_frame_count_command_shape():
-    import inspect
-    src = inspect.getsource(render.clip_frame_count)
-    for token in ("ffprobe", "-select_streams", "v:0", "-count_packets",
-                  "stream=nb_read_packets", "-print_format", "json"):
-        check("R5f clip_frame_count uses %r" % token, token in src, "src=%r" % src)
+def test_clip_frame_count_argv():
+    saved = render.subprocess.run
+    seen = {}
+    class P:
+        returncode = 0
+        stdout = '{"streams":[{"nb_read_packets":"241"}]}'
+        stderr = ""
+    try:
+        render.subprocess.run = lambda argv, **k: (seen.__setitem__("argv", argv), P())[1]
+        check("R5h returns parsed int", render.clip_frame_count("/c.mp4") == 241)
+        check("R5i exact argv", seen["argv"] == [
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+            "-show_entries", "stream=nb_read_packets", "-print_format", "json", "/c.mp4"],
+            "got %r" % seen.get("argv"))
+    finally:
+        render.subprocess.run = saved
+
+
+def test_clip_frame_count_survives_missing_ffprobe():
+    saved = render.subprocess.run
+    try:
+        def _boom(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory", "ffprobe")
+        render.subprocess.run = _boom
+        check("R5g ffprobe not installed -> None (no raise)",
+              render.clip_frame_count("/x.mp4") is None)
+    finally:
+        render.subprocess.run = saved
 
 
 if __name__ == "__main__":
@@ -288,7 +310,8 @@ if __name__ == "__main__":
     test_load_manifest()
     test_build_units()
     test_clip_is_reusable()
-    test_clip_frame_count_command_shape()
+    test_clip_frame_count_argv()
+    test_clip_frame_count_survives_missing_ffprobe()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
