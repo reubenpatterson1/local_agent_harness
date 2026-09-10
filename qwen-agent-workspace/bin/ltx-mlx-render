@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""ltx-mlx-render -- turn a generated/stories/<story_id>/manifest.json into
+one movie.mp4 by rendering ONE ltx-2-mlx clip per panel and stream-copy
+concatenating them with ffmpeg's concat demuxer.
+
+This is the MLX render path. It is deliberately NOT bin/ltx-story-video:
+
+  * It never imports mps_guard, and therefore never runs bin/ltx-host-prep
+    or bin/ltx-host-restore, never touches the MTPLX/vLLM servers on
+    8177/8178, never runs a ceiling check, an _await_gpu_reclaim, a
+    _release_page_cache or a Sentinel abort.
+  * It produces one real .mp4 per panel (h264 + aac, written by ltx-2-mlx's
+    own ffmpeg child), not a flat list of PNG frames. There is therefore no
+    all-frames-in-RAM concat and no MAX_TOTAL_FRAMES cap of any kind: the
+    concat demuxer streams.
+  * It carries its own trimmed manifest validator. That duplicates ~35 lines
+    of bin/ltx-story-video::load_manifest ON PURPOSE -- the two have
+    genuinely diverged (that one must enforce the 8k+1 lattice on
+    manifest-supplied frame counts, this one overrides them with --frames),
+    and importing bin/ltx-story-video to share a validator would drag
+    mps_guard into this process. Do not "fix" this by extracting a module.
+
+It does NOT duplicate the story.md parser: this script reads manifest.json
+only. bin/ltx-story-manifest remains the single story.md parser in this
+workspace (see the load-bearing comment at bin/ltx-story-images:83-87).
+
+See docs/superpowers/specs/2026-09-10-ltx2-mlx-video-pipeline-design.md.
+"""
+
+import argparse
+import datetime
+import glob
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import ltx2_mlx_video_skill as SKILL  # noqa: E402
+
+# Provisional until acceptance test A1 measures it on this host; A1 replaces
+# this with the measured per-panel wall-clock rounded to the nearest 60 s.
+SECONDS_PER_PANEL_ESTIMATE = 2400   # 40 min
+
+JETSAM_LADDER = """\
+This is the signature of a jetsam kill: ltx-2-mlx exited 0 but wrote no
+usable mp4, which is what happens when the OS kills the ffmpeg child under
+memory pressure. There is no traceback to read. Remediation ladder, applied
+as RUN-TIME FLAGS (the --frames 241 default is deliberately not lowered):
+  1. --tile-frames 2
+  2. --tile-frames 2 --tile-spatial 2
+  3. --frames 193   (8.04 s per panel)
+  4. --frames 145   (6.04 s per panel)"""
+
+
+class ConcatPreflightError(RuntimeError):
+    """Raised when the rendered clips are not uniform enough to stream-copy
+    concatenate, naming the offending clip and the exact differing field."""
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ltx-mlx-render",
+        description=("Render one ltx-2-mlx clip per manifest panel and "
+                     "stream-copy concatenate them into OUTPUT_MP4."),
+    )
+    parser.add_argument("manifest_path", metavar="MANIFEST")
+    parser.add_argument("output_path", metavar="OUTPUT_MP4")
+    parser.add_argument("--frames", type=int, default=SKILL.DEFAULT_NUM_FRAMES)
+    parser.add_argument("--width", type=int, default=SKILL.DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=SKILL.DEFAULT_HEIGHT)
+    # There is no --fps: --frame-rate is the single source of truth. It is
+    # written to story_summary.json as "fps" so bin/ltx-movie::_report_summary
+    # keeps working unchanged.
+    parser.add_argument("--frame-rate", dest="frame_rate", type=int,
+                        default=SKILL.DEFAULT_FRAME_RATE)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="base seed; panel i uses seed S+i")
+    parser.add_argument("--model", default=SKILL.MODEL_ID)
+    parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
+                        default=False)
+    parser.add_argument("--tile-frames", dest="tile_frames", type=int, default=1)
+    parser.add_argument("--tile-spatial", dest="tile_spatial", type=int, default=1)
+    parser.add_argument("--panel-timeout", dest="panel_timeout", type=int, default=7200)
+    parser.add_argument("--clips-dir", dest="clips_dir", default=None,
+                        help="default: <story_dir>/clips")
+    parser.add_argument("--resume", action="store_true", default=False,
+                        help="reuse existing clips whose frame count matches --frames")
+    parser.add_argument("--force", action="store_true", default=False,
+                        help="overwrite OUTPUT_MP4 if it exists; has NO effect on "
+                             "clip reuse (that is --resume's job)")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
+    parser.add_argument("--on-panel-failure", dest="on_panel_failure",
+                        choices=["skip", "stop"], default="stop")
+    parser.add_argument("--retry-failed", dest="retry_failed", type=int,
+                        choices=[0, 1], default=0)
+    parser.add_argument("--retry-idle", dest="retry_idle", type=float, default=120)
+    parser.add_argument("--max-consecutive-failures", dest="max_consecutive_failures",
+                        type=int, default=3)
+    parser.add_argument("--skip-input-screen", dest="skip_input_screen",
+                        action="store_true", default=False)
+    return parser
+
+
+def validate_cli_geometry(args):
+    """Return None when the geometry/tiling flags are usable, else the error
+    message string the caller should print before exiting 2."""
+    try:
+        SKILL.validate_geometry(args.width, args.height, args.frames)
+    except ValueError as e:
+        return str(e)
+    if args.tile_frames < 1:
+        return "tile_frames must be >= 1, got %d" % args.tile_frames
+    if args.tile_spatial < 1:
+        return "tile_spatial must be >= 1, got %d" % args.tile_spatial
+    return None
+
+
+def story_dir_for(story_id):
+    return os.path.join(WS, "generated", "stories", story_id)
+
+
+def new_run_id():
+    """Same shape as bin/ltx-story-video:865-872 so bin/ltx-movie's
+    runs/*/story_summary.json glob keeps finding these runs."""
+    return "%s-%s" % (
+        datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        uuid.uuid4().hex[:8],
+    )
