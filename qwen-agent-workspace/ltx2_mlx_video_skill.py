@@ -254,7 +254,13 @@ def _run_subprocess(cmd, log_path, timeout_s, output_path):
     because ltx-2-mlx spawns an ffmpeg child that would otherwise survive.
     A failed spawn, or any other exception while the child is running, also
     kills and reaps the whole process group so nothing is left orphaned."""
-    logf = open(log_path, "a") if log_path else None
+    try:
+        logf = open(log_path, "a") if log_path else None
+    except OSError as e:
+        raise Ltx2MlxError(
+            _format_error("cannot open log_path %s: %s" % (log_path, e), None,
+                          output_path, ""),
+            returncode=None, cmd=cmd, stderr_tail="", output_path=output_path)
     try:
         popen = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,

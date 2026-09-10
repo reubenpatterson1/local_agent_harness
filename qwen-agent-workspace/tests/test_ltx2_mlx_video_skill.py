@@ -694,6 +694,7 @@ def test_cli_full_flag_wiring():
     """M11: every non-default CLI flag must reach generate_video / build_command
     unchanged. Mutating width<->height, hardcoding low_ram=True, or hardcoding
     seed=0 in main() must fail this test (task 6 fix round 1, finding 2)."""
+    PROMPT_SENTINEL = "distinctive-prompt-sentinel-xyz"
     saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -704,7 +705,7 @@ def test_cli_full_flag_wiring():
             out = os.path.join(td, "wired.mp4")
             cli_log = os.path.join(td, "wired.log")
             rc = skill.main([
-                "p", out, "--image", img,
+                PROMPT_SENTINEL, out, "--image", img,
                 "--width", "1024", "--height", "576", "--frames", "121",
                 "--frame-rate", "30", "--seed", "99", "--no-low-ram",
                 "--tile-frames", "3", "--tile-spatial", "2", "--quiet",
@@ -740,6 +741,10 @@ def test_cli_full_flag_wiring():
             check("M11z2 --log path was created and is non-empty (--log reached generate_video)",
                   os.path.isfile(cli_log) and os.path.getsize(cli_log) > 0,
                   "cli_log=%r exists=%r" % (cli_log, os.path.exists(cli_log)))
+
+            pi = argv.index("--prompt") if "--prompt" in argv else -1
+            check("M11z7 --prompt reached the child argv",
+                  pi >= 0 and argv[pi + 1] == PROMPT_SENTINEL, "got %r" % argv)
     finally:
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
         os.environ.pop("STUB_MODE", None)
@@ -778,23 +783,44 @@ def test_cli_timeout_flag_wiring():
     """M11: --timeout must actually reach generate_video's timeout_s
     parameter -- hardcoding timeout_s=None (or ignoring the flag) in main()
     would hang forever against the sleep-mode stub instead of returning 1
-    (task 6 fix round 2, finding C)."""
+    (task 6 fix round 2, finding C). A SIGALRM watchdog bounds this test at
+    10s so an ignored --timeout is caught as a failure, not a 120s hang
+    (task 6 fix round 3, finding: the round-2 version only checked rc == 1,
+    which the sleep-mode stub satisfies whether or not the watchdog fired)."""
     saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    saved_handler = signal.getsignal(signal.SIGALRM)
     try:
         with tempfile.TemporaryDirectory() as td:
             _install_stub(td, mode="sleep")
             img = os.path.join(td, "in.png")
             with open(img, "wb") as f:
                 f.write(b"png")
-            pidfile = os.path.join(td, "stub.pid")
-            os.environ["STUB_PIDFILE"] = pidfile
+            os.environ["STUB_PIDFILE"] = os.path.join(td, "stub.pid")
             out = os.path.join(td, "timeout.mp4")
 
-            rc = skill.main(["p", out, "--image", img, "--timeout", "1"])
-            check("M11z5 --timeout reached generate_video: main() returns 1 "
-                  "(Ltx2MlxError, timed out) instead of hanging",
-                  rc == 1, "got %r" % rc)
+            class _TestWatchdog(Exception):
+                pass
+
+            def _fire(signum, frame):
+                raise _TestWatchdog()
+
+            signal.signal(signal.SIGALRM, _fire)
+            signal.alarm(10)
+            t0 = time.time()
+            try:
+                rc = skill.main(["p", out, "--image", img, "--timeout", "1"])
+            except _TestWatchdog:
+                rc = "TEST-WATCHDOG-FIRED"
+            finally:
+                signal.alarm(0)
+            elapsed = time.time() - t0
+            check("M11z5 --timeout reached generate_video: main() returns 1", rc == 1,
+                  "got %r after %.1fs" % (rc, elapsed))
+            check("M11z6 the 1s watchdog fired, not the stub finishing on its own",
+                  elapsed < 10, "elapsed=%.1fs" % elapsed)
     finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, saved_handler)
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
         os.environ.pop("STUB_PIDFILE", None)
         os.environ.pop("STUB_MODE", None)
