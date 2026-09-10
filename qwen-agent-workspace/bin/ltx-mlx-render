@@ -133,3 +133,48 @@ def new_run_id():
         datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
         uuid.uuid4().hex[:8],
     )
+
+
+def load_manifest(path):
+    """Load and schema-validate a manifest.json for the MLX path.
+
+    Modelled on bin/ltx-story-video::load_manifest (:166-222) with the
+    num_frames checks REMOVED: per-panel num_frames is ignored here because
+    --frames is authoritative for every panel. In practice they agree,
+    because bin/ltx-movie passes --min-frames <frames> --max-frames <frames>
+    to bin/ltx-story-manifest, which makes _allocate_frames a no-op.
+
+    A panel whose image_path is None or absent renders text-to-video. An
+    EMPTY STRING is not "absent" and is rejected."""
+    with open(path) as f:
+        data = json.load(f)
+
+    panels = data.get("panels") or []
+    if not panels:
+        raise ValueError("manifest has no panels")
+
+    expected_index = 1
+    for panel in panels:
+        index = panel.get("index")
+        if index != expected_index:
+            raise ValueError(
+                "panels must be indexed contiguously from 1 with no gaps; "
+                "expected index %d, got %r" % (expected_index, index))
+        expected_index += 1
+
+        if "image_path" not in panel or panel.get("image_path") is None:
+            panel["image_path"] = None
+        else:
+            image_path = panel["image_path"]
+            if (not image_path or not os.path.isfile(image_path)
+                    or not os.access(image_path, os.R_OK)):
+                raise ValueError(
+                    "panel %d: image_path does not exist or is not readable: %r"
+                    % (index, image_path))
+
+        panel_text = panel.get("panel_text")
+        if not isinstance(panel_text, str) or not panel_text.strip():
+            raise ValueError("panel %d: panel_text is required and must be a "
+                             "non-empty string" % index)
+
+    return data

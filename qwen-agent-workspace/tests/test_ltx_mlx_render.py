@@ -120,11 +120,84 @@ def test_render_script_has_no_heavy_imports():
           "found %r" % hits)
 
 
+# ---------------------------------------------------------------------------
+# R3: manifest validation
+# ---------------------------------------------------------------------------
+
+def _write_manifest(td, panels, story_id="demo", schema_version=2):
+    path = os.path.join(td, "manifest.json")
+    with open(path, "w") as f:
+        json.dump({"schema_version": schema_version, "story_id": story_id,
+                   "fps": 24, "panels": panels}, f)
+    return path
+
+
+def _panel(i, image_path, text="panel text %d", motion=None, num_frames=241):
+    return {"index": i, "image_path": image_path, "panel_text": text % i,
+            "motion_prompt": motion, "num_frames": num_frames}
+
+
+def _load_error(path):
+    try:
+        render.load_manifest(path)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        return str(e)
+    return None
+
+
+def test_load_manifest():
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+
+        ok = _write_manifest(td, [_panel(1, img), _panel(2, None)])
+        data = render.load_manifest(ok)
+        check("R3a valid manifest loads", len(data["panels"]) == 2)
+        check("R3b null image_path is accepted as T2V", data["panels"][1]["image_path"] is None,
+              "got %r" % data["panels"][1]["image_path"])
+        check("R3c story_id preserved", data.get("story_id") == "demo")
+
+        empty = _write_manifest(td, [])
+        check("R3d empty panels rejected", "no panels" in (_load_error(empty) or ""),
+              "got %r" % _load_error(empty))
+
+        gap = _write_manifest(td, [_panel(1, img), _panel(3, img)])
+        msg = _load_error(gap)
+        check("R3e non-contiguous index rejected naming the expected index",
+              msg is not None and "expected index 2" in msg, "got %r" % msg)
+
+        blank = _write_manifest(td, [dict(_panel(1, img), panel_text="   ")])
+        msg = _load_error(blank)
+        check("R3f empty panel_text rejected naming the panel",
+              msg is not None and "panel 1" in msg and "panel_text" in msg, "got %r" % msg)
+
+        emptystr = _write_manifest(td, [dict(_panel(1, img), image_path="")])
+        msg = _load_error(emptystr)
+        check("R3g empty-string image_path rejected (not 'absent')",
+              msg is not None and "panel 1" in msg and "image_path" in msg, "got %r" % msg)
+
+        missing = _write_manifest(td, [dict(_panel(1, img),
+                                            image_path=os.path.join(td, "gone.png"))])
+        msg = _load_error(missing)
+        check("R3h unreadable image_path rejected naming the panel",
+              msg is not None and "panel 1" in msg and "image_path" in msg, "got %r" % msg)
+
+        offlattice = _write_manifest(td, [dict(_panel(1, img), num_frames=240)])
+        check("R3i manifest num_frames is NOT validated (--frames is authoritative)",
+              _load_error(offlattice) is None, "got %r" % _load_error(offlattice))
+
+        nokey = _write_manifest(td, [{"index": 1, "panel_text": "t"}])
+        check("R3j absent image_path key is accepted as T2V",
+              render.load_manifest(nokey)["panels"][0]["image_path"] is None)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
     test_run_id_and_story_dir()
     test_render_script_has_no_heavy_imports()
+    test_load_manifest()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
