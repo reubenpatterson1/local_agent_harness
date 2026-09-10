@@ -238,6 +238,48 @@ def test_build_units():
           "got %r" % sorted(units[0]))
 
 
+# ---------------------------------------------------------------------------
+# R5: --resume clip-reuse predicate
+# ---------------------------------------------------------------------------
+
+def test_clip_is_reusable():
+    saved = render.clip_frame_count
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            good = os.path.join(td, "good.mp4")
+            with open(good, "wb") as f:
+                f.write(b"\x00" * 512)
+            zero = os.path.join(td, "zero.mp4")
+            open(zero, "w").close()
+            gone = os.path.join(td, "gone.mp4")
+
+            render.clip_frame_count = lambda p: 241
+            check("R5a correct frame count -> reusable",
+                  render.clip_is_reusable(good, 241) is True)
+            check("R5b missing file -> not reusable",
+                  render.clip_is_reusable(gone, 241) is False)
+            check("R5c zero-byte file -> not reusable",
+                  render.clip_is_reusable(zero, 241) is False)
+
+            render.clip_frame_count = lambda p: 193
+            check("R5d wrong frame count -> not reusable",
+                  render.clip_is_reusable(good, 241) is False)
+
+            render.clip_frame_count = lambda p: None
+            check("R5e ffprobe failure (None) -> not reusable",
+                  render.clip_is_reusable(good, 241) is False)
+    finally:
+        render.clip_frame_count = saved
+
+
+def test_clip_frame_count_command_shape():
+    import inspect
+    src = inspect.getsource(render.clip_frame_count)
+    for token in ("ffprobe", "-select_streams", "v:0", "-count_packets",
+                  "stream=nb_read_packets", "-print_format", "json"):
+        check("R5f clip_frame_count uses %r" % token, token in src, "src=%r" % src)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -245,6 +287,8 @@ if __name__ == "__main__":
     test_render_script_has_no_heavy_imports()
     test_load_manifest()
     test_build_units()
+    test_clip_is_reusable()
+    test_clip_frame_count_command_shape()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

@@ -210,3 +210,28 @@ def build_units(panels, seed, clips_dir, run_root=None):
                          if run_root else None),
         })
     return units
+
+
+def clip_frame_count(clip_path):
+    """Number of video packets in clip_path, or None if ffprobe cannot say.
+    None is deliberately NOT distinguished from a wrong count: anything that
+    is not a confident match causes a regenerate."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-print_format", "json", clip_path],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(json.loads(proc.stdout)["streams"][0]["nb_read_packets"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+
+
+def clip_is_reusable(clip_path, expected_frames):
+    """A clip is reused under --resume only when it exists, is non-empty and
+    reports exactly expected_frames video packets. Missing, empty, wrong
+    count, unreadable and ffprobe-non-zero all mean regenerate."""
+    if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+        return False
+    return clip_frame_count(clip_path) == expected_frames
