@@ -250,9 +250,6 @@ import os, subprocess, sys, time
 argv = sys.argv[1:]
 with open(os.environ["STUB_LOG"], "a") as f:
     f.write(repr(argv) + "\\n")
-if os.environ.get("STUB_PIDFILE"):
-    with open(os.environ["STUB_PIDFILE"], "w") as f:
-        f.write(str(os.getpid()))
 out = argv[argv.index("--output") + 1] if "--output" in argv else None
 sys.stdout.write("stub stdout line 1\\n")
 sys.stdout.flush()
@@ -265,8 +262,11 @@ if mode == "fail":
 if mode == "sleep":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
     if os.environ.get("STUB_PIDFILE"):
-        with open(os.environ["STUB_PIDFILE"], "w") as f:
+        pidfile = os.environ["STUB_PIDFILE"]
+        tmp = pidfile + ".tmp"
+        with open(tmp, "w") as f:
             f.write(str(child.pid))
+        os.replace(tmp, pidfile)
     child.wait()
 if mode == "empty":
     open(out, "w").close()
@@ -490,6 +490,7 @@ def test_exception_during_render_kills_process_group():
             signal.signal(signal.SIGALRM, _raise_keyboard_interrupt)
             signal.alarm(1)  # fires after the grandchild should be up
             interrupted = False
+            t0 = time.time()
             try:
                 skill.generate_video("p", os.path.join(td, "orphan.mp4"), image_path=img,
                                      timeout_s=None)
@@ -497,9 +498,12 @@ def test_exception_during_render_kills_process_group():
                 interrupted = True
             finally:
                 signal.alarm(0)
+            elapsed = time.time() - t0
 
             check("M9a KeyboardInterrupt during render propagates out of generate_video",
                   interrupted)
+            check("M9d exception cleanup completes promptly (not by waiting out the grandchild)",
+                  elapsed < 10, "elapsed=%.1fs (grandchild likely survived and finished on its own)" % elapsed)
 
             grandchild_pid = None
             for _ in range(50):
