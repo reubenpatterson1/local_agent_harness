@@ -346,3 +346,53 @@ def build_concat_command(list_path, output_path):
     before its video -- a brief tail silence, not drift."""
     return ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
             "-c", "copy", "-movflags", "+faststart", output_path]
+
+
+def estimate_seconds_per_panel(story_dir, frames, width, height, low_ram,
+                               tile_frames, tile_spatial):
+    """Return (seconds_per_panel, label).
+
+    Precedence: the newest story_summary.json under <story_dir>/runs/ whose
+    frames_per_panel/width/height/low_ram/tile_frames/tile_spatial all match
+    this invocation AND that has at least one unit with status "ok" and
+    resumed false -- mean of those units' seconds. Resumed units carry
+    seconds 0.0 and would poison the mean, so they are excluded. Otherwise
+    the SECONDS_PER_PANEL_ESTIMATE constant."""
+    matches = glob.glob(os.path.join(story_dir, "runs", "*", "story_summary.json"))
+    for path in sorted(matches, key=os.path.getmtime, reverse=True):
+        try:
+            with open(path) as f:
+                summary = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if (summary.get("frames_per_panel") != frames
+                or summary.get("width") != width
+                or summary.get("height") != height
+                or summary.get("low_ram") != low_ram
+                or summary.get("tile_frames") != tile_frames
+                or summary.get("tile_spatial") != tile_spatial):
+            continue
+        seconds = [u.get("seconds") for u in summary.get("units", [])
+                   if u.get("status") == "ok" and u.get("resumed") is False
+                   and isinstance(u.get("seconds"), (int, float))]
+        if not seconds:
+            continue
+        run_id = os.path.basename(os.path.dirname(path))
+        return (sum(seconds) / len(seconds),
+                "measured (%s, %d panels)" % (run_id, len(seconds)))
+    return (float(SECONDS_PER_PANEL_ESTIMATE),
+            "default estimate (unmeasured for this configuration)")
+
+
+def format_estimate_lines(seconds_per_panel, label, to_render, total):
+    """The estimate block printed at the bottom of --dry-run. Because
+    bin/ltx-movie Phase 3 shells this with --dry-run and streams the output,
+    this lands directly above the review prompt with no stdout parsing
+    anywhere."""
+    lines = ["estimated render time: %d panels x %.1f min = %.1f h  [source: %s]"
+             % (to_render, seconds_per_panel / 60.0,
+                to_render * seconds_per_panel / 3600.0, label)]
+    if to_render != total:
+        lines.append("  (%d of %d panels already rendered and will be skipped)"
+                     % (total - to_render, total))
+    return lines

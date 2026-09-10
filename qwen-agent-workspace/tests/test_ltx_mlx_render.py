@@ -536,6 +536,87 @@ def test_probe_timeout_kwarg_present():
     check("R9o clip_frame_count passes timeout=60", "timeout=60" in src)
 
 
+# ---------------------------------------------------------------------------
+# R8: wall-clock estimate
+# ---------------------------------------------------------------------------
+
+def _write_summary(story_dir, run_id, units, **over):
+    run_root = os.path.join(story_dir, "runs", run_id)
+    os.makedirs(run_root, exist_ok=True)
+    summary = {"schema_version": 3, "frames_per_panel": 241, "width": 704,
+               "height": 480, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
+               "units": units}
+    summary.update(over)
+    with open(os.path.join(run_root, "story_summary.json"), "w") as f:
+        json.dump(summary, f)
+    return run_root
+
+
+def test_estimate_default_source():
+    with tempfile.TemporaryDirectory() as td:
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        check("R8a no summaries -> default constant",
+              secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
+        check("R8b default label",
+              label == "default estimate (unmeasured for this configuration)",
+              "got %r" % label)
+
+
+def test_estimate_measured_source():
+    with tempfile.TemporaryDirectory() as td:
+        units = [{"unit": "panel-%d" % i, "status": "ok", "resumed": False,
+                  "seconds": s} for i, s in enumerate([1200.0, 1500.0, 1800.0], start=1)]
+        _write_summary(td, "20260910T010101Z-aaaaaaaa", units)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        check("R8c measured mean of the three ok units", abs(secs - 1500.0) < 1e-9,
+              "got %r" % secs)
+        check("R8d measured label names the run id and panel count",
+              label == "measured (20260910T010101Z-aaaaaaaa, 3 panels)", "got %r" % label)
+
+
+def test_estimate_excludes_resumed_and_mismatched():
+    with tempfile.TemporaryDirectory() as td:
+        _write_summary(td, "20260910T020202Z-bbbbbbbb",
+                       [{"unit": "panel-1", "status": "ok", "resumed": False,
+                         "seconds": 900.0}],
+                       frames_per_panel=193)
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        check("R8e a config-mismatched summary is ignored",
+              secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
+
+        _write_summary(td, "20260910T030303Z-cccccccc",
+                       [{"unit": "panel-1", "status": "ok", "resumed": True,
+                         "seconds": 0.0},
+                        {"unit": "panel-2", "status": "ok", "resumed": False,
+                         "seconds": 2000.0},
+                        {"unit": "panel-3", "status": "error", "resumed": False,
+                         "seconds": 30.0}])
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1)
+        check("R8f resumed (seconds 0.0) and error units are excluded from the mean",
+              abs(secs - 2000.0) < 1e-9, "got %r" % secs)
+        check("R8g label counts only the units used", "1 panels" in label, "got %r" % label)
+
+
+def test_format_estimate_lines():
+    lines = render.format_estimate_lines(2400.0, "default estimate (unmeasured for "
+                                         "this configuration)", 3, 3)
+    check("R8h single line when nothing is skipped", len(lines) == 1, "got %r" % lines)
+    check("R8i exact estimate line format",
+          lines[0] == "estimated render time: 3 panels x 40.0 min = 2.0 h  "
+                      "[source: default estimate (unmeasured for this configuration)]",
+          "got %r" % lines[0])
+
+    lines = render.format_estimate_lines(2400.0, "measured (r1, 2 panels)", 1, 3)
+    check("R8j second line appears when panels are skipped", len(lines) == 2,
+          "got %r" % lines)
+    check("R8k exact skipped line format",
+          lines[1] == "  (2 of 3 panels already rendered and will be skipped)",
+          "got %r" % lines[1])
+    check("R8l estimate line uses the render count, not the total",
+          lines[0].startswith("estimated render time: 1 panels x 40.0 min = 0.7 h"),
+          "got %r" % lines[0])
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -553,6 +634,10 @@ if __name__ == "__main__":
     test_real_ffmpeg_concat()
     test_real_clip_frame_count_smoke()
     test_probe_timeout_kwarg_present()
+    test_estimate_default_source()
+    test_estimate_measured_source()
+    test_estimate_excludes_resumed_and_mismatched()
+    test_format_estimate_lines()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
