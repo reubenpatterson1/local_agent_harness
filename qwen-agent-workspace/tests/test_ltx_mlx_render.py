@@ -882,6 +882,64 @@ def test_input_content_screen_empty_list_is_cheap():
           rc == 0, "got %r" % rc)
 
 
+def test_input_content_screen_behavioral():
+    """Actually runs run_input_content_screen's child subprocess against a
+    real stub content_safety.py, rather than just grepping source text."""
+    saved_ws = render.WS
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            stub_src = (
+                "class ContentSafetyError(Exception):\n"
+                "    pass\n"
+                "def assert_image_safe(img, skill=None, prompt=None):\n"
+                "    if 'blocked' in prompt:\n"
+                "        raise ContentSafetyError('blocked marker found')\n"
+            )
+            with open(os.path.join(td, "content_safety.py"), "w") as f:
+                f.write(stub_src)
+
+            # PIL is a real dependency the child script imports; stub it too
+            # so this test has no dependency on torch/transformers being
+            # installed for real image safety classification.
+            pil_dir = os.path.join(td, "PIL")
+            os.makedirs(pil_dir, exist_ok=True)
+            with open(os.path.join(pil_dir, "__init__.py"), "w") as f:
+                # open() checks the path exists (like real PIL does) so the
+                # missing-path case below actually fails closed.
+                f.write("import builtins\n"
+                       "class Image:\n"
+                       "    @staticmethod\n"
+                       "    def open(p):\n"
+                       "        builtins.open(p, 'rb').close()\n"
+                       "        class _Img:\n"
+                       "            def convert(self, mode):\n"
+                       "                return self\n"
+                       "        return _Img()\n")
+
+            render.WS = td
+
+            clean_paths = [os.path.join(td, "ok1.png"), os.path.join(td, "ok2.png")]
+            for p in clean_paths:
+                open(p, "wb").close()
+            rc = render.run_input_content_screen(clean_paths)
+            check("R11h all-clean images screen through with rc 0", rc == 0, "got %r" % rc)
+
+            blocked_path = os.path.join(td, "blocked.png")
+            open(blocked_path, "wb").close()
+            never_reached = os.path.join(td, "never_reached.png")
+            open(never_reached, "wb").close()
+            rc2 = render.run_input_content_screen([clean_paths[0], blocked_path, never_reached])
+            check("R11i a blocked image in the middle of the list stops the run with rc 3",
+                  rc2 == 3, "got %r" % rc2)
+
+            missing_path = os.path.join(td, "does_not_exist.png")
+            rc3 = render.run_input_content_screen([missing_path])
+            check("R11j a nonexistent image path fails closed (nonzero rc)",
+                  rc3 != 0, "got %r" % rc3)
+    finally:
+        render.WS = saved_ws
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -914,6 +972,7 @@ if __name__ == "__main__":
     test_dry_run_resume_lines()
     test_input_content_screen_shape()
     test_input_content_screen_empty_list_is_cheap()
+    test_input_content_screen_behavioral()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
