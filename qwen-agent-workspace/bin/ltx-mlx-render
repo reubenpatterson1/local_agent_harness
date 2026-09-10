@@ -247,9 +247,13 @@ _REMEDY = ("re-render that panel with --force (or delete the clip and rerun "
 def probe_streams(clip_path):
     """ffprobe -show_streams as a parsed dict. Raises ConcatPreflightError if
     ffprobe cannot read the clip."""
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", clip_path],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", clip_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ConcatPreflightError("clip %s: could not run ffprobe (%s); %s"
+                                   % (clip_path, e, _REMEDY))
     if proc.returncode != 0:
         raise ConcatPreflightError(
             "clip %s: ffprobe failed (rc=%d): %s; %s"
@@ -323,8 +327,13 @@ def build_concat_list(clip_paths):
     """The concat demuxer's list file. Absolute paths, panel-index order, a
     literal single quote escaped as '\\'' per ffmpeg's quoting rules."""
     out = []
-    for path in clip_paths:
-        out.append("file '%s'\n" % os.path.abspath(path).replace("'", "'\\''"))
+    for clip_path in clip_paths:
+        path = os.path.abspath(clip_path)
+        if "\n" in path or "\r" in path:
+            raise ConcatPreflightError(
+                "clip path %r contains a newline; the concat demuxer's list "
+                "format cannot represent it -- use a --clips-dir without one" % path)
+        out.append("file '%s'\n" % path.replace("'", "'\\''"))
     return "".join(out)
 
 

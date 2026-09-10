@@ -302,6 +302,25 @@ def test_clip_frame_count_survives_missing_ffprobe():
         render.subprocess.run = saved
 
 
+def test_probe_streams_survives_missing_ffprobe():
+    saved = render.subprocess.run
+    try:
+        def _boom(*a, **k):
+            raise FileNotFoundError(2, "No such file or directory", "ffprobe")
+        render.subprocess.run = _boom
+        try:
+            render.probe_streams("/x.mp4")
+            raised = None
+        except render.ConcatPreflightError as e:
+            raised = e
+        except Exception as e:
+            raised = e
+        check("R5j ffprobe not installed -> ConcatPreflightError (not raw OSError)",
+              isinstance(raised, render.ConcatPreflightError), "got %r" % raised)
+    finally:
+        render.subprocess.run = saved
+
+
 # ---------------------------------------------------------------------------
 # R6: concat list quoting and concat argv
 # ---------------------------------------------------------------------------
@@ -314,6 +333,14 @@ def test_build_concat_list():
     quoted = render.build_concat_list(["/abs/o'brien/panel_01.mp4"])
     check("R6b a single quote is escaped as '\\'' per the concat demuxer rules",
           quoted == "file '/abs/o'\\''brien/panel_01.mp4'\n", "got %r" % quoted)
+
+    try:
+        render.build_concat_list(["/abs/clips/panel_0\n1.mp4"])
+        raised = None
+    except render.ConcatPreflightError as e:
+        raised = e
+    check("R6e a newline in a clip path raises ConcatPreflightError",
+          isinstance(raised, render.ConcatPreflightError), "got %r" % raised)
 
 
 def test_build_concat_command():
@@ -361,6 +388,11 @@ def test_assert_clips_uniform():
     check("R7b differing width raises naming clip and field",
           msg is not None and "panel_02.mp4" in msg and "width" in msg, "got %r" % msg)
 
+    bad_h = [("/c/panel_01.mp4", _probe()), ("/c/panel_02.mp4", _probe(height=360))]
+    msg = _uniform_error(bad_h)
+    check("R7l differing height raises naming clip and field",
+          msg is not None and "panel_02.mp4" in msg and "height" in msg, "got %r" % msg)
+
     bad_fr = [("/c/panel_01.mp4", _probe(rfr="30/1"))]
     msg = _uniform_error(bad_fr)
     check("R7c differing r_frame_rate raises naming clip and field",
@@ -381,7 +413,7 @@ def test_assert_clips_uniform():
 
     bad_codec = [("/c/panel_01.mp4", _probe(vcodec="hevc"))]
     msg = _uniform_error(bad_codec)
-    check("R7f wrong video codec raises", msg is not None and "codec_name" in msg,
+    check("R7f wrong video codec raises", msg is not None and "video codec_name" in msg,
           "got %r" % msg)
 
     bad_pix = [("/c/panel_01.mp4", _probe(pix="yuv444p"))]
@@ -418,6 +450,7 @@ if __name__ == "__main__":
     test_clip_is_reusable()
     test_clip_frame_count_argv()
     test_clip_frame_count_survives_missing_ffprobe()
+    test_probe_streams_survives_missing_ffprobe()
     test_build_concat_list()
     test_build_concat_command()
     test_assert_clips_uniform()
