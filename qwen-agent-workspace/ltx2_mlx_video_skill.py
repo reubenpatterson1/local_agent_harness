@@ -137,7 +137,8 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
 
 
 def _validate_generate_args(prompt, output_path, image_path, width, height,
-                            num_frames, tile_frames, tile_spatial, force):
+                            num_frames, tile_frames, tile_spatial, force,
+                            log_path=None, timeout_s=None):
     """Every ValueError this module can raise is raised here, before any
     subprocess is spawned. Order matches the design doc section 5.3 list."""
     if not isinstance(prompt, str) or not prompt.strip():
@@ -154,6 +155,14 @@ def _validate_generate_args(prompt, output_path, image_path, width, height,
     out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
         raise ValueError("output directory does not exist or is not writable: %s" % out_dir)
+
+    if log_path is not None:
+        log_dir = os.path.dirname(os.path.abspath(log_path)) or "."
+        if not os.path.isdir(log_dir) or not os.access(log_dir, os.W_OK):
+            raise ValueError("log_path directory does not exist or is not writable: %s" % log_dir)
+
+    if timeout_s is not None and timeout_s <= 0:
+        raise ValueError("timeout_s must be positive, got %r" % (timeout_s,))
 
     if os.path.exists(output_path) and not force:
         raise ValueError("output already exists: %s (pass force=True to overwrite)"
@@ -185,7 +194,8 @@ def generate_video(prompt, output_path, image_path=None, *,
     Ltx2MlxError for a missing binary, a non-zero exit, a timeout, or the
     jetsam signature (exit 0 with no usable output file)."""
     _validate_generate_args(prompt, output_path, image_path, width, height,
-                            num_frames, tile_frames, tile_spatial, force)
+                            num_frames, tile_frames, tile_spatial, force,
+                            log_path=log_path, timeout_s=timeout_s)
     resolved_bin = _resolve_bin()
     if not os.path.isfile(resolved_bin) or not os.access(resolved_bin, os.X_OK):
         raise Ltx2MlxError(

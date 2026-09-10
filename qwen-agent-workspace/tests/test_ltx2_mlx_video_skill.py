@@ -5,6 +5,7 @@ No GPU, no model weights, no network: every subprocess outcome is driven by
 a stub CLI installed through the LTX2_MLX_BIN / LTX2_MLX_DIR seam.
 """
 
+import ast
 import os
 import signal
 import sys
@@ -329,6 +330,9 @@ def test_generate_video_value_errors():
                 ("M5k tile_frames < 1", "tile_frames", base(tile_frames=0)),
                 ("M5l tile_spatial < 1", "tile_spatial", base(tile_spatial=0)),
                 ("M5o non-str output_path", "output_path", base(output_path=None)),
+                ("M5q log_path directory missing", "log_path",
+                 base(log_path=os.path.join(td, "nope", "x.log"))),
+                ("M5r timeout_s not positive", "timeout_s", base(timeout_s=-5)),
             ]
             for name, needle, kw in cases:
                 msg = _raises_value_error(skill.generate_video, **kw)
@@ -626,29 +630,29 @@ def test_env_override_seam():
 
 
 # ---------------------------------------------------------------------------
-# M9: the skill CLI
+# M11: the skill CLI
 # ---------------------------------------------------------------------------
 
 def test_cli_parser_defaults():
     a = skill.build_cli_parser().parse_args(["a prompt", "/tmp/o.mp4"])
-    check("M9a image default None", a.image is None, "got %r" % a.image)
-    check("M9b width 704", a.width == 704, "got %r" % a.width)
-    check("M9c height 480", a.height == 480, "got %r" % a.height)
-    check("M9d frames 241", a.frames == 241, "got %r" % a.frames)
-    check("M9e frame_rate 24", a.frame_rate == 24, "got %r" % a.frame_rate)
-    check("M9f seed 0", a.seed == 0, "got %r" % a.seed)
-    check("M9g model MODEL_ID", a.model == skill.MODEL_ID, "got %r" % a.model)
-    check("M9h no_low_ram False", a.no_low_ram is False, "got %r" % a.no_low_ram)
-    check("M9i tile_frames 1", a.tile_frames == 1, "got %r" % a.tile_frames)
-    check("M9j tile_spatial 1", a.tile_spatial == 1, "got %r" % a.tile_spatial)
-    check("M9k log None", a.log is None, "got %r" % a.log)
-    check("M9l timeout None", a.timeout is None, "got %r" % a.timeout)
-    check("M9m quiet False", a.quiet is False, "got %r" % a.quiet)
-    check("M9n force False", a.force is False, "got %r" % a.force)
-    check("M9o prompt/output positionals",
+    check("M11a image default None", a.image is None, "got %r" % a.image)
+    check("M11b width 704", a.width == 704, "got %r" % a.width)
+    check("M11c height 480", a.height == 480, "got %r" % a.height)
+    check("M11d frames 241", a.frames == 241, "got %r" % a.frames)
+    check("M11e frame_rate 24", a.frame_rate == 24, "got %r" % a.frame_rate)
+    check("M11f seed 0", a.seed == 0, "got %r" % a.seed)
+    check("M11g model MODEL_ID", a.model == skill.MODEL_ID, "got %r" % a.model)
+    check("M11h no_low_ram False", a.no_low_ram is False, "got %r" % a.no_low_ram)
+    check("M11i tile_frames 1", a.tile_frames == 1, "got %r" % a.tile_frames)
+    check("M11j tile_spatial 1", a.tile_spatial == 1, "got %r" % a.tile_spatial)
+    check("M11k log None", a.log is None, "got %r" % a.log)
+    check("M11l timeout None", a.timeout is None, "got %r" % a.timeout)
+    check("M11m quiet False", a.quiet is False, "got %r" % a.quiet)
+    check("M11n force False", a.force is False, "got %r" % a.force)
+    check("M11o prompt/output positionals",
           a.prompt == "a prompt" and a.output == "/tmp/o.mp4",
           "got %r %r" % (a.prompt, a.output))
-    check("M9p there is no --t2v flag",
+    check("M11p there is no --t2v flag",
           not any("--t2v" in a.option_strings for a in skill.build_cli_parser()._actions),
           "found in: %r" % [a.option_strings for a in skill.build_cli_parser()._actions
                             if "--t2v" in a.option_strings])
@@ -664,15 +668,57 @@ def test_cli_exit_codes():
                 f.write(b"png")
             rc = skill.main(["p", os.path.join(td, "cli.mp4"), "--image", img,
                              "--timeout", "60"])
-            check("M9q success exits 0", rc == 0, "got %r" % rc)
+            check("M11q success exits 0", rc == 0, "got %r" % rc)
 
             rc = skill.main(["p", os.path.join(td, "cli.mov"), "--image", img])
-            check("M9r ValueError exits 2", rc == 2, "got %r" % rc)
+            check("M11r ValueError exits 2", rc == 2, "got %r" % rc)
 
             os.environ["STUB_MODE"] = "fail"
             rc = skill.main(["p", os.path.join(td, "cli2.mp4"), "--image", img,
                              "--timeout", "60"])
-            check("M9s Ltx2MlxError exits 1", rc == 1, "got %r" % rc)
+            check("M11s Ltx2MlxError exits 1", rc == 1, "got %r" % rc)
+    finally:
+        skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
+        os.environ.pop("STUB_MODE", None)
+        os.environ.pop("STUB_LOG", None)
+
+
+def test_cli_full_flag_wiring():
+    """M11: every non-default CLI flag must reach generate_video / build_command
+    unchanged. Mutating width<->height, hardcoding low_ram=True, or hardcoding
+    seed=0 in main() must fail this test (task 6 fix round 1, finding 2)."""
+    saved_bin, saved_dir = skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            _stub, log = _install_stub(td, mode="ok")
+            img = os.path.join(td, "in.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            out = os.path.join(td, "wired.mp4")
+            rc = skill.main([
+                "p", out, "--image", img,
+                "--width", "1024", "--height", "576", "--frames", "121",
+                "--frame-rate", "30", "--seed", "99", "--no-low-ram",
+                "--tile-frames", "3", "--tile-spatial", "2", "--quiet",
+                "--timeout", "60",
+            ])
+            check("M11t full-flag CLI invocation exits 0", rc == 0, "got %r" % rc)
+            with open(log) as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            check("M11u exactly one invocation was logged", len(lines) == 1,
+                  "got %d" % len(lines))
+            argv = ast.literal_eval(lines[-1])
+            argv_str = " ".join(argv)
+            check("M11v width/height/frames/frame-rate/seed all reached the child argv",
+                  "-W 1024" in argv_str and "-H 576" in argv_str and "-f 121" in argv_str
+                  and "--frame-rate 30" in argv_str and "--seed 99" in argv_str,
+                  "got %r" % argv)
+            check("M11w --no-low-ram honoured (no --low-ram in argv)",
+                  "--low-ram" not in argv, "got %r" % argv)
+            check("M11x --tile-frames 3 and --tile-spatial 2 reached the child argv",
+                  "--tile-frames 3" in argv_str and "--tile-spatial 2" in argv_str,
+                  "got %r" % argv)
+            check("M11y --quiet reached the child argv", "--quiet" in argv, "got %r" % argv)
     finally:
         skill.LTX2_MLX_BIN, skill.LTX2_MLX_DIR = saved_bin, saved_dir
         os.environ.pop("STUB_MODE", None)
@@ -696,6 +742,7 @@ if __name__ == "__main__":
     test_env_override_seam()
     test_cli_parser_defaults()
     test_cli_exit_codes()
+    test_cli_full_flag_wiring()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
