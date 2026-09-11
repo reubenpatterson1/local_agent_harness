@@ -44,9 +44,10 @@ sys.path.insert(0, WS)
 
 import ltx2_mlx_video_skill as SKILL  # noqa: E402
 
-# Provisional until acceptance test A1 measures it on this host; A1 replaces
-# this with the measured per-panel wall-clock rounded to the nearest 60 s.
-SECONDS_PER_PANEL_ESTIMATE = 2400   # 40 min
+# Measured by acceptance test A1 on this 48 GiB host, 2026-09-11:
+# 704x448, 241 frames, --distilled --low-ram, tile_frames=1, tile_spatial=1
+# -> 160.18 s per panel, rounded to the nearest 60 s.
+SECONDS_PER_PANEL_ESTIMATE = 180   # 3 min
 
 JETSAM_LADDER = """\
 This is the signature of a jetsam kill: ltx-2-mlx exited 0 but wrote no

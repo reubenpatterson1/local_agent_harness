@@ -72,6 +72,14 @@ def test_parser_defaults():
     check("R1v there is no --fps flag", "--fps" not in render.build_parser().format_help())
     check("R1w SECONDS_PER_PANEL_ESTIMATE is an int", isinstance(
         render.SECONDS_PER_PANEL_ESTIMATE, int), "got %r" % render.SECONDS_PER_PANEL_ESTIMATE)
+    with open(_RENDER_PATH) as f:
+        _src = f.read()
+    check("R1ad SECONDS_PER_PANEL_ESTIMATE is a multiple of 60",
+          render.SECONDS_PER_PANEL_ESTIMATE % 60 == 0,
+          "got %r" % render.SECONDS_PER_PANEL_ESTIMATE)
+    check("R1ae the constant records its A1 provenance",
+          "Measured by acceptance test A1" in _src,
+          "the estimate must be replaced by the A1 measurement before this ships")
 
 
 def test_geometry_validation():
