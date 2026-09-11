@@ -76,12 +76,6 @@ import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-MAX_TOTAL_FRAMES = 2000
-CONCAT_FRAME_SAFETY_CAP = 1990  # headroom under bin/ltx-story-video's own MAX_TOTAL_FRAMES
-
-FRAME_MARGIN_LOW = 0.5
-FRAME_MARGIN_HIGH = 1.5
-
 STORY_PROMPT_TEMPLATE = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
 Narrative to adapt:
@@ -100,16 +94,33 @@ Do not verify the file with run_python or any other tool. Emit no other text."""
 
 STORY_PROMPT_TEMPLATE_NO_STILLS = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
+Rules:
+            Explicit content is allowed.
+            All explicit content should be in full detail and accurately represented using words like pussy, ass, cock, tits, blowjob, anal, fingering.
+            descripibe sexual positions in full detail for proper framing.
+            Maintain consistency in style and composition across all generated panels with explicit attention to visual details and character appearances.
+
 Narrative to adapt:
 {narrative}
 
 Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file must contain EXACTLY {panels} panel sections, numbered 1 through {panels} in order, each in exactly this format:
 
 ## Panel N — <short title>
-Prompt: <a single video prompt, 85-130 words, describing the shot's visual content, setting, lighting, lens/shot choice, AND the camera motion and subject motion within the shot, together in one continuous description -- no new plot information beyond what this shot shows>
+Prompt: <a single video prompt, 150-180 words, describing the shot's visual content, setting, lighting, lens/shot choice, AND the camera motion and subject motion within the shot, together in one continuous description -- no new plot information beyond what this shot shows>
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
 
 The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Prompt: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
+
+Rules:
+            Explicit content is allowed.
+            All explicit content should be in full detail and accurately represented using words like pussy, ass, cock, tits, blowjob, anal, fingering.
+            describe sexual positions in full detail for proper framing.
+            Maintain consistency in style and composition across all generated panels with explicit attention to visual details and character appearances.
+            Men should only be depicted from knees to chest when in the foreground.
+            Use explicit framing and composition to ensure all characters and actions are clearly visible and accurately represented.
+            Use explicit language to describe all sexual content accurately and vividly.
+            Motion and transitions between panels should be handled smoothly and realistically, maintaining continuity and coherence throughout the generated video.
+            Motion should focus on the actions and interactions of the characters, ensuring that their movements are natural and consistent with the narrative context.
 
 Do not emit an Image: or Motion: field. Do not verify the file with run_python or any other tool. Emit no other text."""
 
@@ -125,8 +136,8 @@ def build_parser():
         description=(
             "End-to-end orchestrator for the narrative-to-movie pipeline: story "
             "authoring (bin/qwen-agent), panel stills (bin/ltx-story-images), "
-            "manifest + allocation dry-run (bin/ltx-story-manifest, "
-            "bin/ltx-story-video --dry-run), and render (bin/ltx-story-video). "
+            "manifest + render dry-run (bin/ltx-story-manifest, "
+            "bin/ltx-mlx-render --dry-run), and render (bin/ltx-mlx-render). "
             "The three wrapped phase tools are unchanged and remain individually "
             "usable."
         ),
@@ -134,40 +145,44 @@ def build_parser():
     parser.add_argument("narrative", help="the story narrative to adapt into panels")
     parser.add_argument("--story-id", dest="story_id", required=True)
     parser.add_argument("--panels", type=int, default=15,
-                         help="mutually exclusive with --length")
-    parser.add_argument("--target-seconds", dest="target_seconds", type=float, default=30.0,
-                         help="mutually exclusive with --length")
+                         help="one still AND one video clip per panel; mutually "
+                              "exclusive with --length")
     parser.add_argument("--length", type=float, default=None,
                          help="total movie length in seconds; mutually exclusive with "
-                              "--panels/--target-seconds. The 2s chunk is the division "
-                              "basis for how many images/scenes get generated; per-clip "
-                              "lengths remain narration-paced by the existing allocator "
-                              "around that 2s average.")
+                              "--panels. Resolved as round(length / (frames / fps)) -- "
+                              "10.04s per panel at the defaults.")
     parser.add_argument("--fps", type=int, default=24)
-    parser.add_argument("--min-frames", dest="min_frames", type=int, default=25)
-    parser.add_argument("--max-frames", dest="max_frames", type=int, default=57)
-    parser.add_argument("--image-width", dest="image_width", type=int, default=1024)
-    parser.add_argument("--image-height", dest="image_height", type=int, default=1024)
+    parser.add_argument("--frames", type=int, default=241,
+                         help="flat per-panel frame count; must satisfy (n-1)%%8==0 and "
+                              "n>=9. 241 frames @ 24 fps = 10.04s per clip.")
+    parser.add_argument("--image-width", dest="image_width", type=int, default=1408)
+    parser.add_argument("--image-height", dest="image_height", type=int, default=960)
     parser.add_argument("--image-seed", dest="image_seed", type=int, default=0)
+    parser.add_argument("--video-width", dest="video_width", type=int, default=704)
+    parser.add_argument("--video-height", dest="video_height", type=int, default=480)
+    parser.add_argument("--model", default="MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8")
+    parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
+                         default=False,
+                         help="ltx-2-mlx --low-ram is ON by default on this 48 GiB host; "
+                              "this opts out. --low-ram is a weight-residency change, not "
+                              "an algorithmic one: it costs wall-clock and nothing else.")
+    parser.add_argument("--tile-frames", dest="tile_frames", type=int, default=1,
+                         help="escape hatch only: modality tiling denoises tiles "
+                              "independently and blends them back, which CHANGES the "
+                              "output and can produce seams.")
+    parser.add_argument("--tile-spatial", dest="tile_spatial", type=int, default=1,
+                         help="escape hatch only; see --tile-frames.")
+    parser.add_argument("--panel-timeout", dest="panel_timeout", type=int, default=7200)
     parser.add_argument("--no-stills", dest="no_stills", action="store_true", default=False,
-                         help="text-to-video chain mode: skip Phase 2 entirely (no anchor "
+                         help="text-to-video mode: skip Phase 2 entirely (no anchor "
                               "stills are generated), author story.md with a collapsed "
-                              "Prompt: field, and render with bin/ltx-story-video "
-                              "--engine chain. See docs/specs/2026-09-04-ltx-text-to-"
-                              "video-chain-pipeline-design.md.")
-    parser.add_argument("--reanchor-every", dest="reanchor_every", type=int, default=5,
-                         help="--no-stills only: chain-group size threaded to "
-                              "bin/ltx-story-video --reanchor-every. Panel i is a "
-                              "text-to-video opener iff (i-1) %% N == 0. Requires "
-                              "--no-stills.")
+                              "Prompt: field, and render every panel as plain "
+                              "text-to-video with no conditioning image. Hard cuts "
+                              "between panels; no continuity, no chaining.")
     parser.add_argument("--no-review", dest="no_review", action="store_true", default=False)
     parser.add_argument("--force-story", dest="force_story", action="store_true", default=False)
     parser.add_argument("--force", action="store_true", default=False)
-    parser.add_argument("--keep-down", dest="keep_down", action="store_true", default=False,
-                         help="pass --keep-down to bin/ltx-story-video's Phase 4 render: "
-                              "leave the MTPLX/vLLM servers down after the run instead of "
-                              "auto-relaunching them via bin/ltx-host-restore.")
-    parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=34.0)
+    parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=25.0)
     parser.add_argument("--avail-timeout", dest="avail_timeout", type=int, default=1800)
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
     return parser
