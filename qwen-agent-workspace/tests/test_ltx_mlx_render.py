@@ -6,6 +6,7 @@ ffmpeg (R9) skips itself with a clear message when ffmpeg is absent.
 """
 
 import contextlib
+import glob
 import importlib.machinery
 import io
 import json
@@ -1519,6 +1520,40 @@ def test_run_root_collision_is_loud():
               isinstance(raised, FileExistsError), "raised=%r" % (raised,))
 
 
+# ---------------------------------------------------------------------------
+# R14: story_summary.json shape
+# ---------------------------------------------------------------------------
+
+def _newest_summary(story_id):
+    matches = glob.glob(os.path.join(render.story_dir_for(story_id), "runs", "*",
+                                     "story_summary.json"))
+    if not matches:
+        return None
+    with open(max(matches, key=os.path.getmtime)) as f:
+        return json.load(f)
+
+
+def test_summary_shape():
+    s = {"schema_version": 3, "backend": "ltx-2-mlx", "requested_units": 3,
+         "completed_units": 3, "frames_per_panel": 241,
+         "intended_total_frames": 723, "actual_total_frames": 723, "fps": 24,
+         "units": [{"unit": "panel-1", "attempts": 1}]}
+    check("R14a intended == requested * frames_per_panel",
+          s["intended_total_frames"] == s["requested_units"] * s["frames_per_panel"])
+    for key in ("completed_units", "requested_units", "intended_total_frames",
+                "actual_total_frames", "fps", "units"):
+        check("R14b _report_summary reads %r" % key, key in s)
+    check("R14c summary_keys() is the single source of truth for the schema",
+          set(render.SUMMARY_KEYS) >= {
+              "schema_version", "backend", "story_id", "manifest_path",
+              "manifest_schema_version", "model", "width", "height",
+              "frames_per_panel", "fps", "low_ram", "tile_frames", "tile_spatial",
+              "requested_units", "completed_units", "intended_total_frames",
+              "actual_total_frames", "units", "clips", "skipped_panels",
+              "concat_mode", "output_path", "on_panel_failure", "stopped_reason"},
+          "got %r" % sorted(render.SUMMARY_KEYS))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -1564,6 +1599,7 @@ if __name__ == "__main__":
     test_panel_loop_max_consecutive_failures_zero_disables()
     test_panel_loop_reuse_requires_resume_flag()
     test_run_root_collision_is_loud()
+    test_summary_shape()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

@@ -58,6 +58,15 @@ as RUN-TIME FLAGS (the --frames 241 default is deliberately not lowered):
   3. --frames 193   (8.04 s per panel)
   4. --frames 145   (6.04 s per panel)"""
 
+SUMMARY_KEYS = (
+    "schema_version", "backend", "story_id", "manifest_path",
+    "manifest_schema_version", "model", "width", "height", "frames_per_panel",
+    "fps", "low_ram", "tile_frames", "tile_spatial", "requested_units",
+    "completed_units", "intended_total_frames", "actual_total_frames", "units",
+    "clips", "skipped_panels", "concat_mode", "output_path", "on_panel_failure",
+    "stopped_reason",
+)
+
 
 class ConcatPreflightError(RuntimeError):
     """Raised when the rendered clips are not uniform enough to stream-copy
@@ -551,7 +560,104 @@ def render_panel(unit, args):
 
 def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
                completed, stopped_reason, run_root, story_id):
-    raise NotImplementedError("retry pass, concat and summary land in the next task")
+    """Retry pass -> concat -> story_summary.json -> exit code.
+
+    story_summary.json is written on EVERY terminal path once run_root
+    exists, so bin/ltx-movie::_report_summary always finds something to
+    read."""
+    # --- retry pass (opt-in). Never runs when the main loop already stopped.
+    failed = [u for u in units
+              if unit_results[u["index"]]["status"] not in ("ok", "not_attempted")]
+    if args.retry_failed and failed and stopped_reason is None:
+        print("=== retry pass: %d panel(s) ===" % len(failed))
+        print(", ".join(u["label"] for u in failed))
+        print("retrying in %.0fs..." % args.retry_idle)
+        time.sleep(args.retry_idle)
+        for unit in failed:
+            i = unit["index"]
+            prior_status = unit_results[i]["status"]
+            result = render_panel(unit, args)
+            result["attempts"] = 2
+            result["first_failure"] = prior_status
+            unit_results[i] = result
+            if result["status"] == "ok":
+                clips_by_index[i] = result["clip"]
+                completed += 1
+
+    ordered_clips = [clips_by_index[u["index"]] for u in units
+                     if u["index"] in clips_by_index]
+    skipped_panels = [u["index"] for u in units if u["index"] not in clips_by_index]
+
+    wrote_output = False
+    concat_failed = False
+    if ordered_clips:
+        list_path = os.path.join(run_root, "concat_list.txt")
+        try:
+            pairs = [(c, probe_streams(c)) for c in ordered_clips]
+            assert_clips_uniform(pairs, args.width, args.height, args.frame_rate)
+            with open(list_path, "w") as f:
+                f.write(build_concat_list(ordered_clips))
+            cmd = build_concat_command(list_path, args.output_path)
+            print("Running: %s" % shlex.join(cmd))
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT, text=True)
+            if proc.returncode != 0:
+                tail = "\n".join((proc.stdout or "").splitlines()[-40:])
+                raise ConcatPreflightError(
+                    "ffmpeg concat failed (rc=%d); clips and %s are preserved\n%s"
+                    % (proc.returncode, list_path, tail))
+            wrote_output = True
+            size_kb = os.path.getsize(args.output_path) // 1024
+            duration = len(ordered_clips) * args.frames / float(args.frame_rate)
+            print("MOVIE %d/%d panels, %d frames, %.2fs -> %s (%dKB)"
+                  % (completed, len(units), len(ordered_clips) * args.frames,
+                     duration, args.output_path, size_kb))
+        except ConcatPreflightError as e:
+            concat_failed = True
+            print("Error: %s" % e, file=sys.stderr)
+    else:
+        print("No panels completed; no output written.")
+
+    summary = {
+        "schema_version": 3,
+        "backend": "ltx-2-mlx",
+        "story_id": story_id,
+        "manifest_path": os.path.abspath(args.manifest_path),
+        "manifest_schema_version": manifest.get("schema_version", 1),
+        "model": args.model,
+        "width": args.width,
+        "height": args.height,
+        "frames_per_panel": args.frames,
+        "fps": args.frame_rate,
+        "low_ram": (not args.no_low_ram),
+        "tile_frames": args.tile_frames,
+        "tile_spatial": args.tile_spatial,
+        "requested_units": len(units),
+        "completed_units": completed,
+        "intended_total_frames": len(units) * args.frames,
+        "actual_total_frames": completed * args.frames,
+        "units": [unit_results[u["index"]] for u in units],
+        "clips": ordered_clips,
+        "skipped_panels": skipped_panels,
+        "concat_mode": "demux-copy",
+        "output_path": os.path.abspath(args.output_path) if wrote_output else None,
+        "on_panel_failure": args.on_panel_failure,
+        "stopped_reason": stopped_reason,
+    }
+    with open(os.path.join(run_root, "story_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    if concat_failed:
+        return 1
+    if completed == len(units) and wrote_output:
+        print("DONE: all %d panels completed -> %s" % (len(units), args.output_path))
+        return 0
+    print("STOPPED EARLY: %d/%d panels completed" % (completed, len(units)))
+    if stopped_reason == "consecutive_failures":
+        print("relaunch: %s %s %s"
+              % (sys.executable, os.path.abspath(__file__),
+                 " ".join(shlex.quote(a) for a in raw_argv)))
+    return 1
 
 
 def main(argv=None):
