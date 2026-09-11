@@ -44,7 +44,7 @@ phase tools:
      frame-allocation dry-run and asked to confirm before any GPU time is
      spent; --no-review skips these for unattended runs (which then
      requires a non-interactive stdin, checked up front).
-  3. Avail-memory gate -- phase 4 will not launch bin/ltx-story-video
+  3. Avail-memory gate -- phase 4 will not launch bin/ltx-mlx-render
      until psutil reports at least --min-avail-gib available memory. This
      encodes the 2026-08-27 lesson (docs/specs/2026-08-27-narrative-movie-
      pipeline-design.md Section 4): a batch launched at 30.4 GiB available
@@ -252,6 +252,8 @@ def _render_flags(args):
     if args.no_low_ram:
         flags.append("--no-low-ram")
     flags.append("--resume")
+    if args.force:
+        flags.append("--force")
     return flags
 
 
@@ -265,8 +267,6 @@ def _phase4_flags(args):
         "--retry-failed", "1",
         "--retry-idle", "120",
         "--max-consecutive-failures", "3"]
-    if args.force:
-        flags.append("--force")
     return flags
 
 
