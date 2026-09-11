@@ -562,9 +562,26 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
                completed, stopped_reason, run_root, story_id):
     """Retry pass -> concat -> story_summary.json -> exit code.
 
-    story_summary.json is written on EVERY terminal path once run_root
-    exists, so bin/ltx-movie::_report_summary always finds something to
-    read."""
+    story_summary.json is written on every path this function returns
+    from -- a failed concat and a run where zero panels completed both
+    still write it. The concat block therefore catches OSError as well
+    as ConcatPreflightError: a vanished ffmpeg or a full disk must
+    degrade to exit 1 with a summary on disk, not to a traceback with
+    none. Do not narrow that except clause back.
+
+    The consumer this protects is NOT bin/ltx-movie::_report_summary --
+    phase4_render returns the moment the render exits non-zero
+    (bin/ltx-movie:681-683) and never reaches the summary read on any
+    failure path. It is estimate_seconds_per_panel above, which globs
+    <story_dir>/runs/*/story_summary.json regardless of how each run
+    exited, so a partial or failed run still teaches the next --dry-run
+    its measured per-panel wall clock.
+
+    The invariant is scoped to this function. An exception escaping
+    render_panel -- in main's loop or in the retry pass below -- unwinds
+    past it before the write. render_panel maps only ValueError and
+    Ltx2MlxError, so an OSError, a MemoryError or a Ctrl-C leaves
+    run_root without a summary."""
     # --- retry pass (opt-in). Never runs when the main loop already stopped.
     failed = [u for u in units
               if unit_results[u["index"]]["status"] not in ("ok", "not_attempted")]
@@ -612,7 +629,7 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
             print("MOVIE %d/%d panels, %d frames, %.2fs -> %s (%dKB)"
                   % (completed, len(units), len(ordered_clips) * args.frames,
                      duration, args.output_path, size_kb))
-        except ConcatPreflightError as e:
+        except (ConcatPreflightError, OSError) as e:
             concat_failed = True
             print("Error: %s" % e, file=sys.stderr)
     else:

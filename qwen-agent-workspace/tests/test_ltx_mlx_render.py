@@ -1554,6 +1554,82 @@ def test_summary_shape():
           "got %r" % sorted(render.SUMMARY_KEYS))
 
 
+def test_finish_run_emits_exactly_summary_keys():
+    saved = (render.probe_streams, render.assert_clips_uniform,
+             render.build_concat_command)
+    render.probe_streams = lambda p: {"streams": []}
+    render.assert_clips_uniform = lambda *a: None
+    render.build_concat_command = lambda lp, out: [
+        sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'M')", out]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            run_root = os.path.join(td, "run"); os.makedirs(run_root)
+            args = render.build_parser().parse_args(
+                [os.path.join(td, "m.json"), os.path.join(td, "out.mp4")])
+            units = [{"index": 1, "label": "panel-1", "prompt": "p",
+                      "image_path": None, "clip_path": os.path.join(td, "c1.mp4"),
+                      "log_path": None, "seed": 1}]
+            ur = {1: {"unit": "panel-1", "status": "ok", "attempts": 1,
+                      "seconds": 1.0, "clip": "/a/1.mp4", "resumed": False}}
+            rc = render.finish_run(args, ["m", "o"], {"schema_version": 2}, units,
+                                   ur, {1: "/a/1.mp4"}, 1, None, run_root, "sid")
+            with open(os.path.join(run_root, "story_summary.json")) as f:
+                s = json.load(f)
+            check("R14d finish_run emits exactly SUMMARY_KEYS",
+                  set(s) == set(render.SUMMARY_KEYS),
+                  "extra=%r missing=%r" % (sorted(set(s) - set(render.SUMMARY_KEYS)),
+                                           sorted(set(render.SUMMARY_KEYS) - set(s))))
+            check("R14e a complete run exits 0", rc == 0, "rc=%r" % rc)
+            check("R14f schema_version is 3", s["schema_version"] == 3,
+                  "got %r" % s["schema_version"])
+    finally:
+        (render.probe_streams, render.assert_clips_uniform,
+         render.build_concat_command) = saved
+
+
+def test_finish_run_writes_summary_when_concat_fails():
+    saved = (render.probe_streams, render.assert_clips_uniform,
+             render.build_concat_command)
+    render.probe_streams = lambda p: {"streams": []}
+    render.assert_clips_uniform = lambda *a: None
+    try:
+        for tag, cmd_stub, keys in (
+                ("R14g/h/i ffmpeg non-zero rc",
+                 lambda lp, out: [sys.executable, "-c", "raise SystemExit(7)"],
+                 ("R14g", "R14h", "R14i")),
+                ("R14j/k/l ffmpeg missing from PATH mid-run",
+                 lambda lp, out: ["/nonexistent/ffmpeg", "-i", lp, out],
+                 ("R14j", "R14k", "R14l"))):
+            render.build_concat_command = cmd_stub
+            with tempfile.TemporaryDirectory() as td:
+                run_root = os.path.join(td, "run")
+                os.makedirs(run_root)
+                args = render.build_parser().parse_args(
+                    [os.path.join(td, "m.json"), os.path.join(td, "out.mp4")])
+                units = [{"index": 1, "label": "panel-1", "prompt": "p",
+                          "image_path": None, "clip_path": os.path.join(td, "c1.mp4"),
+                          "log_path": None, "seed": 1}]
+                ur = {1: {"unit": "panel-1", "status": "ok", "attempts": 1,
+                          "seconds": 1.0, "clip": "/a/1.mp4", "resumed": False}}
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = render.finish_run(args, ["m", "o"], {}, units, ur,
+                                           {1: "/a/1.mp4"}, 1, None, run_root, "sid")
+                summary_path = os.path.join(run_root, "story_summary.json")
+                check("%s exits 1" % keys[0], rc == 1, "%s rc=%r" % (tag, rc))
+                check("%s still writes story_summary.json" % keys[1],
+                      os.path.exists(summary_path), tag)
+                if not os.path.exists(summary_path):
+                    continue
+                with open(summary_path) as f:
+                    s = json.load(f)
+                check("%s records output_path null" % keys[2],
+                      s["output_path"] is None, "%s got %r" % (tag, s["output_path"]))
+    finally:
+        (render.probe_streams, render.assert_clips_uniform,
+         render.build_concat_command) = saved
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -1600,6 +1676,8 @@ if __name__ == "__main__":
     test_panel_loop_reuse_requires_resume_flag()
     test_run_root_collision_is_loud()
     test_summary_shape()
+    test_finish_run_emits_exactly_summary_keys()
+    test_finish_run_writes_summary_when_concat_fails()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
