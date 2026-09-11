@@ -1140,6 +1140,52 @@ def test_jetsam_ladder_text():
               "got %r" % render.JETSAM_LADDER)
 
 
+# ---------------------------------------------------------------------------
+# R13: main() preflight exit codes (all exit 2, all before any panel)
+# ---------------------------------------------------------------------------
+
+def test_preflight_exit_codes():
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        manifest = _write_manifest(td, [_panel(1, img)], story_id="preflight")
+        clips = os.path.join(td, "clips")
+        out = os.path.join(td, "movie.mp4")
+
+        r = _run_render([os.path.join(td, "nope.json"), out, "--clips-dir", clips])
+        check("R13a unreadable manifest exits 2", r.returncode == 2,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+        r = _run_render([manifest, os.path.join(td, "movie.mov"), "--clips-dir", clips])
+        check("R13b non-.mp4 output exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+
+        r = _run_render([manifest, os.path.join(td, "missing_dir", "m.mp4"),
+                         "--clips-dir", clips])
+        check("R13c missing output directory exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+
+        with open(out, "wb") as f:
+            f.write(b"x")
+        r = _run_render([manifest, out, "--clips-dir", clips])
+        check("R13d existing OUTPUT_MP4 without --force exits 2", r.returncode == 2,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+        check("R13e that error names --force", "--force" in r.stderr, "stderr=%r" % r.stderr)
+        os.remove(out)
+
+        r = _run_render([manifest, out, "--clips-dir", clips, "--frames", "240"])
+        check("R13f off-lattice --frames exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+
+        env_r = subprocess.run(
+            [sys.executable, _RENDER_PATH, manifest, out, "--clips-dir", clips,
+             "--skip-input-screen"],
+            capture_output=True, text=True, cwd=WS,
+            env=dict(os.environ, LTX2_MLX_BIN=os.path.join(td, "no-such-bin")))
+        check("R13g missing LTX2_MLX_BIN exits 2", env_r.returncode == 2,
+              "rc=%r stderr=%r" % (env_r.returncode, env_r.stderr))
+        check("R13h that error names the resolved path", "no-such-bin" in env_r.stderr,
+              "stderr=%r" % env_r.stderr)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -1175,6 +1221,7 @@ if __name__ == "__main__":
     test_input_content_screen_behavioral()
     test_render_panel_statuses()
     test_jetsam_ladder_text()
+    test_preflight_exit_codes()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

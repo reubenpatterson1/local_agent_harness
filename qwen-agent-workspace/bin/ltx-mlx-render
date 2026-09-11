@@ -547,3 +547,148 @@ def render_panel(unit, args):
     print("panel %d ok: %s (%.1fs)" % (unit["index"], clip, elapsed))
     base.update({"status": "ok", "clip": clip, "seconds": elapsed})
     return base
+
+
+def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
+               completed, stopped_reason, run_root, story_id):
+    raise NotImplementedError("retry pass, concat and summary land in the next task")
+
+
+def main(argv=None):
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    args = build_parser().parse_args(argv)
+
+    geo_error = validate_cli_geometry(args)
+    if geo_error:
+        print("Error: %s" % geo_error, file=sys.stderr)
+        return 2
+
+    try:
+        manifest = load_manifest(args.manifest_path)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    panels = manifest["panels"]
+
+    story_id = manifest.get("story_id") or "story"
+    story_dir = story_dir_for(story_id)
+    clips_dir = args.clips_dir or os.path.join(story_dir, "clips")
+
+    if args.dry_run:
+        units = build_units(panels, args.seed, clips_dir)
+        return print_dry_run(args, manifest, units, story_id, clips_dir)
+
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            print("Error: %s not found on PATH" % tool, file=sys.stderr)
+            return 2
+    resolved_bin = SKILL._resolve_bin()
+    if not os.path.isfile(resolved_bin) or not os.access(resolved_bin, os.X_OK):
+        print("Error: ltx-2-mlx binary not found or not executable: %s "
+              "(set LTX2_MLX_BIN)" % resolved_bin, file=sys.stderr)
+        return 2
+
+    if not args.output_path.endswith(".mp4"):
+        print("Error: OUTPUT_MP4 must end in .mp4: %s" % args.output_path, file=sys.stderr)
+        return 2
+    out_dir = os.path.dirname(os.path.abspath(args.output_path)) or "."
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        print("Error: output directory not writable: %s" % out_dir, file=sys.stderr)
+        return 2
+    if os.path.exists(args.output_path) and not args.force:
+        print("Error: output already exists: %s (use --force to overwrite)"
+              % args.output_path, file=sys.stderr)
+        return 2
+
+    try:
+        os.makedirs(clips_dir, exist_ok=True)
+    except OSError as e:
+        print("Error: cannot create --clips-dir %s: %s" % (clips_dir, e), file=sys.stderr)
+        return 2
+    if not os.access(clips_dir, os.W_OK):
+        print("Error: --clips-dir is not writable: %s" % clips_dir, file=sys.stderr)
+        return 2
+
+    if not args.skip_input_screen:
+        unique_images = []
+        seen = set()
+        for panel in panels:
+            p = panel.get("image_path")
+            if p and p not in seen:
+                seen.add(p)
+                unique_images.append(p)
+        rc = run_input_content_screen(unique_images)
+        if rc != 0:
+            print("Error: input image content screen failed (rc=%d); refusing to run "
+                  "(no GPU time spent). Pass --skip-input-screen to bypass." % rc,
+                  file=sys.stderr)
+            return 1
+
+    run_id = new_run_id()
+    run_root = os.path.join(story_dir, "runs", run_id)
+    os.makedirs(run_root)
+    print("run root: %s" % run_root)
+    print("clips dir: %s" % clips_dir)
+
+    units = build_units(panels, args.seed, clips_dir, run_root)
+
+    # ORDER-SAFE: keyed on unit index, never appended in loop order, because
+    # the retry pass fills these in out of order (only failed panels, in
+    # their own subset order) -- list-append ordering would silently
+    # scramble the movie.
+    unit_results = {}
+    clips_by_index = {}
+    completed = 0
+    consecutive_failures = 0
+    stopped_reason = None
+
+    for unit in units:
+        i = unit["index"]
+        if args.resume and clip_is_reusable(unit["clip_path"], args.frames):
+            print("panel %d: reusing %s (--resume)" % (i, unit["clip_path"]))
+            unit_results[i] = {"unit": unit["label"], "status": "ok", "attempts": 0,
+                               "seconds": 0.0,
+                               "clip": os.path.abspath(unit["clip_path"]),
+                               "resumed": True}
+            clips_by_index[i] = os.path.abspath(unit["clip_path"])
+            completed += 1
+            consecutive_failures = 0
+            continue
+
+        print("=== panel %d/%d (%s) ===" % (i, len(units), unit["label"]))
+        result = render_panel(unit, args)
+        unit_results[i] = result
+
+        if result["status"] == "ok":
+            clips_by_index[i] = result["clip"]
+            completed += 1
+            consecutive_failures = 0
+            continue
+
+        consecutive_failures += 1
+        # Checked in the same order as bin/ltx-story-video:927-929: the stop
+        # policy wins first, then the consecutive-failure circuit breaker.
+        if args.on_panel_failure == "stop":
+            stopped_reason = "panel_failure"
+            break
+        if (args.max_consecutive_failures > 0
+                and consecutive_failures >= args.max_consecutive_failures):
+            stopped_reason = "consecutive_failures"
+            break
+
+    for unit in units:
+        if unit["index"] not in unit_results:
+            unit_results[unit["index"]] = {
+                "unit": unit["label"], "status": "not_attempted", "attempts": 0,
+                "seconds": 0.0, "clip": None, "resumed": False}
+
+    return finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
+                      completed, stopped_reason, run_root, story_id)
+
+
+if __name__ == "__main__":
+    try:
+        _rc = main()
+    except KeyboardInterrupt:
+        _rc = 130
+    sys.exit(_rc)
