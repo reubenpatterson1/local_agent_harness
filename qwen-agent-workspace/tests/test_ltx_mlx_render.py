@@ -889,10 +889,15 @@ def test_input_content_screen_behavioral():
     try:
         with tempfile.TemporaryDirectory() as td:
             stub_src = (
+                "import os\n"
                 "class ContentSafetyError(Exception):\n"
                 "    pass\n"
                 "def assert_image_safe(img, skill=None, prompt=None):\n"
-                "    if 'blocked' in prompt:\n"
+                "    with open(os.path.join(os.path.dirname(__file__), 'skill_seen.txt'), 'a') as f:\n"
+                "        f.write(repr(skill) + '\\n')\n"
+                "    if skill != 'ltx-mlx-render':\n"
+                "        raise SystemExit('BAD_SKILL %r' % (skill,))\n"
+                "    if os.path.basename(prompt).startswith('blocked'):\n"
                 "        raise ContentSafetyError('blocked marker found')\n"
             )
             with open(os.path.join(td, "content_safety.py"), "w") as f:
@@ -924,6 +929,11 @@ def test_input_content_screen_behavioral():
             rc = render.run_input_content_screen(clean_paths)
             check("R11h all-clean images screen through with rc 0", rc == 0, "got %r" % rc)
 
+            with open(os.path.join(td, "skill_seen.txt")) as f:
+                seen = [ln.strip() for ln in f if ln.strip()]
+            check("R11k the safety call is actually reached with skill='ltx-mlx-render', once per image",
+                  seen == ["'ltx-mlx-render'"] * 2, "got %r" % seen)
+
             blocked_path = os.path.join(td, "blocked.png")
             open(blocked_path, "wb").close()
             never_reached = os.path.join(td, "never_reached.png")
@@ -936,6 +946,25 @@ def test_input_content_screen_behavioral():
             rc3 = render.run_input_content_screen([missing_path])
             check("R11j a nonexistent image path fails closed (nonzero rc)",
                   rc3 != 0, "got %r" % rc3)
+
+            # R11l: the metacharacters live in the FINAL path segment (no "/"
+            # inside it, or open() would treat them as directories). The
+            # sentinel is a bare relative name, and run_input_content_screen
+            # passes no cwd= to subprocess.run, so the child inherits ours --
+            # we chdir to td across the call to make td/PWNED the one and only
+            # place a shelled-out `touch PWNED` could land.
+            weird = os.path.join(td, "it's a $(touch PWNED) ; file.png")
+            open(weird, "wb").close()
+            sentinel = os.path.join(td, "PWNED")
+            saved_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                rc4 = render.run_input_content_screen([weird])
+            finally:
+                os.chdir(saved_cwd)
+            check("R11l a path with quote/$()/; is passed as argv, never interpolated or shelled out",
+                  rc4 == 0 and not os.path.exists(sentinel),
+                  "rc=%r sentinel_exists=%r" % (rc4, os.path.exists(sentinel)))
     finally:
         render.WS = saved_ws
 
