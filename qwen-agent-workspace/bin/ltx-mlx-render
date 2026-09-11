@@ -574,6 +574,26 @@ def main(argv=None):
     story_dir = story_dir_for(story_id)
     clips_dir = args.clips_dir or os.path.join(story_dir, "clips")
 
+    # Hoisted ABOVE the --dry-run short-circuit on purpose. These three are
+    # pure reads -- they touch nothing, so they honor "--dry-run resolves
+    # everything, touches nothing" (spec 6.9) -- and --dry-run is the human
+    # review gate that bin/ltx-movie Phase 3 shows before Phase 4 renders.
+    # A dry run that reports a clean plan and is then followed by an instant
+    # exit 2 on an output path it already had in hand is the wrong gate.
+    # The ffmpeg/ffprobe and ltx-2-mlx checks below stay BELOW the
+    # short-circuit: a dry run must stay usable on a host that cannot render.
+    if not args.output_path.endswith(".mp4"):
+        print("Error: OUTPUT_MP4 must end in .mp4: %s" % args.output_path, file=sys.stderr)
+        return 2
+    out_dir = os.path.dirname(os.path.abspath(args.output_path)) or "."
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        print("Error: output directory not writable: %s" % out_dir, file=sys.stderr)
+        return 2
+    if os.path.exists(args.output_path) and not args.force:
+        print("Error: output already exists: %s (use --force to overwrite)"
+              % args.output_path, file=sys.stderr)
+        return 2
+
     if args.dry_run:
         units = build_units(panels, args.seed, clips_dir)
         return print_dry_run(args, manifest, units, story_id, clips_dir)
@@ -586,18 +606,6 @@ def main(argv=None):
     if not os.path.isfile(resolved_bin) or not os.access(resolved_bin, os.X_OK):
         print("Error: ltx-2-mlx binary not found or not executable: %s "
               "(set LTX2_MLX_BIN)" % resolved_bin, file=sys.stderr)
-        return 2
-
-    if not args.output_path.endswith(".mp4"):
-        print("Error: OUTPUT_MP4 must end in .mp4: %s" % args.output_path, file=sys.stderr)
-        return 2
-    out_dir = os.path.dirname(os.path.abspath(args.output_path)) or "."
-    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
-        print("Error: output directory not writable: %s" % out_dir, file=sys.stderr)
-        return 2
-    if os.path.exists(args.output_path) and not args.force:
-        print("Error: output already exists: %s (use --force to overwrite)"
-              % args.output_path, file=sys.stderr)
         return 2
 
     try:
