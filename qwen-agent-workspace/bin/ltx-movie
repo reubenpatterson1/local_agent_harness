@@ -161,7 +161,7 @@ def build_parser():
     parser.add_argument("--image-height", dest="image_height", type=int, default=960)
     parser.add_argument("--image-seed", dest="image_seed", type=int, default=0)
     parser.add_argument("--video-width", dest="video_width", type=int, default=704)
-    parser.add_argument("--video-height", dest="video_height", type=int, default=480)
+    parser.add_argument("--video-height", dest="video_height", type=int, default=448)
     parser.add_argument("--model", default="MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                          default=False,

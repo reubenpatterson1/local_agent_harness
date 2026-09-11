@@ -47,7 +47,7 @@ def test_parser_defaults():
     check("L1 image_width == 1408", args.image_width == 1408, "got %r" % args.image_width)
     check("L1 image_height == 960", args.image_height == 960, "got %r" % args.image_height)
     check("L1 video_width == 704", args.video_width == 704, "got %r" % args.video_width)
-    check("L1 video_height == 480", args.video_height == 480, "got %r" % args.video_height)
+    check("L1 video_height == 448", args.video_height == 448, "got %r" % args.video_height)
     check("L1 image_seed == 0", args.image_seed == 0, "got %r" % args.image_seed)
     check("L1 panel_timeout == 7200", args.panel_timeout == 7200, "got %r" % args.panel_timeout)
     check("L1 model is the pack id",
@@ -598,7 +598,7 @@ def test_dry_run_plan_targets_mlx_render():
     check("L24f exactly two ltx-mlx-render commands appear (Phase 3 probe, Phase 4 render)",
           len(render_lines) == 2, "got %r" % render_lines)
     for line in render_lines:
-        for flag, want in (("--frames", "241"), ("--width", "704"), ("--height", "480"),
+        for flag, want in (("--frames", "241"), ("--width", "704"), ("--height", "448"),
                            ("--frame-rate", "24"), ("--tile-frames", "1"),
                            ("--tile-spatial", "1")):
             check("L24f %r has %s %s" % (line.split()[0:2], flag, want),

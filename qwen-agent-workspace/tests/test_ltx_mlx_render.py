@@ -47,7 +47,7 @@ def test_parser_defaults():
     check("R1b output_path positional", a.output_path == "/tmp/movie.mp4")
     check("R1c frames 241", a.frames == 241, "got %r" % a.frames)
     check("R1d width 704", a.width == 704, "got %r" % a.width)
-    check("R1e height 480", a.height == 480, "got %r" % a.height)
+    check("R1e height 448", a.height == 448, "got %r" % a.height)
     check("R1f frame_rate 24 and is an int", a.frame_rate == 24 and isinstance(a.frame_rate, int),
           "got %r" % a.frame_rate)
     check("R1g seed 0", a.seed == 0, "got %r" % a.seed)
@@ -361,7 +361,7 @@ def test_build_concat_command():
 # R7: ffprobe uniformity checker, fed synthetic stream dicts
 # ---------------------------------------------------------------------------
 
-def _probe(width=704, height=480, rfr="24/1", vcodec="h264", pix="yuv420p",
+def _probe(width=704, height=448, rfr="24/1", vcodec="h264", pix="yuv420p",
            acodec="aac", rate="48000", channels=2, n_video=1, n_audio=1):
     streams = []
     for _ in range(n_video):
@@ -375,7 +375,7 @@ def _probe(width=704, height=480, rfr="24/1", vcodec="h264", pix="yuv420p",
 
 def _uniform_error(pairs):
     try:
-        render.assert_clips_uniform(pairs, 704, 480, 24)
+        render.assert_clips_uniform(pairs, 704, 448, 24)
     except render.ConcatPreflightError as e:
         return str(e)
     return None
@@ -463,7 +463,7 @@ def test_real_ffmpeg_concat():
         for i in range(1, 4):
             clip = os.path.join(td, "panel_%02d.mp4" % i)
             proc = subprocess.run(
-                ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=704x480:rate=24",
+                ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=704x448:rate=24",
                  "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
                  "-t", "1", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p",
                  "-c:a", "aac", clip],
@@ -472,7 +472,7 @@ def test_real_ffmpeg_concat():
                 check("R9a synthesized clip %d" % i, False, proc.stdout[-800:])
                 return
             clips.append(clip)
-        check("R9a synthesized three 1s 704x480/24fps clips", len(clips) == 3)
+        check("R9a synthesized three 1s 704x448/24fps clips", len(clips) == 3)
 
         counts = [render.clip_frame_count(c) for c in clips]
         check("R9b clip_frame_count reads 24 packets per clip", counts == [24, 24, 24],
@@ -481,7 +481,7 @@ def test_real_ffmpeg_concat():
         pairs = [(c, render.probe_streams(c)) for c in clips]
         err = None
         try:
-            render.assert_clips_uniform(pairs, 704, 480, 24)
+            render.assert_clips_uniform(pairs, 704, 448, 24)
         except render.ConcatPreflightError as e:
             err = str(e)
         check("R9c real preflight passes on real clips", err is None, "got %r" % err)
@@ -547,7 +547,7 @@ def _write_summary(story_dir, run_id, units, **over):
     run_root = os.path.join(story_dir, "runs", run_id)
     os.makedirs(run_root, exist_ok=True)
     summary = {"schema_version": 3, "frames_per_panel": 241, "width": 704,
-               "height": 480, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
+               "height": 448, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                "model": render.SKILL.MODEL_ID, "units": units}
     summary.update(over)
     with open(os.path.join(run_root, "story_summary.json"), "w") as f:
@@ -557,7 +557,7 @@ def _write_summary(story_dir, run_id, units, **over):
 
 def test_estimate_default_source():
     with tempfile.TemporaryDirectory() as td:
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8a no summaries -> default constant",
               secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
@@ -571,7 +571,7 @@ def test_estimate_measured_source():
         units = [{"unit": "panel-%d" % i, "status": "ok", "resumed": False,
                   "seconds": s} for i, s in enumerate([1200.0, 1500.0, 1800.0], start=1)]
         _write_summary(td, "20260910T010101Z-aaaaaaaa", units)
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8c measured mean of the three ok units", abs(secs - 1500.0) < 1e-9,
               "got %r" % secs)
@@ -585,7 +585,7 @@ def test_estimate_excludes_resumed_and_mismatched():
                        [{"unit": "panel-1", "status": "ok", "resumed": False,
                          "seconds": 900.0}],
                        frames_per_panel=193)
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8e a config-mismatched summary is ignored",
               secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
@@ -597,7 +597,7 @@ def test_estimate_excludes_resumed_and_mismatched():
                          "seconds": 2000.0},
                         {"unit": "panel-3", "status": "error", "resumed": False,
                          "seconds": 30.0}])
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8f resumed (seconds 0.0) and error units are excluded from the mean",
               abs(secs - 2000.0) < 1e-9, "got %r" % secs)
@@ -614,7 +614,7 @@ def test_estimate_prefers_newest_matching_summary():
                                [{"unit": "panel-1", "status": "ok", "resumed": False,
                                  "seconds": 2000.0}])
         os.utime(os.path.join(newer, "story_summary.json"), (2000, 2000))
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8m the newer matching summary wins over the older one",
               abs(secs - 2000.0) < 1e-9, "got %r" % secs)
@@ -633,7 +633,7 @@ def test_estimate_skips_corrupt_summary():
         with open(os.path.join(corrupt_dir, "story_summary.json"), "w") as f:
             f.write("[1, 2, 3]")
         os.utime(os.path.join(corrupt_dir, "story_summary.json"), (2000, 2000))
-        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 480, True, 1, 1,
+        secs, label = render.estimate_seconds_per_panel(td, 241, 704, 448, True, 1, 1,
                                                          render.SKILL.MODEL_ID)
         check("R8o a corrupt (non-dict) summary is skipped without crashing",
               abs(secs - 1500.0) < 1e-9, "got %r" % secs)
@@ -657,7 +657,7 @@ def test_estimate_order_independent_of_glob_order():
             for order in ([old_path, new_path], [new_path, old_path]):
                 render.glob.glob = lambda pat, _o=order: list(_o)
                 secs, label = render.estimate_seconds_per_panel(
-                    td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+                    td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
                 check("R8p newest wins regardless of glob order (%r)" % order,
                       abs(secs - 2000.0) < 1e-9, "got %r for order %r" % (secs, order))
         finally:
@@ -677,7 +677,7 @@ def test_estimate_dangling_path_sorts_last_not_fatal():
         try:
             render.glob.glob = lambda pat: [dangling_path, good_path]
             secs, label = render.estimate_seconds_per_panel(
-                td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+                td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
             check("R8q a dangling glob result does not crash and the real summary is used",
                   abs(secs - 1234.0) < 1e-9, "got %r" % secs)
         finally:
@@ -703,7 +703,7 @@ def test_estimate_mtime_tie_break_is_deterministic():
             for order in ([path_a, path_b], [path_b, path_a]):
                 render.glob.glob = lambda pat, _o=order: list(_o)
                 secs, _ = render.estimate_seconds_per_panel(
-                    td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+                    td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
                 results.add(secs)
             check("R8r identical mtimes resolve deterministically regardless of glob order",
                   len(results) == 1, "got multiple results across glob orders: %r" % results)
@@ -717,11 +717,11 @@ def test_estimate_model_key_gates_reuse():
                        [{"unit": "panel-1", "status": "ok", "resumed": False,
                          "seconds": 999.0}], model="some-other-model")
         secs_same, _ = render.estimate_seconds_per_panel(
-            td, 241, 704, 480, True, 1, 1, "some-other-model")
+            td, 241, 704, 448, True, 1, 1, "some-other-model")
         check("R8s matching model reuses the measurement",
               abs(secs_same - 999.0) < 1e-9, "got %r" % secs_same)
         secs_diff, label_diff = render.estimate_seconds_per_panel(
-            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+            td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
         check("R8t mismatched model falls back to the default estimate",
               secs_diff == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs_diff)
 
@@ -731,24 +731,24 @@ def test_estimate_handles_null_units_and_non_dict_entries():
         run_root = os.path.join(td, "runs", "20260910T070707Z-99999999")
         os.makedirs(run_root, exist_ok=True)
         with open(os.path.join(run_root, "story_summary.json"), "w") as f:
-            json.dump({"frames_per_panel": 241, "width": 704, "height": 480,
+            json.dump({"frames_per_panel": 241, "width": 704, "height": 448,
                       "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                       "model": render.SKILL.MODEL_ID, "units": None}, f)
         secs, label = render.estimate_seconds_per_panel(
-            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+            td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
         check("R8u units:null does not crash, falls back to default",
               secs == float(render.SECONDS_PER_PANEL_ESTIMATE), "got %r" % secs)
 
         run_root2 = os.path.join(td, "runs", "20260910T080808Z-88888888")
         os.makedirs(run_root2, exist_ok=True)
         with open(os.path.join(run_root2, "story_summary.json"), "w") as f:
-            json.dump({"frames_per_panel": 241, "width": 704, "height": 480,
+            json.dump({"frames_per_panel": 241, "width": 704, "height": 448,
                       "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                       "model": render.SKILL.MODEL_ID,
                       "units": ["not-a-dict", {"status": "ok", "resumed": False,
                                                 "seconds": 555.0}]}, f)
         secs2, label2 = render.estimate_seconds_per_panel(
-            td, 241, 704, 480, True, 1, 1, render.SKILL.MODEL_ID)
+            td, 241, 704, 448, True, 1, 1, render.SKILL.MODEL_ID)
         check("R8v a non-dict unit entry alongside a good one does not crash",
               abs(secs2 - 555.0) < 1e-9, "got %r" % secs2)
 
@@ -804,7 +804,7 @@ def test_dry_run_output():
         check("R10f marks T2V panels", "panel  2: T2V (no conditioning image)" in o,
               "got %r" % o)
         check("R10g resolved geometry line",
-              "geometry: 704x480, 241 frames @ 24 fps = 10.04 s per panel" in o, "got %r" % o)
+              "geometry: 704x448, 241 frames @ 24 fps = 10.04 s per panel" in o, "got %r" % o)
         check("R10h total line", "total: 3 panels x 10.04 s = 30.12 s of finished movie" in o,
               "got %r" % o)
         check("R10i the num_frames-ignored note",

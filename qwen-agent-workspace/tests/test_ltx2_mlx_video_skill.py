@@ -39,7 +39,7 @@ def test_constants():
     check("M1a MODEL_ID", skill.MODEL_ID == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8",
           "got %r" % skill.MODEL_ID)
     check("M1b DEFAULT_WIDTH 704", skill.DEFAULT_WIDTH == 704, "got %r" % skill.DEFAULT_WIDTH)
-    check("M1c DEFAULT_HEIGHT 480", skill.DEFAULT_HEIGHT == 480, "got %r" % skill.DEFAULT_HEIGHT)
+    check("M1c DEFAULT_HEIGHT 448", skill.DEFAULT_HEIGHT == 448, "got %r" % skill.DEFAULT_HEIGHT)
     check("M1d DEFAULT_NUM_FRAMES 241", skill.DEFAULT_NUM_FRAMES == 241,
           "got %r" % skill.DEFAULT_NUM_FRAMES)
     check("M1e DEFAULT_FRAME_RATE 24", skill.DEFAULT_FRAME_RATE == 24,
@@ -94,22 +94,22 @@ def _raises_value_error(fn, *a, **kw):
 
 
 def test_validate_geometry():
-    check("M3a (704,480,241) accepted", skill.validate_geometry(704, 480, 241) is None)
+    check("M3a (704,448,241) accepted", skill.validate_geometry(704, 448, 241) is None)
     check("M3b width not multiple of 32 rejected",
-          "width" in (_raises_value_error(skill.validate_geometry, 700, 480, 241) or ""),
-          "got %r" % _raises_value_error(skill.validate_geometry, 700, 480, 241))
+          "width" in (_raises_value_error(skill.validate_geometry, 700, 448, 241) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 700, 448, 241))
     check("M3c height not multiple of 32 rejected",
           "height" in (_raises_value_error(skill.validate_geometry, 704, 481, 241) or ""),
           "got %r" % _raises_value_error(skill.validate_geometry, 704, 481, 241))
     check("M3d num_frames off the 8k+1 lattice rejected",
-          "8" in (_raises_value_error(skill.validate_geometry, 704, 480, 240) or ""),
-          "got %r" % _raises_value_error(skill.validate_geometry, 704, 480, 240))
+          "8" in (_raises_value_error(skill.validate_geometry, 704, 448, 240) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 704, 448, 240))
     check("M3e num_frames < 9 rejected",
-          ">= 9" in (_raises_value_error(skill.validate_geometry, 704, 480, 1) or ""),
-          "got %r" % _raises_value_error(skill.validate_geometry, 704, 480, 1))
+          ">= 9" in (_raises_value_error(skill.validate_geometry, 704, 448, 1) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 704, 448, 1))
     check("M3f width < 32 rejected",
-          "width" in (_raises_value_error(skill.validate_geometry, 0, 480, 241) or ""),
-          "got %r" % _raises_value_error(skill.validate_geometry, 0, 480, 241))
+          "width" in (_raises_value_error(skill.validate_geometry, 0, 448, 241) or ""),
+          "got %r" % _raises_value_error(skill.validate_geometry, 0, 448, 241))
     check("M3g height < 32 rejected",
           "height" in (_raises_value_error(skill.validate_geometry, 704, -32, 241) or ""),
           "got %r" % _raises_value_error(skill.validate_geometry, 704, -32, 241))
@@ -161,7 +161,7 @@ def test_resolve_bin():
 
 def test_build_command_i2v_defaults():
     cmd = skill.build_command(prompt="a prompt", output_path="/tmp/out.mp4",
-                              image_path="/tmp/in.png", width=704, height=480,
+                              image_path="/tmp/in.png", width=704, height=448,
                               num_frames=241, frame_rate=24, seed=0)
     check("M4a I2V golden argv",
           cmd == [skill._resolve_bin(), "generate",
@@ -170,7 +170,7 @@ def test_build_command_i2v_defaults():
                   "--prompt", "a prompt",
                   "--output", "/tmp/out.mp4",
                   "--image", "/tmp/in.png", "0", "1.0",
-                  "-H", "480", "-W", "704", "-f", "241",
+                  "-H", "448", "-W", "704", "-f", "241",
                   "--frame-rate", "24", "--seed", "0",
                   "--low-ram"],
           "got %r" % (cmd,))
@@ -178,7 +178,7 @@ def test_build_command_i2v_defaults():
 
 def test_build_command_t2v():
     cmd = skill.build_command(prompt="p", output_path="/tmp/o.mp4", image_path=None,
-                              width=704, height=480, num_frames=241,
+                              width=704, height=448, num_frames=241,
                               frame_rate=24, seed=3)
     check("M4b T2V has no --image token at all", "--image" not in cmd, "got %r" % (cmd,))
     check("M4c T2V golden argv",
@@ -187,7 +187,7 @@ def test_build_command_t2v():
                   "--distilled",
                   "--prompt", "p",
                   "--output", "/tmp/o.mp4",
-                  "-H", "480", "-W", "704", "-f", "241",
+                  "-H", "448", "-W", "704", "-f", "241",
                   "--frame-rate", "24", "--seed", "3",
                   "--low-ram"],
           "got %r" % (cmd,))
@@ -195,18 +195,18 @@ def test_build_command_t2v():
 
 def test_build_command_flags():
     no_low = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
-                                 height=480, num_frames=241, frame_rate=24, seed=0,
+                                 height=448, num_frames=241, frame_rate=24, seed=0,
                                  low_ram=False)
     check("M4d low_ram=False omits --low-ram", "--low-ram" not in no_low, "got %r" % (no_low,))
 
     tiled = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
-                                height=480, num_frames=241, frame_rate=24, seed=0,
+                                height=448, num_frames=241, frame_rate=24, seed=0,
                                 tile_frames=2, tile_spatial=2)
     check("M4e tiling emitted after --low-ram in order",
           tiled[-4:] == ["--tile-frames", "2", "--tile-spatial", "2"], "got %r" % (tiled,))
 
     untiled = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
-                                  height=480, num_frames=241, frame_rate=24, seed=0,
+                                  height=448, num_frames=241, frame_rate=24, seed=0,
                                   tile_frames=1, tile_spatial=1)
     check("M4f tiling at 1 emits nothing",
           "--tile-frames" not in untiled and "--tile-spatial" not in untiled,
@@ -229,7 +229,7 @@ def test_build_command_flags():
 def test_build_command_invariants():
     for kw in ({"image_path": "/tmp/i.png"}, {}):
         cmd = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
-                                  height=480, num_frames=241, frame_rate=24, seed=0, **kw)
+                                  height=448, num_frames=241, frame_rate=24, seed=0, **kw)
         check("M4h --distilled always present (image_path=%r)" % kw.get("image_path"),
               "--distilled" in cmd, "got %r" % (cmd,))
         check("M4i --frame-rate always present (image_path=%r)" % kw.get("image_path"),
@@ -347,7 +347,7 @@ def test_generate_video_value_errors():
 
             def _v(**over):
                 kw = dict(prompt="p", output_path=out, image_path=img, width=704,
-                          height=480, num_frames=241, tile_frames=1, tile_spatial=1,
+                          height=448, num_frames=241, tile_frames=1, tile_spatial=1,
                           force=False)
                 kw.update(over)
                 return _raises_value_error(skill._validate_generate_args, **kw)
@@ -370,7 +370,7 @@ def test_generate_video_value_errors():
 
             msg = _raises_value_error(skill._validate_generate_args, prompt="p",
                                       output_path=out, image_path=img, width=704,
-                                      height=480, num_frames=241, tile_frames=1,
+                                      height=448, num_frames=241, tile_frames=1,
                                       tile_spatial=1, force=True)
             check("M5p force=True accepts an existing output_path", msg is None,
                   "over-rejected: %r" % msg)
@@ -644,7 +644,7 @@ def test_cli_parser_defaults():
     a = skill.build_cli_parser().parse_args(["a prompt", "/tmp/o.mp4"])
     check("M11a image default None", a.image is None, "got %r" % a.image)
     check("M11b width 704", a.width == 704, "got %r" % a.width)
-    check("M11c height 480", a.height == 480, "got %r" % a.height)
+    check("M11c height 448", a.height == 448, "got %r" % a.height)
     check("M11d frames 241", a.frames == 241, "got %r" % a.frames)
     check("M11e frame_rate 24", a.frame_rate == 24, "got %r" % a.frame_rate)
     check("M11f seed 0", a.seed == 0, "got %r" % a.seed)

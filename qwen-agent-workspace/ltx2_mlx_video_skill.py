@@ -35,7 +35,7 @@ LTX2_MLX_BIN = os.environ.get("LTX2_MLX_BIN",
 
 MODEL_ID = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
 DEFAULT_WIDTH = 704            # 704 % 32 == 0
-DEFAULT_HEIGHT = 480           # 480 % 32 == 0
+DEFAULT_HEIGHT = 448           # 448 % 64 == 0; distilled two-stage snaps H down to a multiple of 64
 DEFAULT_NUM_FRAMES = 241       # (241 - 1) % 8 == 0; 240 / 24 == 10.000 s
 DEFAULT_FRAME_RATE = 24
 DEFAULT_LOW_RAM = True
