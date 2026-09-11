@@ -5,7 +5,9 @@ No GPU, no model weights, no network. The one test that shells out to real
 ffmpeg (R9) skips itself with a clear message when ffmpeg is absent.
 """
 
+import contextlib
 import importlib.machinery
+import io
 import json
 import os
 import re
@@ -980,28 +982,82 @@ def _stub_args(**over):
     return a
 
 
+def _render_panel_capturing_stderr(unit, args):
+    """Call render_panel with sys.stderr redirected; return (result, stderr).
+
+    render_panel's jetsam remediation ladder is written to stderr and is the
+    only operator-facing output of a jetsam kill, so it has to be asserted on
+    directly -- asserting the JETSAM_LADDER constant's text proves nothing
+    about whether anything ever prints it."""
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        res = render.render_panel(unit, args)
+    return res, buf.getvalue()
+
+
 def test_render_panel_statuses():
     saved = render.SKILL.generate_video
     try:
-        unit = {"index": 1, "label": "panel-1", "seed": 1, "prompt": "p",
-                "image_path": None, "clip_path": "/tmp/panel_01.mp4", "log_path": None}
-        args = _stub_args()
+        # Every field below is deliberately distinct from every other field
+        # and from build_parser()'s defaults, so that an argument-swap or a
+        # hardcoded-constant mutation in render_panel cannot pass.
+        unit = {"index": 1, "label": "panel-1", "seed": 7, "prompt": "p",
+                "image_path": "/tmp/in.png", "clip_path": "/tmp/panel_01.mp4",
+                "log_path": "/tmp/panel_01.log"}
+        args = _stub_args(width=640, height=384, frames=145, frame_rate=25,
+                          model="test-model", no_low_ram=True, tile_frames=2,
+                          tile_spatial=3, panel_timeout=11)
 
-        render.SKILL.generate_video = lambda *a, **k: "/tmp/panel_01.mp4"
+        calls = []
+
+        def _ok(*a, **k):
+            calls.append((a, k))
+            # Deliberately NOT unit["clip_path"]: the skill returns
+            # os.path.abspath(output_path), and R12c must prove that
+            # render_panel records the skill's return value rather than
+            # re-deriving the path from the unit.
+            return "/tmp/abs/panel_01.mp4"
+        render.SKILL.generate_video = _ok
         res = render.render_panel(unit, args)
         check("R12a success -> status ok", res["status"] == "ok", "got %r" % res)
         check("R12b success -> attempts 1", res["attempts"] == 1, "got %r" % res)
-        check("R12c success -> clip path recorded", res["clip"] == "/tmp/panel_01.mp4",
-              "got %r" % res)
+        check("R12c success -> the skill's returned clip path is recorded",
+              res["clip"] == "/tmp/abs/panel_01.mp4", "got %r" % res)
         check("R12d success -> resumed False", res["resumed"] is False, "got %r" % res)
         check("R12e success -> seconds is a float", isinstance(res["seconds"], float),
               "got %r" % res)
         check("R12f unit label carried", res["unit"] == "panel-1", "got %r" % res)
 
+        check("R12t1 exactly one skill call", len(calls) == 1, "got %r" % (calls,))
+        pos, kw = calls[0] if calls else ((), {})
+        check("R12t2 prompt and clip path are the positional args",
+              pos == ("p", "/tmp/panel_01.mp4"), "got %r" % (pos,))
+        check("R12t3 force=True is passed unconditionally", kw.get("force") is True,
+              "got %r" % (kw,))
+        check("R12t4 image_path comes from the unit",
+              kw.get("image_path", "MISSING") == "/tmp/in.png", "got %r" % (kw,))
+        check("R12t5 seed comes from the unit", kw.get("seed") == 7, "got %r" % (kw,))
+        check("R12t6 log_path comes from the unit",
+              kw.get("log_path", "MISSING") == "/tmp/panel_01.log", "got %r" % (kw,))
+        check("R12t7 num_frames comes from --frames", kw.get("num_frames") == 145,
+              "got %r" % (kw,))
+        check("R12t8 frame_rate comes from --frame-rate", kw.get("frame_rate") == 25,
+              "got %r" % (kw,))
+        check("R12t9 width and height are not swapped",
+              (kw.get("width"), kw.get("height")) == (640, 384), "got %r" % (kw,))
+        check("R12t10 model comes from --model", kw.get("model") == "test-model",
+              "got %r" % (kw,))
+        check("R12t11 tile_frames and tile_spatial are not swapped",
+              (kw.get("tile_frames"), kw.get("tile_spatial")) == (2, 3), "got %r" % (kw,))
+        check("R12t12 low_ram is the inverse of --no-low-ram",
+              kw.get("low_ram") is False, "got %r" % (kw,))
+        check("R12t13 timeout_s comes from --panel-timeout", kw.get("timeout_s") == 11,
+              "got %r" % (kw,))
+
         def _raise_value(*a, **k):
             raise ValueError("bad image")
         render.SKILL.generate_video = _raise_value
-        res = render.render_panel(unit, args)
+        res, err = _render_panel_capturing_stderr(unit, args)
         check("R12g ValueError -> status invalid", res["status"] == "invalid", "got %r" % res)
         check("R12h invalid -> clip None", res["clip"] is None, "got %r" % res)
 
@@ -1009,27 +1065,71 @@ def test_render_panel_statuses():
             raise render.SKILL.Ltx2MlxError("boom", returncode=1, cmd=[],
                                             stderr_tail="tail", output_path="/tmp/x.mp4")
         render.SKILL.generate_video = _raise_rc1
-        res = render.render_panel(unit, args)
+        res, err = _render_panel_capturing_stderr(unit, args)
         check("R12i non-zero rc -> status error", res["status"] == "error", "got %r" % res)
         check("R12j rc recorded", res.get("rc") == 1, "got %r" % res)
+        check("R12p non-zero rc is not flagged jetsam", "jetsam" not in res, "got %r" % res)
+        check("R12p2 non-zero rc does not print the jetsam ladder",
+              render.JETSAM_LADDER not in err, "got %r" % err)
 
         def _raise_timeout(*a, **k):
             raise render.SKILL.Ltx2MlxError("slow", returncode=-9, cmd=[],
                                             stderr_tail="", output_path="/tmp/x.mp4",
                                             timed_out=True)
         render.SKILL.generate_video = _raise_timeout
-        res = render.render_panel(unit, args)
+        res, err = _render_panel_capturing_stderr(unit, args)
         check("R12k timeout -> status timeout", res["status"] == "timeout", "got %r" % res)
+
+        # A timeout whose returncode is NOT -9: status must be keyed on
+        # timed_out, never on a particular return code.
+        def _raise_timeout_rc_none(*a, **k):
+            raise render.SKILL.Ltx2MlxError("slow", returncode=None, cmd=[],
+                                            stderr_tail="", output_path="/tmp/x.mp4",
+                                            timed_out=True)
+        render.SKILL.generate_video = _raise_timeout_rc_none
+        res, err = _render_panel_capturing_stderr(unit, args)
+        check("R12r timeout with rc None -> status timeout", res["status"] == "timeout",
+              "got %r" % res)
+
+        # The converse: rc -9 without timed_out is a signal kill, not a
+        # timeout (the parent itself was killed), and is a plain error.
+        def _raise_rc_neg9_no_timeout(*a, **k):
+            raise render.SKILL.Ltx2MlxError("killed", returncode=-9, cmd=[],
+                                            stderr_tail="", output_path="/tmp/x.mp4")
+        render.SKILL.generate_video = _raise_rc_neg9_no_timeout
+        res, err = _render_panel_capturing_stderr(unit, args)
+        check("R12s rc -9 without timed_out -> status error", res["status"] == "error",
+              "got %r" % res)
+        check("R12s2 rc -9 without timed_out is not flagged jetsam",
+              "jetsam" not in res, "got %r" % res)
 
         def _raise_jetsam(*a, **k):
             raise render.SKILL.Ltx2MlxError("no output", returncode=0, cmd=[],
                                             stderr_tail="", output_path="/tmp/x.mp4")
         render.SKILL.generate_video = _raise_jetsam
-        res = render.render_panel(unit, args)
+        res, err = _render_panel_capturing_stderr(unit, args)
         check("R12l jetsam signature -> status error", res["status"] == "error",
               "got %r" % res)
         check("R12m jetsam signature is flagged for the ladder message",
               res.get("jetsam") is True, "got %r" % res)
+        check("R12o jetsam signature prints the remediation ladder to stderr",
+              render.JETSAM_LADDER in err, "got %r" % err)
+
+        # The watchdog can fire in the window where the child has already
+        # exited 0, so rc 0 AND timed_out is reachable: timeout must win and
+        # the ladder must stay quiet.
+        def _raise_timeout_rc0(*a, **k):
+            raise render.SKILL.Ltx2MlxError("slow", returncode=0, cmd=[],
+                                            stderr_tail="", output_path="/tmp/x.mp4",
+                                            timed_out=True)
+        render.SKILL.generate_video = _raise_timeout_rc0
+        res, err = _render_panel_capturing_stderr(unit, args)
+        check("R12q rc 0 with timed_out -> status timeout", res["status"] == "timeout",
+              "got %r" % res)
+        check("R12q2 rc 0 with timed_out is not flagged jetsam", "jetsam" not in res,
+              "got %r" % res)
+        check("R12q3 rc 0 with timed_out does not print the jetsam ladder",
+              render.JETSAM_LADDER not in err, "got %r" % err)
     finally:
         render.SKILL.generate_video = saved
 
