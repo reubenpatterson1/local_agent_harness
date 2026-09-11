@@ -156,10 +156,10 @@ def test_story_prompt_template():
     check("L5a prompt contains VERBATIM", "VERBATIM" in prompt)
     check("L5b prompt contains 'Do not verify'", "Do not verify" in prompt)
     check("L5c prompt formats panels count (7) in", prompt.count("7") >= 2)
-    check("L5d Motion: line asks for 90-130 words", "90-130 words" in prompt,
+    check("L5d Motion: line asks for 150-220 words", "150-220 words" in prompt,
           "got %r" % prompt)
-    check("L5e Motion: line asks for a 4-6 sentence chronological paragraph",
-          "one flowing paragraph of 4-6 sentences in strict chronological order" in prompt,
+    check("L5e Motion: line asks for a 7-10 sentence chronological paragraph",
+          "one flowing paragraph of 7-10 sentences in strict chronological order" in prompt,
           "got %r" % prompt)
     check("L5f Motion: line forbids cuts and new plot info",
           "no cuts, no new plot information" in prompt, "got %r" % prompt)
@@ -177,9 +177,30 @@ def test_story_prompt_template():
     check("L5l a style line bans scene-opener phrasing",
           'never open with "The scene opens with", "We see" or "There is"' in prompt,
           "got %r" % prompt)
-    check("L5m Motion: must not restate what Image: already carries",
-          "Do not restate the composition, setting, lighting or lens the Image: field "
-          "already carries" in prompt, "got %r" % prompt)
+    check("L5m Motion: keeps setting/lighting/wardrobe consistent with Image: "
+          "instead of banning it",
+          "Keep the setting, lighting and wardrobe consistent with the Image: field" in prompt
+          and "Do not restate the composition" not in prompt, "got %r" % prompt)
+    check("L5n Motion: line names the temporal connectors",
+          '"initially", "as", "then", "while", "simultaneously", "a moment later"' in prompt,
+          "got %r" % prompt)
+    check("L5o Motion: line and style line both demand the present tense",
+          prompt.count("in the present tense") >= 2, "got %r" % prompt)
+    check("L5p Motion: line prescribes the LTX shot-type vocabulary",
+          "extreme wide shot, wide shot, medium shot, medium close-up, close-up, "
+          "extreme close-up" in prompt, "got %r" % prompt)
+    check("L5q Motion: line prescribes the LTX camera-viewpoint vocabulary",
+          "front-facing, back-facing, side view, over-the-shoulder, top-down, "
+          "low-angle or high-angle" in prompt, "got %r" % prompt)
+    check("L5r Motion: line always states camera motion",
+          "if the camera holds, say that it remains static" in prompt, "got %r" % prompt)
+    check("L5s a style line requires a soundscape and forbids dialogue",
+          "Sound is part of the shot" in prompt
+          and "write no spoken dialogue" in prompt, "got %r" % prompt)
+    check("L5t the style paragraph comes last, after the VERBATIM paragraph",
+          "Write the Motion: field in the present tense" in prompt and "VERBATIM" in prompt
+          and prompt.index("Write the Motion: field in the present tense")
+              > prompt.index("VERBATIM"), "got %r" % prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -296,15 +317,15 @@ def test_length_100_panels_and_tokens():
     m = re.search(r"--max-tokens\s+(\d+)", result.stdout)
     check("L11c --max-tokens present", m is not None)
     if m:
-        check("L11d --max-tokens is max(4096, 10*350) == 4096", int(m.group(1)) == 4096,
+        check("L11d --max-tokens is max(4096, 10*550) == 5500", int(m.group(1)) == 5500,
               "got %s" % m.group(1))
 
 
 def test_phase1_scaling():
-    check("L11e 15 panels -> 5250 tokens", ltx_movie._phase1_max_tokens(15) == 5250)
-    check("L11f 30 panels -> 10500 tokens", ltx_movie._phase1_max_tokens(30) == 10500)
+    check("L11e 15 panels -> 8250 tokens", ltx_movie._phase1_max_tokens(15) == 8250)
+    check("L11f 30 panels -> 16500 tokens", ltx_movie._phase1_max_tokens(30) == 16500)
     check("L11g 5 panels floors at 4096", ltx_movie._phase1_max_tokens(5) == 4096)
-    check("L11h 30 panels -> 1800s timeout", ltx_movie._phase1_timeout(30) == 1800)
+    check("L11h 30 panels -> 2700s timeout", ltx_movie._phase1_timeout(30) == 2700)
     check("L11i 5 panels floors at 900s", ltx_movie._phase1_timeout(5) == 900)
 
 
@@ -369,10 +390,10 @@ def test_no_stills_story_prompt_template():
     check("L15f no Motion: field", "Motion: <" not in p)
     check("L15g forbids emitting the old fields",
           "Do not emit an Image: or Motion: field." in p)
-    check("L15h word band is 150-180", "150-180 words" in p, "got %r" % p[:600])
-    check("L15l Prompt: line asks for a 6-8 sentence chronological paragraph",
-          "one flowing paragraph of 6-8 sentences" in p and "strictly chronological" in p,
-          "got %r" % p[:900])
+    check("L15h word band is 150-220", "150-220 words" in p, "got %r" % p[:600])
+    check("L15l Prompt: line asks for a 7-10 sentence chronological paragraph",
+          "one flowing paragraph of 7-10 sentences" in p
+          and "in strict chronological order" in p, "got %r" % p[:1400])
     check("L15m Prompt: line demands enough beats to fill the ten seconds",
           "fill the full ten seconds instead of rushing the action" in p, "got %r" % p[:900])
     check("L15n Prompt: line no longer carries the old single-take framing",
@@ -380,11 +401,42 @@ def test_no_stills_story_prompt_template():
     check("L15o Prompt: line keeps the no-cuts / no-new-plot rule",
           "no cuts, no new plot information beyond what this shot shows" in p,
           "got %r" % p[:900])
-    check("L15p Prompt: line states the LTX element order",
-          "camera angle/lens and camera movement" in p, "got %r" % p[:900])
-    check("L15q a style line bans abstract mood words and intensifiers",
+    check("L15p Prompt: line states the gemma4 caption element order",
+          all(s in p for s in ("opens with the main action", "visible physical attributes",
+                               "the setting and background", "the shot type",
+                               "the lighting and colour"))
+          and [p.index(s) for s in ("opens with the main action", "visible physical attributes",
+                                    "the setting and background", "the shot type",
+                                    "the lighting and colour")]
+              == sorted(p.index(s) for s in ("opens with the main action",
+                                             "visible physical attributes",
+                                             "the setting and background", "the shot type",
+                                             "the lighting and colour")),
+          "got %r" % p[:1400])
+    check("L15q a style line bans abstract mood words and the old intensifier rule is gone",
           'never "she looks sad" or any other mood word' in p
-          and '"a red dress", not "a vibrant crimson dress"' in p, "got %r" % p[:900])
+          and '"a vibrant crimson dress"' not in p, "got %r" % p[:1400])
+    check("L15s Prompt: line names the temporal connectors",
+          '"initially", "as", "then", "while", "simultaneously", "a moment later"' in p,
+          "got %r" % p[:1400])
+    check("L15t Prompt: line and style line both demand the present tense",
+          p.count("in the present tense") >= 2, "got %r" % p[:1400])
+    check("L15u Prompt: line prescribes the LTX shot-type vocabulary",
+          "extreme wide shot, wide shot, medium shot, medium close-up, close-up, "
+          "extreme close-up" in p, "got %r" % p[:1400])
+    check("L15v Prompt: line prescribes the LTX camera-viewpoint vocabulary",
+          "front-facing, back-facing, side view, over-the-shoulder, top-down, "
+          "low-angle or high-angle" in p, "got %r" % p[:1400])
+    check("L15w Prompt: line always states camera motion",
+          "if the camera holds, say that it remains static" in p, "got %r" % p[:1400])
+    check("L15x a style line requires a soundscape and forbids dialogue",
+          "Sound is part of the shot" in p and "write no spoken dialogue" in p,
+          "got %r" % p[:1400])
+    check("L15y the style paragraph comes after the trailing Rules: block",
+          "Write the Prompt: field in the present tense" in p
+          and "Motion should focus on the actions" in p
+          and p.index("Write the Prompt: field in the present tense")
+              > p.rindex("Motion should focus on the actions"), "got %r" % p[:2400])
     check("L15r a style line bans scene-opener phrasing",
           'never open with "The scene opens with", "We see" or "There is"' in p,
           "got %r" % p[:900])
@@ -510,8 +562,8 @@ def test_no_stills_dry_run_plan():
     check("L18f no chain flags anywhere", "--engine chain" not in out
           and "--reanchor-every" not in out, "got %r" % out)
     check("L18g the rendered prompt is the no-stills template",
-          "Prompt: <a single video prompt, 150-180 words" in out
-          and "one flowing paragraph of 6-8 sentences" in out
+          "Prompt: <150-220 words in the present tense" in out
+          and "one flowing paragraph of 7-10 sentences" in out
           and "Image: <a single still-image prompt" not in out)
     check("L18h no per-panel opener/follower table here (it comes from a real Phase 3)",
           "T2V opener" not in out, "got %r" % out)
@@ -530,7 +582,7 @@ def test_default_dry_run_plan_unchanged():
     check("L18k default plan has no --no-images / --engine chain",
           "--no-images" not in out and "--engine chain" not in out)
     check("L18l default plan carries the rewritten Motion: line",
-          "Motion: <90-130 words covering ONLY the camera motion" in out
+          "Motion: <150-220 words in the present tense" in out
           and "ONE CONTINUOUS TEN-SECOND TAKE" not in out, "got %r" % out)
 
 

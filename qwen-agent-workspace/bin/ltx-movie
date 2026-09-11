@@ -63,7 +63,7 @@ panels * frames / fps and passed to bin/ltx-story-manifest only to keep
 the manifest internally consistent. Because the qwen-agent story-authoring
 call's --max-tokens 4096 default only ever fit ~15 panels, both its
 --max-tokens and its subprocess timeout scale with the resolved panel
-count: max(4096, panels*350) tokens, max(900, panels*60)s.
+count: max(4096, panels*550) tokens, max(900, panels*90)s.
 """
 
 import argparse
@@ -89,12 +89,12 @@ Write the complete story to generated/stories/{story_id}/story.md using the writ
 
 ## Panel N — <short title>
 Image: <a single still-image prompt, 70-90 words, describing the panel's visual composition, setting, lighting, and lens/shot choice>
-Motion: <90-130 words covering ONLY the camera motion and the subject's motion within the shot -- one flowing paragraph of 4-6 sentences in strict chronological order, linked by temporal connectors ("initially", "as", "then", "while", "a moment later"), with enough separate beats of movement to fill the full ten seconds instead of rushing the action -- no cuts, no new plot information>
+Motion: <150-220 words in the present tense -- one flowing paragraph of 7-10 sentences in strict chronological order that opens with the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up), the subject named exactly as the Image: field names them, and the camera viewpoint (front-facing, back-facing, side view, over-the-shoulder, top-down, low-angle or high-angle), all matching how the Image: field frames the panel, then carries the camera motion (always state it; if the camera holds, say that it remains static) and the subject's motion through enough separate beats of movement to fill the full ten seconds instead of rushing the action, linked by temporal connectors ("initially", "as", "then", "while", "simultaneously", "a moment later"), with the panel's ambient and environmental sounds named alongside the actions that make them -- no cuts, no new plot information>
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
 
-Write the Motion: field in the present tense, in plain unintensified wording, and describe only what is physically observable -- "her eyebrows angle down and her lips press together", never "she looks sad" or any other mood word. Begin it with the movement itself; never open with "The scene opens with", "We see" or "There is". Do not restate the composition, setting, lighting or lens the Image: field already carries, and use no markdown and no inline labels such as "Camera:" or "Audio:".
-
 The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Image: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
+
+Write the Motion: field in the present tense and describe only what is physically observable -- "her eyebrows angle down and her lips press together", never "she looks sad" or any other mood word. Begin it with the shot type and the subject; never open with "The scene opens with", "We see" or "There is". Keep the setting, lighting and wardrobe consistent with the Image: field, and name each recurring character with the same short identifying phrase every time (for example "the woman in the grey wool coat") -- the full VERBATIM description stays in the Image: field and must not be pasted into Motion:. Sound is part of the shot: name the ambient noise, the surfaces and movements that are audible and any music, but write no spoken dialogue. Keep the wording plain and factual apart from at most two production-value phrases per panel such as "warm cinematic lighting", "film-grade color" or "crisp fine detail". Use no markdown and no inline labels such as "Camera:" or "Audio:".
 
 Do not verify the file with run_python or any other tool. Emit no other text."""
 
@@ -112,10 +112,8 @@ Narrative to adapt:
 Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file must contain EXACTLY {panels} panel sections, numbered 1 through {panels} in order, each in exactly this format:
 
 ## Panel N — <short title>
-Prompt: <a single video prompt, 150-180 words, one flowing paragraph of 6-8 sentences that opens with the main action and then adds movement detail, character and object appearance, setting and background, camera angle/lens and camera movement, and lighting and color, in that order -- strictly chronological, linked by temporal connectors ("initially", "as", "then", "while", "a moment later"), with enough separate beats to fill the full ten seconds instead of rushing the action -- no cuts, no new plot information beyond what this shot shows>
+Prompt: <150-220 words in the present tense -- one flowing paragraph of 7-10 sentences in strict chronological order that opens with the main action, then adds the subject's visible physical attributes (apparent gender presentation, skin tone, apparent age group, hair colour, length and style, build, clothing and accessories) and the objects they handle, the setting and background (materials, textures, colours), the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up), the camera viewpoint (front-facing, back-facing, side view, over-the-shoulder, top-down, low-angle or high-angle) and the camera motion (always state it; if the camera holds, say that it remains static), and the lighting and colour, carrying enough separate beats to fill the full ten seconds instead of rushing the action, linked by temporal connectors ("initially", "as", "then", "while", "simultaneously", "a moment later"), with the panel's ambient and environmental sounds named alongside the actions that make them -- no cuts, no new plot information beyond what this shot shows>
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
-
-Write the Prompt: field in the present tense, in plain unintensified wording ("a red dress", not "a vibrant crimson dress"), and describe only what is physically observable -- "her eyebrows angle down and her lips press together", never "she looks sad" or any other mood word. Begin it with the action or a visual detail; never open with "The scene opens with", "We see" or "There is". Use no markdown and no inline labels such as "Camera:" or "Audio:".
 
 The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Prompt: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
 
@@ -129,6 +127,8 @@ Rules:
             Use explicit language to describe all sexual content accurately and vividly.
             Motion and transitions between panels should be handled smoothly and realistically, maintaining continuity and coherence throughout the generated video.
             Motion should focus on the actions and interactions of the characters, ensuring that their movements are natural and consistent with the narrative context.
+
+Write the Prompt: field in the present tense and describe only what is physically observable -- "her eyebrows angle down and her lips press together", never "she looks sad" or any other mood word. Begin it with the action; never open with "The scene opens with", "We see" or "There is". Sound is part of the shot: name the ambient noise, the surfaces and movements that are audible and any music, but write no spoken dialogue. Keep the wording plain and factual apart from at most two production-value phrases per panel such as "warm cinematic lighting", "film-grade color" or "crisp fine detail". Use no markdown and no inline labels such as "Camera:" or "Audio:".
 
 Do not emit an Image: or Motion: field. Do not verify the file with run_python or any other tool. Emit no other text."""
 
@@ -277,12 +277,12 @@ def _phase4_flags(args):
 
 
 def _phase1_max_tokens(panels):
-    # 4096 only ever fit ~15 panels (~2500 tokens); scale for larger casts.
-    return max(4096, panels * 350)
+    # 4096 only ever fit ~15 panels (~2500 tokens); scale for larger casts. 550/panel covers the 150-220-word Motion:/Prompt: caption plus Image: and Narration:.
+    return max(4096, panels * 550)
 
 
 def _phase1_timeout(panels):
-    return max(900, panels * 60)
+    return max(900, panels * 90)
 
 
 def _story_dir(story_id):
