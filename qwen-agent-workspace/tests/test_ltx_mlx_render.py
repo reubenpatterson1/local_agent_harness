@@ -827,6 +827,73 @@ def glob_has_new_run(story_id):
     return bool(_g.glob(os.path.join(render.story_dir_for(story_id), "runs", "*")))
 
 
+def test_manifest_without_story_id_falls_back():
+    """A manifest with no story_id must fall back to "story"; without the
+    fallback story_dir_for(None) raises TypeError deep in os.path.join."""
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        path = os.path.join(td, "no_story_id.json")
+        with open(path, "w") as f:
+            json.dump({"schema_version": 2, "fps": 24, "panels": [_panel(1, img)]}, f)
+        r = _run_render([path, os.path.join(td, "movie.mp4"),
+                         "--clips-dir", os.path.join(td, "clips"), "--dry-run"])
+        check("R10v a manifest with no story_id falls back to 'story'",
+              r.returncode == 0 and "story id: story" in r.stdout,
+              "rc=%r stdout=%r stderr=%r" % (r.returncode, r.stdout, r.stderr))
+
+
+def test_dry_run_validates_output_path():
+    """--dry-run is the human review gate bin/ltx-movie Phase 3 shows before
+    Phase 4 renders, so it must reject the output paths Phase 4 would reject.
+    These three checks are pure reads, so --dry-run still touches nothing."""
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        manifest = _write_manifest(td, [_panel(1, img)], story_id="dryvalidate")
+        clips = os.path.join(td, "clips")
+        os.makedirs(clips)
+        out = os.path.join(td, "movie.mp4")
+
+        r = _run_render([manifest, os.path.join(td, "movie.mov"), "--clips-dir", clips,
+                         "--dry-run"])
+        check("R10p --dry-run rejects a non-.mp4 output with exit 2",
+              r.returncode == 2 and "must end in .mp4" in r.stderr,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+        r = _run_render([manifest, os.path.join(td, "missing_dir", "m.mp4"),
+                         "--clips-dir", clips, "--dry-run"])
+        check("R10q --dry-run rejects a missing output directory with exit 2",
+              r.returncode == 2 and "output directory not writable" in r.stderr,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+        with open(out, "wb") as f:
+            f.write(b"x")
+        r = _run_render([manifest, out, "--clips-dir", clips, "--dry-run"])
+        check("R10r --dry-run rejects an existing output without --force",
+              r.returncode == 2 and "--force" in r.stderr,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+        r = _run_render([manifest, out, "--clips-dir", clips, "--dry-run", "--force"])
+        check("R10s --dry-run with --force accepts an existing output",
+              r.returncode == 0, "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+        check("R10t --dry-run still touched nothing", os.listdir(clips) == [],
+              "clips=%r" % os.listdir(clips))
+
+        # The ffmpeg/ltx-2-mlx checks must STAY below the short-circuit: a dry
+        # run has to remain usable on a host that cannot render.
+        r = subprocess.run(
+            [sys.executable, _RENDER_PATH, manifest, os.path.join(td, "ok.mp4"),
+             "--clips-dir", clips, "--dry-run"],
+            capture_output=True, text=True, cwd=WS,
+            env=dict(os.environ, LTX2_MLX_BIN=os.path.join(td, "no-such-bin")))
+        check("R10u --dry-run still works with no ltx-2-mlx binary installed",
+              r.returncode == 0, "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+
 def test_dry_run_resume_lines():
     saved = render.clip_frame_count
     try:
@@ -1156,13 +1223,19 @@ def test_preflight_exit_codes():
         r = _run_render([os.path.join(td, "nope.json"), out, "--clips-dir", clips])
         check("R13a unreadable manifest exits 2", r.returncode == 2,
               "rc=%r stderr=%r" % (r.returncode, r.stderr))
+        check("R13a2 the manifest error names the unreadable path",
+              "nope.json" in r.stderr, "stderr=%r" % r.stderr)
 
         r = _run_render([manifest, os.path.join(td, "movie.mov"), "--clips-dir", clips])
         check("R13b non-.mp4 output exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+        check("R13b2 the .mp4 check is the check that fired",
+              "must end in .mp4" in r.stderr, "stderr=%r" % r.stderr)
 
         r = _run_render([manifest, os.path.join(td, "missing_dir", "m.mp4"),
                          "--clips-dir", clips])
         check("R13c missing output directory exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+        check("R13c2 the output-directory check is the check that fired",
+              "output directory not writable" in r.stderr, "stderr=%r" % r.stderr)
 
         with open(out, "wb") as f:
             f.write(b"x")
@@ -1174,6 +1247,8 @@ def test_preflight_exit_codes():
 
         r = _run_render([manifest, out, "--clips-dir", clips, "--frames", "240"])
         check("R13f off-lattice --frames exits 2", r.returncode == 2, "rc=%r" % r.returncode)
+        check("R13f2 the geometry check is the check that fired",
+              "(num_frames - 1) % 8 == 0" in r.stderr, "stderr=%r" % r.stderr)
 
         env_r = subprocess.run(
             [sys.executable, _RENDER_PATH, manifest, out, "--clips-dir", clips,
@@ -1184,6 +1259,264 @@ def test_preflight_exit_codes():
               "rc=%r stderr=%r" % (env_r.returncode, env_r.stderr))
         check("R13h that error names the resolved path", "no-such-bin" in env_r.stderr,
               "stderr=%r" % env_r.stderr)
+
+
+def test_preflight_clips_dir_not_writable():
+    """The --clips-dir writability check (the one preflight that lives BELOW
+    the ffmpeg/binary checks). LTX2_MLX_BIN is pointed at a real executable so
+    this case does not depend on ltx-2-mlx being installed on the host."""
+    with tempfile.TemporaryDirectory() as td:
+        img = os.path.join(td, "p1.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        manifest = _write_manifest(td, [_panel(1, img)], story_id="rodir")
+        out = os.path.join(td, "movie.mp4")
+        clips = os.path.join(td, "ro_clips")
+        os.makedirs(clips)
+        os.chmod(clips, 0o500)
+        try:
+            r = subprocess.run(
+                [sys.executable, _RENDER_PATH, manifest, out, "--clips-dir", clips,
+                 "--skip-input-screen"],
+                capture_output=True, text=True, cwd=WS,
+                env=dict(os.environ, LTX2_MLX_BIN="/bin/echo"))
+            check("R13m an unwritable --clips-dir exits 2", r.returncode == 2,
+                  "rc=%r stderr=%r" % (r.returncode, r.stderr))
+            check("R13n the --clips-dir writability check is the check that fired",
+                  "--clips-dir is not writable" in r.stderr, "stderr=%r" % r.stderr)
+        finally:
+            os.chmod(clips, 0o700)
+
+
+# ---------------------------------------------------------------------------
+# R13i-R13l: the input content screen call site inside main() is LIVE
+# ---------------------------------------------------------------------------
+
+def test_main_content_screen_is_live():
+    """Behavioral, not a source grep: main() is driven in-process with the
+    screen stubbed to block. If the call site were commented out, guarded by a
+    dead branch, or had its rc discarded, main() would fall through to the
+    panel loop and this test would fail."""
+    saved = (render.story_dir_for, render.render_panel,
+             render.finish_run, render.run_input_content_screen)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            img = os.path.join(td, "p1.png")
+            with open(img, "wb") as f:
+                f.write(b"png")
+            # panels 1 and 2 SHARE one image, panel 3 is T2V -- proves the dedup
+            manifest = _write_manifest(td, [_panel(1, img), _panel(2, img), _panel(3, None)],
+                                       story_id="screenlive")
+            clips = os.path.join(td, "clips")
+            os.makedirs(os.path.join(td, "story", "screenlive"))
+            render.story_dir_for = lambda sid: os.path.join(td, "story", sid)
+            rendered = []
+
+            def _never(unit, args):
+                rendered.append(unit["index"])
+                return {"unit": unit["label"], "status": "error", "attempts": 1,
+                        "seconds": 0.0, "clip": None, "rc": 1, "error": "should not run"}
+
+            render.render_panel = _never
+            render.finish_run = lambda *a, **k: 99
+            seen = []
+            render.run_input_content_screen = lambda paths: (seen.append(list(paths)) or 3)
+
+            rc = render.main([manifest, os.path.join(td, "m.mp4"), "--clips-dir", clips])
+            check("R13i a screen block makes main() exit 1, not 2", rc == 1, "rc=%r" % rc)
+            check("R13j the screen was actually called exactly once",
+                  len(seen) == 1, "calls=%r" % seen)
+            check("R13k the screen got deduped, non-null image paths",
+                  seen == [[img]], "got %r" % seen)
+            check("R13l no panel was rendered after a block",
+                  rendered == [], "rendered=%r" % rendered)
+            check("R13l2 the screen runs BEFORE the run root is created",
+                  not os.path.isdir(os.path.join(td, "story", "screenlive", "runs")),
+                  "a run root was created despite a content-screen block")
+    finally:
+        (render.story_dir_for, render.render_panel,
+         render.finish_run, render.run_input_content_screen) = saved
+
+
+# ---------------------------------------------------------------------------
+# R13o-R13z: the panel loop -- stop policy, circuit breaker, resume gate,
+# not_attempted backfill, run_root collision
+# ---------------------------------------------------------------------------
+
+_FINISH_KEYS = ("args", "raw_argv", "manifest", "units", "unit_results",
+                "clips_by_index", "completed", "stopped_reason", "run_root",
+                "story_id")
+
+
+def _drive_main(td, story_id, n_panels, extra_argv, panel_status="error",
+                reusable=None, run_id=None):
+    """Run main()'s panel loop in-process and return finish_run's arguments as
+    a dict, plus the list of panel indices render_panel was actually called
+    with. render_panel, finish_run and story_dir_for are stubbed; the loop
+    itself is the real one."""
+    img = os.path.join(td, "%s.png" % story_id)
+    with open(img, "wb") as f:
+        f.write(b"png")
+    manifest = _write_manifest(td, [_panel(i, img) for i in range(1, n_panels + 1)],
+                               story_id=story_id)
+    clips = os.path.join(td, "clips_%s" % story_id)
+    out = os.path.join(td, "%s.mp4" % story_id)
+    os.makedirs(os.path.join(td, "story", story_id), exist_ok=True)
+
+    captured = {}
+    rendered = []
+
+    def fake_render_panel(unit, args):
+        rendered.append(unit["index"])
+        if panel_status == "ok":
+            return {"unit": unit["label"], "status": "ok", "attempts": 1,
+                    "seconds": 1.0, "clip": os.path.abspath(unit["clip_path"]),
+                    "resumed": False}
+        return {"unit": unit["label"], "status": panel_status, "attempts": 1,
+                "seconds": 0.1, "clip": None, "rc": 1, "error": "stub failure"}
+
+    def fake_finish_run(*a, **k):
+        captured.update(dict(zip(_FINISH_KEYS, a)))
+        return 77
+
+    saved = (render.story_dir_for, render.render_panel, render.finish_run,
+             render.run_input_content_screen, render.clip_is_reusable,
+             render.new_run_id, render.SKILL._resolve_bin)
+    try:
+        render.story_dir_for = lambda sid: os.path.join(td, "story", sid)
+        render.render_panel = fake_render_panel
+        render.finish_run = fake_finish_run
+        render.run_input_content_screen = lambda paths: 0
+        # so these tests do not depend on ltx-2-mlx being installed
+        render.SKILL._resolve_bin = lambda: sys.executable
+        if reusable is not None:
+            render.clip_is_reusable = lambda path, frames: reusable
+        if run_id is not None:
+            render.new_run_id = lambda: run_id
+        argv = [manifest, out, "--clips-dir", clips, "--skip-input-screen"] + extra_argv
+        rc = render.main(argv)
+    finally:
+        (render.story_dir_for, render.render_panel, render.finish_run,
+         render.run_input_content_screen, render.clip_is_reusable,
+         render.new_run_id, render.SKILL._resolve_bin) = saved
+    return rc, captured, rendered, argv
+
+
+def _reached_loop(tag, rc, captured):
+    """Guard so a preflight regression reports one clean FAIL instead of
+    crashing the rest of the suite on an empty capture dict."""
+    ok = bool(captured)
+    check("%s main() reached the panel loop and called finish_run" % tag, ok,
+          "main() returned %r before finish_run" % rc)
+    return ok
+
+
+def test_panel_loop_circuit_breaker():
+    with tempfile.TemporaryDirectory() as td:
+        rc, cap, rendered, argv = _drive_main(
+            td, "cb", 5, ["--on-panel-failure", "skip", "--max-consecutive-failures", "2"])
+        if not _reached_loop("R13o0", rc, cap):
+            return
+        check("R13o main() returns finish_run's value", rc == 77, "rc=%r" % rc)
+        check("R13p the circuit breaker stops the loop at the 2nd consecutive failure",
+              rendered == [1, 2], "rendered=%r" % rendered)
+        check("R13q stopped_reason is consecutive_failures",
+              cap.get("stopped_reason") == "consecutive_failures",
+              "got %r" % cap.get("stopped_reason"))
+        check("R13r completed is 0 when every attempted panel failed",
+              cap.get("completed") == 0, "got %r" % cap.get("completed"))
+        check("R13s unit_results is keyed by panel index, one entry per unit",
+              isinstance(cap.get("unit_results"), dict)
+              and sorted(cap["unit_results"]) == [1, 2, 3, 4, 5],
+              "got %r" % (cap.get("unit_results"),))
+        _st = {i: cap["unit_results"].get(i, {}).get("status") for i in (1, 2, 3, 4, 5)}
+        check("R13t unattempted panels are backfilled as not_attempted",
+              [_st[i] for i in (1, 2, 3, 4, 5)]
+              == ["error", "error", "not_attempted", "not_attempted", "not_attempted"],
+              "got %r" % _st)
+        check("R13u raw_argv is the argv main() was called with",
+              cap.get("raw_argv") == argv, "got %r" % (cap.get("raw_argv"),))
+
+
+def test_panel_loop_stop_policy_wins_over_circuit_breaker():
+    """Both policies armed at once. 'stop' is checked first, so a single
+    failure must report panel_failure, never consecutive_failures."""
+    with tempfile.TemporaryDirectory() as td:
+        rc, cap, rendered, _ = _drive_main(
+            td, "stopwins", 4, ["--on-panel-failure", "stop", "--max-consecutive-failures", "1"])
+        if not _reached_loop("R13v0", rc, cap):
+            return
+        check("R13v the stop policy aborts on the first failure",
+              rendered == [1], "rendered=%r" % rendered)
+        check("R13w the stop policy wins over the circuit breaker",
+              cap.get("stopped_reason") == "panel_failure",
+              "got %r; the circuit breaker must not claim this stop"
+              % cap.get("stopped_reason"))
+
+
+def test_panel_loop_max_consecutive_failures_zero_disables():
+    with tempfile.TemporaryDirectory() as td:
+        rc, cap, rendered, _ = _drive_main(
+            td, "cbzero", 4, ["--on-panel-failure", "skip", "--max-consecutive-failures", "0"])
+        if not _reached_loop("R13x0", rc, cap):
+            return
+        check("R13x --max-consecutive-failures 0 disables the circuit breaker",
+              rendered == [1, 2, 3, 4], "rendered=%r" % rendered)
+        check("R13y a disabled circuit breaker leaves stopped_reason None",
+              cap.get("stopped_reason") is None, "got %r" % cap.get("stopped_reason"))
+
+
+def test_panel_loop_reuse_requires_resume_flag():
+    """clip_is_reusable is forced True. WITHOUT --resume every panel must
+    still be rendered: the reuse gate is 'resume AND reusable', never OR."""
+    with tempfile.TemporaryDirectory() as td:
+        rc, cap, rendered, _ = _drive_main(
+            td, "noresume", 3, ["--on-panel-failure", "skip"],
+            panel_status="ok", reusable=True)
+        if not _reached_loop("R13z0", rc, cap):
+            return
+        check("R13z a reusable clip is NOT reused without --resume",
+              rendered == [1, 2, 3], "rendered=%r" % rendered)
+        check("R13z2 no unit is marked resumed without --resume",
+              all(not cap["unit_results"].get(i, {}).get("resumed") for i in (1, 2, 3)),
+              "got %r" % cap["unit_results"])
+
+        rc, cap, rendered, _ = _drive_main(
+            td, "yesresume", 3, ["--on-panel-failure", "skip", "--resume"],
+            panel_status="ok", reusable=True)
+        if not _reached_loop("R13z30", rc, cap):
+            return
+        check("R13z3 with --resume a reusable clip skips render_panel",
+              rendered == [], "rendered=%r" % rendered)
+        check("R13z4 resumed units are flagged resumed with seconds 0.0",
+              all(cap["unit_results"].get(i, {}).get("resumed")
+                  and cap["unit_results"].get(i, {}).get("seconds") == 0.0
+                  for i in (1, 2, 3)),
+              "got %r" % cap["unit_results"])
+        check("R13z5 resumed units still count as completed",
+              cap.get("completed") == 3, "got %r" % cap.get("completed"))
+        check("R13z6 resumed units populate clips_by_index by index",
+              sorted(cap.get("clips_by_index", {})) == [1, 2, 3],
+              "got %r" % (cap.get("clips_by_index"),))
+
+
+def test_run_root_collision_is_loud():
+    """os.makedirs(run_root) deliberately has no exist_ok=True: a run-id
+    collision must never be silently merged into a stale run."""
+    with tempfile.TemporaryDirectory() as td:
+        rc, cap, rendered, _ = _drive_main(
+            td, "collide", 1, ["--on-panel-failure", "skip"], run_id="FIXED-RUN-ID")
+        if not _reached_loop("R13z70", rc, cap):
+            return
+        check("R13z7 the first run creates its run root", rc == 77, "rc=%r" % rc)
+        raised = None
+        try:
+            _drive_main(td, "collide", 1, ["--on-panel-failure", "skip"],
+                        run_id="FIXED-RUN-ID")
+        except FileExistsError as e:
+            raised = e
+        check("R13z8 a run-id collision raises instead of merging into the stale run",
+              isinstance(raised, FileExistsError), "raised=%r" % (raised,))
 
 
 if __name__ == "__main__":
@@ -1216,12 +1549,21 @@ if __name__ == "__main__":
     test_format_estimate_lines()
     test_dry_run_output()
     test_dry_run_resume_lines()
+    test_manifest_without_story_id_falls_back()
+    test_dry_run_validates_output_path()
     test_input_content_screen_shape()
     test_input_content_screen_empty_list_is_cheap()
     test_input_content_screen_behavioral()
     test_render_panel_statuses()
     test_jetsam_ladder_text()
     test_preflight_exit_codes()
+    test_preflight_clips_dir_not_writable()
+    test_main_content_screen_is_live()
+    test_panel_loop_circuit_breaker()
+    test_panel_loop_stop_policy_wins_over_circuit_breaker()
+    test_panel_loop_max_consecutive_failures_zero_disables()
+    test_panel_loop_reuse_requires_resume_flag()
+    test_run_root_collision_is_loud()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
