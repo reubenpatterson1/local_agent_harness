@@ -42,20 +42,43 @@ def check(name, condition, detail=""):
 def test_parser_defaults():
     args = ltx_movie.build_parser().parse_args(["some narrative", "--story-id", "test"])
     check("L1 panels == 15", args.panels == 15, "got %r" % args.panels)
-    check("L1 target_seconds == 30.0", args.target_seconds == 30.0, "got %r" % args.target_seconds)
+    check("L1 frames == 241", args.frames == 241, "got %r" % args.frames)
     check("L1 fps == 24", args.fps == 24, "got %r" % args.fps)
-    check("L1 min_frames == 25", args.min_frames == 25, "got %r" % args.min_frames)
-    check("L1 max_frames == 57", args.max_frames == 57, "got %r" % args.max_frames)
-    check("L1 image_width == 1024", args.image_width == 1024, "got %r" % args.image_width)
-    check("L1 image_height == 1024", args.image_height == 1024, "got %r" % args.image_height)
+    check("L1 image_width == 1408", args.image_width == 1408, "got %r" % args.image_width)
+    check("L1 image_height == 960", args.image_height == 960, "got %r" % args.image_height)
+    check("L1 video_width == 704", args.video_width == 704, "got %r" % args.video_width)
+    check("L1 video_height == 480", args.video_height == 480, "got %r" % args.video_height)
     check("L1 image_seed == 0", args.image_seed == 0, "got %r" % args.image_seed)
-    check("L1 min_avail_gib == 34.0", args.min_avail_gib == 34.0, "got %r" % args.min_avail_gib)
+    check("L1 panel_timeout == 7200", args.panel_timeout == 7200, "got %r" % args.panel_timeout)
+    check("L1 model is the pack id",
+          args.model == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8", "got %r" % args.model)
+    check("L1 low-ram is ON by default (no_low_ram False)", args.no_low_ram is False,
+          "got %r" % args.no_low_ram)
+    check("L1 tile_frames == 1", args.tile_frames == 1, "got %r" % args.tile_frames)
+    check("L1 tile_spatial == 1", args.tile_spatial == 1, "got %r" % args.tile_spatial)
+    check("L1 min_avail_gib == 25.0", args.min_avail_gib == 25.0, "got %r" % args.min_avail_gib)
     check("L1 avail_timeout == 1800", args.avail_timeout == 1800, "got %r" % args.avail_timeout)
     check("L1 no_review is False", args.no_review is False, "got %r" % args.no_review)
     check("L1 force_story is False", args.force_story is False, "got %r" % args.force_story)
     check("L1 force is False", args.force is False, "got %r" % args.force)
     check("L1 dry_run is False", args.dry_run is False, "got %r" % args.dry_run)
     check("L1 length is None", args.length is None, "got %r" % args.length)
+
+
+def test_removed_flags_rejected():
+    for flag, value in (("--min-frames", "25"), ("--max-frames", "57"),
+                        ("--target-seconds", "30"), ("--keep-down", None),
+                        ("--reanchor-every", "3")):
+        argv = [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x", flag]
+        if value is not None:
+            argv.append(value)
+        argv.append("--dry-run")
+        result = subprocess.run(argv, capture_output=True, text=True, cwd=WS)
+        check("L23 %s is rejected by the parser" % flag, result.returncode == 2,
+              "rc=%r stderr=%r" % (result.returncode, result.stderr))
+        check("L23 %s error names the unrecognized flag" % flag,
+              "unrecognized arguments" in result.stderr or flag in result.stderr,
+              "stderr=%r" % result.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -130,10 +153,20 @@ def test_sudo_n_not_sudo_s():
 
 def test_story_prompt_template():
     prompt = ltx_movie.build_story_prompt("some narrative", "some_id", 7)
-    check("L5 prompt contains VERBATIM", "VERBATIM" in prompt)
-    check("L5 prompt contains 'Do not verify'", "Do not verify" in prompt)
-    check("L5 prompt formats panels count (7) in", prompt.count("7") >= 2,
-          "prompt=%r" % prompt)
+    check("L5a prompt contains VERBATIM", "VERBATIM" in prompt)
+    check("L5b prompt contains 'Do not verify'", "Do not verify" in prompt)
+    check("L5c prompt formats panels count (7) in", prompt.count("7") >= 2)
+    check("L5d Motion: line asks for 40-70 words", "40-70 words" in prompt,
+          "got %r" % prompt)
+    check("L5e Motion: line asks for one continuous ten-second take",
+          "ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end" in prompt,
+          "got %r" % prompt)
+    check("L5f Motion: line forbids cuts and new plot info",
+          "no cuts, no new plot information" in prompt, "got %r" % prompt)
+    check("L5g Image: line is unchanged (70-90 words)", "70-90 words" in prompt)
+    check("L5h Narration: line is unchanged",
+          "Narration: <one sentence of voice-over narration; vary the sentence length "
+          "across panels rather than repeating a similar length every time>" in prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -184,13 +217,24 @@ def test_validate_story_md_missing_motion():
 # L8 (addendum): --length 60 resolves to panels=30, target_seconds=60.0
 # ---------------------------------------------------------------------------
 
-def test_resolve_length_60():
-    raw_argv = ["narrative text", "--story-id", "x", "--length", "60"]
-    args = ltx_movie.build_parser().parse_args(raw_argv)
-    ltx_movie._resolve_length(args, raw_argv)
-    check("L8 --length 60 -> panels == 30", args.panels == 30, "got %r" % args.panels)
-    check("L8 --length 60 -> target_seconds == 60.0", args.target_seconds == 60.0,
-          "got %r" % args.target_seconds)
+def test_resolve_length_math():
+    def _resolve(argv):
+        args = ltx_movie.build_parser().parse_args(argv)
+        ltx_movie._resolve_length(args, argv)
+        return args.panels
+
+    check("L8a --length 100 -> 10 panels (round(9.958))",
+          _resolve(["n", "--story-id", "x", "--length", "100"]) == 10,
+          "got %r" % _resolve(["n", "--story-id", "x", "--length", "100"]))
+    check("L8b --length 20 -> 2 panels (round(1.992))",
+          _resolve(["n", "--story-id", "x", "--length", "20"]) == 2,
+          "got %r" % _resolve(["n", "--story-id", "x", "--length", "20"]))
+    check("L8c the divisor tracks --frames: --length 100 --frames 121 -> 20 panels",
+          _resolve(["n", "--story-id", "x", "--length", "100", "--frames", "121"]) == 20,
+          "got %r" % _resolve(["n", "--story-id", "x", "--length", "100",
+                               "--frames", "121"]))
+    check("L8d --length is a no-op when absent",
+          _resolve(["n", "--story-id", "x"]) == 15)
 
 
 # ---------------------------------------------------------------------------
@@ -201,66 +245,46 @@ def test_length_conflicts():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
          "--length", "60", "--panels", "20", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L9 --length+--panels exits 2", result.returncode == 2, "rc=%r" % result.returncode)
-    check("L9 --length+--panels stderr names --panels", "--panels" in result.stderr,
-          "stderr=%r" % result.stderr)
-
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "60", "--target-seconds", "30", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L9 --length+--target-seconds exits 2", result.returncode == 2, "rc=%r" % result.returncode)
-    check("L9 --length+--target-seconds stderr names --target-seconds",
-          "--target-seconds" in result.stderr, "stderr=%r" % result.stderr)
-
-
-# ---------------------------------------------------------------------------
-# L10 (addendum): --length too short, and --length exceeding the frame cap
-# ---------------------------------------------------------------------------
-
-def test_length_bounds():
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "3", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L10 --length 3 (too short) exits 2", result.returncode == 2,
-          "rc=%r stderr=%r" % (result.returncode, result.stderr))
-
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "90", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L10 --length 90 @ fps 24 (over frame cap) exits 2", result.returncode == 2,
-          "rc=%r stderr=%r" % (result.returncode, result.stderr))
-    check("L10 --length 90 stderr names the frame cap",
-          ("2000-frame" in result.stderr) or ("concat cap" in result.stderr),
+        capture_output=True, text=True, cwd=WS)
+    check("L9a --length+--panels exits 2", result.returncode == 2, "rc=%r" % result.returncode)
+    check("L9b --length+--panels stderr names --panels", "--panels" in result.stderr,
           "stderr=%r" % result.stderr)
 
 
-# ---------------------------------------------------------------------------
-# L11 (addendum): --length 40 -> 20 panels requested, --max-tokens >= 7000
-# ---------------------------------------------------------------------------
-
-def test_length_40_panels_and_tokens():
+def test_length_too_short():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "40", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L11 --length 40 exits 0", result.returncode == 0,
+         "--length", "15", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L10a --length 15 exits 2", result.returncode == 2,
           "rc=%r stderr=%r" % (result.returncode, result.stderr))
-    check("L11 story prompt requests EXACTLY 20 panels", "EXACTLY 20" in result.stdout,
+    check("L10b the message names 10.04s per panel", "10.04s per panel" in result.stderr,
+          "stderr=%r" % result.stderr)
+    check("L10c the message names the resolved panel count",
+          "resolves to 1 panel" in result.stderr, "stderr=%r" % result.stderr)
+    check("L10d the message tells the operator what to do",
+          "Raise --length or pass --panels directly." in result.stderr,
+          "stderr=%r" % result.stderr)
+    check("L10e there is no upper --length bound any more",
+          subprocess.run([sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
+                          "--length", "900", "--dry-run"],
+                         capture_output=True, text=True, cwd=WS).returncode == 0)
+
+
+def test_length_100_panels_and_tokens():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
+         "--length", "100", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L11a --length 100 exits 0", result.returncode == 0,
+          "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    check("L11b story prompt requests EXACTLY 10 panels", "EXACTLY 10" in result.stdout,
           "stdout=%r" % result.stdout[:2000])
     m = re.search(r"--max-tokens\s+(\d+)", result.stdout)
-    check("L11 --max-tokens present in dry-run output", m is not None,
-          "stdout=%r" % result.stdout[:2000])
+    check("L11c --max-tokens present", m is not None)
     if m:
-        check("L11 --max-tokens >= 7000", int(m.group(1)) >= 7000, "got %s" % m.group(1))
+        check("L11d --max-tokens is max(4096, 10*350) == 4096", int(m.group(1)) == 4096,
+              "got %s" % m.group(1))
 
 
 # ---------------------------------------------------------------------------
@@ -281,37 +305,15 @@ def test_phase1_nonzero_rc_checks_story_md_before_failing():
 
 
 # ---------------------------------------------------------------------------
-# L13: --no-stills / --reanchor-every defaults and validation
+# L13: --no-stills default. The --reanchor-every half of this test died with
+# the chain engine -- the parser now rejects that flag outright, which L23
+# covers.
 # ---------------------------------------------------------------------------
 
-def test_no_stills_defaults_and_validation():
+def test_no_stills_default():
     args = ltx_movie.build_parser().parse_args(["narrative", "--story-id", "x"])
     check("L13a --no-stills default is False", args.no_stills is False,
           "got %r" % args.no_stills)
-    check("L13b --reanchor-every default is 5", args.reanchor_every == 5,
-          "got %r" % args.reanchor_every)
-
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--reanchor-every", "3", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L13c --reanchor-every without --no-stills exits 2", result.returncode == 2,
-          "rc=%r" % result.returncode)
-    check("L13d message is the spec's verbatim text",
-          "Error: --reanchor-every requires --no-stills (it only applies to the "
-          "chain engine)" in result.stderr, "stderr=%r" % result.stderr)
-
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--no-stills", "--reanchor-every", "0", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    check("L13e --reanchor-every 0 exits 2", result.returncode == 2,
-          "rc=%r" % result.returncode)
-    check("L13f message names the >= 1 rule",
-          "Error: --reanchor-every must be >= 1, got 0" in result.stderr,
-          "stderr=%r" % result.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -322,14 +324,13 @@ def test_no_stills_orthogonal_to_length():
     def _resolve(argv):
         args = ltx_movie.build_parser().parse_args(argv)
         ltx_movie._resolve_length(args, argv)
-        return args.panels, args.target_seconds
+        return args.panels
 
-    plain = _resolve(["narrative", "--story-id", "x", "--length", "30"])
-    with_flag = _resolve(["narrative", "--story-id", "x", "--no-stills", "--length", "30"])
+    plain = _resolve(["narrative", "--story-id", "x", "--length", "100"])
+    with_flag = _resolve(["narrative", "--story-id", "x", "--no-stills", "--length", "100"])
     check("L14a --no-stills does not change --length resolution", plain == with_flag,
           "got %r vs %r" % (plain, with_flag))
-    check("L14b --length 30 still resolves to (15, 30.0)", plain == (15, 30.0),
-          "got %r" % (plain,))
+    check("L14b --length 100 resolves to 10 panels", plain == 10, "got %r" % plain)
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +348,10 @@ def test_no_stills_story_prompt_template():
     check("L15f no Motion: field", "Motion: <" not in p)
     check("L15g forbids emitting the old fields",
           "Do not emit an Image: or Motion: field." in p)
-    check("L15h word band is 85-130", "85-130 words" in p)
+    check("L15h word band is 150-180", "150-180 words" in p, "got %r" % p[:600])
+    check("L15l Prompt: line carries the ten-second pacing",
+          "ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end" in p,
+          "got %r" % p[:600])
     check("L15i formats narrative/story_id/panels",
           "some narrative" in p and "some_id" in p and "EXACTLY 7 panel sections" in p)
 
@@ -432,10 +436,11 @@ def test_no_stills_phase_sequencing_source():
                                       .split("def phase3_manifest")[0])
     check("L17c phase 3 swaps --glob/--images-dir for --no-images",
           '"--no-images"' in text and '"--glob", "panel_*.png"' in text)
-    check("L17d phase 3/4 thread --engine chain",
-          text.count('"--engine", "chain", "--reanchor-every", str(args.reanchor_every)') >= 4,
-          "got %r occurrences" % text.count(
-              '"--engine", "chain", "--reanchor-every", str(args.reanchor_every)'))
+    check("L17d Phase 3 and Phase 4 both build their flags from _render_flags",
+          text.count("_render_flags(args)") == 4,
+          "got %r occurrences" % text.count("_render_flags(args)"))
+    check("L17e the chain engine is gone", '"--engine"' not in text,
+          "the --engine chain wiring must be gone")
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +450,7 @@ def test_no_stills_phase_sequencing_source():
 def test_no_stills_dry_run_plan():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-nostills",
-         "--no-stills", "--panels", "6", "--reanchor-every", "3", "--dry-run"],
+         "--no-stills", "--panels", "6", "--dry-run"],
         capture_output=True, text=True, cwd=WS,
     )
     out = result.stdout
@@ -458,10 +463,10 @@ def test_no_stills_dry_run_plan():
           "ltx-story-images" not in out, "got %r" % out)
     check("L18d Phase 3 uses --no-images", "--no-images" in out)
     check("L18e Phase 3 does not glob panel_*.png", "panel_*.png" not in out)
-    check("L18f the chain flags appear", "--engine chain" in out
-          and "--reanchor-every 3" in out, "got %r" % out)
+    check("L18f no chain flags anywhere", "--engine chain" not in out
+          and "--reanchor-every" not in out, "got %r" % out)
     check("L18g the rendered prompt is the no-stills template",
-          "Prompt: <a single video prompt, 85-130 words" in out
+          "Prompt: <a single video prompt, 150-180 words" in out
           and "Image: <a single still-image prompt" not in out)
     check("L18h no per-panel opener/follower table here (it comes from a real Phase 3)",
           "T2V opener" not in out, "got %r" % out)
@@ -549,126 +554,63 @@ def test_top5_rss_skips_none_memory_info():
 
 
 # ---------------------------------------------------------------------------
-# L21: dynamic --min-frames/--max-frames (derived from target seconds/panel,
-# snapped to the n=1+8k lattice, clamped against ltx_ceiling.json's
-# measured 512x512 entry)
+# L24: the dry-run plan targets bin/ltx-mlx-render, never bin/ltx-story-video
 # ---------------------------------------------------------------------------
 
-def test_dynamic_frame_bounds_default_2s_per_panel():
-    result = ltx_movie._dynamic_frame_bounds(30.0, 15, 24)
-    check("L21a default (2s/panel) result", result == (25, 73, False, 2.0, 48.0),
-          "got %r" % (result,))
-
-
-def test_dynamic_frame_bounds_clamped_by_ceiling():
-    result = ltx_movie._dynamic_frame_bounds(30.0, 6, 24)
-    check("L21b 5s/panel clamps max to the 512x512 ceiling (73)",
-          result == (57, 73, True, 5.0, 120.0), "got %r" % (result,))
-
-
-def test_dynamic_frame_bounds_tiny_target_floors_at_9():
-    result = ltx_movie._dynamic_frame_bounds(6.0, 30, 24)
-    min_frames, max_frames, ceiling_clamped, seconds_per_panel, target_frames_per_panel = result
-    check("L21c tiny target floors both bounds at 9, no clamp",
-          (min_frames, max_frames, ceiling_clamped) == (9, 9, False), "got %r" % (result,))
-    check("L21c seconds_per_panel == 0.2",
-          abs(seconds_per_panel - 0.2) < 1e-9, "got %r" % (seconds_per_panel,))
-    check("L21c target_frames_per_panel ~= 4.8 (float non-associativity, not exact)",
-          abs(target_frames_per_panel - 4.8) < 1e-9, "got %r" % (target_frames_per_panel,))
-
-
-def test_dynamic_frame_bounds_infeasible_clamp_exits():
-    try:
-        ltx_movie._dynamic_frame_bounds(40.0, 5, 24)
-        check("L21d infeasible clamp raises SystemExit", False, "did not raise")
-    except SystemExit as e:
-        check("L21d infeasible clamp raises SystemExit(2)", e.code == 2, "got code=%r" % e.code)
-
-
-def test_dynamic_frame_bounds_dry_run_banner():
+def test_dry_run_plan_targets_mlx_render():
     result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-dynamic",
-         "--panels", "6", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-mlx",
+         "--panels", "3", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
     out = result.stdout
-    check("L21e exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
-                                                                       result.stderr))
-    check("L21f banner printed", "Dynamic frame bounds:" in out, "got %r" % out)
-    check("L21g banner shows min=57", "min=57" in out, "got %r" % out)
-    check("L21h banner shows max=73", "max=73" in out, "got %r" % out)
-    check("L21i banner notes the ceiling clamp",
-          "[clamped to measured 512x512 ceiling]" in out, "got %r" % out)
-    check("L21j Phase 3 manifest command uses the computed bounds",
-          "--min-frames 57" in out and "--max-frames 73" in out, "got %r" % out)
+    check("L24a exits 0", result.returncode == 0,
+          "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    check("L24b Phase 3 and Phase 4 both name bin/ltx-mlx-render",
+          out.count("ltx-mlx-render") == 2, "got %d" % out.count("ltx-mlx-render"))
+    check("L24c bin/ltx-story-video is never named", "ltx-story-video" not in out,
+          "got %r" % out)
+    check("L24d Phase 3 pins the manifest allocator to a flat 241 frames",
+          "--min-frames 241 --max-frames 241" in out, "got %r" % out)
+    check("L24e --target-seconds is computed as panels*frames/fps",
+          "--target-seconds 30.125" in out, "got %r" % out)
+    check("L24f the render flags are threaded",
+          "--frames 241" in out and "--width 704" in out and "--height 480" in out
+          and "--frame-rate 24" in out and "--tile-frames 1" in out
+          and "--tile-spatial 1" in out, "got %r" % out)
+    check("L24g --resume is always passed", out.count("--resume") == 2, "got %r" % out)
+    check("L24h --no-low-ram is absent by default", "--no-low-ram" not in out, "got %r" % out)
+    check("L24i Phase 4 carries the failure policy",
+          "--on-panel-failure skip" in out and "--retry-failed 1" in out
+          and "--retry-idle 120" in out and "--max-consecutive-failures 3" in out
+          and "--panel-timeout 7200" in out, "got %r" % out)
+    check("L24j Phase 2 uses the new still resolution",
+          "--width 1408" in out and "--height 960" in out, "got %r" % out)
 
-
-def test_dynamic_frame_bounds_explicit_min_disables_both():
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-explicit",
-         "--panels", "6", "--min-frames", "41", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    out = result.stdout
-    check("L21k exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
-                                                                       result.stderr))
-    check("L21l no dynamic banner when --min-frames is explicit",
-          "Dynamic frame bounds:" not in out, "got %r" % out)
-    check("L21m explicit --min-frames 41 passed through unchanged",
-          "--min-frames 41" in out, "got %r" % out)
-    check("L21n --max-frames falls back to its static default (57), not computed",
-          "--max-frames 57" in out, "got %r" % out)
-
-
-# ---------------------------------------------------------------------------
-# L22: --keep-down passthrough to bin/ltx-story-video
-# ---------------------------------------------------------------------------
-
-def test_keep_down_defaults_false():
-    args = ltx_movie.build_parser().parse_args(["some narrative", "--story-id", "test"])
-    check("L22a keep_down defaults to False", args.keep_down is False, "got %r" % args.keep_down)
-
-
-def test_keep_down_absent_from_dry_run_plan_by_default():
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-keepdown-off",
-         "--panels", "6", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    out = result.stdout
-    check("L22b exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
-                                                                       result.stderr))
-    check("L22c --keep-down absent from Phase 4 command by default",
-          "--keep-down" not in out, "got %r" % out)
-
-
-def test_keep_down_present_in_dry_run_plan_when_passed():
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-keepdown-on",
-         "--panels", "6", "--keep-down", "--dry-run"],
-        capture_output=True, text=True, cwd=WS,
-    )
-    out = result.stdout
-    check("L22d exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode,
-                                                                       result.stderr))
-    check("L22e --keep-down present in Phase 4 command when passed",
-          "--keep-down" in out, "got %r" % out)
+    forced = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-mlx2",
+         "--panels", "3", "--no-low-ram", "--force", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L24k --no-low-ram propagates to both phases",
+          forced.stdout.count("--no-low-ram") == 2, "got %r" % forced.stdout)
+    check("L24l --force propagates to Phase 4 only",
+          forced.stdout.count("--force") >= 1, "got %r" % forced.stdout)
 
 
 if __name__ == "__main__":
     test_parser_defaults()
+    test_removed_flags_rejected()
     test_dry_run_prints_phases_and_prompt()
     test_ast_guard_no_toplevel_heavy_imports()
     test_sudo_n_not_sudo_s()
     test_story_prompt_template()
     test_lock_state()
     test_validate_story_md_missing_motion()
-    test_resolve_length_60()
+    test_resolve_length_math()
     test_length_conflicts()
-    test_length_bounds()
-    test_length_40_panels_and_tokens()
+    test_length_too_short()
+    test_length_100_panels_and_tokens()
     test_phase1_nonzero_rc_checks_story_md_before_failing()
-    test_no_stills_defaults_and_validation()
+    test_no_stills_default()
     test_no_stills_orthogonal_to_length()
     test_no_stills_story_prompt_template()
     test_validate_story_md_no_stills()
@@ -677,15 +619,7 @@ if __name__ == "__main__":
     test_default_dry_run_plan_unchanged()
     test_phase1_qwen_agent_gets_workspace_flag()
     test_top5_rss_skips_none_memory_info()
-    test_dynamic_frame_bounds_default_2s_per_panel()
-    test_dynamic_frame_bounds_clamped_by_ceiling()
-    test_dynamic_frame_bounds_tiny_target_floors_at_9()
-    test_dynamic_frame_bounds_infeasible_clamp_exits()
-    test_dynamic_frame_bounds_dry_run_banner()
-    test_dynamic_frame_bounds_explicit_min_disables_both()
-    test_keep_down_defaults_false()
-    test_keep_down_absent_from_dry_run_plan_by_default()
-    test_keep_down_present_in_dry_run_plan_when_passed()
+    test_dry_run_plan_targets_mlx_render()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
