@@ -1826,6 +1826,13 @@ def test_failure_state_machine():
             check("R16q the retried panel ends ok", s and s["units"][1]["status"] == "ok",
                   "got %r" % (s or {}).get("units"))
             check("R16r a fully recovered run exits 0", rc == 0, "rc=%r" % rc)
+            check("R16r2 the retried clip lands in the concat list",
+                  s and [os.path.basename(c) for c in s["clips"]]
+                  == ["panel_01.mp4", "panel_02.mp4"],
+                  "got %r" % (s or {}).get("clips"))
+            check("R16r3 a fully recovered run skips nothing",
+                  s and s["skipped_panels"] == [],
+                  "got %r" % (s or {}).get("skipped_panels"))
 
     with tempfile.TemporaryDirectory() as td:
         with _Harness(td, "fsm5", 2, fail_indices=[1, 2]) as h:
@@ -1843,6 +1850,21 @@ def test_failure_state_machine():
             check("R16v a skill ValueError maps to status invalid",
                   s and s["units"][0]["status"] == "invalid",
                   "got %r" % (s or {}).get("units"))
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm7", 4, fail_indices=[2]) as h:
+            rc = h.run("--on-panel-failure", "stop", "--retry-failed", "1",
+                       "--retry-idle", "0")
+            s = _newest_summary("fsm7")
+            check("R16w stop suppresses the retry pass (attempts stays 1)",
+                  s and s["units"][1]["attempts"] == 1,
+                  "got %r" % (s or {}).get("units"))
+            check("R16x the failed panel was rendered exactly once",
+                  h.rendered_seeds == [1, 2], "got %r" % h.rendered_seeds)
+            check("R16y stopped_reason is still panel_failure",
+                  s and s["stopped_reason"] == "panel_failure",
+                  "got %r" % (s or {}).get("stopped_reason"))
+            check("R16z stop + retry still exits 1", rc == 1, "rc=%r" % rc)
 
 
 if __name__ == "__main__":
