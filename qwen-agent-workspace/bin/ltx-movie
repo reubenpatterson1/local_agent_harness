@@ -85,7 +85,7 @@ Write the complete story to generated/stories/{story_id}/story.md using the writ
 
 ## Panel N — <short title>
 Image: <a single still-image prompt, 70-90 words, describing the panel's visual composition, setting, lighting, and lens/shot choice>
-Motion: <15-40 words describing ONLY the camera motion and the subject's motion within the shot -- no new plot information>
+Motion: <40-70 words describing ONLY the camera motion and the subject's motion within the shot, paced as ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end -- no cuts, no new plot information>
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
 
 The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Image: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
@@ -106,7 +106,7 @@ Narrative to adapt:
 Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file must contain EXACTLY {panels} panel sections, numbered 1 through {panels} in order, each in exactly this format:
 
 ## Panel N — <short title>
-Prompt: <a single video prompt, 150-180 words, describing the shot's visual content, setting, lighting, lens/shot choice, AND the camera motion and subject motion within the shot, together in one continuous description -- no new plot information beyond what this shot shows>
+Prompt: <a single video prompt, 150-180 words, describing the shot's visual content, setting, lighting, lens/shot choice, AND the camera motion and subject motion within the shot, paced as ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end, together in one continuous description -- no cuts, no new plot information beyond what this shot shows>
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
 
 The FIRST time a recurring character (or other recurring visual element) appears, write out their full visual description in the Prompt: field. Every later panel in which that same character appears must repeat that exact description VERBATIM -- word for word, not paraphrased -- so the character stays visually consistent across panels.
