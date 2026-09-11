@@ -2,14 +2,14 @@
 """ltx-movie -- single end-to-end orchestrator for the narrative-to-movie
 pipeline: bin/qwen-agent (story authoring), bin/ltx-story-images (panel
 stills), bin/ltx-story-manifest (frame-allocation manifest), and
-bin/ltx-story-video (render). See
+bin/ltx-mlx-render (render). See
 docs/specs/2026-08-27-narrative-movie-pipeline-design.md for the
 underlying four-phase runbook this consolidates; the ronin_return story
 under generated/stories/ronin_return/ is a reference execution of that
 same runbook, run by hand before this wrapper existed.
 
 None of the three wrapped phase tools (bin/ltx-story-images,
-bin/ltx-story-manifest, bin/ltx-story-video) nor bin/qwen-agent are
+bin/ltx-story-manifest, bin/ltx-mlx-render) nor bin/qwen-agent are
 modified by this script -- each remains independently runnable and
 unchanged; this script only sequences them, adds a few safety gates
 around the sequence, and writes to the same output paths (story.md,
@@ -22,14 +22,15 @@ Four phases and host state:
   Phase 2 (stills)    -- calls bin/ltx-story-images; needs the same server
                          stack UP (it renders through z_image_skill).
   Phase 3 (manifest)  -- calls bin/ltx-story-manifest and then
-                         bin/ltx-story-video --dry-run; both are offline
+                         bin/ltx-mlx-render --dry-run; both are offline
                          and never touch the servers.
-  Phase 4 (render)    -- calls bin/ltx-story-video for real; that tool
-                         takes the vLLM servers DOWN itself
-                         (bin/ltx-host-prep) before rendering and brings
-                         them back UP again (bin/ltx-host-restore) in its
-                         own try/finally, whether it succeeds, fails, or
-                         is interrupted.
+  Phase 4 (render)    -- calls bin/ltx-mlx-render for real. Unlike the old
+                         bin/ltx-story-video path, this tool does NOT take
+                         the vLLM/MTPLX servers down: it never imports
+                         mps_guard, never runs bin/ltx-host-prep or
+                         bin/ltx-host-restore, and never touches ports
+                         8177/8178. One ltx-2-mlx clip per panel, stitched
+                         with ffmpeg's concat demuxer under -c copy.
 
 Three design problems this wrapper solves, on top of the (unchanged)
 phase tools:
@@ -51,12 +52,13 @@ phase tools:
      clear it -- only quitting memory-heavy apps (Chrome/Slack/Docker) did.
 
 --length SECONDS is an alternate way to size the movie: it derives
---panels and --target-seconds from a single number, treating 2 seconds as
-the per-panel chunk basis (panels = max(2, round(SECONDS / 2.0)); the
-per-clip lengths that actually get rendered stay narration-paced by the
-existing bin/ltx-story-manifest allocator around that 2s average, not
-locked to exactly 2s each). --length is mutually exclusive with both
---panels and --target-seconds. Because the qwen-agent story-authoring
+--panels from a single number by dividing by the clip's own playback
+duration, --frames / --fps (10.04s at the defaults):
+panels = round(SECONDS / (frames / fps)), with a hard error below 2
+panels rather than a silent clamp. --length is mutually exclusive with
+--panels. --target-seconds is no longer an input -- it is computed as
+panels * frames / fps and passed to bin/ltx-story-manifest only to keep
+the manifest internally consistent. Because the qwen-agent story-authoring
 call's --max-tokens 4096 default only ever fit ~15 panels, both its
 --max-tokens and its subprocess timeout scale with the resolved panel
 count: max(4096, panels*350) tokens, max(900, panels*60)s.
@@ -230,6 +232,42 @@ def _target_seconds(args):
     bin/ltx-story-manifest purely to keep the manifest internally
     consistent with what actually gets rendered."""
     return args.panels * args.frames / args.fps
+
+
+def _render_flags(args):
+    """The bin/ltx-mlx-render flags shared by the Phase 3 dry-run and the
+    Phase 4 render. Both build their command from THIS ONE helper so the
+    preview can never disagree with the render it previews.
+
+    --resume is always on: a 15-panel run is measured in hours, and without
+    it any interruption costs the entire run. --resume and --force are
+    orthogonal -- --force only ever means "overwrite movie.mp4"."""
+    flags = ["--frames", str(args.frames),
+             "--width", str(args.video_width),
+             "--height", str(args.video_height),
+             "--frame-rate", str(args.fps),
+             "--model", args.model,
+             "--tile-frames", str(args.tile_frames),
+             "--tile-spatial", str(args.tile_spatial)]
+    if args.no_low_ram:
+        flags.append("--no-low-ram")
+    flags.append("--resume")
+    return flags
+
+
+def _phase4_flags(args):
+    """Phase 4 = the shared flags plus the failure policy bin/ltx-movie has
+    always used (skip + one retry + a 3-consecutive circuit breaker), plus
+    --force when bin/ltx-movie --force was given."""
+    flags = _render_flags(args) + [
+        "--panel-timeout", str(args.panel_timeout),
+        "--on-panel-failure", "skip",
+        "--retry-failed", "1",
+        "--retry-idle", "120",
+        "--max-consecutive-failures", "3"]
+    if args.force:
+        flags.append("--force")
+    return flags
 
 
 def _phase1_max_tokens(panels):
@@ -480,8 +518,10 @@ def phase3_manifest(args):
         cmd_manifest += ["--no-images"]
     else:
         cmd_manifest += ["--glob", "panel_*.png", "--images-dir", paths["images_dir"]]
-    cmd_manifest += ["--fps", str(args.fps), "--target-seconds", str(args.target_seconds),
-                     "--min-frames", str(args.min_frames), "--max-frames", str(args.max_frames),
+    cmd_manifest += ["--fps", str(args.fps),
+                     "--target-seconds", str(_target_seconds(args)),
+                     "--min-frames", str(args.frames),
+                     "--max-frames", str(args.frames),
                      "--force"]
     print("Running: %s" % shlex.join(cmd_manifest))
     proc = subprocess.run(cmd_manifest, cwd=WS)
@@ -489,20 +529,18 @@ def phase3_manifest(args):
         print("Error: ltx-story-manifest exited %d" % proc.returncode, file=sys.stderr)
         return 1
 
-    cmd_dryrun = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-                  paths["manifest_path"], paths["movie_path"],
-                  "--mode", "per-panel"]
-    if args.no_stills:
-        cmd_dryrun += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
-    cmd_dryrun += ["--dry-run"]
+    cmd_dryrun = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
+                  paths["manifest_path"], paths["movie_path"]] + _render_flags(args) \
+                 + ["--dry-run"]
     print("Running: %s" % shlex.join(cmd_dryrun))
     proc = subprocess.run(cmd_dryrun, cwd=WS)
     if proc.returncode != 0:
-        print("Error: ltx-story-video --dry-run exited %d" % proc.returncode, file=sys.stderr)
+        print("Error: ltx-mlx-render --dry-run exited %d" % proc.returncode, file=sys.stderr)
         return 1
 
     if not args.no_review:
-        input("Review the allocation above. Enter to render, Ctrl-C to abort: ")
+        input("Review the plan and the estimated render time above. Enter to render, "
+              "Ctrl-C to abort: ")
 
     return 0
 
@@ -605,21 +643,13 @@ def phase4_render(args):
     if not _wait_for_avail(args.min_avail_gib, args.avail_timeout):
         return 1
 
-    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-           paths["manifest_path"], movie_path, "--mode", "per-panel"]
-    if args.no_stills:
-        cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
-    cmd += ["--on-unit-failure", "skip", "--retry-failed", "1",
-            "--retry-idle", "120", "--max-consecutive-failures", "3"]
-    if args.force:
-        cmd.append("--force")
-    if args.keep_down:
-        cmd.append("--keep-down")
+    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
+           paths["manifest_path"], movie_path] + _phase4_flags(args)
     print("Running: %s" % shlex.join(cmd))
 
     rc = _stream_and_tee(cmd, paths["movie_log_path"])
     if rc != 0:
-        print("Error: ltx-story-video exited %d" % rc, file=sys.stderr)
+        print("Error: ltx-mlx-render exited %d" % rc, file=sys.stderr)
         return rc
 
     return _report_summary(args, movie_path, paths["story_dir"])
@@ -670,32 +700,21 @@ def _print_dry_run_plan(args):
     else:
         phase3_manifest_cmd += ["--glob", "panel_*.png", "--images-dir", paths["images_dir"]]
     phase3_manifest_cmd += ["--fps", str(args.fps),
-                             "--target-seconds", str(args.target_seconds),
-                             "--min-frames", str(args.min_frames),
-                             "--max-frames", str(args.max_frames), "--force"]
+                             "--target-seconds", str(_target_seconds(args)),
+                             "--min-frames", str(args.frames),
+                             "--max-frames", str(args.frames), "--force"]
     print("Command: %s" % shlex.join(phase3_manifest_cmd))
-    phase3_video_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-                        paths["manifest_path"], paths["movie_path"],
-                        "--mode", "per-panel"]
-    if args.no_stills:
-        phase3_video_cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
-    phase3_video_cmd += ["--dry-run"]
-    print("Command: %s" % shlex.join(phase3_video_cmd))
+    phase3_render_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
+                         paths["manifest_path"], paths["movie_path"]] \
+                        + _render_flags(args) + ["--dry-run"]
+    print("Command: %s" % shlex.join(phase3_render_cmd))
     print()
 
     print("--- Phase 4: render ---")
     print("Avail gate: wait until psutil.virtual_memory().available/2**30 >= %.1f GiB "
           "(timeout %ds)." % (args.min_avail_gib, args.avail_timeout))
-    phase4_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-video"),
-                  paths["manifest_path"], paths["movie_path"], "--mode", "per-panel"]
-    if args.no_stills:
-        phase4_cmd += ["--engine", "chain", "--reanchor-every", str(args.reanchor_every)]
-    phase4_cmd += ["--on-unit-failure", "skip", "--retry-failed", "1",
-                   "--retry-idle", "120", "--max-consecutive-failures", "3"]
-    if args.force:
-        phase4_cmd.append("--force")
-    if args.keep_down:
-        phase4_cmd.append("--keep-down")
+    phase4_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
+                  paths["manifest_path"], paths["movie_path"]] + _phase4_flags(args)
     print("Command: %s" % shlex.join(phase4_cmd))
     return 0
 
