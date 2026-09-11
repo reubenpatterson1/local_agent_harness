@@ -193,101 +193,43 @@ def _flag_explicit(raw_argv, flag):
 
 
 def _resolve_length(args, raw_argv):
-    """If --length was given, resolve it into args.panels/args.target_seconds
-    (mutating args in place) and validate it. No-op when --length is None.
-    Exits the process (code 2) on any validation failure."""
+    """If --length was given, resolve it into args.panels (mutating args in
+    place) and validate it. No-op when --length is None. Exits the process
+    (code 2) on any validation failure.
+
+    The divisor is args.frames / args.fps -- the clip's own playback
+    duration, 10.0417s at the defaults -- NOT the old hardcoded 2.0s chunk.
+    Without that change --length 60 would silently render a 300-second
+    movie. There is no upper bound on --length any more: the concat demuxer
+    streams, so the old CONCAT_FRAME_SAFETY_CAP has no successor."""
     if args.length is None:
         return
 
     if _flag_explicit(raw_argv, "--panels"):
         print("Error: --length is mutually exclusive with --panels", file=sys.stderr)
         sys.exit(2)
-    if _flag_explicit(raw_argv, "--target-seconds"):
-        print("Error: --length is mutually exclusive with --target-seconds", file=sys.stderr)
+
+    seconds_per_panel = args.frames / args.fps
+    resolved = round(args.length / seconds_per_panel)
+    if resolved < 2:
+        print("Error: --length %.1f at %.2fs per panel (--frames %d @ --fps %d) resolves "
+              "to %d panel(s); the minimum is 2. Raise --length or pass --panels directly."
+              % (args.length, seconds_per_panel, args.frames, args.fps, resolved),
+              file=sys.stderr)
         sys.exit(2)
 
-    # "too short": validated against the raw (pre-rounding) quotient rather
-    # than round(length/2) itself, so an exact 2s-boundary length like 3.0s
-    # (which rounds to 2 either way) is still rejected as implying fewer
-    # than 2 full panel-chunks.
-    if args.length / 2.0 < 2:
-        print("Error: --length %.1f is too short; the minimum is 4.0s (2 panels at "
-              "the 2s-per-panel chunk basis)" % args.length, file=sys.stderr)
-        sys.exit(2)
-
-    implied_frames = args.length * args.fps
-    if implied_frames > CONCAT_FRAME_SAFETY_CAP:
-        max_length = CONCAT_FRAME_SAFETY_CAP / args.fps
-        print(
-            "Error: --length %.1f at --fps %d implies %.0f frames, exceeding the "
-            "downstream %d-frame concat cap (limit ~%d frames); max supported "
-            "--length at fps=%d is %.2fs"
-            % (args.length, args.fps, implied_frames, MAX_TOTAL_FRAMES,
-               CONCAT_FRAME_SAFETY_CAP, args.fps, max_length),
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    args.panels = max(2, round(args.length / 2.0))
-    args.target_seconds = args.length
+    # No max(2, ...) clamp: the check above already guarantees resolved >= 2,
+    # and silently clamping would contradict the error it just declined to
+    # raise.
+    args.panels = resolved
 
 
-def _load_story_manifest_module():
-    manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
-    return importlib.machinery.SourceFileLoader(
-        "ltx_story_manifest_for_frame_bounds", manifest_tool_path
-    ).load_module()
-
-
-def _dynamic_frame_bounds(target_seconds, panels, fps):
-    """Compute (min_frames, max_frames, ceiling_clamped, seconds_per_panel,
-    target_frames_per_panel) from the target seconds-per-panel.
-
-    min/max are a FRAME_MARGIN_LOW..FRAME_MARGIN_HIGH margin around the
-    per-panel target frame count, snapped to bin/ltx-story-manifest's own
-    n=1+8k lattice via its _snap_frames (reused, not reimplemented, so the
-    two tools' lattice math never drifts apart). _snap_frames is monotonic
-    non-decreasing, so min_frames <= max_frames is guaranteed by
-    construction; its n>=9 floor is inherited for free.
-
-    max_frames is then clamped against ltx_ceiling.json's measured
-    "512x512" entry (the only resolution this pipeline ever renders at --
-    bin/ltx-story-video hardcodes 512x512 and bin/ltx-movie never overrides
-    it) when that file/entry is present. If clamping pushes max_frames
-    below min_frames, exits the process (code 2) with a clear error --
-    that combination is infeasible, not something to silently paper over.
-    """
-    story_manifest = _load_story_manifest_module()
-    seconds_per_panel = target_seconds / panels
-    target_frames_per_panel = seconds_per_panel * fps
-    min_frames = story_manifest._snap_frames(FRAME_MARGIN_LOW * target_frames_per_panel)
-    max_frames = story_manifest._snap_frames(FRAME_MARGIN_HIGH * target_frames_per_panel)
-
-    ceiling_clamped = False
-    ceiling_path = os.path.join(WS, "ltx_ceiling.json")
-    ceiling_value = None
-    try:
-        with open(ceiling_path) as f:
-            ceiling_data = json.load(f)
-        ceiling_value = ceiling_data["ceiling"]["512x512"]
-    except (OSError, ValueError, KeyError):
-        ceiling_value = None
-
-    if ceiling_value is not None and ceiling_value < max_frames:
-        max_frames = ceiling_value
-        ceiling_clamped = True
-        if max_frames < min_frames:
-            print(
-                "Error: dynamic --max-frames clamped to the measured 512x512 ceiling "
-                "(%d frames) falls below the computed --min-frames (%d, from %.2fs/panel "
-                "@ %dfps); reduce --target-seconds/--panels (shorter seconds-per-panel) "
-                "or pass explicit --min-frames/--max-frames to override."
-                % (ceiling_value, min_frames, seconds_per_panel, fps),
-                file=sys.stderr,
-            )
-            sys.exit(2)
-
-    return min_frames, max_frames, ceiling_clamped, seconds_per_panel, target_frames_per_panel
+def _target_seconds(args):
+    """--target-seconds is no longer an input. With a flat per-panel frame
+    count it is not a control any more, so it is COMPUTED and passed to
+    bin/ltx-story-manifest purely to keep the manifest internally
+    consistent with what actually gets rendered."""
+    return args.panels * args.frames / args.fps
 
 
 def _phase1_max_tokens(panels):
@@ -767,27 +709,6 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     _resolve_length(args, raw_argv)
-
-    if not _flag_explicit(raw_argv, "--min-frames") and not _flag_explicit(raw_argv, "--max-frames"):
-        (args.min_frames, args.max_frames, ceiling_clamped,
-         seconds_per_panel, target_frames_per_panel) = _dynamic_frame_bounds(
-            args.target_seconds, args.panels, args.fps)
-        print(
-            "Dynamic frame bounds: %.2fs/panel @ %dfps -> target %.1f frames/panel; "
-            "min=%d (0.5x), max=%d (1.5x)%s"
-            % (seconds_per_panel, args.fps, target_frames_per_panel,
-               args.min_frames, args.max_frames,
-               " [clamped to measured 512x512 ceiling]" if ceiling_clamped else "")
-        )
-
-    if _flag_explicit(raw_argv, "--reanchor-every") and not args.no_stills:
-        print("Error: --reanchor-every requires --no-stills (it only applies to the "
-              "chain engine)", file=sys.stderr)
-        sys.exit(2)
-    if args.reanchor_every < 1:
-        print("Error: --reanchor-every must be >= 1, got %d" % args.reanchor_every,
-              file=sys.stderr)
-        sys.exit(2)
 
     if args.dry_run:
         return _print_dry_run_plan(args)
