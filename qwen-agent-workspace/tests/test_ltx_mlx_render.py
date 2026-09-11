@@ -969,6 +969,77 @@ def test_input_content_screen_behavioral():
         render.WS = saved_ws
 
 
+# ---------------------------------------------------------------------------
+# R12: render_panel maps skill outcomes onto unit statuses
+# ---------------------------------------------------------------------------
+
+def _stub_args(**over):
+    a = render.build_parser().parse_args(["/tmp/m.json", "/tmp/o.mp4"])
+    for k, v in over.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_render_panel_statuses():
+    saved = render.SKILL.generate_video
+    try:
+        unit = {"index": 1, "label": "panel-1", "seed": 1, "prompt": "p",
+                "image_path": None, "clip_path": "/tmp/panel_01.mp4", "log_path": None}
+        args = _stub_args()
+
+        render.SKILL.generate_video = lambda *a, **k: "/tmp/panel_01.mp4"
+        res = render.render_panel(unit, args)
+        check("R12a success -> status ok", res["status"] == "ok", "got %r" % res)
+        check("R12b success -> attempts 1", res["attempts"] == 1, "got %r" % res)
+        check("R12c success -> clip path recorded", res["clip"] == "/tmp/panel_01.mp4",
+              "got %r" % res)
+        check("R12d success -> resumed False", res["resumed"] is False, "got %r" % res)
+        check("R12e success -> seconds is a float", isinstance(res["seconds"], float),
+              "got %r" % res)
+        check("R12f unit label carried", res["unit"] == "panel-1", "got %r" % res)
+
+        def _raise_value(*a, **k):
+            raise ValueError("bad image")
+        render.SKILL.generate_video = _raise_value
+        res = render.render_panel(unit, args)
+        check("R12g ValueError -> status invalid", res["status"] == "invalid", "got %r" % res)
+        check("R12h invalid -> clip None", res["clip"] is None, "got %r" % res)
+
+        def _raise_rc1(*a, **k):
+            raise render.SKILL.Ltx2MlxError("boom", returncode=1, cmd=[],
+                                            stderr_tail="tail", output_path="/tmp/x.mp4")
+        render.SKILL.generate_video = _raise_rc1
+        res = render.render_panel(unit, args)
+        check("R12i non-zero rc -> status error", res["status"] == "error", "got %r" % res)
+        check("R12j rc recorded", res.get("rc") == 1, "got %r" % res)
+
+        def _raise_timeout(*a, **k):
+            raise render.SKILL.Ltx2MlxError("slow", returncode=-9, cmd=[],
+                                            stderr_tail="", output_path="/tmp/x.mp4",
+                                            timed_out=True)
+        render.SKILL.generate_video = _raise_timeout
+        res = render.render_panel(unit, args)
+        check("R12k timeout -> status timeout", res["status"] == "timeout", "got %r" % res)
+
+        def _raise_jetsam(*a, **k):
+            raise render.SKILL.Ltx2MlxError("no output", returncode=0, cmd=[],
+                                            stderr_tail="", output_path="/tmp/x.mp4")
+        render.SKILL.generate_video = _raise_jetsam
+        res = render.render_panel(unit, args)
+        check("R12l jetsam signature -> status error", res["status"] == "error",
+              "got %r" % res)
+        check("R12m jetsam signature is flagged for the ladder message",
+              res.get("jetsam") is True, "got %r" % res)
+    finally:
+        render.SKILL.generate_video = saved
+
+
+def test_jetsam_ladder_text():
+    for rung in ("--tile-frames 2", "--tile-spatial 2", "--frames 193", "--frames 145"):
+        check("R12n the jetsam ladder names %r" % rung, rung in render.JETSAM_LADDER,
+              "got %r" % render.JETSAM_LADDER)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -1002,6 +1073,8 @@ if __name__ == "__main__":
     test_input_content_screen_shape()
     test_input_content_screen_empty_list_is_cheap()
     test_input_content_screen_behavioral()
+    test_render_panel_statuses()
+    test_jetsam_ladder_text()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

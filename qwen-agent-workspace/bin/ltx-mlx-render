@@ -505,3 +505,45 @@ def run_input_content_screen(image_paths):
     )
     print(proc.stdout)
     return proc.returncode
+
+
+def render_panel(unit, args):
+    """Render one panel and return its result dict.
+
+    Keys: unit, status, attempts, seconds, clip, resumed -- plus rc/error/
+    jetsam on failure. status is one of "ok", "error", "timeout", "invalid".
+
+    force=True is passed into the skill unconditionally: the render script
+    only gets here when it has already DECIDED to regenerate (either
+    --resume was off, or the existing clip failed the reuse check), so the
+    skill's own overwrite guard must not veto that decision."""
+    started = time.monotonic()
+    base = {"unit": unit["label"], "attempts": 1, "resumed": False}
+    try:
+        clip = SKILL.generate_video(
+            unit["prompt"], unit["clip_path"], image_path=unit["image_path"],
+            width=args.width, height=args.height, num_frames=args.frames,
+            frame_rate=args.frame_rate, seed=unit["seed"], model=args.model,
+            low_ram=(not args.no_low_ram), tile_frames=args.tile_frames,
+            tile_spatial=args.tile_spatial, log_path=unit["log_path"],
+            timeout_s=args.panel_timeout, force=True)
+    except ValueError as e:
+        print("panel %d FAILED (invalid): %s" % (unit["index"], e), file=sys.stderr)
+        base.update({"status": "invalid", "clip": None, "error": str(e),
+                     "seconds": round(time.monotonic() - started, 1)})
+        return base
+    except SKILL.Ltx2MlxError as e:
+        status = "timeout" if e.timed_out else "error"
+        print("panel %d FAILED (%s, rc=%s): %s"
+              % (unit["index"], status, e.returncode, e), file=sys.stderr)
+        base.update({"status": status, "clip": None, "rc": e.returncode,
+                     "error": str(e), "seconds": round(time.monotonic() - started, 1)})
+        if e.returncode == 0 and not e.timed_out:
+            base["jetsam"] = True
+            print(JETSAM_LADDER, file=sys.stderr)
+        return base
+
+    elapsed = round(time.monotonic() - started, 1)
+    print("panel %d ok: %s (%.1fs)" % (unit["index"], clip, elapsed))
+    base.update({"status": "ok", "clip": clip, "seconds": elapsed})
+    return base
