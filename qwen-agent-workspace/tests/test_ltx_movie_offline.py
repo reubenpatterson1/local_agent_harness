@@ -156,10 +156,10 @@ def test_story_prompt_template():
     check("L5a prompt contains VERBATIM", "VERBATIM" in prompt)
     check("L5b prompt contains 'Do not verify'", "Do not verify" in prompt)
     check("L5c prompt formats panels count (7) in", prompt.count("7") >= 2)
-    check("L5d Motion: line asks for 40-70 words", "40-70 words" in prompt,
+    check("L5d Motion: line asks for 90-130 words", "90-130 words" in prompt,
           "got %r" % prompt)
-    check("L5e Motion: line asks for one continuous ten-second take",
-          "ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end" in prompt,
+    check("L5e Motion: line asks for a 4-6 sentence chronological paragraph",
+          "one flowing paragraph of 4-6 sentences in strict chronological order" in prompt,
           "got %r" % prompt)
     check("L5f Motion: line forbids cuts and new plot info",
           "no cuts, no new plot information" in prompt, "got %r" % prompt)
@@ -167,6 +167,19 @@ def test_story_prompt_template():
     check("L5h Narration: line is unchanged",
           "Narration: <one sentence of voice-over narration; vary the sentence length "
           "across panels rather than repeating a similar length every time>" in prompt)
+    check("L5i Motion: line demands enough beats to fill the ten seconds",
+          "fill the full ten seconds instead of rushing the action" in prompt,
+          "got %r" % prompt)
+    check("L5j Motion: line no longer carries the old single-take framing",
+          "ONE CONTINUOUS TEN-SECOND TAKE" not in prompt, "got %r" % prompt)
+    check("L5k a style line bans abstract mood words",
+          'never "she looks sad" or any other mood word' in prompt, "got %r" % prompt)
+    check("L5l a style line bans scene-opener phrasing",
+          'never open with "The scene opens with", "We see" or "There is"' in prompt,
+          "got %r" % prompt)
+    check("L5m Motion: must not restate what Image: already carries",
+          "Do not restate the composition, setting, lighting or lens the Image: field "
+          "already carries" in prompt, "got %r" % prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +370,24 @@ def test_no_stills_story_prompt_template():
     check("L15g forbids emitting the old fields",
           "Do not emit an Image: or Motion: field." in p)
     check("L15h word band is 150-180", "150-180 words" in p, "got %r" % p[:600])
-    check("L15l Prompt: line carries the ten-second pacing",
-          "ONE CONTINUOUS TEN-SECOND TAKE with a clear beginning, middle and end" in p,
-          "got %r" % p[:600])
+    check("L15l Prompt: line asks for a 6-8 sentence chronological paragraph",
+          "one flowing paragraph of 6-8 sentences" in p and "strictly chronological" in p,
+          "got %r" % p[:900])
+    check("L15m Prompt: line demands enough beats to fill the ten seconds",
+          "fill the full ten seconds instead of rushing the action" in p, "got %r" % p[:900])
+    check("L15n Prompt: line no longer carries the old single-take framing",
+          "ONE CONTINUOUS TEN-SECOND TAKE" not in p, "got %r" % p[:900])
+    check("L15o Prompt: line keeps the no-cuts / no-new-plot rule",
+          "no cuts, no new plot information beyond what this shot shows" in p,
+          "got %r" % p[:900])
+    check("L15p Prompt: line states the LTX element order",
+          "camera angle/lens and camera movement" in p, "got %r" % p[:900])
+    check("L15q a style line bans abstract mood words and intensifiers",
+          'never "she looks sad" or any other mood word' in p
+          and '"a red dress", not "a vibrant crimson dress"' in p, "got %r" % p[:900])
+    check("L15r a style line bans scene-opener phrasing",
+          'never open with "The scene opens with", "We see" or "There is"' in p,
+          "got %r" % p[:900])
     check("L15i formats narrative/story_id/panels",
           "some narrative" in p and "some_id" in p and "EXACTLY 7 panel sections" in p)
 
@@ -483,6 +511,7 @@ def test_no_stills_dry_run_plan():
           and "--reanchor-every" not in out, "got %r" % out)
     check("L18g the rendered prompt is the no-stills template",
           "Prompt: <a single video prompt, 150-180 words" in out
+          and "one flowing paragraph of 6-8 sentences" in out
           and "Image: <a single still-image prompt" not in out)
     check("L18h no per-panel opener/follower table here (it comes from a real Phase 3)",
           "T2V opener" not in out, "got %r" % out)
@@ -500,6 +529,9 @@ def test_default_dry_run_plan_unchanged():
     check("L18j default plan still calls ltx-story-images", "ltx-story-images" in out)
     check("L18k default plan has no --no-images / --engine chain",
           "--no-images" not in out and "--engine chain" not in out)
+    check("L18l default plan carries the rewritten Motion: line",
+          "Motion: <90-130 words covering ONLY the camera motion" in out
+          and "ONE CONTINUOUS TEN-SECOND TAKE" not in out, "got %r" % out)
 
 
 # ---------------------------------------------------------------------------
