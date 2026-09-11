@@ -1630,6 +1630,221 @@ def test_finish_run_writes_summary_when_concat_fails():
          render.build_concat_command) = saved
 
 
+# ---------------------------------------------------------------------------
+# R15: end-to-end main() against a stubbed skill and a stubbed concat
+# ---------------------------------------------------------------------------
+
+class _Harness(object):
+    """Runs main() in-process with SKILL.generate_video, probe_streams,
+    assert_clips_uniform, build_concat_command and clip_frame_count all
+    stubbed, so no model and no ffmpeg are needed. Records which panel seeds
+    were actually rendered."""
+
+    def __init__(self, td, story_id, n_panels, fail_indices=(), fail_status="error"):
+        self.td = td
+        self.story_id = story_id
+        self.rendered_seeds = []
+        self.fail_indices = set(fail_indices)
+        self.fail_status = fail_status
+        self.saved = {}
+        img = os.path.join(td, "p.png")
+        with open(img, "wb") as f:
+            f.write(b"png")
+        self.manifest = _write_manifest(
+            td, [_panel(i, img) for i in range(1, n_panels + 1)], story_id=story_id)
+        self.clips = os.path.join(td, "clips")
+        os.makedirs(self.clips, exist_ok=True)
+        self.out = os.path.join(td, "movie.mp4")
+
+    def __enter__(self):
+        self.saved = {
+            "gen": render.SKILL.generate_video,
+            "probe": render.probe_streams,
+            "uniform": render.assert_clips_uniform,
+            "concat": render.build_concat_command,
+            "count": render.clip_frame_count,
+            "bin": render.SKILL.LTX2_MLX_BIN,
+        }
+        fake_bin = os.path.join(self.td, "fake-ltx")
+        with open(fake_bin, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_bin, 0o755)
+        render.SKILL.LTX2_MLX_BIN = fake_bin
+
+        harness = self
+
+        def _gen(prompt, output_path, image_path=None, **kw):
+            harness.rendered_seeds.append(kw["seed"])
+            idx = int(os.path.basename(output_path)[len("panel_"):-len(".mp4")])
+            if idx in harness.fail_indices:
+                if harness.fail_status == "invalid":
+                    raise ValueError("stub invalid panel %d" % idx)
+                raise render.SKILL.Ltx2MlxError(
+                    "stub failure", returncode=1, cmd=[], stderr_tail="stub tail",
+                    output_path=output_path)
+            with open(output_path, "wb") as f:
+                f.write(b"\x00" * 128)
+            return os.path.abspath(output_path)
+
+        render.SKILL.generate_video = _gen
+        render.probe_streams = lambda p: {"streams": []}
+        render.assert_clips_uniform = lambda pairs, w, h, fr: None
+        render.build_concat_command = lambda lp, out: [
+            sys.executable, "-c",
+            "import sys; open(sys.argv[1],'wb').write(b'MOVIE')", out]
+        render.clip_frame_count = lambda p: 241
+        return self
+
+    def __exit__(self, *exc):
+        render.SKILL.generate_video = self.saved["gen"]
+        render.probe_streams = self.saved["probe"]
+        render.assert_clips_uniform = self.saved["uniform"]
+        render.build_concat_command = self.saved["concat"]
+        render.clip_frame_count = self.saved["count"]
+        render.SKILL.LTX2_MLX_BIN = self.saved["bin"]
+        shutil.rmtree(render.story_dir_for(self.story_id), ignore_errors=True)
+        return False
+
+    def run(self, *extra):
+        return render.main([self.manifest, self.out, "--clips-dir", self.clips,
+                            "--skip-input-screen"] + list(extra))
+
+
+def test_resume_force_orthogonality():
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "orth1", 2) as h:
+            rc = h.run()
+            check("R15a first run renders every panel and exits 0", rc == 0,
+                  "rc=%r" % rc)
+            check("R15b both panels rendered", h.rendered_seeds == [1, 2],
+                  "got %r" % h.rendered_seeds)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "orth2", 2) as h:
+            h.run()
+            h.rendered_seeds[:] = []
+            rc = h.run("--resume", "--force")
+            check("R15c --resume --force renders zero panels", h.rendered_seeds == [],
+                  "got %r" % h.rendered_seeds)
+            check("R15d --resume --force rewrites the movie and exits 0", rc == 0,
+                  "rc=%r" % rc)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "orth3", 2) as h:
+            h.run()
+            h.rendered_seeds[:] = []
+            rc = h.run("--resume")
+            check("R15e --resume alone with an existing OUTPUT_MP4 exits 2", rc == 2,
+                  "rc=%r" % rc)
+            check("R15f nothing was rendered before that exit", h.rendered_seeds == [],
+                  "got %r" % h.rendered_seeds)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "orth4", 2) as h:
+            h.run()
+            h.rendered_seeds[:] = []
+            rc = h.run("--force")
+            check("R15g --force alone regenerates every panel", h.rendered_seeds == [1, 2],
+                  "got %r" % h.rendered_seeds)
+            check("R15h --force alone exits 0", rc == 0, "rc=%r" % rc)
+
+
+def test_failure_state_machine():
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm1", 4, fail_indices=[2]) as h:
+            rc = h.run("--on-panel-failure", "stop")
+            check("R16a stop aborts on the first failure", h.rendered_seeds == [1, 2],
+                  "got %r" % h.rendered_seeds)
+            check("R16b stop exits 1", rc == 1, "rc=%r" % rc)
+            s = _newest_summary("fsm1")
+            check("R16c stopped_reason is panel_failure",
+                  s and s["stopped_reason"] == "panel_failure",
+                  "got %r" % (s or {}).get("stopped_reason"))
+            check("R16d panels after the abort are not_attempted",
+                  s and s["units"][3]["status"] == "not_attempted",
+                  "got %r" % (s or {}).get("units"))
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm2", 4, fail_indices=[2]) as h:
+            rc = h.run("--on-panel-failure", "skip")
+            check("R16e skip continues past the failure",
+                  h.rendered_seeds == [1, 2, 3, 4], "got %r" % h.rendered_seeds)
+            check("R16f skip exits 1 when a panel was skipped", rc == 1, "rc=%r" % rc)
+            s = _newest_summary("fsm2")
+            check("R16g survivors are concatenated in index order",
+                  s and [os.path.basename(c) for c in s["clips"]]
+                  == ["panel_01.mp4", "panel_03.mp4", "panel_04.mp4"],
+                  "got %r" % (s or {}).get("clips"))
+            check("R16h skipped_panels records the failure", s and s["skipped_panels"] == [2],
+                  "got %r" % (s or {}).get("skipped_panels"))
+            check("R16i completed_units counts survivors only",
+                  s and s["completed_units"] == 3, "got %r" % (s or {}).get("completed_units"))
+            check("R16j actual_total_frames = completed * frames_per_panel",
+                  s and s["actual_total_frames"] == 3 * 241,
+                  "got %r" % (s or {}).get("actual_total_frames"))
+            check("R16k intended_total_frames = requested * frames_per_panel",
+                  s and s["intended_total_frames"] == 4 * 241,
+                  "got %r" % (s or {}).get("intended_total_frames"))
+            check("R16l the movie was still written", s and s["output_path"] is not None)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm3", 6, fail_indices=[2, 3, 4]) as h:
+            rc = h.run("--on-panel-failure", "skip", "--max-consecutive-failures", "3")
+            check("R16m the circuit breaker stops on the third consecutive failure",
+                  h.rendered_seeds == [1, 2, 3, 4], "got %r" % h.rendered_seeds)
+            s = _newest_summary("fsm3")
+            check("R16n stopped_reason is consecutive_failures",
+                  s and s["stopped_reason"] == "consecutive_failures",
+                  "got %r" % (s or {}).get("stopped_reason"))
+            check("R16o exits 1", rc == 1, "rc=%r" % rc)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm4", 2, fail_indices=[2]) as h:
+            h.fail_indices = {2}
+
+            original = render.SKILL.generate_video
+            state = {"seen": 0}
+
+            def _flaky(prompt, output_path, image_path=None, **kw):
+                idx = int(os.path.basename(output_path)[len("panel_"):-len(".mp4")])
+                if idx == 2 and state["seen"] == 0:
+                    state["seen"] = 1
+                    h.rendered_seeds.append(kw["seed"])
+                    raise render.SKILL.Ltx2MlxError(
+                        "first attempt fails", returncode=1, cmd=[],
+                        stderr_tail="t", output_path=output_path)
+                h.fail_indices = set()
+                return original(prompt, output_path, image_path=image_path, **kw)
+
+            render.SKILL.generate_video = _flaky
+            rc = h.run("--on-panel-failure", "skip", "--retry-failed", "1",
+                       "--retry-idle", "0")
+            s = _newest_summary("fsm4")
+            check("R16p the retry pass records attempts: 2",
+                  s and s["units"][1]["attempts"] == 2,
+                  "got %r" % (s or {}).get("units"))
+            check("R16q the retried panel ends ok", s and s["units"][1]["status"] == "ok",
+                  "got %r" % (s or {}).get("units"))
+            check("R16r a fully recovered run exits 0", rc == 0, "rc=%r" % rc)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm5", 2, fail_indices=[1, 2]) as h:
+            rc = h.run("--on-panel-failure", "skip", "--max-consecutive-failures", "0")
+            s = _newest_summary("fsm5")
+            check("R16s all-panels-failed writes output_path null",
+                  s and s["output_path"] is None, "got %r" % (s or {}).get("output_path"))
+            check("R16t all-panels-failed exits 1", rc == 1, "rc=%r" % rc)
+            check("R16u the summary still exists", s is not None)
+
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "fsm6", 2, fail_indices=[1], fail_status="invalid") as h:
+            h.run("--on-panel-failure", "skip")
+            s = _newest_summary("fsm6")
+            check("R16v a skill ValueError maps to status invalid",
+                  s and s["units"][0]["status"] == "invalid",
+                  "got %r" % (s or {}).get("units"))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_geometry_validation()
@@ -1678,6 +1893,8 @@ if __name__ == "__main__":
     test_summary_shape()
     test_finish_run_emits_exactly_summary_keys()
     test_finish_run_writes_summary_when_concat_fails()
+    test_resume_force_orthogonality()
+    test_failure_state_machine()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
