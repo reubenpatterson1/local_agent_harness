@@ -287,6 +287,14 @@ def test_length_100_panels_and_tokens():
               "got %s" % m.group(1))
 
 
+def test_phase1_scaling():
+    check("L11e 15 panels -> 5250 tokens", ltx_movie._phase1_max_tokens(15) == 5250)
+    check("L11f 30 panels -> 10500 tokens", ltx_movie._phase1_max_tokens(30) == 10500)
+    check("L11g 5 panels floors at 4096", ltx_movie._phase1_max_tokens(5) == 4096)
+    check("L11h 30 panels -> 1800s timeout", ltx_movie._phase1_timeout(30) == 1800)
+    check("L11i 5 panels floors at 900s", ltx_movie._phase1_timeout(5) == 900)
+
+
 # ---------------------------------------------------------------------------
 # L12 (addendum): source guard -- Phase 1 nonzero-rc handling checks
 # os.path.isfile(story_md) before any return 1 in that block, so a valid
@@ -441,6 +449,14 @@ def test_no_stills_phase_sequencing_source():
           "got %r occurrences" % text.count("_render_flags(args)"))
     check("L17e the chain engine is gone", '"--engine"' not in text,
           "the --engine chain wiring must be gone")
+    check("L17f every render invocation targets bin/ltx-mlx-render",
+          text.count('os.path.join(WS, "bin", "ltx-mlx-render")') == 4
+          and 'os.path.join(WS, "bin", "ltx-story-video")' not in text,
+          "got %r" % text.count('os.path.join(WS, "bin", "ltx-mlx-render")'))
+    check("L17g the real Phase 3 manifest cmd pins a flat frame count",
+          'cmd_manifest += ["--fps", str(args.fps),' in text
+          and '"--min-frames", str(args.frames),' in text
+          and '"--max-frames", str(args.frames),' in text)
 
 
 # ---------------------------------------------------------------------------
@@ -573,10 +589,21 @@ def test_dry_run_plan_targets_mlx_render():
           "--min-frames 241 --max-frames 241" in out, "got %r" % out)
     check("L24e --target-seconds is computed as panels*frames/fps",
           "--target-seconds 30.125" in out, "got %r" % out)
-    check("L24f the render flags are threaded",
-          "--frames 241" in out and "--width 704" in out and "--height 480" in out
-          and "--frame-rate 24" in out and "--tile-frames 1" in out
-          and "--tile-spatial 1" in out, "got %r" % out)
+
+    def _val(line, flag):
+        t = line.split()
+        return t[t.index(flag) + 1] if flag in t else None
+
+    render_lines = [l for l in out.splitlines() if "ltx-mlx-render" in l]
+    check("L24f exactly two ltx-mlx-render commands appear (Phase 3 probe, Phase 4 render)",
+          len(render_lines) == 2, "got %r" % render_lines)
+    for line in render_lines:
+        for flag, want in (("--frames", "241"), ("--width", "704"), ("--height", "480"),
+                           ("--frame-rate", "24"), ("--tile-frames", "1"),
+                           ("--tile-spatial", "1")):
+            check("L24f %r has %s %s" % (line.split()[0:2], flag, want),
+                  _val(line, flag) == want,
+                  "got %r in %r" % (_val(line, flag), line))
     check("L24g --resume is always passed", out.count("--resume") == 2, "got %r" % out)
     check("L24h --no-low-ram is absent by default", "--no-low-ram" not in out, "got %r" % out)
     check("L24i Phase 4 carries the failure policy",
@@ -592,8 +619,16 @@ def test_dry_run_plan_targets_mlx_render():
         capture_output=True, text=True, cwd=WS)
     check("L24k --no-low-ram propagates to both phases",
           forced.stdout.count("--no-low-ram") == 2, "got %r" % forced.stdout)
-    check("L24l --force propagates to Phase 4 only",
-          forced.stdout.count("--force") >= 1, "got %r" % forced.stdout)
+
+    def _render_lines(stdout):
+        return [l for l in stdout.splitlines() if "ltx-mlx-render" in l]
+
+    fl = _render_lines(forced.stdout)
+    check("L24l --force reaches BOTH the Phase 3 probe and the Phase 4 render",
+          len(fl) == 2 and all("--force" in l.split() for l in fl), "got %r" % fl)
+    pl = _render_lines(out)
+    check("L24m neither render command carries --force when it was not given",
+          len(pl) == 2 and not any("--force" in l.split() for l in pl), "got %r" % pl)
 
 
 if __name__ == "__main__":
@@ -609,6 +644,7 @@ if __name__ == "__main__":
     test_length_conflicts()
     test_length_too_short()
     test_length_100_panels_and_tokens()
+    test_phase1_scaling()
     test_phase1_nonzero_rc_checks_story_md_before_failing()
     test_no_stills_default()
     test_no_stills_orthogonal_to_length()
