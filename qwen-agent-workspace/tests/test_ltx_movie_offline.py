@@ -44,8 +44,8 @@ def test_parser_defaults():
     check("L1 panels == 15", args.panels == 15, "got %r" % args.panels)
     check("L1 frames == 241", args.frames == 241, "got %r" % args.frames)
     check("L1 fps == 24", args.fps == 24, "got %r" % args.fps)
-    check("L1 image_width == 1408", args.image_width == 1408, "got %r" % args.image_width)
-    check("L1 image_height == 960", args.image_height == 960, "got %r" % args.image_height)
+    check("L1 image_width == 1280", args.image_width == 1280, "got %r" % args.image_width)
+    check("L1 image_height == 704", args.image_height == 704, "got %r" % args.image_height)
     check("L1 video_width == 704", args.video_width == 704, "got %r" % args.video_width)
     check("L1 video_height == 448", args.video_height == 448, "got %r" % args.video_height)
     check("L1 image_seed == 0", args.image_seed == 0, "got %r" % args.image_seed)
@@ -156,7 +156,7 @@ def test_story_prompt_template():
     check("L5a prompt contains VERBATIM", "VERBATIM" in prompt)
     check("L5b prompt contains 'Do not verify'", "Do not verify" in prompt)
     check("L5c prompt formats panels count (7) in", prompt.count("7") >= 2)
-    check("L5d Motion: line asks for 150-220 words", "150-220 words" in prompt,
+    check("L5d Motion: line asks for 110-160 words", "110-160 words" in prompt,
           "got %r" % prompt)
     check("L5e Motion: line asks for a 7-10 sentence chronological paragraph",
           "one flowing paragraph of 7-10 sentences in strict chronological order" in prompt,
@@ -177,10 +177,9 @@ def test_story_prompt_template():
     check("L5l a style line bans scene-opener phrasing",
           'never open with "The scene opens with", "We see" or "There is"' in prompt,
           "got %r" % prompt)
-    check("L5m Motion: keeps setting/lighting/wardrobe consistent with Image: "
-          "instead of banning it",
-          "Keep the setting, lighting and wardrobe consistent with the Image: field" in prompt
-          and "Do not restate the composition" not in prompt, "got %r" % prompt)
+    check("L5m Motion: bans restating appearance/wardrobe/setting/lighting from Image:",
+          "Keep the setting, lighting and wardrobe consistent with the Image: field" not in prompt
+          and "must not be described again in Motion:" in prompt, "got %r" % prompt)
     check("L5n Motion: line names the temporal connectors",
           '"initially", "as", "then", "while", "simultaneously", "a moment later"' in prompt,
           "got %r" % prompt)
@@ -582,7 +581,7 @@ def test_default_dry_run_plan_unchanged():
     check("L18k default plan has no --no-images / --engine chain",
           "--no-images" not in out and "--engine chain" not in out)
     check("L18l default plan carries the rewritten Motion: line",
-          "Motion: <150-220 words in the present tense" in out
+          "Motion: <110-160 words in the present tense" in out
           and "ONE CONTINUOUS TEN-SECOND TAKE" not in out, "got %r" % out)
 
 
@@ -695,7 +694,7 @@ def test_dry_run_plan_targets_mlx_render():
           and "--retry-idle 120" in out and "--max-consecutive-failures 3" in out
           and "--panel-timeout 7200" in out, "got %r" % out)
     check("L24j Phase 2 uses the new still resolution",
-          "--width 1408" in out and "--height 960" in out, "got %r" % out)
+          "--width 1280" in out and "--height 704" in out, "got %r" % out)
 
     forced = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-mlx2",

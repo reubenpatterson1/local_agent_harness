@@ -87,8 +87,8 @@ def test_unlabeled_section_keeps_text_and_empty_labels():
 
 def test_parser_defaults():
     args = story_images.build_parser().parse_args(["--story-md", "s.md", "--out-dir", "o"])
-    check("I3 width == 1024", args.width == 1024, "got %r" % args.width)
-    check("I3 height == 1024", args.height == 1024, "got %r" % args.height)
+    check("I3 width == 1280", args.width == 1280, "got %r" % args.width)
+    check("I3 height == 704", args.height == 704, "got %r" % args.height)
     check("I3 seed == 0", args.seed == 0, "got %r" % args.seed)
     check("I3 force is False", args.force is False, "got %r" % args.force)
     check("I3 dry_run is False", args.dry_run is False, "got %r" % args.dry_run)
