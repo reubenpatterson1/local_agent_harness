@@ -103,6 +103,100 @@ emphatically out of scope:
 - **An audit log.** [HARNESS] 14 nice-to-have 1 stays out of scope; the `[auto]` trace lines are
   terminal output only.
 
+### 1.4 Superseded: `--danger-auto-approve` (2026-09-12)
+
+**Two clauses of this document are superseded as of commit `fa87f9b`. They are superseded, not
+reinterpreted, not read narrowly, not satisfied by a technicality.**
+
+1. Section 1.3, bullet 2 above: "**A `--yes` / `--auto-approve` / `--dry-run` flag, an allowlist
+   file, a per-session 'always allow' answer, or any other operator-configurable widening of the tier
+   table.** The tier table is a compile-time constant. Do not add a flag that touches it."
+2. Section 9, nice-to-have 9: "Any operator-configurable widening of `AUTO_APPROVE_TOOLS`. (Not
+   merely out of scope — forbidden.)"
+
+Both were written to forbid exactly the class of thing that now exists. A flag now lets the operator
+skip the confirmation prompt. Saying otherwise would be word games. What follows is what was built,
+which part of the original concern survives intact, and which part was deliberately given up.
+
+**What was built.** `bin/qwen-agent` gained `--danger-auto-approve` (off by default, `store_true`),
+covered by `tests/test_qwen_agent_danger_auto_approve.py` (37 checks, offline). When the flag is set,
+every tool call except `promote` runs without a confirmation prompt — `bash`, `run_python`,
+`generate_image`, and an overwriting `write_file` included. Neither `bash` nor `run_python` is
+sandboxed under it; they run as the operator, with the operator's permissions.
+
+**Why the tier table itself is still a compile-time constant.** The original clause's operational
+concern was that the tier table would be widened *silently and invisibly* — that a reader of
+`should_auto_approve()`, or of a transcript, could no longer tell what the harness would run without
+asking. That concern is still substantively honoured, by four properties that the implementation has
+and that the tests assert:
+
+- **`should_auto_approve()` is unmodified and provably flag-blind.** It takes `(name,
+  resolved_paths)` and nothing else; it has no access to `args_ns` and therefore cannot observe the
+  flag. `AUTO_APPROVE_TOOLS` is untouched. The bypass is composed at the **dispatch site** instead,
+  as `danger_bypass = args_ns.danger_auto_approve and name != "promote" and not auto_by_policy`, and
+  the final `auto` is the `or` of the two. The policy function and the operator override are two
+  separate, separately-readable decisions, which is the property Section 3.2's reasoning depends on
+  and which a flag *inside* the tier table would have destroyed. Test D7 asserts the string
+  `danger` does not occur anywhere in `should_auto_approve`'s source; D4–D6b assert it still refuses
+  `promote`, `bash`, `run_python`, and `generate_image`; D8 asserts `AUTO_APPROVE_TOOLS` still
+  excludes the whole gated tier.
+- **`promote` is excluded unconditionally, before any tool-identity lookup.** The dispatch-site
+  `name != "promote"` conjunct is evaluated independently of `AUTO_APPROVE_TOOLS`, mirroring the
+  by-name refusal at the top of `should_auto_approve()`. A long-term memory write — the one write
+  this harness never deletes and loads into every future session — still requires a human keystroke
+  under the flag. Tests D17, D18, and D19 assert this, D18 specifically by *tampering*
+  `AUTO_APPROVE_TOOLS` to include `"promote"` at runtime and showing the prompt is still reached;
+  D19b asserts the `name != "promote"` guard is literally present in `dispatch`'s source.
+- **Every bypassed call traces distinctly.** A call waved through by the flag prints `[danger-auto]`,
+  never `[auto]` (tests D16, D20, D23, D23b, and the end-to-end D29), and a call the tier policy
+  would have auto-approved anyway still prints `[auto]` even with the flag on (D21, D22). A
+  transcript reader can always tell, per call, which ran without confirmation *and why* — tier policy
+  or operator override. Nothing became invisible.
+- **The bypass does not propagate.** `--danger-auto-approve` is not forwarded to `delegate_to_skill`
+  child processes; a child re-derives its own approval behaviour from its own argv, which does not
+  carry the flag (test D33 asserts the string is absent from `exec_delegate_to_skill`'s source).
+- **The flag announces itself.** `print_danger_auto_warning()` prints a one-time banner at startup in
+  both REPL and one-shot mode, stating that every tool call runs without asking, that `bash` and
+  `run_python` are not sandboxed, that bypassed calls trace as `[danger-auto]`, and that `promote` is
+  the only tool still asking. The flag's name contains the word `danger`; `--help` says "For
+  unattended runs only." Nobody reaches this state by accident or by a default.
+
+**The accepted risk, stated plainly.** This flag exists so that an unattended or long-running session
+can proceed with no human present to answer prompts. That is its entire purpose, and the cost is
+exact: with the flag set, `bash`, `run_python`, `generate_image`, and an overwriting `write_file`
+execute with **zero real-time human review**. The [HARNESS] Section 2 threat model's mitigation —
+"the human reads every command that can change something before it runs" — does not hold in a
+`--danger-auto-approve` run. The full prompt-injection kill chain named in Section 3.3 (hostile text
+fetched into context → the abliterated model complies → unsandboxed execution) has no human gate in
+it when the flag is on. The tier table's compile-time constancy does not protect against this; it was
+never meant to. Section 3.2's prohibition on content-based classification of `bash`/`run_python` also
+still stands, and is *not* a mitigation here either: no classifier is being trusted, because no
+classifier exists — the call simply runs.
+
+This risk is **accepted as implemented, not mitigated further.** The decision is the user's, made
+explicitly, with the chain above named. No additional confirmation layer, no narrower scope, no
+command allowlist, no per-tool opt-in, and no interaction guard against other features is to be added
+under the heading of making this flag safer. A proposal to do so is a re-litigation of a settled
+tradeoff, not a finding.
+
+**What would change the calculus.** Any of the following makes this acceptance stale and requires the
+tradeoff to be re-opened rather than re-asserted:
+
+- Evidence that the flag is being reached for in *attended* sessions — an operator sitting at the
+  terminal using it to avoid typing `y`, rather than to leave the machine running. That is approval
+  fatigue re-emerging as a habit, and it converts an unattended-run tool into a default posture.
+- Any incident in which a `[danger-auto]` call did damage: data loss, credential exposure, an
+  outbound request the operator did not intend, or an injected instruction reaching execution.
+- The flag becoming reachable without an explicit operator-typed argument — set from a config file,
+  an environment variable, a wrapper script's default, or any caller that passes it implicitly. The
+  acceptance above rests on the flag being typed, per invocation, by a human who read its name.
+- `promote`'s unconditional exclusion being weakened, or the `[danger-auto]` trace label being merged
+  back into `[auto]`. Both are load-bearing for this acceptance, not incidental.
+
+**Composition with `/resume`.** `--danger-auto-approve` composes with the session-memory `/resume`
+command into a chain with no human review at any point. That composition is named and accepted in
+`docs/specs/2026-09-02-qwen-agent-session-memory-design.md` Section 17; it is not repeated here.
+
 ---
 
 ## 2. Complete list of parent-spec revisions
@@ -122,7 +216,7 @@ Every deviation from the parents is listed here. Nothing else changes.
 | [HARNESS] 13 (Manual test script) | **amended** — T1–T8 still run; T2/T3/T5 no longer show a prompt | Section 8 of this spec |
 | [HARNESS] 14 must-haves ("confirmation on every call with no exemptions") | **superseded** | Section 9 of this spec |
 | [ONESHOT] 1.2 criterion 7 ("banner identical") | **amended** | banner is now Section 6.6's text; byte-identity is asserted against *that* |
-| [ONESHOT] 1.3 bullet 1 ("No auto-approval … of any kind") | **superseded** | Section 3 of this spec. The *residual* prohibition (no operator-facing approval-bypass flag) survives in Section 1.3 above. |
+| [ONESHOT] 1.3 bullet 1 ("No auto-approval … of any kind") | **superseded** | Section 3 of this spec. The *residual* prohibition (no operator-facing approval-bypass flag) held in Section 1.3 above until 2026-09-12, and is itself **superseded** by Section 1.4. |
 | [ONESHOT] 4.2 `outcome` field type and vocabulary table | **amended** — `"duplicate"` added, `"approved"` prose widened | Section 6.3 of this spec |
 | [ONESHOT] 6.3 stdout-purity audit table | **amended** — two new writer rows | Section 6.7 of this spec |
 | [ONESHOT] 8 (Acceptance tests A1–A10) | **retained in full**, plus B1–B11 | Section 8 of this spec |
@@ -1224,6 +1318,13 @@ grep -nE '\bargs\[.(command|code).\]' /Users/reubenpatterson/.local/bin/qwen-age
 7. Colouring or bolding the `[auto]` / `[duplicate]` lines.
 8. Blocking repeats of *successful* calls, or of duplicate calls in the same round only.
 9. Any operator-configurable widening of `AUTO_APPROVE_TOOLS`. (Not merely out of scope — forbidden.)
+
+**Superseded 2026-09-12 (see Section 1.4):** nice-to-have 9 above, and must-have 10's "No new CLI
+flag", no longer hold. `--danger-auto-approve` exists, `parse_args()` and `main()` were both touched
+to add and announce it, and the accepted risk is recorded in Section 1.4. Must-haves 1–9 and
+nice-to-haves 1–8 are unaffected: in particular `AUTO_APPROVE_TOOLS` and `should_auto_approve()` are
+still exactly as must-haves 1–3 require, and no `--no-auto-approve` / `--strict` counterpart flag was
+added.
 
 ---
 

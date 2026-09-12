@@ -689,7 +689,7 @@ def test_source_guards():
                 import_names.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
             import_names.add(node.module)
-    expected = {"argparse", "ast", "datetime", "html.parser", "json", "operator", "os", "re",
+    expected = {"argparse", "ast", "base64", "datetime", "html.parser", "json", "operator", "os", "re",
                 "signal", "subprocess", "sys", "time", "urllib.error", "urllib.parse",
                 "urllib.request", "uuid", "pathlib"}
     check("M14 no new imports", import_names == expected, "got %r" % (import_names,))

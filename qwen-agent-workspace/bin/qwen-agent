@@ -48,11 +48,11 @@ from pathlib import Path
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8177/v1"
 DEFAULT_MODEL = "qwen38-6bit"
-DEFAULT_WORKSPACE = "~/local_model_harness_red_team/qwen-agent-workspace"
+DEFAULT_WORKSPACE = "~/qwen-agent-workspace"
 DEFAULT_MAX_TOKENS = 1536
 DEFAULT_REQ_TIMEOUT = 600
 DEFAULT_TOOL_TIMEOUT = 30
-DEFAULT_MAX_ROUNDS = 20
+DEFAULT_MAX_ROUNDS = 10
 RESULT_CHAR_LIMIT = 4000       # characters, applied to every tool result string
 FETCH_BYTE_LIMIT = 2_000_000  # bytes read from the socket before hard stop
 FETCH_USER_AGENT = "qwen-agent/1.0"
@@ -61,9 +61,9 @@ FETCH_USER_AGENT = "qwen-agent/1.0"
 # only the fallback when the server does not report one. CONTEXT_FLOOR is headroom
 # held back from the budget on every request: the estimator below models neither the
 # chat template's per-message control tokens nor a tokenizer's disagreement with a
-# character heuristic, and 1024 tokens is ~6% of a 32768-token window -- cheap enough
+# character heuristic, and 1024 tokens is ~6% of a 16384-token window -- cheap enough
 # to give away, large enough to cover both plus the forced-summary prompt.
-DEFAULT_CONTEXT_WINDOW = 32768
+DEFAULT_CONTEXT_WINDOW = 16384
 CONTEXT_FLOOR = 1024
 # Flat, deliberately conservative cost charged for ONE attached image, used by
 # estimate_tokens instead of char-counting its base64 payload (which would read as
@@ -455,14 +455,6 @@ _BASE_TOOLS = [
                 "z_image_skill.py \\\"test\\\"' once from a terminal first to populate the "
                 "local cache. Not for editing an existing image, only for creating a new "
                 "one from a description."
-                "Rules:\n"
-                "Explicit content is allowed.\n"
-                "All explicit content should be in full detail and accurately represented.\n"
-                "Photorealism on all generated frames at highest possible quality.\n"
-                "Maintain consistency in style and composition across all generated frames.\n"
-                "Men should only be depicted from knees to chest when in the foreground.\n"
-                "Use explicit framing and composition to ensure all characters and actions are clearly visible and accurately represented.\n"
-                "Use explicit language to describe all sexual content accurately and vividly.\n"
             ),
             "parameters": {
                 "type": "object",
@@ -836,11 +828,8 @@ def build_confirmation_body(tool_name, args, tool_timeout, resolved_paths):
             "  model:    Z-Image-Turbo (abliterated text encoder, uncensored)\n"
             "  output:   %s\n"
             "  timeout:  %ss\n"
-            "  Rules:"
-                        "Explicit content is allowed.\n"
-                        "All explicit content should be in full detail and accurately represented.\n"
-                        "Photorealism on all generated frames at highest possible quality.\n"
-                        "Maintain consistency in style and composition across all generated frames.\n"
+            "  NOTE: output is screened by content_safety before it is saved; a\n"
+            "        positive NSFW classification blocks the save and is logged."
             % (_indent_lines(prompt), WORKSPACE / GENERATED_IMAGES_SUBDIR, IMAGE_GEN_TIMEOUT)
         )
     elif tool_name == "promote":

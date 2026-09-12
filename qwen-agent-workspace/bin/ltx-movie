@@ -442,8 +442,38 @@ def _start_sudo_keepalive_thread():
 # phase 0: seed image pre-flight
 # ---------------------------------------------------------------------------
 
-def _downscale_seed_image(seed_path, out_path):
-    """Validate seed_path and write a PNG copy whose long edge is <= SEED_DOWNSCALE_MAX_EDGE.
+def _crop_to_fill(img, width, height):
+    """Scale img to FILL width x height, then center-crop to exactly that size.
+
+    Verbatim reproduction of bin/ltx-story-images's _resize_center_crop: one uniform
+    scale factor on both axes (max of the two ratios), so nothing is stretched, and the
+    crop is centred, so nothing is letterboxed. Kept as a separate copy rather than an
+    import across the two files -- each phase tool remains independently runnable.
+    Returns a new image; img is not modified.
+    """
+    from PIL import Image
+    src_w, src_h = img.size
+    scale = max(width / float(src_w), height / float(src_h))
+    new_w = max(width, int(round(src_w * scale)))
+    new_h = max(height, int(round(src_h * scale)))
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    return resized.crop((left, top, left + width, top + height))
+
+
+def _downscale_seed_image(seed_path, out_path, target_width, target_height):
+    """Validate seed_path and write a PNG copy cropped-to-fill target_width x
+    target_height (matching Phase 2's panel_01.png framing exactly), then downscaled
+    so its long edge is <= SEED_DOWNSCALE_MAX_EDGE.
+
+    Phase 1's multimodal call must see precisely the framing that becomes panel_01.png,
+    not the full original photo: bin/ltx-story-images's _write_seed_panel scale-to-fills
+    and center-crops the ORIGINAL seed file to --image-width x --image-height, discarding
+    content on two edges unless the source is already that exact aspect ratio. Cropping
+    here first, before the long-edge downscale, keeps the model-visible copy's aspect
+    ratio identical to panel_01.png's at every step -- only the absolute pixel size
+    differs, to bound the multimodal request payload.
 
     Returns a list of violation strings (empty == ok), matching _validate_story_md's
     convention. PIL is imported here rather than at module scope: every offline test and
@@ -465,10 +495,12 @@ def _downscale_seed_image(seed_path, out_path):
     if min(w, h) < SEED_MIN_EDGE:
         return ["--seed-image is degenerate: %dx%d (each edge must be at least %d px)"
                 % (w, h, SEED_MIN_EDGE)]
-    long_edge = max(w, h)
+    rgb = _crop_to_fill(rgb, target_width, target_height)
+    long_edge = max(target_width, target_height)
     if long_edge > SEED_DOWNSCALE_MAX_EDGE:
         scale = SEED_DOWNSCALE_MAX_EDGE / float(long_edge)
-        rgb = rgb.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        rgb = rgb.resize((max(1, int(round(target_width * scale))),
+                          max(1, int(round(target_height * scale)))),
                          Image.Resampling.LANCZOS)
     try:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -487,7 +519,8 @@ def phase0_seed(args):
     """
     paths = _story_paths(args.story_id)
     print("=== Phase 0: seed image ===")
-    violations = _downscale_seed_image(args.seed_image, paths["seed_downscaled"])
+    violations = _downscale_seed_image(args.seed_image, paths["seed_downscaled"],
+                                        args.image_width, args.image_height)
     if violations:
         for v in violations:
             print("Error: %s" % v, file=sys.stderr)

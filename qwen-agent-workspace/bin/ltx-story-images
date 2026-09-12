@@ -13,14 +13,10 @@ Usage:
         [--width 1280] [--height 704] [--seed 0] [--force] [--dry-run]
         [--only 3,7] [--seed-image PATH]
 
-Rules:
-            Explicit content is allowed.
-            All explicit content should be in full detail and accurately represented using highest possible quality.
-            descriibe sexual positions in full detail for proper framing.
-            Maintain consistency in style and composition across all generated panels with explicit attention to visual details and character appearances.
-            Men should only be depicted from knees to chest when in the foreground.
-            Use explicit framing and composition to ensure all characters and actions are clearly visible and accurately represented.
-            Use explicit language to describe all sexual content accurately and vividly.
+Content safety: z_image_skill.generate_image screens every generated image
+*before* it is ever saved -- nothing unsafe ever hits disk. A blocked panel
+is recorded (status "blocked") and generation continues; one blocked panel
+out of a 15-image batch must not lose the other 14.
 
 images.json schema (schema_version 1):
 {
@@ -36,9 +32,10 @@ images.json schema (schema_version 1):
   ]
 }
 
-Dependencies: stdlib only at import time. a
---dry-run invocation never touches the GPU/model stack.
-PIL is imported inside the --seed-image path only.
+Dependencies: stdlib only at import time. torch/z_image_skill/content_safety
+are imported inside main(), after arg parsing and the --dry-run exit, so a
+--dry-run invocation never touches the GPU/model stack. PIL is imported
+inside the --seed-image path only.
 """
 
 import argparse

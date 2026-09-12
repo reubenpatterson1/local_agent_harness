@@ -22,6 +22,10 @@ sys.path.insert(0, WS)
 _SCRIPT_PATH = os.path.join(WS, "bin", "ltx-movie")
 ltx_movie = importlib.machinery.SourceFileLoader("ltx_movie", _SCRIPT_PATH).load_module()
 
+_IMAGES_SCRIPT_PATH = os.path.join(WS, "bin", "ltx-story-images")
+ltx_story_images = importlib.machinery.SourceFileLoader(
+    "ltx_story_images", _IMAGES_SCRIPT_PATH).load_module()
+
 TOTAL = 0
 FAILED = 0
 
@@ -753,11 +757,21 @@ def test_seed_prompt_preface():
 def test_phase0_seed_image():
     from PIL import Image
 
+    # Real tool defaults (--image-width/--image-height), used as target_width/
+    # target_height in every _downscale_seed_image call below.
+    tw, th = 1280, 704
+    # Crop-to-fill always produces exactly tw x th first, so the subsequent long-edge
+    # downscale (tw > SEED_DOWNSCALE_MAX_EDGE) always scales by the same factor,
+    # regardless of the source's own size/aspect -- the whole point of the fix.
+    _scale = ltx_movie.SEED_DOWNSCALE_MAX_EDGE / float(max(tw, th))
+    expected_w = int(round(tw * _scale))
+    expected_h = int(round(th * _scale))
+
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "out.png")
 
         missing = os.path.join(tmp, "missing.png")
-        v = ltx_movie._downscale_seed_image(missing, out_path)
+        v = ltx_movie._downscale_seed_image(missing, out_path, tw, th)
         check("L26a missing file -> violation names 'not found'",
               any("not found" in s for s in v), "got %r" % v)
         check("L26a missing file -> output not created", not os.path.exists(out_path))
@@ -765,50 +779,69 @@ def test_phase0_seed_image():
         junk = os.path.join(tmp, "junk.png")
         with open(junk, "w") as f:
             f.write("not a real image xx")
-        v = ltx_movie._downscale_seed_image(junk, out_path)
+        v = ltx_movie._downscale_seed_image(junk, out_path, tw, th)
         check("L26b unreadable file -> violation names 'not a readable image'",
               any("not a readable image" in s for s in v), "got %r" % v)
 
         tiny = os.path.join(tmp, "tiny.png")
         Image.new("RGB", (32, 32), (1, 2, 3)).save(tiny, format="PNG")
-        v = ltx_movie._downscale_seed_image(tiny, out_path)
+        v = ltx_movie._downscale_seed_image(tiny, out_path, tw, th)
         check("L26c 32x32 -> violation names 'degenerate' and '32x32'",
               any("degenerate" in s and "32x32" in s for s in v), "got %r" % v)
 
         big = os.path.join(tmp, "big.png")
         Image.new("RGB", (4000, 3000), (4, 5, 6)).save(big, format="PNG")
-        v = ltx_movie._downscale_seed_image(big, out_path)
+        v = ltx_movie._downscale_seed_image(big, out_path, tw, th)
         check("L26d 4000x3000 -> no violations", v == [], "got %r" % v)
         with Image.open(out_path) as img:
             w, h = img.size
             check("L26d output long edge == SEED_DOWNSCALE_MAX_EDGE",
                   max(w, h) == ltx_movie.SEED_DOWNSCALE_MAX_EDGE, "got %r" % (img.size,))
-            check("L26d output stays proportional (4:3)", abs(w / h - 4000 / 3000) < 0.01,
-                  "got %r" % (img.size,))
+            check("L26d output aspect matches target (crop-to-fill, not source 4:3)",
+                  abs(w / h - tw / float(th)) < 0.01, "got %r" % (img.size,))
             check("L26d output format is PNG", img.format == "PNG", "got %r" % img.format)
 
         under_cap = os.path.join(tmp, "under.png")
         Image.new("RGB", (800, 600), (7, 8, 9)).save(under_cap, format="PNG")
-        v = ltx_movie._downscale_seed_image(under_cap, out_path)
+        v = ltx_movie._downscale_seed_image(under_cap, out_path, tw, th)
         check("L26e 800x600 (under the cap) -> no violations", v == [], "got %r" % v)
         with Image.open(out_path) as img:
-            check("L26e size unchanged, no upscaling", img.size == (800, 600),
-                  "got %r" % (img.size,))
+            check("L26e size is crop-to-fill then downscale, not source size unchanged",
+                  img.size == (expected_w, expected_h), "got %r" % (img.size,))
 
         at_cap = os.path.join(tmp, "at_cap.png")
         Image.new("RGB", (1024, 1024), (10, 11, 12)).save(at_cap, format="PNG")
-        v = ltx_movie._downscale_seed_image(at_cap, out_path)
+        v = ltx_movie._downscale_seed_image(at_cap, out_path, tw, th)
         check("L26f 1024x1024 (exactly at the cap) -> no violations", v == [], "got %r" % v)
         with Image.open(out_path) as img:
-            check("L26f size unchanged at the cap", img.size == (1024, 1024),
-                  "got %r" % (img.size,))
+            check("L26f size is crop-to-fill then downscale, not the source's 1024x1024",
+                  img.size == (expected_w, expected_h), "got %r" % (img.size,))
 
         rgba = os.path.join(tmp, "rgba.png")
         Image.new("RGBA", (200, 200), (1, 2, 3, 128)).save(rgba, format="PNG")
-        v = ltx_movie._downscale_seed_image(rgba, out_path)
+        v = ltx_movie._downscale_seed_image(rgba, out_path, tw, th)
         check("L26g RGBA input -> no violations", v == [], "got %r" % v)
         with Image.open(out_path) as img:
             check("L26g output mode is RGB", img.mode == "RGB", "got %r" % img.mode)
+
+        # L26j: bin/ltx-movie's _crop_to_fill and bin/ltx-story-images's
+        # _resize_center_crop must produce pixel-identical output for the same source
+        # and target size -- Phase 1 must see exactly the framing that becomes
+        # panel_01.png. Marker-image technique mirrors
+        # tests/test_ltx_story_images.py's test_resize_center_crop_geometry.
+        marker_src = Image.new("RGB", (900, 600), (255, 0, 0))
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(marker_src)
+        cx, cy, half = 900 / 2.0, 600 / 2.0, 60 / 2.0
+        left = int(round(cx - half))
+        top = int(round(cy - half))
+        draw.rectangle([left, top, left + 60 - 1, top + 60 - 1], fill=(0, 0, 0))
+        movie_out = ltx_movie._crop_to_fill(marker_src, tw, th)
+        images_out = ltx_story_images._resize_center_crop(marker_src, tw, th)
+        check("L26j crop-to-fill output sizes match", movie_out.size == images_out.size,
+              "got %r vs %r" % (movie_out.size, images_out.size))
+        check("L26j bin/ltx-movie and bin/ltx-story-images crop pixel-identically",
+              list(movie_out.getdata()) == list(images_out.getdata()))
 
     # phase0_seed end-to-end, with a throwaway story-id, cleaned up in a finally block.
     story_id = "_test_phase0_seed_%d" % os.getpid()
