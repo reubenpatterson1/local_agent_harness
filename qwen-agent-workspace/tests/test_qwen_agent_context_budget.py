@@ -471,7 +471,8 @@ def test_source_guards():
     check("C8 no stale 8192-token string", "8192-token" not in src)
 
     check("C8 both overflow messages parameterised",
-          src.count("%d-token window. Use /reset to start over.]") == 2)
+          src.count("%d-token window. Use /resume to continue from this session's "
+                    "checkpoints, or /reset to start clean.]") == 2)
 
     import_names = set()
     tree = ast.parse(src)
@@ -482,7 +483,7 @@ def test_source_guards():
         elif isinstance(node, ast.ImportFrom):
             import_names.add(node.module)
     expected = {
-        "argparse", "ast", "datetime", "html.parser", "json", "operator", "os",
+        "argparse", "ast", "base64", "datetime", "html.parser", "json", "operator", "os",
         "re", "signal", "subprocess", "sys", "time", "urllib.error",
         "urllib.parse", "urllib.request", "uuid", "pathlib",
     }

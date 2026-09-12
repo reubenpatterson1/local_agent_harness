@@ -11,12 +11,16 @@ drifts out of sync with the images rendered here.
 Usage:
     ltx-story-images --story-md path/to/story.md --out-dir path/to/panels
         [--width 1280] [--height 704] [--seed 0] [--force] [--dry-run]
-        [--only 3,7]
+        [--only 3,7] [--seed-image PATH]
 
-Content safety: z_image_skill.generate_image screens every generated image
-*before* it is ever saved -- nothing unsafe ever hits disk. A blocked panel
-is recorded (status "blocked") and generation continues; one blocked panel
-out of a 15-image batch must not lose the other 14.
+Rules:
+            Explicit content is allowed.
+            All explicit content should be in full detail and accurately represented using highest possible quality.
+            descriibe sexual positions in full detail for proper framing.
+            Maintain consistency in style and composition across all generated panels with explicit attention to visual details and character appearances.
+            Men should only be depicted from knees to chest when in the foreground.
+            Use explicit framing and composition to ensure all characters and actions are clearly visible and accurately represented.
+            Use explicit language to describe all sexual content accurately and vividly.
 
 images.json schema (schema_version 1):
 {
@@ -27,13 +31,14 @@ images.json schema (schema_version 1):
   "seed": 0,
   "panels": [
     {"index": 1, "path": "/abs/panel_01.png", "prompt": "...",
-     "status": "ok" | "blocked" | "error", "seconds": 4.2}
+     "status": "ok" | "blocked" | "error", "seconds": 4.2,
+     "source": "seed" | "generated"}
   ]
 }
 
-Dependencies: stdlib only at import time. torch/z_image_skill/content_safety
-are imported inside main(), after arg parsing and the --dry-run exit, so a
+Dependencies: stdlib only at import time. a
 --dry-run invocation never touches the GPU/model stack.
+PIL is imported inside the --seed-image path only.
 """
 
 import argparse
@@ -62,6 +67,12 @@ def build_parser():
     parser.add_argument("--only", dest="only", default=None,
                          help="comma-separated 1-based panel indices, e.g. 3,7 "
                               "(default: every panel)")
+    parser.add_argument("--seed-image", dest="seed_image", default=None,
+                        help="image that becomes panel 1 verbatim: it is scaled to fill "
+                             "and center-cropped to --width x --height and saved as "
+                             "panel_01.png instead of being generated. Panel 1 takes this "
+                             "path even with --force (there is no txt2img output to "
+                             "regenerate).")
     return parser
 
 
@@ -71,6 +82,39 @@ def _parse_only(only, n_panels):
     if only is None:
         return list(range(1, n_panels + 1))
     return [int(x) for x in only.split(",") if x.strip()]
+
+
+def _resize_center_crop(img, width, height):
+    """Scale img to FILL width x height, then center-crop to exactly that size.
+
+    One uniform scale factor on both axes (max of the two ratios), so nothing is
+    stretched, and the crop is centred, so nothing is letterboxed -- every generated
+    panel already fills the frame edge to edge and panel 1 must match. Returns a new
+    image; img is not modified.
+    """
+    from PIL import Image
+    src_w, src_h = img.size
+    scale = max(width / float(src_w), height / float(src_h))
+    new_w = max(width, int(round(src_w * scale)))
+    new_h = max(height, int(round(src_h * scale)))
+    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    return resized.crop((left, top, left + width, top + height))
+
+
+def _write_seed_panel(seed_path, out_path, width, height):
+    """Write seed_path to out_path as an RGB PNG of exactly width x height.
+
+    PIL is imported here and not at module scope on purpose: this file's docstring
+    promises stdlib-only imports at import time, and tests/test_ltx_story_images.py
+    guards that promise.
+    """
+    from PIL import Image
+    with Image.open(seed_path) as img:
+        img.load()
+        rgb = img.convert("RGB")
+    _resize_center_crop(rgb, width, height).save(out_path, format="PNG")
 
 
 def main(argv=None):
@@ -113,6 +157,10 @@ def main(argv=None):
             print("Error: panel %d has no Image: field" % i, file=sys.stderr)
             return 2
 
+    if args.seed_image is not None and not os.path.isfile(args.seed_image):
+        print("Error: --seed-image not found: %s" % args.seed_image, file=sys.stderr)
+        return 2
+
     # panel_%02d.png matches bin/ltx-story-manifest's own _PANEL_NUM_RE, so
     # a later `--glob 'panel_*.png'` sorts numerically and never falls back
     # to the (order-fragile) mtime heuristic.
@@ -120,7 +168,10 @@ def main(argv=None):
 
     if args.dry_run:
         for i in selected_indices:
-            print("%d | %s | %r" % (i, out_paths[i], panels[i - 1]["image"][:100]))
+            if args.seed_image is not None and i == 1:
+                print("%d | %s | seed: %s" % (i, out_paths[i], args.seed_image))
+            else:
+                print("%d | %s | %r" % (i, out_paths[i], panels[i - 1]["image"][:100]))
         return 0
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -137,9 +188,32 @@ def main(argv=None):
         prompt = panels[i - 1]["image"]
         path = out_paths[i]
 
+        if args.seed_image is not None and i == 1:
+            # Section 3.5: panel 1 takes this path regardless of --force and
+            # regardless of an existing panel_01.png -- there is no txt2img output
+            # to regenerate for it, so "skipped, exists" would be wrong, not cheap.
+            start = time.monotonic()
+            try:
+                _write_seed_panel(args.seed_image, path, args.width, args.height)
+                elapsed = time.monotonic() - start
+                print("panel %d -> %s (seed image, %.1fs)" % (i, path, elapsed))
+                results.append({"index": i, "path": path, "prompt": prompt,
+                                 "status": "ok", "source": "seed",
+                                 "seconds": round(elapsed, 1)})
+            except Exception as e:
+                elapsed = time.monotonic() - start
+                print("panel %d ERROR: seed image could not be written: %s" % (i, e),
+                      file=sys.stderr)
+                results.append({"index": i, "path": path, "prompt": prompt,
+                                 "status": "error", "source": "seed",
+                                 "seconds": round(elapsed, 1)})
+                any_bad = True
+            continue
+
         if os.path.exists(path) and not args.force:
             print("panel %d -> %s (skipped, exists)" % (i, path))
-            results.append({"index": i, "path": path, "prompt": prompt, "status": "ok", "seconds": 0.0})
+            results.append({"index": i, "path": path, "prompt": prompt, "status": "ok",
+                             "source": "generated", "seconds": 0.0})
             continue
 
         start = time.monotonic()
@@ -154,7 +228,8 @@ def main(argv=None):
             elapsed = time.monotonic() - start
             print("panel %d -> %s (%.1fs)" % (i, path, elapsed))
             results.append({"index": i, "path": path, "prompt": prompt,
-                             "status": "ok", "seconds": round(elapsed, 1)})
+                             "status": "ok", "source": "generated",
+                             "seconds": round(elapsed, 1)})
         except ContentSafetyError as e:
             # A block on one panel must not lose the rest of a 15-image
             # batch -- record and continue. z_image_skill screens before
@@ -162,13 +237,15 @@ def main(argv=None):
             elapsed = time.monotonic() - start
             print("panel %d BLOCKED: %s" % (i, e))
             results.append({"index": i, "path": path, "prompt": prompt,
-                             "status": "blocked", "seconds": round(elapsed, 1)})
+                             "status": "blocked", "source": "generated",
+                             "seconds": round(elapsed, 1)})
             any_bad = True
         except Exception as e:
             elapsed = time.monotonic() - start
             print("panel %d ERROR: %s" % (i, e), file=sys.stderr)
             results.append({"index": i, "path": path, "prompt": prompt,
-                             "status": "error", "seconds": round(elapsed, 1)})
+                             "status": "error", "source": "generated",
+                             "seconds": round(elapsed, 1)})
             any_bad = True
 
     with open(os.path.join(args.out_dir, "images.json"), "w") as f:

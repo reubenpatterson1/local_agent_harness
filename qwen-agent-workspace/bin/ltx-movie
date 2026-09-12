@@ -80,6 +80,12 @@ import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
+# --seed-image pre-flight (Phase 0). The long-edge cap bounds the multimodal request
+# payload; the minimum edge rejects a degenerate input before a 27B call or any GPU
+# time is spent on it.
+SEED_DOWNSCALE_MAX_EDGE = 1024
+SEED_MIN_EDGE = 64
+
 STORY_PROMPT_TEMPLATE = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
 Narrative to adapt:
@@ -132,10 +138,19 @@ Write the Prompt: field in the present tense and describe only what is physicall
 
 Do not emit an Image: or Motion: field. Do not verify the file with run_python or any other tool. Emit no other text."""
 
+SEED_IMAGE_PREFACE = """An image is attached to this message. It is the movie's literal opening frame: Panel 1's still will NOT be rendered from your text -- the attached image IS Panel 1's still, exactly as it is.
 
-def build_story_prompt(narrative, story_id, panels, no_stills=False):
+Before you write anything, look at the attached image and describe what it actually shows. Panel 1's Image: field must be a faithful, literal description of that attached image and nothing else -- its subject, pose, framing, setting, lighting, colour palette and visual style as they really appear -- not a generative prompt, not an embellishment, and not an invention. Do not add people, objects, actions or scenery that are not visible in the attached image, and do not omit the ones that are.
+
+Panel 1's Motion: and Narration: fields are written normally, and Panel 2 onward continue the narrative as usual -- but every later panel's Image: field must stay visually consistent with what you actually observed in the attached image: the same characters, wardrobe, setting, lighting and style. Any character or recurring visual element visible in the attached image gets its full visual description written out in Panel 1's Image: field, taken from the image itself, and that exact wording is repeated VERBATIM in every later panel in which it appears."""
+
+
+def build_story_prompt(narrative, story_id, panels, no_stills=False, seed_image=False):
     template = STORY_PROMPT_TEMPLATE_NO_STILLS if no_stills else STORY_PROMPT_TEMPLATE
-    return template.format(narrative=narrative, story_id=story_id, panels=panels)
+    rendered = template.format(narrative=narrative, story_id=story_id, panels=panels)
+    if seed_image and not no_stills:
+        return SEED_IMAGE_PREFACE + "\n\n" + rendered
+    return rendered
 
 
 def build_parser():
@@ -152,6 +167,11 @@ def build_parser():
     )
     parser.add_argument("narrative", help="the story narrative to adapt into panels")
     parser.add_argument("--story-id", dest="story_id", required=True)
+    parser.add_argument("--seed-image", dest="seed_image", default=None,
+                         help="image that becomes the movie's literal opening frame: "
+                              "Phase 0 attaches a downscaled copy to the Phase 1 story "
+                              "prompt, and Phase 2 crops the ORIGINAL to panel_01.png. "
+                              "Incompatible with --no-stills.")
     parser.add_argument("--panels", type=int, default=15,
                          help="one still AND one video clip per panel; mutually "
                               "exclusive with --length")
@@ -299,6 +319,7 @@ def _story_paths(story_id):
         "movie_path": os.path.join(story_dir, "movie.mp4"),
         "movie_log_path": os.path.join(story_dir, "movie.log"),
         "lock_path": os.path.join(story_dir, ".movie.lock"),
+        "seed_downscaled": os.path.join(story_dir, "seed_downscaled.png"),
     }
 
 
@@ -418,6 +439,66 @@ def _start_sudo_keepalive_thread():
 
 
 # ---------------------------------------------------------------------------
+# phase 0: seed image pre-flight
+# ---------------------------------------------------------------------------
+
+def _downscale_seed_image(seed_path, out_path):
+    """Validate seed_path and write a PNG copy whose long edge is <= SEED_DOWNSCALE_MAX_EDGE.
+
+    Returns a list of violation strings (empty == ok), matching _validate_story_md's
+    convention. PIL is imported here rather than at module scope: every offline test and
+    every --dry-run in this file must keep working with no third-party package present.
+    """
+    if not os.path.isfile(seed_path):
+        return ["--seed-image not found: %s" % seed_path]
+    try:
+        from PIL import Image
+    except ImportError as e:
+        return ["--seed-image needs Pillow, which is not importable: %s" % e]
+    try:
+        with Image.open(seed_path) as img:
+            img.load()
+            rgb = img.convert("RGB")
+    except Exception as e:
+        return ["--seed-image is not a readable image: %s: %s" % (type(e).__name__, e)]
+    w, h = rgb.size
+    if min(w, h) < SEED_MIN_EDGE:
+        return ["--seed-image is degenerate: %dx%d (each edge must be at least %d px)"
+                % (w, h, SEED_MIN_EDGE)]
+    long_edge = max(w, h)
+    if long_edge > SEED_DOWNSCALE_MAX_EDGE:
+        scale = SEED_DOWNSCALE_MAX_EDGE / float(long_edge)
+        rgb = rgb.resize((max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                         Image.Resampling.LANCZOS)
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        rgb.save(out_path, format="PNG")
+    except OSError as e:
+        return ["cannot write the downscaled seed copy to %s: %s" % (out_path, e)]
+    return []
+
+
+def phase0_seed(args):
+    """Pre-flight --seed-image and write the downscaled PNG that Phase 1 attaches.
+
+    Runs before the 27B call and before any GPU time: a missing, corrupt or degenerate
+    seed must fail here, not halfway through a run. The downscaled copy bounds the
+    multimodal payload; Phase 2 works from the ORIGINAL file, never from this copy.
+    """
+    paths = _story_paths(args.story_id)
+    print("=== Phase 0: seed image ===")
+    violations = _downscale_seed_image(args.seed_image, paths["seed_downscaled"])
+    if violations:
+        for v in violations:
+            print("Error: %s" % v, file=sys.stderr)
+        return 2
+    args.seed_downscaled_path = paths["seed_downscaled"]
+    print("seed image OK: %s -> %s (long edge <= %dpx, attached to the Phase 1 request)"
+          % (args.seed_image, paths["seed_downscaled"], SEED_DOWNSCALE_MAX_EDGE))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # phase 1: story
 # ---------------------------------------------------------------------------
 
@@ -430,13 +511,17 @@ def phase1_story(args):
               % story_md)
     else:
         print("=== Phase 1: story ===")
-        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills)
+        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
+                                     bool(getattr(args, "seed_image", None)))
         max_tokens = _phase1_max_tokens(args.panels)
         timeout = _phase1_timeout(args.panels)
         cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
                "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
-               "--request-timeout", "600", "--user-prompt", prompt]
+               "--request-timeout", "600"]
+        if getattr(args, "seed_downscaled_path", None):
+            cmd += ["--image", args.seed_downscaled_path]
+        cmd += ["--user-prompt", prompt]
         print("Running (timeout %ds): %s" % (
             timeout, shlex.join(cmd[:-1] + ["--user-prompt", "<%d chars>" % len(prompt)])
         ))
@@ -503,6 +588,8 @@ def phase2_stills(args):
            "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
            "--width", str(args.image_width), "--height", str(args.image_height),
            "--seed", str(args.image_seed)]
+    if getattr(args, "seed_image", None):
+        cmd += ["--seed-image", args.seed_image]
     print("Running: %s" % shlex.join(cmd))
     proc = subprocess.run(cmd, cwd=WS)
     if proc.returncode != 0:
@@ -672,17 +759,30 @@ def _print_dry_run_plan(args):
     paths = _story_paths(args.story_id)
     max_tokens = _phase1_max_tokens(args.panels)
     timeout = _phase1_timeout(args.panels)
-    prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills)
+    prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
+                                 bool(getattr(args, "seed_image", None)))
 
     print("=== DRY RUN: ltx-movie phase plan (story-id=%s) ===" % args.story_id)
     print()
+
+    if getattr(args, "seed_image", None):
+        print("--- Phase 0: seed image ---")
+        print("Would validate %s (readable image, every edge >= %dpx) and write a PNG "
+              "copy with a long edge <= %dpx to %s. Phase 1 attaches that copy; Phase 2 "
+              "receives the ORIGINAL." % (args.seed_image, SEED_MIN_EDGE,
+                                          SEED_DOWNSCALE_MAX_EDGE, paths["seed_downscaled"]))
+        print()
+
     print("--- Phase 1: story ---")
     print("Would skip if %s already exists (pass --force-story to regenerate)."
           % paths["story_md"])
     phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
                   "--workspace", WS,
                   "--max-tokens", str(max_tokens), "--max-rounds", "4",
-                  "--request-timeout", "600", "--user-prompt", prompt]
+                  "--request-timeout", "600"]
+    if getattr(args, "seed_image", None):
+        phase1_cmd += ["--image", paths["seed_downscaled"]]
+    phase1_cmd += ["--user-prompt", prompt]
     print("Command (subprocess timeout %ds): %s" % (timeout, shlex.join(phase1_cmd)))
     print()
     print("Rendered story prompt:")
@@ -698,6 +798,8 @@ def _print_dry_run_plan(args):
                       "--story-md", paths["story_md"], "--out-dir", paths["images_dir"],
                       "--width", str(args.image_width), "--height", str(args.image_height),
                       "--seed", str(args.image_seed)]
+        if getattr(args, "seed_image", None):
+            phase2_cmd += ["--seed-image", args.seed_image]
         print("Command: %s" % shlex.join(phase2_cmd))
         print()
 
@@ -738,6 +840,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     _resolve_length(args, raw_argv)
 
+    if getattr(args, "seed_image", None) and args.no_stills:
+        print("Error: --seed-image is incompatible with --no-stills: --no-stills removes "
+              "Phase 2 entirely, so the seed image would never become panel_01.png.",
+              file=sys.stderr)
+        return 2
+
     if args.dry_run:
         return _print_dry_run_plan(args)
 
@@ -772,6 +880,8 @@ def main(argv=None):
 
         phases = ((phase1_story, phase3_manifest, phase4_render) if args.no_stills
                   else (phase1_story, phase2_stills, phase3_manifest, phase4_render))
+        if getattr(args, "seed_image", None):
+            phases = (phase0_seed,) + phases
         for phase_fn in phases:
             rc = phase_fn(args)
             if rc != 0:

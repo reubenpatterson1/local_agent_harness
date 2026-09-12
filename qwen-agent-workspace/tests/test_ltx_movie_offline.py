@@ -10,6 +10,7 @@ never shells out to the wrapped tools under --dry-run).
 import ast
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,7 @@ def test_parser_defaults():
     check("L1 force is False", args.force is False, "got %r" % args.force)
     check("L1 dry_run is False", args.dry_run is False, "got %r" % args.dry_run)
     check("L1 length is None", args.length is None, "got %r" % args.length)
+    check("L1 seed_image is None", args.seed_image is None, "got %r" % args.seed_image)
 
 
 def test_removed_flags_rejected():
@@ -714,6 +716,251 @@ def test_dry_run_plan_targets_mlx_render():
           len(pl) == 2 and not any("--force" in l.split() for l in pl), "got %r" % pl)
 
 
+# ---------------------------------------------------------------------------
+# L25: --seed-image story-prompt preface
+# ---------------------------------------------------------------------------
+
+def test_seed_prompt_preface():
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+
+    check("L25a unseeded (4-arg-equivalent) prompt is byte-identical to today's template",
+          p_off == ltx_movie.STORY_PROMPT_TEMPLATE.format(narrative="n", story_id="sid", panels=5),
+          "got %r" % p_off[:400])
+    check("L25b preface sentence present only when seeded",
+          "An image is attached to this message." in p_on
+          and "An image is attached to this message." not in p_off)
+    check("L25c seeded prompt starts with SEED_IMAGE_PREFACE",
+          p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
+    check("L25d seeded prompt ends with the unseeded template appended intact",
+          p_on.endswith(p_off))
+    for phrase in (
+        "Panel 1's still will NOT be rendered from your text",
+        "faithful, literal description of that attached image",
+        "not a generative prompt",
+        "must stay visually consistent with what you actually observed",
+    ):
+        check("L25e preface contains %r" % phrase, phrase in p_on)
+    check("L25f --no-stills wins over --seed-image",
+          ltx_movie.build_story_prompt("n", "sid", 5, True, True)
+          == ltx_movie.build_story_prompt("n", "sid", 5, True, False))
+
+
+# ---------------------------------------------------------------------------
+# L26: Phase 0 -- _downscale_seed_image and phase0_seed
+# ---------------------------------------------------------------------------
+
+def test_phase0_seed_image():
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out_path = os.path.join(tmp, "out.png")
+
+        missing = os.path.join(tmp, "missing.png")
+        v = ltx_movie._downscale_seed_image(missing, out_path)
+        check("L26a missing file -> violation names 'not found'",
+              any("not found" in s for s in v), "got %r" % v)
+        check("L26a missing file -> output not created", not os.path.exists(out_path))
+
+        junk = os.path.join(tmp, "junk.png")
+        with open(junk, "w") as f:
+            f.write("not a real image xx")
+        v = ltx_movie._downscale_seed_image(junk, out_path)
+        check("L26b unreadable file -> violation names 'not a readable image'",
+              any("not a readable image" in s for s in v), "got %r" % v)
+
+        tiny = os.path.join(tmp, "tiny.png")
+        Image.new("RGB", (32, 32), (1, 2, 3)).save(tiny, format="PNG")
+        v = ltx_movie._downscale_seed_image(tiny, out_path)
+        check("L26c 32x32 -> violation names 'degenerate' and '32x32'",
+              any("degenerate" in s and "32x32" in s for s in v), "got %r" % v)
+
+        big = os.path.join(tmp, "big.png")
+        Image.new("RGB", (4000, 3000), (4, 5, 6)).save(big, format="PNG")
+        v = ltx_movie._downscale_seed_image(big, out_path)
+        check("L26d 4000x3000 -> no violations", v == [], "got %r" % v)
+        with Image.open(out_path) as img:
+            w, h = img.size
+            check("L26d output long edge == SEED_DOWNSCALE_MAX_EDGE",
+                  max(w, h) == ltx_movie.SEED_DOWNSCALE_MAX_EDGE, "got %r" % (img.size,))
+            check("L26d output stays proportional (4:3)", abs(w / h - 4000 / 3000) < 0.01,
+                  "got %r" % (img.size,))
+            check("L26d output format is PNG", img.format == "PNG", "got %r" % img.format)
+
+        under_cap = os.path.join(tmp, "under.png")
+        Image.new("RGB", (800, 600), (7, 8, 9)).save(under_cap, format="PNG")
+        v = ltx_movie._downscale_seed_image(under_cap, out_path)
+        check("L26e 800x600 (under the cap) -> no violations", v == [], "got %r" % v)
+        with Image.open(out_path) as img:
+            check("L26e size unchanged, no upscaling", img.size == (800, 600),
+                  "got %r" % (img.size,))
+
+        at_cap = os.path.join(tmp, "at_cap.png")
+        Image.new("RGB", (1024, 1024), (10, 11, 12)).save(at_cap, format="PNG")
+        v = ltx_movie._downscale_seed_image(at_cap, out_path)
+        check("L26f 1024x1024 (exactly at the cap) -> no violations", v == [], "got %r" % v)
+        with Image.open(out_path) as img:
+            check("L26f size unchanged at the cap", img.size == (1024, 1024),
+                  "got %r" % (img.size,))
+
+        rgba = os.path.join(tmp, "rgba.png")
+        Image.new("RGBA", (200, 200), (1, 2, 3, 128)).save(rgba, format="PNG")
+        v = ltx_movie._downscale_seed_image(rgba, out_path)
+        check("L26g RGBA input -> no violations", v == [], "got %r" % v)
+        with Image.open(out_path) as img:
+            check("L26g output mode is RGB", img.mode == "RGB", "got %r" % img.mode)
+
+    # phase0_seed end-to-end, with a throwaway story-id, cleaned up in a finally block.
+    story_id = "_test_phase0_seed_%d" % os.getpid()
+    story_dir = ltx_movie._story_dir(story_id)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            valid_seed = os.path.join(tmp, "valid.png")
+            Image.new("RGB", (800, 600), (1, 2, 3)).save(valid_seed, format="PNG")
+            args = ltx_movie.build_parser().parse_args(
+                ["n", "--story-id", story_id, "--seed-image", valid_seed])
+            rc = ltx_movie.phase0_seed(args)
+            expected_path = ltx_movie._story_paths(story_id)["seed_downscaled"]
+            check("L26h phase0_seed returns 0 for a valid seed", rc == 0, "got %r" % rc)
+            check("L26h args.seed_downscaled_path is set to the expected path",
+                  getattr(args, "seed_downscaled_path", None) == expected_path,
+                  "got %r" % getattr(args, "seed_downscaled_path", None))
+
+            missing_seed = os.path.join(tmp, "does_not_exist.png")
+            args2 = ltx_movie.build_parser().parse_args(
+                ["n", "--story-id", story_id, "--seed-image", missing_seed])
+            rc2 = ltx_movie.phase0_seed(args2)
+            check("L26i phase0_seed returns 2 for a missing seed", rc2 == 2, "got %r" % rc2)
+    finally:
+        shutil.rmtree(story_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# L27: --seed-image --dry-run plan
+# ---------------------------------------------------------------------------
+
+def test_seed_dry_run_plan():
+    missing = "/nonexistent/seed_for_test.png"
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-seed",
+         "--panels", "3", "--seed-image", missing, "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    out = result.stdout
+    check("L27a exits 0 (dry-run never opens the seed file itself)",
+          result.returncode == 0, "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    check("L27b stdout contains a Phase 0 block", "--- Phase 0: seed image ---" in out,
+          "got %r" % out[:1500])
+
+    m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", out)
+    check("L27c phase-1 command line found", m is not None, "got %r" % out[:1500])
+    if m:
+        check("L27c phase-1 command carries --image with a seed_downscaled.png path",
+              re.search(r"--image \S*seed_downscaled\.png", m.group(1)) is not None,
+              "got %r" % m.group(1))
+
+    phase2_lines = [l for l in out.splitlines() if "ltx-story-images" in l]
+    check("L27d exactly one phase-2 command line found", len(phase2_lines) == 1,
+          "got %r" % phase2_lines)
+    if phase2_lines:
+        check("L27d phase-2 command carries --seed-image with the ORIGINAL path",
+              ("--seed-image " + missing) in phase2_lines[0], "got %r" % phase2_lines[0])
+        check("L27d phase-2 command does not carry the downscaled path",
+              "seed_downscaled" not in phase2_lines[0], "got %r" % phase2_lines[0])
+        check("L27f --seed-image appears exactly once in the ltx-story-images command line",
+              phase2_lines[0].count("--seed-image") == 1, "got %r" % phase2_lines[0])
+
+    check("L27e rendered prompt preview contains the preface sentence",
+          "An image is attached to this message." in out, "got %r" % out[-2000:])
+
+    plain = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-seed-off",
+         "--panels", "3", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L27g non-seeded dry-run prints no Phase 0", "Phase 0" not in plain.stdout,
+          "got %r" % plain.stdout[:800])
+    check("L27h non-seeded dry-run has no --image flag", "--image " not in plain.stdout,
+          "got %r" % plain.stdout)
+    check("L27i non-seeded dry-run mentions no seed_downscaled anywhere",
+          "seed_downscaled" not in plain.stdout, "got %r" % plain.stdout)
+
+
+# ---------------------------------------------------------------------------
+# L28: --seed-image + --no-stills is a hard error, dry-run or not
+# ---------------------------------------------------------------------------
+
+def test_seed_no_stills_conflict():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-seed-conflict",
+         "--seed-image", "/tmp/x.png", "--no-stills", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L28a --dry-run + conflict exits 2", result.returncode == 2,
+          "rc=%r" % result.returncode)
+    check("L28b stderr names the incompatibility",
+          "--seed-image is incompatible with --no-stills" in result.stderr,
+          "got %r" % result.stderr)
+
+    story_id = "unittest-seed-conflict-real"
+    story_dir = ltx_movie._story_dir(story_id)
+    try:
+        result2 = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+             "--seed-image", "/tmp/x.png", "--no-stills"],
+            capture_output=True, text=True, cwd=WS)
+        check("L28c non-dry-run + conflict ALSO exits 2 (checked before lock/phase machinery)",
+              result2.returncode == 2, "rc=%r" % result2.returncode)
+        check("L28d non-dry-run stderr names the same incompatibility",
+              "--seed-image is incompatible with --no-stills" in result2.stderr,
+              "got %r" % result2.stderr)
+        check("L28e no story directory was created", not os.path.exists(story_dir))
+    finally:
+        shutil.rmtree(story_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# L29: source guards
+# ---------------------------------------------------------------------------
+
+def test_seed_source_guards():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    tree = ast.parse(text, filename=_SCRIPT_PATH)
+
+    top_level_pil = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] == "PIL":
+            top_level_pil.append(node.module)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "PIL":
+                    top_level_pil.append(alias.name)
+    check("L29a no top-level PIL import", not top_level_pil, "found: %r" % top_level_pil)
+
+    pil_in_func = False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.ImportFrom) and sub.module == "PIL":
+                    pil_in_func = True
+    check("L29b PIL is imported, but only inside a function body (mirrors the "
+          "existing psutil guard pattern)", pil_in_func)
+
+    check("L29c --image threaded at exactly the 2 expected call sites",
+          text.count('cmd += ["--image", args.seed_downscaled_path]') == 1
+          and text.count('phase1_cmd += ["--image", paths["seed_downscaled"]]') == 1)
+    check("L29d --seed-image threaded at exactly the 2 expected call sites",
+          # NOTE: "phase2_cmd += [...]" ends with "cmd += [...]", so counting the
+          # plain-"cmd" literal as a substring would double-count it. Anchored on
+          # the newline + exact indentation instead, to count each call site once.
+          text.count('\n        cmd += ["--seed-image", args.seed_image]') == 1
+          and text.count('phase2_cmd += ["--seed-image", args.seed_image]') == 1)
+    check("L29e phase0_seed is prepended to the phase tuple",
+          "phases = (phase0_seed,) + phases" in text)
+    check("L29f --user-prompt is still the last element of the real phase1 cmd",
+          'cmd += ["--user-prompt", prompt]' in text)
+    check("L29g --user-prompt is still the last element of the dry-run preview phase1_cmd",
+          'phase1_cmd += ["--user-prompt", prompt]' in text)
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_removed_flags_rejected()
@@ -739,6 +986,11 @@ if __name__ == "__main__":
     test_phase1_qwen_agent_gets_workspace_flag()
     test_top5_rss_skips_none_memory_info()
     test_dry_run_plan_targets_mlx_render()
+    test_seed_prompt_preface()
+    test_phase0_seed_image()
+    test_seed_dry_run_plan()
+    test_seed_no_stills_conflict()
+    test_seed_source_guards()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
