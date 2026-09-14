@@ -66,7 +66,7 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 _PANEL_NUM_RE = re.compile(r"panel[-_]?(\d+)", re.IGNORECASE)
 _PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
-_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt):\s*(.*)$")
+_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
 MAX_PROMPT_WORDS = 150
 
 
@@ -156,7 +156,7 @@ def _extract_narrative(lines):
 
 def _parse_prompts_md(path):
     """Return (narrative, [{'title': str, 'text': str, 'image': str,
-    'motion': str, 'narration': str, 'prompt': str}, ...]) parsed from a
+    'motion': str, 'narration': str, 'prompt': str, 'style': str}, ...]) parsed from a
     prompts.md file. Raises OSError if the file cannot be read.
 
     v2: inside a panel section, a line matching `Image:`/`Motion:`/
@@ -174,6 +174,12 @@ def _parse_prompts_md(path):
     A `Prompt:` label is the collapsed form used by bin/ltx-movie
     --no-stills: one field describing the shot's content, setting, and
     motion together. `prompt` is "" when the label never appears.
+
+    A `Style:` label is the once-per-story visual-identity block written by
+    bin/ltx-movie's --seed-image preface, and it is expected in Panel 1 only:
+    bin/ltx-story-images appends Panel 1's `style` verbatim to every panel's
+    image prompt. `style` is "" when the label never appears, so a story.md
+    written before this field existed parses exactly as it did before.
     """
     with open(path) as f:
         lines = f.read().splitlines()
@@ -202,7 +208,7 @@ def _parse_prompts_md(path):
     for p in panels:
         p["text"] = " ".join(s.strip() for s in p["body"] if s.strip())
 
-        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": []}
+        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": []}
         open_field = None
         for line in p["body"]:
             m = _PANEL_LABEL_RE.match(line)
@@ -218,6 +224,7 @@ def _parse_prompts_md(path):
         p["motion"] = " ".join(fields["Motion"])
         p["narration"] = " ".join(fields["Narration"])
         p["prompt"] = " ".join(fields["Prompt"])
+        p["style"] = " ".join(fields["Style"])
 
     return narrative, panels
 

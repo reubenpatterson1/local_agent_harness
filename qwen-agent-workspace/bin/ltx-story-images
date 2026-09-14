@@ -32,6 +32,16 @@ images.json schema (schema_version 1):
   ]
 }
 
+Grounded mode: when the story.md's Panel 1 carries a `Style:` field (written by
+bin/ltx-movie's --seed-image story preface), that text is appended verbatim to
+every panel's image prompt, and every panel is generated with the SAME CPU RNG
+seed (--seed exactly, not --seed + index) so that panels sharing a prompt suffix
+also share their noise draw. Without that field nothing changes: prompts are the
+Image: text alone and panel i uses --seed + i, exactly as before. The Style:
+field, not the --seed-image flag, is the switch -- so a single-panel rerun
+(--only 5 --force) reproduces the same seed and the same prompt as the original
+batch whether or not --seed-image is passed again.
+
 Dependencies: stdlib only at import time. torch/z_image_skill/content_safety
 are imported inside main(), after arg parsing and the --dry-run exit, so a
 --dry-run invocation never touches the GPU/model stack. PIL is imported
@@ -58,7 +68,10 @@ def build_parser():
     parser.add_argument("--out-dir", dest="out_dir", required=True)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=704)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="base CPU RNG seed. Ungrounded story.md: panel i uses "
+                             "--seed + i. Grounded story.md (Panel 1 has a Style: field): "
+                             "every panel uses --seed exactly.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--only", dest="only", default=None,
@@ -114,6 +127,47 @@ def _write_seed_panel(seed_path, out_path, width, height):
     _resize_center_crop(rgb, width, height).save(out_path, format="PNG")
 
 
+def _style_text(panels):
+    """Panel 1's once-only Style: text, stripped, or "" when there is none.
+
+    Only Panel 1 is consulted: the Phase 1 preface asks for exactly one Style:
+    line, in Panel 1, and a stray one elsewhere is parsed but never read. The
+    .get() keeps this working against a story.md parser that predates the field.
+    """
+    if not panels:
+        return ""
+    return panels[0].get("style", "").strip()
+
+
+def _compose_prompt(image_text, style_text):
+    """The txt2img prompt for one panel: its own Image: text, then the story's
+    Style: text appended verbatim, joined by a single space.
+
+    The panel's own text leads because it carries everything panel-specific; the
+    style suffix carries only what every panel shares. With no style this returns
+    the Image: text unchanged (the parser already strips and space-joins it), so
+    an ungrounded story.md produces byte-identical prompts to before this existed.
+    """
+    image_text = image_text.strip()
+    style_text = style_text.strip()
+    if not style_text:
+        return image_text
+    if not image_text:
+        return style_text
+    return image_text + " " + style_text
+
+
+def _panel_seed(base_seed, index, grounded):
+    """The CPU RNG seed for panel `index` (1-based).
+
+    Ungrounded: base_seed + index -- unchanged pre-existing behaviour, where each
+    panel is an independent scene and per-panel noise variety is wanted. Grounded:
+    base_seed for every panel, so panels that share a prompt suffix also share
+    their noise draw instead of drifting apart on composition and palette alone.
+    """
+    return base_seed if grounded else base_seed + index
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -158,15 +212,31 @@ def main(argv=None):
         print("Error: --seed-image not found: %s" % args.seed_image, file=sys.stderr)
         return 2
 
+    # Grounded mode (see the module docstring): a non-empty Panel 1 Style: field
+    # means this story.md was authored against a reference image and every panel
+    # shares one visual identity. Two things then change, together: the style text
+    # is appended verbatim to every panel's prompt, and the RNG seed is pinned to
+    # --seed for every panel. Both are keyed to the file, not to --seed-image, so a
+    # single-panel rerun reproduces the batch exactly.
+    style = _style_text(panels)
+    grounded = bool(style)
+
     # panel_%02d.png matches bin/ltx-story-manifest's own _PANEL_NUM_RE, so
     # a later `--glob 'panel_*.png'` sorts numerically and never falls back
     # to the (order-fragile) mtime heuristic.
     out_paths = {i: os.path.join(args.out_dir, "panel_%02d.png" % i) for i in selected_indices}
 
     if args.dry_run:
+        if grounded:
+            print("style: %s" % style)
+            print("seed: pinned to %d for every generated panel (grounded mode)" % args.seed)
         for i in selected_indices:
             if args.seed_image is not None and i == 1:
                 print("%d | %s | seed: %s" % (i, out_paths[i], args.seed_image))
+            elif grounded:
+                print("%d | %s | rng %d | +style | %r"
+                      % (i, out_paths[i], _panel_seed(args.seed, i, grounded),
+                         _compose_prompt(panels[i - 1]["image"], style)[:100]))
             else:
                 print("%d | %s | %r" % (i, out_paths[i], panels[i - 1]["image"][:100]))
         return 0
@@ -182,7 +252,8 @@ def main(argv=None):
     results = []
     any_bad = False
     for i in selected_indices:
-        prompt = panels[i - 1]["image"]
+        prompt = _compose_prompt(panels[i - 1]["image"], style)
+        seed_used = _panel_seed(args.seed, i, grounded)
         path = out_paths[i]
 
         if args.seed_image is not None and i == 1:
@@ -220,10 +291,10 @@ def main(argv=None):
                 output_path=path,
                 width=args.width,
                 height=args.height,
-                generator=torch.Generator("cpu").manual_seed(args.seed + i),
+                generator=torch.Generator("cpu").manual_seed(seed_used),
             )
             elapsed = time.monotonic() - start
-            print("panel %d -> %s (%.1fs)" % (i, path, elapsed))
+            print("panel %d -> %s (seed %d, %.1fs)" % (i, path, seed_used, elapsed))
             results.append({"index": i, "path": path, "prompt": prompt,
                              "status": "ok", "source": "generated",
                              "seconds": round(elapsed, 1)})

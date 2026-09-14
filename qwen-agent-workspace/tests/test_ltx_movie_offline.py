@@ -736,8 +736,10 @@ def test_seed_prompt_preface():
           and "An image is attached to this message." not in p_off)
     check("L25c seeded prompt starts with SEED_IMAGE_PREFACE",
           p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
-    check("L25d seeded prompt ends with the unseeded template appended intact",
-          p_on.endswith(p_off))
+    check("L25d seeded prompt is preface + unseeded template + postface, exactly",
+          p_on == (ltx_movie.SEED_IMAGE_PREFACE + "\n\n" + p_off + "\n\n"
+                   + ltx_movie.SEED_IMAGE_POSTFACE),
+          "got tail %r" % p_on[-400:])
     for phrase in (
         "Panel 1's still will NOT be rendered from your text",
         "faithful, literal description of that attached image",
@@ -994,6 +996,546 @@ def test_seed_source_guards():
           'phase1_cmd += ["--user-prompt", prompt]' in text)
 
 
+# ---------------------------------------------------------------------------
+# L30: the preface specifies the Style: field
+# ---------------------------------------------------------------------------
+
+def test_seed_preface_specifies_style_field():
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+
+    check("L30a Style: present only when seeded",
+          "Style:" in p_on and "Style:" not in p_off)
+    for phrase in (
+        "Panel 1, and only Panel 1, carries one extra field",
+        "30-55 words on a single line",
+        "appended word for word to the end of every panel's image prompt",
+        "Emit the Style: line exactly once, in Panel 1, and never in any other panel.",
+    ):
+        check("L30b p_on contains %r" % phrase, phrase in p_on)
+    check("L30c p_on bans composition/framing words",
+          "It must not mention composition, framing, shot type, camera angle, viewpoint, pose, action"
+          in p_on)
+    check("L30d p_on starts with SEED_IMAGE_PREFACE", p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
+    check("L30e p_on ends with the postface and still contains p_off intact",
+          p_on.endswith(ltx_movie.SEED_IMAGE_POSTFACE)
+          and ("\n\n" + p_off + "\n\n") in p_on,
+          "got tail %r" % p_on[-400:])
+
+
+# ---------------------------------------------------------------------------
+# L31: per-panel verbatim repetition of the reference is gone, with an
+# explicit precedence rule
+# ---------------------------------------------------------------------------
+
+def test_seed_preface_drops_verbatim_repetition():
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+
+    check("L31a old verbatim-repetition sentence is gone",
+          "that exact wording is repeated VERBATIM in every later panel in which it appears"
+          not in p_on)
+    check("L31b explicit ban on copying panel 1 forward",
+          "Do NOT copy Panel 1's Image: description into the later panels" in p_on)
+    check("L31c precedence rule: Style: replaces verbatim repetition, with the subject's "
+          "appearance carved back out of it",
+          "This replaces the verbatim-repetition rule below for everything that is visible "
+          "in the attached image" in p_on
+          and "put the global look -- and nothing about the subject -- into the Style: line"
+              in p_on
+          and "only as much of it as their shot band allows" in p_on
+          and "name their fixed attributes in the Style: line" not in p_on,
+          "the final preface paragraph still carries Step 2's superseded rule")
+    check("L31d precedence rule: VERBATIM still applies to new recurring elements",
+          "The verbatim-repetition rule below still applies to any NEW recurring character"
+          in p_on)
+    check("L31e base VERBATIM rule survives for unseeded runs (guards D5)",
+          "VERBATIM" in p_off)
+
+
+# ---------------------------------------------------------------------------
+# L32: _validate_story_md(require_style=...)
+# ---------------------------------------------------------------------------
+
+def test_validate_story_md_require_style():
+    with tempfile.TemporaryDirectory() as td:
+        without = os.path.join(td, "without.md")
+        with open(without, "w") as f:
+            f.write(
+                "# Story\n\n"
+                "## Panel 1 — First\n"
+                "Image: a scene one\n"
+                "Motion: camera pans\n"
+                "Narration: narration one\n\n"
+                "## Panel 2 — Second\n"
+                "Image: a scene two\n"
+                "Motion: camera pans again\n"
+                "Narration: narration two\n"
+            )
+        with_style = os.path.join(td, "with_style.md")
+        with open(with_style, "w") as f:
+            f.write(
+                "# Story\n\n"
+                "## Panel 1 — First\n"
+                "Image: a scene one\n"
+                "Motion: camera pans\n"
+                "Narration: narration one\n"
+                "Style: teal palette, matte grain\n\n"
+                "## Panel 2 — Second\n"
+                "Image: a scene two\n"
+                "Motion: camera pans again\n"
+                "Narration: narration two\n"
+            )
+        empty = os.path.join(td, "empty.md")
+        with open(empty, "w") as f:
+            f.write("# Story\n\n")
+
+        v_without_required = ltx_movie._validate_story_md(without, 2, False, True)
+        check("L32a without Style: + require_style -> exactly one violation",
+              len(v_without_required) == 1, "got %r" % v_without_required)
+        check("L32a violation names the missing Style: field",
+              v_without_required and "missing/empty Style: field" in v_without_required[0],
+              "got %r" % v_without_required)
+
+        v_with_required = ltx_movie._validate_story_md(with_style, 2, False, True)
+        check("L32b with Style: + require_style -> no violations",
+              v_with_required == [], "got %r" % v_with_required)
+
+        v_without_default = ltx_movie._validate_story_md(without, 2, False)
+        check("L32c default require_style is False (back-compat)",
+              v_without_default == [], "got %r" % v_without_default)
+
+        v_without_explicit_false = ltx_movie._validate_story_md(without, 2, False, False)
+        check("L32d require_style=False explicitly -> no violations",
+              v_without_explicit_false == [], "got %r" % v_without_explicit_false)
+
+        v_empty = ltx_movie._validate_story_md(empty, 2, False, True)
+        check("L32e empty file + require_style=True does not raise and reports panel count",
+              any("expected exactly 2 panels, found 0" in v for v in v_empty),
+              "got %r" % v_empty)
+
+
+# ---------------------------------------------------------------------------
+# L33: call-site guard
+# ---------------------------------------------------------------------------
+
+def test_require_style_call_site_guard():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L33a require_style assignment line present exactly once",
+          text.count('    require_style = bool(getattr(args, "seed_image", None)) and not args.no_stills\n')
+          == 1)
+    check("L33b _validate_story_md call site passes require_style exactly once",
+          text.count('    violations = _validate_story_md(story_md, args.panels, args.no_stills, require_style)\n')
+          == 1)
+
+
+# ---------------------------------------------------------------------------
+# L34: SEED_IMAGE_POSTFACE -- the two overrides are restated AFTER the template
+# ---------------------------------------------------------------------------
+
+def test_seed_postface_overrides_last():
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+    post = ltx_movie.SEED_IMAGE_POSTFACE
+
+    check("L34a postface present only when seeded",
+          post in p_on and post not in p_off)
+    check("L34b postface is the tail of the seeded prompt", p_on.endswith(post))
+    check("L34c the VERBATIM rule it overrides appears BEFORE it",
+          p_on.index("must repeat that exact description VERBATIM") < p_on.index(post),
+          "postface must come after the rule it overrides")
+    for phrase in (
+        "Two of the rules above are overridden for this movie",
+        "The VERBATIM-repetition rule applies only to a new recurring character or element "
+        "you introduce later that is NOT visible in the attached image.",
+        "not word for word and not reworded",
+        "The 70-90 word length applies to Panel 1's Image: field.",
+        "Every later panel's Image: field is 45-70 words: composition first, then "
+        "only the identity detail its shot band allows",
+        "Every other panel has exactly three, in this order: Image:, Motion:, Narration: "
+        "-- and no Style: line.",
+    ):
+        check("L34d postface contains %r" % phrase[:60], phrase in post,
+              "missing from postface")
+    check("L34e postface ends with the template's own terminator",
+          post.endswith("Do not verify the file with run_python or any other tool. "
+                        "Emit no other text."))
+    check("L34f --no-stills still wins over --seed-image",
+          ltx_movie.build_story_prompt("n", "sid", 5, True, True)
+          == ltx_movie.build_story_prompt("n", "sid", 5, True, False))
+
+
+# ---------------------------------------------------------------------------
+# L35: preface bans RESTATING appearance (not just copying) and gives later
+# panels a positive construction to use instead
+# ---------------------------------------------------------------------------
+
+def test_seed_preface_bans_restated_appearance():
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+    pre = ltx_movie.SEED_IMAGE_PREFACE
+
+    for phrase in (
+        "and do not carry more identity detail than that panel's shot distance can "
+        "actually resolve",
+        "not word for word and not reworded",
+        "Materials, colour palette, lighting character and rendering style must not "
+        "be described again in any Image: field after Panel 1",
+        "Each later panel's Image: field is 45-70 words",
+        "shot type first, then camera viewpoint, then the subject's short referring "
+        "phrase, then the identity detail this shot band allows, then the action "
+        "and placement, then the setting",
+        "one short referring phrase of at most five words",
+        "That phrase carries the subject's continuity; the identity words its shot "
+        "band allows are written after it.",
+        "A later panel has exactly three fields, in this order: Image:, Motion:, "
+        "Narration: -- and no Style: line.",
+        "The pipeline reads that line from Panel 1 alone, so a Style: line written "
+        "under Panel 2 or later is dead text that is never read.",
+    ):
+        check("L35a preface contains %r" % phrase[:60], phrase in pre, "missing from preface")
+
+    check("L35b the old 70-90-words-per-later-panel wording is gone",
+          "its own 70-90 word description" not in pre)
+    check("L35c 45-70 appears in both preface and postface",
+          "45-70 words" in pre and "45-70 words" in ltx_movie.SEED_IMAGE_POSTFACE)
+    check("L35d none of this leaks into the unseeded prompt",
+          "45-70 words" not in ltx_movie.build_story_prompt("n", "sid", 5))
+    # Three occurrences, not two: STORY_PROMPT_TEMPLATE already uses this exact
+    # clause for the Motion: field (the ban the model demonstrably obeys, which is
+    # why the preface and postface borrow its wording). Verified 2026-09-13:
+    # build_story_prompt("n","sid",5).count(...) == 1.
+    check("L35e assembled seeded prompt carries the ban three times "
+          "(template Motion: rule + preface + postface)",
+          p_on.count("not word for word and not reworded") == 3
+          and ltx_movie.build_story_prompt("n", "sid", 5)
+              .count("not word for word and not reworded") == 1,
+          "got %d" % p_on.count("not word for word and not reworded"))
+
+
+# ---------------------------------------------------------------------------
+# L36: _style_echo_warnings -- the advisory appearance-echo heuristic
+# ---------------------------------------------------------------------------
+
+_ECHO_STYLE = ("young woman with tightly curled auburn-red hair, warm light-brown skin with "
+               "scattered freckles, brown eyes, glossy pink lips, soft even diffused "
+               "lighting, clean high-resolution photographic rendering, shallow depth of "
+               "field")
+# Reproduces the drift_red_test defect: shot type, then the whole appearance list.
+_ECHO_BAD_IMAGE = ("A wide shot of a young woman with tightly curled auburn-red hair, warm "
+                   "light-brown skin with scattered freckles, brown eyes and glossy pink "
+                   "lips, seen from behind as she walks away down a quiet street at dusk, "
+                   "rendered in a clean high-resolution photographic style with a shallow "
+                   "depth of field.")
+# Compliant: composition only, referring phrase, and a few incidental shared words
+# ("woman", "soft", "even", "light") so the check is not passing trivially.
+_ECHO_GOOD_IMAGE = ("A wide shot from behind, the camera at knee height on the crown of the "
+                    "road, the curly-haired woman small in the centre of the frame walking "
+                    "away down a quiet residential street at dusk, low houses and parked cars "
+                    "on either side, soft even dusk light on the pavement, perspective lines "
+                    "converging at a distant intersection.")
+_ECHO_GREEK = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda omicron rho "
+               "sigma tau upsilon phi chi psi omega")
+
+
+def _echo_panels(style, images, styles=None):
+    """panels list for _style_echo_warnings: panel 1 carries `style`, panels
+    2..N carry images[0..] (panel 1's own Image: text is irrelevant to the check)."""
+    panels = [{"number": 1, "image": "panel one image text", "style": style}]
+    for idx, img in enumerate(images, start=2):
+        panels.append({"number": idx, "image": img,
+                       "style": (styles or {}).get(idx, "")})
+    return panels
+
+
+def test_style_echo_warnings():
+    check("L36k _content_words drops glue words and 1-2 letter tokens",
+          ltx_movie._content_words("The warm 35mm lens and its soft, even light")
+          == {"warm", "lens", "soft", "even", "light"},
+          "got %r" % ltx_movie._content_words(
+              "The warm 35mm lens and its soft, even light"))
+
+    w = ltx_movie._style_echo_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_BAD_IMAGE]))
+    check("L36a a restating panel is flagged", len(w) == 1, "got %r" % w)
+    check("L36a the warning names the panel and the mechanism",
+          w and w[0].startswith("panel 2: Image: restates ")
+          and "crowds out" in w[0], "got %r" % w)
+
+    check("L36b a composition-only panel is silent",
+          ltx_movie._style_echo_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])) == [],
+          "got %r" % ltx_movie._style_echo_warnings(
+              _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])))
+
+    mixed = ltx_movie._style_echo_warnings(
+        _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE, _ECHO_BAD_IMAGE, _ECHO_GOOD_IMAGE]))
+    check("L36c only the offending panel is flagged, by its number",
+          len(mixed) == 1 and mixed[0].startswith("panel 3: "), "got %r" % mixed)
+
+    # Panel 1 is exempt: its Image: IS the literal description of the reference,
+    # so near-total Style: overlap there is correct, not a defect.
+    p1 = _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])
+    p1[0]["image"] = _ECHO_BAD_IMAGE
+    check("L36d panel 1 is never flagged",
+          ltx_movie._style_echo_warnings(p1) == [], "got %r" % ltx_movie._style_echo_warnings(p1))
+
+    # Threshold boundary. 20 distinct content words -> threshold 12.
+    greek = _ECHO_GREEK.split()
+    below = _echo_panels(_ECHO_GREEK,
+                         ["A wide shot of the road, " + " ".join(greek[:11]) + ", camera static."])
+    at = _echo_panels(_ECHO_GREEK,
+                      ["A wide shot of the road, " + " ".join(greek[:12]) + ", camera static."])
+    check("L36e 11 of 20 shared words is below threshold",
+          ltx_movie._style_echo_warnings(below) == [], "got %r" % ltx_movie._style_echo_warnings(below))
+    check("L36e 12 of 20 shared words trips it",
+          len(ltx_movie._style_echo_warnings(at)) == 1, "got %r" % ltx_movie._style_echo_warnings(at))
+
+    # A very short Style: line is not checked at all.
+    short = _echo_panels("teal palette, matte grain", ["teal palette, matte grain everywhere"])
+    check("L36f a Style: line under 12 content words is skipped",
+          ltx_movie._style_echo_warnings(short) == [],
+          "got %r" % ltx_movie._style_echo_warnings(short))
+
+    # Stray Style: lines -- reported, and separately from the echo warnings.
+    stray = ltx_movie._style_echo_warnings(
+        _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE, _ECHO_GOOD_IMAGE],
+                     styles={2: _ECHO_STYLE, 3: _ECHO_STYLE}))
+    check("L36g stray Style: lines are reported once, listing the panels",
+          len(stray) == 1 and stray[0].startswith("panels 2, 3: carry a Style: line"),
+          "got %r" % stray)
+
+    check("L36h empty panel list returns [] and does not raise",
+          ltx_movie._style_echo_warnings([]) == [])
+    check("L36i panels with no style key at all return []",
+          ltx_movie._style_echo_warnings([{"number": 1, "image": "x"},
+                                          {"number": 2, "image": "y"}]) == [])
+
+    # Reproduces the real defect's exact proportions -- 34 of 42 Style: words
+    # recovered, against a threshold of 22. Synthesised from 42 distinct nonsense
+    # tokens ("qzwaa", "qzwab", ...), deliberately NOT read from
+    # generated/stories/drift_red_test/story.md: that file is regenerated by the
+    # acceptance rerun (A3) and generated/ is not version-controlled, so a test
+    # reading it would flip red the moment the fix is validated.
+    big_tokens = ["qzw" + chr(97 + n // 26) + chr(97 + n % 26) for n in range(42)]
+    big_style = " ".join(big_tokens)
+    check("L36j fixture really has 42 distinct content words",
+          len(ltx_movie._content_words(big_style)) == 42,
+          "got %d" % len(ltx_movie._content_words(big_style)))
+    real_shape = _echo_panels(big_style,
+                              ["A wide shot down the street, " + " ".join(big_tokens[:34])])
+    check("L36j the real run's 34-of-42 proportion is flagged",
+          len(ltx_movie._style_echo_warnings(real_shape)) == 1,
+          "got %r" % ltx_movie._style_echo_warnings(real_shape))
+
+
+# ---------------------------------------------------------------------------
+# L37: phase1_story prints the warnings and _load_story_panels works
+# ---------------------------------------------------------------------------
+
+def test_style_echo_call_site_guard():
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L37a phase1_story prints the advisory warnings exactly once",
+          text.count(
+              '    for warning in _style_echo_warnings(_load_story_panels(story_md)):\n'
+              '        print("Warning: %s" % warning)\n') == 1)
+    check("L37b the warning loop is not inside an `if not args.no_review` block",
+          '        for warning in _style_echo_warnings(' not in text,
+          "the loop must be at function indent, so --no-review runs still log it")
+    check("L37c _validate_story_md still returns only fatal violations",
+          'def _validate_story_md(story_md_path, expected_panels, no_stills=False, '
+          'require_style=False):' in text
+          and "_style_echo_warnings" not in text.split("def _validate_story_md")[1]
+              .split("return violations")[0])
+
+    with tempfile.TemporaryDirectory() as td:
+        md = os.path.join(td, "story.md")
+        with open(md, "w") as f:
+            f.write(
+                "# Story\n\n"
+                "## Panel 1 — First\n"
+                "Image: a scene one\n"
+                "Motion: camera pans\n"
+                "Narration: narration one\n"
+                "Style: teal palette, matte grain\n\n"
+                "## Panel 2 — Second\n"
+                "Image: a scene two\n"
+                "Motion: camera pans again\n"
+                "Narration: narration two\n"
+            )
+        panels = ltx_movie._load_story_panels(md)
+        check("L37d _load_story_panels parses a real file",
+              len(panels) == 2 and panels[0]["style"] == "teal palette, matte grain",
+              "got %r" % panels)
+        check("L37e _load_story_panels returns [] for a missing file",
+              ltx_movie._load_story_panels(os.path.join(td, "nope.md")) == [])
+
+
+# A compliant global-look Style: line: palette, lighting, setting materials, render
+# style -- and no subject. 39 words / 36 content words, so it is comfortably inside
+# the 30-55 word budget and well above _ECHO_MIN_STYLE_WORDS (the echo check stays
+# engaged on it).
+_BAND_GOOD_STYLE = ("muted teal and amber palette, desaturated shadows, soft overcast key "
+                    "light from camera left, low contrast, damp asphalt and weathered brick "
+                    "textures, painted metal railings, clean high-resolution photographic "
+                    "rendering, 35mm lens character, shallow depth of field, fine natural "
+                    "grain")
+# The exact 8 tokens _ECHO_STYLE (the pre-fix reference Style: line) trips.
+_BAND_ECHO_STYLE_HITS = ["curled", "eyes", "freckles", "hair", "lips", "skin", "woman", "young"]
+
+
+# ---------------------------------------------------------------------------
+# L38: _style_content_warnings -- the advisory subject-attribute check on Style:
+# ---------------------------------------------------------------------------
+
+def test_style_content_warnings():
+    check("L38a _STYLE_BANNED_TOKENS has exactly 109 tokens",
+          len(ltx_movie._STYLE_BANNED_TOKENS) == 109,
+          "got %d" % len(ltx_movie._STYLE_BANNED_TOKENS))
+
+    _banned_as_set = set(ltx_movie._STYLE_BANNED_TOKENS)
+    check("L38b _STYLE_BANNED_TOKENS is disjoint from _ECHO_STOPWORDS",
+          _banned_as_set.isdisjoint(ltx_movie._ECHO_STOPWORDS),
+          "intersection: %r"
+          % (_banned_as_set & set(ltx_movie._ECHO_STOPWORDS)))
+
+    bad_tokens = [t for t in ltx_movie._STYLE_BANNED_TOKENS
+                  if not (t.isalpha() and t.islower() and len(t) > 2)]
+    check("L38c _STYLE_BANNED_TOKENS is a frozenset of lowercase alphabetic 3+ char tokens",
+          isinstance(ltx_movie._STYLE_BANNED_TOKENS, frozenset) and not bad_tokens,
+          "offending tokens: %r" % bad_tokens)
+
+    w = ltx_movie._style_content_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE]))
+    check("L38d flags a non-compliant Style: line and names every hit",
+          len(w) == 1
+          and all(tok in w[0] for tok in _BAND_ECHO_STYLE_HITS)
+          and "names 8 subject-level attribute word(s)" in w[0],
+          "got %r" % w)
+
+    check("L38e the warning is a single string with the expected shape",
+          len(w) == 1
+          and w[0].startswith("panel 1: Style: names ")
+          and "extreme wide shots" in w[0]
+          and "pull the camera in" in w[0],
+          "got %r" % w)
+
+    check("L38f a compliant Style: line is silent",
+          ltx_movie._style_content_warnings(
+              _echo_panels(_BAND_GOOD_STYLE, [_ECHO_GOOD_IMAGE])) == [])
+
+    def _never_raises(panels):
+        """_style_content_warnings' contract is "returns [], never raises". A bare
+        call here cannot express that: an exception in a check()'s condition
+        argument propagates before check() is ever entered, killing the run and
+        suppressing both the OK n/n summary and every later row. Catching it turns
+        a raise into an ordinary red check."""
+        try:
+            return ltx_movie._style_content_warnings(panels)
+        except Exception as exc:
+            return "raised %s: %s" % (type(exc).__name__, exc)
+
+    _g_cases = ([], [{"number": 1, "image": "x"}],
+                [{"number": 1, "image": "x", "style": ""}])
+    check("L38g never raises on an empty panel list or a missing/empty style key",
+          all(_never_raises(c) == [] for c in _g_cases),
+          "got %r" % ([_never_raises(c) for c in _g_cases],))
+
+    # Built with _echo_panels (two panels) rather than a bare one-element list: a
+    # one-element fixture cannot survive a panels[0]->panels[1] mutation, so it
+    # crashed the run instead of letting the row's own checks go red (see the
+    # spec's Q-6 finding). Panel 1 still carries the mixed-case Style: text, which
+    # is what this row is actually about.
+    w_case = ltx_movie._style_content_warnings(_echo_panels(
+        "Young Woman With Auburn HAIR And Freckled SKIN, teal palette",
+        [_ECHO_GOOD_IMAGE]))
+    check("L38h case- and punctuation-insensitive matching",
+          len(w_case) == 1
+          and all(tok in w_case[0]
+                  for tok in ("freckled", "hair", "skin", "woman", "young")),
+          "got %r" % w_case)
+
+    w_panel2 = ltx_movie._style_content_warnings(
+        _echo_panels(_BAND_GOOD_STYLE, [_ECHO_BAD_IMAGE], styles={2: _ECHO_STYLE}))
+    check("L38i only panel 1's Style: line is inspected",
+          w_panel2 == [], "got %r" % w_panel2)
+
+
+# ---------------------------------------------------------------------------
+# L39: the band contract and the _style_content_warnings call site
+# ---------------------------------------------------------------------------
+
+def test_band_prompt_and_content_call_site():
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+    pre = ltx_movie.SEED_IMAGE_PREFACE
+    post = ltx_movie.SEED_IMAGE_POSTFACE
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+
+    check("L39a the content-warning loop appears exactly once, at function indent",
+          text.count(
+              '    for warning in _style_content_warnings(_load_story_panels(story_md)):\n'
+              '        print("Warning: %s" % warning)\n') == 1)
+
+    check("L39b the loop is not nested",
+          '        for warning in _style_content_warnings(' not in text,
+          "the loop must be at function indent, so --no-review runs still log it")
+
+    check("L39c it is advisory, not fatal: _validate_story_md never calls it",
+          "_style_content_warnings"
+          not in text.split("def _validate_story_md")[1].split("return violations")[0])
+
+    check("L39d the Style: template carries the content boundary",
+          "30-55 words on a single line" in pre
+          and "It must name NO person and NO subject attribute" in pre
+          and "It must not mention the subject either" in pre,
+          "missing from preface")
+
+    band_headings = (
+        "FAR BAND -- extreme wide shot, wide shot.", "At most 8 identity words",
+        "MID BAND -- medium shot, medium close-up.", "10 to 20 identity words",
+        "NEAR BAND -- close-up, extreme close-up.", "18 to 30 identity words",
+    )
+    check("L39e the three band headings and budgets are each present once in the preface",
+          all(pre.count(phrase) == 1 for phrase in band_headings),
+          "missing/duplicated: %r"
+          % [phrase for phrase in band_headings if pre.count(phrase) != 1])
+
+    rationale_phrases = (
+        "write only the identity a viewer could actually resolve at that distance",
+        "which turns a wide shot into a portrait",
+        "the renderer invents a different person",
+        "This is the only band that describes a face",
+        "The mid and near counts are ranges with a floor, not ceilings to stay under",
+    )
+    check("L39f the preface states both directions of the identity trade-off",
+          all(phrase in pre for phrase in rationale_phrases),
+          "missing: %r" % [phrase for phrase in rationale_phrases if phrase not in pre])
+
+    check("L39g the identity budget is shared with the composition budget, not additive",
+          "The identity words come out of the same 45-70 words, not on top of them" in pre)
+
+    postface_phrases = (
+        "far band (extreme wide shot, wide shot): at most 8 identity words",
+        "mid band (medium shot, medium close-up): 10 to 20 identity words",
+        "near band (close-up, extreme close-up): 18 to 30 identity words",
+        "The mid and near counts have a floor",
+    )
+    check("L39h the postface restates all three bands and the floor",
+          all(phrase in post for phrase in postface_phrases),
+          "missing: %r" % [phrase for phrase in postface_phrases if phrase not in post])
+
+    leaked_phrases = ("FAR BAND", "MID BAND", "NEAR BAND", "30-55 words", "identity words")
+    check("L39i none of the band language leaks into the unseeded prompt",
+          not any(phrase in p_off for phrase in leaked_phrases),
+          "leaked: %r" % [phrase for phrase in leaked_phrases if phrase in p_off])
+
+    check("L39j the band and content-boundary text is assembled into the seeded prompt once",
+          p_on.count("30-55 words on a single line") == 1
+          and p_on.count("FAR BAND") == 1
+          and p_on.startswith(pre)
+          and p_on.endswith(post))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
     test_removed_flags_rejected()
@@ -1024,6 +1566,16 @@ if __name__ == "__main__":
     test_seed_dry_run_plan()
     test_seed_no_stills_conflict()
     test_seed_source_guards()
+    test_seed_preface_specifies_style_field()
+    test_seed_preface_drops_verbatim_repetition()
+    test_validate_story_md_require_style()
+    test_require_style_call_site_guard()
+    test_seed_postface_overrides_last()
+    test_seed_preface_bans_restated_appearance()
+    test_style_echo_warnings()
+    test_style_echo_call_site_guard()
+    test_style_content_warnings()
+    test_band_prompt_and_content_call_site()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

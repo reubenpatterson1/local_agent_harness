@@ -120,6 +120,32 @@ def _write_three_panel_story(tmp):
     return md_path
 
 
+STYLE_TEXT = ("weathered brass fittings, deep teal and rust palette, matte film grain, "
+              "soft overcast light, photoreal 35mm rendering")
+
+
+def _write_three_panel_story_with_style(tmp, style=STYLE_TEXT):
+    md_path = os.path.join(tmp, "story.md")
+    with open(md_path, "w") as f:
+        f.write(
+            "# Story\n\n"
+            "## Panel 1 - First\n"
+            "Image: a red ball on a table\n"
+            "Motion: camera zooms in\n"
+            "Narration: the ball sits quietly\n"
+            "Style: %s\n\n"
+            "## Panel 2 - Second\n"
+            "Image: a blue cube on the floor\n"
+            "Motion: camera pans left\n"
+            "Narration: the cube waits\n\n"
+            "## Panel 3 - Third\n"
+            "Image: a green pyramid in the sky\n"
+            "Motion: slow rotation\n"
+            "Narration: the pyramid floats\n" % style
+        )
+    return md_path
+
+
 def test_dry_run_prints_and_never_imports_torch():
     with tempfile.TemporaryDirectory() as tmp:
         md_path = _write_three_panel_story(tmp)
@@ -401,6 +427,195 @@ def test_seed_source_guards():
     check("I13 schema_version unbumped", '"schema_version": 1,' in src)
 
 
+# ---------------------------------------------------------------------------
+# I14: the parser reads Style:, back-compatibly
+# ---------------------------------------------------------------------------
+
+def test_style_field_parses_back_compatibly():
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = _write_three_panel_story_with_style(tmp)
+        _narrative, panels = story_manifest._parse_prompts_md(md_path)
+        check("I14 panel 1 style == STYLE_TEXT", panels[0]["style"] == STYLE_TEXT,
+              "got %r" % panels[0]["style"])
+        check("I14 panel 2 style == ''", panels[1]["style"] == "", "got %r" % panels[1]["style"])
+        check("I14 panel 3 style == ''", panels[2]["style"] == "", "got %r" % panels[2]["style"])
+        check("I14 panel 1 image unaffected", panels[0]["image"] == "a red ball on a table",
+              "got %r" % panels[0]["image"])
+        check("I14 panel 1 motion unaffected", panels[0]["motion"] == "camera zooms in",
+              "got %r" % panels[0]["motion"])
+        check("I14 panel 1 narration unaffected",
+              panels[0]["narration"] == "the ball sits quietly", "got %r" % panels[0]["narration"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = os.path.join(tmp, "story.md")
+        with open(md_path, "w") as f:
+            f.write(
+                "# Story\n\n"
+                "## Panel 1 - First\n"
+                "Image: a red ball on a table\n"
+                "Motion: camera zooms in\n"
+                "Narration: the ball sits quietly\n"
+                "Style: first part\n"
+                "second part\n"
+            )
+        _narrative, panels = story_manifest._parse_prompts_md(md_path)
+        check("I14 wrapped Style: value space-joins",
+              panels[0]["style"] == "first part second part", "got %r" % panels[0]["style"])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = _write_three_panel_story(tmp)
+        _narrative, panels = story_manifest._parse_prompts_md(md_path)
+        check("I14 no Style: -> style == ''", panels[0]["style"] == "", "got %r" % panels[0]["style"])
+        check("I14 no Style: -> image unaffected", panels[0]["image"] == "a red ball on a table",
+              "got %r" % panels[0]["image"])
+
+
+# ---------------------------------------------------------------------------
+# I15: _compose_prompt
+# ---------------------------------------------------------------------------
+
+def test_compose_prompt():
+    check("I15 image + style, one space",
+          story_images._compose_prompt("a red ball", "teal palette") == "a red ball teal palette",
+          "got %r" % story_images._compose_prompt("a red ball", "teal palette"))
+    check("I15 empty style returns image unchanged",
+          story_images._compose_prompt("a red ball", "") == "a red ball",
+          "got %r" % story_images._compose_prompt("a red ball", ""))
+    check("I15 whitespace-only style returns image unchanged",
+          story_images._compose_prompt("a red ball", "   ") == "a red ball",
+          "got %r" % story_images._compose_prompt("a red ball", "   "))
+    check("I15 empty image returns style unchanged",
+          story_images._compose_prompt("", "teal palette") == "teal palette",
+          "got %r" % story_images._compose_prompt("", "teal palette"))
+    check("I15 both sides stripped",
+          story_images._compose_prompt("  a red ball  ", "  teal palette  ") == "a red ball teal palette",
+          "got %r" % story_images._compose_prompt("  a red ball  ", "  teal palette  "))
+    result = story_images._compose_prompt("a red ball", "teal palette")
+    check("I15 style is a suffix, not a prefix",
+          result.startswith("a red ball") and result.endswith("teal palette"), "got %r" % result)
+
+
+# ---------------------------------------------------------------------------
+# I16: _style_text
+# ---------------------------------------------------------------------------
+
+def test_style_text():
+    check("I16 no panels -> ''", story_images._style_text([]) == "")
+    check("I16 strips whitespace", story_images._style_text([{"style": "  abc  "}]) == "abc")
+    check("I16 missing key tolerated", story_images._style_text([{}]) == "")
+    check("I16 only panel 1 is read",
+          story_images._style_text([{"style": ""}, {"style": "later"}]) == "")
+
+
+# ---------------------------------------------------------------------------
+# I17: _panel_seed
+# ---------------------------------------------------------------------------
+
+def test_panel_seed():
+    check("I17 ungrounded seed 0 index 1", story_images._panel_seed(0, 1, False) == 1)
+    check("I17 ungrounded seed 0 index 5", story_images._panel_seed(0, 5, False) == 5)
+    check("I17 ungrounded seed 7 index 3", story_images._panel_seed(7, 3, False) == 10)
+    check("I17 grounded seed 0 index 1", story_images._panel_seed(0, 1, True) == 0)
+    check("I17 grounded seed 0 index 5", story_images._panel_seed(0, 5, True) == 0)
+    check("I17 grounded seed 7 index 3", story_images._panel_seed(7, 3, True) == 7)
+
+
+# ---------------------------------------------------------------------------
+# I18: grounded --dry-run output
+# ---------------------------------------------------------------------------
+
+def test_grounded_dry_run_output():
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = _write_three_panel_story_with_style(tmp)
+        out_dir = os.path.join(tmp, "imgs")
+        script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import importlib.machinery\n"
+            "m = importlib.machinery.SourceFileLoader('ltx_story_images', %r).load_module()\n"
+            "rc = m.main(['--story-md', %r, '--out-dir', %r, '--seed', '4', '--dry-run'])\n"
+            "print('TORCH_IMPORTED=%%s' %% ('torch' in sys.modules))\n"
+            "print('RC=%%d' %% rc)\n"
+        ) % (WS, _IMAGES_PATH, md_path, out_dir)
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        panel_lines = [ln for ln in lines if ln[:1].isdigit()]
+        check("I18 rc == 0", "RC=0" in lines, "got %r" % lines)
+        check("I18 torch never imported", "TORCH_IMPORTED=False" in lines, "got %r" % lines)
+        check("I18 style line present", ("style: " + STYLE_TEXT) in lines, "got %r" % lines)
+        check("I18 pinned-seed line present",
+              "seed: pinned to 4 for every generated panel (grounded mode)" in lines,
+              "got %r" % lines)
+        check("I18 three panel lines", len(panel_lines) == 3, "got %r" % panel_lines)
+        check("I18 every panel line has rng 4",
+              all("| rng 4 |" in ln for ln in panel_lines), "got %r" % panel_lines)
+        check("I18 every panel line has +style",
+              all("| +style |" in ln for ln in panel_lines), "got %r" % panel_lines)
+        check("I18 every panel line's prompt actually carries the style text",
+              all("weathered brass fittings" in ln for ln in panel_lines),
+              "got %r" % panel_lines)
+        check("I18 no ascending rng offsets",
+              not any(("rng 5" in ln or "rng 6" in ln or "rng 7" in ln) for ln in panel_lines),
+              "got %r" % panel_lines)
+        panel2_line = next((ln for ln in panel_lines if ln.startswith("2 |")), "")
+        panel3_line = next((ln for ln in panel_lines if ln.startswith("3 |")), "")
+        check("I18 panel 2 still shows its own content", "blue cube" in panel2_line,
+              "got %r" % panel2_line)
+        check("I18 panel 3 still shows its own content", "green pyramid" in panel3_line,
+              "got %r" % panel3_line)
+
+
+# ---------------------------------------------------------------------------
+# I19: ungrounded --dry-run output is unchanged
+# ---------------------------------------------------------------------------
+
+def test_ungrounded_dry_run_output_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        md_path = _write_three_panel_story(tmp)
+        out_dir = os.path.join(tmp, "imgs")
+        script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "import importlib.machinery\n"
+            "m = importlib.machinery.SourceFileLoader('ltx_story_images', %r).load_module()\n"
+            "rc = m.main(['--story-md', %r, '--out-dir', %r, '--seed', '4', '--dry-run'])\n"
+            "print('RC=%%d' %% rc)\n"
+        ) % (WS, _IMAGES_PATH, md_path, out_dir)
+        proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        panel_lines = [ln for ln in lines if ln[:1].isdigit()]
+        check("I19 exactly 3 panel lines", len(panel_lines) == 3, "got %r" % panel_lines)
+        check("I19 no panel line has +style",
+              not any("+style" in ln for ln in panel_lines), "got %r" % panel_lines)
+        check("I19 no panel line has 'rng '",
+              not any("rng " in ln for ln in panel_lines), "got %r" % panel_lines)
+        check("I19 no panel line has 'pinned to'",
+              not any("pinned to" in ln for ln in panel_lines), "got %r" % panel_lines)
+        check("I19 no line starts with 'style: '",
+              not any(ln.startswith("style: ") for ln in lines), "got %r" % lines)
+        pattern = re.compile(r"^\d+ \| .+ \| '.*'$")
+        check("I19 each panel line matches the plain format",
+              all(pattern.match(ln) for ln in panel_lines), "got %r" % panel_lines)
+
+
+# ---------------------------------------------------------------------------
+# I20: source guards for the seed change
+# ---------------------------------------------------------------------------
+
+def test_seed_and_style_source_guards():
+    with open(_IMAGES_PATH) as f:
+        src = f.read()
+    check("I20 _panel_seed(args.seed, i, grounded) appears twice",
+          src.count("_panel_seed(args.seed, i, grounded)") == 2,
+          "got %d" % src.count("_panel_seed(args.seed, i, grounded)"))
+    check("I20 manual_seed(seed_used) present", "manual_seed(seed_used)" in src)
+    check("I20 old per-panel offset gone from the call site",
+          "manual_seed(args.seed + i)" not in src)
+    check("I20 _compose_prompt( appears three times",
+          src.count("_compose_prompt(") == 3, "got %d" % src.count("_compose_prompt("))
+    check("I20 grounded = bool(style) present", "grounded = bool(style)" in src)
+
+
 if __name__ == "__main__":
     test_labeled_section_parses_three_fields()
     test_unlabeled_section_keeps_text_and_empty_labels()
@@ -415,6 +630,13 @@ if __name__ == "__main__":
     test_seed_dry_run_marks_panel_one()
     test_missing_seed_image_rejected()
     test_seed_source_guards()
+    test_style_field_parses_back_compatibly()
+    test_compose_prompt()
+    test_style_text()
+    test_panel_seed()
+    test_grounded_dry_run_output()
+    test_ungrounded_dry_run_output_unchanged()
+    test_seed_and_style_source_guards()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

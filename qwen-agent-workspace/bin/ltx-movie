@@ -71,7 +71,7 @@ import glob
 import importlib.machinery
 import json
 import os
-import re  # noqa: F401 -- kept for parity with the workspace's stdlib-only import convention
+import re
 import shlex
 import subprocess
 import sys
@@ -142,14 +142,44 @@ SEED_IMAGE_PREFACE = """An image is attached to this message. It is the movie's 
 
 Before you write anything, look at the attached image and describe what it actually shows. Panel 1's Image: field must be a faithful, literal description of that attached image and nothing else -- its subject, pose, framing, setting, lighting, colour palette and visual style as they really appear -- not a generative prompt, not an embellishment, and not an invention. Do not add people, objects, actions or scenery that are not visible in the attached image, and do not omit the ones that are.
 
-Panel 1's Motion: and Narration: fields are written normally, and Panel 2 onward continue the narrative as usual -- but every later panel's Image: field must stay visually consistent with what you actually observed in the attached image: the same characters, wardrobe, setting, lighting and style. Any character or recurring visual element visible in the attached image gets its full visual description written out in Panel 1's Image: field, taken from the image itself, and that exact wording is repeated VERBATIM in every later panel in which it appears."""
+Panel 1's Motion: and Narration: fields are written normally, and Panel 2 onward continue the narrative as usual -- but every later panel's Image: field must stay visually consistent with what you actually observed in the attached image: the same characters, wardrobe, setting, lighting and style. The palette, lighting and rendering style are already handled for you: the Style: line described below is appended word for word to the end of every panel's image prompt by the pipeline, before the panel is rendered. The subject's identity is NOT handled that way -- it is written into each panel's own Image: field, sized to that panel's shot distance by the three bands below. So: Do NOT copy Panel 1's Image: description into the later panels, and do not carry more identity detail than that panel's shot distance can actually resolve. Materials, colour palette, lighting character and rendering style must not be described again in any Image: field after Panel 1 -- not word for word and not reworded. Writing them a second time puts the same attribute list into the image prompt twice and crowds out the shot type, camera angle and framing that are the only things making that panel different from its neighbours. Appearance is the exception, and it works the other way round: hair, skin, face, build and wardrobe are NOT in the Style: line, so each later panel writes them itself -- but only as much of them as its own shot distance can show.
+
+Each later panel's Image: field is 45-70 words -- shorter than the 70-90 words asked for below, which applies to Panel 1 only, because the global-look words are gone and the identity words are trimmed to what the shot distance can show -- and carries that panel's own composition plus the identity its band allows, and nothing else: the shot type, the camera viewpoint and height, where the subject sits in the frame and which way it faces, the action or pose at that instant, the distance between camera and subject, and the setting and background elements in view. Write it in that order: shot type first, then camera viewpoint, then the subject's short referring phrase, then the identity detail this shot band allows, then the action and placement, then the setting. Refer to each recurring subject by one short referring phrase of at most five words -- the same phrase the Motion: fields use, chosen the first time that subject appears and reused word for word in every later Image: and Motion: field, for example "the woman in grey" or "the red car". That phrase carries the subject's continuity; the identity words its shot band allows are written after it. A later panel has exactly three fields, in this order: Image:, Motion:, Narration: -- and no Style: line.
+
+How much of the subject's appearance a later Image: field carries is decided by that panel's shot type and by nothing else. The rule is: write only the identity a viewer could actually resolve at that distance -- and write all of it, because the Style: line does not carry appearance and this field is the only place the subject's identity is stated. Too much identity in a distant shot is a contradiction the renderer resolves by moving the camera closer, which turns a wide shot into a portrait; too little in a near shot leaves the face unspecified, and the renderer invents a different person. The three bands are:
+FAR BAND -- extreme wide shot, wide shot. At most 8 identity words after the referring phrase: overall build or height, and the dominant colour of the clothing. Nothing else. No hair texture, no hair length, no skin tone, no face, no eyes, no lips, no freckles, no markings, no fabric detail.
+MID BAND -- medium shot, medium close-up. 10 to 20 identity words after the referring phrase: the garments and their colours, hair colour and length, and build. No face-feature detail -- no eye colour, no lip colour, no freckles, no skin texture.
+NEAR BAND -- close-up, extreme close-up. 18 to 30 identity words after the referring phrase: skin tone, markings such as freckles or scars, eye colour, lip colour, hair colour and texture, and whatever garment is visible at the neckline. This is the only band that describes a face, and it is the band where writing too little is the bigger mistake.
+The mid and near counts are ranges with a floor, not ceilings to stay under: a near-band panel that names only the referring phrase renders a stranger. The identity words come out of the same 45-70 words, not on top of them: a near-band panel has almost no setting left in frame, so the words it spends on the face are the words a far-band panel spends on the street.
+
+Panel 1, and only Panel 1, carries one extra field, written as its LAST line, after Narration:, in exactly this form:
+
+Style: <30-55 words on a single line describing ONLY the global look that every panel of this movie shares, taken from the attached image: the colour palette, the lighting character, the materials and surface textures of the setting, and the rendering style, medium and lens character. It must name NO person and NO subject attribute -- no hair, skin, face, eyes, lips, build, age, gender or wardrobe words -- because this line is appended unchanged to EVERY panel's image prompt, including the extreme wide shots where none of those could be resolved, and a face named in a wide shot's prompt drags the camera in.>
+
+Write the Style: line as a plain comma-separated list of attributes with no sentence subject: it is appended word for word to the end of every panel's image prompt, so it must read correctly after any panel's Image: text. It must not mention composition, framing, shot type, camera angle, viewpoint, pose, action, or where anything sits in the frame -- those change from panel to panel and each panel's own Image: field sets them. It must not mention the subject either -- who they are, their hair, skin, face, build, age, gender or clothing -- because those change in renderability from panel to panel, and each panel's own Image: field sets them, at its band's level of detail. Emit the Style: line exactly once, in Panel 1, and never in any other panel. The pipeline reads that line from Panel 1 alone, so a Style: line written under Panel 2 or later is dead text that is never read.
+
+This replaces the verbatim-repetition rule below for everything that is visible in the attached image: describe those elements once, in Panel 1's Image: field, put the global look -- and nothing about the subject -- into the Style: line, and do not repeat Panel 1's wording in later panels. Later panels do state the subject's appearance again, in their own words and only as much of it as their shot band allows. The verbatim-repetition rule below still applies to any NEW recurring character or visual element you introduce later that is not visible in the attached image."""
+
+SEED_IMAGE_POSTFACE = """Two of the rules above are overridden for this movie, because an image is attached and Panel 1's still IS that image:
+
+1. The VERBATIM-repetition rule applies only to a new recurring character or element you introduce later that is NOT visible in the attached image. For everything that IS visible in it, the global look -- colour palette, lighting character, setting materials and textures, rendering style -- goes once into Panel 1's Style: line and is never described again -- not word for word and not reworded. No Image: field after Panel 1 may carry colour-palette, lighting-character or rendering-style words. The subject's appearance is NOT in the Style: line, so every later Image: field must state it: each names its subject with the short referring phrase and then adds the identity its shot band calls for -- far band (extreme wide shot, wide shot): at most 8 identity words, build and dominant clothing colour only, no face, no hair texture, no skin tone; mid band (medium shot, medium close-up): 10 to 20 identity words, garments and their colours, hair colour and length, build, and no face-feature detail; near band (close-up, extreme close-up): 18 to 30 identity words, and it is the only band that may describe a face. The mid and near counts have a floor: a close-up that names only the referring phrase renders a different person, because nothing else in the prompt says who this is.
+2. The 70-90 word length applies to Panel 1's Image: field. Every later panel's Image: field is 45-70 words: composition first, then only the identity detail its shot band allows, in this order: shot type, camera viewpoint and height, the subject's referring phrase, the band's identity words, the action and placement in frame, the setting and background.
+
+Panel 1 has four fields, in this order: Image:, Motion:, Narration:, Style:. Every other panel has exactly three, in this order: Image:, Motion:, Narration: -- and no Style: line.
+
+Do not verify the file with run_python or any other tool. Emit no other text."""
 
 
 def build_story_prompt(narrative, story_id, panels, no_stills=False, seed_image=False):
     template = STORY_PROMPT_TEMPLATE_NO_STILLS if no_stills else STORY_PROMPT_TEMPLATE
     rendered = template.format(narrative=narrative, story_id=story_id, panels=panels)
     if seed_image and not no_stills:
-        return SEED_IMAGE_PREFACE + "\n\n" + rendered
+        # The postface goes AFTER the rendered template on purpose. The template's
+        # VERBATIM-repetition rule and its 70-90 word Image: budget are concrete and
+        # imperative; a preface-only override of them sits ~1000 words upstream and lost
+        # to them in the 2026-09-13 drift_red_test run, where every later panel re-typed
+        # the full appearance list. Restating the two overrides last is the fix.
+        return SEED_IMAGE_PREFACE + "\n\n" + rendered + "\n\n" + SEED_IMAGE_POSTFACE
     return rendered
 
 
@@ -353,12 +383,17 @@ def _lock_state(lock_path):
 # story.md validation
 # ---------------------------------------------------------------------------
 
-def _validate_story_md(story_md_path, expected_panels, no_stills=False):
+def _validate_story_md(story_md_path, expected_panels, no_stills=False, require_style=False):
     """Load bin/ltx-story-manifest via SourceFileLoader and validate
     story_md_path against it: exactly expected_panels panels, each with a
     non-empty Image:/Motion:/Narration: field -- or, under no_stills, a
     non-empty Prompt:/Narration: field and neither Image: nor Motion:.
-    Returns a list of violation strings (empty list == valid)."""
+    Returns a list of violation strings (empty list == valid).
+
+    require_style additionally demands a non-empty Style: field on panel 1 --
+    set only for a --seed-image run, whose Phase 2 carries the reference's
+    identity forward from that field.
+    """
     violations = []
     manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
     try:
@@ -391,7 +426,178 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False):
                 if not p[key].strip():
                     violations.append("panel %d: missing/empty %s: field" % (num, label))
 
+    # A seeded run's whole grounding mechanism after panel 1 is Phase 2 appending
+    # panel 1's Style: text to every panel prompt. Without the field the run would
+    # silently fall back to the drift-prone paraphrase-per-panel behaviour this
+    # replaced, so fail loudly: story.md is kept, and one hand-edited line fixes it.
+    if require_style and panels and not panels[0].get("style", "").strip():
+        violations.append(
+            "panel 1: missing/empty Style: field, which --seed-image requires -- add one "
+            "line to panel 1 after Narration:, naming only the global look: colour palette, "
+            "lighting character, setting materials and textures, and rendering style, medium "
+            "and lens character (no composition or camera words, and no subject, hair, skin, "
+            "face, build or wardrobe words)"
+        )
+
     return violations
+
+
+# Glue words dropped before comparing a panel's Image: text with Panel 1's Style:
+# text. Deliberately minimal: the Style: line is a bare comma-separated attribute
+# list, so nearly every word in it is signal, and a longer stop-list would only
+# shrink an already 4-vs-15-vs-34 separation (see the docstring below).
+_ECHO_STOPWORDS = frozenset(
+    "and are its that the their they them this with without".split()
+)
+
+# A later panel is flagged when it recovers more than half of Panel 1's Style:
+# words AND at least _ECHO_MIN_OVERLAP of them. Both conditions, so a very short
+# Style: line cannot be tripped by a handful of incidental matches. Stories whose
+# Style: line has fewer than _ECHO_MIN_STYLE_WORDS content words are not checked
+# at all.
+_ECHO_MIN_STYLE_WORDS = 12
+_ECHO_MIN_OVERLAP = 12
+_ECHO_FRACTION = 0.5
+
+
+def _content_words(text):
+    """Lowercased alphabetic words of 3+ characters, minus _ECHO_STOPWORDS."""
+    return set(
+        w for w in re.findall(r"[a-z]+", text.lower())
+        if len(w) > 2 and w not in _ECHO_STOPWORDS
+    )
+
+
+def _load_story_panels(story_md_path):
+    """Panel dicts from story_md_path via bin/ltx-story-manifest's parser, or []
+    when the file cannot be read.
+
+    Deliberately separate from _validate_story_md rather than a second return
+    value from it: that function's return contract is "the list of FATAL
+    violations" and three checks pin its signature, while this feeds an advisory
+    warning that must never change a return code.
+    """
+    manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
+    try:
+        story_manifest = importlib.machinery.SourceFileLoader(
+            "ltx_story_manifest_for_movie", manifest_tool_path
+        ).load_module()
+        _narrative, panels = story_manifest._parse_prompts_md(story_md_path)
+    except OSError:
+        return []
+    return panels
+
+
+def _style_echo_warnings(panels):
+    """Advisory warnings about a seeded story.md, as a list of strings ([] == clean).
+
+    Two things are reported, neither of them fatal:
+
+    1. A panel after the first whose Image: field re-states the appearance that
+       Panel 1's Style: line already carries. Phase 2 appends the Style: text to
+       every panel's image prompt mechanically, so restating it puts the same
+       attribute list in the prompt twice and crowds out the shot type, camera
+       angle and framing -- which is exactly how the 2026-09-13 drift_red_test
+       run ended up rendering "extreme wide shot ... receding into the distance"
+       as a close-up portrait. Measured on that run, later panels recovered 34-37
+       of Panel 1's 42 Style: words against a threshold of 22; a compliant
+       composition-only panel recovers about 4 of 29 against a threshold of 15.
+       Panel 1 is exempt: it is the literal description of the reference image,
+       so a near-total Style: overlap there is correct.
+    2. A Style: line under any panel but the first. Harmless -- the pipeline
+       reads Panel 1's alone -- but it means the prompt's once-only rule did not
+       land, which is worth seeing.
+
+    This is a warning and not a _validate_story_md violation on purpose: item 1
+    is a word-overlap heuristic, violations are fatal with no override flag, and
+    a false positive must not be able to strand a legitimate story behind a word
+    counter.
+    """
+    if not panels:
+        return []
+
+    warnings = []
+    style_words = _content_words(panels[0].get("style", ""))
+    if len(style_words) >= _ECHO_MIN_STYLE_WORDS:
+        threshold = max(_ECHO_MIN_OVERLAP,
+                        int(_ECHO_FRACTION * len(style_words)) + 1)
+        for p in panels[1:]:
+            shared = _content_words(p.get("image", "")) & style_words
+            if len(shared) >= threshold:
+                warnings.append(
+                    "panel %s: Image: restates %d of Panel 1's %d Style: attribute words "
+                    "(%s ...) -- the Style: text is appended to every panel's image prompt "
+                    "automatically, so repeating appearance here doubles it and crowds out "
+                    "this panel's shot type, camera angle and framing"
+                    % (p.get("number"), len(shared), len(style_words),
+                       ", ".join(sorted(shared)[:8]))
+                )
+
+    stray = [str(p.get("number")) for p in panels[1:] if p.get("style", "").strip()]
+    if stray:
+        warnings.append(
+            "panels %s: carry a Style: line; only Panel 1's is read, so these are ignored "
+            "-- harmless, but it means the story prompt's once-only rule did not land"
+            % ", ".join(stray)
+        )
+
+    return warnings
+
+
+# Subject-attribute tokens that must not appear in Panel 1's Style: line. The
+# Style: text is appended unchanged to EVERY panel's image prompt (see
+# bin/ltx-story-images _compose_prompt), so a face-level word in it is asserted
+# over an extreme wide shot too, and the renderer reconciles the contradiction by
+# moving the camera in -- the 2026-09-13 defect this list guards. Matched through
+# _content_words, so the list is lowercase, alphabetic and 3+ characters, and
+# matching is case- and punctuation-insensitive. Materials, palette, lighting and
+# rendering-style words are deliberately absent: those ARE Style: content.
+_STYLE_BANNED_TOKENS = frozenset("""
+hair haired hairs hairline bald balding bangs fringe braid braided braids bun curls
+curled curly ponytail dreadlocks updo
+face faced facial cheek cheeks cheekbones chin jaw jawline brow brows eyebrow eyebrows
+eyelash eyelashes eye eyes nose nostrils lip lips mouth teeth freckle freckles dimples
+skin skinned complexion freckled blemish blemishes pores wrinkles scar stubble beard moustache
+body build built physique figure muscular slender slim stocky athletic curvy petite tall
+shoulders waist hips torso arms legs hands fingers neck
+woman women man men girl boy person people young elderly aged teenage
+wearing wears worn dressed clothing clothes wardrobe outfit garment garments shirt blouse
+dress jacket coat trousers jeans skirt sweater
+""".split())
+
+
+def _style_content_warnings(panels):
+    """Advisory warning about Panel 1's Style: line naming subject attributes.
+
+    Returns [] or a single-element list; never raises, never fatal.
+
+    The Style: line is the one piece of text bin/ltx-story-images appends to every
+    panel's prompt unchanged, so it is the only place in the story where a word is
+    asserted over every shot distance at once. Identity is distance-dependent --
+    freckles and lip colour cannot be rendered on a forty-pixel-tall subject -- so a
+    Style: line naming them contradicts every wide shot in the movie, and the
+    renderer resolves that by closing the distance. Measured on the 2026-09-13
+    reference Style: line, 8 of its content words are subject attributes; a
+    compliant global-look line (palette, lighting, materials, render style) scores
+    0 of 36.
+
+    Advisory and not a _validate_story_md violation, for the same reason as
+    _style_echo_warnings: violations are fatal with no override flag, and a token
+    list must never be able to strand a legitimate story behind a word match.
+    """
+    if not panels:
+        return []
+    hits = sorted(_content_words(panels[0].get("style", "")) & _STYLE_BANNED_TOKENS)
+    if not hits:
+        return []
+    return [
+        "panel 1: Style: names %d subject-level attribute word(s) (%s) -- the Style: text is "
+        "appended unchanged to EVERY panel's image prompt, including the extreme wide shots "
+        "where a face cannot be resolved, so appearance words here fight each wide panel's own "
+        "shot type and pull the camera in; move them into the Image: fields of the panels whose "
+        "shot band can actually show them"
+        % (len(hits), ", ".join(hits))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +796,8 @@ def phase1_story(args):
                       % (proc.returncode, tail), file=sys.stderr)
                 return 1
 
-    violations = _validate_story_md(story_md, args.panels, args.no_stills)
+    require_style = bool(getattr(args, "seed_image", None)) and not args.no_stills
+    violations = _validate_story_md(story_md, args.panels, args.no_stills, require_style)
     if violations:
         print("Error: story.md failed validation:", file=sys.stderr)
         for v in violations:
@@ -605,6 +812,20 @@ def phase1_story(args):
             content = f.read()
         print("=== story.md ===")
         print(content)
+
+    # Advisory only -- never changes the return code (see _style_echo_warnings).
+    # Printed after the story dump so a human reviewing it sees these immediately
+    # above the prompt they are about to answer, and printed under --no-review too
+    # so they land in movie.log. The content warning goes first: a Style: line that
+    # names the subject is the upstream cause, the per-panel echo is the symptom.
+    # _load_story_panels is deliberately called twice rather than hoisted -- the
+    # hoist would churn the exact-text guards L37a/L37b for one markdown re-read.
+    for warning in _style_content_warnings(_load_story_panels(story_md)):
+        print("Warning: %s" % warning)
+    for warning in _style_echo_warnings(_load_story_panels(story_md)):
+        print("Warning: %s" % warning)
+
+    if not args.no_review:
         input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
 
     return 0

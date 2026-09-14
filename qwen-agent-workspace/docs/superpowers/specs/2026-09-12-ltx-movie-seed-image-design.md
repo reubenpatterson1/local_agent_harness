@@ -104,6 +104,10 @@ in `ltx-movie` and not in `bin/qwen-agent`.
   still will not be rendered at all, it *is* the seed image. Every later panel's
   `Image:`/`Motion:` must stay visually consistent with what the model actually observed,
   using the existing verbatim-repetition convention for recurring characters/settings.
+- **Superseded 2026-09-13** by `docs/superpowers/specs/2026-09-13-ltx-movie-panel-drift-fix.md`:
+  the verbatim-repetition convention is no longer how later panels stay consistent with the
+  reference. Panel 1 now emits a once-only `Style:` field and Phase 2 appends it to every
+  panel's prompt mechanically, with the still-generation RNG seed pinned for such stories.
 - One combined model turn: the model sees the image and writes the entire `story.md` in
   the same call it does today (not a separate captioning-then-writing pipeline).
 
