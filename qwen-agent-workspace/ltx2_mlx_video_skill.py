@@ -14,10 +14,21 @@ The LTX2_MLX_BIN / LTX2_MLX_DIR environment overrides exist solely so the
 offline test suite can substitute a stub CLI. They are test infrastructure,
 not a user-facing feature.
 
-Why the venv binary and not bare `ltx-2-mlx`: the `ltx-2-mlx` name on PATH is
-a SHELL ALIAS pointing at ~/local_model_harness_red_team/.../ltx-2-mlx, and
-shell aliases do not resolve inside subprocess. Pinning
+Why the venv binary and not bare `ltx-2-mlx`: the bare name on PATH resolves
+to real executables (a pip --user editable install on system Python, and a
+`uv tool install`) that point at ~/local_model_harness_red_team/.../ltx-2-mlx
+-- an out-of-scope clone, not a shell alias. Because these are real PATH
+executables, a subprocess WOULD inherit and use them. Pinning
 ~/ltx-2-mlx/.venv/bin/ltx-2-mlx is what makes "use ~/ltx-2-mlx" reproducible.
+
+Why HF_HOME is overridden for the subprocess only: the global HF_HOME (set
+in ~/.zshenv for ollama/ComfyUI) can point at slow external storage. MLX
+evaluates lazily, so a slow weight read can end up blocking inside a Metal
+command buffer's wait, which macOS's GPU watchdog then kills as a "Command
+buffer execution failed: GPU Timeout" -- indistinguishable from a real
+Metal/MLX bug until traced back to disk throughput. LTX2_MLX_HF_HOME points
+this subprocess (only) at an internal-only cache holding just the repos this
+pipeline needs, leaving the global HF_HOME and every other tool untouched.
 """
 
 import argparse
@@ -32,6 +43,8 @@ import threading
 LTX2_MLX_DIR = os.environ.get("LTX2_MLX_DIR", os.path.expanduser("~/ltx-2-mlx"))
 LTX2_MLX_BIN = os.environ.get("LTX2_MLX_BIN",
                               os.path.join(LTX2_MLX_DIR, ".venv", "bin", "ltx-2-mlx"))
+LTX2_MLX_HF_HOME = os.environ.get("LTX2_MLX_HF_HOME",
+                                  os.path.join(LTX2_MLX_DIR, "hf_cache"))
 
 MODEL_ID = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
 DEFAULT_WIDTH = 704            # 704 % 32 == 0
@@ -268,7 +281,8 @@ def _run_subprocess(cmd, log_path, timeout_s, output_path):
                           output_path, ""),
             returncode=None, cmd=cmd, stderr_tail="", output_path=output_path)
     try:
-        popen = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, stdout=subprocess.PIPE,
+        env = dict(os.environ, HF_HOME=LTX2_MLX_HF_HOME)
+        popen = subprocess.Popen(cmd, cwd=LTX2_MLX_DIR, env=env, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, bufsize=1,
                                  start_new_session=True)
     except OSError as e:

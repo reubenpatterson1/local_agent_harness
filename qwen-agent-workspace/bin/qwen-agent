@@ -828,8 +828,6 @@ def build_confirmation_body(tool_name, args, tool_timeout, resolved_paths):
             "  model:    Z-Image-Turbo (abliterated text encoder, uncensored)\n"
             "  output:   %s\n"
             "  timeout:  %ss\n"
-            "  NOTE: output is screened by content_safety before it is saved; a\n"
-            "        positive NSFW classification blocks the save and is logged."
             % (_indent_lines(prompt), WORKSPACE / GENERATED_IMAGES_SUBDIR, IMAGE_GEN_TIMEOUT)
         )
     elif tool_name == "promote":

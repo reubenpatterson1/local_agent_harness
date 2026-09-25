@@ -1,0 +1,627 @@
+#!/bin/bash
+# story-server -- single lifecycle tool for the Phase-1 story LLM: `vision` mode serves
+# Qwen3-VL-32B abliterated 4-bit via vLLM-Metal; `text` mode serves the 27B MTPLX text
+# model. See docs/superpowers/plans/2026-09-17-story-server-lifecycle-plan.md.
+#
+# Contract and known hazards (plan D2/R1/R3 -- these are documented, NOT defended in
+# code; there is no lock file and no health watchdog):
+#   * `vision` and `text` are idempotent: they exit 0 when the requested mode is
+#     already serving OR still loading. There is no `ensure` subcommand, because it
+#     would be a second name for that same behaviour.
+#   * Switching modes is `stop` then `vision`/`text`. Nothing else switches modes.
+#   * (R1) The mode file is the ONLY discriminator during the load window, because
+#     vLLM binds the port only after the model is resident (measured: still unbound
+#     after 7m29s). If you delete it by hand mid-load, the next `vision` sees a free
+#     port and spawns a SECOND ~22 GiB server, which will OOM this host.
+#   * (R3) vllm-metal has a reproduced fatal crash under overlapping requests and the
+#     vision server runs --max-num-seqs 4. Do not run `bin/qwen-agent chat` against
+#     this server while a story phase is in flight: a concurrent turn can kill the
+#     server mid-story. Phase 1 then fails loudly and `--force-story` re-runs it.
+#
+# macOS /bin/bash is 3.2.57, which lacks several bash-4-only features (line-into-array
+# reads, lowercase-parameter expansion, associative arrays, indirect expansion) -- none of
+# those are used anywhere below.
+# no set -e, because every exit status below is inspected; an unexpected abort would skip
+# the line that says why.
+set -u
+
+STORY_SERVER_VERSION="1"
+
+WS="${STORY_SERVER_WS:-/Users/reubenpatterson/local_model_harness/qwen-agent-workspace}"
+MODEL_ID="${STORY_SERVER_MODEL_ID:-qwen38-6bit}"
+PORT="${STORY_SERVER_PORT:-8177}"
+HEALTH_URL="http://127.0.0.1:${PORT}/v1/models"
+CHAT_URL="http://127.0.0.1:${PORT}/v1/chat/completions"
+
+VISION_MODEL_DIR="${STORY_SERVER_VISION_MODEL_DIR:-/Users/reubenpatterson/mlx_models/qwen3-vl}"
+VLLM_BIN="${STORY_SERVER_VLLM_BIN:-/Users/reubenpatterson/.venv-vllm-metal/bin/vllm}"
+VISION_LOG="$WS/generated/vllm_vl_serve.log"
+# Measured 2026-09-17: with vLLM-Metal's default the 32B left 1.91 GiB available and stills
+# pushed swap past the supervisor's absolute 3.0 GiB gate; 0.70 is qwen-serve-guard's
+# production value.
+VISION_GPU_MEM_UTIL="${STORY_SERVER_VISION_GPU_MEM_UTIL:-0.70}"
+
+MTPLX_BIN="${STORY_SERVER_MTPLX_BIN:-/opt/homebrew/bin/mtplx}"
+MTPLX_VERSION_REQUIRED="${STORY_SERVER_MTPLX_VERSION:-2.10.1}"
+TEXT_MODEL_REPO="${STORY_SERVER_TEXT_MODEL_REPO:-Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed-V2}"
+TEXT_PROFILE="turbo"
+TEXT_LOG="$WS/generated/mtplx_serve.log"
+# VISION_LOG/TEXT_LOG grow without bound; the guard's log rotation
+# (qwen-serve-guard:480 rotate_if_needed) is deliberately not reimplemented here --
+# truncate by hand if needed.
+
+STATE_DIR="${STORY_SERVER_STATE_DIR:-/Users/reubenpatterson/.qwen-serve-guard}"
+MODE_FILE="$STATE_DIR/story-server-mode"
+STANDDOWN="$STATE_DIR/stand-down"
+
+# Measured 2026-09-17 on macOS 25.5.0: lsof is in /usr/sbin, NOT /usr/bin.
+# Never invoke it unqualified and never assume /usr/bin/lsof exists.
+LSOF="${STORY_SERVER_LSOF:-/usr/sbin/lsof}"
+PY="${STORY_SERVER_PY:-/usr/bin/python3}"   # 3.9.6, guaranteed present. jq is NOT assumed.
+CURL="/usr/bin/curl"
+
+READY_TIMEOUT="${STORY_SERVER_READY_TIMEOUT:-840}"
+READY_POLL="${STORY_SERVER_READY_POLL:-5}"
+PROBE_TIMEOUT=10
+WARM_TIMEOUT="${STORY_SERVER_WARM_TIMEOUT:-300}"
+WARM_MAX_TOKENS=8
+STOP_TERM_WAIT=60
+STOP_KILL_WAIT=10
+LOG_TAIL_LINES=40
+# D9's VLLM::EngineCore sweep is host-global: it is deliberately NOT scoped by $PORT,
+# so it reaps an EngineCore belonging to a vLLM on any port (R8, accepted in
+# production -- this host runs at most one vLLM). That makes it unsafe for the
+# offline test suite, which runs `stop` against an ephemeral port while a real vLLM
+# may be loading on the production port: without this switch every `stop` in the
+# suite silently adds the real EngineCore to its kill set. Set
+# STORY_SERVER_ENGINE_SCAN=0 to disable the sweep. Production sets nothing; the
+# default 1 is the contract.
+ENGINE_SCAN="${STORY_SERVER_ENGINE_SCAN:-1}"
+# How much of a command line the `mode pid:` status line shows. Measured 2026-09-17
+# on this host: the real vLLM front-end's argv[0] is the 123-char Homebrew framework
+# python, so the literal `vllm serve` starts at column 170 and a 120-char cut hides
+# it -- which makes the plan's own Step 8a/8c pass criterion ("a `mode pid: alive
+# (...)` line whose command text contains `vllm serve`") unsatisfiable. The M09/M27
+# refusal messages stay at the plan's 120 chars.
+PID_CMD_CHARS=240
+
+STANDDOWN_REASON="story-server owns port ${PORT}: qwen-serve-guard must not auto-restart vLLM, because its MODEL_PATH names the 27B text model and its serve command uses --tool-call-parser qwen3_xml, which cannot parse Qwen3-VL tool calls. Delete this file only if you know what you are re-arming."
+
+MODE=""          # set to $CMD by vision/text; every <mode> below means "$MODE"
+MODE_REC=""
+PID_REC=""
+TS_REC=""
+SPAWN_PID=""
+CAND=""
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+say()  { printf 'story-server: %s\n' "$1"; }              # stdout
+die2() { printf 'story-server: %s\n' "$1" >&2; }          # stderr, caller sets the code
+
+iso_now() { /bin/date -u "+%Y-%m-%dT%H:%M:%SZ"; }
+
+# stdin: a /v1/models body. stdout: data[0].id, or empty on any failure.
+extract_served_id() {
+    "$PY" -c 'import json,sys
+try:
+    print(json.load(sys.stdin)["data"][0]["id"])
+except Exception:
+    print("")'
+}
+
+# stdin: a /v1/chat/completions body. stdout: choices[0].message.content if it is a
+# non-empty str, else empty.
+extract_chat_content() {
+    "$PY" -c 'import json,sys
+try:
+    c = json.load(sys.stdin)["choices"][0]["message"]["content"]
+    print(c if isinstance(c, str) else "")
+except Exception:
+    print("")'
+}
+
+# stdout: the served model id currently on $PORT, or empty.
+probe_served_id() {
+    "$CURL" -s -m "$PROBE_TIMEOUT" "$HEALTH_URL" 2>/dev/null | extract_served_id
+}
+
+# stdout: the HTTP code of GET $HEALTH_URL, or 000.
+probe_http_code() {
+    "$CURL" -s -o /dev/null -w '%{http_code}' -m "$PROBE_TIMEOUT" "$HEALTH_URL" 2>/dev/null
+}
+
+# stdout: space-separated LISTEN pids on $PORT (may be empty).
+port_pids() { "$LSOF" -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | /usr/bin/tr '\n' ' '; }
+
+pid_cmd() { /bin/ps -ww -o command= -p "$1" 2>/dev/null; }
+
+# 0 if $1 is a live pid whose command line looks like one of our two servers.
+is_server_pid() {
+    local cmd
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    /bin/kill -0 "$1" 2>/dev/null || return 1
+    cmd=$(pid_cmd "$1")
+    case "$cmd" in
+        *"vllm serve"*)      return 0 ;;
+        *mtplx*" serve "*)   return 0 ;;
+        *mtplx*" serve")     return 0 ;;
+        VLLM::*)             return 0 ;;
+        # (R5, measured 2026-09-17) The Homebrew mtplx wrapper execs a venv console
+        # script which re-execs the framework Python as
+        #   Python -P -m mtplx.server.openai --model <dir> ... --host 127.0.0.1 --port <PORT> ...
+        # in the SAME pid, so a serving MTPLX command line contains no `mtplx serve`
+        # at all. The trailing space is part of the pattern: the module name is always
+        # followed by its first flag, and requiring it keeps this from matching a
+        # command that merely mentions the module name as its last argument.
+        *" -m mtplx.server.openai "*) return 0 ;;
+    esac
+    return 1
+}
+
+# stdout: space-separated live VLLM::EngineCore pids (see D9).
+engine_pids() {
+    [ "$ENGINE_SCAN" = "1" ] || return 0
+    /bin/ps -xww -o pid=,command= 2>/dev/null \
+      | /usr/bin/awk '$2 ~ /^VLLM::EngineCore/ { printf "%s ", $1 }'
+}
+
+# Reads $MODE_FILE into MODE_REC / PID_REC / TS_REC (empty when absent/garbage).
+read_mode_file() {
+    MODE_REC=""; PID_REC=""; TS_REC=""
+    [ -r "$MODE_FILE" ] || return 1
+    read -r MODE_REC PID_REC TS_REC < "$MODE_FILE" 2>/dev/null
+    return 0
+}
+
+# TERM -> wait STOP_TERM_WAIT -> KILL -> wait STOP_KILL_WAIT over a
+# space-separated pid list. 0 = every pid gone AND $PORT free, else 1.
+# Progress line every 15s: "story-server: waiting for <n> pid(s) to exit (<m>s elapsed)".
+# This is the single kill implementation: stop (1.6 steps 4-5), the readiness
+# timeout (M19), the server-exited path (M18) and the INT/TERM trap all call it.
+kill_set() {
+    local pids="$1" elapsed n p
+    [ -n "$(printf '%s' "$pids" | /usr/bin/tr -d ' ')" ] || return 0
+
+    for p in $pids; do /bin/kill -TERM "$p" 2>/dev/null; done
+    elapsed=0
+    while [ "$elapsed" -lt "$STOP_TERM_WAIT" ]; do
+        n=0
+        for p in $pids; do /bin/kill -0 "$p" 2>/dev/null && n=$((n + 1)); done
+        if [ "$n" -eq 0 ] && [ -z "$(port_pids)" ]; then return 0; fi
+        /bin/sleep 1
+        elapsed=$((elapsed + 1))
+        if [ $((elapsed % 15)) -eq 0 ]; then
+            say "waiting for $n pid(s) to exit (${elapsed}s elapsed)"
+        fi
+    done
+
+    for p in $pids; do /bin/kill -KILL "$p" 2>/dev/null; done
+    elapsed=0
+    while [ "$elapsed" -lt "$STOP_KILL_WAIT" ]; do
+        n=0
+        for p in $pids; do /bin/kill -0 "$p" 2>/dev/null && n=$((n + 1)); done
+        if [ "$n" -eq 0 ] && [ -z "$(port_pids)" ]; then return 0; fi
+        /bin/sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
+# stdout: space-separated live pids whose argv is one of our two `serve`
+# commands AND carries `--port $PORT`. Port-scoped, so a server on another
+# port is never touched. This is what makes `stop` work when the mode file is
+# missing and the port is not yet bound (the Ctrl-C / hand-started cases).
+# (R5) The third clause matches the measured MTPLX module argv. This awk's OWN
+# command line contains that literal and the `--port` literal too, but its argv[0]
+# basename (`awk`) fails the allowlist below, so it is never reported -- the `self`
+# guard is not what excludes it (the guard only covers the story-server pid itself).
+serve_cmd_pids() {
+    /bin/ps -xww -o pid=,command= 2>/dev/null | /usr/bin/awk -v self="$$" -v portarg="--port $PORT" '
+        { pid = $1; cmd = $0
+          sub(/^[ \t]*[0-9]+[ \t]+/, "", cmd)
+          if (pid == self) next
+          split(cmd, f, " "); nb = split(f[1], g, "/"); base = g[nb]
+          if (base !~ /^([Pp]ython|vllm|mtplx|bash)/) next          # argv[0] allowlist (guard:361-364)
+          if (index(cmd, portarg) == 0) next                        # only OUR port
+          if (index(cmd, "vllm serve") > 0 || index(cmd, "mtplx serve") > 0 ||
+              index(cmd, " -m mtplx.server.openai ") > 0) printf "%s ", pid }'
+}
+
+# Usage: CAND=$(add_pid "$CAND" "$p")  -- appends $p to a space-separated list
+# only if it is a number, is not $$, and is not already present.
+add_pid() {
+    local list="$1" p="$2"
+    case "$p" in ''|*[!0-9]*) printf '%s' "$list"; return 0 ;; esac
+    if [ "$p" = "$$" ]; then printf '%s' "$list"; return 0; fi
+    case " $list " in *" $p "*) printf '%s' "$list"; return 0 ;; esac
+    printf '%s' "${list:+$list }$p"
+}
+
+# ---------------------------------------------------------------------------
+# vision / text
+# ---------------------------------------------------------------------------
+
+cmd_serve() {
+    MODE="$CMD"                     # S-0
+    say "v1 cmd=$CMD port=$PORT state-dir=$STATE_DIR"   # M00
+
+    local mf_ok=1
+    read_mode_file && mf_ok=0
+
+    # S-1. Mode-file guard (MF3 step 1a, ordered per D10; MF-I applied).
+    if [ "$mf_ok" -eq 0 ] && is_server_pid "$PID_REC"; then
+        if [ "$MODE_REC" = "$MODE" ]; then
+            say "a $MODE server (pid $PID_REC) is already running; it may still be loading -- poll $HEALTH_URL"   # M05
+            exit 0
+        else
+            die2 "REFUSING: a ${MODE_REC:-unknown} server (pid $PID_REC) is already running; run \"story-server stop\" first, then start $MODE"   # M06
+            exit 3
+        fi
+    elif [ "$mf_ok" -eq 0 ]; then
+        # MF-I: the recorded pid is dead/not-a-server. Only delete the mode file when
+        # no listener is up -- a live listener's mode record must not be destroyed.
+        if [ -z "$(port_pids)" ]; then
+            /bin/rm -f "$MODE_FILE"
+            say "removed a stale mode file (recorded pid $PID_REC is gone or is not a story server)"   # M07
+        fi
+    fi
+
+    # S-2. Port probe.
+    local pids served
+    pids=$(port_pids)
+    if [ -n "$pids" ]; then
+        served=$(probe_served_id)
+        if [ "$served" = "$MODEL_ID" ]; then
+            die2 "REFUSING: 127.0.0.1:$PORT already serves $MODEL_ID in unknown mode; run \"story-server stop\" first, then start $MODE"   # M08
+            exit 3
+        else
+            local firstpid cmd120
+            firstpid=$(printf '%s' "$pids" | /usr/bin/awk '{print $1}')
+            cmd120=$(pid_cmd "$firstpid" | /usr/bin/cut -c1-120)
+            die2 "REFUSING: port $PORT is held by pid $pids ($cmd120) and it is not serving $MODEL_ID; stop it first"   # M09
+            exit 3
+        fi
+    fi
+
+    # S-3. Mode preflight.
+    if [ "$MODE" = "vision" ]; then
+        if [ ! -x "$VLLM_BIN" ]; then
+            die2 "vision mode needs an executable $VLLM_BIN; re-run the installer's user phase"   # M10
+            exit 4
+        fi
+        if [ ! -d "$VISION_MODEL_DIR" ]; then
+            die2 "vision mode needs the model directory $VISION_MODEL_DIR; create it with: ln -sfn /Users/reubenpatterson/hf_home/hub/models--divinetribe--Huihui-Qwen3-VL-32B-Instruct-abliterated-4bit-mlx/snapshots/5428d6aaca0103a1e32f47261a20fecaa47700ec $VISION_MODEL_DIR (on the dev host the snapshot lives under /Volumes/Ollama/hf_home/hub/... -- see Step 6)"   # M11
+            exit 4
+        fi
+    else
+        if [ ! -x "$MTPLX_BIN" ]; then
+            die2 "text mode needs an executable $MTPLX_BIN; see README section \"MTPLX provisioning\""   # M12
+            exit 4
+        fi
+        # If $MTPLX_BIN is the Homebrew wrapper and its venv is absent, --version
+        # bootstraps over the network; M13 then reports the bootstrap line and exits
+        # 4, which is the intended loud failure.
+        local ver
+        ver=$("$MTPLX_BIN" --version 2>&1 | /usr/bin/head -1)
+        if [ "$ver" != "mtplx $MTPLX_VERSION_REQUIRED" ]; then
+            die2 "REFUSING: $ver is installed, this pipeline requires mtplx $MTPLX_VERSION_REQUIRED"   # M13
+            exit 4
+        fi
+    fi
+
+    # S-4. Stand-down marker.
+    /bin/mkdir -p "$STATE_DIR"
+    if [ ! -e "$STANDDOWN" ]; then
+        printf '%s\n' "$STANDDOWN_REASON" > "$STANDDOWN"
+        /bin/chmod 644 "$STANDDOWN"
+        say "wrote the qwen-serve-guard stand-down marker ($STANDDOWN)"   # M14
+    else
+        say "stand-down marker already present, leaving its bytes unchanged ($STANDDOWN)"   # M15
+    fi
+
+    # S-5. Log + spawn.
+    /bin/mkdir -p "$WS/generated"
+    local log
+    if [ "$MODE" = "vision" ]; then log="$VISION_LOG"; else log="$TEXT_LOG"; fi
+    printf '\n===== story-server spawn %s %s =====\n' "$MODE" "$(iso_now)" >> "$log"
+
+    if [ "$MODE" = "vision" ]; then
+        /usr/bin/nohup /usr/bin/env VLLM_HOST_IP=127.0.0.1 \
+            "$VLLM_BIN" serve "$VISION_MODEL_DIR" \
+            --served-model-name "$MODEL_ID" \
+            --host 127.0.0.1 --port "$PORT" \
+            --max-model-len 16384 --max-num-seqs 2 \
+            --reasoning-parser qwen3 \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --gpu-memory-utilization "$VISION_GPU_MEM_UTIL" \
+            >>"$log" 2>&1 </dev/null &
+        SPAWN_PID=$!
+    else
+        /usr/bin/nohup "$MTPLX_BIN" serve --model "$TEXT_MODEL_REPO" \
+            --model-id "$MODEL_ID" --port "$PORT" --profile "$TEXT_PROFILE" \
+            >>"$log" 2>&1 </dev/null &
+        SPAWN_PID=$!
+    fi
+
+    # S-6. Mode file, written BEFORE readiness.
+    printf '%s %s %s\n' "$MODE" "$SPAWN_PID" "$(iso_now)" > "$MODE_FILE"
+    /bin/chmod 644 "$MODE_FILE"
+    say "launched $MODE server, pid $SPAWN_PID, log: $log"   # M16
+
+    # S-6b. Interrupt trap (MF-B).
+    on_interrupt() {
+        trap - INT TERM
+        die2 "interrupted during load; killing the $MODE server (pid $SPAWN_PID) so it does not hold memory the render needs"
+        kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+        /bin/rm -f "$MODE_FILE"
+        exit 5
+    }
+    trap on_interrupt INT TERM
+
+    # S-7. Readiness poll.
+    local waited=0 ready=0 sid newpid poll_started
+    poll_started=$(/bin/date +%s)
+    while [ "$waited" -lt "$READY_TIMEOUT" ]; do
+        /bin/sleep "$READY_POLL"
+        waited=$(( $(/bin/date +%s) - poll_started ))
+        if ! /bin/kill -0 "$SPAWN_PID" 2>/dev/null; then
+            sid=$(probe_served_id)
+            if [ "$sid" = "$MODEL_ID" ]; then
+                # The launcher forked (possible for the MTPLX brew wrapper): rewrite
+                # $MODE_FILE with the first port_pids pid and treat as ready (F7).
+                newpid=$(printf '%s' "$(port_pids)" | /usr/bin/awk '{print $1}')
+                say "note: launcher pid $SPAWN_PID exited but 127.0.0.1:$PORT serves $MODEL_ID; recorded listener pid $newpid instead"   # M18b
+                printf '%s %s %s\n' "$MODE" "$newpid" "$(iso_now)" > "$MODE_FILE"
+                SPAWN_PID="$newpid"
+                ready=1
+                break
+            else
+                die2 "FAILED: the $MODE server (pid $SPAWN_PID) exited after ${waited}s before becoming ready; last $LOG_TAIL_LINES lines of $log follow"   # M18
+                /usr/bin/tail -n "$LOG_TAIL_LINES" "$log" >&2
+                kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+                /bin/rm -f "$MODE_FILE"
+                exit 5
+            fi
+        elif [ "$(probe_served_id)" = "$MODEL_ID" ]; then
+            ready=1
+            break
+        fi
+    done
+
+    if [ "$ready" -ne 1 ]; then
+        die2 "TIMEOUT: 127.0.0.1:$PORT did not become ready in ${READY_TIMEOUT}s; killing the $MODE server (pid $SPAWN_PID) so it does not hold memory the render needs; last $LOG_TAIL_LINES lines of $log follow"   # M19
+        /usr/bin/tail -n "$LOG_TAIL_LINES" "$log" >&2
+        kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+        /bin/rm -f "$MODE_FILE"
+        exit 5
+    fi
+
+    trap - INT TERM
+
+    # S-8. Ready line.
+    local source
+    if [ "$MODE" = "vision" ]; then source="$VISION_MODEL_DIR"; else source="$TEXT_MODEL_REPO"; fi
+    say "ready after ${waited}s; serving $source as $MODEL_ID in $MODE mode on 127.0.0.1:$PORT"   # M17
+
+    # S-9. Warm-up (D6). Exactly one attempt -- vllm-metal crashes under overlapping
+    # requests, so this must be the only request in flight and never retried.
+    say "warming up (max_tokens $WARM_MAX_TOKENS, timeout ${WARM_TIMEOUT}s) ..."   # M20
+    local started body rc content elapsed_warm
+    started=$(/bin/date +%s)
+    body=$("$CURL" -s -m "$WARM_TIMEOUT" -H 'Content-Type: application/json' \
+           -X POST "$CHAT_URL" --data-binary @- <<EOF
+{"model":"$MODEL_ID","max_tokens":$WARM_MAX_TOKENS,"messages":[{"role":"user","content":"Reply with the single word ok"}]}
+EOF
+)
+    rc=$?
+    content=$(printf '%s' "$body" | extract_chat_content)
+    elapsed_warm=$(( $(/bin/date +%s) - started ))
+    if [ -n "$content" ] && [ "$rc" -eq 0 ]; then
+        say "warm-up OK after ${elapsed_warm}s"   # M21
+    else
+        say "WARNING: warm-up produced no content after ${elapsed_warm}s (curl rc $rc); the server is reachable and the first real story request will pay the compile cost"   # M22
+    fi
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    read_mode_file
+
+    local pids served code state firstpid cmd120 pid_cmd_text first_line log tail_line
+
+    pids=$(port_pids)
+    served=$(probe_served_id)
+    code=$(probe_http_code)
+
+    if [ -n "$pids" ] && [ "$served" = "$MODEL_ID" ]; then
+        state="SERVING ${MODE_REC:-unknown}"
+    elif [ -n "$pids" ]; then
+        firstpid=$(printf '%s' "$pids" | /usr/bin/awk '{print $1}')
+        state="FOREIGN pid $firstpid"
+    elif is_server_pid "$PID_REC"; then
+        state="LOADING ${MODE_REC:-unknown}"
+    else
+        state="STOPPED"
+    fi
+
+    printf 'story-server status  %s\n' "$(iso_now)"
+    printf '  %-16s%s\n' 'state:' "$state"
+    if [ -n "$pids" ]; then
+        printf '  %-16s%s\n' "port $PORT:" "LISTEN pid $pids"
+    else
+        printf '  %-16s%s\n' "port $PORT:" "free"
+    fi
+    printf '  %-16s%s\n' 'health:' "HTTP $code model=${served:-none}"
+    if [ -n "$MODE_REC" ] || [ -n "$PID_REC" ] || [ -n "$TS_REC" ]; then
+        printf '  %-16s%s\n' 'mode file:' "$MODE_REC $PID_REC $TS_REC"
+    else
+        printf '  %-16s%s\n' 'mode file:' "no mode recorded"
+    fi
+    if [ -z "$PID_REC" ]; then
+        printf '  %-16s%s\n' 'mode pid:' "n/a"
+    elif is_server_pid "$PID_REC"; then
+        pid_cmd_text=$(pid_cmd "$PID_REC" | /usr/bin/cut -c1-"$PID_CMD_CHARS")
+        printf '  %-16s%s\n' 'mode pid:' "alive ($pid_cmd_text)"
+    else
+        printf '  %-16s%s\n' 'mode pid:' "dead"
+    fi
+    if [ -e "$STANDDOWN" ]; then
+        first_line=$(/usr/bin/head -1 "$STANDDOWN" | /usr/bin/cut -c1-120)
+        printf '  %-16s%s\n' 'stand-down:' "YES -- qwen-serve-guard autostart is OFF ($first_line)"
+    else
+        printf '  %-16s%s\n' 'stand-down:' "no"
+    fi
+    log=""
+    if [ "$MODE_REC" = "vision" ]; then log="$VISION_LOG"
+    elif [ "$MODE_REC" = "text" ]; then log="$TEXT_LOG"
+    fi
+    if [ -n "$log" ]; then
+        printf '  %-16s%s\n' 'log:' "$log"
+    else
+        printf '  %-16s%s\n' 'log:' "n/a (no mode recorded)"
+    fi
+    printf '  last 5 log lines:\n'
+    if [ -n "$log" ] && [ -f "$log" ]; then
+        /usr/bin/tail -n 5 "$log" | while IFS= read -r tail_line; do
+            printf '    %s\n' "$tail_line"
+        done
+    else
+        printf '    (none)\n'
+    fi
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# stop
+# ---------------------------------------------------------------------------
+
+cmd_stop() {
+    read_mode_file
+
+    local port_list serve_list eng_list pid cmd120 accepted
+
+    port_list=$(port_pids)
+    serve_list=$(serve_cmd_pids)
+    eng_list=$(engine_pids)
+
+    # Step 2: validate every port_pids member before touching anything (D8, MF-C).
+    for pid in $port_list; do
+        accepted=0
+        if is_server_pid "$pid"; then
+            accepted=1
+        elif [ "$(probe_served_id)" = "$MODEL_ID" ]; then
+            accepted=1
+        elif [ -n "$PID_REC" ] && [ "$pid" = "$PID_REC" ]; then
+            accepted=1
+        else
+            case " $serve_list " in
+                *" $pid "*) accepted=1 ;;
+            esac
+        fi
+        if [ "$accepted" -ne 1 ]; then
+            cmd120=$(pid_cmd "$pid" | /usr/bin/cut -c1-120)
+            die2 "REFUSING: port $PORT is held by pid $pid ($cmd120), which is not a story server; stop it yourself"   # M27
+            exit 3
+        fi
+    done
+
+    # Step 1: build the candidate set.
+    CAND=""
+    for pid in $port_list $serve_list $eng_list; do
+        CAND=$(add_pid "$CAND" "$pid")
+    done
+    if is_server_pid "$PID_REC"; then
+        CAND=$(add_pid "$CAND" "$PID_REC")
+    fi
+
+    if [ -z "$CAND" ]; then
+        say "nothing to stop"   # M23
+        /bin/rm -f "$MODE_FILE"
+        if [ -e "$STANDDOWN" ]; then
+            say "leaving the qwen-serve-guard stand-down marker in place ($STANDDOWN)"   # M26
+        fi
+        exit 0
+    fi
+
+    if kill_set "$CAND"; then
+        /bin/rm -f "$MODE_FILE"
+        if [ -e "$STANDDOWN" ]; then
+            say "leaving the qwen-serve-guard stand-down marker in place ($STANDDOWN)"   # M26
+        else
+            # SF-4: qwen-serve-guard:596-598 deletes the marker on a successful
+            # restart, so it can legitimately be missing here -- re-create it.
+            printf '%s\n' "$STANDDOWN_REASON" > "$STANDDOWN"
+            /bin/chmod 644 "$STANDDOWN"
+            say "wrote the qwen-serve-guard stand-down marker ($STANDDOWN)"   # M14
+        fi
+        say "stopped pid(s) $CAND"   # M24
+        exit 0
+    else
+        /bin/rm -f "$MODE_FILE"
+        if [ -e "$STANDDOWN" ]; then
+            say "leaving the qwen-serve-guard stand-down marker in place ($STANDDOWN)"   # M26
+        else
+            printf '%s\n' "$STANDDOWN_REASON" > "$STANDDOWN"
+            /bin/chmod 644 "$STANDDOWN"
+            say "wrote the qwen-serve-guard stand-down marker ($STANDDOWN)"   # M14
+        fi
+        local survivors="" p remaining portstate
+        for p in $CAND; do
+            /bin/kill -0 "$p" 2>/dev/null && survivors="${survivors:+$survivors }$p"
+        done
+        remaining=$(port_pids)
+        if [ -n "$remaining" ]; then
+            portstate="still held by pid $remaining"
+        else
+            portstate="free"
+        fi
+        die2 "FAILED to stop pid(s) ${survivors:-$CAND}; port $PORT is $portstate"   # M25
+        exit 6
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# entry point and dependency gate
+# ---------------------------------------------------------------------------
+
+CMD="${1:-}"
+
+if [ "$#" -ne 1 ] || { [ "$CMD" != "vision" ] && [ "$CMD" != "text" ] \
+                        && [ "$CMD" != "status" ] && [ "$CMD" != "stop" ]; }; then
+    printf 'usage: story-server [vision|text|status|stop]\n' >&2   # M01
+    exit 2
+fi
+
+[ -x "$LSOF" ] || {
+    die2 "$LSOF is missing or not executable; this script cannot determine whether port $PORT is held and refuses to guess"   # M02
+    exit 4
+}
+[ -x "$PY" ] || {
+    die2 "$PY is missing or not executable; this script cannot parse /v1/models and refuses to guess"   # M03
+    exit 4
+}
+[ -x "$CURL" ] || {
+    die2 "/usr/bin/curl is missing or not executable"   # M04
+    exit 4
+}
+
+case "$CMD" in
+    vision|text)
+        cmd_serve
+        ;;
+    status)
+        cmd_status
+        ;;
+    stop)
+        say "v1 cmd=$CMD port=$PORT state-dir=$STATE_DIR"   # M00
+        cmd_stop
+        ;;
+esac

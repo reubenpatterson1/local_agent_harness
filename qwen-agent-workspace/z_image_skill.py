@@ -20,10 +20,17 @@ Environment:
     HF_TOKEN  Hugging Face access token (optional; omitted falls back to any
               token cached locally by `huggingface-cli login`, or anonymous
               access for public repos).
+    Z_IMAGE_HF_HOME  Directory of a Hugging Face cache (containing a `hub/`
+              subdirectory) to load the two models from instead of the global
+              HF_HOME. Default: ~/hf_home. The global HF_HOME on this host is
+              /Volumes/Ollama/hf_home, a USB volume that reads at ~60 MB/s, so
+              the 38 GB of shards take ~10 min to load; an internal copy loads
+              in well under a minute. Per model, the scoped cache is used only
+              when it already contains `hub/models--<org>--<name>`; otherwise
+              that model falls back to the default HF cache, so a missing copy
+              degrades to slow, never to a silent re-download into an empty dir.
 
-Generated output is screened by content_safety.assert_image_safe before
-being saved or returned; a positive verdict raises ContentSafetyError and
-saves nothing.
+Explicit content IS allowed.
 """
 
 import os
@@ -37,6 +44,21 @@ import content_safety
 
 BASE_MODEL_ID = "Tongyi-MAI/Z-Image-Turbo"
 TEXT_ENCODER_ID = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"
+
+
+def _z_image_hf_home() -> str:
+    """The scoped cache root: $Z_IMAGE_HF_HOME, else ~/hf_home. Read at call time
+    (not import time) so tests and callers can change it without reloading."""
+    return os.environ.get("Z_IMAGE_HF_HOME", os.path.expanduser("~/hf_home"))
+
+
+def _cache_dir_for(model_id: str):
+    """`<scoped>/hub` if that cache already holds model_id's repo directory, else
+    None (= let transformers/diffusers use the default HF cache). The repo
+    directory name follows the hub convention: models--<org>--<name>."""
+    hub = os.path.join(_z_image_hf_home(), "hub")
+    repo_dir = os.path.join(hub, "models--" + model_id.replace("/", "--"))
+    return hub if os.path.isdir(repo_dir) else None
 
 
 def _pick_device() -> torch.device:
@@ -59,12 +81,17 @@ def load_pipeline():
     dtype = _pick_dtype(device)
     token = os.environ.get("HF_TOKEN")
     print(f"[z_image_skill] loading {BASE_MODEL_ID} + {TEXT_ENCODER_ID} on {device.type} ({dtype}) ...")
-    text_encoder = Qwen3Model.from_pretrained(TEXT_ENCODER_ID, dtype=dtype, token=token)
+    te_cache = _cache_dir_for(TEXT_ENCODER_ID)
+    base_cache = _cache_dir_for(BASE_MODEL_ID)
+    print(f"[z_image_skill] cache: {TEXT_ENCODER_ID} <- {te_cache or 'default HF cache'}")
+    print(f"[z_image_skill] cache: {BASE_MODEL_ID} <- {base_cache or 'default HF cache'}")
+    text_encoder = Qwen3Model.from_pretrained(TEXT_ENCODER_ID, dtype=dtype, token=token, cache_dir=te_cache)
     pipeline = ZImagePipeline.from_pretrained(
         BASE_MODEL_ID,
         text_encoder=text_encoder,
         torch_dtype=dtype,
         token=token,
+        cache_dir=base_cache,
     ).to(device)
     pipeline.vae.to(torch.float32)
     return pipeline
