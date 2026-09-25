@@ -737,6 +737,366 @@ def phase_verify(ctx, fatal_failures):
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# accept (spec 13)
+# ---------------------------------------------------------------------------
+ACCEPT_NARR = ("An old fisherman in a flat cap and a waxed coat stands at a lighthouse railing as a storm "
+               "rolls in over the sea. He grips the rail and watches the waves, then turns and walks toward "
+               "the lighthouse door.")
+GEOMETRIES = (
+    ("portrait", "generated/hw_gate_seeds/portrait.png", 320, 576, 320, 576),
+    ("wide", "generated/hw_gate_seeds/wide3x1.png", 960, 320, 960, 320),
+    ("square", "generated/hw_gate_seeds/square.png", 512, 512, 512, 512),
+    ("noseed", None, 704, 448, 1408, 896),
+)
+SCOPED_HF_VARS = ("Z_IMAGE_HF_HOME", "LTX2_MLX_HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE")
+REFUSAL_ENV_VARS = ("HF_HOME",) + SCOPED_HF_VARS
+STORY_SERVER_USAGE = "usage: story-server [vision|text|status|stop]"
+SWAP_REFUSE_MB = 3072.00
+LTX_MOVIE_TIMEOUT = 7200
+STORY_SERVER_UP_TIMEOUT = 1800
+POLL_SECONDS = 15
+SAMPLER_SRC = r'''
+import glob, json, os, subprocess, sys, time, psutil
+out, pid, memsize = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+story_dir = os.path.dirname(out)
+samples = []
+while psutil.pid_exists(pid):
+    vm, sw = psutil.virtual_memory(), psutil.swap_memory()
+    lvl = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                         capture_output=True, text=True).stdout.strip()
+    samples.append({"t": time.time(), "avail_gib": vm.available / 2**30,
+                    "swap_used_gib": sw.used / 2**30, "pressure": int(lvl or 0)})
+    time.sleep(2)
+runs = glob.glob(os.path.join(story_dir, "runs", "*"))
+t4 = max(os.stat(r).st_birthtime for r in runs) if runs else samples[0]["t"]
+p4 = [s for s in samples if s["t"] >= t4] or samples
+json.dump({"phase4_start": t4,
+           "phase4_min_avail_gib": min(s["avail_gib"] for s in p4),
+           "phase4_peak_used_gib": memsize / 2**30 - min(s["avail_gib"] for s in p4),
+           "phase4_max_pressure": max(s["pressure"] for s in p4),
+           "phase4_swap_delta_gib": max(s["swap_used_gib"] for s in p4) - p4[0]["swap_used_gib"],
+           "samples": samples}, open(out, "w"), indent=2)
+'''
+
+
+def load_json(path):
+    try:
+        with open(path, "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def accept_a1_metadata(ctx):
+    problems = []
+    for entry in ctx.entries:
+        target = entry["t"]
+        try:
+            st = os.lstat(target)
+        except OSError:
+            problems.append("missing: %s" % target)
+            continue
+        if entry["k"] == "f":
+            if not stat.S_ISREG(st.st_mode):
+                problems.append("not a regular file: %s" % target)
+            elif st.st_size != entry["b"]:
+                problems.append("size differs: %s" % target)
+            elif st.st_mtime_ns != entry["mt"]:
+                problems.append("mtime differs: %s" % target)
+        elif entry["k"] == "l":
+            if not stat.S_ISLNK(st.st_mode) or os.readlink(target) != entry["l"]:
+                problems.append("symlink target differs: %s" % target)
+        elif not stat.S_ISDIR(st.st_mode):
+            problems.append("not a directory: %s" % target)
+    return {"ok": not problems, "problems": problems[:200], "problem_count": len(problems), "entries": len(ctx.entries)}
+
+
+def accept_a2_probes(ctx):
+    problems = []
+    rc, out = HOOKS["run"]([framework_py(), "-c", "import torch, diffusers, transformers, PIL, numpy, safetensors, psutil, pytest, pexpect"], timeout=300)
+    if rc != 0:
+        problems.append("framework + user-site import probe rc=%d: %s" % (rc, out[-200:]))
+    want = load_json(ctx.package_root + "/manifests/source-host.json").get("vllm_version")
+    rc, out = HOOKS["run"]([home() + "/.venv-vllm-metal/bin/python", "-c", "import vllm, vllm_metal, mlx_vlm; print(vllm.__version__)"], timeout=300)
+    got = _bp.last_line(out).strip()   # C1: the version is the last line
+    if rc != 0 or got != want:
+        problems.append("vLLM probe rc=%d version=%r, source-host vllm_version=%r" % (rc, got, want))
+    rc, out = HOOKS["run"]([home() + "/ltx-2-mlx/.venv/bin/ltx-2-mlx", "--help"], timeout=300)
+    if rc != 0:
+        problems.append("ltx-2-mlx --help rc=%d: %s" % (rc, out[-200:]))
+    return {"ok": not problems, "problems": problems}
+
+
+def accept_a3_gates(ctx):
+    baseline = load_json(ctx.package_root + "/manifests/acceptance-baseline.json")
+    gates, extras = _bp.run_offline_gates(HOOKS["run"], framework_py(), workspace())
+    base_gates = dict((g["id"], g) for g in baseline.get("gates", []))
+    base_extras = dict((x["id"], x) for x in baseline.get("extras", []))
+    problems = []
+    for gate in gates:
+        base = base_gates.get(gate["id"], {})
+        if gate["rc"] != base.get("rc") or gate["last_line"] != base.get("last_line"):
+            problems.append("%s: rc=%r last_line=%r; baseline rc=%r last_line=%r"
+                            % (gate["id"], gate["rc"], gate["last_line"], base.get("rc"), base.get("last_line")))
+    for extra in extras:
+        if extra["id"] == "X1" and extra["rc"] != base_extras.get("X1", {}).get("rc"):
+            problems.append("X1: rc=%r; baseline rc=%r" % (extra["rc"], base_extras.get("X1", {}).get("rc")))
+        if extra["id"] == "X2" and (extra["rc"] != 0 or extra["brace_lines"] != 0):
+            problems.append("X2: rc=%r brace_lines=%r" % (extra["rc"], extra["brace_lines"]))
+    return {"ok": not problems, "problems": problems, "gates": gates, "extras": extras}
+
+
+def accept_a4_story_server(ctx):
+    rc, out = HOOKS["run"]([workspace() + "/bin/story-server"], timeout=120)
+    ok = rc == 2 and STORY_SERVER_USAGE in out
+    return {"ok": ok, "problems": [] if ok else ["story-server with no arguments: rc=%r output=%r" % (rc, out[-200:])]}
+
+
+def gpu_refusals(ctx):
+    refusals = []
+    for path in sorted(glob.glob(os.path.join(VOLUMES_ROOT, "*", "hf_home"))):
+        if os.path.exists(path):
+            refusals.append("r1: %s exists; eject the drive, so that the run can only use the shipped weights" % path)
+    for name in REFUSAL_ENV_VARS:
+        value = os.environ.get(name, "")
+        if value.startswith("/Volumes/"):
+            refusals.append("r2: %s=%s points at an external volume" % (name, value))
+    rc, out = HOOKS["run"](["/bin/zsh", "-c", 'printf "%s" "$HF_HOME"'])
+    if out.startswith("/Volumes/"):
+        refusals.append("r2: zsh HF_HOME=%s points at an external volume" % out)
+    rc, out = HOOKS["run"](["/usr/bin/pgrep", "-fl", "ltx-2-mlx|z_image|mlx_lm|vllm"])
+    if out.strip():
+        refusals.append("r3: another GPU job or a live story server is running: %s" % " | ".join(out.strip().splitlines()[:5]))
+    if not HOOKS["port_free"](STORY_PORT):
+        refusals.append("r4: port %d is in use" % STORY_PORT)
+    rc, out = HOOKS["run"](["/usr/sbin/sysctl", "-n", "vm.swapusage"])
+    found = re.search(r"used = ([0-9]+(?:\.[0-9]+)?)M", out)
+    if rc != 0 or not found:
+        refusals.append("r5: cannot read swap usage (%r)" % out.strip())
+    elif float(found.group(1)) >= SWAP_REFUSE_MB:
+        refusals.append("r5: swap used = %sM >= 3072.00M; wait: swap drains at about 32 MB/min and purge does not help" % found.group(1))
+    return refusals
+
+
+def wait_for_story_server():
+    url = "http://127.0.0.1:%d/v1/models" % STORY_PORT
+    waited = 0
+    while True:
+        if HOOKS["http_ok"](url):
+            return True
+        if waited >= STORY_SERVER_UP_TIMEOUT:
+            return False
+        HOOKS["sleep"](POLL_SECONDS)
+        waited += POLL_SECONDS
+
+
+def accept_env():
+    env = dict(os.environ)
+    env["HF_HOME"] = home() + "/hf_home"
+    env["HF_HUB_OFFLINE"] = "1"
+    for name in SCOPED_HF_VARS + ("HF_TOKEN",):
+        env.pop(name, None)
+    return env
+
+
+def ffprobe_stream(ctx, path, select, entries, count=False):
+    argv = ([ctx.ffprobe or "ffprobe", "-v", "error", "-select_streams", select] + (["-count_frames"] if count else [])
+            + ["-show_entries", "stream=" + entries, "-of", "json", path])
+    rc, out = HOOKS["run"](argv, timeout=300)
+    if rc != 0:
+        return {}
+    try:
+        streams = json.loads(out or "{}").get("streams") or [{}]
+    except ValueError:
+        return {}
+    return streams[0]
+
+
+def framemd5(ctx, path, vf):
+    # -map 0:v:0 is mandatory: without it the AAC track adds rows and c4 always fails (fixed 2026-09-24).
+    argv = [ctx.ffmpeg or "ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:v:0", "-vf", vf,
+            "-fps_mode", "passthrough", "-f", "framemd5", "-"]
+    rc, out = HOOKS["run"](argv, timeout=300)
+    rows = [line for line in out.splitlines() if line.strip() and not line.startswith("#")]
+    return rows[0].split(",")[-1].strip() if rc == 0 and len(rows) == 1 else None
+
+
+def evaluate_run(ctx, story_dir, rc, W, H, SW, SH):
+    result = {}
+    summaries = glob.glob(os.path.join(story_dir, "runs", "*", "story_summary.json"))
+    summary = load_json(max(summaries, key=os.path.getmtime)) if summaries else {}
+    result["c1"] = rc == 0 and summary.get("completed_units") == summary.get("requested_units") == 2
+    movie = story_dir + "/movie.mp4"
+    video = ffprobe_stream(ctx, movie, "v:0", "width,height,codec_name,nb_read_frames", count=True)
+    audio = ffprobe_stream(ctx, movie, "a:0", "codec_name")
+    result["c2"] = ((video.get("width"), video.get("height")) == (W, H) and str(video.get("nb_read_frames")) == "290"
+                    and video.get("codec_name") == "h264" and audio.get("codec_name") == "aac")
+    still = ffprobe_stream(ctx, story_dir + "/images/panel_01.png", "v:0", "width,height")
+    result["c3"] = (still.get("width"), still.get("height")) == (SW, SH)
+    seed_md5 = framemd5(ctx, story_dir + "/clips/panel_02.chainseed.png", "format=rgb24")
+    last_md5 = framemd5(ctx, story_dir + "/clips/panel_01.mp4", "select=eq(n\\,144),format=rgb24")
+    result["c4"] = seed_md5 is not None and seed_md5 == last_md5
+    gate = load_json(story_dir + "/hw_gate.json")
+    result["c5"] = bool(gate) and gate.get("phase4_max_pressure", 99) < 4 and gate.get("phase4_swap_delta_gib", 99) <= 1.0
+    try:
+        with open(story_dir + "/console.txt", "r", encoding="utf-8", errors="replace") as fh:
+            console = fh.read()
+    except OSError:
+        console = ""
+    found = re.search(r"residual pad (\d+) px", console)
+    result["record"] = {"pad_px": int(found.group(1)) if found else 0, "movie": video, "still": still,
+                        "peak_used_gib": round(gate.get("phase4_peak_used_gib", -1.0), 2),
+                        "max_pressure": gate.get("phase4_max_pressure"),
+                        "swap_delta_gib": round(gate.get("phase4_swap_delta_gib", -1.0), 3),
+                        "unit_seconds": [u.get("seconds") for u in summary.get("units", [])]}
+    return result
+
+
+def gpu_run(ctx, label, seed, W, H, SW, SH):
+    ws = workspace()
+    result = {"label": label, "pass": False}
+    rc, out = HOOKS["run"]([ws + "/bin/story-server", "vision"], timeout=120)
+    result["story_server_vision_rc"] = rc
+    if rc != 0:
+        result["error"] = "story-server vision rc=%d: %s" % (rc, out[-200:])
+        return result
+    if not wait_for_story_server():
+        result["error"] = "story server did not come up"
+        return result
+    stamp = time.strftime("%Y%m%d%H%M%S", HOOKS["now_utc"]())
+    sid = "deploy-accept-%s-%s" % (label, stamp)
+    story_dir = ws + "/generated/stories/" + sid
+    result["story_id"] = sid
+    if os.path.lexists(story_dir):
+        result["error"] = "story dir %s already exists; a story id is never reused" % story_dir
+        return result
+    os.makedirs(story_dir)
+    argv = ([framework_py(), ws + "/bin/ltx-movie", ACCEPT_NARR, "--story-id", sid, "--panels", "2"]
+            + (["--seed-image", ws + "/" + seed] if seed else [])
+            + ["--model", ltx25_model_path(), "--no-review", "--story-server-stop-after-story"])
+    started = time.time()
+    proc = HOOKS["spawn"](argv, cwd=ws, env=accept_env(), stdout_path=story_dir + "/console.txt", new_session=True)
+    sampler = HOOKS["spawn"]([framework_py(), "-c", SAMPLER_SRC, story_dir + "/hw_gate.json", str(proc.pid), str(ctx.memsize)],
+                             cwd=ws, env=None, stdout_path=story_dir + "/sampler_console.txt", new_session=False)
+    try:
+        movie_rc = proc.wait(timeout=LTX_MOVIE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        HOOKS["killpg"](proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            HOOKS["killpg"](proc.pid, signal.SIGKILL)
+            proc.wait()
+        movie_rc = "timeout"
+    with open(story_dir + "/gate_rc.txt", "w") as fh:
+        fh.write("%s\n" % movie_rc)
+    try:
+        sampler.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        sampler.kill()
+        sampler.wait()
+    stop_rc, _ = HOOKS["run"]([ws + "/bin/story-server", "stop"], timeout=120)
+    result["story_server_stop_rc"] = stop_rc
+    result["rc"] = movie_rc
+    result["seconds"] = round(time.time() - started, 1)
+    result.update(evaluate_run(ctx, story_dir, movie_rc, W, H, SW, SH))
+    result["pass"] = all(result[c] for c in ("c1", "c2", "c3", "c4", "c5"))
+    result["movie"] = story_dir + "/movie.mp4"
+    return result
+
+
+def scrub_record(ctx, value):
+    """Recursively withhold any string that holds secret material before the record reaches disk
+    (the accept record can embed real subprocess/GPU-run output; see has_secret)."""
+    if isinstance(value, str):
+        return safe_line(ctx, value, "(value withheld: it contained secret material)")
+    if isinstance(value, list):
+        return [scrub_record(ctx, item) for item in value]
+    if isinstance(value, dict):
+        return dict((key, scrub_record(ctx, item)) for key, item in value.items())
+    return value
+
+
+def write_accept_record(ctx, record, stamp, verdict):
+    record["verdict"] = verdict
+    record["finished_at"] = iso_now()
+    directory = receipts_dir(ctx.package_id())
+    os.makedirs(directory, exist_ok=True)
+    path = directory + "/accept-%s.json" % stamp
+    with open(path, "w") as fh:
+        fh.write(json.dumps(scrub_record(ctx, record), indent=2) + "\n")
+    print(safe_line(ctx, "install_pkg: accept record written to %s" % path,
+                    "install_pkg: accept record written (path withheld: it contained secret material)"))
+    return path
+
+
+def report_step(ctx, step_id, result):
+    print("%s %s" % (step_id, "PASS" if result["ok"] else "FAIL"))
+    for problem in result["problems"]:
+        print(safe_line(ctx, "%s   %s" % (step_id, problem),
+                        "%s   (problem withheld: it contained secret material)" % step_id))
+
+
+def phase_accept(ctx, fatal_failures):
+    args = ctx.args
+    stamp = time.strftime("%Y%m%d%H%M%S", HOOKS["now_utc"]())
+    geometries = GEOMETRIES if args.gpu_all else (GEOMETRIES[:1] if args.gpu else ())
+    record = {"schema_version": 1, "package_id": ctx.package_id(), "started_at": iso_now(),
+              "gpu": "all" if args.gpu_all else ("portrait" if args.gpu else "none"), "steps": {}}
+    steps = record["steps"]
+    steps["A0"] = {"ok": not fatal_failures, "failed": [r.check_id for r in fatal_failures]}
+    if fatal_failures:
+        write_accept_record(ctx, record, stamp, "REFUSED")
+        print("ACCEPT REFUSED (A0: %s)" % ", ".join(r.check_id for r in fatal_failures))
+        return EXIT_REFUSED
+    if geometries:
+        refusals = gpu_refusals(ctx)
+        steps["refusals"] = refusals
+        if refusals:
+            for line in refusals:
+                print(safe_line(ctx, "REFUSE " + line,
+                                "REFUSE %s: (message withheld: it contained secret material)" % line.split(":", 1)[0]))
+            write_accept_record(ctx, record, stamp, "GPU-REFUSED")
+            print("ACCEPT REFUSED (GPU precondition; nothing was started)")
+            return EXIT_GPU_REFUSED
+    a1 = accept_a1_metadata(ctx)
+    steps["A1"] = a1
+    report_step(ctx, "A1", a1)
+    ok = a1["ok"]
+    if ok:
+        for step_id, func in (("A2", accept_a2_probes), ("A3", accept_a3_gates), ("A4", accept_a4_story_server)):
+            result = func(ctx)
+            steps[step_id] = result
+            report_step(ctx, step_id, result)
+            ok = ok and result["ok"]
+    else:
+        print("A2-A5 skipped: A1 found installed files that do not match the manifest")
+    runs = []
+    if ok and geometries:
+        runs = [gpu_run(ctx, *geometry) for geometry in geometries]
+        steps["A5"] = runs
+        for run in runs:
+            failed = [c for c in ("c1", "c2", "c3", "c4", "c5") if not run.get(c)]
+            line = "A5 %s %s%s" % (run["label"], "PASS" if run["pass"] else "FAIL",
+                                   "" if run["pass"] else " (%s)" % (run.get("error") or "failed: " + ", ".join(failed)))
+            print(safe_line(ctx, line, "A5 %s %s (detail withheld: it contained secret material)"
+                            % (run["label"], "PASS" if run["pass"] else "FAIL")))
+        ok = all(run["pass"] for run in runs)
+    write_accept_record(ctx, record, stamp, "PASS" if ok else "FAIL")
+    if not ok:
+        print("ACCEPT FAIL")
+        return EXIT_RUNTIME
+    for run in runs:
+        print(safe_line(ctx, "movie: %s (pad_px=%d)" % (run["movie"], run["record"]["pad_px"]),
+                        "movie: (path withheld: it contained secret material)"))
+    if runs:
+        print("Eyeball each movie.mp4 now (manual sign-off, not part of the exit code): the subject is not cropped; "
+              "there is no black bar beyond pad_px; panel 2 continues panel 1.")
+    print("ACCEPT PASS")
+    return EXIT_OK
+
+
 # ---- CLI entry point ----
 
 
@@ -763,6 +1123,8 @@ def main(argv=None):
     fatal_failures = [r for r in results if r.fatal and not r.ok]
     if args.phase == "verify":
         return phase_verify(ctx, fatal_failures)
+    if args.phase == "accept":
+        return phase_accept(ctx, fatal_failures)
     return gated_install(ctx, fatal_failures)
 
 

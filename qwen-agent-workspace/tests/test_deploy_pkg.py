@@ -2797,5 +2797,209 @@ class TestInstallApply(InstallCase):
         self.assertEqual(stat.S_IMODE(os.lstat(b4_root["t"]).st_mode), 0o750)
 
 
+NARR = "An old fisherman in a flat cap and a waxed coat stands at a lighthouse railing as a storm rolls in over the sea. He grips the rail and watches the waves, then turns and walks toward the lighthouse door."
+
+
+class TestAccept(InstallCase):
+    def setUp(self):
+        InstallCase.setUp(self)
+        self.fx.install_all()
+        self.fx.eject_hf_home()
+        self.story_server = self.fx.ws + "/bin/story-server"
+        self.ltx_movie = self.fx.ws + "/bin/ltx-movie"
+
+    def accept(self, *extra):
+        self.fx.events[:] = []
+        self.fx.spawned[:] = []
+        return self.fx.install("accept", *extra)
+
+    def accept_records(self):
+        receipts = self.fx.ws + "/generated/deploy-receipts/" + self.fx.package_id
+        names = sorted(n for n in os.listdir(receipts) if n.startswith("accept-") and n.endswith(".json"))
+        with open(receipts + "/" + names[-1]) as fh:
+            return json.load(fh)
+
+    def test_accept_without_gpu_passes_a0_to_a4(self):
+        rc, out, err = self.accept()
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines()[-1], "ACCEPT PASS")
+        for step in ("A1 PASS", "A2 PASS", "A3 PASS", "A4 PASS"):
+            self.assertIn(step, out.splitlines())
+        self.assertEqual(self.fx.spawned, [])
+        record = self.accept_records()
+        self.assertEqual(record["verdict"], "PASS")
+        self.assertEqual(sorted(record["steps"]), ["A0", "A1", "A2", "A3", "A4"])
+
+    def test_T76b_accept_runs_from_receipts_with_the_usb_gone(self):
+        receipts = self.fx.ws + "/generated/deploy-receipts/" + self.fx.package_id
+        shutil.rmtree(self.fx.usb)
+        rc, out, err = self.fx.install("accept", root=receipts)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(out.splitlines()[-1], "ACCEPT PASS")
+
+    def test_T80_gate_last_line_must_equal_the_baseline(self):
+        self.fx.run.overrides[(self.fx.fw_py, "tests/test_ltx_movie_offline.py")] = (0, "OK 117/118\n")
+        rc, out, err = self.accept()
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(out.splitlines()[-1], "ACCEPT FAIL")
+        self.assertIn("OK 117/118", out)
+        self.assertIn("OK 118/118", out)
+        self.assertEqual(self.accept_records()["verdict"], "FAIL")
+
+    def test_A1_metadata_mismatch_skips_everything_else(self):
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+        os.utime(target, ns=(1, 1))
+        rc, out, err = self.accept()
+        self.assertEqual(rc, 1)
+        self.assertIn("mtime differs: " + target, out)
+        self.assertNotIn(("run", (self.story_server,)), self.fx.events)
+
+    def make_story(self, label):
+        story_dir = self.fx.ws + "/generated/stories/deploy-accept-%s-20260925000000" % label
+        write_file(story_dir + "/runs/r1/story_summary.json", json.dumps({"completed_units": 2, "requested_units": 2, "units": [{"seconds": 1.0}, {"seconds": 2.0}]}).encode("utf-8"))
+        write_file(story_dir + "/hw_gate.json", json.dumps({"phase4_max_pressure": 1, "phase4_swap_delta_gib": 0.0, "phase4_peak_used_gib": 30.5}).encode("utf-8"))
+        write_file(story_dir + "/console.txt", b"(residual pad 7 px, 1.00x)\n")
+        return story_dir
+
+    def test_T81_criteria_c1_to_c5(self):
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "accept", "--package-root", self.fx.pkg]))
+        ctx.ffprobe, ctx.ffmpeg = self.fx.ffprobe, self.fx.ffmpeg
+        d = self.make_story("portrait")
+        crit = ["c1", "c2", "c3", "c4", "c5"]
+
+        def verdict(rc=0):
+            res = ip.evaluate_run(ctx, d, rc, 320, 576, 320, 576)
+            return [c for c in crit if not res[c]], res
+        failed, res = verdict()
+        self.assertEqual(failed, [])
+        self.assertEqual(res["record"]["pad_px"], 7)
+        self.assertEqual(verdict(1)[0], ["c1"])
+        self.assertEqual(verdict("timeout")[0], ["c1"])
+        for media, expect in (({"frames": "289"}, ["c2"]), ({"audio": "mp3"}, ["c2"]), ({"w": 704}, ["c2"]),
+                              ({"still_w": 640}, ["c3"]),
+                              ({"rows_seed": ["0,0,0,1,6220800,ffffffffffffffffffffffffffffffff"]}, ["c4"]),
+                              ({"rows_clip": ["0,0,0,1,6220800,ac2833aa09711810c612e6b20955113e", "0,1,1,1,6220800,00"]}, ["c4"])):
+            self.fx.run.media_overrides = {"portrait": media}
+            self.assertEqual(verdict()[0], expect, media)
+        self.fx.run.media_overrides = {}
+        write_file(d + "/hw_gate.json", json.dumps({"phase4_max_pressure": 4, "phase4_swap_delta_gib": 0.0}).encode("utf-8"))
+        self.assertEqual(verdict()[0], ["c5"])
+        write_file(d + "/hw_gate.json", json.dumps({"phase4_max_pressure": 1, "phase4_swap_delta_gib": 1.5}).encode("utf-8"))
+        self.assertEqual(verdict()[0], ["c5"])
+        write_file(d + "/runs/r1/story_summary.json", json.dumps({"completed_units": 1, "requested_units": 2}).encode("utf-8"))
+        self.assertIn("c1", verdict()[0])
+        ffmpeg_calls = [c for c in self.fx.run.calls if c[0] == self.fx.ffmpeg and "-f" in c]
+        self.assertTrue(ffmpeg_calls)
+        for call in ffmpeg_calls:
+            index = call.index("-map")
+            self.assertEqual(call[index + 1], "0:v:0")
+        self.assertIn("select=eq(n\\,144),format=rgb24", [c[c.index("-vf") + 1] for c in ffmpeg_calls])
+
+    def assert_refused(self):
+        rc, out, err = self.accept("--gpu")
+        self.assertEqual(rc, 5, out + err)
+        self.assertEqual(self.fx.spawned, [])
+        self.assertEqual([e for e in self.fx.events if e[0] == "run" and e[1][0] == self.story_server], [])
+        self.assertIn("ACCEPT REFUSED (GPU precondition; nothing was started)", out)
+        return out
+
+    def test_T82_r1_external_hf_home_refuses(self):
+        os.makedirs(self.fx.volumes + "/Other/hf_home")
+        self.assertIn("r1: ", self.assert_refused())
+
+    def test_T82_r2_scoped_hf_variable_on_a_volume_refuses(self):
+        for name in ("Z_IMAGE_HF_HOME", "TRANSFORMERS_CACHE"):
+            os.environ[name] = "/Volumes/Ollama/cache"
+            self.assertIn("r2: %s=" % name, self.assert_refused())
+            del os.environ[name]
+
+    def test_T82_r3_other_gpu_job_refuses(self):
+        self.fx.run.overrides[("/usr/bin/pgrep", "-fl", "ltx-2-mlx|z_image|mlx_lm|vllm")] = (0, "123 vllm serve\n")
+        self.assertIn("r3: ", self.assert_refused())
+
+    def test_T82_r4_port_in_use_refuses(self):
+        ip.HOOKS["port_free"] = lambda port: False
+        self.assertIn("r4: ", self.assert_refused())
+
+    def test_T82_r5_swap_refuses_at_3072_and_not_below(self):
+        key = ("/usr/sbin/sysctl", "-n", "vm.swapusage")
+        self.fx.run.overrides[key] = (0, "total = 4096.00M  used = 3072.00M  free = 1024.00M  (encrypted)\n")
+        self.assertIn("r5: ", self.assert_refused())
+        self.fx.run.overrides[key] = (0, "total = 4096.00M  used = 3071.99M  free = 1024.01M  (encrypted)\n")
+        rc, out, err = self.accept("--gpu")
+        self.assertEqual(rc, 0, out + err)
+
+    def test_T83_portrait_argv_and_env(self):
+        os.environ["HF_TOKEN"] = "abc"
+        os.environ["Z_IMAGE_HF_HOME"] = self.fx.home + "/z"
+        os.environ["HF_HUB_CACHE"] = self.fx.home + "/c"
+        rc, out, err = self.accept("--gpu")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("ACCEPT PASS", out.splitlines())
+        movies = [s for s in self.fx.spawned if s["argv"][1] == self.ltx_movie]
+        self.assertEqual(len(movies), 1)
+        spawn = movies[0]
+        sid = spawn["argv"][4]
+        self.assertTrue(re.match(r"^deploy-accept-portrait-\d{14}$", sid), sid)
+        story_dir = self.fx.ws + "/generated/stories/" + sid
+        self.assertEqual(spawn["argv"], [self.fx.fw_py, self.ltx_movie, NARR, "--story-id", sid, "--panels", "2",
+                                         "--seed-image", self.fx.ws + "/generated/hw_gate_seeds/portrait.png",
+                                         "--model", self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8",
+                                         "--no-review", "--story-server-stop-after-story"])
+        self.assertEqual(spawn["cwd"], self.fx.ws)
+        self.assertTrue(spawn["new_session"])
+        self.assertEqual(spawn["stdout_path"], story_dir + "/console.txt")
+        env = spawn["env"]
+        self.assertEqual(env["HF_HOME"], self.fx.home + "/hf_home")
+        self.assertEqual(env["HF_HUB_OFFLINE"], "1")
+        for name in ("Z_IMAGE_HF_HOME", "LTX2_MLX_HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_TOKEN"):
+            self.assertNotIn(name, env)
+        sampler = [s for s in self.fx.spawned if s["argv"][1:2] == ["-c"]][0]
+        self.assertEqual(sampler["argv"], [self.fx.fw_py, "-c", ip.SAMPLER_SRC, story_dir + "/hw_gate.json", "4242", "68719476736"])
+        with open(story_dir + "/gate_rc.txt") as fh:
+            self.assertEqual(fh.read(), "0\n")
+        self.assertIn("movie: " + story_dir + "/movie.mp4 (pad_px=7)", out)
+        run = self.accept_records()["steps"]["A5"][0]
+        self.assertTrue(run["pass"])
+        self.assertEqual(run["story_server_stop_rc"], 0)
+
+    def test_T84_gpu_all_runs_four_geometries_restarting_the_server_each_time(self):
+        rc, out, err = self.accept("--gpu-all")
+        self.assertEqual(rc, 0, out + err)
+        seq = []
+        for kind, argv in self.fx.events:
+            if kind == "run" and argv == (self.story_server, "vision"):
+                seq.append("vision")
+            elif kind == "spawn" and argv[1] == self.ltx_movie:
+                seq.append(argv[4].split("-")[2])
+        self.assertEqual(seq, ["vision", "portrait", "vision", "wide", "vision", "square", "vision", "noseed"])
+        noseed = [s for s in self.fx.spawned if s["argv"][1] == self.ltx_movie][-1]
+        self.assertNotIn("--seed-image", noseed["argv"])
+        self.assertEqual(len([e for e in self.fx.events if e == ("run", (self.story_server, "stop"))]), 4)
+
+    def test_story_server_that_never_comes_up_fails_the_run(self):
+        ip.HOOKS["http_ok"] = lambda url: False
+        sleeps = []
+        ip.HOOKS["sleep"] = lambda seconds: sleeps.append(seconds)
+        rc, out, err = self.accept("--gpu")
+        self.assertEqual(rc, 1)
+        self.assertIn("story server did not come up", out)
+        self.assertEqual(sum(sleeps), 1800)
+        self.assertEqual(self.fx.spawned, [])
+
+    def test_T85_a4_story_server_usage_check(self):
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "accept", "--package-root", self.fx.pkg]))
+        self.assertTrue(ip.accept_a4_story_server(ctx)["ok"])
+        for value in ((0, "usage: story-server [vision|text|status|stop]\n"), (2, "something else\n")):
+            self.fx.run.overrides[(self.story_server,)] = value
+            self.assertFalse(ip.accept_a4_story_server(ctx)["ok"], value)
+
+    def test_sampler_source(self):
+        compile(ip.SAMPLER_SRC, "sampler", "exec")
+        self.assertIn("memsize / 2**30 - min(", ip.SAMPLER_SRC)
+        self.assertNotIn("48.0 -", ip.SAMPLER_SRC)
+        self.assertIn("kern.memorystatus_vm_pressure_level", ip.SAMPLER_SRC)
+
+
 if __name__ == "__main__":
     unittest.main()
