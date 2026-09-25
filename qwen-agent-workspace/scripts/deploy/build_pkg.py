@@ -1706,3 +1706,269 @@ def render_readme(ctx):
         "narrative": README_NARRATIVE,
     }
     return README_TEMPLATE % values
+
+
+# ---------------------------------------------------------------------------
+# Root files, copy stage, post-copy stage (spec 9, 11)
+# ---------------------------------------------------------------------------
+def root_file_contents(ctx):
+    def as_json(obj):
+        return (json.dumps(obj, indent=2) + "\n").encode("utf-8")
+    files = collections.OrderedDict()
+    files["README.md"] = (render_readme(ctx).encode("utf-8"), 0o644)
+    files["manifests/source-host.json"] = (as_json(ctx.host), 0o644)
+    for rel, argv in freeze_commands():
+        files[rel] = (ctx.freezes.get(rel, "").encode("utf-8"), 0o644)
+    files["manifests/source-git.json"] = (as_json(ctx.git_record), 0o644)
+    files["manifests/acceptance-baseline.json"] = (as_json(ctx.baseline), 0o644)
+    files["manifests/credential-scan.json"] = (as_json(credential_scan_doc(ctx)), 0o644)
+    for name in DEPLOY_SCRIPT_FILES:
+        files["scripts/deploy/" + name] = (ctx.script_bytes[name], 0o755 if name.endswith(".py") else 0o644)
+    return files
+
+
+def write_root_files(ctx):
+    ctx.root_files = collections.OrderedDict()
+    for rel, (data, mode) in root_file_contents(ctx).items():
+        ctx.root_files[rel] = write_package_file(ctx, rel, data, mode)
+
+
+def open_package_root(ctx):
+    root = ctx.package_root
+    if not ctx.resume:
+        os.mkdir(root)
+        return
+    failed = root + "/BUILD-FAILED.json"
+    if os.path.lexists(failed):
+        os.unlink(failed)
+    partial = root + "/MANIFEST-ENTRIES.jsonl.partial"
+    if ctx.resume_rename:
+        os.replace(root + "/MANIFEST-ENTRIES.jsonl", partial)
+    if os.path.exists(partial):
+        os.truncate(partial, ctx.resume_keep_bytes)
+    if ctx.resume_prefix_len < len(ctx.entries):
+        entry = ctx.entries[ctx.resume_prefix_len]
+        if "p" in entry:
+            dst = root + "/" + entry["p"]
+            if os.path.lexists(dst) and not (os.path.isdir(dst) and not os.path.islink(dst)):
+                os.unlink(dst)
+
+
+def copy_entry(ctx, entry):
+    dst = ctx.package_root + "/" + entry["p"]
+    if entry["k"] == "f":
+        entry["h"] = copy_regular_file(entry["_src"], dst, entry, ctx.secrets)
+    elif entry["k"] == "l":
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.lexists(dst):
+            os.unlink(dst)
+        os.symlink(entry["l"], dst)
+    else:
+        os.makedirs(dst, exist_ok=True)
+
+
+def chmod_component_dirs(ctx, cid):
+    for entry in ctx.entries:
+        if entry["c"] == cid and entry["k"] == "d" and "p" in entry:
+            os.chmod(ctx.package_root + "/" + entry["p"], int(entry["m"], 8))
+
+
+def flush_partial(ctx):
+    ctx.partial_fh.flush()
+    os.fsync(ctx.partial_fh.fileno())
+
+
+def copy_payload(ctx):
+    ctx.partial_fh = open(ctx.package_root + "/MANIFEST-ENTRIES.jsonl.partial", "ab")
+    last_index = {}
+    for index, entry in enumerate(ctx.entries):
+        last_index[entry["c"]] = index
+    start = ctx.resume_prefix_len
+    for cid in COMPONENT_ORDER:
+        if cid in last_index and last_index[cid] < start:
+            chmod_component_dirs(ctx, cid)
+    since_sync = 0
+    for index in range(start, len(ctx.entries)):
+        entry = ctx.entries[index]
+        if "p" in entry:
+            CTX_STATE["payload_started"] = True
+            copy_entry(ctx, entry)
+        line = entry_line(entry).encode("utf-8")
+        l3_check_bytes(ctx.secrets, line, "MANIFEST-ENTRIES.jsonl")
+        ctx.partial_fh.write(line)
+        since_sync += 1
+        component_end = last_index[entry["c"]] == index
+        if since_sync >= 512 or component_end:
+            flush_partial(ctx)
+            since_sync = 0
+        if component_end:
+            chmod_component_dirs(ctx, entry["c"])
+        HOOKS["after_entry"](index)
+
+
+def build_stage(ctx):
+    """Stage steps 6-8. Any exception here is a copy-stage abort (exit 5)."""
+    open_package_root(ctx)
+    write_root_files(ctx)
+    copy_payload(ctx)
+
+
+def abort_copy_stage(ctx, exc):
+    fh = ctx.partial_fh
+    if fh is not None and not fh.closed:
+        try:
+            fh.flush()
+            os.fsync(fh.fileno())
+            fh.close()
+        except OSError:
+            pass
+    print("build_pkg: COPY ABORTED (%s): %s" % (type(exc).__name__, exc), file=sys.stderr)
+    print("build_pkg: no MANIFEST.json was written; fix the cause, then rerun with --apply --resume --package-id %s"
+          % ctx.package_id, file=sys.stderr)
+    return 5
+
+
+def finalize_entries(ctx):
+    flush_partial(ctx)
+    ctx.partial_fh.close()
+    os.replace(ctx.package_root + "/MANIFEST-ENTRIES.jsonl.partial", ctx.package_root + "/MANIFEST-ENTRIES.jsonl")
+    fsync_dir(ctx.package_root)
+
+
+def check_a1_consistency(ctx):
+    records = {}
+    records.update(ctx.git_record.get("pipeline_files", {}))
+    records.update(ctx.git_record.get("test_files", {}))
+    for entry in ctx.entries:
+        if entry["c"] == "A1" and entry["k"] == "f":
+            record = records.get(entry["_rel"])
+            if record is None or record["sha256"] != entry.get("h"):
+                raise ValueError("PC3: A1 file %s was copied with a sha256 that differs from the provenance record"
+                                 % entry["_rel"])
+
+
+def manifest_doc(ctx):
+    stats = component_stats(ctx.entries)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "package_id": ctx.package_id,
+        "created_at": iso_now(),
+        "entries_file": "MANIFEST-ENTRIES.jsonl",
+        "entries_sha256": ctx.entries_sha256,
+        "entries_count": len(ctx.entries),
+        "totals": stats_totals(stats),
+        "components": stats,
+        "root_files": ctx.root_files,
+        "source_git_head": ctx.git_record.get("head", ""),
+        "models": {"video_model_path": ltx25_model_path(), "vision_model_snapshot": HF_PINS["H4"][1],
+                   "vision_model_symlink": home() + "/mlx_models/qwen3-vl"},
+        "credential_scan": {"l1": "clean", "l2_allowlisted": len(ctx.l2_allowed),
+                            "l3_values_loaded": len(ctx.secrets), "l4": "clean"},
+        "build": {"started_at": ctx.started_at, "finished_at": iso_now(), "resumed": ctx.resume},
+    }
+
+
+def write_manifest(ctx):
+    data = (json.dumps(manifest_doc(ctx), indent=2) + "\n").encode("utf-8")
+    write_package_file(ctx, "MANIFEST.json", data, 0o644)
+
+
+def fail_post_copy(ctx, step, exc):
+    doc = {"schema_version": SCHEMA_VERSION, "package_id": ctx.package_id, "failed_step": step,
+           "error_type": type(exc).__name__, "error": str(exc), "created_at": iso_now()}
+    data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    if KnownSecretScanner(ctx.secrets).feed(data):
+        doc["error"] = "error text withheld: it contained a known secret value"
+        data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    manifest = ctx.package_root + "/MANIFEST.json"
+    if os.path.lexists(manifest):
+        os.unlink(manifest)
+    try:
+        write_package_file(ctx, "BUILD-FAILED.json", data, 0o644)
+    except Exception as write_exc:
+        print("build_pkg: could not write BUILD-FAILED.json: %s" % write_exc, file=sys.stderr)
+    print("build_pkg: POST-COPY FAILURE at %s (%s): %s" % (step, doc["error_type"], doc["error"]), file=sys.stderr)
+    print("build_pkg: BUILD-FAILED.json written; no MANIFEST.json. Fix the cause, then rerun with --apply --resume --package-id %s"
+          % ctx.package_id, file=sys.stderr)
+    return 3
+
+
+def finish_build(ctx):
+    step = "PC1"
+    try:
+        finalize_entries(ctx)
+        step = "PC2"
+        ctx.entries_sha256 = sha256_file(ctx.package_root + "/MANIFEST-ENTRIES.jsonl")
+        step = "PC3"
+        check_a1_consistency(ctx)
+        step = "PC4"
+        l4_rescan(ctx)
+        step = "PC5"
+        write_manifest(ctx)
+    except Exception as exc:
+        return fail_post_copy(ctx, step, exc)
+    total = sum(e["b"] for e in ctx.entries if e["k"] == "f")
+    print("build_pkg: BUILD OK: %s (%d entries, %d bytes)" % (ctx.package_root, len(ctx.entries), total))
+    return 0
+
+
+def print_prebuild_report(ctx, results):
+    gib = 1024.0 ** 3
+    for cid in COMPONENT_ORDER:
+        row = ctx.comp_stats[cid]
+        print("%s %s files=%d symlinks=%d dirs=%d bytes=%d (%.2f GiB)"
+              % (cid, row["slug"], row["files"], row["symlinks"], row["dirs"], row["bytes"], row["bytes"] / gib))
+    totals = stats_totals(ctx.comp_stats)
+    print("TOTAL files=%d symlinks=%d dirs=%d bytes=%d (%.2f GiB)"
+          % (totals["files"], totals["symlinks"], totals["dirs"], totals["bytes"], totals["bytes"] / gib))
+    print("SPACE required=%d (%.2f GiB) free=%d (%.2f GiB)"
+          % (ctx.required_bytes, ctx.required_bytes / gib, ctx.free_bytes, ctx.free_bytes / gib))
+    for result in results:
+        print(format_result(result))
+
+
+def cmd_build(args):
+    ctx = BuildCtx(args)
+    try:
+        ctx.started_at = iso_now()
+        ctx.secrets, ctx.l3_sources, ctx.l3_errors = load_known_secrets()
+        enumerate_components(ctx)
+        results = run_prebuild_checks(ctx)
+    except Exception:
+        traceback.print_exc()
+        print("build_pkg: UNEXPECTED ERROR before any write", file=sys.stderr)
+        return 1
+    print_prebuild_report(ctx, results)
+    fatal = [r for r in results if r.fatal and not r.ok]
+    if not ctx.apply:
+        if fatal:
+            print("build_pkg: DRY RUN FAILED (%d checks)" % len(fatal))
+            return 4
+        print("build_pkg: DRY RUN OK")
+        return 0
+    if fatal:
+        print("build_pkg: APPLY REFUSED (%d checks); the package root was not created" % len(fatal))
+        return 4
+    try:
+        build_stage(ctx)
+    except Exception as exc:
+        return abort_copy_stage(ctx, exc)
+    return finish_build(ctx)
+
+
+# ---- CLI entry point ----
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    CTX_STATE["payload_started"] = False
+    try:
+        if args.credential_report:
+            return cmd_credential_report(args)
+        return cmd_build(args)
+    finally:
+        CTX_STATE["payload_started"] = False
+
+
+if __name__ == "__main__":
+    sys.exit(main())

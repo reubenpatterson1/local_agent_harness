@@ -1566,5 +1566,371 @@ class TestReadme(DeployTestCase):
         self.assertEqual(bp.l2_scan_bytes(self.text.encode("utf-8")), [])
 
 
+def build_apply(fx, *extra):
+    return run_main(bp.main, ["--apply", "--usb-root", fx.usb, "--package-id", fx.package_id] + list(extra))
+
+
+def build_dry(fx, *extra):
+    return run_main(bp.main, ["--dry-run", "--usb-root", fx.usb, "--package-id", fx.package_id] + list(extra))
+
+
+ROOT_FILES = ["README.md", "manifests/source-host.json", "manifests/pip-freeze-framework-py313.txt",
+              "manifests/pip-freeze-ltx2mlx-venv.txt", "manifests/pip-freeze-vllm-venv.txt",
+              "manifests/source-git.json", "manifests/acceptance-baseline.json", "manifests/credential-scan.json",
+              "scripts/deploy/build_pkg.py", "scripts/deploy/install_pkg.py", "scripts/deploy/credential_allowlist.json"]
+
+
+class BuildE2ECase(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = Fixture(self)
+        self.fx.build_sources()
+        self.fx.configure_build_hooks()
+
+    def fresh_fixture(self):
+        fx = Fixture(self)
+        fx.build_sources()
+        fx.configure_build_hooks()
+        return fx
+
+
+class TestBuildCli(BuildE2ECase):
+    def test_dry_run_report_format_and_writes_nothing(self):
+        before = snapshot(self.fx.root)
+        rc, out, err = build_dry(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        lines = out.splitlines()
+        self.assertEqual(lines[-1], "build_pkg: DRY RUN OK")
+        comp = [line for line in lines if re.match(r"^[A-H][0-9] ", line)]
+        self.assertEqual([line.split()[0] for line in comp], list(ORDER))
+        self.assertTrue(re.match(r"^A1 workspace-code files=17 symlinks=0 dirs=3 bytes=\d+ \(\d+\.\d\d GiB\)$", comp[0]), comp[0])
+        self.assertEqual(comp[9], "F2 framework-symlinks files=0 symlinks=17 dirs=3 bytes=0 (0.00 GiB)")
+        totals = [line for line in lines if line.startswith("TOTAL ")]
+        self.assertEqual(len(totals), 1)
+        self.assertTrue(re.match(r"^TOTAL files=\d+ symlinks=\d+ dirs=\d+ bytes=\d+ \(\d+\.\d\d GiB\)$", totals[0]))
+        self.assertEqual(len([line for line in lines if line.startswith("SPACE required=")]), 1)
+        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 20)])
+        self.assertEqual(snapshot(self.fx.root), before)
+
+    def test_default_mode_is_dry_run_and_failures_exit_4(self):
+        bp.HOOKS["port_free"] = lambda port: False
+        rc, out, err = run_main(bp.main, ["--usb-root", self.fx.usb, "--package-id", self.fx.package_id])
+        self.assertEqual(rc, 4)
+        self.assertIn("FAIL B09 ", out)
+        self.assertEqual(out.splitlines()[-1], "build_pkg: DRY RUN FAILED (1 checks)")
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+    def test_apply_builds_a_complete_package(self):
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        pkg = self.fx.pkg
+        with open(pkg + "/MANIFEST.json") as fh:
+            manifest = json.load(fh)
+        entries = bp.read_entries(pkg + "/MANIFEST-ENTRIES.jsonl")
+        self.assertEqual(manifest["schema_version"], 4)
+        self.assertEqual(manifest["package_id"], self.fx.package_id)
+        self.assertEqual(manifest["entries_file"], "MANIFEST-ENTRIES.jsonl")
+        self.assertEqual(manifest["entries_sha256"], file_sha256(pkg + "/MANIFEST-ENTRIES.jsonl"))
+        self.assertEqual(manifest["entries_count"], len(entries))
+        self.assertEqual(list(manifest["components"]), list(ORDER))
+        self.assertEqual(list(manifest["root_files"]), ROOT_FILES)
+        for rel, digest in manifest["root_files"].items():
+            self.assertEqual(file_sha256(pkg + "/" + rel), digest, rel)
+        self.assertEqual(manifest["source_git_head"], HEAD_SHA)
+        self.assertEqual(manifest["models"], {"video_model_path": self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8",
+                                              "vision_model_snapshot": PINS["H4"][1],
+                                              "vision_model_symlink": self.fx.home + "/mlx_models/qwen3-vl"})
+        self.assertEqual(manifest["credential_scan"], {"l1": "clean", "l2_allowlisted": 0, "l3_values_loaded": 0, "l4": "clean"})
+        self.assertIs(manifest["build"]["resumed"], False)
+        self.assertEqual(manifest["totals"]["files"], len([e for e in entries if e["k"] == "f"]))
+        self.assertFalse(os.path.lexists(pkg + "/BUILD-FAILED.json"))
+        self.assertFalse(os.path.lexists(pkg + "/MANIFEST-ENTRIES.jsonl.partial"))
+        self.assertEqual([n for n in os.listdir(pkg) if n.endswith(".tmp")], [])
+        ctx = self.fx.ctx()
+        ctx.git_record = {"head": HEAD_SHA, "branch": "ltx2-mlx-video-pipeline"}
+        with open(pkg + "/README.md") as fh:
+            self.assertEqual(fh.read(), bp.render_readme(ctx))
+        with open(pkg + "/scripts/deploy/build_pkg.py", "rb") as a, open(os.path.join(DEPLOY_DIR, "build_pkg.py"), "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual(stat.S_IMODE(os.lstat(pkg + "/scripts/deploy/build_pkg.py").st_mode), 0o755)
+        with open(pkg + "/manifests/acceptance-baseline.json") as fh:
+            self.assertEqual(json.load(fh)["gates"][6], {"id": "G7", "argv": ["tests/check_ltx2_mlx_no_forbidden_imports.py"], "rc": 0, "last_line": "RESULT: ok"})
+        self.assertTrue(out.splitlines()[-1].startswith("build_pkg: BUILD OK: " + pkg))
+
+    def test_T06_jsonl_on_disk(self):
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        with open(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl", "rb") as fh:
+            raw_lines = fh.read().decode("utf-8").splitlines()
+        shapes = set()
+        for raw in raw_lines:
+            obj = json.loads(raw)
+            self.assertEqual(raw, json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+            shapes.add(tuple(obj))
+        self.assertEqual(shapes, set([
+            ("k", "c", "p", "t", "b", "m", "h", "mt"),
+            ("k", "c", "p", "t", "m"),
+            ("k", "c", "p", "t", "l"),
+            ("k", "c", "t", "m"),
+            ("k", "c", "t", "l"),
+            ("k", "c", "t", "m", "s"),
+            ("k", "c", "t", "l", "s")]))
+
+    def test_T03_payload_symlinks_after_apply(self):
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        repo, pin = PINS["H1"]
+        link = self.fx.pkg + "/payload/H1-hf-zimage/snapshots/" + pin + "/config.json"
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.readlink(link), "../../blobs/" + hashlib.sha1(repo.encode("utf-8")).hexdigest())
+        self.assertEqual(os.readlink(self.fx.pkg + "/payload/B3-uv-cpython311/bin/python3"), "python3.11")
+
+    def test_T07_fifo_fails_b03_and_refuses_apply(self):
+        fifo = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/pipe"
+        os.mkfifo(fifo)
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 4)
+        self.assertTrue([line for line in out.splitlines() if line.startswith("FAIL B03 ") and fifo in line])
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+    def test_RF3_missing_pack_file_refuses_apply_without_creating_root(self):
+        os.unlink(self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8/transformer-distilled.safetensors")
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 4)
+        self.assertIn("missing=['transformer-distilled.safetensors']", out)
+        self.assertIn("build_pkg: APPLY REFUSED (1 checks)", out)
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+    def test_credential_report_through_main(self):
+        rc, out, err = run_main(bp.main, ["--credential-report", "--usb-root", self.fx.usb, "--package-id", self.fx.package_id])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(out.splitlines()[-1].startswith("build_pkg: CREDENTIAL REPORT CLEAN"))
+
+    def test_unexpected_pre_write_error_exits_1(self):
+        def boom(ctx):
+            raise RuntimeError("injected")
+        with mock.patch.object(bp, "run_prebuild_checks", boom):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 1)
+        self.assertIn("RuntimeError: injected", err)
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+
+class TestRPre(BuildE2ECase):
+    def test_T20_failing_gate_refuses_before_any_write(self):
+        self.fx.run.overrides[(self.fx.fw_py, "tests/test_ltx_story_images.py")] = (1, "boom\n")
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("FAIL B15 ", out)
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+    def test_T21_no_outside_open_and_no_subprocess_after_first_payload_write(self):
+        root = self.fx.pkg
+        sources = set()
+        violations = []
+        real_enumerate = bp.enumerate_components
+        real_open = open
+        real_os_open = os.open
+        real_run = bp.HOOKS["run"]
+
+        def spy_enumerate(ctx):
+            real_enumerate(ctx)
+            sources.update(e["_src"] for e in ctx.entries if "_src" in e)
+
+        def allowed(path):
+            if isinstance(path, int):
+                return True
+            p = os.path.abspath(os.fsdecode(path))
+            return p == root or p.startswith(root + "/") or p in sources
+
+        def guarded_open(file, *args, **kwargs):
+            if bp.CTX_STATE["payload_started"] and not allowed(file):
+                violations.append(("open", file))
+                raise AssertionError("R-PRE: open(%r) after the first payload write" % (file,))
+            return real_open(file, *args, **kwargs)
+
+        def guarded_os_open(path, *args, **kwargs):
+            if bp.CTX_STATE["payload_started"] and not allowed(path):
+                violations.append(("os.open", path))
+                raise AssertionError("R-PRE: os.open(%r) after the first payload write" % (path,))
+            return real_os_open(path, *args, **kwargs)
+
+        def guarded_run(argv, timeout=120, env=None, cwd=None):
+            if bp.CTX_STATE["payload_started"]:
+                violations.append(("run", tuple(argv)))
+                raise AssertionError("R-PRE: subprocess after the first payload write")
+            return real_run(argv, timeout=timeout, env=env, cwd=cwd)
+
+        bp.HOOKS["run"] = guarded_run
+        with mock.patch.object(bp, "enumerate_components", spy_enumerate), \
+                mock.patch("builtins.open", guarded_open), \
+                mock.patch.object(os, "open", guarded_os_open):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(violations, [])
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(os.path.isfile(root + "/MANIFEST.json"))
+        bp.CTX_STATE["payload_started"] = True
+        with self.assertRaises(bp.RPreViolation):
+            bp._run(["/usr/bin/true"])
+        bp.CTX_STATE["payload_started"] = False
+
+    def test_T22_post_copy_failure_writes_build_failed_and_no_manifest(self):
+        def boom(ctx):
+            raise RuntimeError("injected L4 failure")
+        with mock.patch.object(bp, "l4_rescan", boom):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 3, out + err)
+        with open(self.fx.pkg + "/BUILD-FAILED.json") as fh:
+            doc = json.load(fh)
+        self.assertEqual((doc["schema_version"], doc["package_id"], doc["failed_step"], doc["error_type"], doc["error"]),
+                         (4, self.fx.package_id, "PC4", "RuntimeError", "injected L4 failure"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+        self.assertTrue(os.path.isfile(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl.partial"))
+
+    def test_T23_root_files_exist_before_the_first_entry_is_listed(self):
+        seen = {}
+
+        def after_entry(index):
+            if index == 0:
+                seen["present"] = [rel for rel in ROOT_FILES if os.path.isfile(self.fx.pkg + "/" + rel)]
+        bp.HOOKS["after_entry"] = after_entry
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(seen["present"], ROOT_FILES)
+
+
+class TestCopyEngineE2E(BuildE2ECase):
+    def test_T30_payload_matches_sources(self):
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        pkg = self.fx.pkg
+        ctx = self.fx.ctx()
+        src_by_p = dict((e["p"], e["_src"]) for e in ctx.entries if "p" in e)
+        entries = bp.read_entries(pkg + "/MANIFEST-ENTRIES.jsonl")
+        for entry in entries:
+            if "p" not in entry:
+                continue
+            dst = pkg + "/" + entry["p"]
+            if entry["k"] == "f":
+                src = src_by_p[entry["p"]]
+                with open(src, "rb") as a, open(dst, "rb") as b:
+                    self.assertEqual(a.read(), b.read(), entry["p"])
+                self.assertEqual(entry["h"], file_sha256(src))
+                sst, dstat = os.lstat(src), os.lstat(dst)
+                self.assertEqual(stat.S_IMODE(dstat.st_mode), stat.S_IMODE(sst.st_mode), entry["p"])
+                self.assertEqual(dstat.st_mtime_ns, sst.st_mtime_ns)
+                self.assertEqual(dstat.st_mtime_ns, entry["mt"])
+            elif entry["k"] == "d":
+                self.assertEqual(stat.S_IMODE(os.lstat(dst).st_mode), int(entry["m"], 8), entry["p"])
+        self.assertEqual(stat.S_IMODE(os.lstat(pkg + "/payload/B4-ltx25-mlx-q8").st_mode), 0o750)
+
+    def test_T31_source_appended_mid_copy_aborts_with_exit_5(self):
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+        state = {"done": False}
+
+        def after_chunk(src, nbytes):
+            if src == target and not state["done"]:
+                state["done"] = True
+                with open(src, "ab") as fh:
+                    fh.write(b"more\n")
+        bp.HOOKS["after_chunk"] = after_chunk
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn("source changed mid-copy: " + target, err)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/payload/B1-ltx2mlx-repo/README.md"))
+
+    def test_T32_source_changed_between_enumeration_and_copy(self):
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+
+        def after_entry(index):
+            if index == 0:
+                write_file(target, b"a different, longer README\n")
+        bp.HOOKS["after_entry"] = after_entry
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn("source changed since enumeration: " + target, err)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+
+
+class TestCredentialGatesE2E(BuildE2ECase):
+    def test_T10_nested_token_file_refuses_apply(self):
+        path = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/sub/token"
+        write_file(path, b"not-a-secret-value-xyz\n")
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 4)
+        self.assertTrue([line for line in out.splitlines() if line.startswith("FAIL B12 ") and path in line])
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+    def test_T13_known_secret_across_boundary_and_inside_chunk(self):
+        secret = SECRET_CANARY.encode("ascii")
+        for label, content in (("boundary", b"a" * 50 + secret + b"b" * 50), ("inside", b"a" * 10 + secret + b"b" * 10)):
+            fx = self.fresh_fixture()
+            write_file(fx.home + "/.cache/huggingface/token", secret + b"\n")
+            src = fx.home + "/ltx-2-mlx/packages/ltx_core/leak.txt"
+            write_file(src, content)
+            with mock.patch.object(bp, "CHUNK_SIZE", 64):
+                rc, out, err = build_apply(fx)
+            self.assertEqual(rc, 5, label + out + err)
+            self.assertIn(src, err)
+            self.assertNotIn(SECRET_CANARY, out + err)
+            self.assertFalse(os.path.lexists(fx.pkg + "/payload/B1-ltx2mlx-repo/packages/ltx_core/leak.txt"))
+            self.assertFalse(os.path.lexists(fx.pkg + "/MANIFEST.json"))
+            with open(fx.pkg + "/MANIFEST-ENTRIES.jsonl.partial", "rb") as fh:
+                partial = fh.read()
+            self.assertNotIn(b"leak.txt", partial)
+            self.assertNotIn(secret, partial)
+
+    def test_RF1_long_jwt_like_token_in_unrecognized_file_is_caught_by_l3(self):
+        token = "hf" + "_" + "eyJ0eXAi" + "." + "Q" * 800
+        self.assertEqual(bp.l2_scan_bytes(token.encode("ascii")), [])
+        write_file(self.fx.home + "/ltx-2-mlx/hf_cache/token", (token + "\n").encode("ascii"))
+        src = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/hub_auth.cfg"
+        write_file(src, b"[auth]\nvalue = " + token.encode("ascii") + b"\n")
+        self.assertEqual(self.fx.ctx().l1_hits, [])
+        with mock.patch.object(bp, "CHUNK_SIZE", 64):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn(src, err)
+        self.assertNotIn(token, out + err)
+        self.assertNotIn("Q" * 64, out + err)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/payload/F3-user-site/lib/python/site-packages/torch/hub_auth.cfg"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+
+    def test_RF1b_secret_in_a_root_file_aborts_before_payload(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        self.fx.run.freeze_text = "pkg==1.0\n# " + SECRET_CANARY + "\n"
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn("manifests/pip-freeze-framework-py313.txt", err)
+        self.assertNotIn(SECRET_CANARY, out + err)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/manifests/pip-freeze-framework-py313.txt"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/manifests/.pip-freeze-framework-py313.txt.tmp"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/payload"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+
+    def test_T15_l4_catches_a_pattern_in_a_root_file(self):
+        self.fx.run.freeze_text = "pkg==1.0\n# " + GITHUB_CANARY + "\n"
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 3, out + err)
+        with open(self.fx.pkg + "/BUILD-FAILED.json") as fh:
+            doc = json.load(fh)
+        self.assertEqual((doc["failed_step"], doc["error_type"], doc["schema_version"]), ("PC4", "CredentialLeak", 4))
+        self.assertIn("manifests/pip-freeze-framework-py313.txt", doc["error"])
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+        self.assertNotIn(GITHUB_CANARY, out + err + json.dumps(doc))
+
+    def test_l4_rejects_a_ds_store_dropped_into_the_package(self):
+        def after_entry(index):
+            if index == 0:
+                write_file(self.fx.pkg + "/payload/.DS_Store", b"finder")
+        bp.HOOKS["after_entry"] = after_entry
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 3, out + err)
+        with open(self.fx.pkg + "/BUILD-FAILED.json") as fh:
+            self.assertIn("DS_Store", json.load(fh)["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
