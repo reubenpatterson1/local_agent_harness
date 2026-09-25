@@ -1582,17 +1582,18 @@ def check_b19(ctx):
 
 def check_b20(ctx):
     """B20: no present file-backed known-secret source (ctx.l3_sources) lies under the volume being
-    built onto. Both sides are realpaths, so a symlink cannot hide a token file on that volume.
+    built onto. Both sides are realpaths, so a symlink cannot hide a token file on that volume, and they are
+    compared case-insensitively, because /Volumes is: --usb-root /volumes/ollama is /Volumes/Ollama.
     "$HF_TOKEN"-style env-var sources are not paths and are skipped. Messages name paths only."""
     root = os.path.realpath(ctx.usb_root)
-    prefix = root.rstrip("/") + "/"
+    prefix = root.rstrip("/").lower() + "/"
     hits = []
     for source in ctx.l3_sources:
         label = source["source"]
         if not source["present"] or not label.startswith("/"):
             continue
         real = os.path.realpath(label)
-        if real.startswith(prefix):
+        if real.lower().startswith(prefix):
             hits.append(label if real == label else "%s -> %s" % (label, real))
     if hits:
         return CheckResult("B20", False, "known-secret source file(s) on the build volume %s: %s; build onto a volume "

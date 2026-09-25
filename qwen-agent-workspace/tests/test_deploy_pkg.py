@@ -1620,6 +1620,10 @@ class TestBuildChecks(DeployTestCase):
         link = self.fx.root + "/usb-link"
         make_link(link, usb)
         self.assertEqual(b20(link), bp.CheckResult("B20", False, on_volume % (usb, usb + "/hf_home/token"), True))
+        folded = os.path.dirname(usb) + "/" + os.path.basename(usb).lower()
+        self.assertNotEqual(folded, usb)
+        self.assertEqual(b20(folded), bp.CheckResult(
+            "B20", False, on_volume % (os.path.realpath(folded), usb + "/hf_home/token"), True))
         os.unlink(usb + "/hf_home/token")
         write_file(usb + "/stash/tok", (tok + "\n").encode("ascii"))
         make_link(self.fx.home + "/alt/tokfile", usb + "/stash/tok")
@@ -1631,6 +1635,9 @@ class TestBuildChecks(DeployTestCase):
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(usb)
         self.assertEqual(b20(usb), clean)
+        write_file(self.fx.usb2 + "/hf_home/token", (tok + "\n").encode("ascii"))
+        self.assertEqual(b20(usb), clean)
+        self.assertFalse(b20(self.fx.usb2).ok)
 
 
 class TestReadme(DeployTestCase):
