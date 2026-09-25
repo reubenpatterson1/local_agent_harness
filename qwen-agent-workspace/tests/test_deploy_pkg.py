@@ -1135,5 +1135,304 @@ class TestCredentialGates(DeployTestCase):
         self.assertEqual(bp.l2_scan_bytes(text.encode("utf-8")), [])
 
 
+def prebuild(fx, *extra):
+    args = bp.parse_args(["--usb-root", fx.usb, "--package-id", fx.package_id] + list(extra))
+    ctx = bp.BuildCtx(args)
+    ctx.secrets, ctx.l3_sources, ctx.l3_errors = bp.load_known_secrets()
+    bp.enumerate_components(ctx)
+    results = bp.run_prebuild_checks(ctx)
+    by_id = {}
+    for result in results:
+        by_id.setdefault(result.check_id, result)
+    return ctx, results, by_id
+
+
+class TestBuildChecks(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = Fixture(self)
+        self.fx.build_sources()
+        self.fx.configure_build_hooks()
+
+    def check(self, check_id, *extra):
+        return prebuild(self.fx, *extra)[2][check_id]
+
+    def test_clean_fixture_passes_every_check_in_table_order(self):
+        ctx, results, by_id = prebuild(self.fx)
+        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 18)])
+        self.assertEqual([bp.format_result(r) for r in results if not r.ok], [])
+        self.assertEqual(ctx.baseline["schema_version"], 1)
+        self.assertEqual(ctx.baseline["interpreter"], self.fx.fw_py)
+        self.assertEqual(ctx.baseline["cwd"], self.fx.ws)
+        self.assertEqual(ctx.baseline["gates"][0], {"id": "G1", "argv": ["tests/test_ltx_movie_offline.py"], "rc": 0, "last_line": "OK 118/118"})
+        self.assertEqual([g["id"] for g in ctx.baseline["gates"]], ["G1", "G2", "G3", "G4", "G5", "G6", "G7"])
+        self.assertEqual(ctx.baseline["extras"], [
+            {"id": "X1", "argv": ["bin/ltx-mlx-render", "--help"], "rc": 0},
+            {"id": "X2", "argv": list(X2_ARGV), "rc": 0, "brace_lines": 0}])
+        self.assertEqual(ctx.host["vllm_version"], "0.27.1")          # C1: last line, not the INFO line
+        self.assertEqual(ctx.host["memsize"], 68719476736)
+        self.assertEqual(ctx.host["ffmpeg_version"], "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers")
+        self.assertEqual(ctx.host["falconsai_source_hub"], self.fx.usb_hub)
+        self.assertEqual(sorted(ctx.freezes), ["manifests/pip-freeze-framework-py313.txt", "manifests/pip-freeze-ltx2mlx-venv.txt", "manifests/pip-freeze-vllm-venv.txt"])
+        self.assertEqual(ctx.git_record["head"], HEAD_SHA)
+        self.assertEqual(ctx.git_record["branch"], "ltx2-mlx-video-pipeline")
+        self.assertEqual(list(ctx.git_record["pipeline_files"]), list(PIPELINE))
+        self.assertEqual(list(ctx.git_record["test_files"]), list(TESTS7))
+        info = ctx.git_record["pipeline_files"]["bin/ltx-movie"]
+        self.assertEqual(info["sha256"], file_sha256(self.fx.ws + "/bin/ltx-movie"))
+        self.assertTrue(info["clean"])
+        gate_calls = [c for c in self.fx.run.kwcalls if c[0][1:2] == ("tests/test_ltx_movie_offline.py",)]
+        self.assertEqual(gate_calls, [((self.fx.fw_py, "tests/test_ltx_movie_offline.py"), 900, self.fx.ws)])
+
+    def test_B01_usb_volume(self):
+        self.fx.mounts.clear()
+        self.assertFalse(self.check("B01").ok)
+        self.fx.mounts.add(self.fx.usb)
+        for personality in ("APFS", "Case-sensitive Journaled HFS+"):
+            bp.HOOKS["diskutil_personality"] = lambda path, value=personality: value
+            self.assertFalse(self.check("B01").ok, personality)
+
+    def test_B02_free_space(self):
+        bp.HOOKS["statvfs_free"] = lambda path: 1000
+        ctx, results, by_id = prebuild(self.fx)
+        self.assertFalse(by_id["B02"].ok)
+        total = sum(e["b"] for e in ctx.entries if e["k"] == "f")
+        self.assertEqual(ctx.required_bytes, total + bp.BUILD_HEADROOM_BYTES)
+        self.assertIn("required=%d" % ctx.required_bytes, by_id["B02"].message)
+
+    def test_B03_sources_and_venv_pins(self):
+        cfg = self.fx.home + "/.venv-vllm-metal/pyvenv.cfg"
+        write_file(cfg, b"home = /usr/bin\n")
+        result = self.check("B03")
+        self.assertFalse(result.ok)
+        self.assertIn(cfg, result.message)
+        write_file(cfg, ("home = %s\n" % os.path.dirname(self.fx.brew_py312)).encode("utf-8"))
+        self.assertTrue(self.check("B03").ok)
+        ltx_cfg = self.fx.home + "/ltx-2-mlx/.venv/pyvenv.cfg"
+        write_file(ltx_cfg, b"home = /opt/other/bin\n")
+        self.assertFalse(self.check("B03").ok)
+        fifo = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/pipe"
+        write_file(ltx_cfg, ("home = %s/bin\n" % bp.b3_source()).encode("utf-8"))
+        os.mkfifo(fifo)
+        result = self.check("B03")
+        self.assertFalse(result.ok)
+        self.assertIn(fifo, result.message)
+
+    def test_B04_RF3_pack_file_set(self):
+        P = self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8"
+        self.assertTrue(self.check("B04").ok)
+        os.unlink(P + "/vocoder.safetensors")
+        result = self.check("B04")
+        self.assertFalse(result.ok)
+        self.assertIn("missing=['vocoder.safetensors']", result.message)
+        self.assertIn("extra=[]", result.message)
+        write_file(P + "/vocoder.safetensors", b"v")
+        write_file(P + "/transformer-dev.safetensors.part", b"partial")
+        result = self.check("B04")
+        self.assertFalse(result.ok)
+        self.assertIn("extra=['transformer-dev.safetensors.part']", result.message)
+        os.unlink(P + "/transformer-dev.safetensors.part")
+        os.unlink(P + "/LICENSE")
+        os.makedirs(P + "/LICENSE")
+        result = self.check("B04")
+        self.assertFalse(result.ok)
+        self.assertIn("not_regular=['LICENSE']", result.message)
+
+    def test_B05_hf_repo_completeness(self):
+        hub = self.fx.home + "/hf_home/hub"
+        repo, pin = PINS["H1"]
+        R = hub + "/" + repo
+        write_file(R + "/refs/main", b"0" * 40)
+        self.assertFalse(self.check("B05").ok)
+        write_file(R + "/refs/main", pin.encode("ascii"))
+        self.assertTrue(self.check("B05").ok)
+        os.makedirs(R + "/snapshots/" + "1" * 40)
+        self.assertFalse(self.check("B05").ok)
+        os.rmdir(R + "/snapshots/" + "1" * 40)
+        write_file(R + "/blobs/abc.incomplete", b"")
+        self.assertFalse(self.check("B05").ok)
+        os.unlink(R + "/blobs/abc.incomplete")
+        make_link(R + "/snapshots/" + pin + "/missing.json", "../../blobs/nothere")
+        result = self.check("B05")
+        self.assertFalse(result.ok)
+        self.assertIn("missing.json", result.message)
+        os.unlink(R + "/snapshots/" + pin + "/missing.json")
+        write_file(self.fx.usb_hub + "/" + PINS["H3"][0] + "/refs/main", b"f" * 40)
+        self.assertFalse(self.check("B05").ok)
+
+    def test_B06_case_insensitive_collisions(self):
+        ctx = self.fx.ctx()
+        self.assertTrue(bp.check_b06(ctx).ok)
+        entry = [e for e in ctx.entries if e["c"] == "A1" and e["k"] == "f"][0]
+        ctx.entries.append(dict(entry, t=entry["t"].upper(), p=entry["p"] + "-other"))
+        result = bp.check_b06(ctx)
+        self.assertFalse(result.ok)
+        self.assertIn("t collision", result.message)
+        ctx = self.fx.ctx()
+        ctx.entries.append(dict(entry, p=entry["p"].upper(), t=entry["t"] + "-other"))
+        result = bp.check_b06(ctx)
+        self.assertFalse(result.ok)
+        self.assertIn("p collision", result.message)
+
+    def test_B07_package_root_state(self):
+        self.assertTrue(self.check("B07").ok)
+        os.makedirs(self.fx.pkg)
+        result = self.check("B07")
+        self.assertFalse(result.ok)
+        self.assertIn("already exists", result.message)
+        result = self.check("B07", "--apply", "--resume")
+        self.assertTrue(result.ok, result.message)
+        self.assertIn("resume prefix: 0 of", result.message)
+        write_file(self.fx.pkg + "/MANIFEST.json", b"{}")
+        result = self.check("B07", "--apply", "--resume")
+        self.assertFalse(result.ok)
+        self.assertIn("MANIFEST.json", result.message)
+        shutil.rmtree(self.fx.pkg)
+        result = self.check("B07", "--apply", "--resume")
+        self.assertFalse(result.ok)
+        self.assertIn("does not exist", result.message)
+
+    def test_B07_resume_prefix_analysis(self):
+        root = self.fx.pkg
+        os.makedirs(root)
+        ctx = self.fx.ctx("--apply", "--resume")
+        e0, e1, e2 = ctx.entries[0], ctx.entries[1], ctx.entries[2]
+        self.assertEqual((e0["k"], e1["k"], e2["k"]), ("d", "d", "f"))
+        os.makedirs(root + "/" + e1["p"])
+        shutil.copyfile(e2["_src"], root + "/" + e2["p"])
+        lines = [dict(e0), dict(e1), dict(e2, h=file_sha256(e2["_src"]))]
+        data = "".join(bp.entry_line(x) for x in lines).encode("utf-8")
+        partial = root + "/MANIFEST-ENTRIES.jsonl.partial"
+        write_file(partial, data + b'{"k":"f","c":"A')
+        bp.analyze_resume(ctx)
+        self.assertEqual((ctx.resume_prefix_len, ctx.resume_keep_bytes, ctx.resume_rename, ctx.resume_error), (3, len(data), False, None))
+        self.assertEqual(ctx.entries[2]["h"], file_sha256(e2["_src"]))
+        with open(root + "/" + e2["p"], "r+b") as fh:
+            fh.write(b"X")
+        ctx = self.fx.ctx("--apply", "--resume")
+        bp.analyze_resume(ctx)
+        self.assertEqual(ctx.resume_prefix_len, 2)
+        self.assertEqual(ctx.resume_keep_bytes, len("".join(bp.entry_line(x) for x in lines[:2]).encode("utf-8")))
+        os.rename(partial, root + "/MANIFEST-ENTRIES.jsonl")
+        ctx = self.fx.ctx("--apply", "--resume")
+        bp.analyze_resume(ctx)
+        self.assertTrue(ctx.resume_rename)
+        os.unlink(root + "/MANIFEST-ENTRIES.jsonl")
+        write_file(partial, bp.entry_line(dict(e0, t=e0["t"] + "x")).encode("utf-8"))
+        ctx = self.fx.ctx("--apply", "--resume")
+        bp.analyze_resume(ctx)
+        self.assertTrue(ctx.resume_error.startswith("enumeration changed since the interrupted build; delete %s and rebuild" % root))
+        write_file(partial, "".join(bp.entry_line(x) for x in [lines[0], lines[1], dict(lines[2], mt=e2["mt"] + 1)]).encode("utf-8"))
+        ctx = self.fx.ctx("--apply", "--resume")
+        bp.analyze_resume(ctx)
+        self.assertEqual(ctx.resume_error, "source changed since the interrupted build: " + e2["_src"])
+        write_file(partial, b"not json\n")
+        ctx = self.fx.ctx("--apply", "--resume")
+        bp.analyze_resume(ctx)
+        self.assertIn("not valid JSON", ctx.resume_error)
+
+    def test_B08_synthetic_symlink_target(self):
+        link = self.fx.home + "/mlx_models/qwen3-vl"
+        os.unlink(link)
+        make_link(link, "/elsewhere")
+        self.assertFalse(self.check("B08").ok)
+        os.unlink(link)
+        self.assertFalse(self.check("B08").ok)
+
+    def test_B09_port(self):
+        bp.HOOKS["port_free"] = lambda port: False
+        result = self.check("B09")
+        self.assertFalse(result.ok)
+        self.assertIn("stop the story server", result.message)
+
+    def test_B10_hf_scope(self):
+        H = self.fx.home
+        self.assertTrue(bp.check_b10(self.fx.ctx()).ok)
+        base = {"k": "f", "c": "B1", "p": "payload/B1-ltx2mlx-repo/x", "b": 1, "m": "0644", "mt": 1}
+        cases = [
+            dict(base, t=H + "/ltx-2-mlx/x", _src=H + "/hf_home/hub/models--other/x"),
+            dict(base, t=H + "/ltx-2-mlx/x", _src=H + "/.cache/huggingface/token"),
+            dict(base, t=H + "/ltx-2-mlx/x", _src=os.path.dirname(self.fx.usb_hub) + "/hub/models--other/y"),
+            dict(base, c="H1", t=H + "/hf_home/hub/models--other/y", _src=H + "/hf_home/hub/" + PINS["H1"][0] + "/y"),
+            dict(base, t=H + "/ltx-2-mlx/hf_cache/token", _src=H + "/ltx-2-mlx/README.md"),
+        ]
+        for extra in cases:
+            ctx = self.fx.ctx()
+            ctx.entries.append(extra)
+            self.assertFalse(bp.check_b10(ctx).ok, extra)
+
+    def test_B11_RF5_target_path_allowlist(self):
+        H, fw, ulb = self.fx.home, self.fx.fw, self.fx.ulb
+        for t in (H + "/x", fw, fw + "/Versions/3.13/bin/python3", ulb, ulb + "/python3"):
+            self.assertTrue(bp.target_allowed(t), t)
+        for t in ("/tmp/evil", H, H + "X/evil", fw + "X", fw + "X/y", ulb + "X", "/Volumes/Ollama/x",
+                  "/opt/homebrew/bin/x", H + "/../evil", H + "/a/../../evil", H + "//x", H + "/./x", H + "/x/",
+                  "relative/x", ""):
+            self.assertFalse(bp.target_allowed(t), t)
+        ctx = self.fx.ctx()
+        self.assertTrue(bp.check_b11(ctx).ok)
+        ctx.entries.append({"k": "d", "c": "H0", "t": H + "/../../etc/evil", "m": "0755", "s": True})
+        result = bp.check_b11(ctx)
+        self.assertFalse(result.ok)
+        self.assertIn(H + "/../../etc/evil", result.message)
+        with mock.patch.object(bp, "REQUIRED_HOME", H + "-other"):
+            result = bp.check_b11(self.fx.ctx())
+        self.assertFalse(result.ok)
+        self.assertIn("home()", result.message)
+
+    def test_B15_offline_gates(self):
+        fw = self.fx.fw_py
+        cases = [((fw, "tests/test_ltx_story_images.py"), (1, "FAILED\nOK 97/98\n"), "G3"),
+                 ((fw, "tests/check_ltx2_mlx_no_forbidden_imports.py"), (0, "RESULT: 1 forbidden import\n"), "G7"),
+                 ((fw,) + X2_ARGV, (0, '{"x": 1}\n'), "X2"),
+                 ((fw, "tests/test_ltx_movie_offline.py"), (0, "OK 117/118\n"), "G1"),
+                 ((fw, "tests/test_ltx_mlx_render.py"), (0, ""), "G2"),
+                 ((fw, "bin/ltx-mlx-render", "--help"), (2, "usage error\n"), "X1")]
+        for key, value, gate_id in cases:
+            self.fx.run.overrides = {key: value}
+            result = self.check("B15")
+            self.assertFalse(result.ok, gate_id)
+            self.assertIn(gate_id, result.message)
+        self.fx.run.overrides = {}
+        self.assertTrue(self.check("B15").ok)
+
+    def test_B16_host_facts_and_freezes(self):
+        cases = [(("/usr/sbin/sysctl", "-n", "hw.model"), (1, "error"), "hw_model"),
+                 (("/usr/sbin/sysctl", "-n", "hw.memsize"), (0, "abc\n"), "memsize"),
+                 ((self.fx.vllm_py, "-m", "pip", "freeze", "--all"), (1, "boom"), "pip-freeze-vllm-venv.txt")]
+        for key, value, word in cases:
+            self.fx.run.overrides = {key: value}
+            result = self.check("B16")
+            self.assertFalse(result.ok, word)
+            self.assertIn(word, result.message)
+        self.fx.run.overrides = {}
+        bp.HOOKS["which"] = lambda name: None
+        result = self.check("B16")
+        self.assertFalse(result.ok)
+        self.assertIn("ffmpeg", result.message)
+
+    def test_B17_provenance(self):
+        self.fx.untracked.add("qwen-agent-workspace/bin/story-server")
+        result = self.check("B17")
+        self.assertFalse(result.ok)
+        self.assertIn("bin/story-server: untracked", result.message)
+        self.fx.untracked.clear()
+        self.fx.modified.add("qwen-agent-workspace/bin/qwen-agent")
+        result = self.check("B17")
+        self.assertFalse(result.ok)
+        self.assertIn("bin/qwen-agent: modified", result.message)
+        self.fx.modified.clear()
+        self.fx.committed["qwen-agent-workspace/z_image_skill.py"] = "0" * 40
+        result = self.check("B17")
+        self.assertFalse(result.ok)
+        self.assertIn("z_image_skill.py: blob differs", result.message)
+        self.fx.committed.clear()
+        self.fx.modified.add("qwen-agent-workspace/tests/test_ltx_image_fit.py")
+        ctx, results, by_id = prebuild(self.fx)
+        self.assertTrue(by_id["B17"].ok, by_id["B17"].message)
+        self.assertFalse(ctx.git_record["test_files"]["tests/test_ltx_image_fit.py"]["clean"])
+        self.assertEqual(ctx.git_record["porcelain"], [" M qwen-agent-workspace/tests/test_ltx_image_fit.py"])
+
+
 if __name__ == "__main__":
     unittest.main()

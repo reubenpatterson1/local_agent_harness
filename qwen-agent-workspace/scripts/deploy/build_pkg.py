@@ -1064,3 +1064,501 @@ def cmd_credential_report(args):
     print("build_pkg: CREDENTIAL REPORT %s: l1=%d new=%d allowlisted=%d stale=%d" % (
         "CLEAN" if clean else "NOT CLEAN", len(ctx.l1_hits), len(ctx.l2_new), len(ctx.l2_allowed), len(stale)))
     return 0 if clean else 1
+
+
+# ---------------------------------------------------------------------------
+# Offline gates (spec 10.1) -- shared with install_pkg (accept A3)
+# ---------------------------------------------------------------------------
+LTX25_LITERAL = "/Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8"
+GATE_SPECS = (
+    ("G1", ("tests/test_ltx_movie_offline.py",)),
+    ("G2", ("tests/test_ltx_mlx_render.py",)),
+    ("G3", ("tests/test_ltx_story_images.py",)),
+    ("G4", ("tests/test_ltx2_mlx_video_skill.py",)),
+    ("G5", ("tests/test_ltx_image_fit.py",)),
+    ("G6", ("tests/test_ltx_story_manifest_chain.py",)),
+    ("G7", ("tests/check_ltx2_mlx_no_forbidden_imports.py",)),
+)
+EXTRA_SPECS = (
+    ("X1", ("bin/ltx-mlx-render", "--help")),
+    ("X2", ("bin/ltx-movie", "a test narrative", "--story-id", "deploy-gate-dry", "--dry-run", "--no-review",
+            "--model", LTX25_LITERAL)),
+)
+OK_LINE_RE = re.compile(r"^OK (\d+)/\1$")
+
+
+def run_offline_gates(run, py, cwd):
+    """Run G1-G7 then X1, X2 by direct invocation (never through pytest)."""
+    gates = []
+    for gate_id, argv in GATE_SPECS:
+        rc, text = run([py] + list(argv), timeout=GATE_TIMEOUT, cwd=cwd)
+        gates.append({"id": gate_id, "argv": list(argv), "rc": rc, "last_line": last_line(text)})
+    extras = []
+    for extra_id, argv in EXTRA_SPECS:
+        rc, text = run([py] + list(argv), timeout=GATE_TIMEOUT, cwd=cwd)
+        record = {"id": extra_id, "argv": list(argv), "rc": rc}
+        if extra_id == "X2":
+            record["brace_lines"] = sum(1 for line in text.splitlines() if "{" in line or "}" in line)
+        extras.append(record)
+    return gates, extras
+
+
+def gate_build_failures(gates, extras):
+    bad = []
+    for gate in gates:
+        if gate["id"] == "G7":
+            ok = gate["rc"] == 0 and gate["last_line"] == "RESULT: ok"
+        else:
+            ok = gate["rc"] == 0 and OK_LINE_RE.match(gate["last_line"]) is not None
+        if not ok:
+            bad.append("%s rc=%r last_line=%r" % (gate["id"], gate["rc"], gate["last_line"]))
+    for extra in extras:
+        if extra["id"] == "X1" and extra["rc"] != 0:
+            bad.append("X1 rc=%r" % extra["rc"])
+        if extra["id"] == "X2" and (extra["rc"] != 0 or extra["brace_lines"] != 0):
+            bad.append("X2 rc=%r brace_lines=%r" % (extra["rc"], extra["brace_lines"]))
+    return bad
+
+
+def check_offline_gates(ctx):
+    gates, extras = run_offline_gates(_run, framework_py(), workspace())
+    ctx.baseline = {"schema_version": 1, "measured_at": iso_now(), "interpreter": framework_py(),
+                    "cwd": workspace(), "gates": gates, "extras": extras}
+    bad = gate_build_failures(gates, extras)
+    message = "offline gates G1-G7, X1, X2 passed" if not bad else "offline gate failure(s): " + "; ".join(bad)
+    return CheckResult("B15", not bad, message, True)
+
+
+# ---------------------------------------------------------------------------
+# Host facts, pip freezes, git provenance (spec 6.4, B16, B17)
+# ---------------------------------------------------------------------------
+def _first_line(text):
+    lines = text.strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def _probe(ctx, key, argv, pick_last=False):
+    rc, text = _run(argv, timeout=HOST_TIMEOUT)
+    if rc != 0:
+        ctx.host_failures.append("%s: %s exited %d" % (key, " ".join(argv), rc))
+        return ""
+    return last_line(text).strip() if pick_last else _first_line(text)
+
+
+def gather_host_facts(ctx):
+    H = home()
+    host = {}
+    host["hw_model"] = _probe(ctx, "hw_model", ["/usr/sbin/sysctl", "-n", "hw.model"])
+    host["cpu"] = _probe(ctx, "cpu", ["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"])
+    memsize = _probe(ctx, "memsize", ["/usr/sbin/sysctl", "-n", "hw.memsize"])
+    if memsize.isdigit():
+        host["memsize"] = int(memsize)
+    else:
+        host["memsize"] = -1
+        ctx.host_failures.append("memsize: %r is not an integer" % memsize)
+    host["product_version"] = _probe(ctx, "product_version", ["/usr/bin/sw_vers", "-productVersion"])
+    host["build_version"] = _probe(ctx, "build_version", ["/usr/bin/sw_vers", "-buildVersion"])
+    host["machine"] = platform.machine()
+    host["framework_python_version"] = _probe(ctx, "framework_python_version",
+                                              [framework_py(), "-c", "import sys;print(sys.version.split()[0])"])
+    for key, tool in (("ffmpeg_version", "ffmpeg"), ("ffprobe_version", "ffprobe")):
+        path = HOOKS["which"](tool)
+        if path:
+            host[key] = _probe(ctx, key, [path, "-version"])
+        else:
+            host[key] = ""
+            ctx.host_failures.append("%s: %s not found on PATH" % (key, tool))
+    host["brew_version"] = _probe(ctx, "brew_version", [BREW_BIN, "--version"])
+    host["brew_python312_version"] = _probe(ctx, "brew_python312_version", [BREW_PY312, "--version"])
+    # C1: vllm logs timestamped INFO lines before the version; the version is the LAST line.
+    host["vllm_version"] = _probe(ctx, "vllm_version", [H + "/.venv-vllm-metal/bin/python", "-c",
+                                                        "import vllm; print(vllm.__version__)"], pick_last=True)
+    host["falconsai_source_hub"] = ctx.falconsai_hub or ""
+    host["gathered_at"] = iso_now()
+    ctx.host = host
+
+
+def freeze_commands():
+    H = home()
+    return (
+        ("manifests/pip-freeze-framework-py313.txt",
+         [framework_py(), "-m", "pip", "freeze", "--all", "--exclude", "fubotv-mcp-common", "--exclude", "student-agent-mcp"]),
+        ("manifests/pip-freeze-ltx2mlx-venv.txt",
+         [FRAMEWORK_ROOT + "/Versions/3.13/bin/uv", "pip", "freeze", "--python", H + "/ltx-2-mlx/.venv/bin/python"]),
+        ("manifests/pip-freeze-vllm-venv.txt",
+         [H + "/.venv-vllm-metal/bin/python", "-m", "pip", "freeze", "--all"]),
+    )
+
+
+def gather_freezes(ctx):
+    for rel, argv in freeze_commands():
+        rc, text = _run(argv, timeout=FREEZE_TIMEOUT)
+        if rc != 0:
+            ctx.host_failures.append("%s: %s exited %d" % (rel, " ".join(argv), rc))
+        ctx.freezes[rel] = text
+
+
+def git_file_state(repo, rel):
+    rp = WS_REPO_PREFIX + "/" + rel
+    abs_path = workspace() + "/" + rel
+    try:
+        with open(abs_path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return {"sha256": "", "git_blob": "", "clean": False}, "missing"
+    rc_ls, _ = _run([GIT, "-C", repo, "ls-files", "--error-unmatch", "--", rp])
+    rc_st, st_out = _run([GIT, "-C", repo, "status", "--porcelain", "--", rp])
+    rc_ho, ho_out = _run([GIT, "-C", repo, "hash-object", abs_path])
+    rc_rp, rp_out = _run([GIT, "-C", repo, "rev-parse", "HEAD:" + rp])
+    blob = rp_out.strip() if rc_rp == 0 else ""
+    reason = ""
+    if rc_ls != 0:
+        reason = "untracked"
+    elif rc_st != 0 or st_out.strip():
+        reason = "modified"
+    elif rc_ho != 0 or rc_rp != 0 or ho_out.strip() != blob:
+        reason = "blob differs"
+    return {"sha256": sha256_bytes(data), "git_blob": blob, "clean": not reason}, reason
+
+
+def gather_git_record(ctx):
+    repo = repo_root()
+    problems = []
+    rc, out = _run([GIT, "-C", repo, "rev-parse", "HEAD"])
+    if rc != 0:
+        problems.append("git rev-parse HEAD failed (rc=%d)" % rc)
+    head = out.strip() if rc == 0 else ""
+    rc, out = _run([GIT, "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = out.strip() if rc == 0 else ""
+    rc, out = _run([GIT, "-C", repo, "status", "--porcelain", "--", WS_REPO_PREFIX])
+    porcelain = [line for line in out.splitlines() if line.strip()] if rc == 0 else []
+    record = {"head": head, "branch": branch, "porcelain": porcelain, "pipeline_files": {}, "test_files": {}}
+    for rel in PIPELINE_FILES:
+        info, reason = git_file_state(repo, rel)
+        record["pipeline_files"][rel] = info
+        if reason:
+            problems.append("%s: %s" % (rel, reason))
+    for rel in TEST_FILES:
+        info, reason = git_file_state(repo, rel)
+        record["test_files"][rel] = info
+    ctx.git_record = record
+    ctx.git_problems = problems
+
+
+# ---------------------------------------------------------------------------
+# Resume-prefix analysis (spec 11.3; read-only, used by B07)
+# ---------------------------------------------------------------------------
+def entry_identity(entry):
+    return tuple(entry.get(key) for key in ("k", "c", "p", "t", "l", "s"))
+
+
+def payload_matches(package_root, line):
+    if "p" not in line:
+        return True
+    path = package_root + "/" + line["p"]
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if line["k"] == "f":
+        return stat.S_ISREG(st.st_mode) and st.st_size == line.get("b") and sha256_file(path) == line.get("h")
+    if line["k"] == "l":
+        return stat.S_ISLNK(st.st_mode) and os.readlink(path) == line.get("l")
+    return stat.S_ISDIR(st.st_mode)
+
+
+def analyze_resume(ctx):
+    root = ctx.package_root
+    partial = root + "/MANIFEST-ENTRIES.jsonl.partial"
+    final = root + "/MANIFEST-ENTRIES.jsonl"
+    ctx.resume_prefix_len = 0
+    ctx.resume_keep_bytes = 0
+    ctx.resume_rename = False
+    ctx.resume_error = None
+    if os.path.exists(partial):
+        source = partial
+    elif os.path.exists(final):
+        source = final
+        ctx.resume_rename = True
+    else:
+        return
+    with open(source, "rb") as fh:
+        data = fh.read()
+    complete = data[:data.rfind(b"\n") + 1]
+    offset = 0
+    for index, raw in enumerate(complete.split(b"\n")[:-1]):
+        try:
+            line = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            ctx.resume_error = "line %d of %s is not valid JSON; delete %s and rebuild" % (index, source, root)
+            return
+        if index >= len(ctx.entries) or entry_identity(line) != entry_identity(ctx.entries[index]):
+            ctx.resume_error = "enumeration changed since the interrupted build; delete %s and rebuild" % root
+            return
+        fresh = ctx.entries[index]
+        if (line.get("b"), line.get("m"), line.get("mt")) != (fresh.get("b"), fresh.get("m"), fresh.get("mt")):
+            ctx.resume_error = "source changed since the interrupted build: %s" % fresh.get("_src", fresh["t"])
+            return
+        if not payload_matches(root, line):
+            break
+        if line["k"] == "f":
+            fresh["h"] = line["h"]
+        offset += len(raw) + 1
+        ctx.resume_prefix_len = index + 1
+    ctx.resume_keep_bytes = offset
+
+
+# ---------------------------------------------------------------------------
+# B01-B17 (spec 10)
+# ---------------------------------------------------------------------------
+def _under(path, root):
+    return path == root or path.startswith(root + "/")
+
+
+def check_b01(ctx):
+    mounted = bool(HOOKS["ismount"](ctx.usb_root))
+    personality = HOOKS["diskutil_personality"](ctx.usb_root) if mounted else ""
+    ok = mounted and "APFS" in personality and "Case-sensitive" in personality
+    return CheckResult("B01", ok, "usb_root=%s mounted=%s personality=%r (need a mounted Case-sensitive APFS volume)"
+                       % (ctx.usb_root, mounted, personality), True)
+
+
+def check_b02(ctx):
+    total = sum(e["b"] for e in ctx.entries if e["k"] == "f")
+    done = sum(e["b"] for e in ctx.entries[:ctx.resume_prefix_len] if e["k"] == "f")
+    ctx.remaining_bytes = total - done
+    ctx.required_bytes = ctx.remaining_bytes + BUILD_HEADROOM_BYTES
+    try:
+        ctx.free_bytes = HOOKS["statvfs_free"](ctx.usb_root)
+    except OSError:
+        ctx.free_bytes = -1
+    ok = ctx.free_bytes >= ctx.required_bytes
+    return CheckResult("B02", ok, "free=%d required=%d (remaining %d + headroom %d)"
+                       % (ctx.free_bytes, ctx.required_bytes, ctx.remaining_bytes, BUILD_HEADROOM_BYTES), True)
+
+
+def read_pyvenv_home(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                key, sep, value = line.partition("=")
+                if sep and key.strip() == "home":
+                    return value.strip()
+    except OSError:
+        return None
+    return None
+
+
+def check_b03(ctx):
+    problems = list(ctx.enum_errors)
+    H = home()
+    for cfg, want in ((H + "/ltx-2-mlx/.venv/pyvenv.cfg", b3_source() + "/bin"),
+                      (H + "/.venv-vllm-metal/pyvenv.cfg", os.path.dirname(BREW_PY312))):
+        got = read_pyvenv_home(cfg)
+        if got != want:
+            problems.append("%s: home = %r, expected %r" % (cfg, got, want))
+    ok = not problems
+    return CheckResult("B03", ok, "sources readable; venv base interpreters pinned" if ok else "; ".join(problems[:20]), True)
+
+
+def check_b04(ctx):
+    pack = ltx25_model_path()
+    try:
+        names = set(os.listdir(pack)) - set([".cache", ".DS_Store"])
+    except OSError as exc:
+        return CheckResult("B04", False, "cannot list %s: %s" % (pack, exc), True)
+    extra = sorted(names - LTX25_PACK_FILES)
+    missing = sorted(LTX25_PACK_FILES - names)
+    not_regular = sorted(n for n in names & LTX25_PACK_FILES if not stat.S_ISREG(os.lstat(pack + "/" + n).st_mode))
+    ok = not extra and not missing and not not_regular
+    return CheckResult("B04", ok, "%s: %d pinned files; extra=%s missing=%s not_regular=%s"
+                       % (pack, len(LTX25_PACK_FILES), extra, missing, not_regular), True)
+
+
+def hf_repo_problems(repo_dir, pin):
+    if not os.path.isdir(repo_dir):
+        return ["%s: repo dir missing" % repo_dir]
+    problems = []
+    try:
+        with open(repo_dir + "/refs/main", "r") as fh:
+            ref = fh.read().strip()
+    except OSError:
+        ref = None
+    if ref != pin:
+        problems.append("%s: refs/main=%r, expected %s" % (repo_dir, ref, pin))
+    try:
+        snaps = sorted(n for n in os.listdir(repo_dir + "/snapshots") if n != ".DS_Store")
+    except OSError:
+        snaps = None
+    if snaps != [pin]:
+        problems.append("%s: snapshots=%r, expected [%r]" % (repo_dir, snaps, pin))
+    blobs = repo_dir + "/blobs"
+    if not os.path.isdir(blobs):
+        problems.append("%s: blobs/ missing" % repo_dir)
+    for dirpath, dirnames, filenames in os.walk(blobs):
+        for name in dirnames + filenames:
+            if name.endswith(".incomplete"):
+                problems.append("%s: incomplete download %s" % (repo_dir, os.path.join(dirpath, name)))
+    blobs_real = os.path.realpath(blobs)
+    for dirpath, dirnames, filenames in os.walk(repo_dir):
+        for name in dirnames + filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                real = os.path.realpath(path)
+                if not (real.startswith(blobs_real + "/") and os.path.isfile(real)):
+                    problems.append("%s: symlink does not resolve to a blob: %s" % (repo_dir, path))
+    return problems
+
+
+def check_b05(ctx):
+    hub = home() + "/hf_home/hub"
+    problems = []
+    for cid in ("H1", "H2", "H3", "H4"):
+        repo, pin = HF_PINS[cid]
+        source_hub = ctx.falconsai_hub if cid == "H3" else hub
+        if source_hub is None:
+            problems.append("H3: %s not found in either hub" % repo)
+            continue
+        problems.extend(hf_repo_problems(source_hub + "/" + repo, pin))
+    ok = not problems
+    return CheckResult("B05", ok, "H1-H4 complete at their pinned snapshots" if ok else "; ".join(problems[:20]), True)
+
+
+def check_b06(ctx):
+    problems = []
+    for key in ("p", "t"):
+        seen = {}
+        for entry in ctx.entries:
+            if key in entry:
+                seen.setdefault(entry[key].lower(), []).append(entry[key])
+        for values in seen.values():
+            if len(values) > 1:
+                problems.append("%s collision: %s" % (key, " | ".join(values)))
+    ok = not problems
+    return CheckResult("B06", ok, "no case-insensitive p/t collisions" if ok else "; ".join(problems[:20]), True)
+
+
+def check_b07(ctx):
+    root = ctx.package_root
+    if not ctx.resume:
+        if os.path.lexists(root):
+            return CheckResult("B07", False, "package root %s already exists; pass --resume to continue an interrupted build, or choose another --package-id" % root, True)
+        return CheckResult("B07", True, "package root %s does not exist yet" % root, True)
+    if not os.path.isdir(root):
+        return CheckResult("B07", False, "--resume given but %s does not exist" % root, True)
+    if os.path.lexists(root + "/MANIFEST.json"):
+        return CheckResult("B07", False, "%s already holds MANIFEST.json (the build is complete; nothing to resume)" % root, True)
+    if ctx.resume_error:
+        return CheckResult("B07", False, ctx.resume_error, True)
+    return CheckResult("B07", True, "resume prefix: %d of %d entries verified" % (ctx.resume_prefix_len, len(ctx.entries)), True)
+
+
+def check_b08(ctx):
+    want = h5_link_value()
+    problems = []
+    h5 = [e for e in ctx.entries if e["c"] == "H5" and e["k"] == "l"]
+    h4_dirs = set(e["t"] for e in ctx.entries if e["c"] == "H4" and e["k"] == "d")
+    if len(h5) != 1 or h5[0]["l"] != want or want not in h4_dirs:
+        problems.append("H5 link value is not the t of the pinned H4 snapshot dir %s" % want)
+    link = home() + "/mlx_models/qwen3-vl"
+    try:
+        live = os.readlink(link)
+    except OSError:
+        live = None
+    if live != want:
+        problems.append("live %s -> %r, expected %s" % (link, live, want))
+    ok = not problems
+    return CheckResult("B08", ok, "mlx_models/qwen3-vl -> pinned H4 snapshot" if ok else "; ".join(problems), True)
+
+
+def check_b09(ctx):
+    ok = bool(HOOKS["port_free"](STORY_PORT))
+    message = ("port %d is free" % STORY_PORT) if ok else (
+        "port %d is in use: stop the story server before building (bin/story-server stop)" % STORY_PORT)
+    return CheckResult("B09", ok, message, True)
+
+
+def check_b10(ctx):
+    H = home()
+    src_scopes = (H + "/hf_home", os.path.dirname(FALCONSAI_USB_HUB), H + "/.cache/huggingface", H + "/ltx-2-mlx/hf_cache")
+    pinned_src = [H + "/hf_home/hub/" + HF_PINS[c][0] for c in ("H1", "H2", "H4")]
+    if ctx.falconsai_hub:
+        pinned_src.append(ctx.falconsai_hub + "/" + HF_PINS["H3"][0])
+    pinned_tgt = [H + "/hf_home/hub/" + HF_PINS[c][0] for c in ("H1", "H2", "H3", "H4")]
+    problems = []
+    for entry in ctx.entries:
+        src = entry.get("_src")
+        if src and any(_under(src, s) for s in src_scopes) and not any(_under(src, r) for r in pinned_src):
+            problems.append("source outside the pinned HF repos: %s" % src)
+        target = entry["t"]
+        if _under(target, H + "/hf_home") and entry["c"] != "H0" and not any(_under(target, r) for r in pinned_tgt):
+            problems.append("target under ~/hf_home outside the pinned repos: %s" % target)
+        if _under(target, H + "/ltx-2-mlx/hf_cache") and entry["c"] != "B5":
+            problems.append("target under ~/ltx-2-mlx/hf_cache that is not a B5 dir: %s" % target)
+    ok = not problems
+    return CheckResult("B10", ok, "HF sources and targets stay inside the pinned repos" if ok else "; ".join(problems[:20]), True)
+
+
+def target_allowed(t):
+    # C3 (plan addition): absolute and already normalised, so "..", "//" and "." cannot escape.
+    if not t.startswith("/") or os.path.normpath(t) != t:
+        return False
+    if t.startswith("/Volumes/") or t.startswith("/opt/homebrew/"):
+        return False
+    return (t.startswith(REQUIRED_HOME + "/")
+            or t == FRAMEWORK_ROOT or t.startswith(FRAMEWORK_ROOT + "/")
+            or t == USR_LOCAL_BIN or t.startswith(USR_LOCAL_BIN + "/"))
+
+
+def check_b11(ctx):
+    problems = []
+    if home() != REQUIRED_HOME:
+        problems.append("home() is %s, expected %s" % (home(), REQUIRED_HOME))
+    bad = [e["t"] for e in ctx.entries if not target_allowed(e["t"])]
+    if bad:
+        problems.append("%d target(s) outside the allowlist: %s" % (len(bad), ", ".join(bad[:20])))
+    ok = not problems
+    return CheckResult("B11", ok, "every target is under %s, %s or %s" % (REQUIRED_HOME, FRAMEWORK_ROOT, USR_LOCAL_BIN) if ok else "; ".join(problems), True)
+
+
+def check_b16(ctx):
+    gather_host_facts(ctx)
+    gather_freezes(ctx)
+    ok = not ctx.host_failures
+    return CheckResult("B16", ok, "host facts and 3 pip freezes gathered" if ok else "; ".join(ctx.host_failures), True)
+
+
+def check_b17(ctx):
+    gather_git_record(ctx)
+    ok = not ctx.git_problems
+    message = ("all 10 pipeline files match HEAD %s" % ctx.git_record.get("head", "")) if ok else (
+        "provenance: " + "; ".join(ctx.git_problems))
+    return CheckResult("B17", ok, message, True)
+
+
+def run_prebuild_checks(ctx):
+    """Stage step 4: B01-B17 in table order. Reads only; writes nothing."""
+    load_deploy_files(ctx)
+    prepare_l2(ctx)
+    if ctx.resume and os.path.isdir(ctx.package_root) and not os.path.lexists(ctx.package_root + "/MANIFEST.json"):
+        analyze_resume(ctx)
+    results = []
+    results.append(check_b01(ctx))
+    results.append(check_b02(ctx))
+    results.append(check_b03(ctx))
+    results.append(check_b04(ctx))
+    results.append(check_b05(ctx))
+    results.append(check_b06(ctx))
+    results.append(check_b07(ctx))
+    results.append(check_b08(ctx))
+    results.append(check_b09(ctx))
+    results.append(check_b10(ctx))
+    results.append(check_b11(ctx))
+    results.append(check_b12(ctx))
+    results.append(check_b13(ctx))
+    results.extend(stale_allowlist_warnings(ctx))
+    results.append(check_b14(ctx))
+    results.append(check_offline_gates(ctx))
+    results.append(check_b16(ctx))
+    results.append(check_b17(ctx))
+    return results
