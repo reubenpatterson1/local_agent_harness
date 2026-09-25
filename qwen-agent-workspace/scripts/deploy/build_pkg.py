@@ -1960,6 +1960,95 @@ def cmd_build(args):
     return finish_build(ctx)
 
 
+# ---------------------------------------------------------------------------
+# --verify-only (spec 11.4): re-verify a finished package; writes nothing
+# ---------------------------------------------------------------------------
+def verify_package(root):
+    failures = []
+    manifest_path = root + "/MANIFEST.json"
+    try:
+        with open(manifest_path, "rb") as fh:
+            manifest = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return [("manifest missing or unreadable", manifest_path)], 0
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
+        return [("manifest is not schema_version %d" % SCHEMA_VERSION, manifest_path)], 0
+    if os.path.lexists(root + "/BUILD-FAILED.json"):
+        failures.append(("build failed marker present", root + "/BUILD-FAILED.json"))
+    entries_path = root + "/" + manifest.get("entries_file", "MANIFEST-ENTRIES.jsonl")
+    try:
+        entries_sha = sha256_file(entries_path, nocache=True)
+        entries = read_entries(entries_path)
+    except (OSError, ValueError):
+        failures.append(("entries file unreadable", entries_path))
+        return failures, 0
+    if entries_sha != manifest.get("entries_sha256"):
+        failures.append(("entries sha256 mismatch", entries_path))
+    root_files = manifest.get("root_files", {})
+    for rel in sorted(root_files):
+        path = root + "/" + rel
+        try:
+            got = sha256_file(path, nocache=True)
+        except OSError:
+            got = None
+        if got != root_files[rel]:
+            failures.append(("root file hash mismatch", path))
+    listed = set()
+    nfiles = 0
+    for entry in entries:
+        if "p" not in entry:
+            continue
+        path = root + "/" + entry["p"]
+        listed.add(entry["p"])
+        try:
+            st = os.lstat(path)
+        except OSError:
+            failures.append(("missing", path))
+            continue
+        if entry["k"] == "f":
+            if not stat.S_ISREG(st.st_mode):
+                failures.append(("not a regular file", path))
+            elif st.st_size != entry["b"]:
+                failures.append(("size mismatch", path))
+            else:
+                nfiles += 1
+                if sha256_file(path, nocache=True) != entry["h"]:
+                    failures.append(("hash mismatch", path))
+        elif entry["k"] == "l":
+            if not stat.S_ISLNK(st.st_mode) or os.readlink(path) != entry["l"]:
+                failures.append(("symlink mismatch", path))
+        elif not stat.S_ISDIR(st.st_mode):
+            failures.append(("dir missing", path))
+    if os.path.isdir(root + "/payload"):
+        for rel, st in list_tree(root + "/payload"):
+            if not stat.S_ISDIR(st.st_mode) and ("payload/" + rel) not in listed:
+                failures.append(("extra", root + "/payload/" + rel))
+    allow_path = root + "/scripts/deploy/credential_allowlist.json"
+    try:
+        allow, _ = load_allowlist(allow_path)
+    except (OSError, ValueError):
+        failures.append(("allowlist unreadable", allow_path))
+        allow = set()
+    scan_failures, _ = scan_package(root, allow)
+    for item in scan_failures:
+        failures.append(("credential scan", item))
+    return failures, nfiles
+
+
+def cmd_verify_only(args):
+    usb_root = os.path.abspath(args.usb_root if args.usb_root else USB_ROOT_DEFAULT)
+    package_id = args.package_id if args.package_id else default_package_id()
+    root = os.path.join(usb_root, package_id)
+    failures, nfiles = verify_package(root)
+    for reason, path in failures:
+        print("FAIL VERIFY %s: %s" % (reason, path))
+    if failures:
+        print("build_pkg: VERIFY FAILED: %d problem(s) in %s" % (len(failures), root))
+        return 1
+    print("build_pkg: VERIFY ok: %d files re-hashed" % nfiles)
+    return 0
+
+
 # ---- CLI entry point ----
 
 
@@ -1967,6 +2056,8 @@ def main(argv=None):
     args = parse_args(argv)
     CTX_STATE["payload_started"] = False
     try:
+        if args.verify_only:
+            return cmd_verify_only(args)
         if args.credential_report:
             return cmd_credential_report(args)
         return cmd_build(args)

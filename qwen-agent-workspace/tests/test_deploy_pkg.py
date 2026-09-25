@@ -1974,5 +1974,185 @@ class TestCredentialGatesE2E(BuildE2ECase):
             self.assertIn("DS_Store", json.load(fh)["error"])
 
 
+def build_verify(fx, package_id=None):
+    return run_main(bp.main, ["--verify-only", "--usb-root", fx.usb, "--package-id", package_id or fx.package_id])
+
+
+class TestResume(BuildE2ECase):
+    def interrupt_at(self, k):
+        def after_entry(index):
+            if index == k:
+                raise RuntimeError("injected interrupt at entry %d" % k)
+        bp.HOOKS["after_entry"] = after_entry
+        result = build_apply(self.fx)
+        bp.HOOKS["after_entry"] = lambda index: None
+        return result
+
+    def reference(self):
+        rc, out, err = run_main(bp.main, ["--apply", "--usb-root", self.fx.usb2, "--package-id", self.fx.package_id])
+        self.assertEqual(rc, 0, out + err)
+        return self.fx.usb2 + "/" + self.fx.package_id
+
+    def assert_identical(self, ref):
+        with open(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl", "rb") as a, open(ref + "/MANIFEST-ENTRIES.jsonl", "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual(payload_snapshot(self.fx.pkg), payload_snapshot(ref))
+
+    def partial_lines(self):
+        with open(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl.partial", "rb") as fh:
+            return fh.read().split(b"\n")[:-1]
+
+    def test_T40_interrupt_then_resume_is_byte_identical(self):
+        rc, out, err = self.interrupt_at(30)
+        self.assertEqual(rc, 5, out + err)
+        self.assertIn("injected interrupt at entry 30", err)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+        self.assertEqual(len(self.partial_lines()), 31)
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PASS B07 resume prefix: 31 of ", out)
+        with open(self.fx.pkg + "/MANIFEST.json") as fh:
+            self.assertIs(json.load(fh)["build"]["resumed"], True)
+        self.assert_identical(self.reference())
+
+    def test_T41_torn_final_line_is_truncated(self):
+        rc, out, err = self.interrupt_at(30)
+        self.assertEqual(rc, 5)
+        with open(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl.partial", "ab") as fh:
+            fh.write(b'{"k":"f","c":"B')
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PASS B07 resume prefix: 31 of ", out)
+        self.assert_identical(self.reference())
+
+    def test_T42_listed_source_changed_fails_b07(self):
+        rc, out, err = self.interrupt_at(30)
+        self.assertEqual(rc, 5)
+        readme = self.fx.home + "/ltx-2-mlx/README.md"
+        write_file(readme, b"changed after the interrupted build\n")
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("FAIL B07 source changed since the interrupted build: " + readme, out)
+
+    def test_T43_corrupted_listed_payload_is_recopied(self):
+        rc, out, err = self.interrupt_at(30)
+        self.assertEqual(rc, 5)
+        victim = self.fx.pkg + "/payload/B1-ltx2mlx-repo/README.md"
+        with open(victim, "r+b") as fh:
+            fh.write(b"L")
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PASS B07 resume prefix: 25 of ", out)
+        self.assert_identical(self.reference())
+
+    def test_T44_resume_with_manifest_present_fails_b07(self):
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0)
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 4)
+        self.assertTrue([line for line in out.splitlines() if line.startswith("FAIL B07 ") and "MANIFEST.json" in line])
+
+    def test_RF2_resume_after_mid_copy_abort_completes_and_verifies(self):
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+        state = {"done": False}
+
+        def after_chunk(src, nbytes):
+            if src == target and not state["done"]:
+                state["done"] = True
+                with open(src, "ab") as fh:
+                    fh.write(b"appended while copying\n")
+        bp.HOOKS["after_chunk"] = after_chunk
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 5)
+        self.assertEqual([l for l in self.partial_lines() if b"B1-ltx2mlx-repo/README.md" in l], [])
+        bp.HOOKS["after_chunk"] = lambda src, nbytes: None
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PASS B07 resume prefix: 25 of ", out)
+        rc, out, err = build_verify(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        with open(self.fx.pkg + "/payload/B1-ltx2mlx-repo/README.md", "rb") as fh:
+            self.assertTrue(fh.read().endswith(b"appended while copying\n"))
+
+    def test_RF4_resume_after_post_copy_failure(self):
+        def boom(ctx):
+            raise RuntimeError("injected L4 failure")
+        with mock.patch.object(bp, "l4_rescan", boom):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 3)
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 0, out + err)
+        entries = bp.read_entries(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl")
+        self.assertIn("PASS B07 resume prefix: %d of %d entries verified" % (len(entries), len(entries)), out)
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/BUILD-FAILED.json"))
+        self.assertTrue(os.path.isfile(self.fx.pkg + "/MANIFEST.json"))
+        self.assertEqual(build_verify(self.fx)[0], 0)
+        self.assert_identical(self.reference())
+
+    def test_RF4b_resume_without_package_root_refuses(self):
+        rc, out, err = build_apply(self.fx, "--resume")
+        self.assertEqual(rc, 4)
+        self.assertIn("--resume given but %s does not exist" % self.fx.pkg, out)
+        self.assertFalse(os.path.lexists(self.fx.pkg))
+
+
+class TestVerifyOnly(BuildE2ECase):
+    def setUp(self):
+        BuildE2ECase.setUp(self)
+        rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+
+    def test_T50_clean_package_verifies_and_nothing_is_written(self):
+        before = snapshot(self.fx.usb)
+        rc, out, err = build_verify(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        nfiles = len([e for e in bp.read_entries(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl") if e["k"] == "f" and "p" in e])
+        self.assertEqual(out.splitlines()[-1], "build_pkg: VERIFY ok: %d files re-hashed" % nfiles)
+        self.assertEqual(snapshot(self.fx.usb), before)
+
+    def test_T50_each_corruption_fails(self):
+        repo, pin = PINS["H1"]
+
+        def flip(path):
+            with open(path, "r+b") as fh:
+                first = fh.read(1)
+                fh.seek(0)
+                fh.write(b"L" if first != b"L" else b"M")
+
+        def truncate(path):
+            os.truncate(path, 0)
+
+        def relink(path):
+            os.unlink(path)
+            os.symlink("../../blobs/other", path)
+
+        def append(path, data):
+            with open(path, "ab") as fh:
+                fh.write(data)
+
+        cases = [
+            ("flipped byte", lambda r: flip(r + "/payload/B1-ltx2mlx-repo/README.md"), "hash mismatch"),
+            ("truncated", lambda r: truncate(r + "/payload/B1-ltx2mlx-repo/README.md"), "size mismatch"),
+            ("missing", lambda r: os.unlink(r + "/payload/A2-hw-gate-seeds/square.png"), "missing"),
+            ("extra", lambda r: write_file(r + "/payload/B1-ltx2mlx-repo/extra.txt", b"extra"), "extra"),
+            ("entries edited", lambda r: append(r + "/MANIFEST-ENTRIES.jsonl", b"\n"), "entries sha256 mismatch"),
+            ("root file edited", lambda r: append(r + "/README.md", b"edited\n"), "root file hash mismatch"),
+            ("build failed marker", lambda r: write_file(r + "/BUILD-FAILED.json", b"{}"), "build failed marker present"),
+            ("symlink changed", lambda r: relink(r + "/payload/H1-hf-zimage/snapshots/" + pin + "/config.json"), "symlink mismatch"),
+            ("ds_store", lambda r: write_file(r + "/payload/.DS_Store", b"ds"), "credential scan"),
+            ("manifest missing", lambda r: os.unlink(r + "/MANIFEST.json"), "manifest missing or unreadable"),
+        ]
+        for index, (label, mutate, reason) in enumerate(cases):
+            package_id = "ltx-chain-deploy-202610%02d" % index
+            copy = self.fx.usb + "/" + package_id
+            shutil.copytree(self.fx.pkg, copy, symlinks=True)
+            mutate(copy)
+            before = snapshot(copy)
+            rc, out, err = build_verify(self.fx, package_id)
+            self.assertEqual(rc, 1, label + out + err)
+            self.assertTrue([line for line in out.splitlines() if line.startswith("FAIL VERIFY " + reason + ": ")], label + out)
+            self.assertEqual(snapshot(copy), before, label)
+
+
 if __name__ == "__main__":
     unittest.main()
