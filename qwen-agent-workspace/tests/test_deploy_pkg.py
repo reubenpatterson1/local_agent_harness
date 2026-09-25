@@ -42,7 +42,8 @@ def load_module(name, filename):
 
 
 bp = load_module("build_pkg", "build_pkg.py")
-HOOKED_MODULES = [bp]
+ip = load_module("install_pkg", "install_pkg.py")
+HOOKED_MODULES = [bp, ip, ip._bp]
 
 FIXED_NOW = time.gmtime(1790000000)
 SECRET_CANARY = "Lx3." + "k9Qm2vR7" + "Tz5.Wp8N"   # 20 bytes; the "." keeps every L2 pattern from matching
@@ -2164,6 +2165,461 @@ class TestVerifyOnly(BuildE2ECase):
         self.assertEqual(len(withheld), 2, out)
         self.assertNotIn(SECRET_CANARY, out + err)
         self.assertNotIn(GITHUB_CANARY, out + err)
+
+
+PW = collections.namedtuple("PW", "pw_dir")
+
+
+class FakeProc(object):
+    def __init__(self, pid, rc=0):
+        self.pid = pid
+        self.returncode = rc
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        return None
+
+
+class InstallFixture(Fixture):
+    """Build a package from the fake source host, then turn the fake host into a fresh target."""
+
+    def __init__(self, tc):
+        Fixture.__init__(self, tc)
+        self.euid = 501
+        self.spawned = []
+        self.killed = []
+        self.lsof = self.root + "/usr/sbin/lsof"
+        self.system_py = self.root + "/usr/bin/python3"
+
+    def build_and_become_target(self):
+        self.build_sources()
+        self.configure_build_hooks()
+        rc, out, err = run_main(bp.main, ["--apply", "--usb-root", self.usb, "--package-id", self.package_id])
+        self.tc.assertEqual(rc, 0, out + err)
+        os.rename(self.home, self.root + "/source-home")
+        os.makedirs(self.home)
+        os.rename(self.fw, self.root + "/source-framework")
+        os.rename(self.ulb, self.root + "/source-usr-local-bin")
+        self.configure_install()
+
+    def configure_install(self):
+        for path in (self.brew_bin, self.lsof, self.system_py):
+            write_file(path, b"#!fake\n", 0o755)
+        values = {"REQUIRED_HOME": self.home, "FRAMEWORK_ROOT": self.fw, "VOLUMES_ROOT": self.volumes,
+                  "BREW_BIN": self.brew_bin, "BREW_PY312": self.brew_py312, "LSOF_PATH": self.lsof,
+                  "SYSTEM_PY": self.system_py}
+        for name, value in sorted(values.items()):
+            patcher = mock.patch.object(ip, name, value)
+            patcher.start()
+            self.tc.addCleanup(patcher.stop)
+        os.environ["HF_HOME"] = self.home + "/hf_home"
+
+        def getpwnam(name):
+            if name == "reubenpatterson":
+                return PW(self.home)
+            raise KeyError(name)
+        ip.HOOKS.update({
+            "run": self.run,
+            "geteuid": lambda: self.euid,
+            "getpwnam": getpwnam,
+            "getuser": lambda: "reubenpatterson",
+            "statvfs_free": lambda path: 10 ** 15,
+            "port_free": lambda port: True,
+            "which": lambda name: {"ffmpeg": self.ffmpeg, "ffprobe": self.ffprobe}.get(name),
+            "now_utc": lambda: FIXED_NOW,
+            "after_chunk": lambda src, nbytes: None,
+            "http_ok": lambda url: True,
+            "sleep": lambda seconds: None,
+            "spawn": self.spawn,
+            "killpg": lambda pid, sig: self.killed.append((pid, sig)),
+        })
+
+    def spawn(self, argv, cwd=None, env=None, stdout_path=None, new_session=False):
+        self.spawned.append({"argv": list(argv), "cwd": cwd, "env": env, "stdout_path": stdout_path, "new_session": new_session})
+        self.events.append(("spawn", tuple(argv)))
+        if argv[1:2] == ["-c"]:
+            write_file(argv[3], json.dumps({"phase4_max_pressure": 1, "phase4_swap_delta_gib": 0.0,
+                                            "phase4_peak_used_gib": 30.0}).encode("utf-8"))
+            return FakeProc(4243)
+        story_dir = os.path.dirname(stdout_path)
+        write_file(stdout_path, b"(residual pad 7 px, 1.00x of the measured 704x448 area)\n")
+        write_file(story_dir + "/runs/r1/story_summary.json", json.dumps(
+            {"completed_units": 2, "requested_units": 2, "units": [{"seconds": 59.2}, {"seconds": 58.0}]}).encode("utf-8"))
+        for rel in ("movie.mp4", "images/panel_01.png", "clips/panel_01.mp4", "clips/panel_02.chainseed.png"):
+            write_file(story_dir + "/" + rel, b"media")
+        return FakeProc(4242)
+
+    def install(self, phase, *extra, **kw):
+        self.euid = kw.get("euid", 0 if phase == "system-python" else 501)
+        argv = ["--phase", phase, "--package-root", kw.get("root", self.pkg)] + list(extra)
+        return run_main(ip.main, argv)
+
+    def install_all(self):
+        rc, out, err = self.install("system-python", "--apply")
+        self.tc.assertEqual(rc, 0, out + err)
+        rc, out, err = self.install("user", "--apply")
+        self.tc.assertEqual(rc, 0, out + err)
+
+    def eject_hf_home(self):
+        shutil.rmtree(self.usb + "/hf_home")
+
+
+class InstallCase(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = InstallFixture(self)
+        self.fx.build_and_become_target()
+
+    def entries(self):
+        return bp.read_entries(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl")
+
+
+class TestInstallChecks(InstallCase):
+    def check(self, check_id, phase="preflight", root=None):
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", phase, "--package-root", root or self.fx.pkg]))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            if check_id in ("I09", "I10", "I11"):
+                ip.check_i06(ctx)
+            result = ip.CHECKS[check_id](ctx)
+        return result, out.getvalue(), ctx
+
+    def test_T60_I01_python_version(self):
+        self.assertTrue(self.check("I01")[0].ok)
+        with mock.patch.object(ip, "MIN_PYTHON", (99, 0)):
+            self.assertFalse(self.check("I01")[0].ok)
+
+    def test_T61_I02_platform(self):
+        self.assertTrue(self.check("I02")[0].ok)
+        with mock.patch.object(ip.platform, "machine", return_value="x86_64"):
+            self.assertFalse(self.check("I02")[0].ok)
+        with mock.patch.object(ip.platform, "system", return_value="Linux"):
+            self.assertFalse(self.check("I02")[0].ok)
+
+    def test_T62_I03_memsize(self):
+        result, out, ctx = self.check("I03")
+        self.assertTrue(result.ok)
+        self.assertEqual(ctx.memsize, 68719476736)
+        self.fx.run.memsize = str(48 * 1024 ** 3)
+        self.assertTrue(self.check("I03")[0].ok)
+        self.fx.run.memsize = str(16 * 1024 ** 3)
+        result = self.check("I03")[0]
+        self.assertFalse(result.ok)
+        self.assertTrue(result.fatal)
+        self.assertIn("36.61 GiB", result.message)
+        self.fx.run.memsize = "garbage"
+        self.assertFalse(self.check("I03")[0].ok)
+
+    def test_T63_I04_macos_major(self):
+        self.assertTrue(self.check("I04")[0].ok)
+        self.fx.run.overrides[("/usr/bin/sw_vers", "-productVersion")] = (0, "15.6.1\n")
+        self.assertFalse(self.check("I04")[0].ok)
+
+    def test_T64_I05_account(self):
+        self.assertTrue(self.check("I05")[0].ok)
+        ip.HOOKS["getuser"] = lambda: "someone"
+        self.assertFalse(self.check("I05")[0].ok)
+        self.assertTrue(self.check("I05", phase="system-python")[0].ok)
+        ip.HOOKS["getuser"] = lambda: "reubenpatterson"
+        os.environ["HOME"] = self.fx.home + "-other"
+        self.assertFalse(self.check("I05")[0].ok)
+        os.environ["HOME"] = self.fx.home
+
+        def no_user(name):
+            raise KeyError(name)
+        ip.HOOKS["getpwnam"] = no_user
+        self.assertFalse(self.check("I05")[0].ok)
+
+    def test_T65_I06_package_integrity(self):
+        result, out, ctx = self.check("I06")
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(len(ctx.entries), len(self.entries()))
+        write_file(self.fx.pkg + "/BUILD-FAILED.json", b"{}")
+        self.assertFalse(self.check("I06")[0].ok)
+        os.unlink(self.fx.pkg + "/BUILD-FAILED.json")
+        with open(self.fx.pkg + "/README.md", "ab") as fh:
+            fh.write(b"x")
+        self.assertFalse(self.check("I06")[0].ok)
+        os.rename(self.fx.pkg + "/payload", self.fx.pkg + "/payload-away")
+        result = self.check("I06")[0]
+        self.assertFalse(result.ok)
+        self.assertIn("receipts root", result.message)
+
+    def test_T65b_I06_verify_phase_accepts_a_receipts_root(self):
+        os.rename(self.fx.pkg + "/payload", self.fx.pkg + "/payload-away")
+        self.assertTrue(self.check("I06", phase="verify")[0].ok)
+        with open(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl", "ab") as fh:
+            fh.write(b"\n")
+        self.assertFalse(self.check("I06", phase="verify")[0].ok)
+
+    def test_T66_I07_ds_store(self):
+        self.assertTrue(self.check("I07")[0].ok)
+        write_file(self.fx.pkg + "/payload/.DS_Store", b"ds")
+        result = self.check("I07")[0]
+        self.assertFalse(result.ok)
+        self.assertIn('find "%s" -name .DS_Store -delete' % self.fx.pkg, result.message)
+
+    def test_T67_I08_rescan(self):
+        self.assertTrue(self.check("I08")[0].ok)
+        write_file(self.fx.pkg + "/payload/F3-user-site/leak.txt", ("x " + GITHUB_CANARY).encode("ascii"))
+        result = self.check("I08")[0]
+        self.assertFalse(result.ok)
+        self.assertNotIn(GITHUB_CANARY, result.message)
+
+    def test_T68_I09_free_space(self):
+        self.assertTrue(self.check("I09")[0].ok)
+        ip.HOOKS["statvfs_free"] = lambda path: 1000
+        self.assertFalse(self.check("I09")[0].ok)
+
+    def test_T69_I10_collisions(self):
+        self.assertTrue(self.check("I10")[0].ok)
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+        write_file(target, b"something else\n")
+        result, out, ctx = self.check("I10")
+        self.assertFalse(result.ok)
+        self.assertIn("COLLISION size differs: " + target, out)
+        self.assertIn("COLLISIONS 1", out)
+
+    def test_T70_I11_case_duplicates(self):
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "preflight", "--package-root", self.fx.pkg]))
+        ip.check_i06(ctx)
+        self.assertTrue(ip.check_i11(ctx).ok)
+        ctx.entries.append(dict(ctx.entries[-1], t=ctx.entries[-1]["t"].upper()))
+        self.assertFalse(ip.check_i11(ctx).ok)
+
+    def test_T71_I12_ffmpeg(self):
+        self.assertTrue(self.check("I12")[0].ok)
+        self.fx.run.overrides[(self.fx.ffmpeg, "-version")] = (0, "ffmpeg version n9.0 Copyright\n")
+        self.assertTrue(self.check("I12")[0].ok)
+        self.fx.run.overrides[(self.fx.ffmpeg, "-version")] = (0, "ffmpeg version 8.1 Copyright\n")
+        self.assertFalse(self.check("I12")[0].ok)
+        self.fx.run.overrides = {}
+        ip.HOOKS["which"] = lambda name: None
+        self.assertFalse(self.check("I12")[0].ok)
+
+    def test_T72_I13_brew(self):
+        self.assertTrue(self.check("I13")[0].ok)
+        os.unlink(self.fx.brew_bin)
+        self.assertFalse(self.check("I13")[0].ok)
+
+    def test_T73_I14_brew_python312(self):
+        self.assertTrue(self.check("I14")[0].ok)
+        for text in ("Python 3.11.9\n", "Python 3.12.9\nextra line\n"):
+            self.fx.run.overrides[(self.fx.brew_py312, "--version")] = (0, text)
+            self.assertFalse(self.check("I14")[0].ok, text)
+
+    def test_T74_I15_lsof_and_system_python(self):
+        self.assertTrue(self.check("I15")[0].ok)
+        os.unlink(self.fx.lsof)
+        self.assertFalse(self.check("I15")[0].ok)
+
+    def test_T75_I16_port(self):
+        self.assertTrue(self.check("I16")[0].ok)
+        ip.HOOKS["port_free"] = lambda port: False
+        self.assertFalse(self.check("I16")[0].ok)
+
+    def test_T76_I17_hf_home(self):
+        self.assertTrue(self.check("I17")[0].ok)
+        os.environ["HF_HOME"] = "/Volumes/Ollama/hf_home"
+        self.assertFalse(self.check("I17")[0].ok)
+        os.environ["HF_HOME"] = self.fx.home + "/hf_home"
+        self.fx.run.zsh_hf_home = "/Volumes/Ollama/hf_home"
+        self.assertFalse(self.check("I17")[0].ok)
+        self.fx.run.zsh_hf_home = None
+        write_file(self.fx.home + "/.zshenv", b"# HF cache used to be on /Volumes/Ollama\nexport PATH=/x\nexport HF_HOME=/Volumes/Ollama/hf_home\n")
+        result = self.check("I17")[0]
+        self.assertFalse(result.ok)
+        self.assertIn("3", result.message)
+        self.assertIn('export HF_HOME="/Users/reubenpatterson/hf_home"', result.message)
+        write_file(self.fx.home + "/.zshenv", b"# HF cache used to be on /Volumes/Ollama\n")
+        self.assertTrue(self.check("I17")[0].ok)
+
+    def test_T77_I18_workspace_writable(self):
+        self.assertTrue(self.check("I18")[0].ok)
+        os.makedirs(self.fx.ws)
+        os.chmod(self.fx.ws, 0o555)
+        self.assertFalse(self.check("I18")[0].ok)
+
+    def test_T78_I19_euid(self):
+        self.fx.euid = 0
+        self.assertTrue(self.check("I19", phase="system-python")[0].ok)
+        self.assertFalse(self.check("I19", phase="user")[0].ok)
+        self.fx.euid = 501
+        result = self.check("I19", phase="system-python")[0]
+        self.assertFalse(result.ok)
+        self.assertIn("sudo", result.message)
+        self.assertTrue(self.check("I19", phase="user")[0].ok)
+
+    def test_T79_I20_framework_python(self):
+        result = self.check("I20")[0]
+        self.assertTrue(result.ok)
+        self.assertTrue(bp.format_result(result).startswith("PENDING I20 "))
+        self.assertIn("run --phase system-python next", result.message)
+        self.fx.run.overrides[(self.fx.fw_py, "-c", "import sys;print(sys.version.split()[0])")] = (127, "no such file\n")
+        self.assertFalse(self.check("I20", phase="user")[0].ok)
+        os.makedirs(self.fx.fw + "/Versions/3.13")
+        self.fx.run.overrides[(self.fx.fw_py, "-c", "import sys;print(sys.version.split()[0])")] = (0, "3.12.0\n")
+        self.assertFalse(self.check("I20")[0].ok)
+
+    def test_phase_check_lists_match_the_spec_table(self):
+        self.assertEqual(ip.PHASE_CHECKS["system-python"], ("I01", "I02", "I03", "I04", "I05", "I06", "I07", "I08", "I09", "I10", "I11", "I19"))
+        self.assertEqual(ip.PHASE_CHECKS["verify"], ("I01", "I05", "I06", "I19", "I20"))
+        self.assertEqual(ip.PHASE_CHECKS["accept"], ("I01", "I03", "I05", "I06", "I12", "I14", "I17", "I19", "I20"))
+        self.assertEqual(ip.PHASE_CHECKS["preflight"], tuple("I%02d" % i for i in range(1, 21)))
+        self.assertEqual(ip.PHASE_CHECKS["user"], tuple("I%02d" % i for i in range(1, 21)))
+
+    def test_usage_errors(self):
+        for argv in (["--phase", "verify", "--apply"], ["--phase", "user", "--gpu"],
+                     ["--phase", "accept", "--gpu", "--gpu-all"], ["--phase", "all"], []):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    ip.parse_args(argv)
+            self.assertEqual(cm.exception.code, 2, argv)
+
+
+class TestInstallApply(InstallCase):
+    def test_T70_S_and_U_without_apply_change_nothing(self):
+        before = snapshot(self.fx.root)
+        rc, out, err = self.fx.install("system-python")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PLAN F1 copy=", out)
+        rc, out, err = self.fx.install("user")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PLAN B4 copy=", out)
+        rc, out, err = self.fx.install("preflight")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("PENDING I20 ", out)
+        self.assertEqual(snapshot(self.fx.root), before)
+
+    def test_T71_low_memory_refuses_apply_and_writes_nothing(self):
+        self.fx.run.memsize = str(16 * 1024 ** 3)
+        before = snapshot(self.fx.root)
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("FAIL I03 ", out)
+        rc, out, err = self.fx.install("system-python", "--apply")
+        self.assertEqual(rc, 4, out + err)
+        self.assertEqual(snapshot(self.fx.root), before)
+
+    def test_T72_identical_targets_skipped_and_every_collision_listed(self):
+        self.fx.install_all()
+        t_file = self.fx.home + "/ltx-2-mlx/README.md"
+        t_link = self.fx.home + "/ltx-2-mlx/.venv/bin/python"
+        st1 = os.lstat(t_file)
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        st2 = os.lstat(t_file)
+        self.assertEqual((st1.st_ino, st1.st_mtime_ns), (st2.st_ino, st2.st_mtime_ns))
+        with open(t_file, "r+b") as fh:
+            fh.write(b"L")
+        os.unlink(t_link)
+        os.symlink("/somewhere/else", t_link)
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 4, out + err)
+        self.assertIn("COLLISION content differs: " + t_file, out)
+        self.assertIn("COLLISION symlink target differs: " + t_link, out)
+        self.assertIn("COLLISIONS 2", out)
+
+    def test_T73_interrupted_file_never_appears_under_its_final_name(self):
+        rc, out, err = self.fx.install("system-python", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        calls = {"n": 0}
+
+        def after_chunk(src, nbytes):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("injected failure mid-file")
+        ip.HOOKS["after_chunk"] = after_chunk
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 1, out + err)
+        first = [e for e in self.entries() if e["c"] == "A1" and e["k"] == "f"][0]
+        self.assertFalse(os.path.lexists(first["t"]))
+        tmp = os.path.dirname(first["t"]) + "/." + os.path.basename(first["t"]) + ".ltxdeploy.tmp"
+        self.assertTrue(os.path.lexists(tmp))
+        ip.HOOKS["after_chunk"] = lambda src, nbytes: None
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(file_sha256(first["t"]), first["h"])
+        self.assertFalse(os.path.lexists(tmp))
+
+    def test_T74_installed_bytes_modes_mtimes_links_and_dirs(self):
+        os.makedirs(self.fx.ws)
+        os.chmod(self.fx.ws, 0o700)
+        self.fx.install_all()
+        for entry in self.entries():
+            t = entry["t"]
+            if entry["k"] == "f":
+                st = os.lstat(t)
+                self.assertEqual(file_sha256(t), entry["h"], t)
+                self.assertEqual(stat.S_IMODE(st.st_mode), int(entry["m"], 8), t)
+                self.assertEqual(st.st_mtime_ns, entry["mt"], t)
+            elif entry["k"] == "l":
+                self.assertEqual(os.readlink(t), entry["l"], t)
+            else:
+                self.assertTrue(os.path.isdir(t) and not os.path.islink(t), t)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8").st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.fx.fw + "/Versions").st_mode), 0o775)
+        self.assertEqual(stat.S_IMODE(os.lstat(self.fx.ws).st_mode), 0o700)
+
+    def test_T75_corrupted_payload_byte_fails_the_file(self):
+        first = [e for e in self.entries() if e["c"] == "A1" and e["k"] == "f"][0]
+        with open(self.fx.pkg + "/" + first["p"], "r+b") as fh:
+            fh.write(b"X")
+        rc, out, err = self.fx.install("system-python", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("sha256 mismatch for " + first["t"], err)
+        self.assertFalse(os.path.lexists(first["t"]))
+        self.assertFalse(os.path.lexists(os.path.dirname(first["t"]) + "/." + os.path.basename(first["t"]) + ".ltxdeploy.tmp"))
+
+    def test_T76_receipts_and_running_from_them(self):
+        self.fx.install_all()
+        receipts = self.fx.ws + "/generated/deploy-receipts/" + self.fx.package_id
+        with open(self.fx.pkg + "/MANIFEST.json") as fh:
+            manifest = json.load(fh)
+        for rel in ["MANIFEST.json", "MANIFEST-ENTRIES.jsonl"] + list(manifest["root_files"]):
+            self.assertEqual(file_sha256(receipts + "/" + rel), file_sha256(self.fx.pkg + "/" + rel), rel)
+        shutil.rmtree(self.fx.usb)
+        rc, out, err = self.fx.install("verify", root=receipts)
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(out.splitlines()[-1].startswith("VERIFY OK "))
+        for phase in ("preflight", "system-python", "user"):
+            rc, out, err = self.fx.install(phase, root=receipts)
+            self.assertEqual(rc, 4, phase + out + err)
+            self.assertIn("FAIL I06 ", out)
+
+    def test_T77_euid_rules(self):
+        rc, out, err = self.fx.install("system-python", euid=501)
+        self.assertEqual(rc, 4)
+        self.assertIn("FAIL I19 ", out)
+        rc, out, err = self.fx.install("system-python", euid=0)
+        self.assertEqual(rc, 0, out + err)
+        rc, out, err = self.fx.install("user", euid=0)
+        self.assertEqual(rc, 4)
+        self.assertIn("FAIL I19 ", out)
+
+    def test_system_python_post_check(self):
+        key = (self.fx.fw_py, "-s", "-c", "import sys, psutil, pytest, pexpect; print(sys.version.split()[0])")
+        self.fx.run.overrides[key] = (1, "ModuleNotFoundError: No module named 'psutil'\n")
+        rc, out, err = self.fx.install("system-python", "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("No module named 'psutil'", err)
+
+    def test_verify_phase_reports_mismatches(self):
+        self.fx.install_all()
+        rc, out, err = self.fx.install("verify")
+        self.assertEqual(rc, 0, out + err)
+        target = self.fx.home + "/ltx-2-mlx/README.md"
+        with open(target, "r+b") as fh:
+            fh.write(b"L")
+        os.chmod(self.fx.home + "/ltx-2-mlx/.venv/pyvenv.cfg", 0o600)
+        rc, out, err = self.fx.install("verify")
+        self.assertEqual(rc, 1)
+        self.assertIn("MISMATCH content differs: " + target, out)
+        self.assertIn("MISMATCH mode differs: " + self.fx.home + "/ltx-2-mlx/.venv/pyvenv.cfg", out)
 
 
 if __name__ == "__main__":
