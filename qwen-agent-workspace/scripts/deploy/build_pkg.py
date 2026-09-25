@@ -15,6 +15,7 @@ import collections
 import configparser
 import fcntl
 import getpass
+import glob
 import hashlib
 import json
 import os
@@ -860,12 +861,37 @@ def _read_token_file(path, label, add, sources, errors):
     sources.append({"source": label, "present": True, "values": add(label, [value])})
 
 
+def _read_stored_tokens_file(path, label, add, sources, errors):
+    if not os.path.lexists(path):
+        sources.append({"source": label, "present": False, "values": 0})
+        return
+    found = []
+    try:
+        with open(path, "rb") as fh:
+            text = fh.read().decode("utf-8")
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(text)
+        for section in parser.sections():
+            if parser.has_option(section, "hf_token"):
+                found.append(parser.get(section, "hf_token").strip().encode("utf-8"))
+            if parser.has_option(section, "refresh_token"):
+                found.append(parser.get(section, "refresh_token").strip().encode("utf-8"))
+    except (OSError, UnicodeDecodeError, configparser.Error):
+        errors.append("B14: %s exists but cannot be parsed" % label)
+        sources.append({"source": label, "present": True, "values": 0})
+        return
+    if not [v for v in found if v]:
+        errors.append("B14: %s yields no hf_token or refresh_token values" % label)
+    sources.append({"source": label, "present": True, "values": add(label, found)})
+
+
 def load_known_secrets():
     """L3 secret values (spec 8.3). Values are never written, logged, hashed into output or measured."""
     H = home()
     values = []
     sources = []
     errors = []
+    seen_paths = set()
 
     def add(label, candidates):
         count = 0
@@ -879,36 +905,43 @@ def load_known_secrets():
                 values.append(value)
         return count
 
-    _read_token_file(H + "/.cache/huggingface/token", H + "/.cache/huggingface/token", add, sources, errors)
-    stored = H + "/.cache/huggingface/stored_tokens"
-    if not os.path.lexists(stored):
-        sources.append({"source": stored, "present": False, "values": 0})
-    else:
-        found = []
-        try:
-            with open(stored, "rb") as fh:
-                text = fh.read().decode("utf-8")
-            parser = configparser.ConfigParser(interpolation=None)
-            parser.read_string(text)
-            for section in parser.sections():
-                if parser.has_option(section, "hf_token"):
-                    found.append(parser.get(section, "hf_token").strip().encode("utf-8"))
-                if parser.has_option(section, "refresh_token"):
-                    found.append(parser.get(section, "refresh_token").strip().encode("utf-8"))
-        except (OSError, UnicodeDecodeError, configparser.Error):
-            errors.append("B14: %s exists but cannot be parsed" % stored)
-            sources.append({"source": stored, "present": True, "values": 0})
+    def read_file(path, reader):
+        path = os.path.normpath(path)
+        if path in seen_paths:
+            return
+        seen_paths.add(path)
+        reader(path, path, add, sources, errors)
+
+    def read_env_value(name):
+        label = "$" + name
+        env_value = os.environ.get(name)
+        if env_value is None:
+            sources.append({"source": label, "present": False, "values": 0})
         else:
-            if not [v for v in found if v]:
-                errors.append("B14: %s yields no hf_token or refresh_token values" % stored)
-            sources.append({"source": stored, "present": True, "values": add(stored, found)})
-    ltx_token = H + "/ltx-2-mlx/hf_cache/token"
-    _read_token_file(ltx_token, ltx_token, add, sources, errors)
-    env_value = os.environ.get("HF_TOKEN")
-    if env_value is None:
-        sources.append({"source": "$HF_TOKEN", "present": False, "values": 0})
-    else:
-        sources.append({"source": "$HF_TOKEN", "present": True, "values": add("$HF_TOKEN", [env_value.strip().encode("utf-8")])})
+            sources.append({"source": label, "present": True, "values": add(label, [env_value.strip().encode("utf-8")])})
+
+    def env_path(name):
+        raw = os.environ.get(name)
+        if not raw:
+            return None
+        return os.path.expandvars(os.path.expanduser(raw))
+
+    read_file(H + "/.cache/huggingface/token", _read_token_file)
+    read_file(H + "/.cache/huggingface/stored_tokens", _read_stored_tokens_file)
+    read_file(H + "/ltx-2-mlx/hf_cache/token", _read_token_file)
+    read_env_value("HF_TOKEN")
+    hf_home_env = env_path("HF_HOME")
+    if hf_home_env is not None:
+        read_file(hf_home_env + "/token", _read_token_file)
+        read_file(hf_home_env + "/stored_tokens", _read_stored_tokens_file)
+    hf_home_dirs = [H + "/hf_home"] + sorted(glob.glob(os.path.join(VOLUMES_ROOT, "*", "hf_home")))
+    for hf_dir in hf_home_dirs:
+        read_file(hf_dir + "/token", _read_token_file)
+        read_file(hf_dir + "/stored_tokens", _read_stored_tokens_file)
+    token_path = env_path("HF_TOKEN_PATH")
+    if token_path is not None:
+        read_file(token_path, _read_token_file)
+    read_env_value("HUGGING_FACE_HUB_TOKEN")
     return values, sources, errors
 
 

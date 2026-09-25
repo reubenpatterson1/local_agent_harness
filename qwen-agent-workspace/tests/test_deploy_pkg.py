@@ -503,7 +503,7 @@ class Fixture(object):
             patcher.start()
             self.tc.addCleanup(patcher.stop)
         for name in ("HF_TOKEN", "HF_HOME", "Z_IMAGE_HF_HOME", "LTX2_MLX_HF_HOME", "HF_HUB_CACHE",
-                     "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+                     "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_TOKEN_PATH", "HUGGING_FACE_HUB_TOKEN"):
             os.environ.pop(name, None)
 
     def write_deploy_dir(self):
@@ -940,10 +940,14 @@ class TestCredentialGates(DeployTestCase):
 
     def test_T14_known_secret_sources(self):
         H = self.fx.home
+        V = self.fx.volumes
         values, sources, errors = bp.load_known_secrets()
         self.assertEqual((values, errors), ([], []))
-        self.assertEqual([s["source"] for s in sources], [H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token", "$HF_TOKEN"])
-        self.assertEqual([s["present"] for s in sources], [False, False, False, False])
+        self.assertEqual([s["source"] for s in sources], [
+            H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token",
+            "$HF_TOKEN", H + "/hf_home/token", H + "/hf_home/stored_tokens",
+            V + "/USB/hf_home/token", V + "/USB/hf_home/stored_tokens", "$HUGGING_FACE_HUB_TOKEN"])
+        self.assertEqual([s["present"] for s in sources], [False, False, False, False, False, False, False, False, False])
         tok_a = "tokA." + "x" * 20
         tok_b = "tokB." + "y" * 20
         tok_r = "reft." + "z" * 20
@@ -954,8 +958,8 @@ class TestCredentialGates(DeployTestCase):
         values, sources, errors = bp.load_known_secrets()
         self.assertEqual(errors, [])
         self.assertEqual(values, [tok_a.encode("ascii"), tok_b.encode("ascii"), tok_r.encode("ascii")])
-        self.assertEqual([s["values"] for s in sources], [1, 3, 1, 1])
-        self.assertEqual([s["present"] for s in sources], [True, True, True, True])
+        self.assertEqual([s["values"] for s in sources], [1, 3, 1, 1, 0, 0, 0, 0, 0])
+        self.assertEqual([s["present"] for s in sources], [True, True, True, True, False, False, False, False, False])
         write_file(H + "/.cache/huggingface/token", b"fifteen.bytes15\n")
         values, sources, errors = bp.load_known_secrets()
         self.assertTrue([e for e in errors if "too short" in e], errors)
@@ -976,6 +980,79 @@ class TestCredentialGates(DeployTestCase):
         self.assertIn(tok_r.encode("ascii"), values)
         stored_source = [s for s in sources if s["source"] == H + "/.cache/huggingface/stored_tokens"][0]
         self.assertEqual(stored_source["values"], 1)
+
+    def test_T14b_hf_home_volume_and_env_token_sources(self):
+        H = self.fx.home
+        V = self.fx.volumes
+        HF = self.fx.root + "/custom_hf_home"
+        base = [H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token",
+                "$HF_TOKEN", H + "/hf_home/token", H + "/hf_home/stored_tokens",
+                V + "/USB/hf_home/token", V + "/USB/hf_home/stored_tokens", "$HUGGING_FACE_HUB_TOKEN"]
+        os.environ["HF_HOME"] = ""
+        os.environ["HF_TOKEN_PATH"] = ""
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual((values, errors), ([], []))
+        self.assertEqual([s["source"] for s in sources], base)
+        tok_a = "tokA." + "x" * 20
+        tok_h = "tokH." + "h" * 20
+        tok_s = "tokS." + "s" * 20
+        tok_f = "refF." + "f" * 20
+        tok_v = "tokV." + "v" * 20
+        tok_u = "tokU." + "u" * 20
+        tok_p = "tokP." + "p" * 20
+        tok_e = "tokE." + "e" * 20
+        write_file(H + "/.cache/huggingface/token", (tok_a + "\n").encode("ascii"))
+        write_file(H + "/.cache/huggingface/stored_tokens", ("[default]\nhf_token = %s\n" % tok_a).encode("ascii"))
+        write_file(H + "/ltx-2-mlx/hf_cache/token", (tok_a + "\n").encode("ascii"))
+        os.environ["HF_TOKEN"] = tok_a
+        write_file(HF + "/token", (tok_h + "\n").encode("ascii"))
+        write_file(HF + "/stored_tokens", ("[default]\nhf_token = %s\n" % tok_h).encode("ascii"))
+        os.environ["HF_HOME"] = HF + "/"
+        write_file(H + "/hf_home/token", (tok_s + "\n").encode("ascii"))
+        write_file(H + "/hf_home/stored_tokens", ("[default]\nhf_token = %s\nrefresh_token = %s\n" % (tok_s, tok_f)).encode("ascii"))
+        write_file(V + "/SomeVol/hf_home/token", (tok_v + "\n").encode("ascii"))
+        write_file(V + "/SomeVol/hf_home/stored_tokens", ("[default]\nhf_token = %s\n" % tok_v).encode("ascii"))
+        write_file(V + "/USB/hf_home/token", (tok_u + "\n").encode("ascii"))
+        write_file(V + "/USB/hf_home/stored_tokens", ("[default]\nhf_token = %s\n" % tok_u).encode("ascii"))
+        write_file(V + "/Decoy/not_hf_home/token", ("tokD." + "d" * 20 + "\n").encode("ascii"))
+        write_file(H + "/alt/hf_token_file", (tok_p + "\n").encode("ascii"))
+        os.environ["HF_TOKEN_PATH"] = "~/alt/hf_token_file"
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = "  " + tok_e + "\n"
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual(errors, [])
+        self.assertEqual([s["source"] for s in sources], [
+            H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token",
+            "$HF_TOKEN", HF + "/token", HF + "/stored_tokens", H + "/hf_home/token", H + "/hf_home/stored_tokens",
+            V + "/SomeVol/hf_home/token", V + "/SomeVol/hf_home/stored_tokens",
+            V + "/USB/hf_home/token", V + "/USB/hf_home/stored_tokens",
+            H + "/alt/hf_token_file", "$HUGGING_FACE_HUB_TOKEN"])
+        self.assertEqual([s["present"] for s in sources], [True] * 14)
+        self.assertEqual([s["values"] for s in sources], [1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1])
+        self.assertEqual(values, [t.encode("ascii") for t in (tok_a, tok_h, tok_s, tok_f, tok_v, tok_u, tok_p, tok_e)])
+        self.assertEqual([s["source"] for s in sources if "USB2" in s["source"] or "Decoy" in s["source"]], [])
+        os.environ["HF_HOME"] = self.fx.usb + "/hf_home"
+        os.environ["HF_TOKEN_PATH"] = H + "/hf_home/token"
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual(errors, [])
+        self.assertEqual([s["source"] for s in sources], [
+            H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token",
+            "$HF_TOKEN", V + "/USB/hf_home/token", V + "/USB/hf_home/stored_tokens",
+            H + "/hf_home/token", H + "/hf_home/stored_tokens",
+            V + "/SomeVol/hf_home/token", V + "/SomeVol/hf_home/stored_tokens", "$HUGGING_FACE_HUB_TOKEN"])
+        self.assertEqual(values, [t.encode("ascii") for t in (tok_a, tok_u, tok_s, tok_f, tok_v, tok_e)])
+        write_file(V + "/SomeVol/hf_home/stored_tokens", b"no section header here\n")
+        write_file(H + "/alt/hf_token_file", b"fifteen.bytes15\n")
+        os.environ["HF_TOKEN_PATH"] = H + "/alt/hf_token_file"
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual(errors, [
+            "B14: " + V + "/SomeVol/hf_home/stored_tokens exists but cannot be parsed",
+            "B14: a known-secret value from " + H + "/alt/hf_token_file is too short to scan safely (< 16 bytes)"])
+        ctx = self.fx.ctx()
+        ctx.secrets, ctx.l3_sources, ctx.l3_errors = values, sources, errors
+        self.assertFalse(bp.check_b14(ctx).ok)
+        text = "\n".join(errors) + json.dumps(sources) + bp.check_b14(ctx).message
+        for tok in (tok_a, tok_h, tok_s, tok_f, tok_v, tok_u, tok_p, tok_e, "fifteen.bytes15"):
+            self.assertNotIn(tok, text)
 
     def test_T16_scripts_are_l2_clean(self):
         names = sorted(n for n in os.listdir(DEPLOY_DIR) if n.endswith(".py"))

@@ -464,17 +464,29 @@ The scripts' own source must not match any L2 pattern with an empty allowlist (T
 | Source | Values extracted |
 |---|---|
 | `home()/.cache/huggingface/token` | whole content, `.strip()` |
-| `home()/.cache/huggingface/stored_tokens` | parsed with `configparser`: the `.strip()`ed value of every key named `hf_token` in every section |
+| `home()/.cache/huggingface/stored_tokens` | parsed with `configparser`: the `.strip()`ed value of every key named `hf_token` or `refresh_token` in every section |
 | `home()/ltx-2-mlx/hf_cache/token` | whole content, `.strip()` |
 | `$HF_TOKEN` | `.strip()` |
+| `$HF_HOME/token` (only when `$HF_HOME` is set and non-empty) | as `home()/.cache/huggingface/token` |
+| `$HF_HOME/stored_tokens` (only when `$HF_HOME` is set and non-empty) | as `home()/.cache/huggingface/stored_tokens` |
+| `home()/hf_home/token` | as `home()/.cache/huggingface/token` |
+| `home()/hf_home/stored_tokens` | as `home()/.cache/huggingface/stored_tokens` |
+| `<d>/token`, then `<d>/stored_tokens`, for each `<d>` in `sorted(glob.glob(os.path.join(VOLUMES_ROOT, "*", "hf_home")))` | `token`: as `home()/.cache/huggingface/token`; `stored_tokens`: as `home()/.cache/huggingface/stored_tokens` |
+| the file named by `$HF_TOKEN_PATH` (only when `$HF_TOKEN_PATH` is set and non-empty) | as `home()/.cache/huggingface/token` |
+| `$HUGGING_FACE_HUB_TOKEN` | `.strip()` |
 
 **Loading rules.**
 - Values are UTF-8 encoded to bytes and de-duplicated. Empty values are ignored.
 - Absent sources are allowed and recorded as `present: false`.
 - B14 fails if any value is non-empty but shorter than 16 bytes ("too short to scan safely").
-- B14 also fails if `stored_tokens` exists but cannot be parsed, or yields no `hf_token` values.
+- B14 also fails if any `stored_tokens` source exists but cannot be parsed, or yields no `hf_token` or `refresh_token` values.
+- Sources are loaded, and recorded in `sources`, in the table's order. `$HF_HOME` and `$HF_TOKEN_PATH` are expanded the way `huggingface_hub` expands them: `os.path.expandvars(os.path.expanduser(value))`. Every file path goes through `os.path.normpath`, and the normalized path is that source's label.
+- A file path already loaded earlier in the order is skipped and gets no second `sources` entry. On this host `$HF_HOME` is `/Volumes/Ollama/hf_home`, which the `VOLUMES_ROOT/*/hf_home` glob also matches, so that directory is listed once, at the `$HF_HOME` rows.
+- Exception to the `present: false` rule: when `$HF_HOME` or `$HF_TOKEN_PATH` is unset or empty, its rows produce no `sources` entry at all.
 
 On this host both `token` files are 825-byte single-line values that begin with `hf_` but do **not** match the L2 `hf_token` pattern. That is exactly the leak class L3 exists for.
+
+`~/.zshenv` sets `HF_HOME=/Volumes/Ollama/hf_home` on this host, and a `token` and a `stored_tokens` live there too. At the design review of commit `3bc3af5` they were byte-identical to the `~/.cache/huggingface` copies (compared with `cmp -s`, contents never read). That was the only reason the first four sources were enough. The copies diverge on the next `hf auth login`, so L3 also reads `$HF_HOME`, the fixed `~/hf_home`, every mounted volume's `hf_home`, `$HF_TOKEN_PATH` and `$HUGGING_FACE_HUB_TOKEN`.
 
 **Scanner (exact):**
 ```python
@@ -877,7 +889,7 @@ Rules:
 | Class | Cases |
 |---|---|
 | `TestComponentCollection` | **T01** golden `(k, c, p, t)` list for a fixture of every component. **T02** exclusions: B1 top-level names; R4 pruned dirs in every tree; `.DS_Store`; B4 `.cache`; the exact F1/F3 editable-ref names; A1 is exactly the 17 files while every legacy name in §7 exists in the fixture workspace yet is absent. **T03** HF snapshot symlinks become `l` entries with relative `l`, and after apply they are symlinks in the payload. **T04** B5/H0/H5 entries have `s: true` and no `p`. **T05** F2 has exactly 17 `l` + 3 `d`. **T06** JSONL key order and schema. **T07** a fifo in a tree fails B03. |
-| `TestCredentialGates` | **T10** a nested `token` file fails B12 (exit 4, no package root); `tokenizer.json` passes. **T11** each of the 11 L1 names fails. **T12** for each L2 pattern id, a canary fails B13; hash-pinned allowlisting silences it; changing one byte fails it again; a > 4 MiB file with a canary is not flagged by L2 (documented limit). **T13** L3: a ≥ 16-byte canary in fake `~/.cache/huggingface/token`, containing a `.` so L2 cannot match it, is placed across a 64-byte chunk boundary in a payload source: exit 5; the partial dst is gone; the message contains the source path and not the canary; no `MANIFEST.json`. The same holds for a canary inside one chunk. **T14** `stored_tokens` parsing; a 15-byte value fails B14; an unparsable `stored_tokens` fails B14. **T15** L4: a pattern canary in the fake pip-freeze output gives exit 3, `BUILD-FAILED.json` with `failed_step == "PC4"`, and no `MANIFEST.json`. **T16** L2 over `scripts/deploy/*.py` with an empty allowlist finds 0 hits. **T17** `--credential-report` prints NEW lines, the canary's matched bytes are absent from the output, exit 1, nothing written. |
+| `TestCredentialGates` | **T10** a nested `token` file fails B12 (exit 4, no package root); `tokenizer.json` passes. **T11** each of the 11 L1 names fails. **T12** for each L2 pattern id, a canary fails B13; hash-pinned allowlisting silences it; changing one byte fails it again; a > 4 MiB file with a canary is not flagged by L2 (documented limit). **T13** L3: a ≥ 16-byte canary in fake `~/.cache/huggingface/token`, containing a `.` so L2 cannot match it, is placed across a 64-byte chunk boundary in a payload source: exit 5; the partial dst is gone; the message contains the source path and not the canary; no `MANIFEST.json`. The same holds for a canary inside one chunk. **T14** `stored_tokens` parsing; a 15-byte value fails B14; an unparsable `stored_tokens` fails B14; the no-files baseline order includes `~/hf_home` and the fixture's `VOLUMES_ROOT/USB/hf_home`. **T14b** the `$HF_HOME`, `~/hf_home`, `VOLUMES_ROOT/*/hf_home`, `$HF_TOKEN_PATH` and `$HUGGING_FACE_HUB_TOKEN` sources: the exact 14-entry order with every source present; a volume without `hf_home` and a non-`hf_home` directory are not matched; an empty `$HF_HOME` or `$HF_TOKEN_PATH` adds no entry; a duplicate path is listed once; errors name the new paths; no secret value appears in the errors, the sources or the B14 message. **T15** L4: a pattern canary in the fake pip-freeze output gives exit 3, `BUILD-FAILED.json` with `failed_step == "PC4"`, and no `MANIFEST.json`. **T16** L2 over `scripts/deploy/*.py` with an empty allowlist finds 0 hits. **T17** `--credential-report` prints NEW lines, the canary's matched bytes are absent from the output, exit 1, nothing written. |
 | `TestRPre` | **T20** a failing gate (G3 returns rc 1) gives exit 4 and the package root does not exist. **T21** after the first payload write, `builtins.open`/`os.open` raise for paths outside the root that are not entry sources, and `HOOKS["run"]` raises; the build still exits 0 with `MANIFEST.json` present. **T22** `l4_rescan` patched to raise gives exit 3, `BUILD-FAILED.json`, and no `MANIFEST.json`. **T23** at `after_entry(0)`, README, every `manifests/*` and `scripts/deploy/*` already exist. |
 | `TestCopyEngine` | **T30** payload and `h` equal source bytes and sha256; mode and `mtime_ns` preserved. **T31** `after_chunk` appends to the source: exit 5, message names the source. **T32** a source changed between enumeration and copy: exit 5. |
 | `TestResume` | **T40** `after_entry` raises at K: exit 5; `--resume` exits 0; the result is byte-identical (§11.3) to an uninterrupted build into a second USB root. **T41** a torn final partial line is truncated and resume succeeds. **T42** an already-listed source changes: resume fails B07 (exit 4). **T43** a corrupted listed payload file: resume re-copies from that entry and the result is identical to T40's reference. **T44** `--resume` with `MANIFEST.json` present fails B07. |
