@@ -503,9 +503,23 @@ class Fixture(object):
         for patcher in patchers:
             patcher.start()
             self.tc.addCleanup(patcher.stop)
+        for module in (bp, ip._bp):   # L3 may read fixture files only: a real token path fails before it is opened
+            for name in ("_read_token_file", "_read_stored_tokens_file"):
+                patcher = mock.patch.object(module, name, self.fixture_only(getattr(module, name)))
+                patcher.start()
+                self.tc.addCleanup(patcher.stop)
         for name in ("HF_TOKEN", "HF_HOME", "Z_IMAGE_HF_HOME", "LTX2_MLX_HF_HOME", "HF_HUB_CACHE",
                      "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE", "HF_TOKEN_PATH", "HUGGING_FACE_HUB_TOKEN"):
             os.environ.pop(name, None)
+
+    def fixture_only(self, reader):
+        reader = getattr(reader, "unguarded", reader)   # a second Fixture in one test replaces, not stacks
+        def guarded(path, label, add, sources, errors):
+            if not path.startswith(self.root + "/"):
+                raise AssertionError("known-secret source outside the fixture: %s" % path)
+            return reader(path, label, add, sources, errors)
+        guarded.unguarded = reader
+        return guarded
 
     def write_deploy_dir(self):
         for name in ("build_pkg.py", "install_pkg.py"):
@@ -2425,7 +2439,7 @@ class TestInstallChecks(InstallCase):
 
     def test_T76_I17_hf_home(self):
         self.assertTrue(self.check("I17")[0].ok)
-        os.environ["HF_HOME"] = "/Volumes/Ollama/hf_home"
+        os.environ["HF_HOME"] = self.fx.volumes + "/Ollama/hf_home"   # fixture-local: InstallCtx L3-loads $HF_HOME/token
         self.assertFalse(self.check("I17")[0].ok)
         os.environ["HF_HOME"] = self.fx.home + "/hf_home"
         self.fx.run.zsh_hf_home = "/Volumes/Ollama/hf_home"
@@ -2760,6 +2774,27 @@ class TestInstallApply(InstallCase):
         rc, out, err = self.fx.install("user", "--apply")   # spec 12.4: an existing directory is never chmod-ed
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(stat.S_IMODE(os.lstat(target).st_mode), 0o755)
+
+    def test_a_run_killed_inside_make_dir_leaves_only_the_temp_dir(self):
+        b4_root = [e for e in self.entries() if e["c"] == "B4" and e["k"] == "d"][0]
+        tmp = os.path.dirname(b4_root["t"]) + "/." + os.path.basename(b4_root["t"]) + ".ltxdeploy.tmp"
+        rc, out, err = self.fx.install("system-python", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        real_rename = os.rename
+
+        def rename(src, dst):
+            if dst == b4_root["t"]:
+                raise OSError("injected kill between chmod and rename")
+            return real_rename(src, dst)
+        with mock.patch.object(ip.os, "rename", rename):
+            rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 1, out + err)
+        self.assertFalse(os.path.lexists(b4_root["t"]))
+        self.assertEqual(stat.S_IMODE(os.lstat(tmp).st_mode), 0o750)
+        rc, out, err = self.fx.install("user", "--apply")
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(os.path.lexists(tmp))
+        self.assertEqual(stat.S_IMODE(os.lstat(b4_root["t"]).st_mode), 0o750)
 
 
 if __name__ == "__main__":
