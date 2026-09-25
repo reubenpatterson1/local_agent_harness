@@ -476,6 +476,8 @@ class BuildCtx(object):
         self.freezes = {}
         self.git_record = {}
         self.git_problems = []
+        self.deploy_script_record = {}
+        self.deploy_script_problems = []
         self.baseline = None
         self.script_bytes = {}
         self.root_files = collections.OrderedDict()
@@ -1245,6 +1247,25 @@ def gather_git_record(ctx):
     ctx.git_problems = problems
 
 
+def gather_deploy_script_record(ctx):
+    """B19: the running deploy scripts are the checkout's own, and each matches HEAD (reuses git_file_state)."""
+    repo = repo_root()
+    problems = []
+    actual = os.path.realpath(deploy_dir())
+    expected = os.path.realpath(workspace() + "/scripts/deploy")
+    if actual != expected:
+        problems.append("deploy_dir() is %s, expected %s" % (actual, expected))
+    record = {"deploy_dir": actual, "expected_deploy_dir": expected, "files": {}}
+    for name in DEPLOY_SCRIPT_FILES:
+        rel = "scripts/deploy/" + name
+        state, reason = git_file_state(repo, rel)
+        record["files"][rel] = state
+        if reason:
+            problems.append("%s: %s" % (rel, reason))
+    ctx.deploy_script_record = record
+    ctx.deploy_script_problems = problems
+
+
 # ---------------------------------------------------------------------------
 # Resume-prefix analysis (spec 11.3; read-only, used by B07)
 # ---------------------------------------------------------------------------
@@ -1536,8 +1557,17 @@ def check_b17(ctx):
     return CheckResult("B17", ok, message, True)
 
 
+def check_b19(ctx):
+    gather_deploy_script_record(ctx)
+    ok = not ctx.deploy_script_problems
+    message = ("all %d deploy script files in %s match HEAD" % (
+        len(DEPLOY_SCRIPT_FILES), ctx.deploy_script_record["expected_deploy_dir"])) if ok else (
+        "deploy provenance: " + "; ".join(ctx.deploy_script_problems))
+    return CheckResult("B19", ok, message, True)
+
+
 def run_prebuild_checks(ctx):
-    """Stage step 4: B01-B17 in table order, then B18. Reads only; writes nothing."""
+    """Stage step 4: B01-B17 in table order, then B18, then B19. Reads only; writes nothing."""
     load_deploy_files(ctx)
     prepare_l2(ctx)
     if ctx.resume and os.path.isdir(ctx.package_root) and not os.path.lexists(ctx.package_root + "/MANIFEST.json"):
@@ -1562,4 +1592,5 @@ def run_prebuild_checks(ctx):
     results.append(check_b16(ctx))
     results.append(check_b17(ctx))
     results.append(check_no_employer_packages(ctx))
+    results.append(check_b19(ctx))
     return results

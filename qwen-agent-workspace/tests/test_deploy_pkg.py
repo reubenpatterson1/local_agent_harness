@@ -468,7 +468,7 @@ class Fixture(object):
         self.brew_py312 = self.root + "/opt/homebrew/opt/python@3.12/bin/python3.12"
         self.ffmpeg = self.root + "/opt/homebrew/bin/ffmpeg"
         self.ffprobe = self.root + "/opt/homebrew/bin/ffprobe"
-        self.deploy = self.root + "/deploy"
+        self.deploy = self.ws + "/scripts/deploy"
         self.package_id = "ltx-chain-deploy-20260925"
         self.pkg = self.usb + "/" + self.package_id
         self.fw_py = self.fw + "/Versions/3.13/bin/python3"
@@ -1159,7 +1159,7 @@ class TestBuildChecks(DeployTestCase):
 
     def test_clean_fixture_passes_every_check_in_table_order(self):
         ctx, results, by_id = prebuild(self.fx)
-        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 19)])
+        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 20)])
         self.assertEqual([bp.format_result(r) for r in results if not r.ok], [])
         self.assertEqual(ctx.baseline["schema_version"], 1)
         self.assertEqual(ctx.baseline["interpreter"], self.fx.fw_py)
@@ -1439,6 +1439,80 @@ class TestBuildChecks(DeployTestCase):
         self.assertTrue(by_id["B17"].ok, by_id["B17"].message)
         self.assertFalse(ctx.git_record["test_files"]["tests/test_ltx_image_fit.py"]["clean"])
         self.assertEqual(ctx.git_record["porcelain"], [" M qwen-agent-workspace/tests/test_ltx_image_fit.py"])
+
+    def test_B19_all_clean_when_install_pkg_present(self):
+        deploy = self.fx.ws + "/scripts/deploy"
+        ctx = self.fx.ctx()
+        result = bp.check_b19(ctx)
+        self.assertEqual(result, bp.CheckResult("B19", True, "all 3 deploy script files in %s match HEAD" % deploy, True))
+        self.assertEqual(ctx.deploy_script_problems, [])
+        record = ctx.deploy_script_record
+        self.assertEqual((record["deploy_dir"], record["expected_deploy_dir"]), (deploy, deploy))
+        rels = ["scripts/deploy/build_pkg.py", "scripts/deploy/install_pkg.py", "scripts/deploy/credential_allowlist.json"]
+        self.assertEqual(list(record["files"]), rels)
+        for rel in rels:
+            with open(self.fx.ws + "/" + rel, "rb") as fh:
+                data = fh.read()
+            self.assertEqual(record["files"][rel], {"sha256": hashlib.sha256(data).hexdigest(), "git_blob": git_blob(data), "clean": True}, rel)
+            self.assertIn((bp.GIT, "-C", self.fx.repo, "ls-files", "--error-unmatch", "--", "qwen-agent-workspace/" + rel), self.fx.run.calls)
+        with open(os.path.join(DEPLOY_DIR, "build_pkg.py"), "rb") as a, open(deploy + "/build_pkg.py", "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        self.assertEqual(ctx.git_record, {})
+
+    def test_B19_install_pkg_not_committed_fails_closed(self):
+        rel = "scripts/deploy/install_pkg.py"
+        self.fx.untracked.add("qwen-agent-workspace/" + rel)
+        ctx = self.fx.ctx()
+        self.assertEqual(bp.check_b19(ctx), bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/install_pkg.py: untracked", True))
+        files = ctx.deploy_script_record["files"]
+        self.assertEqual([r for r in files if not files[r]["clean"]], [rel])
+        self.fx.untracked.clear()
+        os.unlink(self.fx.ws + "/" + rel)
+        ctx = self.fx.ctx()
+        self.assertEqual(bp.check_b19(ctx), bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/install_pkg.py: missing", True))
+        self.assertEqual(ctx.deploy_script_record["files"][rel], {"sha256": "", "git_blob": "", "clean": False})
+        self.assertEqual(ctx.deploy_script_problems, ["scripts/deploy/install_pkg.py: missing"])
+
+    def test_B19_deploy_dir_mismatch(self):
+        stray = self.fx.root + "/opt/stray/scripts/deploy"
+        expected = self.fx.ws + "/scripts/deploy"
+        with mock.patch.object(bp, "deploy_dir", lambda: stray):
+            ctx = self.fx.ctx()
+            result = bp.check_b19(ctx)
+        self.assertEqual(result, bp.CheckResult("B19", False, "deploy provenance: deploy_dir() is %s, expected %s" % (stray, expected), True))
+        self.assertEqual(ctx.deploy_script_record["deploy_dir"], stray)
+        self.assertTrue(all(info["clean"] for info in ctx.deploy_script_record["files"].values()))
+        self.fx.modified.add("qwen-agent-workspace/scripts/deploy/credential_allowlist.json")
+        with mock.patch.object(bp, "deploy_dir", lambda: stray):
+            result = bp.check_b19(self.fx.ctx())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.message, "deploy provenance: deploy_dir() is %s, expected %s; scripts/deploy/credential_allowlist.json: modified" % (stray, expected))
+
+    def test_B19_symlinked_deploy_dir_is_the_checkout(self):
+        link = self.fx.root + "/linked-deploy"
+        make_link(link, self.fx.ws + "/scripts/deploy")
+        with mock.patch.object(bp, "deploy_dir", lambda: link):
+            result = bp.check_b19(self.fx.ctx())
+        self.assertTrue(result.ok, result.message)
+        copy = self.fx.root + "/copied-deploy"
+        shutil.copytree(self.fx.ws + "/scripts/deploy", copy)
+        with mock.patch.object(bp, "deploy_dir", lambda: copy):
+            result = bp.check_b19(self.fx.ctx())
+        self.assertEqual(result, bp.CheckResult("B19", False, "deploy provenance: deploy_dir() is %s, expected %s/scripts/deploy" % (copy, self.fx.ws), True))
+
+    def test_B19_detects_dirty_build_pkg(self):
+        self.fx.modified.add("qwen-agent-workspace/scripts/deploy/build_pkg.py")
+        ctx, results, by_id = prebuild(self.fx)
+        self.assertEqual(results[-1].check_id, "B19")
+        self.assertEqual(by_id["B19"], bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/build_pkg.py: modified", True))
+        self.assertTrue(by_id["B17"].ok, by_id["B17"].message)
+        self.assertTrue(ctx.deploy_script_record["files"]["scripts/deploy/credential_allowlist.json"]["clean"])
+        self.fx.modified.clear()
+        self.fx.committed["qwen-agent-workspace/scripts/deploy/credential_allowlist.json"] = "0" * 40
+        result = self.check("B19")
+        self.assertEqual(result, bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/credential_allowlist.json: blob differs", True))
+        self.fx.committed.clear()
+        self.assertTrue(self.check("B19").ok)
 
 
 if __name__ == "__main__":

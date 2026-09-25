@@ -3790,7 +3790,7 @@ class TestBuildCli(BuildE2ECase):
         self.assertEqual(len(totals), 1)
         self.assertTrue(re.match(r"^TOTAL files=\d+ symlinks=\d+ dirs=\d+ bytes=\d+ \(\d+\.\d\d GiB\)$", totals[0]))
         self.assertEqual(len([line for line in lines if line.startswith("SPACE required=")]), 1)
-        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 19)])
+        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 20)])
         self.assertEqual(snapshot(self.fx.root), before)
 
     def test_default_mode_is_dry_run_and_failures_exit_4(self):
@@ -6840,7 +6840,7 @@ Write the literal `PKG` value into the results table and use that literal in eve
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --package-id <PKG> > generated/deploy-dryrun-1.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-1.txt; tail -25 generated/deploy-dryrun-1.txt
 ```
-Expected: rc=4 with exactly one `FAIL` line, `FAIL B13 …` (P1: roughly 64 un-reviewed L2 hits). All of B01-B12 and B14-B17 are `PASS`; B17 passes now that P0 is resolved at 6ab72ac.
+Expected: rc=4 with exactly one `FAIL` line, `FAIL B13 …` (P1: roughly 64 un-reviewed L2 hits). All of B01-B12, B14-B17 and B19 are `PASS`; B17 passes now that P0 is resolved at 6ab72ac.
 - Any other FAIL is a real finding. Read its message, diagnose from the evidence, and report to the user before changing anything.
 - Do not call it an environment issue without evidence.
 
@@ -6919,14 +6919,14 @@ cd /Users/reubenpatterson/local_model_harness
 git add qwen-agent-workspace/scripts/deploy/credential_allowlist.json
 git commit -m "deploy: human-reviewed L2 credential allowlist (P1)"
 ```
-The new commit leaves B17 unaffected, because B17 checks only the 10 pipeline files against HEAD.
+The new commit leaves B17 unaffected, because B17 checks only the 10 pipeline files against HEAD. B19 requires it: until the allowlist is committed, B19 fails with `scripts/deploy/credential_allowlist.json: modified`.
 
 - [ ] **Step 5: Second dry run.**
 ```bash
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --package-id <PKG> > generated/deploy-dryrun-2.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-2.txt; tail -22 generated/deploy-dryrun-2.txt
 ```
-Expected: rc=0, the final line `build_pkg: DRY RUN OK`, and 17 `PASS B..` lines. B13's message reads `L2: <n> hit(s), all allowlisted`.
+Expected: rc=0, the final line `build_pkg: DRY RUN OK`, and 19 `PASS B..` lines (B01-B19). B13's message reads `L2: <n> hit(s), all allowlisted`.
 
 - [ ] **Step 6: The real `--apply`.** Launch it as **one** background Bash invocation (`run_in_background: true`), with no `nohup` or `&` inside, and capture rc into the log:
 ```bash

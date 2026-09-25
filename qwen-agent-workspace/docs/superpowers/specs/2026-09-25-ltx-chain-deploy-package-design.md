@@ -591,6 +591,7 @@ Exit 0 or 4. Per-component line format: `<id> <slug> files=<n> symlinks=<n> dirs
 | B15 | Offline gates pass | §10.1. Measured now; the result becomes `acceptance-baseline.json`. |
 | B16 | Host facts and freezes | Every §6.4 command rc 0. |
 | B17 | Provenance (D12) | For each of the 10 pipeline files (`<rp>` = `qwen-agent-workspace/<rel>`): `/usr/bin/git -C REPO ls-files --error-unmatch -- <rp>` rc 0; `git -C REPO status --porcelain -- <rp>` output empty; `git -C REPO hash-object <abs path>` equals `git -C REPO rev-parse HEAD:<rp>`. The message names each failing file and reason (`untracked`, `modified`, `blob differs`). **Fails today; see P0.** |
+| B19 | Deploy-script provenance | Runs last, after B18, and does not depend on B17. `os.path.realpath(deploy_dir())` equals `os.path.realpath(workspace() + "/scripts/deploy")`, so the build reads the checkout's scripts, not a stray copy. A symlink into the checkout is accepted; a copy elsewhere, even a byte-identical one, is not. For each file in `DEPLOY_SCRIPT_FILES` (`build_pkg.py`, `install_pkg.py`, `credential_allowlist.json`), with `<rel>` = `scripts/deploy/<name>`, the three B17 commands pass. The message names the `deploy_dir()` mismatch and each failing file with its reason (`untracked`, `modified`, `blob differs`, `missing`). The record (`ctx.deploy_script_record`) is in memory only. **Fails until `scripts/deploy/install_pkg.py` is committed** (reason `missing`). |
 
 ### 10.1 Offline gates (B15; also used by accept A4)
 
