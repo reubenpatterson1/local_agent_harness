@@ -1487,6 +1487,12 @@ class TestBuildChecks(DeployTestCase):
             result = bp.check_b19(self.fx.ctx())
         self.assertFalse(result.ok)
         self.assertEqual(result.message, "deploy provenance: deploy_dir() is %s, expected %s; scripts/deploy/credential_allowlist.json: modified" % (stray, expected))
+        clone = self.fx.usb2 + "/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/scripts/deploy"
+        shutil.copytree(self.fx.ws + "/scripts/deploy", clone)
+        self.fx.modified.clear()
+        with mock.patch.object(bp, "deploy_dir", lambda: clone):
+            result = bp.check_b19(self.fx.ctx())
+        self.assertEqual(result, bp.CheckResult("B19", False, "deploy provenance: deploy_dir() is %s, expected %s" % (clone, expected), True))
 
     def test_B19_symlinked_deploy_dir_is_the_checkout(self):
         link = self.fx.root + "/linked-deploy"
