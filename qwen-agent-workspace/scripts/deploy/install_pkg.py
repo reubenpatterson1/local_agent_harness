@@ -756,6 +756,9 @@ SWAP_REFUSE_MB = 3072.00
 LTX_MOVIE_TIMEOUT = 7200
 STORY_SERVER_UP_TIMEOUT = 1800
 POLL_SECONDS = 15
+
+# The plan's Task 13 Step 3 sampler (2026-09-24 redesign plan), with one change:
+# phase4_peak_used_gib = memsize/2**30 - min(avail) instead of the hard-coded 48.0.
 SAMPLER_SRC = r'''
 import glob, json, os, subprocess, sys, time, psutil
 out, pid, memsize = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
@@ -788,6 +791,12 @@ def load_json(path):
         return {}
 
 
+def output_tail(ctx, out):
+    """The last 200 characters of out, or a fixed notice if the WHOLE of out holds secret material:
+    a secret cut by the 200-character tail is still caught (as in apply_system_python)."""
+    return "(output withheld: it contained secret material)" if has_secret(ctx, out) else out[-200:]
+
+
 def accept_a1_metadata(ctx):
     problems = []
     for entry in ctx.entries:
@@ -816,7 +825,7 @@ def accept_a2_probes(ctx):
     problems = []
     rc, out = HOOKS["run"]([framework_py(), "-c", "import torch, diffusers, transformers, PIL, numpy, safetensors, psutil, pytest, pexpect"], timeout=300)
     if rc != 0:
-        problems.append("framework + user-site import probe rc=%d: %s" % (rc, out[-200:]))
+        problems.append("framework + user-site import probe rc=%d: %s" % (rc, output_tail(ctx, out)))
     want = load_json(ctx.package_root + "/manifests/source-host.json").get("vllm_version")
     rc, out = HOOKS["run"]([home() + "/.venv-vllm-metal/bin/python", "-c", "import vllm, vllm_metal, mlx_vlm; print(vllm.__version__)"], timeout=300)
     got = _bp.last_line(out).strip()   # C1: the version is the last line
@@ -824,7 +833,7 @@ def accept_a2_probes(ctx):
         problems.append("vLLM probe rc=%d version=%r, source-host vllm_version=%r" % (rc, got, want))
     rc, out = HOOKS["run"]([home() + "/ltx-2-mlx/.venv/bin/ltx-2-mlx", "--help"], timeout=300)
     if rc != 0:
-        problems.append("ltx-2-mlx --help rc=%d: %s" % (rc, out[-200:]))
+        problems.append("ltx-2-mlx --help rc=%d: %s" % (rc, output_tail(ctx, out)))
     return {"ok": not problems, "problems": problems}
 
 
@@ -850,7 +859,7 @@ def accept_a3_gates(ctx):
 def accept_a4_story_server(ctx):
     rc, out = HOOKS["run"]([workspace() + "/bin/story-server"], timeout=120)
     ok = rc == 2 and STORY_SERVER_USAGE in out
-    return {"ok": ok, "problems": [] if ok else ["story-server with no arguments: rc=%r output=%r" % (rc, out[-200:])]}
+    return {"ok": ok, "problems": [] if ok else ["story-server with no arguments: rc=%r output=%r" % (rc, output_tail(ctx, out))]}
 
 
 def gpu_refusals(ctx):
@@ -959,7 +968,7 @@ def gpu_run(ctx, label, seed, W, H, SW, SH):
     rc, out = HOOKS["run"]([ws + "/bin/story-server", "vision"], timeout=120)
     result["story_server_vision_rc"] = rc
     if rc != 0:
-        result["error"] = "story-server vision rc=%d: %s" % (rc, out[-200:])
+        result["error"] = "story-server vision rc=%d: %s" % (rc, output_tail(ctx, out))
         return result
     if not wait_for_story_server():
         result["error"] = "story server did not come up"
@@ -1011,7 +1020,7 @@ def scrub_record(ctx, value):
     (the accept record can embed real subprocess/GPU-run output; see has_secret)."""
     if isinstance(value, str):
         return safe_line(ctx, value, "(value withheld: it contained secret material)")
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [scrub_record(ctx, item) for item in value]
     if isinstance(value, dict):
         return dict((key, scrub_record(ctx, item)) for key, item in value.items())
@@ -1024,8 +1033,12 @@ def write_accept_record(ctx, record, stamp, verdict):
     directory = receipts_dir(ctx.package_id())
     os.makedirs(directory, exist_ok=True)
     path = directory + "/accept-%s.json" % stamp
+    text = json.dumps(scrub_record(ctx, record), indent=2) + "\n"
+    if has_secret(ctx, text):   # scrub_record keeps dict keys as they are: keep only the verdict
+        text = json.dumps({"schema_version": 1, "verdict": verdict, "finished_at": record["finished_at"],
+                           "withheld": "the record contained secret material"}, indent=2) + "\n"
     with open(path, "w") as fh:
-        fh.write(json.dumps(scrub_record(ctx, record), indent=2) + "\n")
+        fh.write(text)
     print(safe_line(ctx, "install_pkg: accept record written to %s" % path,
                     "install_pkg: accept record written (path withheld: it contained secret material)"))
     return path

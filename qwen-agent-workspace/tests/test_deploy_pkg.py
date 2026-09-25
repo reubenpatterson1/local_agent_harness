@@ -2994,6 +2994,47 @@ class TestAccept(InstallCase):
             self.fx.run.overrides[(self.story_server,)] = value
             self.assertFalse(ip.accept_a4_story_server(ctx)["ok"], value)
 
+    def test_secret_cut_by_the_200_character_tail_is_withheld_from_stdout_and_the_record(self):
+        tok = dict(L2_CANARIES)["hf_token"]
+        text = "token=" + tok + "\n" + "x" * 167   # out[-200:] keeps the last 32 characters of tok
+        probe = (self.fx.fw_py, "-c", "import torch, diffusers, transformers, PIL, numpy, safetensors, psutil, pytest, pexpect")
+        for key, extra in ((probe, ()), ((self.fx.home + "/ltx-2-mlx/.venv/bin/ltx-2-mlx", "--help"), ()),
+                           ((self.story_server,), ()), ((self.story_server, "vision"), ("--gpu",))):
+            self.fx.run.overrides = {key: (1, text)}
+            rc, out, err = self.accept(*extra)
+            self.assertEqual(rc, 1, out + err)
+            self.assertIn("(output withheld: it contained secret material)", out, key)
+            self.assertNotIn(tok[-20:], out + err, key)
+            self.assertNotIn(tok[-20:], json.dumps(self.accept_records()), key)
+
+    def test_secret_in_a_gate_line_or_a_refusal_is_withheld_from_stdout_and_the_record(self):
+        tok = dict(L2_CANARIES)["hf_token"]
+        self.fx.run.overrides[(self.fx.fw_py, "tests/test_ltx_movie_offline.py")] = (0, tok + "\n")
+        rc, out, err = self.accept()
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("A3   (problem withheld: it contained secret material)", out.splitlines())
+        self.assertNotIn(tok, out + err)
+        self.assertNotIn(tok, json.dumps(self.accept_records()))
+        self.fx.run.overrides = {("/usr/bin/pgrep", "-fl", "ltx-2-mlx|z_image|mlx_lm|vllm"): (0, "123 vllm serve --hf-token %s\n" % tok)}
+        out = self.assert_refused()
+        self.assertIn("REFUSE r3: (message withheld: it contained secret material)", out.splitlines())
+        self.assertNotIn(tok, out)
+        self.assertEqual(self.accept_records()["steps"]["refusals"], ["(value withheld: it contained secret material)"])
+
+    def test_accept_record_scrubs_tuples_and_falls_back_on_a_secret_key(self):
+        tok = dict(L2_CANARIES)["hf_token"]
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "accept", "--package-root", self.fx.pkg]))
+        for record, expect in (({"steps": {"t": (tok, 1)}}, {"t": ["(value withheld: it contained secret material)", 1]}),
+                               ({"steps": {tok: 1}}, None)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                path = ip.write_accept_record(ctx, record, "20260925000000", "FAIL")
+            with open(path) as fh:
+                data = fh.read()
+            self.assertNotIn(tok, data)
+            doc = json.loads(data)
+            self.assertEqual(doc["verdict"], "FAIL")
+            self.assertEqual(doc.get("steps"), expect)
+
     def test_sampler_source(self):
         compile(ip.SAMPLER_SRC, "sampler", "exec")
         self.assertIn("memsize / 2**30 - min(", ip.SAMPLER_SRC)
