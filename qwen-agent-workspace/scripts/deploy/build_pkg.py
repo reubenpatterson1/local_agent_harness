@@ -2040,8 +2040,13 @@ def cmd_verify_only(args):
     package_id = args.package_id if args.package_id else default_package_id()
     root = os.path.join(usb_root, package_id)
     failures, nfiles = verify_package(root)
+    secrets = load_known_secrets()[0]
     for reason, path in failures:
-        print("FAIL VERIFY %s: %s" % (reason, path))
+        line = "FAIL VERIFY %s: %s" % (reason, path)
+        data = line.encode("utf-8")
+        if KnownSecretScanner(secrets).feed(data) or l2_scan_bytes(data):
+            line = "FAIL VERIFY %s: (path withheld: it contained secret material)" % reason
+        print(line)
     if failures:
         print("build_pkg: VERIFY FAILED: %d problem(s) in %s" % (len(failures), root))
         return 1

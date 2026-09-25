@@ -2153,6 +2153,18 @@ class TestVerifyOnly(BuildE2ECase):
             self.assertTrue([line for line in out.splitlines() if line.startswith("FAIL VERIFY " + reason + ": ")], label + out)
             self.assertEqual(snapshot(copy), before, label)
 
+    def test_T51_failure_lines_never_print_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        write_file(self.fx.pkg + "/payload/B1-ltx2mlx-repo/" + SECRET_CANARY + ".txt", b"extra")
+        write_file(self.fx.pkg + "/payload/B1-ltx2mlx-repo/" + GITHUB_CANARY + ".txt", b"extra")
+        rc, out, err = build_verify(self.fx)
+        self.assertEqual(rc, 1, out + err)
+        withheld = [line for line in out.splitlines()
+                    if line.startswith("FAIL VERIFY extra: (path withheld: it contained secret material)")]
+        self.assertEqual(len(withheld), 2, out)
+        self.assertNotIn(SECRET_CANARY, out + err)
+        self.assertNotIn(GITHUB_CANARY, out + err)
+
 
 if __name__ == "__main__":
     unittest.main()
