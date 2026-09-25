@@ -3790,7 +3790,7 @@ class TestBuildCli(BuildE2ECase):
         self.assertEqual(len(totals), 1)
         self.assertTrue(re.match(r"^TOTAL files=\d+ symlinks=\d+ dirs=\d+ bytes=\d+ \(\d+\.\d\d GiB\)$", totals[0]))
         self.assertEqual(len([line for line in lines if line.startswith("SPACE required=")]), 1)
-        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 18)])
+        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 19)])
         self.assertEqual(snapshot(self.fx.root), before)
 
     def test_default_mode_is_dry_run_and_failures_exit_4(self):

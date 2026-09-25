@@ -1159,7 +1159,7 @@ class TestBuildChecks(DeployTestCase):
 
     def test_clean_fixture_passes_every_check_in_table_order(self):
         ctx, results, by_id = prebuild(self.fx)
-        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 18)])
+        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 19)])
         self.assertEqual([bp.format_result(r) for r in results if not r.ok], [])
         self.assertEqual(ctx.baseline["schema_version"], 1)
         self.assertEqual(ctx.baseline["interpreter"], self.fx.fw_py)
@@ -1410,6 +1410,13 @@ class TestBuildChecks(DeployTestCase):
         result = self.check("B16")
         self.assertFalse(result.ok)
         self.assertIn("ffmpeg", result.message)
+
+    def test_B18_runs_in_prebuild(self):
+        write_file(self.fx.fw + "/Versions/3.13/bin/fubotv-mcp-common", b"#!fake\n", 0o755)
+        result = self.check("B18")
+        self.assertFalse(result.ok)
+        self.assertTrue(result.fatal)
+        self.assertIn("fubotv-mcp-common", result.message)
 
     def test_B17_provenance(self):
         self.fx.untracked.add("qwen-agent-workspace/bin/story-server")

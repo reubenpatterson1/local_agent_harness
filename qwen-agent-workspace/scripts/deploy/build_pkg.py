@@ -1537,7 +1537,7 @@ def check_b17(ctx):
 
 
 def run_prebuild_checks(ctx):
-    """Stage step 4: B01-B17 in table order. Reads only; writes nothing."""
+    """Stage step 4: B01-B17 in table order, then B18. Reads only; writes nothing."""
     load_deploy_files(ctx)
     prepare_l2(ctx)
     if ctx.resume and os.path.isdir(ctx.package_root) and not os.path.lexists(ctx.package_root + "/MANIFEST.json"):
@@ -1561,4 +1561,5 @@ def run_prebuild_checks(ctx):
     results.append(check_offline_gates(ctx))
     results.append(check_b16(ctx))
     results.append(check_b17(ctx))
+    results.append(check_no_employer_packages(ctx))
     return results
