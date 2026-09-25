@@ -1521,5 +1521,50 @@ class TestBuildChecks(DeployTestCase):
         self.assertTrue(self.check("B19").ok)
 
 
+class TestReadme(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = Fixture(self)
+        self.fx.build_sources()
+        ctx = self.fx.ctx()
+        ctx.git_record = {"head": HEAD_SHA, "branch": "ltx2-mlx-video-pipeline"}
+        self.text = bp.render_readme(ctx)
+        self.lines = self.text.splitlines()
+
+    def test_T90_every_ltx_movie_line_passes_model_explicitly(self):
+        model = "--model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8"
+        hits = [line for line in self.lines if "bin/ltx-movie" in line]
+        self.assertGreaterEqual(len(hits), 2)
+        for line in hits:
+            self.assertIn(model, line)
+            self.assertFalse(line.rstrip().endswith("\\"), line)
+            self.assertIn("--story-server-stop-after-story", line)
+            self.assertTrue(line.strip().startswith("/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 bin/ltx-movie "), line)
+        self.assertEqual(len([line for line in hits if "--seed-image " in line]), 1)
+
+    def test_T90b_sections_and_install_commands(self):
+        for heading in ("## 1. What this package is", "## 2. Target requirements", "## 3. Install",
+                        "## 4. Running the pipeline", "## 5. Warnings", "## 6. Troubleshooting", "## 7. Not included"):
+            self.assertIn(heading, self.text)
+        inst = "/usr/bin/python3 %s/%s/scripts/deploy/install_pkg.py" % (self.fx.usb, self.fx.package_id)
+        for tail in ("--phase preflight", "--phase user --apply", "--phase verify", "--phase accept --gpu", "--phase accept --gpu-all"):
+            self.assertIn(inst + " " + tail, self.text)
+        self.assertIn("sudo " + inst + " --phase system-python --apply", self.text)
+        self.assertIn("/usr/bin/python3 /Users/reubenpatterson/local_model_harness/qwen-agent-workspace/generated/deploy-receipts/%s/scripts/deploy/install_pkg.py --phase accept --gpu" % self.fx.package_id, self.text)
+        for needle in ('export HF_HOME="/Users/reubenpatterson/hf_home"', "brew install ffmpeg python@3.12", HEAD_SHA,
+                       "2026-09-25", "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8", "--image-seed",
+                       "~/.qwen-serve-guard/stand-down", "curl -sf http://127.0.0.1:8177/v1/models",
+                       ">= 48 GiB RAM", "sudo", "32 MB/min"):
+            self.assertIn(needle, self.text)
+
+    def test_T91_forbidden_strings_absent(self):
+        low = self.text.lower()
+        for needle in ("--video" + "-backend", "comf" + "yui", "cct" + "ech", "chriscole" + "tech", "81" + "89"):
+            self.assertNotIn(needle, low)
+
+    def test_T92_readme_is_l2_clean(self):
+        self.assertEqual(bp.l2_scan_bytes(self.text.encode("utf-8")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1594,3 +1594,115 @@ def run_prebuild_checks(ctx):
     results.append(check_no_employer_packages(ctx))
     results.append(check_b19(ctx))
     return results
+
+
+# ---------------------------------------------------------------------------
+# README (spec 14): rendered from a string constant before the copy
+# ---------------------------------------------------------------------------
+README_PY = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3"
+README_NARRATIVE = ("An old fisherman in a flat cap and a waxed coat stands at a lighthouse railing as a storm "
+                    "rolls in over the sea. He grips the rail and watches the waves, then turns and walks toward "
+                    "the lighthouse door.")
+README_TEMPLATE = """\
+# ltx-chain deployment package %(package_id)s
+
+## 1. What this package is
+
+- Package id: %(package_id)s
+- Build date: %(build_date)s
+- Source git HEAD: %(head)s (branch %(branch)s)
+- It installs exactly the ltx-movie sequential I2V frame-chaining pipeline on a second, similar Mac that has the same account (user reubenpatterson, home /Users/reubenpatterson). No path is re-pinned.
+- Video model: %(model)s (ltx-2.5 only). Story model: Qwen3-VL-32B served by vLLM-Metal (vision mode only).
+- Code: the 10 pipeline files and their 7 offline test files, listed explicitly (no tree walk).
+
+What ships (component, counts, size):
+
+%(component_lines)s
+
+## 2. Target requirements
+
+The package does not provide these; installing them needs network.
+
+1. A local account `reubenpatterson` with home `/Users/reubenpatterson`, on macOS >= 26, Apple Silicon, >= 48 GiB RAM.
+2. Homebrew at `/opt/homebrew`. Installing it also installs the Command Line Tools, which `/usr/bin/python3` needs on a fresh Mac.
+3. `brew install ffmpeg python@3.12`. ffmpeg/ffprobe must be major version 9, and `/opt/homebrew/opt/python@3.12/bin/python3.12` must report 3.12.x. It is the vLLM venv's base interpreter.
+4. `~/.zshenv` contains `export HF_HOME="/Users/reubenpatterson/hf_home"` and no `HF_HOME` line that mentions `/Volumes/`. The exact line to add is:
+
+    export HF_HOME="/Users/reubenpatterson/hf_home"
+
+5. A real Terminal session that can `sudo`, for the `system-python` phase.
+
+## 3. Install
+
+Run these in order, each on one line. A phase changes nothing unless it says --apply.
+
+    %(inst)s --phase preflight
+    sudo %(inst)s --phase system-python --apply
+    %(inst)s --phase user --apply
+    %(inst)s --phase verify
+    %(inst)s --phase accept --gpu
+
+The system-python phase needs a real Terminal, because sudo asks for a password.
+
+Optional, all four acceptance geometries (portrait, wide, square, no seed):
+
+    %(inst)s --phase accept --gpu-all
+
+After the drive is ejected, run acceptance from the receipts copy:
+
+    /usr/bin/python3 /Users/reubenpatterson/local_model_harness/qwen-agent-workspace/generated/deploy-receipts/%(package_id)s/scripts/deploy/install_pkg.py --phase accept --gpu
+
+## 4. Running the pipeline
+
+Start the story server and wait until it answers:
+
+    cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
+    bin/story-server vision
+    until curl -sf http://127.0.0.1:8177/v1/models > /dev/null; do sleep 15; done
+
+A plain run:
+
+    %(py)s bin/ltx-movie "%(narrative)s" --story-id my-first-story --panels 4 --model %(model)s --story-server-stop-after-story
+
+A run seeded from an image:
+
+    %(py)s bin/ltx-movie "%(narrative)s" --story-id my-seeded-story --panels 4 --seed-image generated/hw_gate_seeds/portrait.png --model %(model)s --story-server-stop-after-story
+
+## 5. Warnings
+
+- The code's `--model` default for ltx-movie is `MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8`, an ltx-2.3 model that is NOT shipped. Always pass `--model %(model)s`.
+- `--seed-image` takes an image path. `--image-seed` is a different flag that takes an integer.
+- Restart the story server (`bin/story-server vision`) before every run: `--story-server-stop-after-story` stops it after each run's story phase.
+- Keep swap under 3 GiB before a run (check `sysctl -n vm.swapusage`). Swap drains at about 32 MB/min, and `purge` does not help.
+
+## 6. Troubleshooting
+
+- `~/.qwen-serve-guard/stand-down` makes Phase 1 exit 2 without probing port 8177 (a known open bug). Report it; do not delete it blindly.
+
+## 7. Not included
+
+- Text-mode story generation (MTPLX 27B) and the 27B fallback model.
+- ltx-2.3 models and the Gemma-3-12B text encoder.
+- Path re-pinning: the target must have the same account and home.
+"""
+
+
+def render_readme(ctx):
+    pid = ctx.package_id
+    lines = []
+    for cid in COMPONENT_ORDER:
+        row = ctx.comp_stats.get(cid) or {"slug": SLUGS[cid], "files": 0, "symlinks": 0, "dirs": 0, "bytes": 0}
+        lines.append("- %s %s: %d files, %d symlinks, %d dirs, %.2f GiB"
+                     % (cid, row["slug"], row["files"], row["symlinks"], row["dirs"], row["bytes"] / 1024.0 ** 3))
+    values = {
+        "package_id": pid,
+        "build_date": "%s-%s-%s" % (pid[-8:-4], pid[-4:-2], pid[-2:]),
+        "head": ctx.git_record.get("head", ""),
+        "branch": ctx.git_record.get("branch", ""),
+        "component_lines": "\n".join(lines),
+        "inst": "/usr/bin/python3 %s/%s/scripts/deploy/install_pkg.py" % (ctx.usb_root, pid),
+        "py": README_PY,
+        "model": LTX25_LITERAL,
+        "narrative": README_NARRATIVE,
+    }
+    return README_TEMPLATE % values
