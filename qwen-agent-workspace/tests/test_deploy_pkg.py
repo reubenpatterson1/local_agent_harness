@@ -825,5 +825,238 @@ class TestComponentCollection(DeployTestCase):
         self.assertEqual(bp.BuildCtx(args).usb_root, self.fx.usb)
 
 
+def allow_entry(hit, note="reviewed: test fixture canary"):
+    return {"component": hit["component"], "relpath": hit["relpath"], "sha256": hit["sha256"],
+            "pattern": hit["pattern"], "note": note}
+
+
+L2_CANARIES = (
+    ("hf_token", "hf" + "_" + "Ab3" * 12),
+    ("private_key", "-----BEGIN " + "RSA PRIVATE" + " KEY-----"),
+    ("aws_access_key_id", "AK" + "IA" + "ABCDEFGHIJKLMNOP"),
+    ("github_token", GITHUB_CANARY),
+    ("anthropic_api_key", " sk-" + "ant-" + "a" * 40),
+    ("openai_api_key", " sk-" + "proj-" + "b" * 40),
+)
+
+
+class TestCredentialGates(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = Fixture(self)
+        self.fx.build_sources()
+        self.torch = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch"
+
+    def l2_ctx(self):
+        ctx = self.fx.ctx()
+        bp.load_deploy_files(ctx)
+        bp.prepare_l2(ctx)
+        return ctx
+
+    def test_T10a_nested_token_file_is_an_l1_hit_and_tokenizer_json_is_not(self):
+        write_file(self.torch + "/tokenizer.json", b"{}")
+        write_file(self.torch + "/credentials.py", b"# code\n")
+        os.makedirs(self.torch + "/token")
+        ctx = self.fx.ctx()
+        self.assertEqual(ctx.l1_hits, [])
+        self.assertTrue(bp.check_b12(ctx).ok)
+        write_file(self.torch + "/sub/token", b"not-a-secret-value-xyz\n")
+        ctx = self.fx.ctx()
+        self.assertEqual(ctx.l1_hits, [self.torch + "/sub/token"])
+        result = bp.check_b12(ctx)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.fatal)
+        self.assertIn(self.torch + "/sub/token", result.message)
+
+    def test_T11_each_l1_name_fails_b12(self):
+        names = ["token", "stored_tokens", ".netrc", ".git-credentials", ".pypirc", ".env", "credentials",
+                 "id_rsa", "id_ecdsa", "id_ed25519", "id_dsa"]
+        self.assertEqual(sorted(bp.L1_NAMES), sorted(names))
+        for name in names:
+            path = self.torch + "/" + name
+            write_file(path, b"harmless\n")
+            ctx = self.fx.ctx()
+            self.assertEqual(ctx.l1_hits, [path], name)
+            self.assertFalse(bp.check_b12(ctx).ok, name)
+            os.unlink(path)
+        link = self.torch + "/id_rsa"
+        make_link(link, "elsewhere")
+        self.assertEqual(self.fx.ctx().l1_hits, [link])
+
+    def test_T12_each_l2_pattern_is_allowlisted_only_by_exact_hash(self):
+        for pid, canary in L2_CANARIES:
+            path = self.torch + "/leak_%s.txt" % pid
+            rel = "lib/python/site-packages/torch/leak_%s.txt" % pid
+            write_file(path, ("prefix " + canary + " suffix\n").encode("utf-8"))
+            ctx = self.l2_ctx()
+            mine = [h for h in ctx.l2_hits if h["relpath"] == rel]
+            self.assertIn(pid, [h["pattern"] for h in mine], pid)
+            self.assertTrue(all(h["component"] == "F3" and h["sha256"] == file_sha256(path) for h in mine))
+            self.assertFalse(bp.check_b13(ctx).ok, pid)
+            self.fx.write_allowlist([allow_entry(h) for h in mine])
+            ctx = self.l2_ctx()
+            self.assertEqual(ctx.l2_new, [], pid)
+            self.assertTrue(bp.check_b13(ctx).ok, pid)
+            write_file(path, ("Prefix " + canary + " suffix\n").encode("utf-8"))   # one byte changed
+            ctx = self.l2_ctx()
+            self.assertFalse(bp.check_b13(ctx).ok, pid)
+            warnings = bp.stale_allowlist_warnings(ctx)
+            self.assertEqual(len(warnings), len(mine))
+            self.assertTrue(all(w.check_id == "B13" and not w.ok and not w.fatal and w.message.startswith("stale allowlist entry {") for w in warnings))
+            os.unlink(path)
+            self.fx.write_allowlist([])
+
+    def test_T12b_l2_size_limit(self):
+        big = self.torch + "/big.bin"
+        write_file(big, GITHUB_CANARY.encode("ascii") + b"\0" * bp.L2_MAX_BYTES)
+        at_limit = self.torch + "/limit.bin"
+        payload = GITHUB_CANARY.encode("ascii")
+        write_file(at_limit, payload + b"\0" * (bp.L2_MAX_BYTES - len(payload)))
+        ctx = self.l2_ctx()
+        rels = [h["relpath"] for h in ctx.l2_hits]
+        self.assertNotIn("lib/python/site-packages/torch/big.bin", rels)
+        self.assertIn("lib/python/site-packages/torch/limit.bin", rels)
+
+    def test_allowlist_validation(self):
+        good = {"component": "F3", "relpath": "x", "sha256": "0" * 64, "pattern": "hf_token", "note": "ok"}
+        allow, entries = bp.parse_allowlist(json.dumps({"schema_version": 1, "entries": [good]}).encode("utf-8"), "t")
+        self.assertEqual(allow, set([("F3", "x", "0" * 64, "hf_token")]))
+        self.assertEqual(entries, [good])
+        for bad in ({"schema_version": 2, "entries": []}, {"schema_version": 1},
+                    {"schema_version": 1, "entries": [dict(good, note="")]},
+                    {"schema_version": 1, "entries": [dict(good, note="   ")]},
+                    {"schema_version": 1, "entries": [dict((k, v) for k, v in good.items() if k != "note")]},
+                    {"schema_version": 1, "entries": [dict(good, sha256=5)]}):
+            with self.assertRaises(ValueError):
+                bp.parse_allowlist(json.dumps(bad).encode("utf-8"), "t")
+        with self.assertRaises(ValueError):
+            bp.parse_allowlist(b"not json", "t")
+        write_file(self.fx.deploy + "/credential_allowlist.json", b'{"schema_version": 1, "entries": [{"component": "F3"}]}')
+        ctx = self.l2_ctx()
+        self.assertIsNotNone(ctx.allow_error)
+        result = bp.check_b13(ctx)
+        self.assertFalse(result.ok)
+        self.assertIn("allowlist failed to load", result.message)
+
+    def test_T14_known_secret_sources(self):
+        H = self.fx.home
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual((values, errors), ([], []))
+        self.assertEqual([s["source"] for s in sources], [H + "/.cache/huggingface/token", H + "/.cache/huggingface/stored_tokens", H + "/ltx-2-mlx/hf_cache/token", "$HF_TOKEN"])
+        self.assertEqual([s["present"] for s in sources], [False, False, False, False])
+        tok_a = "tokA." + "x" * 20
+        tok_b = "tokB." + "y" * 20
+        tok_r = "reft." + "z" * 20
+        write_file(H + "/.cache/huggingface/token", (tok_a + "\n").encode("ascii"))
+        write_file(H + "/.cache/huggingface/stored_tokens", ("[default]\nhf_token = %s\nrefresh_token = %s\n[other]\nhf_token = %s\n" % (tok_b, tok_r, tok_a)).encode("ascii"))
+        write_file(H + "/ltx-2-mlx/hf_cache/token", (tok_a + "\n").encode("ascii"))
+        os.environ["HF_TOKEN"] = "  " + tok_b + "  "
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual(errors, [])
+        self.assertEqual(values, [tok_a.encode("ascii"), tok_b.encode("ascii"), tok_r.encode("ascii")])
+        self.assertEqual([s["values"] for s in sources], [1, 3, 1, 1])
+        self.assertEqual([s["present"] for s in sources], [True, True, True, True])
+        write_file(H + "/.cache/huggingface/token", b"fifteen.bytes15\n")
+        values, sources, errors = bp.load_known_secrets()
+        self.assertTrue([e for e in errors if "too short" in e], errors)
+        self.assertEqual([e for e in errors if "fifteen" in e], [])
+        write_file(H + "/.cache/huggingface/token", (tok_a + "\n").encode("ascii"))
+        write_file(H + "/.cache/huggingface/stored_tokens", b"no section header here\n")
+        values, sources, errors = bp.load_known_secrets()
+        self.assertTrue([e for e in errors if "cannot be parsed" in e], errors)
+        write_file(H + "/.cache/huggingface/stored_tokens", b"[default]\nsomething_else = abc\n")
+        values, sources, errors = bp.load_known_secrets()
+        self.assertTrue([e for e in errors if "no hf_token or refresh_token" in e], errors)
+        ctx = self.fx.ctx()
+        ctx.secrets, ctx.l3_sources, ctx.l3_errors = values, sources, errors
+        self.assertFalse(bp.check_b14(ctx).ok)
+        write_file(H + "/.cache/huggingface/stored_tokens", ("[default]\nrefresh_token = %s\n" % tok_r).encode("ascii"))
+        values, sources, errors = bp.load_known_secrets()
+        self.assertEqual([e for e in errors if "stored_tokens" in e], [])
+        self.assertIn(tok_r.encode("ascii"), values)
+        stored_source = [s for s in sources if s["source"] == H + "/.cache/huggingface/stored_tokens"][0]
+        self.assertEqual(stored_source["values"], 1)
+
+    def test_T16_scripts_are_l2_clean(self):
+        names = sorted(n for n in os.listdir(DEPLOY_DIR) if n.endswith(".py"))
+        self.assertIn("build_pkg.py", names)
+        for name in names:
+            with open(os.path.join(DEPLOY_DIR, name), "rb") as fh:
+                self.assertEqual(bp.l2_scan_bytes(fh.read()), [], name)
+
+    def test_T17_credential_report(self):
+        path = self.torch + "/leak.txt"
+        write_file(path, ("x " + GITHUB_CANARY + "\n").encode("ascii"))
+        write_file(self.torch + "/deep/.netrc", b"machine example\n")
+        before = snapshot(self.fx.root)
+        args = bp.parse_args(["--credential-report", "--usb-root", self.fx.usb, "--package-id", self.fx.package_id])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = bp.cmd_credential_report(args)
+        text = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("L1 " + self.torch + "/deep/.netrc", text.splitlines())
+        new = [line for line in text.splitlines() if line.startswith("L2 NEW ")]
+        self.assertEqual(len(new), 1)
+        doc = json.loads(new[0][len("L2 NEW "):])
+        self.assertEqual(doc, {"component": "F3", "relpath": "lib/python/site-packages/torch/leak.txt",
+                               "sha256": file_sha256(path), "pattern": "github_token", "note": ""})
+        self.assertIn('", "', new[0])
+        self.assertNotIn(GITHUB_CANARY, text)
+        self.assertEqual(snapshot(self.fx.root), before)
+        self.assertFalse(os.path.exists(self.fx.pkg))
+        os.unlink(self.torch + "/deep/.netrc")
+        stale = {"component": "F3", "relpath": "gone.txt", "sha256": "0" * 64, "pattern": "hf_token", "note": "old"}
+        self.fx.write_allowlist([dict(doc, note="reviewed"), stale])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = bp.cmd_credential_report(args)
+        text = out.getvalue()
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(len([l for l in text.splitlines() if l.startswith("L2 ALLOWLISTED ")]), 1)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("STALE ")], ["STALE " + json.dumps(stale, separators=(", ", ": "))])
+        self.assertTrue(text.splitlines()[-1].startswith("build_pkg: CREDENTIAL REPORT CLEAN"))
+
+    def test_scan_package_l1_l2_keys_and_ds_store(self):
+        pkg = self.fx.root + "/pkgscan"
+        write_file(pkg + "/payload/F3-user-site/lib/x.txt", ("a " + GITHUB_CANARY).encode("ascii"))
+        write_file(pkg + "/manifests/source-host.json", ('{"k": "' + GITHUB_CANARY + '"}').encode("ascii"))
+        write_file(pkg + "/payload/B1-ltx2mlx-repo/.DS_Store", b"ds")
+        write_file(pkg + "/payload/B1-ltx2mlx-repo/deep/.netrc", b"machine x\n")
+        make_link(pkg + "/payload/B1-ltx2mlx-repo/token", "nowhere")
+        failures, allowed = bp.scan_package(pkg, set())
+        self.assertEqual(sorted(failures), sorted([
+            "L2 github_token payload/F3-user-site/lib/x.txt",
+            "L2 github_token manifests/source-host.json",
+            "DS_Store: payload/B1-ltx2mlx-repo/.DS_Store",
+            "L1 payload/B1-ltx2mlx-repo/deep/.netrc",
+            "L1 payload/B1-ltx2mlx-repo/token"]))
+        self.assertEqual([f for f in failures if GITHUB_CANARY in f], [])
+        allow = set([("F3", "lib/x.txt", file_sha256(pkg + "/payload/F3-user-site/lib/x.txt"), "github_token"),
+                     ("ROOT", "manifests/source-host.json", file_sha256(pkg + "/manifests/source-host.json"), "github_token")])
+        failures, allowed = bp.scan_package(pkg, allow)
+        self.assertEqual(len(allowed), 2)
+        self.assertEqual(sorted(failures), sorted(["DS_Store: payload/B1-ltx2mlx-repo/.DS_Store",
+                                                   "L1 payload/B1-ltx2mlx-repo/deep/.netrc",
+                                                   "L1 payload/B1-ltx2mlx-repo/token"]))
+        self.assertEqual(bp.allowlist_key("payload/A2-hw-gate-seeds/portrait.png"), ("A2", "portrait.png"))
+        self.assertEqual(bp.allowlist_key("README.md"), ("ROOT", "README.md"))
+
+    def test_credential_scan_doc_holds_no_secret_material(self):
+        secret = SECRET_CANARY
+        write_file(self.fx.home + "/.cache/huggingface/token", (secret + "\n").encode("ascii"))
+        ctx = self.l2_ctx()
+        ctx.secrets, ctx.l3_sources, ctx.l3_errors = bp.load_known_secrets()
+        doc = bp.credential_scan_doc(ctx)
+        text = json.dumps(doc)
+        self.assertNotIn(secret, text)
+        self.assertNotIn(hashlib.sha256(secret.encode("ascii")).hexdigest(), text)
+        self.assertEqual(doc["l1_names"], sorted(bp.L1_NAMES))
+        self.assertEqual(list(doc["l2_patterns"]), [pid for pid, rx in bp.L2_PATTERNS])
+        self.assertEqual(doc["l2_max_bytes"], 4194304)
+        self.assertEqual(doc["l3_sources"][0], {"source": self.fx.home + "/.cache/huggingface/token", "present": True, "values": 1})
+        self.assertEqual(bp.l2_scan_bytes(text.encode("utf-8")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -738,3 +738,296 @@ def check_no_employer_packages(ctx):
     if hits:
         return CheckResult("B18", False, "employer package path(s) shipped: %s" % ", ".join(hits), True)
     return CheckResult("B18", True, "no employer package paths in %d entries" % len(ctx.entries), True)
+
+
+# ---------------------------------------------------------------------------
+# Credential gate (spec 8)
+# ---------------------------------------------------------------------------
+L2_PATTERNS = (
+    ("hf_token", re.compile(rb"hf_[A-Za-z0-9]{34,40}")),
+    ("private_key", re.compile(rb"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("aws_access_key_id", re.compile(rb"AKIA[0-9A-Z]{16}")),
+    ("github_token", re.compile(rb"gh[pousr]_[A-Za-z0-9]{36}")),
+    ("anthropic_api_key", re.compile(rb"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{32,}")),
+    ("openai_api_key", re.compile(rb"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
+)
+
+
+def is_allowlisted(allow, component, relpath, sha256, pattern_id):
+    return (component, relpath, sha256, pattern_id) in allow
+
+
+def parse_allowlist(data, label):
+    doc = json.loads(data.decode("utf-8"))
+    if not isinstance(doc, dict) or doc.get("schema_version") != 1 or not isinstance(doc.get("entries"), list):
+        raise ValueError('%s: expected {"schema_version": 1, "entries": [...]}' % label)
+    allow = set()
+    entries = []
+    for index, item in enumerate(doc["entries"]):
+        if not isinstance(item, dict):
+            raise ValueError("%s: entry %d is not an object" % (label, index))
+        for key in ("component", "relpath", "sha256", "pattern"):
+            if not isinstance(item.get(key), str) or not item.get(key):
+                raise ValueError("%s: entry %d: %s must be a non-empty string" % (label, index, key))
+        note = item.get("note")
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("%s: entry %d: note must be a non-empty string" % (label, index))
+        allow.add((item["component"], item["relpath"], item["sha256"], item["pattern"]))
+        entries.append(item)
+    return allow, entries
+
+
+def load_allowlist(path):
+    with open(path, "rb") as fh:
+        return parse_allowlist(fh.read(), path)
+
+
+def l2_scan_bytes(data):
+    return [pid for pid, rx in L2_PATTERNS if rx.search(data)]
+
+
+def l2_scan_sources(ctx):
+    hits = []
+    errors = []
+    for entry in ctx.entries:
+        if entry["k"] != "f" or "_src" not in entry or entry["b"] > L2_MAX_BYTES:
+            continue
+        try:
+            with open(entry["_src"], "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            errors.append("cannot read %s for the L2 scan: %s" % (entry["_src"], exc))
+            continue
+        pids = l2_scan_bytes(data)
+        if pids:
+            digest = sha256_bytes(data)
+            for pid in pids:
+                hits.append({"component": entry["c"], "relpath": entry["_rel"], "sha256": digest, "pattern": pid})
+    return hits, errors
+
+
+def classify_l2_hits(hits, allow):
+    new = []
+    allowed = []
+    for hit in hits:
+        if is_allowlisted(allow, hit["component"], hit["relpath"], hit["sha256"], hit["pattern"]):
+            allowed.append(hit)
+        else:
+            new.append(hit)
+    return new, allowed
+
+
+def stale_allowlist_entries(entries, hits):
+    keys = set((h["component"], h["relpath"], h["sha256"], h["pattern"]) for h in hits)
+    return [e for e in entries if (e["component"], e["relpath"], e["sha256"], e["pattern"]) not in keys]
+
+
+def report_json(hit):
+    return json.dumps({"component": hit["component"], "relpath": hit["relpath"], "sha256": hit["sha256"],
+                       "pattern": hit["pattern"], "note": ""}, separators=(", ", ": "))
+
+
+def load_deploy_files(ctx):
+    """Read scripts/deploy/* into memory before any write (stage step 4); parse the allowlist."""
+    directory = deploy_dir()
+    for name in DEPLOY_SCRIPT_FILES:
+        with open(os.path.join(directory, name), "rb") as fh:
+            ctx.script_bytes[name] = fh.read()
+    try:
+        ctx.allow, ctx.allow_entries = parse_allowlist(ctx.script_bytes["credential_allowlist.json"],
+                                                       os.path.join(directory, "credential_allowlist.json"))
+        ctx.allow_error = None
+    except ValueError as exc:
+        ctx.allow, ctx.allow_entries, ctx.allow_error = set(), [], str(exc)
+
+
+def prepare_l2(ctx):
+    ctx.l2_hits, ctx.l2_errors = l2_scan_sources(ctx)
+    ctx.l2_new, ctx.l2_allowed = classify_l2_hits(ctx.l2_hits, ctx.allow)
+
+
+def _read_token_file(path, label, add, sources, errors):
+    if not os.path.lexists(path):
+        sources.append({"source": label, "present": False, "values": 0})
+        return
+    try:
+        with open(path, "rb") as fh:
+            value = fh.read().strip()
+    except OSError as exc:
+        errors.append("B14: cannot read %s: %s" % (label, exc))
+        sources.append({"source": label, "present": True, "values": 0})
+        return
+    sources.append({"source": label, "present": True, "values": add(label, [value])})
+
+
+def load_known_secrets():
+    """L3 secret values (spec 8.3). Values are never written, logged, hashed into output or measured."""
+    H = home()
+    values = []
+    sources = []
+    errors = []
+
+    def add(label, candidates):
+        count = 0
+        for value in candidates:
+            if not value:
+                continue
+            count += 1
+            if len(value) < 16:
+                errors.append("B14: a known-secret value from %s is too short to scan safely (< 16 bytes)" % label)
+            if value not in values:
+                values.append(value)
+        return count
+
+    _read_token_file(H + "/.cache/huggingface/token", H + "/.cache/huggingface/token", add, sources, errors)
+    stored = H + "/.cache/huggingface/stored_tokens"
+    if not os.path.lexists(stored):
+        sources.append({"source": stored, "present": False, "values": 0})
+    else:
+        found = []
+        try:
+            with open(stored, "rb") as fh:
+                text = fh.read().decode("utf-8")
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read_string(text)
+            for section in parser.sections():
+                if parser.has_option(section, "hf_token"):
+                    found.append(parser.get(section, "hf_token").strip().encode("utf-8"))
+                if parser.has_option(section, "refresh_token"):
+                    found.append(parser.get(section, "refresh_token").strip().encode("utf-8"))
+        except (OSError, UnicodeDecodeError, configparser.Error):
+            errors.append("B14: %s exists but cannot be parsed" % stored)
+            sources.append({"source": stored, "present": True, "values": 0})
+        else:
+            if not [v for v in found if v]:
+                errors.append("B14: %s yields no hf_token or refresh_token values" % stored)
+            sources.append({"source": stored, "present": True, "values": add(stored, found)})
+    ltx_token = H + "/ltx-2-mlx/hf_cache/token"
+    _read_token_file(ltx_token, ltx_token, add, sources, errors)
+    env_value = os.environ.get("HF_TOKEN")
+    if env_value is None:
+        sources.append({"source": "$HF_TOKEN", "present": False, "values": 0})
+    else:
+        sources.append({"source": "$HF_TOKEN", "present": True, "values": add("$HF_TOKEN", [env_value.strip().encode("utf-8")])})
+    return values, sources, errors
+
+
+def list_tree(root):
+    """[(relpath, lstat)] for everything under root, sorted, never following symlinks."""
+    out = []
+
+    def walk(rel_dir):
+        abs_dir = root + "/" + rel_dir if rel_dir else root
+        for name in sorted(os.listdir(abs_dir)):
+            rel = rel_dir + "/" + name if rel_dir else name
+            st = os.lstat(root + "/" + rel)
+            out.append((rel, st))
+            if stat.S_ISDIR(st.st_mode):
+                walk(rel)
+    walk("")
+    return out
+
+
+def allowlist_key(rel):
+    parts = rel.split("/")
+    if len(parts) >= 3 and parts[0] == "payload":
+        return parts[1].split("-", 1)[0], "/".join(parts[2:])
+    return "ROOT", rel
+
+
+def scan_package(package_root, allow):
+    """L1 + L2 over every file and symlink under package_root; any .DS_Store fails."""
+    failures = []
+    allowed = []
+    for rel, st in list_tree(package_root):
+        name = rel.rsplit("/", 1)[-1]
+        if name == ".DS_Store":
+            failures.append("DS_Store: " + rel)
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            continue
+        if name in L1_NAMES:
+            failures.append("L1 " + rel)
+        if stat.S_ISREG(st.st_mode) and st.st_size <= L2_MAX_BYTES:
+            with open(package_root + "/" + rel, "rb") as fh:
+                data = fh.read()
+            pids = l2_scan_bytes(data)
+            if pids:
+                component, relpath = allowlist_key(rel)
+                digest = sha256_bytes(data)
+                for pid in pids:
+                    if is_allowlisted(allow, component, relpath, digest, pid):
+                        allowed.append({"component": component, "relpath": relpath, "sha256": digest, "pattern": pid})
+                    else:
+                        failures.append("L2 %s %s" % (pid, rel))
+    return failures, allowed
+
+
+def check_b12(ctx):
+    ok = not ctx.l1_hits
+    message = ("L1: no credential-named files" if ok else
+               "L1: credential-named file(s) (a component root is wrong): %s" % ", ".join(ctx.l1_hits))
+    return CheckResult("B12", ok, message, True)
+
+
+def check_b13(ctx):
+    problems = []
+    if ctx.allow_error:
+        problems.append("allowlist failed to load: %s" % ctx.allow_error)
+    problems.extend(ctx.l2_errors)
+    if ctx.l2_new:
+        shown = "; ".join("%s %s %s" % (h["component"], h["relpath"], h["pattern"]) for h in ctx.l2_new[:20])
+        problems.append("%d L2 hit(s) not allowlisted (review them with --credential-report): %s" % (len(ctx.l2_new), shown))
+    ok = not problems
+    message = ("L2: %d hit(s), all allowlisted" % len(ctx.l2_allowed)) if ok else " | ".join(problems)
+    return CheckResult("B13", ok, message, True)
+
+
+def stale_allowlist_warnings(ctx):
+    return [CheckResult("B13", False, "stale allowlist entry " + json.dumps(entry, separators=(", ", ": ")), False)
+            for entry in stale_allowlist_entries(ctx.allow_entries, ctx.l2_hits)]
+
+
+def check_b14(ctx):
+    ok = not ctx.l3_errors
+    present = ", ".join("%s=%s" % (s["source"], "present" if s["present"] else "absent") for s in ctx.l3_sources)
+    message = ("L3: %d distinct known-secret value(s) loaded (%s)" % (len(ctx.secrets), present)) if ok else "; ".join(ctx.l3_errors)
+    return CheckResult("B14", ok, message, True)
+
+
+def credential_scan_doc(ctx):
+    return {
+        "l1_names": sorted(L1_NAMES),
+        "l2_patterns": dict((pid, rx.pattern.decode("latin-1")) for pid, rx in L2_PATTERNS),
+        "l2_max_bytes": L2_MAX_BYTES,
+        "l2_allowlisted_hits": list(ctx.l2_allowed),
+        "l3_sources": list(ctx.l3_sources),
+    }
+
+
+def l4_rescan(ctx):
+    failures, allowed = scan_package(ctx.package_root, ctx.allow)
+    if failures:
+        raise CredentialLeak("L4: %d finding(s) in the package: %s" % (len(failures), "; ".join(failures[:20])))
+
+
+def cmd_credential_report(args):
+    ctx = BuildCtx(args)
+    enumerate_components(ctx)
+    load_deploy_files(ctx)
+    prepare_l2(ctx)
+    for path in ctx.l1_hits:
+        print("L1 " + path)
+    for hit in ctx.l2_hits:
+        print("L2 %s %s" % ("ALLOWLISTED" if hit in ctx.l2_allowed else "NEW", report_json(hit)))
+    stale = stale_allowlist_entries(ctx.allow_entries, ctx.l2_hits)
+    for entry in stale:
+        print("STALE " + json.dumps(entry, separators=(", ", ": ")))
+    for message in ctx.enum_errors + ctx.l2_errors:
+        print("ENUM-ERROR " + message)
+    if ctx.allow_error:
+        print("ALLOWLIST-ERROR " + ctx.allow_error)
+    clean = not (ctx.l1_hits or ctx.l2_new or ctx.enum_errors or ctx.l2_errors or ctx.allow_error)
+    print("build_pkg: CREDENTIAL REPORT %s: l1=%d new=%d allowlisted=%d stale=%d" % (
+        "CLEAN" if clean else "NOT CLEAN", len(ctx.l1_hits), len(ctx.l2_new), len(ctx.l2_allowed), len(stale)))
+    return 0 if clean else 1
