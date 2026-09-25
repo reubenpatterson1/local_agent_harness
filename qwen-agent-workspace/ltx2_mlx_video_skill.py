@@ -68,18 +68,24 @@ def _format_error(reason, returncode, output_path, stderr_tail):
 
 
 def validate_geometry(width, height, num_frames):
-    """Raise ValueError unless width/height are multiples of 32 and
-    num_frames sits on the 8k+1 lattice at or above 9. The VAE silently
-    crops off-lattice frame counts instead of erroring, so this check is the
-    only thing standing between a typo and a silently shorter clip."""
-    if width % 32 != 0:
-        raise ValueError("width must be a multiple of 32, got %d" % width)
-    if width < 32:
-        raise ValueError("width must be >= 32, got %d" % width)
-    if height % 32 != 0:
-        raise ValueError("height must be a multiple of 32, got %d" % height)
-    if height < 32:
-        raise ValueError("height must be >= 32, got %d" % height)
+    """Raise ValueError unless width/height are multiples of 64 (and at least 64) and
+    num_frames sits on the 8k+1 lattice at or above 9. The distilled pipeline is
+    two-stage and silently floors both edges to multiples of 64 (ltx-core-mlx
+    patchifiers.py snap_output_dimensions), so a 32-multiple such as 736 would render
+    at 704 and only then fail render_panel's uniformity check, after the full GPU
+    spend. The VAE silently crops off-lattice frame counts instead of erroring, so
+    this check is the only thing standing between a typo and a silently shorter
+    clip."""
+    if width % 64 != 0:
+        raise ValueError("width must be a multiple of 64 (ltx-2-mlx distilled two-stage "
+                         "floors to 64; patchifiers.py snap_output_dimensions), got %d" % width)
+    if width < 64:
+        raise ValueError("width must be >= 64, got %d" % width)
+    if height % 64 != 0:
+        raise ValueError("height must be a multiple of 64 (ltx-2-mlx distilled two-stage "
+                         "floors to 64; patchifiers.py snap_output_dimensions), got %d" % height)
+    if height < 64:
+        raise ValueError("height must be >= 64, got %d" % height)
     if (num_frames - 1) % 8 != 0:
         raise ValueError("num_frames must satisfy (num_frames - 1) %% 8 == 0, got %d"
                          % num_frames)

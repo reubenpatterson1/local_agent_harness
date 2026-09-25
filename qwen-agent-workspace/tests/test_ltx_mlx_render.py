@@ -70,6 +70,10 @@ def test_parser_defaults():
     check("R1u skip_input_screen False", a.skip_input_screen is False,
           "got %r" % a.skip_input_screen)
     check("R1v there is no --fps flag", "--fps" not in render.build_parser().format_help())
+    # "video_" + "backend": the spec's grep gate (12.1 item 5) must not match test sources.
+    check("R1af the removed backend flag stays gone",
+          not hasattr(a, "video_" + "backend")
+          and ("--video-" + "backend") not in render.build_parser().format_help())
     check("R1w SECONDS_PER_PANEL_ESTIMATE is an int", isinstance(
         render.SECONDS_PER_PANEL_ESTIMATE, int), "got %r" % render.SECONDS_PER_PANEL_ESTIMATE)
     with open(_RENDER_PATH) as f:
@@ -202,6 +206,49 @@ def test_load_manifest():
         check("R3j absent image_path key is accepted as T2V",
               render.load_manifest(nokey)["panels"][0]["image_path"] is None)
 
+        # v3 (bin/ltx-story-manifest --chain): conditioning is required and validated.
+        def _v3(panels):
+            return _write_manifest(td, panels, schema_version=3)
+
+        good = _v3([{"index": 1, "image_path": img, "panel_text": "t", "conditioning": "still"},
+                    {"index": 2, "image_path": None, "panel_text": "m", "conditioning": "chain"},
+                    {"index": 3, "image_path": None, "panel_text": "x", "conditioning": "t2v"}])
+        check("R3k a valid v3 still/chain/t2v manifest loads",
+              [p["conditioning"] for p in render.load_manifest(good)["panels"]]
+              == ["still", "chain", "t2v"])
+        for label, panels, want in (
+                ("R3l missing conditioning",
+                 [{"index": 1, "image_path": img, "panel_text": "t"}],
+                 "panel 1: conditioning must be one of still/chain/t2v, got None"),
+                ("R3m unknown conditioning",
+                 [{"index": 1, "image_path": img, "panel_text": "t", "conditioning": "bogus"}],
+                 "panel 1: conditioning must be one of still/chain/t2v, got 'bogus'"),
+                ("R3n still with a null image_path",
+                 [{"index": 1, "image_path": None, "panel_text": "t", "conditioning": "still"}],
+                 "panel 1: conditioning 'still' requires an existing, readable image_path"),
+                ("R3o chain on panel 1",
+                 [{"index": 1, "image_path": None, "panel_text": "t", "conditioning": "chain"}],
+                 "panel 1: conditioning 'chain' requires index >= 2 and image_path null"),
+                ("R3p chain with an image_path",
+                 [{"index": 1, "image_path": img, "panel_text": "t", "conditioning": "still"},
+                  {"index": 2, "image_path": img, "panel_text": "m", "conditioning": "chain"}],
+                 "panel 2: conditioning 'chain' requires index >= 2 and image_path null"),
+                ("R3q t2v with an image_path",
+                 [{"index": 1, "image_path": img, "panel_text": "t", "conditioning": "t2v"}],
+                 "panel 1: conditioning 't2v' requires image_path null")):
+            msg = _load_error(_v3(panels))
+            check("%s is rejected with the spec message" % label, msg == want, "got %r" % msg)
+
+        derived = render.load_manifest(_write_manifest(td, [_panel(1, img), _panel(2, None)]))
+        check("R3r v2 derives conditioning: image -> still, null -> t2v",
+              [p["conditioning"] for p in derived["panels"]] == ["still", "t2v"])
+        v1_path = os.path.join(td, "v1.json")
+        with open(v1_path, "w") as f:
+            json.dump({"story_id": "demo", "panels": [_panel(1, img), _panel(2, None)]}, f)
+        check("R3s a v1 manifest (no schema_version) derives the same way",
+              [p["conditioning"] for p in render.load_manifest(v1_path)["panels"]]
+              == ["still", "t2v"])
+
 
 # ---------------------------------------------------------------------------
 # R4: per-panel unit derivation
@@ -210,11 +257,11 @@ def test_load_manifest():
 def test_build_units():
     panels = [
         {"index": 1, "image_path": "/abs/p1.png", "panel_text": "text one",
-         "motion_prompt": "motion one"},
+         "motion_prompt": "motion one", "conditioning": "still"},
         {"index": 2, "image_path": None, "panel_text": "text two",
-         "motion_prompt": None},
+         "motion_prompt": None, "conditioning": "t2v"},
         {"index": 3, "image_path": "/abs/p3.png", "panel_text": "text three",
-         "motion_prompt": ""},
+         "motion_prompt": "", "conditioning": "still"},
     ]
     units = render.build_units(panels, seed=100, clips_dir="/clips", run_root="/runs/r1")
 
@@ -238,15 +285,38 @@ def test_build_units():
     check("R4i log path is <run_root>/panel_%02d.log",
           units[1]["log_path"] == os.path.join("/runs/r1", "panel_02.log"),
           "got %r" % units[1]["log_path"])
-    check("R4j image_path carried through, None stays None",
+    check("R4j image_path carried through for still/t2v, None stays None",
           [u["image_path"] for u in units] == ["/abs/p1.png", None, "/abs/p3.png"],
           "got %r" % [u["image_path"] for u in units])
     check("R4k log_path is None when run_root is None",
           render.build_units(panels, 0, "/clips")[0]["log_path"] is None)
     check("R4l unit keys are exactly the documented set",
           set(units[0]) == {"index", "label", "seed", "prompt", "image_path",
-                            "clip_path", "log_path"},
+                            "clip_path", "log_path", "conditioning", "chain_source"},
           "got %r" % sorted(units[0]))
+    check("R4m conditioning is carried and still/t2v units have no chain_source",
+          [(u["conditioning"], u["chain_source"]) for u in units]
+          == [("still", None), ("t2v", None), ("still", None)])
+
+    chain = [
+        {"index": 1, "image_path": "/abs/p1.png", "panel_text": "img", "motion_prompt": "m1",
+         "conditioning": "still"},
+        {"index": 2, "image_path": None, "panel_text": "m2", "motion_prompt": "m2",
+         "conditioning": "chain"},
+        {"index": 3, "image_path": None, "panel_text": "m3", "motion_prompt": "m3",
+         "conditioning": "chain"},
+    ]
+    cu = render.build_units(chain, seed=0, clips_dir="/clips")
+    check("R4n a still unit keeps its own image_path", cu[0]["image_path"] == "/abs/p1.png")
+    check("R4o chain units read a derived <clips>/panel_%02d.chainseed.png",
+          [u["image_path"] for u in cu[1:]]
+          == ["/clips/panel_02.chainseed.png", "/clips/panel_03.chainseed.png"],
+          "got %r" % [u["image_path"] for u in cu[1:]])
+    check("R4p chain_source is the previous panel's clip",
+          [u["chain_source"] for u in cu] == [None, "/clips/panel_01.mp4", "/clips/panel_02.mp4"],
+          "got %r" % [u["chain_source"] for u in cu])
+    check("R4q chain units keep seed + i and their Motion: prompt",
+          [(u["seed"], u["prompt"]) for u in cu] == [(1, "m1"), (2, "m2"), (3, "m3")])
 
 
 # ---------------------------------------------------------------------------
@@ -264,21 +334,23 @@ def test_clip_is_reusable():
             open(zero, "w").close()
             gone = os.path.join(td, "gone.mp4")
 
+            provenance = {"model_identity": {"resolved_path": td}}
+            render.write_clip_provenance(good, provenance)
             render.clip_frame_count = lambda p: 241
             check("R5a correct frame count -> reusable",
-                  render.clip_is_reusable(good, 241) is True)
+                  render.clip_is_reusable(good, 241, provenance) is True)
             check("R5b missing file -> not reusable",
-                  render.clip_is_reusable(gone, 241) is False)
+                  render.clip_is_reusable(gone, 241, provenance) is False)
             check("R5c zero-byte file -> not reusable",
-                  render.clip_is_reusable(zero, 241) is False)
+                  render.clip_is_reusable(zero, 241, provenance) is False)
 
             render.clip_frame_count = lambda p: 193
             check("R5d wrong frame count -> not reusable",
-                  render.clip_is_reusable(good, 241) is False)
+                  render.clip_is_reusable(good, 241, provenance) is False)
 
             render.clip_frame_count = lambda p: None
             check("R5e ffprobe failure (None) -> not reusable",
-                  render.clip_is_reusable(good, 241) is False)
+                  render.clip_is_reusable(good, 241, provenance) is False)
     finally:
         render.clip_frame_count = saved
 
@@ -554,7 +626,7 @@ def test_probe_timeout_kwarg_present():
 def _write_summary(story_dir, run_id, units, **over):
     run_root = os.path.join(story_dir, "runs", run_id)
     os.makedirs(run_root, exist_ok=True)
-    summary = {"schema_version": 3, "frames_per_panel": 241, "width": 704,
+    summary = {"schema_version": 3, "backend": "ltx-2-mlx", "frames_per_panel": 241, "width": 704,
                "height": 448, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                "model": render.SKILL.MODEL_ID, "units": units}
     summary.update(over)
@@ -739,7 +811,7 @@ def test_estimate_handles_null_units_and_non_dict_entries():
         run_root = os.path.join(td, "runs", "20260910T070707Z-99999999")
         os.makedirs(run_root, exist_ok=True)
         with open(os.path.join(run_root, "story_summary.json"), "w") as f:
-            json.dump({"frames_per_panel": 241, "width": 704, "height": 448,
+            json.dump({"backend": "ltx-2-mlx", "frames_per_panel": 241, "width": 704, "height": 448,
                       "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                       "model": render.SKILL.MODEL_ID, "units": None}, f)
         secs, label = render.estimate_seconds_per_panel(
@@ -750,7 +822,7 @@ def test_estimate_handles_null_units_and_non_dict_entries():
         run_root2 = os.path.join(td, "runs", "20260910T080808Z-88888888")
         os.makedirs(run_root2, exist_ok=True)
         with open(os.path.join(run_root2, "story_summary.json"), "w") as f:
-            json.dump({"frames_per_panel": 241, "width": 704, "height": 448,
+            json.dump({"backend": "ltx-2-mlx", "frames_per_panel": 241, "width": 704, "height": 448,
                       "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
                       "model": render.SKILL.MODEL_ID,
                       "units": ["not-a-dict", {"status": "ok", "resumed": False,
@@ -1073,6 +1145,13 @@ def _render_panel_capturing_stderr(unit, args):
 
 def test_render_panel_statuses():
     saved = render.SKILL.generate_video
+    saved_verification = (render.build_clip_provenance, render.write_clip_provenance,
+                          render.clip_frame_count, render.probe_streams, render.assert_clips_uniform)
+    render.build_clip_provenance = lambda unit, args, **kwargs: {"model_identity": None}
+    render.write_clip_provenance = lambda clip, provenance: None
+    render.clip_frame_count = lambda clip: 145
+    render.probe_streams = lambda clip: {}
+    render.assert_clips_uniform = lambda *args: None
     try:
         # Every field below is deliberately distinct from every other field
         # and from build_parser()'s defaults, so that an argument-swap or a
@@ -1208,6 +1287,8 @@ def test_render_panel_statuses():
               render.JETSAM_LADDER not in err, "got %r" % err)
     finally:
         render.SKILL.generate_video = saved
+        (render.build_clip_provenance, render.write_clip_provenance,
+         render.clip_frame_count, render.probe_streams, render.assert_clips_uniform) = saved_verification
 
 
 def test_jetsam_ladder_text():
@@ -1399,7 +1480,7 @@ def _drive_main(td, story_id, n_panels, extra_argv, panel_status="error",
         # so these tests do not depend on ltx-2-mlx being installed
         render.SKILL._resolve_bin = lambda: sys.executable
         if reusable is not None:
-            render.clip_is_reusable = lambda path, frames: reusable
+            render.clip_is_reusable = lambda path, frames, provenance=None: reusable
         if run_id is not None:
             render.new_run_id = lambda: run_id
         argv = [manifest, out, "--clips-dir", clips, "--skip-input-screen"] + extra_argv
@@ -1660,6 +1741,10 @@ class _Harness(object):
             f.write(b"png")
         self.manifest = _write_manifest(
             td, [_panel(i, img) for i in range(1, n_panels + 1)], story_id=story_id)
+        self.model = os.path.join(td, "model-fixture")
+        os.makedirs(self.model, exist_ok=True)
+        with open(os.path.join(self.model, "split_model.json"), "w") as handle:
+            json.dump({"recipe": "ltx-2.5"}, handle)
         self.clips = os.path.join(td, "clips")
         os.makedirs(self.clips, exist_ok=True)
         self.out = os.path.join(td, "movie.mp4")
@@ -1715,7 +1800,7 @@ class _Harness(object):
 
     def run(self, *extra):
         return render.main([self.manifest, self.out, "--clips-dir", self.clips,
-                            "--skip-input-screen"] + list(extra))
+                            "--skip-input-screen", "--model", self.model] + list(extra))
 
 
 def test_resume_force_orthogonality():
@@ -1875,8 +1960,913 @@ def test_failure_state_machine():
             check("R16z stop + retry still exits 1", rc == 1, "rc=%r" % rc)
 
 
+def test_clip_provenance_contract():
+    from unittest import mock
+    import hashlib
+    with tempfile.TemporaryDirectory() as td:
+        model = os.path.join(td,'model')
+        os.mkdir(model)
+        for name,data in [('z.safetensors',b'weights'),('config.json',b'{}'),('ignored.txt',b'ignored')]:
+            with open(os.path.join(model,name),'wb') as handle: handle.write(data)
+        image = os.path.join(td,'image.png')
+        clip = os.path.join(td,'clip.mp4')
+        with open(image,'wb') as handle: handle.write(b'image bytes')
+        with open(clip,'wb') as handle: handle.write(b'video bytes')
+        unit = dict(prompt='literal prompt\n',image_path=image,seed=4,clip_path=clip,
+                    conditioning='still',chain_source=None)
+        args = _stub_args(model=model)
+        expected = render.build_clip_provenance(unit,args)
+        check('R18 schema_version 2 and the ltx-2-mlx backend constant',
+              expected['schema_version']==2 and expected['backend']=='ltx-2-mlx')
+        check('R18 no VAE decode budget key','vae_decode_budget_gb' not in expected)
+        check('R18 still provenance carries its conditioning and no chain keys',
+              expected['conditioning']=='still' and expected['chain_source_sha256'] is None
+              and expected['chain_frame_index'] is None)
+        identity = expected['model_identity']
+        check('R18 exact identity fields',set(identity)=={'resolved_path','snapshot_revision','files'})
+        check('R18 canonical bundle and local revision',identity['resolved_path']==os.path.realpath(model)
+              and identity['snapshot_revision'] is None)
+        check('R18 sorted relevant metadata excludes unrelated files',
+              [item['path'] for item in identity['files']]==['config.json','z.safetensors'])
+        check('R18 file metadata records sizes and nanosecond mtimes',all(set(item)=={'path','size','mtime_ns'}
+              and isinstance(item['mtime_ns'],int) for item in identity['files']))
+        check('R18 exact prompt and image hashes',expected['prompt_sha256']==hashlib.sha256(b'literal prompt\n').hexdigest()
+              and expected['image_sha256']==hashlib.sha256(b'image bytes').hexdigest())
+        sidecar = clip+'.provenance.json'
+        payload = dict(expected,output_sha256=hashlib.sha256(b'video bytes').hexdigest())
+        def write(value):
+            with open(sidecar,'w') as handle: json.dump(value,handle)
+        with mock.patch.object(render,'clip_frame_count',return_value=241):
+            check('R18 missing sidecar is never reusable',not render.clip_is_reusable(clip,241,expected))
+            write(payload)
+            check('R18 exact provenance reuses clip',render.clip_is_reusable(clip,241,expected))
+            write(dict(reversed(list(payload.items()))))
+            check('R18 reordered valid keys still reuse',render.clip_is_reusable(clip,241,expected))
+            for name,value,comparison in (('schema_version',True,expected),('fps',24.0,expected),
+                                           ('seed',True,dict(expected,seed=1)),('frames',float('nan'),expected)):
+                malformed = dict(payload,**{name:value})
+                write(malformed)
+                check('R18 malformed numeric type %s=%r regenerates' % (name,value),
+                      not render.clip_is_reusable(clip,241,comparison))
+            for key in payload:
+                changed = dict(payload)
+                changed[key] = None if payload[key] is not None else 'changed'
+                write(changed)
+                check('R18 mismatched %s regenerates' % key,not render.clip_is_reusable(clip,241,expected))
+            for value in (None,[],{},'bad',42):
+                write(value)
+                check('R18 malformed sidecar %r regenerates' % value,not render.clip_is_reusable(clip,241,expected))
+            with open(sidecar,'w') as handle: handle.write('{broken')
+            check('R18 corrupt JSON regenerates',not render.clip_is_reusable(clip,241,expected))
+            write(payload)
+            with open(clip,'wb') as handle: handle.write(b'changed video')
+            check('R18 mutated clip checksum regenerates',not render.clip_is_reusable(clip,241,expected))
+            with open(clip,'wb') as handle: handle.write(b'video bytes')
+            with open(os.path.join(model,'config.json'),'ab') as handle: handle.write(b' ')
+            current = render.build_clip_provenance(unit,args)
+            check('R18 changed model metadata regenerates',not render.clip_is_reusable(clip,241,current))
+            unknown = dict(expected,model_identity=None)
+            write(dict(unknown,output_sha256=payload['output_sha256']))
+            check('R18 unknown model identity cannot resume',not render.clip_is_reusable(clip,241,unknown))
+        with mock.patch.object(render,'clip_frame_count',return_value=240):
+            write(payload)
+            check('R18 original frame count guard retained',not render.clip_is_reusable(clip,241,expected))
+        no_image = render.build_clip_provenance(dict(unit,image_path=None,conditioning='t2v'),args)
+        check('R18 T2V provenance hashes no image and no chain source',
+              no_image['image_sha256'] is None and no_image['conditioning']=='t2v'
+              and no_image['chain_source_sha256'] is None and no_image['chain_frame_index'] is None)
+        chain_unit = dict(unit,image_path=os.path.join(td,'panel_02.chainseed.png'),
+                          conditioning='chain',chain_source=clip)
+        chained = render.build_clip_provenance(chain_unit,args)
+        check('R18 chain provenance keys the SOURCE CLIP bytes, never the (absent) PNG',
+              chained['image_sha256'] is None
+              and chained['chain_source_sha256']==hashlib.sha256(b'video bytes').hexdigest())
+        check('R18 chain provenance records the source frame index and its conditioning',
+              chained['chain_frame_index']==args.frames-1 and chained['conditioning']=='chain')
+
+
+def test_cached_model_metadata_and_io_failures():
+    from unittest import mock
+    with tempfile.TemporaryDirectory() as td:
+        cache = os.path.join(td,'cache')
+        repo = os.path.join(cache,'hub','models--org--bundle')
+        snapshot = os.path.join(repo,'snapshots','revision123')
+        os.makedirs(snapshot)
+        os.makedirs(os.path.join(repo,'refs'))
+        with open(os.path.join(repo,'refs','main'),'w') as handle: handle.write('revision123')
+        blob = os.path.join(td,'blob')
+        with open(blob,'wb') as handle: handle.write(b'weight bytes')
+        os.symlink(blob,os.path.join(snapshot,'weights.safetensors'))
+        external = os.path.join(td,'external')
+        os.mkdir(external)
+        with open(os.path.join(external,'ignored.json'),'w') as handle: handle.write('{}')
+        os.symlink(external,os.path.join(snapshot,'linked-directory'))
+        with mock.patch.object(render.SKILL,'LTX2_MLX_HF_HOME',cache):
+            identity = render.model_identity('org/bundle')
+            check('R20 cached identity includes canonical snapshot and revision',
+                  identity['resolved_path']==os.path.realpath(snapshot) and identity['snapshot_revision']=='revision123')
+            check('R20 file symlinks followed, directory symlinks not traversed',
+                  [entry['path'] for entry in identity['files']]==['weights.safetensors'] and identity['files'][0]['size']==12)
+            real_stat = render.os.stat
+            def denied(path,*args,**kwargs):
+                if str(path).endswith('weights.safetensors'): raise PermissionError('fixture read denied')
+                return real_stat(path,*args,**kwargs)
+            with mock.patch.object(render.os,'stat',side_effect=denied):
+                check('R20 unreadable metadata refuses resume',render.model_identity('org/bundle') is None)
+                try:
+                    render.model_identity('org/bundle',strict=True)
+                    raised = False
+                except OSError:
+                    raised = True
+                check('R20 resolved metadata I/O is fatal to verification',raised)
+            check('R20 uncached direct reference remains unresolved',render.model_identity('missing/ref',strict=True) is None)
+            ref_path = os.path.join(repo,'refs','main')
+            real_open = open
+            def unreadable(path,*args,**kwargs):
+                if str(path)==ref_path: raise PermissionError('fixture refs denied')
+                return real_open(path,*args,**kwargs)
+            with mock.patch('builtins.open',side_effect=unreadable):
+                for strict in (False,True):
+                    try:
+                        result = render.model_identity('org/bundle',strict=strict)
+                        raised = False
+                    except OSError:
+                        raised = True
+                    check('R20 unreadable existing refs strict=%s' % strict,raised==strict)
+            with open(ref_path,'w') as handle: handle.write('missing-snapshot')
+            for strict in (False,True):
+                try:
+                    result = render.model_identity('org/bundle',strict=strict)
+                    raised = False
+                except OSError:
+                    raised = True
+                check('R20 broken existing snapshot strict=%s' % strict,raised==strict)
+
+        with _Harness(td,'provenanceio-mlx',1) as h:
+            args = _stub_args(model=h.model)
+            unit = render.build_units(render.load_manifest(h.manifest)['panels'],0,h.clips)[0]
+            with mock.patch.object(render.os,'replace',side_effect=OSError('fixture publish denied')):
+                result = render.render_panel(unit,args)
+            check('R20 sidecar I/O maps to a failed unit',result['status']=='error' and result['clip'] is None)
+            check('R20 sidecar I/O retains the clip and removes sidecar/temp',
+                  os.path.isfile(unit['clip_path']) and not glob.glob(unit['clip_path']+'.provenance.json*'))
+            check('R20 a verification failure is not fatal on the ltx-2-mlx backend',
+                  not result.get('fatal'))
+
+
+def test_provenance_rejects_changes_during_generation():
+    from unittest import mock
+    for changed in ('image','model'):
+        with tempfile.TemporaryDirectory() as td:
+            with _Harness(td,'toctou-'+changed,1) as h:
+                unit = render.build_units(render.load_manifest(h.manifest)['panels'],0,h.clips)[0]
+                args = _stub_args(model=h.model)
+                original = render.SKILL.generate_video
+                def mutate(*pos,**kwargs):
+                    result = original(*pos,**kwargs)
+                    target = unit['image_path'] if changed=='image' else os.path.join(h.model,'split_model.json')
+                    with open(target,'ab') as handle: handle.write(b'changed')
+                    return result
+                with mock.patch.object(render.SKILL,'generate_video',side_effect=mutate):
+                    result = render.render_panel(unit,args)
+                check('R22 changed %s during generation fails without sidecar' % changed,
+                      result['status']=='error' and not result.get('fatal')
+                      and os.path.isfile(unit['clip_path'])
+                      and not os.path.exists(unit['clip_path']+'.provenance.json'))
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td,'identityresolved',1) as h:
+            unit = render.build_units(render.load_manifest(h.manifest)['panels'],0,h.clips)[0]
+            args = _stub_args(model='initially/uncached')
+            with mock.patch.object(render,'model_identity',side_effect=[None,{'resolved_path':'new'}]):
+                result = render.render_panel(unit,args)
+            with open(unit['clip_path']+'.provenance.json') as handle: provenance = json.load(handle)
+            check('R22 newly resolved identity is not adopted for generated clip',
+                  result['status']=='ok' and provenance['model_identity'] is None)
+
+
+# ---------------------------------------------------------------------------
+# R23/R26/R27: chain-seed extraction and validation
+# ---------------------------------------------------------------------------
+
+def _rgb_framemd5(path, vf):
+    """md5 of the single rgb24 frame ffmpeg produces for path under filter vf, or None."""
+    proc = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-vf", vf,
+                           "-fps_mode", "passthrough", "-f", "framemd5", "-"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    rows = [l for l in proc.stdout.splitlines() if l.strip() and not l.startswith("#")]
+    if proc.returncode != 0 or len(rows) != 1:
+        return None
+    return rows[0].split(",")[-1].strip()
+
+
+def test_extract_last_frame_argv():
+    saved = render.subprocess.run
+    seen = {}
+
+    class _Ok(object):
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_ok(argv, **kw):
+        seen["argv"], seen["kw"] = argv, kw
+        with open(argv[-1], "wb") as f:
+            f.write(b"PNGDATA")
+        return _Ok()
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            out_png = os.path.join(td, "panel_02.chainseed.png")
+            tmp_png = os.path.join(td, "panel_02.chainseed.tmp.png")
+            render.subprocess.run = _fake_ok
+            v = render.extract_last_frame("/c/panel_01.mp4", out_png, 145)
+            check("R23a exact argv: select by exact index frames-1, passthrough, one frame, to .tmp.png",
+                  seen.get("argv") == ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i",
+                                       "/c/panel_01.mp4", "-vf", "select=eq(n\\,144)",
+                                       "-fps_mode", "passthrough", "-frames:v", "1", tmp_png],
+                  "got %r" % seen.get("argv"))
+            check("R23b timeout=120", seen.get("kw", {}).get("timeout") == 120,
+                  "got %r" % seen.get("kw"))
+            check("R23c success returns []", v == [], "got %r" % v)
+            check("R23d the tmp file is renamed onto the final path",
+                  os.path.isfile(out_png) and not os.path.exists(tmp_png))
+
+            class _Fail(object):
+                returncode = 1
+                stdout = ""
+                stderr = "E1\nE2\nE3\nE4\nE5\nE6\n"
+            render.subprocess.run = lambda argv, **kw: _Fail()
+            v = render.extract_last_frame("/c/panel_01.mp4", out_png, 145)
+            check("R23e rc!=0 -> one violation naming the clip and the last 5 stderr lines",
+                  len(v) == 1 and v[0].startswith("clip /c/panel_01.mp4: last-frame extraction failed: ")
+                  and "E6" in v[0] and "E2" in v[0] and "E1" not in v[0], "got %r" % v)
+
+            render.subprocess.run = lambda argv, **kw: _Ok()
+            os.remove(out_png)
+            v = render.extract_last_frame("/c/panel_01.mp4", out_png, 145)
+            check("R23f rc 0 but no file written -> a violation, nothing at the final path",
+                  len(v) == 1 and "last-frame extraction failed" in v[0]
+                  and not os.path.exists(out_png), "got %r" % v)
+
+            def _fake_empty(argv, **kw):
+                open(argv[-1], "wb").close()
+                return _Ok()
+            render.subprocess.run = _fake_empty
+            v = render.extract_last_frame("/c/panel_01.mp4", out_png, 145)
+            check("R23g a zero-byte frame -> a violation", len(v) == 1
+                  and "last-frame extraction failed" in v[0], "got %r" % v)
+
+            def _boom(argv, **kw):
+                raise OSError("no ffmpeg here")
+            render.subprocess.run = _boom
+            v = render.extract_last_frame("/c/panel_01.mp4", out_png, 145)
+            check("R23h OSError -> a violation carrying the exception text",
+                  len(v) == 1 and "no ffmpeg here" in v[0], "got %r" % v)
+    finally:
+        render.subprocess.run = saved
+
+
+def test_extract_last_frame_real_ffmpeg():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("SKIP R23i-k real last-frame extraction: ffmpeg/ffprobe not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        clip = os.path.join(td, "panel_01.mp4")
+        proc = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i",
+                               "testsrc2=size=64x64:rate=24", "-frames:v", "9", "-c:v", "libx264",
+                               "-pix_fmt", "yuv420p", clip],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        check("R23i synthesized a 9-frame 64x64 h264 clip",
+              proc.returncode == 0 and render.clip_frame_count(clip) == 9, proc.stdout[-400:])
+        out_png = os.path.join(td, "panel_02.chainseed.png")
+        v = render.extract_last_frame(clip, out_png, 9)
+        check("R23j extraction succeeds and leaves no tmp file",
+              v == [] and os.path.isfile(out_png)
+              and not os.path.exists(os.path.join(td, "panel_02.chainseed.tmp.png")), "got %r" % v)
+        want = _rgb_framemd5(clip, "select=eq(n\\,8),format=rgb24")
+        got = _rgb_framemd5(out_png, "format=rgb24")
+        not_last = _rgb_framemd5(clip, "select=eq(n\\,7),format=rgb24")
+        check("R23k the PNG is exactly frame 8 -- the last -- and not frame 7",
+              want is not None and got == want and not_last != want,
+              "want=%r got=%r frame7=%r" % (want, got, not_last))
+
+
+def test_check_chain_seed():
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print("SKIP R26 check_chain_seed: ffmpeg/ffprobe not on PATH")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        def _still(name, source):
+            path = os.path.join(td, name)
+            p = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i",
+                                source, "-frames:v", "1", path],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return path if p.returncode == 0 else None
+        black = _still("black.png", "color=c=black:s=64x64")
+        grey = _still("grey.png", "color=c=0x808080:s=64x64")
+        busy = _still("busy.png", "testsrc2=s=64x64")
+        # Healthy range (YMIN=16, YMAX=235, range=219) but low average (YAVG=19.42):
+        # the RANGE clause alone would NOT reject this frame, so only the YAVG clause
+        # detects it. Isolates R26b (which black -- range=0 -- does not).
+        lowavg = _still("lowavg.png",
+                       "color=c=black:s=64x64,drawbox=x=0:y=0:w=8:h=8:c=white:t=fill")
+        check("R26a synthesized black, flat-grey, testsrc2 and low-average frames",
+              None not in (black, grey, busy, lowavg))
+        if None in (black, grey, busy, lowavg):
+            return
+        v = render.check_chain_seed(black, 64, 64, 1)
+        check("R26b a black frame is degenerate and names panel 1's Motion: as the remedy",
+              len(v) == 1 and ("chain frame %s is degenerate (YAVG=" % black) in v[0]
+              and "edit panel 1's Motion: in story.md" in v[0], "got %r" % v)
+        v = render.check_chain_seed(grey, 64, 64, 4)
+        check("R26c a flat grey frame (bright but no range) is degenerate",
+              len(v) == 1 and "is degenerate" in v[0] and "edit panel 4's Motion:" in v[0],
+              "got %r" % v)
+        check("R26d a testsrc2 frame passes", render.check_chain_seed(busy, 64, 64, 1) == [],
+              "got %r" % render.check_chain_seed(busy, 64, 64, 1))
+        v = render.check_chain_seed(busy, 128, 64, 1)
+        check("R26e the wrong size is a size violation",
+              v == ["chain frame %s is 64x64, expected 128x64" % busy], "got %r" % v)
+        missing = os.path.join(td, "missing.png")
+        v = render.check_chain_seed(missing, 64, 64, 1)
+        check("R26f a missing frame is an ffprobe failure",
+              len(v) == 1 and v[0].startswith("chain frame %s: ffprobe failed: " % missing),
+              "got %r" % v)
+        v = render.check_chain_seed(lowavg, 64, 64, 7)
+        check("R26g a low-average but healthy-range frame is degenerate on the YAVG clause "
+              "alone (range=219 would pass the RANGE clause by itself)",
+              len(v) == 1 and "is degenerate" in v[0] and "edit panel 7's Motion:" in v[0],
+              "got %r" % v)
+
+
+def test_chain_seed_thresholds():
+    """R26: pin the exact threshold constants and the strict-< boundary behavior of both
+    clauses in check_chain_seed, using stubbed signalstats output (this tests the
+    comparison logic itself, not real ffmpeg)."""
+    check("R26h the degenerate thresholds are pinned",
+          render.CHAIN_SEED_MIN_YAVG == 20 and render.CHAIN_SEED_MIN_YRANGE == 10,
+          "got CHAIN_SEED_MIN_YAVG=%r CHAIN_SEED_MIN_YRANGE=%r"
+          % (render.CHAIN_SEED_MIN_YAVG, render.CHAIN_SEED_MIN_YRANGE))
+
+    saved_run = render.subprocess.run
+    saved_probe = render.ffprobe_image_size
+
+    class _Ok(object):
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def _stats(yavg, ymin, ymax):
+        stdout = ("lavfi.signalstats.YAVG=%s\nlavfi.signalstats.YMIN=%s\n"
+                  "lavfi.signalstats.YMAX=%s\n" % (yavg, ymin, ymax))
+        return lambda argv, **kw: _Ok(stdout)
+
+    try:
+        render.ffprobe_image_size = lambda path: ((64, 64), None)
+
+        render.subprocess.run = _stats(20, 15, 25)  # YAVG==20, range==10: both at boundary
+        v = render.check_chain_seed("/x.png", 64, 64, 1)
+        check("R26i YAVG==20 and range==10 both pass (strict <, boundary is inclusive-pass)",
+              v == [], "got %r" % v)
+
+        render.subprocess.run = _stats(19.9, 15, 25)  # YAVG just under threshold
+        v = render.check_chain_seed("/x.png", 64, 64, 1)
+        check("R26j YAVG==19.9 (just under CHAIN_SEED_MIN_YAVG) fails",
+              len(v) == 1 and "is degenerate" in v[0], "got %r" % v)
+
+        render.subprocess.run = _stats(20, 15.1, 25)  # range just under threshold
+        v = render.check_chain_seed("/x.png", 64, 64, 1)
+        check("R26k range==9.9 (just under CHAIN_SEED_MIN_YRANGE) fails",
+              len(v) == 1 and "is degenerate" in v[0], "got %r" % v)
+    finally:
+        render.subprocess.run = saved_run
+        render.ffprobe_image_size = saved_probe
+
+
+def test_prepare_chain_seed_composition():
+    saved = (render.extract_last_frame, render.check_chain_seed)
+    seen = []
+    try:
+        unit = {"index": 3, "chain_source": "/c/panel_02.mp4",
+                "image_path": "/c/panel_03.chainseed.png"}
+        args = _stub_args(frames=145, width=512, height=384)
+        render.extract_last_frame = lambda clip, png, frames: (
+            seen.append(("x", clip, png, frames)) or ["extract failed"])
+        render.check_chain_seed = lambda png, w, h, src: (seen.append(("c", png, w, h, src)) or [])
+        v = render.prepare_chain_seed(unit, args)
+        check("R27a an extraction failure short-circuits the frame check",
+              v == ["extract failed"]
+              and seen == [("x", "/c/panel_02.mp4", "/c/panel_03.chainseed.png", 145)],
+              "v=%r seen=%r" % (v, seen))
+        seen[:] = []
+        render.extract_last_frame = lambda clip, png, frames: (seen.append(("x",)) or [])
+        render.check_chain_seed = lambda png, w, h, src: (
+            seen.append(("c", png, w, h, src)) or ["bad frame"])
+        v = render.prepare_chain_seed(unit, args)
+        check("R27b after a clean extraction the frame is checked at --width x --height, "
+              "naming panel index-1", v == ["bad frame"]
+              and seen == [("x",), ("c", "/c/panel_03.chainseed.png", 512, 384, 2)],
+              "v=%r seen=%r" % (v, seen))
+    finally:
+        render.extract_last_frame, render.check_chain_seed = saved
+
+
+# ---------------------------------------------------------------------------
+# R24/R25/R28-R32: the chain loop (a v3 --chain manifest through the REAL main()
+# loop and the REAL finish_run; render_panel and the chain seed are scripted)
+# ---------------------------------------------------------------------------
+
+def _write_chain_manifest(td, story_id, n_panels):
+    still = os.path.join(td, "%s_still.png" % story_id)
+    with open(still, "wb") as f:
+        f.write(b"png")
+    panels = [{"index": 1, "image_path": still, "panel_text": "still image text",
+               "motion_prompt": "motion 1", "conditioning": "still", "num_frames": 145}]
+    for i in range(2, n_panels + 1):
+        panels.append({"index": i, "image_path": None, "panel_text": "motion %d" % i,
+                       "motion_prompt": "motion %d" % i, "conditioning": "chain",
+                       "num_frames": 145})
+    return _write_manifest(td, panels, story_id=story_id, schema_version=3), still
+
+
+def _drive_chain(td, story_id, n_panels, extra_argv, script=None, seed_violations=None,
+                 screen=None, still_probe=((704, 448), None)):
+    """script[i] is the list of statuses successive render_panel calls on panel i
+    return ("ok"/"error"/"fatal"); a panel missing from script always returns "ok".
+    "fatal" returns status "error" with fatal=True, matching render_panel's own
+    fatal-backend-error shape.
+    seed_violations[i] is what prepare_chain_seed returns for panel i (default []).
+    screen replaces run_input_content_screen (default: always 0). still_probe is
+    what ffprobe_image_size returns for the panel-1 still.
+    Returns (rc, calls, summary, prepared, stdout, stderr)."""
+    manifest, _still = _write_chain_manifest(td, story_id, n_panels)
+    clips = os.path.join(td, "clips_%s" % story_id)
+    out = os.path.join(td, "%s.mp4" % story_id)
+    story_root = os.path.join(td, "story")
+    os.makedirs(os.path.join(story_root, story_id), exist_ok=True)
+    script = script or {}
+    calls, prepared, attempts = [], [], {}
+
+    def fake_render_panel(unit, args):
+        i = unit["index"]
+        calls.append(i)
+        n = attempts.get(i, 0)
+        attempts[i] = n + 1
+        statuses = script.get(i, ["ok"])
+        status = statuses[min(n, len(statuses) - 1)]
+        if status == "ok":
+            return {"unit": unit["label"], "status": "ok", "attempts": 1, "seconds": 1.0,
+                    "clip": os.path.abspath(unit["clip_path"]), "resumed": False}
+        if status == "fatal":
+            return {"unit": unit["label"], "status": "error", "attempts": 1, "seconds": 0.1,
+                    "clip": None, "rc": 1, "error": "stub fatal failure", "fatal": True}
+        return {"unit": unit["label"], "status": status, "attempts": 1, "seconds": 0.1,
+                "clip": None, "rc": 1, "error": "stub failure"}
+
+    def fake_prepare(unit, args):
+        prepared.append(unit["index"])
+        return list((seed_violations or {}).get(unit["index"], []))
+
+    saved = (render.story_dir_for, render.render_panel, render.prepare_chain_seed,
+             render.run_input_content_screen, render.SKILL._resolve_bin,
+             render.ffprobe_image_size, render.probe_streams, render.assert_clips_uniform,
+             render.build_concat_command)
+    so, se = io.StringIO(), io.StringIO()
+    try:
+        render.story_dir_for = lambda sid: os.path.join(story_root, sid)
+        render.render_panel = fake_render_panel
+        render.prepare_chain_seed = fake_prepare
+        render.run_input_content_screen = screen or (lambda paths: 0)
+        render.SKILL._resolve_bin = lambda: sys.executable
+        render.ffprobe_image_size = lambda path: still_probe
+        render.probe_streams = lambda p: {"streams": []}
+        render.assert_clips_uniform = lambda *a: None
+        render.build_concat_command = lambda lp, o: [
+            sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'MOVIE')", o]
+        with contextlib.redirect_stdout(so), contextlib.redirect_stderr(se):
+            rc = render.main([manifest, out, "--clips-dir", clips] + extra_argv)
+    finally:
+        (render.story_dir_for, render.render_panel, render.prepare_chain_seed,
+         render.run_input_content_screen, render.SKILL._resolve_bin,
+         render.ffprobe_image_size, render.probe_streams, render.assert_clips_uniform,
+         render.build_concat_command) = saved
+    found = glob.glob(os.path.join(story_root, story_id, "runs", "*", "story_summary.json"))
+    summary = None
+    if found:
+        with open(max(found, key=os.path.getmtime)) as f:
+            summary = json.load(f)
+    return rc, calls, summary, prepared, so.getvalue(), se.getvalue()
+
+
+def _clip_names(summary):
+    return [os.path.basename(c) for c in (summary or {}).get("clips", [])]
+
+
+def test_chain_manifest_rejects_skip_policy():
+    with tempfile.TemporaryDirectory() as td:
+        for extra, tag in (([], "R31a"), (["--dry-run"], "R31b")):
+            rc, calls, summary, prepared, out, err = _drive_chain(
+                td, "skipchain%s" % tag, 3, ["--skip-input-screen", "--on-panel-failure", "skip"] + extra)
+            check("%s --on-panel-failure skip on a chained manifest exits 2 before any work" % tag,
+                  rc == 2 and calls == [] and summary is None
+                  and "--on-panel-failure skip is not allowed for a chained manifest: a skipped "
+                      "panel leaves the next panel with no frame to continue from" in err,
+                  "rc=%r calls=%r err=%r" % (rc, calls, err))
+
+
+def test_chain_loop_inline_retry_then_stop():
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "retrystop", 3, ["--skip-input-screen", "--retry-failed", "1", "--retry-idle", "0"],
+            script={2: ["error", "error"]})
+        check("R24a panel 2 fails twice -> exit 1", rc == 1, "rc=%r" % rc)
+        check("R24b panel 2 was rendered twice (inline retry), panel 3 never",
+              calls == [1, 2, 2], "calls=%r" % calls)
+        check("R24c stopped_reason is chain_broken", s and s["stopped_reason"] == "chain_broken",
+              "got %r" % (s or {}).get("stopped_reason"))
+        check("R24d panel 3 is not_attempted",
+              s and s["units"][2]["status"] == "not_attempted", "got %r" % (s or {}).get("units"))
+        check("R24e the retry is recorded as attempt 2 with its first failure",
+              s and s["units"][1]["attempts"] == 2 and s["units"][1]["first_failure"] == "error",
+              "got %r" % (s or {}).get("units"))
+        check("R24f the completed prefix (panel 1) is concatenated into the movie",
+              _clip_names(s) == ["panel_01.mp4"] and s["output_path"] is not None,
+              "got %r" % _clip_names(s))
+        check("R24g the inline-retry banner and the relaunch hint are printed",
+              "=== inline retry: panel 2 (chained; later panels depend on it) ===" in out
+              and "relaunch:" in out, "got %r" % out[-1200:])
+        check("R24h the chain seed is prepared once for panel 2 (the retry reuses it)",
+              prepared == [2], "prepared=%r" % prepared)
+
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "retryok", 3, ["--skip-input-screen", "--retry-failed", "1", "--retry-idle", "0"],
+            script={2: ["error", "ok"]})
+        check("R24i a successful inline retry completes the chain and exits 0",
+              rc == 0 and calls == [1, 2, 2, 3] and prepared == [2, 3]
+              and s["units"][1]["status"] == "ok" and s["units"][1]["attempts"] == 2
+              and s["stopped_reason"] is None,
+              "rc=%r calls=%r prepared=%r" % (rc, calls, prepared))
+
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "noretry", 3, ["--skip-input-screen"], script={2: ["error"]})
+        check("R24j without --retry-failed one failure is chain_broken",
+              rc == 1 and calls == [1, 2] and s["stopped_reason"] == "chain_broken",
+              "rc=%r calls=%r" % (rc, calls))
+
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "p1fails", 3, ["--skip-input-screen", "--retry-failed", "1", "--retry-idle", "0"],
+            script={1: ["error", "error"]})
+        check("R24k panel 1 of a chained manifest also retries inline, then stops",
+              rc == 1 and calls == [1, 1] and prepared == [] and s["stopped_reason"] == "chain_broken"
+              and s["output_path"] is None, "rc=%r calls=%r" % (rc, calls))
+
+    # G14: the end-of-run retry pass must never run for a chained manifest, even when
+    # finish_run is reached with stopped_reason None.
+    saved = (render.render_panel, render.probe_streams, render.assert_clips_uniform,
+             render.build_concat_command)
+    retried = []
+    try:
+        render.render_panel = lambda unit, args: (retried.append(unit["index"]) or {
+            "unit": unit["label"], "status": "ok", "attempts": 1, "seconds": 0.0,
+            "clip": "/a/2.mp4", "resumed": False})
+        render.probe_streams = lambda p: {"streams": []}
+        render.assert_clips_uniform = lambda *a: None
+        render.build_concat_command = lambda lp, o: [
+            sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'M')", o]
+        with tempfile.TemporaryDirectory() as td:
+            run_root = os.path.join(td, "run")
+            os.makedirs(run_root)
+            args = render.build_parser().parse_args(
+                [os.path.join(td, "m.json"), os.path.join(td, "out.mp4"),
+                 "--retry-failed", "1", "--retry-idle", "0"])
+            panels = [{"index": 1, "image_path": "/s.png", "panel_text": "t", "motion_prompt": "m",
+                       "conditioning": "still"},
+                      {"index": 2, "image_path": None, "panel_text": "m2", "motion_prompt": "m2",
+                       "conditioning": "chain"}]
+            units = render.build_units(panels, 0, os.path.join(td, "clips"), run_root)
+            ur = {1: {"unit": "panel-1", "status": "ok", "attempts": 1, "seconds": 1.0,
+                      "clip": "/a/1.mp4", "resumed": False},
+                  2: {"unit": "panel-2", "status": "error", "attempts": 1, "seconds": 0.1,
+                      "clip": None, "rc": 1, "error": "x"}}
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                render.finish_run(args, ["m", "o"], {"schema_version": 3}, units, ur,
+                                  {1: "/a/1.mp4"}, 1, None, run_root, "sid")
+        check("R24l the end-of-run retry pass never runs for a chained manifest", retried == [],
+              "retried=%r" % retried)
+    finally:
+        (render.render_panel, render.probe_streams, render.assert_clips_uniform,
+         render.build_concat_command) = saved
+
+
+def test_chain_loop_inline_retry_fatal_is_backend_failure():
+    """Review Finding 1: a fatal backend error on the INLINE chain retry must stop with
+    stopped_reason backend_failure, the same label a fatal error on the first attempt
+    already gets -- not chain_broken, which would mislabel an unretryable backend
+    crash as an ordinary chain failure and print the (nonsensical) relaunch hint."""
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "retryfatal", 3, ["--skip-input-screen", "--retry-failed", "1", "--retry-idle", "0"],
+            script={2: ["error", "fatal"]})
+        check("F1a a fatal error on the inline chain retry stops with backend_failure, "
+              "not chain_broken",
+              rc == 1 and calls == [1, 2, 2] and s and s["stopped_reason"] == "backend_failure",
+              "rc=%r calls=%r stopped_reason=%r" % (rc, calls, (s or {}).get("stopped_reason")))
+        check("F1b the fatal retry is still recorded as attempt 2 with its first failure",
+              s["units"][1]["attempts"] == 2 and s["units"][1]["first_failure"] == "error"
+              and s["units"][1]["status"] == "error", "got %r" % s["units"][1])
+        check("F1c panel 3 is not_attempted and no relaunch hint is printed for a "
+              "backend_failure stop",
+              s["units"][2]["status"] == "not_attempted" and "relaunch:" not in out,
+              "units=%r out=%r" % (s["units"], out[-500:]))
+
+
+def test_chain_loop_seed_invalid_stops():
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "seedbad", 3, ["--skip-input-screen", "--retry-failed", "1", "--retry-idle", "0"],
+            seed_violations={2: ["chain frame X is degenerate (YAVG=16.0, YMIN=16.0, YMAX=16.0)"]})
+        check("R28a a degenerate chain frame stops the run before panel 2 renders",
+              rc == 1 and calls == [1] and prepared == [2], "rc=%r calls=%r" % (rc, calls))
+        check("R28b panel 2 is recorded chain_seed_invalid with 0 attempts and the reason",
+              s and s["units"][1]["status"] == "chain_seed_invalid"
+              and s["units"][1]["attempts"] == 0 and "degenerate" in s["units"][1]["error"],
+              "got %r" % (s or {}).get("units"))
+        check("R28c stopped_reason chain_seed_invalid; panel 3 not_attempted; prefix kept",
+              s["stopped_reason"] == "chain_seed_invalid"
+              and s["units"][2]["status"] == "not_attempted" and _clip_names(s) == ["panel_01.mp4"])
+        check("R28d the operator sees 'panel 2 FAILED (chain seed):'",
+              "panel 2 FAILED (chain seed): chain frame X is degenerate" in err, "got %r" % err)
+
+    with tempfile.TemporaryDirectory() as td:
+        screened = []
+
+        def screen(paths):
+            screened.append(list(paths))
+            return 3 if any(p.endswith(".chainseed.png") for p in paths) else 0
+        rc, calls, s, prepared, out, err = _drive_chain(td, "seedblocked", 3, [], screen=screen)
+        check("R28e a chain frame that fails the content screen stops the run",
+              rc == 1 and calls == [1] and s["units"][1]["status"] == "chain_seed_blocked"
+              and s["stopped_reason"] == "chain_seed_blocked", "rc=%r calls=%r" % (rc, calls))
+        check("R28f the still is screened at startup and the chain frame before its render",
+              len(screened) == 2 and screened[0][0].endswith("seedblocked_still.png")
+              and screened[1][0].endswith("panel_02.chainseed.png"), "got %r" % screened)
+
+    with tempfile.TemporaryDirectory() as td:
+        screened = []
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "noscreen", 3, ["--skip-input-screen"],
+            screen=lambda paths: (screened.append(list(paths)) or 0))
+        check("R28g --skip-input-screen also skips the chain-frame screen",
+              rc == 0 and screened == [] and calls == [1, 2, 3], "rc=%r screened=%r" % (rc, screened))
+
+
+def test_chain_resume_cascade():
+    saved = render.clip_frame_count
+    try:
+        render.clip_frame_count = lambda p: 145
+        with tempfile.TemporaryDirectory() as td:
+            model = os.path.join(td, "model")
+            os.makedirs(model)
+            with open(os.path.join(model, "split_model.json"), "w") as f:
+                f.write("{}")
+            still = os.path.join(td, "still.png")
+            with open(still, "wb") as f:
+                f.write(b"still")
+            clips = os.path.join(td, "clips")
+            os.makedirs(clips)
+
+            def _panels(p2="motion 2"):
+                return [{"index": 1, "image_path": still, "panel_text": "img",
+                         "motion_prompt": "motion 1", "conditioning": "still"},
+                        {"index": 2, "image_path": None, "panel_text": p2, "motion_prompt": p2,
+                         "conditioning": "chain"},
+                        {"index": 3, "image_path": None, "panel_text": "motion 3",
+                         "motion_prompt": "motion 3", "conditioning": "chain"}]
+
+            args = _stub_args(model=model, frames=145, resume=True)
+            units = render.build_units(_panels(), 0, clips)
+            for u in units:  # an earlier, complete run, recorded in order
+                with open(u["clip_path"], "wb") as f:
+                    f.write(("clip %d" % u["index"]).encode())
+                render.write_clip_provenance(u["clip_path"], render.build_clip_provenance(u, args))
+
+            def _predict(us):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    render.print_dry_run(args, {"schema_version": 3}, us,
+                                         "_cascade_%d" % os.getpid(), clips)
+                out = buf.getvalue()
+                m = re.search(r"resume: \d+ panel\(s\) would render: (\[.*\])", out)
+                return (json.loads(m.group(1)) if m else None), out
+
+            got, _ = _predict(units)
+            check("R25a unchanged prompts reuse all three clips", got == [], "got %r" % got)
+            got, out = _predict(render.build_units(_panels(p2="motion 2 edited"), 0, clips))
+            check("R25b editing panel 2's Motion: reuses 1 and re-renders 2 and 3",
+                  got == [2, 3], "got %r" % got)
+            check("R25c the first render command conditions on panel 2's chain seed",
+                  "panel_02.chainseed.png" in out.split("first render command:")[1].splitlines()[0],
+                  "got %r" % out)
+            with open(units[0]["clip_path"], "wb") as f:
+                f.write(b"clip 1 re-rendered")
+            render.write_clip_provenance(units[0]["clip_path"],
+                                         render.build_clip_provenance(units[0], args))
+            got, _ = _predict(units)
+            check("R25d new clip-1 bytes (with a valid clip-1 sidecar) re-render 2 and 3",
+                  got == [2, 3], "got %r" % got)
+    finally:
+        render.clip_frame_count = saved
+
+
+def test_chain_dry_run_resume_missing_source_does_not_crash():
+    """Task 10 hazard closure: a v3 chain manifest whose previous clip does not
+    exist on disk yet (nothing has ever been rendered) must not make print_dry_run's
+    --resume prediction crash with a FileNotFoundError out of build_clip_provenance's
+    file_sha256(chain_source). It must cleanly predict every panel would render."""
+    with tempfile.TemporaryDirectory() as td:
+        still = os.path.join(td, "still.png")
+        with open(still, "wb") as f:
+            f.write(b"png")
+        clips = os.path.join(td, "clips")
+        os.makedirs(clips)
+        panels = [{"index": 1, "image_path": still, "panel_text": "img",
+                   "motion_prompt": "motion 1", "conditioning": "still"},
+                  {"index": 2, "image_path": None, "panel_text": "motion 2",
+                   "motion_prompt": "motion 2", "conditioning": "chain"},
+                  {"index": 3, "image_path": None, "panel_text": "motion 3",
+                   "motion_prompt": "motion 3", "conditioning": "chain"}]
+        args = _stub_args(frames=145, resume=True)
+        units = render.build_units(panels, 0, clips)
+        assert not os.path.exists(units[1]["chain_source"]), "test setup invalid"
+        assert not os.path.exists(units[2]["chain_source"]), "test setup invalid"
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = render.print_dry_run(args, {"schema_version": 3}, units,
+                                          "hazardcheck", clips)
+        except FileNotFoundError as e:
+            check("hazard: dry-run --resume on a chain manifest with no prior clip "
+                  "does not raise FileNotFoundError", False, "raised %r" % e)
+        else:
+            out = buf.getvalue()
+            m = re.search(r"resume: \d+ panel\(s\) would render: (\[.*\])", out)
+            got = json.loads(m.group(1)) if m else None
+            check("hazard: dry-run --resume on a chain manifest with no prior clip "
+                  "does not raise, and predicts every panel would render",
+                  rc == 0 and got == [1, 2, 3], "rc=%r got=%r out=%r" % (rc, got, out))
+
+
+def test_chain_resume_real_main_mid_chain_recovery():
+    """Review Finding 2: the ONLY way this code runs in production is main() with
+    --resume, since bin/ltx-movie::_render_flags always passes it. Drive the REAL
+    main() on a v3 chain manifest where panel 1's clip already exists (from an
+    earlier, crashed run) and confirm --resume reuses it and picks the chain up from
+    there -- rendering, and preparing the chain seed for, only panels 2 and 3."""
+    saved = (render.story_dir_for, render.render_panel, render.prepare_chain_seed,
+             render.run_input_content_screen, render.SKILL._resolve_bin,
+             render.clip_frame_count, render.probe_streams, render.assert_clips_uniform,
+             render.build_concat_command)
+    calls, prepared = [], []
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            manifest, _still = _write_chain_manifest(td, "midchain", 3)
+            clips = os.path.join(td, "clips_midchain")
+            os.makedirs(clips)
+            out = os.path.join(td, "midchain.mp4")
+            story_root = os.path.join(td, "story")
+            os.makedirs(os.path.join(story_root, "midchain"), exist_ok=True)
+            model = os.path.join(td, "model")
+            os.makedirs(model)
+            with open(os.path.join(model, "split_model.json"), "w") as f:
+                f.write("{}")
+
+            argv = [manifest, out, "--clips-dir", clips, "--skip-input-screen",
+                    "--frames", "145", "--resume", "--model", model]
+            args = render.build_parser().parse_args(argv)
+            panels = render.load_manifest(manifest)["panels"]
+            units = render.build_units(panels, args.seed, clips)
+
+            # An earlier run completed panel 1 and then crashed before panel 2.
+            with open(units[0]["clip_path"], "wb") as f:
+                f.write(b"clip 1 pre-existing")
+            render.write_clip_provenance(units[0]["clip_path"],
+                                         render.build_clip_provenance(units[0], args))
+
+            def fake_render_panel(unit, args):
+                i = unit["index"]
+                calls.append(i)
+                with open(unit["clip_path"], "wb") as f:
+                    f.write(("clip %d" % i).encode())
+                render.write_clip_provenance(unit["clip_path"],
+                                             render.build_clip_provenance(unit, args))
+                return {"unit": unit["label"], "status": "ok", "attempts": 1, "seconds": 1.0,
+                        "clip": os.path.abspath(unit["clip_path"]), "resumed": False}
+
+            def fake_prepare(unit, args):
+                prepared.append(unit["index"])
+                return []
+
+            render.story_dir_for = lambda sid: os.path.join(story_root, sid)
+            render.render_panel = fake_render_panel
+            render.prepare_chain_seed = fake_prepare
+            render.run_input_content_screen = lambda paths: 0
+            render.SKILL._resolve_bin = lambda: sys.executable
+            render.clip_frame_count = lambda p: 145
+            render.probe_streams = lambda p: {"streams": []}
+            render.assert_clips_uniform = lambda *a: None
+            render.build_concat_command = lambda lp, o: [
+                sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'MOVIE')", o]
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = render.main(argv)
+
+            check("F2a mid-chain --resume through the REAL main() reuses panel 1's "
+                  "existing clip and renders only 2 and 3",
+                  rc == 0 and calls == [2, 3], "rc=%r calls=%r" % (rc, calls))
+            check("F2b the chain seed is prepared only for the panels that actually "
+                  "render, not the reused one",
+                  prepared == [2, 3], "prepared=%r" % prepared)
+    finally:
+        (render.story_dir_for, render.render_panel, render.prepare_chain_seed,
+         render.run_input_content_screen, render.SKILL._resolve_bin,
+         render.clip_frame_count, render.probe_streams, render.assert_clips_uniform,
+         render.build_concat_command) = saved
+
+
+def test_v3_still_aspect_preflight():
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "aspectbad", 2, ["--skip-input-screen"], still_probe=((1280, 704), None))
+        check("R29a a 1280x704 still against --width 704 --height 448 exits 2, no render",
+              rc == 2 and calls == [] and s is None
+              and "is 1280x704; its aspect ratio does not match --width x --height (704x448), "
+                  "so ltx-2-mlx would crop it" in err, "rc=%r err=%r" % (rc, err))
+        check("R29b no run root was created",
+              not glob.glob(os.path.join(td, "story", "aspectbad", "runs", "*")))
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "aspectok", 2, ["--skip-input-screen"], still_probe=((1408, 896), None))
+        check("R29c a 1408x896 still (2W x 2H) passes", rc == 0 and calls == [1, 2],
+              "rc=%r err=%r" % (rc, err))
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "aspectprobe", 2, ["--skip-input-screen"], still_probe=(None, "rc=1: boom"))
+        check("R29d an unmeasurable still exits 2", rc == 2 and "ffprobe failed: rc=1: boom" in err,
+              "rc=%r err=%r" % (rc, err))
+        probed = []
+        saved = render.ffprobe_image_size
+        render.ffprobe_image_size = lambda p: (probed.append(p) or ((1, 1), None))
+        try:
+            rc, cap, rendered, _ = _drive_main(td, "v2noprobe", 2, ["--on-panel-failure", "skip"],
+                                               panel_status="ok")
+        finally:
+            render.ffprobe_image_size = saved
+        check("R29e a schema_version 2 manifest is never aspect-probed",
+              probed == [] and rendered == [1, 2], "probed=%r rendered=%r" % (probed, rendered))
+
+
+def test_dry_run_chain_lines():
+    with tempfile.TemporaryDirectory() as td:
+        manifest, still = _write_chain_manifest(td, "drychain", 3)
+        clips = os.path.join(td, "clips")
+        os.makedirs(clips)
+        r = _run_render([manifest, os.path.join(td, "movie.mp4"), "--clips-dir", clips,
+                         "--frames", "145", "--dry-run"])
+        o = r.stdout
+        check("R30a a chained dry run exits 0", r.returncode == 0,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+        check("R30b panel 1 is I2V from the still", ("  panel  1: I2V %s" % still) in o, "got %r" % o)
+        check("R30c panels 2-3 name the exact source frame and clip",
+              ("  panel  2: I2V chained <- last frame (index 144) of %s"
+               % os.path.join(clips, "panel_01.mp4")) in o
+              and ("  panel  3: I2V chained <- last frame (index 144) of %s"
+                   % os.path.join(clips, "panel_02.mp4")) in o, "got %r" % o)
+        check("R30d the first render command conditions on the still",
+              still in o.split("first render command:")[1].splitlines()[0], "got %r" % o)
+        check("R30e the dry run wrote nothing", os.listdir(clips) == [])
+
+
+def test_single_panel_v3_manifest_is_not_chained():
+    with tempfile.TemporaryDirectory() as td:
+        rc, calls, s, prepared, out, err = _drive_chain(td, "single", 1, ["--skip-input-screen"])
+        check("R32a a one-panel v3 manifest renders its still and concatenates one clip",
+              rc == 0 and calls == [1] and prepared == [] and _clip_names(s) == ["panel_01.mp4"],
+              "rc=%r calls=%r" % (rc, calls))
+        rc, calls, s, prepared, out, err = _drive_chain(
+            td, "singleskip", 1, ["--skip-input-screen", "--on-panel-failure", "skip"])
+        check("R32b it has no chain units, so --on-panel-failure skip is allowed",
+              rc == 0 and calls == [1], "rc=%r err=%r" % (rc, err))
+
+
 if __name__ == "__main__":
     test_parser_defaults()
+    test_clip_provenance_contract()
+    test_cached_model_metadata_and_io_failures()
+    test_provenance_rejects_changes_during_generation()
     test_geometry_validation()
     test_run_id_and_story_dir()
     test_render_script_has_no_heavy_imports()
@@ -1925,6 +2915,21 @@ if __name__ == "__main__":
     test_finish_run_writes_summary_when_concat_fails()
     test_resume_force_orthogonality()
     test_failure_state_machine()
+    test_extract_last_frame_argv()
+    test_extract_last_frame_real_ffmpeg()
+    test_check_chain_seed()
+    test_chain_seed_thresholds()
+    test_prepare_chain_seed_composition()
+    test_chain_manifest_rejects_skip_policy()
+    test_chain_loop_inline_retry_then_stop()
+    test_chain_loop_inline_retry_fatal_is_backend_failure()
+    test_chain_loop_seed_invalid_stops()
+    test_chain_resume_cascade()
+    test_chain_dry_run_resume_missing_source_does_not_crash()
+    test_chain_resume_real_main_mid_chain_recovery()
+    test_v3_still_aspect_preflight()
+    test_dry_run_chain_lines()
+    test_single_panel_v3_manifest_is_not_chained()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)

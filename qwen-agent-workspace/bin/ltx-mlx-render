@@ -30,10 +30,13 @@ See docs/superpowers/specs/2026-09-10-ltx2-mlx-video-pipeline-design.md.
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -67,6 +70,11 @@ SUMMARY_KEYS = (
     "clips", "skipped_panels", "concat_mode", "output_path", "on_panel_failure",
     "stopped_reason",
 )
+
+# A chained panel's conditioning frame is rejected as black or flat below these
+# signalstats luma levels. Heuristics: limited-range black is Y=16.
+CHAIN_SEED_MIN_YAVG = 20
+CHAIN_SEED_MIN_YRANGE = 10
 
 
 class ConcatPreflightError(RuntimeError):
@@ -155,9 +163,16 @@ def load_manifest(path):
     to bin/ltx-story-manifest, which makes _allocate_frames a no-op.
 
     A panel whose image_path is None or absent renders text-to-video. An
-    EMPTY STRING is not "absent" and is rejected."""
+    EMPTY STRING is not "absent" and is rejected.
+
+    Schema version 3 (bin/ltx-story-manifest --chain) requires a per-panel
+    "conditioning" of still (an existing, readable image_path), chain (index >= 2,
+    image_path null) or t2v (image_path null). For older schemas conditioning is
+    derived: still when the panel has an image_path, else t2v -- so v1/v2 manifests
+    behave exactly as before."""
     with open(path) as f:
         data = json.load(f)
+    schema_version = data.get("schema_version", 1)
 
     panels = data.get("panels") or []
     if not panels:
@@ -182,6 +197,22 @@ def load_manifest(path):
                     "panel %d: image_path does not exist or is not readable: %r"
                     % (index, image_path))
 
+        if schema_version >= 3:
+            conditioning = panel.get("conditioning")
+            if conditioning not in ("still", "chain", "t2v"):
+                raise ValueError("panel %d: conditioning must be one of still/chain/t2v, got %r"
+                                 % (index, conditioning))
+            if conditioning == "still" and panel["image_path"] is None:
+                raise ValueError("panel %d: conditioning 'still' requires an existing, "
+                                 "readable image_path" % index)
+            if conditioning == "chain" and (index < 2 or panel["image_path"] is not None):
+                raise ValueError("panel %d: conditioning 'chain' requires index >= 2 and "
+                                 "image_path null" % index)
+            if conditioning == "t2v" and panel["image_path"] is not None:
+                raise ValueError("panel %d: conditioning 't2v' requires image_path null" % index)
+        else:
+            panel["conditioning"] = "still" if panel["image_path"] else "t2v"
+
         panel_text = panel.get("panel_text")
         if not isinstance(panel_text, str) or not panel_text.strip():
             raise ValueError("panel %d: panel_text is required and must be a "
@@ -198,26 +229,37 @@ def resolve_prompt(panel):
 def build_units(panels, seed, clips_dir, run_root=None):
     """Return the ordered per-panel unit list.
 
-    Each unit: {"index", "label", "seed", "prompt", "image_path",
-    "clip_path", "log_path"}. seed is base + i and label is "panel-<i>",
-    both identical to bin/ltx-story-video::build_units (:267) so the
+    Each unit: {"index", "label", "seed", "prompt", "image_path", "clip_path",
+    "log_path", "conditioning", "chain_source"}. seed is base + i and label is
+    "panel-<i>", both identical to bin/ltx-story-video::build_units (:267) so the
     story_summary.json unit labels read the same way in
     bin/ltx-movie::_report_summary.
+
+    A "chain" unit is conditioned on the exact last frame of the previous panel's
+    clip: chain_source is that clip, and image_path is <clips_dir>/panel_%02d.chainseed.png,
+    extracted at render time. Every other unit keeps the panel's own image_path and
+    has chain_source None. panels must carry "conditioning" (load_manifest sets it).
 
     Every panel shares --frames/--width/--height/--frame-rate/--model and
     the low-ram + tiling settings; that uniformity is exactly what makes
     stream-copy concatenation valid, so it is NOT per-unit state."""
     units = []
     for i, panel in enumerate(panels, start=1):
+        conditioning = panel["conditioning"]
+        chained = conditioning == "chain"
         units.append({
             "index": i,
             "label": "panel-%d" % i,
             "seed": seed + i,
             "prompt": resolve_prompt(panel),
-            "image_path": panel.get("image_path"),
+            "image_path": (os.path.join(clips_dir, "panel_%02d.chainseed.png" % i) if chained
+                           else panel.get("image_path")),
             "clip_path": os.path.join(clips_dir, "panel_%02d.mp4" % i),
             "log_path": (os.path.join(run_root, "panel_%02d.log" % i)
                          if run_root else None),
+            "conditioning": conditioning,
+            "chain_source": (os.path.join(clips_dir, "panel_%02d.mp4" % (i - 1)) if chained
+                             else None),
         })
     return units
 
@@ -241,13 +283,203 @@ def clip_frame_count(clip_path):
         return None
 
 
-def clip_is_reusable(clip_path, expected_frames):
-    """A clip is reused under --resume only when it exists, is non-empty and
-    reports exactly expected_frames video packets. Missing, empty, wrong
-    count, unreadable and ffprobe-non-zero all mean regenerate."""
-    if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+def model_identity(model, *, strict=False):
+    """Read bundle metadata without loading weights or downloading a model."""
+    revision = None
+    bundle = model
+    resolved = False
+    try:
+        resolved = os.path.lexists(bundle) or os.path.isabs(bundle)
+        if not os.path.isdir(bundle):
+            if resolved:
+                raise FileNotFoundError("model bundle is unavailable: %s" % bundle)
+            repository = os.path.join(SKILL.LTX2_MLX_HF_HOME, "hub", "models--" + model.replace("/", "--"))
+            resolved = os.path.lexists(repository) or model == SKILL.MODEL_ID
+            with open(os.path.join(repository, "refs", "main"), encoding="utf-8") as handle:
+                revision = handle.read().strip()
+            resolved = True
+            if not revision or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in revision):
+                raise OSError("cached model revision is invalid")
+            bundle = os.path.join(repository, "snapshots", revision)
+        bundle = os.path.realpath(bundle)
+        if not os.path.isdir(bundle):
+            raise FileNotFoundError("resolved model bundle is unavailable: %s" % bundle)
+        resolved = True
+        files = []
+        errors = []
+        for directory, _directories, filenames in os.walk(bundle, followlinks=False, onerror=errors.append):
+            for name in filenames:
+                if not name.endswith((".safetensors", ".json")):
+                    continue
+                path = os.path.join(directory, name)
+                info = os.stat(path)
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if not os.access(path, os.R_OK):
+                    raise PermissionError("model metadata is unreadable: %s" % path)
+                files.append({"path": os.path.relpath(path, bundle).replace(os.sep, "/"),
+                              "size": info.st_size, "mtime_ns": info.st_mtime_ns})
+        if errors:
+            raise errors[0]
+        if not files:
+            return None
+        return {"resolved_path": bundle, "snapshot_revision": revision,
+                "files": sorted(files, key=lambda item: item["path"])}
+    except OSError:
+        if strict and resolved:
+            raise
+        return None
+    except (ValueError, TypeError):
+        return None
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def build_clip_provenance(unit, args, *, strict=False):
+    """The exact generation identity a reusable clip must match. schema_version 2: every
+    pre-redesign clip is deliberately non-reusable (it was conditioned on the old,
+    cropped, independent stills). A chain unit is keyed on its SOURCE CLIP's bytes plus
+    the frame index taken from it, not on the extracted PNG, so an ffmpeg PNG-encoder
+    change cannot cascade a spurious re-render while any real change to clip k-1 does."""
+    conditioning = unit["conditioning"]
+    return {
+        "schema_version": 2,
+        "backend": "ltx-2-mlx",
+        "model": args.model,
+        "model_identity": model_identity(args.model, strict=strict),
+        "prompt_sha256": hashlib.sha256(unit["prompt"].encode("utf-8")).hexdigest(),
+        "conditioning": conditioning,
+        "image_sha256": file_sha256(unit["image_path"]) if conditioning == "still" else None,
+        "chain_source_sha256": (file_sha256(unit["chain_source"]) if conditioning == "chain"
+                                else None),
+        "chain_frame_index": args.frames - 1 if conditioning == "chain" else None,
+        "seed": unit["seed"], "width": args.width, "height": args.height,
+        "frames": args.frames, "fps": args.frame_rate, "low_ram": not args.no_low_ram,
+        "tile_frames": args.tile_frames, "tile_spatial": args.tile_spatial,
+    }
+
+
+def write_clip_provenance(clip_path, provenance):
+    path = clip_path + ".provenance.json"
+    temporary = path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(temporary, "x", encoding="utf-8") as handle:
+            json.dump(dict(provenance, output_sha256=file_sha256(clip_path)), handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clip_is_reusable(clip_path, expected_frames, provenance=None):
+    """Reuse requires exact generation identity, clip checksum and frame count."""
+    if not provenance or provenance.get("model_identity") is None:
         return False
-    return clip_frame_count(clip_path) == expected_frames
+    try:
+        if not os.path.isfile(clip_path) or os.path.getsize(clip_path) == 0:
+            return False
+        with open(clip_path + ".provenance.json", encoding="utf-8") as handle:
+            recorded = json.load(handle)
+        expected = dict(provenance, output_sha256=file_sha256(clip_path))
+        if json.dumps(recorded, sort_keys=True, separators=(",", ":"), allow_nan=False) != json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ):
+            return False
+        return clip_frame_count(clip_path) == expected_frames
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def ffprobe_image_size(path):
+    """((width, height), None) for an image file, or (None, reason) when ffprobe cannot
+    say. ffprobe rather than PIL: this script imports no image library (R2a)."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "json", path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    if proc.returncode != 0:
+        return None, "rc=%d: %s" % (proc.returncode, proc.stderr.strip())
+    try:
+        stream = json.loads(proc.stdout)["streams"][0]
+        return (int(stream["width"]), int(stream["height"])), None
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        return None, "unparseable ffprobe output (%s: %s)" % (type(e).__name__, e)
+
+
+def extract_last_frame(clip_path, out_png, frames):
+    """Write frame index frames-1 of clip_path -- its exact last frame -- to out_png.
+    Returns [] on success, else one violation string.
+
+    Selecting by exact index is deterministic because every ok or reused clip has
+    already been verified at exactly --frames frames. -sseof is deliberately not used:
+    it seeks by time, not to the last frame. The frame is written to a .tmp.png first
+    and renamed, so a partial write is never mistaken for a frame."""
+    tmp = out_png[:-len(".png")] + ".tmp.png"
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", clip_path,
+             "-vf", "select=eq(n\\,%d)" % (frames - 1), "-fps_mode", "passthrough",
+             "-frames:v", "1", tmp],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return ["clip %s: last-frame extraction failed: %s" % (clip_path, e)]
+    if proc.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+        tail = "\n".join((proc.stderr or "").splitlines()[-5:])
+        reason = tail or ("ffmpeg exited %d and wrote no frame %d to %s"
+                          % (proc.returncode, frames - 1, tmp))
+        return ["clip %s: last-frame extraction failed: %s" % (clip_path, reason)]
+    os.replace(tmp, out_png)
+    return []
+
+
+def check_chain_seed(png_path, width, height, source_panel):
+    """Validate an extracted chain frame: exactly width x height, and neither black nor
+    flat by ffmpeg signalstats luma. source_panel is the panel whose clip the frame came
+    from; the remedy names that panel's Motion:. Returns [] or one violation string."""
+    size, error = ffprobe_image_size(png_path)
+    if error:
+        return ["chain frame %s: ffprobe failed: %s" % (png_path, error)]
+    if size != (width, height):
+        return ["chain frame %s is %dx%d, expected %dx%d"
+                % (png_path, size[0], size[1], width, height)]
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-v", "error", "-nostdin", "-i", png_path,
+             "-vf", "signalstats,metadata=mode=print:file=-", "-f", "null", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ["chain frame %s: could not measure brightness" % png_path]
+    stats = dict(re.findall(r"lavfi\.signalstats\.(YAVG|YMIN|YMAX)=([0-9.]+)",
+                            proc.stdout or ""))
+    if proc.returncode != 0 or set(stats) != {"YAVG", "YMIN", "YMAX"}:
+        return ["chain frame %s: could not measure brightness" % png_path]
+    yavg, ymin, ymax = float(stats["YAVG"]), float(stats["YMIN"]), float(stats["YMAX"])
+    if yavg < CHAIN_SEED_MIN_YAVG or ymax - ymin < CHAIN_SEED_MIN_YRANGE:
+        return ["chain frame %s is degenerate (YAVG=%.1f, YMIN=%.1f, YMAX=%.1f): black or "
+                "flat; edit panel %d's Motion: in story.md to change it, then rerun -- the "
+                "edited panel and every later panel re-render"
+                % (png_path, yavg, ymin, ymax, source_panel)]
+    return []
+
+
+def prepare_chain_seed(unit, args):
+    """Extract and validate a chain unit's conditioning frame. Returns [] when
+    unit["image_path"] holds a usable frame, else the violations."""
+    return (extract_last_frame(unit["chain_source"], unit["image_path"], args.frames)
+            or check_chain_seed(unit["image_path"], args.width, args.height,
+                                unit["index"] - 1))
 
 
 _REMEDY = ("re-render that panel with --force (or delete the clip and rerun "
@@ -359,7 +591,7 @@ def build_concat_command(list_path, output_path):
 
 
 def estimate_seconds_per_panel(story_dir, frames, width, height, low_ram,
-                               tile_frames, tile_spatial, model):
+                               tile_frames, tile_spatial, model, backend="ltx-2-mlx"):
     """Return (seconds_per_panel, label).
 
     Precedence: the newest story_summary.json under <story_dir>/runs/ whose
@@ -387,7 +619,8 @@ def estimate_seconds_per_panel(story_dir, frames, width, height, low_ram,
         units = summary.get("units")
         if not isinstance(units, list):
             continue
-        if (summary.get("frames_per_panel") != frames
+        if (summary.get("backend") != backend
+                or summary.get("frames_per_panel") != frames
                 or summary.get("width") != width
                 or summary.get("height") != height
                 or summary.get("low_ram") != low_ram
@@ -426,7 +659,11 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
     """Resolve everything, touch nothing, print the plan, return 0.
 
     Deliberately does NOT check for the ltx-2-mlx binary or ffmpeg: a dry run
-    must be usable on a machine that cannot render."""
+    must be usable on a machine that cannot render.
+
+    The --resume prediction runs IN ORDER: a chained unit is predicted reusable only
+    when the unit before it is predicted reusable too -- otherwise its source clip is
+    about to be re-rendered -- and only then is its source clip hashed."""
     seconds_per_panel_play = args.frames / float(args.frame_rate)
     total_panels = len(units)
 
@@ -434,7 +671,10 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
     print("story id: %s" % story_id)
     print("panels: %d" % total_panels)
     for unit in units:
-        if unit["image_path"]:
+        if unit["conditioning"] == "chain":
+            print("  panel %2d: I2V chained <- last frame (index %d) of %s"
+                  % (unit["index"], args.frames - 1, unit["chain_source"]))
+        elif unit["image_path"]:
             print("  panel %2d: I2V %s" % (unit["index"], unit["image_path"]))
         else:
             print("  panel %2d: T2V (no conditioning image)" % unit["index"])
@@ -451,9 +691,15 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
 
     would_skip = []
     would_render = []
+    skipped = set()
     for unit in units:
-        if args.resume and clip_is_reusable(unit["clip_path"], args.frames):
+        reusable = False
+        if args.resume and (unit["conditioning"] != "chain" or unit["index"] - 1 in skipped):
+            reusable = clip_is_reusable(unit["clip_path"], args.frames,
+                                        build_clip_provenance(unit, args))
+        if reusable:
             would_skip.append(unit)
+            skipped.add(unit["index"])
         else:
             would_render.append(unit)
 
@@ -529,6 +775,16 @@ def render_panel(unit, args):
     skill's own overwrite guard must not veto that decision."""
     started = time.monotonic()
     base = {"unit": unit["label"], "attempts": 1, "resumed": False}
+    provenance_path = unit["clip_path"] + ".provenance.json"
+    try:
+        if os.path.lexists(provenance_path):
+            os.unlink(provenance_path)
+        expected_provenance = build_clip_provenance(unit, args, strict=True)
+    except OSError as error:
+        print("panel %d FAILED (provenance): %s" % (unit["index"], error), file=sys.stderr)
+        base.update({"status": "error", "clip": None, "error": str(error),
+                     "seconds": round(time.monotonic() - started, 1)})
+        return base
     try:
         clip = SKILL.generate_video(
             unit["prompt"], unit["clip_path"], image_path=unit["image_path"],
@@ -548,9 +804,27 @@ def render_panel(unit, args):
               % (unit["index"], status, e.returncode, e), file=sys.stderr)
         base.update({"status": status, "clip": None, "rc": e.returncode,
                      "error": str(e), "seconds": round(time.monotonic() - started, 1)})
-        if e.returncode == 0 and not e.timed_out:
+        if getattr(e, "fatal", False):
+            base["fatal"] = True
+        elif e.returncode == 0 and not e.timed_out:
             base["jetsam"] = True
             print(JETSAM_LADDER, file=sys.stderr)
+        return base
+
+    try:
+        if clip_frame_count(clip) != args.frames:
+            raise ConcatPreflightError("clip %s: frame count did not match %d" % (clip, args.frames))
+        assert_clips_uniform([(clip, probe_streams(clip))], args.width, args.height, args.frame_rate)
+        provenance = build_clip_provenance(unit, args, strict=True)
+        if expected_provenance["model_identity"] is None:
+            provenance["model_identity"] = None
+        if provenance != expected_provenance:
+            raise ConcatPreflightError("generation inputs or model metadata changed during rendering")
+        write_clip_provenance(clip, expected_provenance)
+    except (ConcatPreflightError, OSError) as error:
+        print("panel %d FAILED (verification): %s" % (unit["index"], error), file=sys.stderr)
+        base.update({"status": "error", "clip": None, "error": str(error),
+                     "seconds": round(time.monotonic() - started, 1)})
         return base
 
     elapsed = round(time.monotonic() - started, 1)
@@ -583,10 +857,12 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
     past it before the write. render_panel maps only ValueError and
     Ltx2MlxError, so an OSError, a MemoryError or a Ctrl-C leaves
     run_root without a summary."""
-    # --- retry pass (opt-in). Never runs when the main loop already stopped.
+    # --- retry pass (opt-in). Never runs when the main loop already stopped, and never
+    # for a chained manifest: its failures were already retried inline, in order.
     failed = [u for u in units
               if unit_results[u["index"]]["status"] not in ("ok", "not_attempted")]
-    if args.retry_failed and failed and stopped_reason is None:
+    if (args.retry_failed and failed and stopped_reason is None
+            and not any(u.get("conditioning") == "chain" for u in units)):
         print("=== retry pass: %d panel(s) ===" % len(failed))
         print(", ".join(u["label"] for u in failed))
         print("retrying in %.0fs..." % args.retry_idle)
@@ -598,6 +874,9 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
             result["attempts"] = 2
             result["first_failure"] = prior_status
             unit_results[i] = result
+            if result.get("fatal"):
+                stopped_reason = "backend_failure"
+                break
             if result["status"] == "ok":
                 clips_by_index[i] = result["clip"]
                 completed += 1
@@ -671,7 +950,7 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
         print("DONE: all %d panels completed -> %s" % (len(units), args.output_path))
         return 0
     print("STOPPED EARLY: %d/%d panels completed" % (completed, len(units)))
-    if stopped_reason == "consecutive_failures":
+    if stopped_reason in ("consecutive_failures", "chain_broken"):
         print("relaunch: %s %s %s"
               % (sys.executable, os.path.abspath(__file__),
                  " ".join(shlex.quote(a) for a in raw_argv)))
@@ -693,6 +972,16 @@ def main(argv=None):
         print("Error: %s" % e, file=sys.stderr)
         return 2
     panels = manifest["panels"]
+
+    # A chained manifest (any panel conditioned on the previous clip's last frame) cannot
+    # skip a failed panel: the next one would have no frame to continue from. Checked
+    # before the --dry-run short-circuit so the Phase 3 review gate refuses it too.
+    chain_manifest = any(p["conditioning"] == "chain" for p in panels)
+    if chain_manifest and args.on_panel_failure == "skip":
+        print("Error: --on-panel-failure skip is not allowed for a chained manifest: a "
+              "skipped panel leaves the next panel with no frame to continue from",
+              file=sys.stderr)
+        return 2
 
     story_id = manifest.get("story_id") or "story"
     story_dir = story_dir_for(story_id)
@@ -731,6 +1020,25 @@ def main(argv=None):
         print("Error: ltx-2-mlx binary not found or not executable: %s "
               "(set LTX2_MLX_BIN)" % resolved_bin, file=sys.stderr)
         return 2
+
+    # v3 still-aspect preflight: a still whose aspect differs from --width x --height
+    # would be center-cropped by ltx-2-mlx's resize_and_center_crop. Refused here,
+    # before any GPU time.
+    if manifest.get("schema_version", 1) >= 3:
+        for panel in panels:
+            if panel["conditioning"] != "still":
+                continue
+            size, error = ffprobe_image_size(panel["image_path"])
+            if error:
+                print("Error: panel %d's still %s: ffprobe failed: %s"
+                      % (panel["index"], panel["image_path"], error), file=sys.stderr)
+                return 2
+            if size[0] * args.height != size[1] * args.width:
+                print("Error: panel %d's still %s is %dx%d; its aspect ratio does not match "
+                      "--width x --height (%dx%d), so ltx-2-mlx would crop it"
+                      % (panel["index"], panel["image_path"], size[0], size[1],
+                         args.width, args.height), file=sys.stderr)
+                return 2
 
     try:
         os.makedirs(clips_dir, exist_ok=True)
@@ -776,7 +1084,8 @@ def main(argv=None):
 
     for unit in units:
         i = unit["index"]
-        if args.resume and clip_is_reusable(unit["clip_path"], args.frames):
+        if args.resume and clip_is_reusable(
+                unit["clip_path"], args.frames, build_clip_provenance(unit, args)):
             print("panel %d: reusing %s (--resume)" % (i, unit["clip_path"]))
             unit_results[i] = {"unit": unit["label"], "status": "ok", "attempts": 0,
                                "seconds": 0.0,
@@ -788,6 +1097,29 @@ def main(argv=None):
             continue
 
         print("=== panel %d/%d (%s) ===" % (i, len(units), unit["label"]))
+
+        if unit["conditioning"] == "chain":
+            seed_violations = prepare_chain_seed(unit, args)
+            if seed_violations:
+                for v in seed_violations:
+                    print("panel %d FAILED (chain seed): %s" % (i, v), file=sys.stderr)
+                unit_results[i] = {"unit": unit["label"], "status": "chain_seed_invalid",
+                                   "attempts": 0, "seconds": 0.0, "clip": None,
+                                   "resumed": False, "error": "; ".join(seed_violations)}
+                stopped_reason = "chain_seed_invalid"
+                break
+            if not args.skip_input_screen:
+                screen_rc = run_input_content_screen([unit["image_path"]])
+                if screen_rc != 0:
+                    error = ("input content screen rejected %s (rc=%d)"
+                             % (unit["image_path"], screen_rc))
+                    print("panel %d FAILED (chain seed): %s" % (i, error), file=sys.stderr)
+                    unit_results[i] = {"unit": unit["label"], "status": "chain_seed_blocked",
+                                       "attempts": 0, "seconds": 0.0, "clip": None,
+                                       "resumed": False, "error": error}
+                    stopped_reason = "chain_seed_blocked"
+                    break
+
         result = render_panel(unit, args)
         unit_results[i] = result
 
@@ -796,6 +1128,31 @@ def main(argv=None):
             completed += 1
             consecutive_failures = 0
             continue
+
+        if result.get("fatal"):
+            stopped_reason = "backend_failure"
+            break
+
+        if chain_manifest:
+            # Every later panel depends on this clip, so a chained failure is retried
+            # inline (never deferred to the end-of-run pass) and then stops the run; the
+            # skip policy and the consecutive-failure breaker are not consulted.
+            if args.retry_failed:
+                print("=== inline retry: panel %d (chained; later panels depend on it) ===" % i)
+                time.sleep(args.retry_idle)
+                retry = render_panel(unit, args)
+                retry["attempts"] = 2
+                retry["first_failure"] = result["status"]
+                unit_results[i] = retry
+                if retry.get("fatal"):
+                    stopped_reason = "backend_failure"
+                    break
+                if retry["status"] == "ok":
+                    clips_by_index[i] = retry["clip"]
+                    completed += 1
+                    continue
+            stopped_reason = "chain_broken"
+            break
 
         consecutive_failures += 1
         # Checked in the same order as bin/ltx-story-video:927-929: the stop

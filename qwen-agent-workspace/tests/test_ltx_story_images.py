@@ -253,70 +253,46 @@ def test_seed_image_parser_default():
 
 
 # ---------------------------------------------------------------------------
-# I9: _resize_center_crop fills, does not distort, and centers the crop
-# ---------------------------------------------------------------------------
-
-def _marker_image(src_w, src_h, square):
-    """An RGB image: solid red background, a black square marker dead center."""
-    from PIL import Image, ImageDraw
-    img = Image.new("RGB", (src_w, src_h), (255, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy = src_w / 2.0, src_h / 2.0
-    half = square / 2.0
-    left = int(round(cx - half))
-    top = int(round(cy - half))
-    draw.rectangle([left, top, left + square - 1, top + square - 1], fill=(0, 0, 0))
-    return img
-
-
-def test_resize_center_crop_geometry():
-    from PIL import Image, ImageChops
-    target_w, target_h = 1280, 704
-    for src_w, src_h, square in (
-        (800, 400, 100), (400, 800, 100), (1000, 1000, 120),
-        (2000, 600, 150), (100, 100, 20),
-    ):
-        label = "%dx%d/sq%d" % (src_w, src_h, square)
-        src = _marker_image(src_w, src_h, square)
-        out = story_images._resize_center_crop(src, target_w, target_h)
-        check("I9 %s output size" % label, out.size == (target_w, target_h),
-              "got %r" % (out.size,))
-        corners = [out.getpixel((0, 0)), out.getpixel((target_w - 1, 0)),
-                   out.getpixel((0, target_h - 1)), out.getpixel((target_w - 1, target_h - 1))]
-        check("I9 %s corners are red (no letterbox)" % label,
-              all(c == (255, 0, 0) for c in corners), "got %r" % corners)
-        red_ref = Image.new("RGB", out.size, (255, 0, 0))
-        diff = ImageChops.difference(out, red_ref)
-        bbox = diff.getbbox()
-        check("I9 %s marker survives" % label, bbox is not None)
-        if bbox:
-            mw = bbox[2] - bbox[0]
-            mh = bbox[3] - bbox[1]
-            check("I9 %s marker stays square (no distortion)" % label, abs(mw - mh) <= 2,
-                  "got w=%d h=%d" % (mw, mh))
-            mcx = (bbox[0] + bbox[2]) / 2.0
-            mcy = (bbox[1] + bbox[3]) / 2.0
-            check("I9 %s crop is centered" % label,
-                  abs(mcx - target_w / 2.0) <= 2 and abs(mcy - target_h / 2.0) <= 2,
-                  "got center=(%.1f, %.1f)" % (mcx, mcy))
-
-
-# ---------------------------------------------------------------------------
-# I10: _write_seed_panel writes an RGB PNG of exactly the target size
+# I10: _write_seed_panel fits (never crops) the seed into an exact RGB PNG
 # ---------------------------------------------------------------------------
 
 def test_write_seed_panel():
     from PIL import Image
+    colour = (200, 30, 40)
+
+    def _near(p, want):
+        return all(abs(a - b) <= 2 for a, b in zip(p, want))
+
     with tempfile.TemporaryDirectory() as tmp:
-        seed_path = os.path.join(tmp, "seed.jpg")
-        _marker_image(900, 900, 100).convert("RGBA").convert("RGB").save(seed_path, format="JPEG")
-        out_path = os.path.join(tmp, "out.png")
-        story_images._write_seed_panel(seed_path, out_path, 1280, 704)
-        check("I10 output file exists", os.path.isfile(out_path))
-        with Image.open(out_path) as out_img:
-            check("I10 format is PNG", out_img.format == "PNG", "got %r" % out_img.format)
-            check("I10 size is 1280x704", out_img.size == (1280, 704), "got %r" % (out_img.size,))
-            check("I10 mode is RGB", out_img.mode == "RGB", "got %r" % out_img.mode)
+        square = os.path.join(tmp, "square.png")
+        Image.new("RGB", (900, 900), colour).save(square, format="PNG")
+        out_sq = os.path.join(tmp, "out_sq.png")
+        story_images._write_seed_panel(square, out_sq, 512, 512)
+        check("I10a output file exists", os.path.isfile(out_sq))
+        with Image.open(out_sq) as img:
+            check("I10b format is PNG", img.format == "PNG", "got %r" % img.format)
+            check("I10c size is exactly 512x512", img.size == (512, 512), "got %r" % (img.size,))
+            check("I10d mode is RGB", img.mode == "RGB", "got %r" % img.mode)
+            corner = img.getpixel((0, 0))
+            check("I10e a same-aspect source has no pad: the corner is the source colour",
+                  _near(corner, colour), "got %r" % (corner,))
+
+        wide = os.path.join(tmp, "wide.png")
+        Image.new("RGB", (900, 600), colour).save(wide, format="PNG")
+        out_wide = os.path.join(tmp, "out_wide.png")
+        story_images._write_seed_panel(wide, out_wide, 512, 512)
+        with Image.open(out_wide) as img:
+            check("I10f size is exactly 512x512", img.size == (512, 512), "got %r" % (img.size,))
+            rows = [img.getpixel((x, 0)) for x in range(0, 512, 16)] + \
+                   [img.getpixel((x, 511)) for x in range(0, 512, 16)]
+            check("I10g a wider source is letterboxed: the top and bottom rows are black",
+                  all(p == (0, 0, 0) for p in rows), "got %r" % rows[:4])
+            check("I10h the centre is the source colour", _near(img.getpixel((256, 256)), colour),
+                  "got %r" % (img.getpixel((256, 256)),))
+            check("I10i the full source width survives: both edge pixels at mid-height are "
+                  "source-coloured (nothing cropped)",
+                  _near(img.getpixel((0, 256)), colour) and _near(img.getpixel((511, 256)), colour),
+                  "got %r %r" % (img.getpixel((0, 256)), img.getpixel((511, 256))))
 
 
 # ---------------------------------------------------------------------------
@@ -625,7 +601,6 @@ if __name__ == "__main__":
     test_ast_guard_no_toplevel_heavy_imports()
     test_ast_guard_content_safety_handler_continues()
     test_seed_image_parser_default()
-    test_resize_center_crop_geometry()
     test_write_seed_panel()
     test_seed_dry_run_marks_panel_one()
     test_missing_seed_image_rejected()

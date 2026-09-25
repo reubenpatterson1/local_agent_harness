@@ -78,11 +78,11 @@ def build_parser():
                          help="comma-separated 1-based panel indices, e.g. 3,7 "
                               "(default: every panel)")
     parser.add_argument("--seed-image", dest="seed_image", default=None,
-                        help="image that becomes panel 1 verbatim: it is scaled to fill "
-                             "and center-cropped to --width x --height and saved as "
-                             "panel_01.png instead of being generated. Panel 1 takes this "
-                             "path even with --force (there is no txt2img output to "
-                             "regenerate).")
+                        help="image that becomes panel 1 verbatim: it is scaled to fit "
+                             "(never cropped) and centred on a black --width x --height "
+                             "canvas and saved as panel_01.png instead of being generated. "
+                             "Panel 1 takes this path even with --force (there is no "
+                             "txt2img output to regenerate).")
     return parser
 
 
@@ -94,37 +94,19 @@ def _parse_only(only, n_panels):
     return [int(x) for x in only.split(",") if x.strip()]
 
 
-def _resize_center_crop(img, width, height):
-    """Scale img to FILL width x height, then center-crop to exactly that size.
-
-    One uniform scale factor on both axes (max of the two ratios), so nothing is
-    stretched, and the crop is centred, so nothing is letterboxed -- every generated
-    panel already fills the frame edge to edge and panel 1 must match. Returns a new
-    image; img is not modified.
-    """
-    from PIL import Image
-    src_w, src_h = img.size
-    scale = max(width / float(src_w), height / float(src_h))
-    new_w = max(width, int(round(src_w * scale)))
-    new_h = max(height, int(round(src_h * scale)))
-    resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    left = (new_w - width) // 2
-    top = (new_h - height) // 2
-    return resized.crop((left, top, left + width, top + height))
-
-
 def _write_seed_panel(seed_path, out_path, width, height):
-    """Write seed_path to out_path as an RGB PNG of exactly width x height.
+    """Write seed_path to out_path as an RGB PNG of exactly width x height: EXIF
+    orientation applied, scaled to fit (never cropped) and centred on a black
+    width x height canvas (ltx_image_fit.fit_letterbox).
 
-    PIL is imported here and not at module scope on purpose: this file's docstring
-    promises stdlib-only imports at import time, and tests/test_ltx_story_images.py
-    guards that promise.
+    ltx_image_fit is imported here and not at module scope on purpose: this file's
+    docstring promises stdlib-only imports at import time, and
+    tests/test_ltx_story_images.py guards that promise. ltx_image_fit itself imports
+    PIL only inside its functions.
     """
-    from PIL import Image
-    with Image.open(seed_path) as img:
-        img.load()
-        rgb = img.convert("RGB")
-    _resize_center_crop(rgb, width, height).save(out_path, format="PNG")
+    import ltx_image_fit
+    ltx_image_fit.fit_letterbox(ltx_image_fit.load_oriented_rgb(seed_path),
+                                width, height).save(out_path, format="PNG")
 
 
 def _style_text(panels):

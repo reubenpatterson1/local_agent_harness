@@ -113,6 +113,22 @@ def test_validate_geometry():
     check("M3g height < 32 rejected",
           "height" in (_raises_value_error(skill.validate_geometry, 704, -32, 241) or ""),
           "got %r" % _raises_value_error(skill.validate_geometry, 704, -32, 241))
+    msg = _raises_value_error(skill.validate_geometry, 736, 448, 145)
+    check("M3h (geometry) width 736 -- a 32- but not 64-multiple -- is rejected naming "
+          "'multiple of 64'", msg is not None and "width" in msg and "multiple of 64" in msg,
+          "got %r" % msg)
+    msg = _raises_value_error(skill.validate_geometry, 704, 480, 145)
+    check("M3i (geometry) height 480 is rejected", msg is not None and "height" in msg
+          and "multiple of 64" in msg, "got %r" % msg)
+    check("M3j (geometry) the 64x64x9 minimum is accepted",
+          skill.validate_geometry(64, 64, 9) is None)
+    msg = _raises_value_error(skill.validate_geometry, 736, 448, 145)
+    check("M3k (geometry) the width message is the spec text",
+          msg == "width must be a multiple of 64 (ltx-2-mlx distilled two-stage floors to 64; "
+                 "patchifiers.py snap_output_dimensions), got 736", "got %r" % msg)
+    msg = _raises_value_error(skill.validate_geometry, 0, 448, 9)
+    check("M3l (geometry) the minimum message is the spec text",
+          msg == "width must be >= 64, got 0", "got %r" % msg)
 
 
 # ---------------------------------------------------------------------------

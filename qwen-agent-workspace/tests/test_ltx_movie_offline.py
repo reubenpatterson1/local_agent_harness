@@ -8,6 +8,9 @@ never shells out to the wrapped tools under --dry-run).
 """
 
 import ast
+import contextlib
+import inspect
+import io
 import os
 import re
 import shutil
@@ -47,12 +50,25 @@ def check(name, condition, detail=""):
 def test_parser_defaults():
     args = ltx_movie.build_parser().parse_args(["some narrative", "--story-id", "test"])
     check("L1 panels == 15", args.panels == 15, "got %r" % args.panels)
-    check("L1 frames == 241", args.frames == 241, "got %r" % args.frames)
+    check("L1 frames == 145", args.frames == 145, "got %r" % args.frames)
+    helptext = " ".join(ltx_movie.build_parser().format_help().split())
+    check("L1 --frames help states 6.04s per clip",
+          "145 frames @ 24 fps = 6.04s per clip." in helptext, "got %r" % helptext)
+    check("L1 --length help states 6.04s per panel at the defaults",
+          "6.04s per panel at the defaults" in helptext)
+    check("L1 --panels help describes chained clips",
+          "number of chained clips; panel 1 also gets the movie's one still image; "
+          "mutually exclusive with --length" in helptext)
+    check("L1 the description names the chained render",
+          "every clip after the first continues from the previous clip's last frame" in helptext)
     check("L1 fps == 24", args.fps == 24, "got %r" % args.fps)
-    check("L1 image_width == 1280", args.image_width == 1280, "got %r" % args.image_width)
-    check("L1 image_height == 704", args.image_height == 704, "got %r" % args.image_height)
-    check("L1 video_width == 704", args.video_width == 704, "got %r" % args.video_width)
-    check("L1 video_height == 448", args.video_height == 448, "got %r" % args.video_height)
+    check("L1 no --image-width/--image-height any more (the still size is derived)",
+          not hasattr(args, "image_width") and not hasattr(args, "image_height"))
+    check("L1 video_width defaults to None (derived from the seed, or 704 in main)",
+          args.video_width is None, "got %r" % args.video_width)
+    check("L1 video_height defaults to None (derived from the seed, or 448 in main)",
+          args.video_height is None, "got %r" % args.video_height)
+    check("L1 no removed backend attribute", not hasattr(args, "video_" + "backend"))
     check("L1 image_seed == 0", args.image_seed == 0, "got %r" % args.image_seed)
     check("L1 panel_timeout == 7200", args.panel_timeout == 7200, "got %r" % args.panel_timeout)
     check("L1 model is the pack id",
@@ -72,9 +88,11 @@ def test_parser_defaults():
 
 
 def test_removed_flags_rejected():
+    # "--video-" + "backend": the spec's grep gate (12.1 item 5) must not match test sources.
     for flag, value in (("--min-frames", "25"), ("--max-frames", "57"),
                         ("--target-seconds", "30"), ("--keep-down", None),
-                        ("--reanchor-every", "3")):
+                        ("--reanchor-every", "3"), ("--video-" + "backend", "mlx"),
+                        ("--image-width", "1280"), ("--image-height", "704")):
         argv = [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x", flag]
         if value is not None:
             argv.append(value)
@@ -101,8 +119,8 @@ def test_dry_run_prints_phases_and_prompt():
     check("L2 --dry-run exits 0", result.returncode == 0, "rc=%r stderr=%r" % (result.returncode, result.stderr))
     for phase in ("Phase 1", "Phase 2", "Phase 3", "Phase 4"):
         check("L2 stdout contains %r" % phase, phase in result.stdout, "stdout=%r" % result.stdout[:2000])
-    check("L2 stdout contains rendered 'Do not verify the file with run_python'",
-          "Do not verify the file with run_python" in result.stdout,
+    check("L2 stdout contains the rendered template's no-verify instruction",
+          "do NOT run run_python or any other tool to check it" in result.stdout,
           "stdout=%r" % result.stdout[:2000])
 
 
@@ -158,54 +176,39 @@ def test_sudo_n_not_sudo_s():
 # ---------------------------------------------------------------------------
 
 def test_story_prompt_template():
-    prompt = ltx_movie.build_story_prompt("some narrative", "some_id", 7)
-    check("L5a prompt contains VERBATIM", "VERBATIM" in prompt)
-    check("L5b prompt contains 'Do not verify'", "Do not verify" in prompt)
-    check("L5c prompt formats panels count (7) in", prompt.count("7") >= 2)
-    check("L5d Motion: line asks for 110-160 words", "110-160 words" in prompt,
+    prompt = ltx_movie.build_story_prompt("some narrative", "some_id", 5, seconds="6")
+    for phrase in ("ONE continuous take", "exact last frame", "Panel 1 has exactly three fields",
+                   "Every later panel has exactly two fields", "15-35 words"):
+        check("L5a prompt contains %r" % phrase, phrase in prompt, "got %r" % prompt[:800])
+    check("L5b no Style: field anywhere", "Style:" not in prompt, "got %r" % prompt)
+    check("L5c no braces survive rendering", "{" not in prompt and "}" not in prompt,
           "got %r" % prompt)
-    check("L5e Motion: line asks for a 7-10 sentence chronological paragraph",
-          "one flowing paragraph of 7-10 sentences in strict chronological order" in prompt,
-          "got %r" % prompt)
-    check("L5f Motion: line forbids cuts and new plot info",
-          "no cuts, no new plot information" in prompt, "got %r" % prompt)
-    check("L5g Image: line is unchanged (70-90 words)", "70-90 words" in prompt)
-    check("L5h Narration: line is unchanged",
-          "Narration: <one sentence of voice-over narration; vary the sentence length "
-          "across panels rather than repeating a similar length every time>" in prompt)
-    check("L5i Motion: line demands enough beats to fill the ten seconds",
-          "fill the full ten seconds instead of rushing the action" in prompt,
-          "got %r" % prompt)
-    check("L5j Motion: line no longer carries the old single-take framing",
-          "ONE CONTINUOUS TEN-SECOND TAKE" not in prompt, "got %r" % prompt)
-    check("L5k a style line bans abstract mood words",
-          'never "she looks sad" or any other mood word' in prompt, "got %r" % prompt)
-    check("L5l a style line bans scene-opener phrasing",
-          'never open with "The scene opens with", "We see" or "There is"' in prompt,
-          "got %r" % prompt)
-    check("L5m Motion: bans restating appearance/wardrobe/setting/lighting from Image:",
-          "Keep the setting, lighting and wardrobe consistent with the Image: field" not in prompt
-          and "must not be described again in Motion:" in prompt, "got %r" % prompt)
-    check("L5n Motion: line names the temporal connectors",
-          '"initially", "as", "then", "while", "simultaneously", "a moment later"' in prompt,
-          "got %r" % prompt)
-    check("L5o Motion: line and style line both demand the present tense",
-          prompt.count("in the present tense") >= 2, "got %r" % prompt)
-    check("L5p Motion: line prescribes the LTX shot-type vocabulary",
-          "extreme wide shot, wide shot, medium shot, medium close-up, close-up, "
-          "extreme close-up" in prompt, "got %r" % prompt)
-    check("L5q Motion: line prescribes the LTX camera-viewpoint vocabulary",
-          "front-facing, back-facing, side view, over-the-shoulder, top-down, "
-          "low-angle or high-angle" in prompt, "got %r" % prompt)
-    check("L5r Motion: line always states camera motion",
-          "if the camera holds, say that it remains static" in prompt, "got %r" % prompt)
-    check("L5s a style line requires a soundscape and forbids dialogue",
-          "Sound is part of the shot" in prompt
-          and "write no spoken dialogue" in prompt, "got %r" % prompt)
-    check("L5t the style paragraph comes last, after the VERBATIM paragraph",
-          "Write the Motion: field in the present tense" in prompt and "VERBATIM" in prompt
-          and prompt.index("Write the Motion: field in the present tense")
-              > prompt.index("VERBATIM"), "got %r" % prompt)
+    check("L5d no image_rules placeholder", "image_rules" not in prompt)
+    check("L5e formats narrative, story_id and panels",
+          "some narrative" in prompt and '"some_id"' in prompt
+          and "EXACTLY 5 panel sections" in prompt, "got %r" % prompt[:800])
+    check("L5f formats the per-clip seconds", "built 6 seconds at a time" in prompt
+          and "a 6-second continuation" in prompt, "got %r" % prompt[:800])
+    check("L5g is exactly the template formatted with the four placeholders",
+          prompt == ltx_movie.STORY_PROMPT_TEMPLATE.format(
+              narrative="some narrative", story_id="some_id", panels=5, seconds="6"))
+    check("L5h the stop-after-write terminator is kept",
+          "Once the write_file call returns, stop immediately" in prompt)
+    for no_stills in (False, True):
+        for seed_image in (False, True):
+            try:
+                p = ltx_movie.build_story_prompt("n", "sid", 3, no_stills, seed_image, seconds="6")
+                ok = "{" not in p and "}" not in p
+            except KeyError:
+                ok = False
+            check("L5i no_stills=%s seed_image=%s renders without KeyError or braces"
+                  % (no_stills, seed_image), ok)
+    try:
+        ltx_movie.build_story_prompt("n", "sid", 3)
+        raised = False
+    except TypeError:
+        raised = True
+    check("L5j seconds is keyword-only and required", raised)
 
 
 # ---------------------------------------------------------------------------
@@ -233,23 +236,69 @@ def test_lock_state():
 
 def test_validate_story_md_missing_motion():
     with tempfile.TemporaryDirectory() as td:
-        md_path = os.path.join(td, "story.md")
-        with open(md_path, "w") as f:
-            f.write(
-                "# Story\n\n"
-                "## Panel 1 — First\n"
-                "Image: a scene one\n"
-                "Motion: camera pans\n"
-                "Narration: narration one\n\n"
-                "## Panel 2 — Second\n"
-                "Image: a scene two\n"
-                "Narration: narration two\n"
-            )
-        violations = ltx_movie._validate_story_md(md_path, 2)
-        check("L7 violations non-empty", len(violations) > 0, "got %r" % violations)
-        found = any("panel 2" in v.lower() and "motion" in v.lower() for v in violations)
-        check("L7 a violation names panel 2's missing Motion field", found,
-              "violations=%r" % violations)
+        good = _write_md(td, "good.md",
+                         "# Story\n\n## Panel 1 — First\nImage: a scene one\n"
+                         "Motion: she turns\nNarration: one.\n\n"
+                         "## Panel 2 — Second\nMotion: she walks away\nNarration: two.\n")
+        check("L7a panel 1 with three fields + panel 2 with two fields is valid",
+              ltx_movie._validate_story_md(good, 2) == [],
+              "got %r" % ltx_movie._validate_story_md(good, 2))
+
+        no_motion_2 = _write_md(td, "no_motion_2.md",
+                                "# Story\n\n## Panel 1 — First\nImage: a scene one\n"
+                                "Motion: she turns\nNarration: one.\n\n"
+                                "## Panel 2 — Second\nNarration: two.\n")
+        v = ltx_movie._validate_story_md(no_motion_2, 2)
+        check("L7b panel 2 missing Motion: is a violation",
+              "panel 2: missing/empty Motion: field" in v, "got %r" % v)
+
+        no_image_1 = _write_md(td, "no_image_1.md",
+                               "# Story\n\n## Panel 1 — First\nMotion: she turns\n"
+                               "Narration: one.\n\n"
+                               "## Panel 2 — Second\nMotion: she walks away\nNarration: two.\n")
+        v = ltx_movie._validate_story_md(no_image_1, 2)
+        check("L7c panel 1 missing Image: is a violation",
+              "panel 1: missing/empty Image: field" in v, "got %r" % v)
+
+        image_2 = _write_md(td, "image_2.md",
+                            "# Story\n\n## Panel 1 — First\nImage: a scene one\n"
+                            "Motion: she turns\nNarration: one.\n\n"
+                            "## Panel 2 — Second\nImage: an old-format picture\n"
+                            "Motion: she walks away\nNarration: two.\n")
+        check("L7d an Image: on panel 2 is NOT a violation (old-format story.md still renders)",
+              ltx_movie._validate_story_md(image_2, 2) == [],
+              "got %r" % ltx_movie._validate_story_md(image_2, 2))
+        w = ltx_movie._chain_image_warnings(ltx_movie._load_story_panels(image_2))
+        check("L7e it produces exactly one advisory warning naming panel 2",
+              w == ["panel 2: has an Image: field, which is ignored -- panels after the first "
+                    "continue from the previous clip's last frame"], "got %r" % w)
+        check("L7f a panel-1-only Image: produces no warning",
+              ltx_movie._chain_image_warnings(ltx_movie._load_story_panels(good)) == [])
+
+        prompt_2 = _write_md(td, "prompt_2.md",
+                             "# Story\n\n## Panel 1 — First\nImage: a scene one\n"
+                             "Motion: she turns\nNarration: one.\n\n"
+                             "## Panel 2 — Second\nPrompt: a collapsed field\n"
+                             "Motion: she walks away\nNarration: two.\n")
+        v = ltx_movie._validate_story_md(prompt_2, 2)
+        check("L7g a Prompt: field in stills mode is a violation",
+              "panel 2: has a Prompt: field; the chained flow expects Image:, Motion: and "
+              "Narration: on panel 1 and Motion: and Narration: on later panels" in v,
+              "got %r" % v)
+        check("L7h the require_style parameter is gone",
+              "require_style" not in inspect.signature(ltx_movie._validate_story_md).parameters)
+
+    with open(_SCRIPT_PATH) as f:
+        text = f.read()
+    check("L7i the chain-image warning loop is guarded by --no-stills and appears once",
+          text.count('    if not args.no_stills:\n'
+                     '        for w in _chain_image_warnings(_load_story_panels(story_md)):\n'
+                     '            print("Warning: %s" % w)\n') == 1)
+    orphans = ("_style_echo_warnings", "_style_content_warnings", "_content_words", "_ECHO_",
+               "_STYLE_BANNED_TOKENS", "require_style")
+    check("L7j the Style-echo machinery is gone from bin/ltx-movie",
+          not any(o in text for o in orphans) and "\nimport re\n" not in text,
+          "still present: %r" % [o for o in orphans if o in text])
 
 
 # ---------------------------------------------------------------------------
@@ -262,12 +311,12 @@ def test_resolve_length_math():
         ltx_movie._resolve_length(args, argv)
         return args.panels
 
-    check("L8a --length 100 -> 10 panels (round(9.958))",
-          _resolve(["n", "--story-id", "x", "--length", "100"]) == 10,
-          "got %r" % _resolve(["n", "--story-id", "x", "--length", "100"]))
-    check("L8b --length 20 -> 2 panels (round(1.992))",
-          _resolve(["n", "--story-id", "x", "--length", "20"]) == 2,
-          "got %r" % _resolve(["n", "--story-id", "x", "--length", "20"]))
+    check("L8a --length 60 -> 10 panels (round(9.931) at 145/24)",
+          _resolve(["n", "--story-id", "x", "--length", "60"]) == 10,
+          "got %r" % _resolve(["n", "--story-id", "x", "--length", "60"]))
+    check("L8b --length 12 -> 2 panels (round(1.986))",
+          _resolve(["n", "--story-id", "x", "--length", "12"]) == 2,
+          "got %r" % _resolve(["n", "--story-id", "x", "--length", "12"]))
     check("L8c the divisor tracks --frames: --length 100 --frames 121 -> 20 panels",
           _resolve(["n", "--story-id", "x", "--length", "100", "--frames", "121"]) == 20,
           "got %r" % _resolve(["n", "--story-id", "x", "--length", "100",
@@ -293,11 +342,11 @@ def test_length_conflicts():
 def test_length_too_short():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "15", "--dry-run"],
+         "--length", "8", "--dry-run"],
         capture_output=True, text=True, cwd=WS)
-    check("L10a --length 15 exits 2", result.returncode == 2,
+    check("L10a --length 8 exits 2", result.returncode == 2,
           "rc=%r stderr=%r" % (result.returncode, result.stderr))
-    check("L10b the message names 10.04s per panel", "10.04s per panel" in result.stderr,
+    check("L10b the message names 6.04s per panel", "6.04s per panel" in result.stderr,
           "stderr=%r" % result.stderr)
     check("L10c the message names the resolved panel count",
           "resolves to 1 panel" in result.stderr, "stderr=%r" % result.stderr)
@@ -317,12 +366,12 @@ def test_length_100_panels_and_tokens():
         capture_output=True, text=True, cwd=WS)
     check("L11a --length 100 exits 0", result.returncode == 0,
           "rc=%r stderr=%r" % (result.returncode, result.stderr))
-    check("L11b story prompt requests EXACTLY 10 panels", "EXACTLY 10" in result.stdout,
-          "stdout=%r" % result.stdout[:2000])
+    check("L11b story prompt requests EXACTLY 17 panels (round(16.55) at 145/24)",
+          "EXACTLY 17" in result.stdout, "stdout=%r" % result.stdout[:2000])
     m = re.search(r"--max-tokens\s+(\d+)", result.stdout)
     check("L11c --max-tokens present", m is not None)
     if m:
-        check("L11d --max-tokens is max(4096, 10*550) == 5500", int(m.group(1)) == 5500,
+        check("L11d --max-tokens is max(4096, 17*550) == 9350", int(m.group(1)) == 9350,
               "got %s" % m.group(1))
 
 
@@ -377,7 +426,7 @@ def test_no_stills_orthogonal_to_length():
     with_flag = _resolve(["narrative", "--story-id", "x", "--no-stills", "--length", "100"])
     check("L14a --no-stills does not change --length resolution", plain == with_flag,
           "got %r vs %r" % (plain, with_flag))
-    check("L14b --length 100 resolves to 10 panels", plain == 10, "got %r" % plain)
+    check("L14b --length 100 resolves to 17 panels", plain == 17, "got %r" % plain)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +434,7 @@ def test_no_stills_orthogonal_to_length():
 # ---------------------------------------------------------------------------
 
 def test_no_stills_story_prompt_template():
-    p = ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=True)
+    p = ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=True, seconds="6")
     check("L15a contains Prompt:", "Prompt: <" in p, "got %r" % p[:400])
     check("L15b contains Narration:", "Narration: <" in p)
     check("L15c keeps the VERBATIM consistency rule", "VERBATIM" in p)
@@ -399,8 +448,9 @@ def test_no_stills_story_prompt_template():
     check("L15l Prompt: line asks for a 7-10 sentence chronological paragraph",
           "one flowing paragraph of 7-10 sentences" in p
           and "in strict chronological order" in p, "got %r" % p[:1400])
-    check("L15m Prompt: line demands enough beats to fill the ten seconds",
-          "fill the full ten seconds instead of rushing the action" in p, "got %r" % p[:900])
+    check("L15m Prompt: line demands enough beats to fill the clip's seconds",
+          "fill the full 6 seconds instead of rushing the action" in p
+          and "ten seconds" not in p, "got %r" % p[:1400])
     check("L15n Prompt: line no longer carries the old single-take framing",
           "ONE CONTINUOUS TEN-SECOND TAKE" not in p, "got %r" % p[:900])
     check("L15o Prompt: line keeps the no-cuts / no-new-plot rule",
@@ -437,23 +487,17 @@ def test_no_stills_story_prompt_template():
     check("L15x a style line requires a soundscape and forbids dialogue",
           "Sound is part of the shot" in p and "write no spoken dialogue" in p,
           "got %r" % p[:1400])
-    check("L15y the style paragraph comes after the trailing Rules: block",
-          "Write the Prompt: field in the present tense" in p
-          and "Motion should focus on the actions" in p
-          and p.index("Write the Prompt: field in the present tense")
-              > p.rindex("Motion should focus on the actions"), "got %r" % p[:2400])
     check("L15r a style line bans scene-opener phrasing",
           'never open with "The scene opens with", "We see" or "There is"' in p,
           "got %r" % p[:900])
     check("L15i formats narrative/story_id/panels",
           "some narrative" in p and "some_id" in p and "EXACTLY 7 panel sections" in p)
-
-    d = ltx_movie.build_story_prompt("some narrative", "some_id", 7)
-    check("L15j the three-argument call is unchanged from today's template",
-          d == ltx_movie.STORY_PROMPT_TEMPLATE.format(
-              narrative="some narrative", story_id="some_id", panels=7))
-    check("L15k no_stills=False is the same as the three-argument call",
-          ltx_movie.build_story_prompt("some narrative", "some_id", 7, no_stills=False) == d)
+    check("L15j equals the no-stills template formatted with the four placeholders",
+          p == ltx_movie.STORY_PROMPT_TEMPLATE_NO_STILLS.format(
+              narrative="some narrative", story_id="some_id", panels=7, seconds="6"))
+    check("L15k seed_image=True does not change the no-stills prompt",
+          ltx_movie.build_story_prompt("some narrative", "some_id", 7, True, True,
+                                       seconds="6") == p)
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +571,10 @@ def test_no_stills_phase_sequencing_source():
           "def phase2_stills(args):" in text
           and "no_stills" not in text.split("def phase2_stills(args):")[1]
                                       .split("def phase3_manifest")[0])
-    check("L17c phase 3 swaps --glob/--images-dir for --no-images",
-          '"--no-images"' in text and '"--glob", "panel_*.png"' in text)
+    check("L17c phase 3 swaps --chain/--image for --no-images",
+          '"--no-images"' in text
+          and '"--chain", "--image", os.path.join(paths["images_dir"], "panel_01.png")' in text
+          and '"--glob"' not in text)
     check("L17d Phase 3 and Phase 4 both build their flags from _render_flags",
           text.count("_render_flags(args)") == 4,
           "got %r occurrences" % text.count("_render_flags(args)"))
@@ -572,6 +618,8 @@ def test_no_stills_dry_run_plan():
           and "Image: <a single still-image prompt" not in out)
     check("L18h no per-panel opener/follower table here (it comes from a real Phase 3)",
           "T2V opener" not in out, "got %r" % out)
+    check("L18m --no-stills keeps --on-panel-failure skip and never chains",
+          "--on-panel-failure skip" in out and "--chain" not in out, "got %r" % out)
 
 
 def test_default_dry_run_plan_unchanged():
@@ -586,9 +634,17 @@ def test_default_dry_run_plan_unchanged():
     check("L18j default plan still calls ltx-story-images", "ltx-story-images" in out)
     check("L18k default plan has no --no-images / --engine chain",
           "--no-images" not in out and "--engine chain" not in out)
-    check("L18l default plan carries the rewritten Motion: line",
-          "Motion: <110-160 words in the present tense" in out
-          and "ONE CONTINUOUS TEN-SECOND TAKE" not in out, "got %r" % out)
+    check("L18l default plan carries the chained story template",
+          "Every later panel has exactly two fields" in out
+          and "Motion: <110-160 words" not in out and "ONE CONTINUOUS TEN-SECOND TAKE" not in out,
+          "got %r" % out)
+    check("L18n default Phase 3 is --chain --image .../images/panel_01.png",
+          "--chain --image " in out and "images/panel_01.png" in out and "--glob" not in out,
+          "got %r" % out)
+    check("L18o default Phase 4 stops on a failed panel",
+          "--on-panel-failure stop" in out and "--on-panel-failure skip" not in out,
+          "got %r" % out)
+    check("L18p no removed backend flag anywhere", ("--video-" + "backend") not in out)
 
 
 # ---------------------------------------------------------------------------
@@ -674,10 +730,10 @@ def test_dry_run_plan_targets_mlx_render():
           out.count("ltx-mlx-render") == 2, "got %d" % out.count("ltx-mlx-render"))
     check("L24c bin/ltx-story-video is never named", "ltx-story-video" not in out,
           "got %r" % out)
-    check("L24d Phase 3 pins the manifest allocator to a flat 241 frames",
-          "--min-frames 241 --max-frames 241" in out, "got %r" % out)
+    check("L24d Phase 3 pins the manifest allocator to a flat 145 frames",
+          "--min-frames 145 --max-frames 145" in out, "got %r" % out)
     check("L24e --target-seconds is computed as panels*frames/fps",
-          "--target-seconds 30.125" in out, "got %r" % out)
+          "--target-seconds 18.125" in out, "got %r" % out)
 
     def _val(line, flag):
         t = line.split()
@@ -687,7 +743,7 @@ def test_dry_run_plan_targets_mlx_render():
     check("L24f exactly two ltx-mlx-render commands appear (Phase 3 probe, Phase 4 render)",
           len(render_lines) == 2, "got %r" % render_lines)
     for line in render_lines:
-        for flag, want in (("--frames", "241"), ("--width", "704"), ("--height", "448"),
+        for flag, want in (("--frames", "145"), ("--width", "704"), ("--height", "448"),
                            ("--frame-rate", "24"), ("--tile-frames", "1"),
                            ("--tile-spatial", "1")):
             check("L24f %r has %s %s" % (line.split()[0:2], flag, want),
@@ -695,12 +751,15 @@ def test_dry_run_plan_targets_mlx_render():
                   "got %r in %r" % (_val(line, flag), line))
     check("L24g --resume is always passed", out.count("--resume") == 2, "got %r" % out)
     check("L24h --no-low-ram is absent by default", "--no-low-ram" not in out, "got %r" % out)
-    check("L24i Phase 4 carries the failure policy",
-          "--on-panel-failure skip" in out and "--retry-failed 1" in out
+    check("L24i Phase 4 carries the chained failure policy",
+          "--on-panel-failure stop" in out and "--retry-failed 1" in out
           and "--retry-idle 120" in out and "--max-consecutive-failures 3" in out
           and "--panel-timeout 7200" in out, "got %r" % out)
-    check("L24j Phase 2 uses the new still resolution",
-          "--width 1280" in out and "--height 704" in out, "got %r" % out)
+    check("L24j Phase 2 renders panel 1 only, at twice the video size",
+          "--only 1 --width 1408 --height 896" in out, "got %r" % out)
+    check("L24n no removed backend token anywhere", ("--video-" + "backend") not in out)
+    check("L24o Phase 3 builds a chained manifest from panel 1's still",
+          re.search(r"--chain --image \S*images/panel_01\.png", out) is not None, "got %r" % out)
 
     forced = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-mlx2",
@@ -725,31 +784,33 @@ def test_dry_run_plan_targets_mlx_render():
 # ---------------------------------------------------------------------------
 
 def test_seed_prompt_preface():
-    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-
-    check("L25a unseeded (4-arg-equivalent) prompt is byte-identical to today's template",
-          p_off == ltx_movie.STORY_PROMPT_TEMPLATE.format(narrative="n", story_id="sid", panels=5),
-          "got %r" % p_off[:400])
-    check("L25b preface sentence present only when seeded",
+    pre = ltx_movie.SEED_IMAGE_PREFACE
+    post = ltx_movie.SEED_IMAGE_POSTFACE
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5, seconds="6")
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True, seconds="6")
+    check("L25a the unseeded prompt is the plain template",
+          p_off == ltx_movie.STORY_PROMPT_TEMPLATE.format(narrative="n", story_id="sid",
+                                                          panels=5, seconds="6"))
+    check("L25b the preface sentence appears only when seeded",
           "An image is attached to this message." in p_on
           and "An image is attached to this message." not in p_off)
-    check("L25c seeded prompt starts with SEED_IMAGE_PREFACE",
-          p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
-    check("L25d seeded prompt is preface + unseeded template + postface, exactly",
-          p_on == (ltx_movie.SEED_IMAGE_PREFACE + "\n\n" + p_off + "\n\n"
-                   + ltx_movie.SEED_IMAGE_POSTFACE),
-          "got tail %r" % p_on[-400:])
-    for phrase in (
-        "Panel 1's still will NOT be rendered from your text",
-        "faithful, literal description of that attached image",
-        "not a generative prompt",
-        "must stay visually consistent with what you actually observed",
-    ):
-        check("L25e preface contains %r" % phrase, phrase in p_on)
-    check("L25f --no-stills wins over --seed-image",
-          ltx_movie.build_story_prompt("n", "sid", 5, True, True)
-          == ltx_movie.build_story_prompt("n", "sid", 5, True, False))
+    check("L25c the seeded prompt starts with SEED_IMAGE_PREFACE", p_on.startswith(pre))
+    check("L25d the seeded prompt is preface + unseeded template + postface, exactly",
+          p_on == pre + "\n\n" + p_off + "\n\n" + post, "got tail %r" % p_on[-400:])
+    check("L25e the preface says the attached image IS the first frame",
+          "IS the first frame" in pre)
+    for phrase in ("faithful, literal description of what the attached image actually shows",
+                   "not a generative prompt",
+                   "Panel 1's Motion: must start from the exact pose and position shown in "
+                   "the attached image."):
+        check("L25f the preface contains %r" % phrase[:60], phrase in pre)
+    check("L25g neither the preface nor the postface mentions Style: or FAR BAND",
+          all("Style:" not in t and "FAR BAND" not in t for t in (pre, post)))
+    check("L25h the assembled seeded prompt carries no Style: and no FAR BAND",
+          "Style:" not in p_on and "FAR BAND" not in p_on)
+    check("L25i --no-stills wins over --seed-image",
+          ltx_movie.build_story_prompt("n", "sid", 5, True, True, seconds="6")
+          == ltx_movie.build_story_prompt("n", "sid", 5, True, False, seconds="6"))
 
 
 # ---------------------------------------------------------------------------
@@ -757,95 +818,106 @@ def test_seed_prompt_preface():
 # ---------------------------------------------------------------------------
 
 def test_phase0_seed_image():
-    from PIL import Image
-
-    # Real tool defaults (--image-width/--image-height), used as target_width/
-    # target_height in every _downscale_seed_image call below.
-    tw, th = 1280, 704
-    # Crop-to-fill always produces exactly tw x th first, so the subsequent long-edge
-    # downscale (tw > SEED_DOWNSCALE_MAX_EDGE) always scales by the same factor,
-    # regardless of the source's own size/aspect -- the whole point of the fix.
-    _scale = ltx_movie.SEED_DOWNSCALE_MAX_EDGE / float(max(tw, th))
-    expected_w = int(round(tw * _scale))
-    expected_h = int(round(th * _scale))
+    from PIL import Image, ImageChops, ImageDraw
 
     with tempfile.TemporaryDirectory() as tmp:
         out_path = os.path.join(tmp, "out.png")
 
         missing = os.path.join(tmp, "missing.png")
-        v = ltx_movie._downscale_seed_image(missing, out_path, tw, th)
+        v, g = ltx_movie._prepare_seed_image(missing, out_path)
         check("L26a missing file -> violation names 'not found'",
               any("not found" in s for s in v), "got %r" % v)
-        check("L26a missing file -> output not created", not os.path.exists(out_path))
+        check("L26a missing file -> no geometry and no output",
+              g is None and not os.path.exists(out_path))
 
         junk = os.path.join(tmp, "junk.png")
         with open(junk, "w") as f:
             f.write("not a real image xx")
-        v = ltx_movie._downscale_seed_image(junk, out_path, tw, th)
+        v, g = ltx_movie._prepare_seed_image(junk, out_path)
         check("L26b unreadable file -> violation names 'not a readable image'",
-              any("not a readable image" in s for s in v), "got %r" % v)
+              any("not a readable image" in s for s in v) and g is None, "got %r" % v)
 
         tiny = os.path.join(tmp, "tiny.png")
         Image.new("RGB", (32, 32), (1, 2, 3)).save(tiny, format="PNG")
-        v = ltx_movie._downscale_seed_image(tiny, out_path, tw, th)
+        v, g = ltx_movie._prepare_seed_image(tiny, out_path)
         check("L26c 32x32 -> violation names 'degenerate' and '32x32'",
-              any("degenerate" in s and "32x32" in s for s in v), "got %r" % v)
+              any("degenerate" in s and "32x32" in s for s in v) and g is None, "got %r" % v)
 
         big = os.path.join(tmp, "big.png")
         Image.new("RGB", (4000, 3000), (4, 5, 6)).save(big, format="PNG")
-        v = ltx_movie._downscale_seed_image(big, out_path, tw, th)
-        check("L26d 4000x3000 -> no violations", v == [], "got %r" % v)
+        v, g = ltx_movie._prepare_seed_image(big, out_path)
+        check("L26d 4000x3000 -> no violations, geometry (512, 384, 0)",
+              v == [] and g == (512, 384, 0), "got %r %r" % (v, g))
         with Image.open(out_path) as img:
-            w, h = img.size
-            check("L26d output long edge == SEED_DOWNSCALE_MAX_EDGE",
-                  max(w, h) == ltx_movie.SEED_DOWNSCALE_MAX_EDGE, "got %r" % (img.size,))
-            check("L26d output aspect matches target (crop-to-fill, not source 4:3)",
-                  abs(w / h - tw / float(th)) < 0.01, "got %r" % (img.size,))
-            check("L26d output format is PNG", img.format == "PNG", "got %r" % img.format)
+            check("L26d the story-model copy is a 1024x768 PNG",
+                  img.size == (1024, 768) and img.format == "PNG",
+                  "got %r %r" % (img.size, img.format))
 
-        under_cap = os.path.join(tmp, "under.png")
-        Image.new("RGB", (800, 600), (7, 8, 9)).save(under_cap, format="PNG")
-        v = ltx_movie._downscale_seed_image(under_cap, out_path, tw, th)
-        check("L26e 800x600 (under the cap) -> no violations", v == [], "got %r" % v)
+        under = os.path.join(tmp, "under.png")
+        Image.new("RGB", (800, 600), (7, 8, 9)).save(under, format="PNG")
+        v, g = ltx_movie._prepare_seed_image(under, out_path)
+        check("L26e 800x600 -> (512, 384, 0)", v == [] and g == (512, 384, 0), "got %r %r" % (v, g))
         with Image.open(out_path) as img:
-            check("L26e size is crop-to-fill then downscale, not source size unchanged",
-                  img.size == (expected_w, expected_h), "got %r" % (img.size,))
+            check("L26e the copy is 1024x768", img.size == (1024, 768), "got %r" % (img.size,))
 
         at_cap = os.path.join(tmp, "at_cap.png")
         Image.new("RGB", (1024, 1024), (10, 11, 12)).save(at_cap, format="PNG")
-        v = ltx_movie._downscale_seed_image(at_cap, out_path, tw, th)
-        check("L26f 1024x1024 (exactly at the cap) -> no violations", v == [], "got %r" % v)
+        v, g = ltx_movie._prepare_seed_image(at_cap, out_path)
+        check("L26f 1024x1024 -> (512, 512, 0)", v == [] and g == (512, 512, 0), "got %r %r" % (v, g))
         with Image.open(out_path) as img:
-            check("L26f size is crop-to-fill then downscale, not the source's 1024x1024",
-                  img.size == (expected_w, expected_h), "got %r" % (img.size,))
+            check("L26f the copy is 1024x1024", img.size == (1024, 1024), "got %r" % (img.size,))
 
         rgba = os.path.join(tmp, "rgba.png")
         Image.new("RGBA", (200, 200), (1, 2, 3, 128)).save(rgba, format="PNG")
-        v = ltx_movie._downscale_seed_image(rgba, out_path, tw, th)
+        v, g = ltx_movie._prepare_seed_image(rgba, out_path)
         check("L26g RGBA input -> no violations", v == [], "got %r" % v)
         with Image.open(out_path) as img:
-            check("L26g output mode is RGB", img.mode == "RGB", "got %r" % img.mode)
+            check("L26g the copy is RGB", img.mode == "RGB", "got %r" % img.mode)
 
-        # L26j: bin/ltx-movie's _crop_to_fill and bin/ltx-story-images's
-        # _resize_center_crop must produce pixel-identical output for the same source
-        # and target size -- Phase 1 must see exactly the framing that becomes
-        # panel_01.png. Marker-image technique mirrors
-        # tests/test_ltx_story_images.py's test_resize_center_crop_geometry.
-        marker_src = Image.new("RGB", (900, 600), (255, 0, 0))
-        from PIL import ImageDraw
-        draw = ImageDraw.Draw(marker_src)
-        cx, cy, half = 900 / 2.0, 600 / 2.0, 60 / 2.0
-        left = int(round(cx - half))
-        top = int(round(cy - half))
+        wide = os.path.join(tmp, "wide.png")
+        Image.new("RGB", (3001, 1000), (13, 14, 15)).save(wide, format="PNG")
+        wide_out = os.path.join(tmp, "wide_out.png")
+        v, g = ltx_movie._prepare_seed_image(wide, wide_out)
+        check("L26h 3001x1000 -> a violation naming '1:3 to 3:1', nothing written",
+              any("1:3 to 3:1" in s for s in v) and g is None and not os.path.exists(wide_out),
+              "got %r %r" % (v, g))
+
+        exif_path = os.path.join(tmp, "phone.jpg")
+        stored = Image.new("RGB", (400, 300), (200, 10, 10))
+        exif = stored.getexif()
+        exif[0x0112] = 6
+        stored.save(exif_path, format="JPEG", exif=exif)
+        v, g = ltx_movie._prepare_seed_image(exif_path, out_path)
+        check("L26i a JPEG stored 400x300 with EXIF Orientation=6 -> (384, 512, 0)",
+              v == [] and g == (384, 512, 0), "got %r %r" % (v, g))
+
+        # L26j: the story-model copy and panel_01.png frame the SAME picture -- equal
+        # aspect within 1 px of rounding, and a centred marker stays centred in both.
+        src = Image.new("RGB", (900, 600), (255, 0, 0))
+        draw = ImageDraw.Draw(src)
+        left, top = int(round(450 - 30)), int(round(300 - 30))
         draw.rectangle([left, top, left + 60 - 1, top + 60 - 1], fill=(0, 0, 0))
-        movie_out = ltx_movie._crop_to_fill(marker_src, tw, th)
-        images_out = ltx_story_images._resize_center_crop(marker_src, tw, th)
-        check("L26j crop-to-fill output sizes match", movie_out.size == images_out.size,
-              "got %r vs %r" % (movie_out.size, images_out.size))
-        check("L26j bin/ltx-movie and bin/ltx-story-images crop pixel-identically",
-              list(movie_out.getdata()) == list(images_out.getdata()))
+        src_path = os.path.join(tmp, "marker.png")
+        src.save(src_path, format="PNG")
+        llm_out = os.path.join(tmp, "llm.png")
+        panel_out = os.path.join(tmp, "panel_01.png")
+        v, g = ltx_movie._prepare_seed_image(src_path, llm_out)
+        ltx_story_images._write_seed_panel(src_path, panel_out, 576, 384)
+        with Image.open(llm_out) as a, Image.open(panel_out) as b:
+            a, b = a.convert("RGB"), b.convert("RGB")
+            check("L26j 900x600 -> geometry (576, 384, 0) and a 1024x683 copy",
+                  g == (576, 384, 0) and a.size == (1024, 683), "got %r %r" % (g, a.size))
+            check("L26j the copy and panel_01.png have equal aspect within 1 px",
+                  b.size == (576, 384) and abs(a.size[1] - a.size[0] * b.size[1] / float(b.size[0])) <= 1.0,
+                  "got %r vs %r" % (a.size, b.size))
+            for label, img in (("copy", a), ("panel_01", b)):
+                bbox = ImageChops.difference(img, Image.new("RGB", img.size, (255, 0, 0))).getbbox()
+                ok = bbox is not None and \
+                    abs((bbox[0] + bbox[2]) / 2.0 - img.size[0] / 2.0) <= 2 and \
+                    abs((bbox[1] + bbox[3]) / 2.0 - img.size[1] / 2.0) <= 2
+                check("L26j the marker is centred (+-2 px) in the %s" % label, ok,
+                      "bbox=%r size=%r" % (bbox, img.size))
 
-    # phase0_seed end-to-end, with a throwaway story-id, cleaned up in a finally block.
     story_id = "_test_phase0_seed_%d" % os.getpid()
     story_dir = ltx_movie._story_dir(story_id)
     try:
@@ -856,16 +928,18 @@ def test_phase0_seed_image():
                 ["n", "--story-id", story_id, "--seed-image", valid_seed])
             rc = ltx_movie.phase0_seed(args)
             expected_path = ltx_movie._story_paths(story_id)["seed_downscaled"]
-            check("L26h phase0_seed returns 0 for a valid seed", rc == 0, "got %r" % rc)
-            check("L26h args.seed_downscaled_path is set to the expected path",
+            check("L26k phase0_seed returns 0 for a valid seed", rc == 0, "got %r" % rc)
+            check("L26k args.seed_downscaled_path is the expected path",
                   getattr(args, "seed_downscaled_path", None) == expected_path,
                   "got %r" % getattr(args, "seed_downscaled_path", None))
+            check("L26k args.video_width/video_height are the derived 512x384",
+                  (args.video_width, args.video_height) == (512, 384),
+                  "got %r" % ((args.video_width, args.video_height),))
+            check("L26k args.seed_pad_px is the residual pad", getattr(args, "seed_pad_px", None) == 0)
 
-            missing_seed = os.path.join(tmp, "does_not_exist.png")
             args2 = ltx_movie.build_parser().parse_args(
-                ["n", "--story-id", story_id, "--seed-image", missing_seed])
-            rc2 = ltx_movie.phase0_seed(args2)
-            check("L26i phase0_seed returns 2 for a missing seed", rc2 == 2, "got %r" % rc2)
+                ["n", "--story-id", story_id, "--seed-image", os.path.join(tmp, "nope.png")])
+            check("L26l phase0_seed returns 2 for a missing seed", ltx_movie.phase0_seed(args2) == 2)
     finally:
         shutil.rmtree(story_dir, ignore_errors=True)
 
@@ -875,37 +949,74 @@ def test_phase0_seed_image():
 # ---------------------------------------------------------------------------
 
 def test_seed_dry_run_plan():
-    missing = "/nonexistent/seed_for_test.png"
-    result = subprocess.run(
-        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-seed",
-         "--panels", "3", "--seed-image", missing, "--dry-run"],
-        capture_output=True, text=True, cwd=WS)
-    out = result.stdout
-    check("L27a exits 0 (dry-run never opens the seed file itself)",
-          result.returncode == 0, "rc=%r stderr=%r" % (result.returncode, result.stderr))
-    check("L27b stdout contains a Phase 0 block", "--- Phase 0: seed image ---" in out,
-          "got %r" % out[:1500])
+    from PIL import Image
+    story_id = "unittest-seed-%d" % os.getpid()
 
-    m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", out)
-    check("L27c phase-1 command line found", m is not None, "got %r" % out[:1500])
-    if m:
-        check("L27c phase-1 command carries --image with a seed_downscaled.png path",
-              re.search(r"--image \S*seed_downscaled\.png", m.group(1)) is not None,
-              "got %r" % m.group(1))
+    def _val(line, flag):
+        t = line.split()
+        return t[t.index(flag) + 1] if flag in t else None
 
-    phase2_lines = [l for l in out.splitlines() if "ltx-story-images" in l]
-    check("L27d exactly one phase-2 command line found", len(phase2_lines) == 1,
-          "got %r" % phase2_lines)
-    if phase2_lines:
-        check("L27d phase-2 command carries --seed-image with the ORIGINAL path",
-              ("--seed-image " + missing) in phase2_lines[0], "got %r" % phase2_lines[0])
-        check("L27d phase-2 command does not carry the downscaled path",
-              "seed_downscaled" not in phase2_lines[0], "got %r" % phase2_lines[0])
-        check("L27f --seed-image appears exactly once in the ltx-story-images command line",
-              phase2_lines[0].count("--seed-image") == 1, "got %r" % phase2_lines[0])
+    with tempfile.TemporaryDirectory() as tmp:
+        seed = os.path.join(tmp, "seed1920.png")
+        Image.new("RGB", (1920, 1080), (40, 50, 60)).save(seed, format="PNG")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+             "--panels", "3", "--seed-image", seed, "--dry-run"],
+            capture_output=True, text=True, cwd=WS)
+        out = result.stdout
+        check("L27a exits 0", result.returncode == 0,
+              "rc=%r stderr=%r" % (result.returncode, result.stderr))
+        check("L27b stdout contains a Phase 0 block", "--- Phase 0: seed image ---" in out,
+              "got %r" % out[:1500])
+        check("L27b2 Phase 0 prints the derived geometry and residual pad",
+              "video geometry 576x320" in out and "residual pad 7 px" in out,
+              "got %r" % out[:2000])
 
-    check("L27e rendered prompt preview contains the preface sentence",
-          "An image is attached to this message." in out, "got %r" % out[-2000:])
+        m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", out)
+        check("L27c phase-1 command line found", m is not None, "got %r" % out[:1500])
+        if m:
+            check("L27c phase-1 command carries --image with a seed_downscaled.png path",
+                  re.search(r"--image \S*seed_downscaled\.png", m.group(1)) is not None,
+                  "got %r" % m.group(1))
+
+        phase2_lines = [l for l in out.splitlines() if "ltx-story-images" in l]
+        check("L27d exactly one phase-2 command line found", len(phase2_lines) == 1,
+              "got %r" % phase2_lines)
+        if phase2_lines:
+            check("L27d phase 2 renders panel 1 only, at the derived video size",
+                  "--only 1 --width 576 --height 320" in phase2_lines[0], "got %r" % phase2_lines[0])
+            check("L27d phase-2 command carries --seed-image with the ORIGINAL path",
+                  ("--seed-image " + seed) in phase2_lines[0], "got %r" % phase2_lines[0])
+            check("L27d phase-2 command does not carry the downscaled path",
+                  "seed_downscaled" not in phase2_lines[0], "got %r" % phase2_lines[0])
+            check("L27f --seed-image appears exactly once in the ltx-story-images command line",
+                  phase2_lines[0].count("--seed-image") == 1, "got %r" % phase2_lines[0])
+
+        render_lines = [l for l in out.splitlines() if "ltx-mlx-render" in l]
+        check("L27l both render commands carry the derived --width 576 --height 320",
+              len(render_lines) == 2
+              and all(_val(l, "--width") == "576" and _val(l, "--height") == "320"
+                      for l in render_lines), "got %r" % render_lines)
+        check("L27e rendered prompt preview contains the preface sentence",
+              "An image is attached to this message." in out, "got %r" % out[-2000:])
+        check("L27m the dry run wrote no story-model copy",
+              not os.path.exists(ltx_movie._story_paths(story_id)["seed_downscaled"]))
+
+        wide = os.path.join(tmp, "wide.png")
+        Image.new("RGB", (3001, 1000), (1, 1, 1)).save(wide, format="PNG")
+        r = subprocess.run([sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+                            "--seed-image", wide, "--dry-run"],
+                           capture_output=True, text=True, cwd=WS)
+        check("L27k an out-of-range seed fails the dry run with exit 2 naming the bound",
+              r.returncode == 2 and "1:3 to 3:1" in r.stderr,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+
+    r = subprocess.run([sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+                        "--seed-image", "/nonexistent/seed_for_test.png", "--dry-run"],
+                       capture_output=True, text=True, cwd=WS)
+    check("L27j a missing seed fails the dry run with exit 2",
+          r.returncode == 2 and "--seed-image not found" in r.stderr,
+          "rc=%r stderr=%r" % (r.returncode, r.stderr))
 
     plain = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-seed-off",
@@ -913,8 +1024,9 @@ def test_seed_dry_run_plan():
         capture_output=True, text=True, cwd=WS)
     check("L27g non-seeded dry-run prints no Phase 0", "Phase 0" not in plain.stdout,
           "got %r" % plain.stdout[:800])
-    check("L27h non-seeded dry-run has no --image flag", "--image " not in plain.stdout,
-          "got %r" % plain.stdout)
+    m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", plain.stdout)
+    check("L27h non-seeded phase-1 command carries no --image flag",
+          m is not None and "--image " not in m.group(1), "got %r" % (m.group(1) if m else None))
     check("L27i non-seeded dry-run mentions no seed_downscaled anywhere",
           "seed_downscaled" not in plain.stdout, "got %r" % plain.stdout)
 
@@ -970,14 +1082,29 @@ def test_seed_source_guards():
                     top_level_pil.append(alias.name)
     check("L29a no top-level PIL import", not top_level_pil, "found: %r" % top_level_pil)
 
-    pil_in_func = False
+    def _is_fit_loader(call):
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "SourceFileLoader"
+                and any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                        and "ltx_image_fit.py" in n.value for n in ast.walk(call)))
+
+    loader_in_func = loader_at_top = False
     for node in tree.body:
+        found = any(_is_fit_loader(sub) for sub in ast.walk(node))
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for sub in ast.walk(node):
-                if isinstance(sub, ast.ImportFrom) and sub.module == "PIL":
-                    pil_in_func = True
-    check("L29b PIL is imported, but only inside a function body (mirrors the "
-          "existing psutil guard pattern)", pil_in_func)
+            loader_in_func = loader_in_func or found
+        else:
+            loader_at_top = loader_at_top or found
+    check("L29b bin/ltx-movie loads ltx_image_fit.py only inside a function body",
+          loader_in_func and not loader_at_top,
+          "in_func=%r at_top=%r" % (loader_in_func, loader_at_top))
+    fit_path = os.path.join(WS, "ltx_image_fit.py")
+    with open(fit_path) as f:
+        fit_tree = ast.parse(f.read(), filename=fit_path)
+    fit_top_pil = [n for n in fit_tree.body
+                   if (isinstance(n, ast.ImportFrom) and n.module and n.module.split(".")[0] == "PIL")
+                   or (isinstance(n, ast.Import) and any(a.name.split(".")[0] == "PIL" for a in n.names))]
+    check("L29b2 ltx_image_fit.py has no top-level PIL import", not fit_top_pil)
 
     check("L29c --image threaded at exactly the 2 expected call sites",
           text.count('cmd += ["--image", args.seed_downscaled_path]') == 1
@@ -997,543 +1124,339 @@ def test_seed_source_guards():
 
 
 # ---------------------------------------------------------------------------
-# L30: the preface specifies the Style: field
-# ---------------------------------------------------------------------------
-
-def test_seed_preface_specifies_style_field():
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
-
-    check("L30a Style: present only when seeded",
-          "Style:" in p_on and "Style:" not in p_off)
-    for phrase in (
-        "Panel 1, and only Panel 1, carries one extra field",
-        "30-55 words on a single line",
-        "appended word for word to the end of every panel's image prompt",
-        "Emit the Style: line exactly once, in Panel 1, and never in any other panel.",
-    ):
-        check("L30b p_on contains %r" % phrase, phrase in p_on)
-    check("L30c p_on bans composition/framing words",
-          "It must not mention composition, framing, shot type, camera angle, viewpoint, pose, action"
-          in p_on)
-    check("L30d p_on starts with SEED_IMAGE_PREFACE", p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
-    check("L30e p_on ends with the postface and still contains p_off intact",
-          p_on.endswith(ltx_movie.SEED_IMAGE_POSTFACE)
-          and ("\n\n" + p_off + "\n\n") in p_on,
-          "got tail %r" % p_on[-400:])
-
-
-# ---------------------------------------------------------------------------
-# L31: per-panel verbatim repetition of the reference is gone, with an
-# explicit precedence rule
-# ---------------------------------------------------------------------------
-
-def test_seed_preface_drops_verbatim_repetition():
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
-
-    check("L31a old verbatim-repetition sentence is gone",
-          "that exact wording is repeated VERBATIM in every later panel in which it appears"
-          not in p_on)
-    check("L31b explicit ban on copying panel 1 forward",
-          "Do NOT copy Panel 1's Image: description into the later panels" in p_on)
-    check("L31c precedence rule: Style: replaces verbatim repetition, with the subject's "
-          "appearance carved back out of it",
-          "This replaces the verbatim-repetition rule below for everything that is visible "
-          "in the attached image" in p_on
-          and "put the global look -- and nothing about the subject -- into the Style: line"
-              in p_on
-          and "only as much of it as their shot band allows" in p_on
-          and "name their fixed attributes in the Style: line" not in p_on,
-          "the final preface paragraph still carries Step 2's superseded rule")
-    check("L31d precedence rule: VERBATIM still applies to new recurring elements",
-          "The verbatim-repetition rule below still applies to any NEW recurring character"
-          in p_on)
-    check("L31e base VERBATIM rule survives for unseeded runs (guards D5)",
-          "VERBATIM" in p_off)
-
-
-# ---------------------------------------------------------------------------
-# L32: _validate_story_md(require_style=...)
-# ---------------------------------------------------------------------------
-
-def test_validate_story_md_require_style():
-    with tempfile.TemporaryDirectory() as td:
-        without = os.path.join(td, "without.md")
-        with open(without, "w") as f:
-            f.write(
-                "# Story\n\n"
-                "## Panel 1 — First\n"
-                "Image: a scene one\n"
-                "Motion: camera pans\n"
-                "Narration: narration one\n\n"
-                "## Panel 2 — Second\n"
-                "Image: a scene two\n"
-                "Motion: camera pans again\n"
-                "Narration: narration two\n"
-            )
-        with_style = os.path.join(td, "with_style.md")
-        with open(with_style, "w") as f:
-            f.write(
-                "# Story\n\n"
-                "## Panel 1 — First\n"
-                "Image: a scene one\n"
-                "Motion: camera pans\n"
-                "Narration: narration one\n"
-                "Style: teal palette, matte grain\n\n"
-                "## Panel 2 — Second\n"
-                "Image: a scene two\n"
-                "Motion: camera pans again\n"
-                "Narration: narration two\n"
-            )
-        empty = os.path.join(td, "empty.md")
-        with open(empty, "w") as f:
-            f.write("# Story\n\n")
-
-        v_without_required = ltx_movie._validate_story_md(without, 2, False, True)
-        check("L32a without Style: + require_style -> exactly one violation",
-              len(v_without_required) == 1, "got %r" % v_without_required)
-        check("L32a violation names the missing Style: field",
-              v_without_required and "missing/empty Style: field" in v_without_required[0],
-              "got %r" % v_without_required)
-
-        v_with_required = ltx_movie._validate_story_md(with_style, 2, False, True)
-        check("L32b with Style: + require_style -> no violations",
-              v_with_required == [], "got %r" % v_with_required)
-
-        v_without_default = ltx_movie._validate_story_md(without, 2, False)
-        check("L32c default require_style is False (back-compat)",
-              v_without_default == [], "got %r" % v_without_default)
-
-        v_without_explicit_false = ltx_movie._validate_story_md(without, 2, False, False)
-        check("L32d require_style=False explicitly -> no violations",
-              v_without_explicit_false == [], "got %r" % v_without_explicit_false)
-
-        v_empty = ltx_movie._validate_story_md(empty, 2, False, True)
-        check("L32e empty file + require_style=True does not raise and reports panel count",
-              any("expected exactly 2 panels, found 0" in v for v in v_empty),
-              "got %r" % v_empty)
-
-
-# ---------------------------------------------------------------------------
-# L33: call-site guard
-# ---------------------------------------------------------------------------
-
-def test_require_style_call_site_guard():
-    with open(_SCRIPT_PATH) as f:
-        text = f.read()
-    check("L33a require_style assignment line present exactly once",
-          text.count('    require_style = bool(getattr(args, "seed_image", None)) and not args.no_stills\n')
-          == 1)
-    check("L33b _validate_story_md call site passes require_style exactly once",
-          text.count('    violations = _validate_story_md(story_md, args.panels, args.no_stills, require_style)\n')
-          == 1)
-
-
-# ---------------------------------------------------------------------------
 # L34: SEED_IMAGE_POSTFACE -- the two overrides are restated AFTER the template
 # ---------------------------------------------------------------------------
 
 def test_seed_postface_overrides_last():
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
+    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True, seconds="6")
+    p_off = ltx_movie.build_story_prompt("n", "sid", 5, seconds="6")
     post = ltx_movie.SEED_IMAGE_POSTFACE
-
-    check("L34a postface present only when seeded",
-          post in p_on and post not in p_off)
-    check("L34b postface is the tail of the seeded prompt", p_on.endswith(post))
-    check("L34c the VERBATIM rule it overrides appears BEFORE it",
-          p_on.index("must repeat that exact description VERBATIM") < p_on.index(post),
-          "postface must come after the rule it overrides")
-    for phrase in (
-        "Two of the rules above are overridden for this movie",
-        "The VERBATIM-repetition rule applies only to a new recurring character or element "
-        "you introduce later that is NOT visible in the attached image.",
-        "not word for word and not reworded",
-        "The 70-90 word length applies to Panel 1's Image: field.",
-        "Every later panel's Image: field is 45-70 words: composition first, then "
-        "only the identity detail its shot band allows",
-        "Every other panel has exactly three, in this order: Image:, Motion:, Narration: "
-        "-- and no Style: line.",
-    ):
-        check("L34d postface contains %r" % phrase[:60], phrase in post,
-              "missing from postface")
-    check("L34e postface ends with the template's own terminator",
+    check("L34a the postface is present only when seeded", post in p_on and post not in p_off)
+    check("L34b the postface is the tail of the seeded prompt", p_on.endswith(post))
+    check("L34c the seeded prompt starts with the preface",
+          p_on.startswith(ltx_movie.SEED_IMAGE_PREFACE))
+    check("L34d the postface restates the three-field / two-field contract",
+          "Panel 1 has exactly three fields -- Image:, Motion:, Narration: --" in post
+          and "Every later panel has exactly two fields -- Motion:, Narration: --" in post)
+    check("L34e the postface ends with the template's own terminator",
           post.endswith("Do not verify the file with run_python or any other tool. "
                         "Emit no other text."))
-    check("L34f --no-stills still wins over --seed-image",
-          ltx_movie.build_story_prompt("n", "sid", 5, True, True)
-          == ltx_movie.build_story_prompt("n", "sid", 5, True, False))
+    check("L34f the template's two-field rule appears BEFORE the postface restates it",
+          p_on.index("Every later panel has exactly two fields, in this order")
+          < p_on.index(post))
+    check("L34g neither the preface nor the postface mentions Style: or FAR BAND",
+          "Style:" not in post and "FAR BAND" not in post
+          and "Style:" not in ltx_movie.SEED_IMAGE_PREFACE
+          and "FAR BAND" not in ltx_movie.SEED_IMAGE_PREFACE)
 
 
 # ---------------------------------------------------------------------------
-# L35: preface bans RESTATING appearance (not just copying) and gives later
-# panels a positive construction to use instead
+# L48-L50: derived geometry guards in main()
 # ---------------------------------------------------------------------------
 
-def test_seed_preface_bans_restated_appearance():
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-    pre = ltx_movie.SEED_IMAGE_PREFACE
-
-    for phrase in (
-        "and do not carry more identity detail than that panel's shot distance can "
-        "actually resolve",
-        "not word for word and not reworded",
-        "Materials, colour palette, lighting character and rendering style must not "
-        "be described again in any Image: field after Panel 1",
-        "Each later panel's Image: field is 45-70 words",
-        "shot type first, then camera viewpoint, then the subject's short referring "
-        "phrase, then the identity detail this shot band allows, then the action "
-        "and placement, then the setting",
-        "one short referring phrase of at most five words",
-        "That phrase carries the subject's continuity; the identity words its shot "
-        "band allows are written after it.",
-        "A later panel has exactly three fields, in this order: Image:, Motion:, "
-        "Narration: -- and no Style: line.",
-        "The pipeline reads that line from Panel 1 alone, so a Style: line written "
-        "under Panel 2 or later is dead text that is never read.",
-    ):
-        check("L35a preface contains %r" % phrase[:60], phrase in pre, "missing from preface")
-
-    check("L35b the old 70-90-words-per-later-panel wording is gone",
-          "its own 70-90 word description" not in pre)
-    check("L35c 45-70 appears in both preface and postface",
-          "45-70 words" in pre and "45-70 words" in ltx_movie.SEED_IMAGE_POSTFACE)
-    check("L35d none of this leaks into the unseeded prompt",
-          "45-70 words" not in ltx_movie.build_story_prompt("n", "sid", 5))
-    # Three occurrences, not two: STORY_PROMPT_TEMPLATE already uses this exact
-    # clause for the Motion: field (the ban the model demonstrably obeys, which is
-    # why the preface and postface borrow its wording). Verified 2026-09-13:
-    # build_story_prompt("n","sid",5).count(...) == 1.
-    check("L35e assembled seeded prompt carries the ban three times "
-          "(template Motion: rule + preface + postface)",
-          p_on.count("not word for word and not reworded") == 3
-          and ltx_movie.build_story_prompt("n", "sid", 5)
-              .count("not word for word and not reworded") == 1,
-          "got %d" % p_on.count("not word for word and not reworded"))
+def test_seed_with_explicit_video_dims_rejected():
+    for flag in (["--video-width", "704"], ["--video-height", "448"]):
+        r = subprocess.run([sys.executable, _SCRIPT_PATH, "n", "--story-id", "unittest-seed-dims",
+                            "--seed-image", "/nonexistent/x.png"] + flag + ["--dry-run"],
+                           capture_output=True, text=True, cwd=WS)
+        check("L48a %s with --seed-image exits 2" % flag[0], r.returncode == 2,
+              "rc=%r stderr=%r" % (r.returncode, r.stderr))
+        check("L48b %s: stderr says the geometry is derived from --seed-image" % flag[0],
+              "derived from --seed-image" in r.stderr, "stderr=%r" % r.stderr)
 
 
-# ---------------------------------------------------------------------------
-# L36: _style_echo_warnings -- the advisory appearance-echo heuristic
-# ---------------------------------------------------------------------------
-
-_ECHO_STYLE = ("young woman with tightly curled auburn-red hair, warm light-brown skin with "
-               "scattered freckles, brown eyes, glossy pink lips, soft even diffused "
-               "lighting, clean high-resolution photographic rendering, shallow depth of "
-               "field")
-# Reproduces the drift_red_test defect: shot type, then the whole appearance list.
-_ECHO_BAD_IMAGE = ("A wide shot of a young woman with tightly curled auburn-red hair, warm "
-                   "light-brown skin with scattered freckles, brown eyes and glossy pink "
-                   "lips, seen from behind as she walks away down a quiet street at dusk, "
-                   "rendered in a clean high-resolution photographic style with a shallow "
-                   "depth of field.")
-# Compliant: composition only, referring phrase, and a few incidental shared words
-# ("woman", "soft", "even", "light") so the check is not passing trivially.
-_ECHO_GOOD_IMAGE = ("A wide shot from behind, the camera at knee height on the crown of the "
-                    "road, the curly-haired woman small in the centre of the frame walking "
-                    "away down a quiet residential street at dusk, low houses and parked cars "
-                    "on either side, soft even dusk light on the pavement, perspective lines "
-                    "converging at a distant intersection.")
-_ECHO_GREEK = ("alpha beta gamma delta epsilon zeta eta theta iota kappa lambda omicron rho "
-               "sigma tau upsilon phi chi psi omega")
+def test_video_dims_must_be_64_multiples():
+    def _run(extra):
+        return subprocess.run([sys.executable, _SCRIPT_PATH, "n", "--story-id",
+                               "unittest-dims64"] + extra + ["--dry-run"],
+                              capture_output=True, text=True, cwd=WS)
+    r = _run(["--video-width", "736"])
+    check("L49a --video-width 736 exits 2 naming 'multiples of 64' and the size",
+          r.returncode == 2 and "multiples of 64" in r.stderr and "736x448" in r.stderr,
+          "rc=%r stderr=%r" % (r.returncode, r.stderr))
+    check("L49b --video-height 480 exits 2", _run(["--video-height", "480"]).returncode == 2)
+    check("L49c --video-width 0 exits 2", _run(["--video-width", "0"]).returncode == 2)
+    ok = _run(["--video-width", "512", "--video-height", "512"])
+    check("L49d a 512x512 request is accepted and reaches the render flags",
+          ok.returncode == 0 and "--width 512 --height 512" in ok.stdout,
+          "rc=%r stderr=%r" % (ok.returncode, ok.stderr))
 
 
-def _echo_panels(style, images, styles=None):
-    """panels list for _style_echo_warnings: panel 1 carries `style`, panels
-    2..N carry images[0..] (panel 1's own Image: text is irrelevant to the check)."""
-    panels = [{"number": 1, "image": "panel one image text", "style": style}]
-    for idx, img in enumerate(images, start=2):
-        panels.append({"number": idx, "image": img,
-                       "style": (styles or {}).get(idx, "")})
-    return panels
+def test_out_of_range_seed_fails_before_phase1():
+    from PIL import Image
+    calls = []
+    story_id = "_test_out_of_range_%d" % os.getpid()
+    saved = (ltx_movie.phase1_story, ltx_movie._check_sudo_and_start_keepalive)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            seed = os.path.join(tmp, "wide.png")
+            Image.new("RGB", (3001, 1000), (9, 9, 9)).save(seed, format="PNG")
+            ltx_movie.phase1_story = lambda args: (calls.append(args.story_id) or 0)
+            ltx_movie._check_sudo_and_start_keepalive = lambda: None
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = ltx_movie.main(["a narrative", "--story-id", story_id,
+                                     "--seed-image", seed, "--no-review"])
+            check("L50a main() returns 2 for a 3001x1000 seed", rc == 2, "rc=%r" % rc)
+            check("L50b phase1_story was never called", calls == [], "calls=%r" % calls)
+            check("L50c stderr names the 1:3 to 3:1 bound", "1:3 to 3:1" in err.getvalue(),
+                  "stderr=%r" % err.getvalue())
+            check("L50d no story-model copy was written",
+                  not os.path.exists(ltx_movie._story_paths(story_id)["seed_downscaled"]))
+    finally:
+        ltx_movie.phase1_story, ltx_movie._check_sudo_and_start_keepalive = saved
+        shutil.rmtree(ltx_movie._story_dir(story_id), ignore_errors=True)
 
 
-def test_style_echo_warnings():
-    check("L36k _content_words drops glue words and 1-2 letter tokens",
-          ltx_movie._content_words("The warm 35mm lens and its soft, even light")
-          == {"warm", "lens", "soft", "even", "light"},
-          "got %r" % ltx_movie._content_words(
-              "The warm 35mm lens and its soft, even light"))
+def test_phase4_flags_policy_by_mode():
+    def _flags(extra):
+        args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x"] + extra)
+        args.video_width, args.video_height = 704, 448
+        return ltx_movie._phase4_flags(args)
 
-    w = ltx_movie._style_echo_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_BAD_IMAGE]))
-    check("L36a a restating panel is flagged", len(w) == 1, "got %r" % w)
-    check("L36a the warning names the panel and the mechanism",
-          w and w[0].startswith("panel 2: Image: restates ")
-          and "crowds out" in w[0], "got %r" % w)
-
-    check("L36b a composition-only panel is silent",
-          ltx_movie._style_echo_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])) == [],
-          "got %r" % ltx_movie._style_echo_warnings(
-              _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])))
-
-    mixed = ltx_movie._style_echo_warnings(
-        _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE, _ECHO_BAD_IMAGE, _ECHO_GOOD_IMAGE]))
-    check("L36c only the offending panel is flagged, by its number",
-          len(mixed) == 1 and mixed[0].startswith("panel 3: "), "got %r" % mixed)
-
-    # Panel 1 is exempt: its Image: IS the literal description of the reference,
-    # so near-total Style: overlap there is correct, not a defect.
-    p1 = _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE])
-    p1[0]["image"] = _ECHO_BAD_IMAGE
-    check("L36d panel 1 is never flagged",
-          ltx_movie._style_echo_warnings(p1) == [], "got %r" % ltx_movie._style_echo_warnings(p1))
-
-    # Threshold boundary. 20 distinct content words -> threshold 12.
-    greek = _ECHO_GREEK.split()
-    below = _echo_panels(_ECHO_GREEK,
-                         ["A wide shot of the road, " + " ".join(greek[:11]) + ", camera static."])
-    at = _echo_panels(_ECHO_GREEK,
-                      ["A wide shot of the road, " + " ".join(greek[:12]) + ", camera static."])
-    check("L36e 11 of 20 shared words is below threshold",
-          ltx_movie._style_echo_warnings(below) == [], "got %r" % ltx_movie._style_echo_warnings(below))
-    check("L36e 12 of 20 shared words trips it",
-          len(ltx_movie._style_echo_warnings(at)) == 1, "got %r" % ltx_movie._style_echo_warnings(at))
-
-    # A very short Style: line is not checked at all.
-    short = _echo_panels("teal palette, matte grain", ["teal palette, matte grain everywhere"])
-    check("L36f a Style: line under 12 content words is skipped",
-          ltx_movie._style_echo_warnings(short) == [],
-          "got %r" % ltx_movie._style_echo_warnings(short))
-
-    # Stray Style: lines -- reported, and separately from the echo warnings.
-    stray = ltx_movie._style_echo_warnings(
-        _echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE, _ECHO_GOOD_IMAGE],
-                     styles={2: _ECHO_STYLE, 3: _ECHO_STYLE}))
-    check("L36g stray Style: lines are reported once, listing the panels",
-          len(stray) == 1 and stray[0].startswith("panels 2, 3: carry a Style: line"),
-          "got %r" % stray)
-
-    check("L36h empty panel list returns [] and does not raise",
-          ltx_movie._style_echo_warnings([]) == [])
-    check("L36i panels with no style key at all return []",
-          ltx_movie._style_echo_warnings([{"number": 1, "image": "x"},
-                                          {"number": 2, "image": "y"}]) == [])
-
-    # Reproduces the real defect's exact proportions -- 34 of 42 Style: words
-    # recovered, against a threshold of 22. Synthesised from 42 distinct nonsense
-    # tokens ("qzwaa", "qzwab", ...), deliberately NOT read from
-    # generated/stories/drift_red_test/story.md: that file is regenerated by the
-    # acceptance rerun (A3) and generated/ is not version-controlled, so a test
-    # reading it would flip red the moment the fix is validated.
-    big_tokens = ["qzw" + chr(97 + n // 26) + chr(97 + n % 26) for n in range(42)]
-    big_style = " ".join(big_tokens)
-    check("L36j fixture really has 42 distinct content words",
-          len(ltx_movie._content_words(big_style)) == 42,
-          "got %d" % len(ltx_movie._content_words(big_style)))
-    real_shape = _echo_panels(big_style,
-                              ["A wide shot down the street, " + " ".join(big_tokens[:34])])
-    check("L36j the real run's 34-of-42 proportion is flagged",
-          len(ltx_movie._style_echo_warnings(real_shape)) == 1,
-          "got %r" % ltx_movie._style_echo_warnings(real_shape))
+    stills, nostills = _flags([]), _flags(["--no-stills"])
+    check("L51a stills (chained) mode passes --on-panel-failure stop",
+          stills[stills.index("--on-panel-failure") + 1] == "stop", "got %r" % stills)
+    check("L51b --no-stills passes --on-panel-failure skip",
+          nostills[nostills.index("--on-panel-failure") + 1] == "skip", "got %r" % nostills)
+    for label, flags in (("stills", stills), ("no-stills", nostills)):
+        joined = " ".join(flags)
+        check("L51c %s keeps one retry, a 120 s idle and the 3-failure breaker" % label,
+              "--retry-failed 1 --retry-idle 120 --max-consecutive-failures 3" in joined,
+              "got %r" % joined)
+        check("L51d %s carries no removed backend flag" % label,
+              ("--video-" + "backend") not in flags)
 
 
 # ---------------------------------------------------------------------------
-# L37: phase1_story prints the warnings and _load_story_panels works
+# L40-L47: --story-server-stop-after-story (bin/story-server lifecycle tool)
 # ---------------------------------------------------------------------------
 
-def test_style_echo_call_site_guard():
+class _StoryServerArgs(object):
+    def __init__(self, no_stills=False, story_server_stop_after_story=False,
+                 seed_image=None, min_avail_gib=25.0, avail_timeout=1800):
+        self.no_stills = no_stills
+        self.story_server_stop_after_story = story_server_stop_after_story
+        self.seed_image = seed_image
+        self.min_avail_gib = min_avail_gib
+        self.avail_timeout = avail_timeout
+
+
+def _phase_names(phases):
+    return tuple(p.__name__ for p in phases)
+
+
+def test_story_server_flag_default():
+    parser = ltx_movie.build_parser()
+    args_off = parser.parse_args(["a narrative", "--story-id", "l40"])
+    check("L40a --story-server-stop-after-story defaults to False",
+          args_off.story_server_stop_after_story is False,
+          "got %r" % (args_off.story_server_stop_after_story,))
+    args_on = parser.parse_args(["a narrative", "--story-id", "l40",
+                                  "--story-server-stop-after-story"])
+    check("L40b --story-server-stop-after-story sets True",
+          args_on.story_server_stop_after_story is True,
+          "got %r" % (args_on.story_server_stop_after_story,))
+    check("L40c the flag's dest is exactly story_server_stop_after_story",
+          any(getattr(a, "dest", None) == "story_server_stop_after_story"
+              for a in parser._actions),
+          "no action with that dest")
+
+
+def test_phase_sequence_ordering():
+    cases = [
+        (dict(no_stills=False, story_server_stop_after_story=False, seed_image=None),
+         ("phase1_story", "phase2_stills", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=True, seed_image=None),
+         ("phase1_story", "phase_release_story_server", "phase2_stills",
+          "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=False, seed_image=None),
+         ("phase1_story", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=True, seed_image=None),
+         ("phase1_story", "phase_release_story_server", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=False, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase2_stills", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=True, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase_release_story_server", "phase2_stills",
+          "phase3_manifest", "phase4_render")),
+        # (F8) no_stills + seed_image: _phase_sequence is pure and does not enforce
+        # main()'s mutual exclusion between --no-stills and --seed-image.
+        (dict(no_stills=True, story_server_stop_after_story=False, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=True, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase_release_story_server",
+          "phase3_manifest", "phase4_render")),
+    ]
+    for i, (kwargs, expected) in enumerate(cases, 1):
+        args = _StoryServerArgs(**kwargs)
+        got = _phase_names(ltx_movie._phase_sequence(args))
+        check("L41.%d phase order %r" % (i, kwargs), got == expected,
+              "got %r expected %r" % (got, expected))
+
+
+def test_phase_release_story_server():
+    orig_run = ltx_movie.subprocess.run
+    orig_wait = ltx_movie._wait_for_avail
+    try:
+        class _Rc(object):
+            def __init__(self, returncode):
+                self.returncode = returncode
+
+        recorded = {}
+
+        def fake_run_ok(cmd, cwd=None):
+            recorded["cmd"] = cmd
+            recorded["cwd"] = cwd
+            return _Rc(0)
+
+        def fake_run_fail(cmd, cwd=None):
+            return _Rc(3)
+
+        wait_calls_a = []
+
+        def fake_wait_true(min_avail_gib, avail_timeout):
+            wait_calls_a.append((min_avail_gib, avail_timeout))
+            return True
+
+        args = _StoryServerArgs()
+
+        ltx_movie.subprocess.run = fake_run_ok
+        ltx_movie._wait_for_avail = fake_wait_true
+        rc_a = ltx_movie.phase_release_story_server(args)
+        expected_cmd = [os.path.join(ltx_movie.WS, "bin", "story-server"), "stop"]
+        check("L42a rc 0 + avail True returns 0", rc_a == 0, "got %r" % rc_a)
+        check("L42a argv is exactly [story-server, stop]",
+              recorded.get("cmd") == expected_cmd, "got %r" % (recorded.get("cmd"),))
+        check("L42a cwd=WS", recorded.get("cwd") == ltx_movie.WS,
+              "got %r" % (recorded.get("cwd"),))
+        check("L42a _wait_for_avail called exactly once", len(wait_calls_a) == 1,
+              "got %r" % wait_calls_a)
+
+        wait_calls_b = []
+
+        def fake_wait_track(min_avail_gib, avail_timeout):
+            wait_calls_b.append((min_avail_gib, avail_timeout))
+            return True
+
+        ltx_movie.subprocess.run = fake_run_fail
+        ltx_movie._wait_for_avail = fake_wait_track
+        rc_b = ltx_movie.phase_release_story_server(args)
+        check("L42b story-server rc 3 returns 1", rc_b == 1, "got %r" % rc_b)
+        check("L42b _wait_for_avail is never called", len(wait_calls_b) == 0,
+              "got %r" % wait_calls_b)
+
+        def fake_wait_false(min_avail_gib, avail_timeout):
+            return False
+
+        ltx_movie.subprocess.run = fake_run_ok
+        ltx_movie._wait_for_avail = fake_wait_false
+        rc_c = ltx_movie.phase_release_story_server(args)
+        check("L42c rc 0 but avail False returns 1", rc_c == 1, "got %r" % rc_c)
+    finally:
+        ltx_movie.subprocess.run = orig_run
+        ltx_movie._wait_for_avail = orig_wait
+
+
+def test_dry_run_story_server_block_ordering():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-storyserver-l43",
+         "--panels", "6", "--story-server-stop-after-story", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L43 exits 0", result.returncode == 0,
+          "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    i_1 = out.find("--- Phase 1: story ---")
+    i_1b = out.find("--- Phase 1b:")
+    i_2 = out.find("--- Phase 2: stills ---")
+    check("L43 Phase 1b sits after Phase 1 and before Phase 2",
+          i_1 != -1 and i_1b != -1 and i_2 != -1 and i_1 < i_1b < i_2,
+          "i_1=%r i_1b=%r i_2=%r" % (i_1, i_1b, i_2))
+
+
+def test_dry_run_no_story_server_block_by_default():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-storyserver-l44",
+         "--panels", "6", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L44a exits 0", result.returncode == 0, "rc=%r" % result.returncode)
+    check("L44b no Phase 1b block without the flag", "Phase 1b" not in out, "got %r" % out)
+    check("L44c no story-server mention without the flag", "story-server" not in out,
+          "got %r" % out)
+
+
+def test_dry_run_story_server_block_with_no_stills():
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-storyserver-l45",
+         "--no-stills", "--panels", "6", "--story-server-stop-after-story", "--dry-run"],
+        capture_output=True, text=True, cwd=WS,
+    )
+    out = result.stdout
+    check("L45a exits 0", result.returncode == 0, "rc=%r" % result.returncode)
+    i_1 = out.find("--- Phase 1: story ---")
+    i_1b = out.find("--- Phase 1b:")
+    i_skip = out.find("--- Phase 2: stills --- SKIPPED")
+    i_3 = out.find("--- Phase 3:")
+    check("L45b Phase 1b sits after Phase 1 and before the SKIPPED banner and Phase 3",
+          i_1 != -1 and i_1b != -1 and i_skip != -1 and i_3 != -1
+          and i_1 < i_1b < i_skip < i_3,
+          "i_1=%r i_1b=%r i_skip=%r i_3=%r" % (i_1, i_1b, i_skip, i_3))
+
+
+def test_story_server_source_guards():
+    story_server_path = os.path.join(WS, "bin", "story-server")
+    check("L46a bin/story-server exists", os.path.isfile(story_server_path))
+    check("L46b bin/story-server is executable", os.access(story_server_path, os.X_OK))
+    with open(story_server_path) as f:
+        first_line = f.readline()
+    check("L46c bin/story-server's first line is #!/bin/bash", first_line == "#!/bin/bash\n",
+          "got %r" % first_line)
     with open(_SCRIPT_PATH) as f:
         text = f.read()
-    check("L37a phase1_story prints the advisory warnings exactly once",
-          text.count(
-              '    for warning in _style_echo_warnings(_load_story_panels(story_md)):\n'
-              '        print("Warning: %s" % warning)\n') == 1)
-    check("L37b the warning loop is not inside an `if not args.no_review` block",
-          '        for warning in _style_echo_warnings(' not in text,
-          "the loop must be at function indent, so --no-review runs still log it")
-    check("L37c _validate_story_md still returns only fatal violations",
-          'def _validate_story_md(story_md_path, expected_panels, no_stills=False, '
-          'require_style=False):' in text
-          and "_style_echo_warnings" not in text.split("def _validate_story_md")[1]
-              .split("return violations")[0])
-
-    with tempfile.TemporaryDirectory() as td:
-        md = os.path.join(td, "story.md")
-        with open(md, "w") as f:
-            f.write(
-                "# Story\n\n"
-                "## Panel 1 — First\n"
-                "Image: a scene one\n"
-                "Motion: camera pans\n"
-                "Narration: narration one\n"
-                "Style: teal palette, matte grain\n\n"
-                "## Panel 2 — Second\n"
-                "Image: a scene two\n"
-                "Motion: camera pans again\n"
-                "Narration: narration two\n"
-            )
-        panels = ltx_movie._load_story_panels(md)
-        check("L37d _load_story_panels parses a real file",
-              len(panels) == 2 and panels[0]["style"] == "teal palette, matte grain",
-              "got %r" % panels)
-        check("L37e _load_story_panels returns [] for a missing file",
-              ltx_movie._load_story_panels(os.path.join(td, "nope.md")) == [])
+    check("L46d bin/ltx-movie references story-server exactly twice",
+          text.count('os.path.join(WS, "bin", "story-server")') == 2,
+          "got %r" % text.count('os.path.join(WS, "bin", "story-server")'))
+    check("L46e _render_flags(args) count is unchanged at 4",
+          text.count("_render_flags(args)") == 4,
+          "got %r occurrences" % text.count("_render_flags(args)"))
+    check("L46f ltx-mlx-render path count is unchanged at 4",
+          text.count('os.path.join(WS, "bin", "ltx-mlx-render")') == 4,
+          "got %r" % text.count('os.path.join(WS, "bin", "ltx-mlx-render")'))
 
 
-# A compliant global-look Style: line: palette, lighting, setting materials, render
-# style -- and no subject. 39 words / 36 content words, so it is comfortably inside
-# the 30-55 word budget and well above _ECHO_MIN_STYLE_WORDS (the echo check stays
-# engaged on it).
-_BAND_GOOD_STYLE = ("muted teal and amber palette, desaturated shadows, soft overcast key "
-                    "light from camera left, low contrast, damp asphalt and weathered brick "
-                    "textures, painted metal railings, clean high-resolution photographic "
-                    "rendering, 35mm lens character, shallow depth of field, fine natural "
-                    "grain")
-# The exact 8 tokens _ECHO_STYLE (the pre-fix reference Style: line) trips.
-_BAND_ECHO_STYLE_HITS = ["curled", "eyes", "freckles", "hair", "lips", "skin", "woman", "young"]
+def _is_main_guard(test_node):
+    return (isinstance(test_node, ast.Compare)
+            and isinstance(test_node.left, ast.Name) and test_node.left.id == "__name__"
+            and len(test_node.ops) == 1 and isinstance(test_node.ops[0], ast.Eq)
+            and len(test_node.comparators) == 1
+            and isinstance(test_node.comparators[0], ast.Constant)
+            and test_node.comparators[0].value == "__main__")
 
 
-# ---------------------------------------------------------------------------
-# L38: _style_content_warnings -- the advisory subject-attribute check on Style:
-# ---------------------------------------------------------------------------
+def test_main_block_completeness():
+    with open(__file__) as f:
+        self_text = f.read()
+    tree = ast.parse(self_text)
 
-def test_style_content_warnings():
-    check("L38a _STYLE_BANNED_TOKENS has exactly 109 tokens",
-          len(ltx_movie._STYLE_BANNED_TOKENS) == 109,
-          "got %d" % len(ltx_movie._STYLE_BANNED_TOKENS))
-
-    _banned_as_set = set(ltx_movie._STYLE_BANNED_TOKENS)
-    check("L38b _STYLE_BANNED_TOKENS is disjoint from _ECHO_STOPWORDS",
-          _banned_as_set.isdisjoint(ltx_movie._ECHO_STOPWORDS),
-          "intersection: %r"
-          % (_banned_as_set & set(ltx_movie._ECHO_STOPWORDS)))
-
-    bad_tokens = [t for t in ltx_movie._STYLE_BANNED_TOKENS
-                  if not (t.isalpha() and t.islower() and len(t) > 2)]
-    check("L38c _STYLE_BANNED_TOKENS is a frozenset of lowercase alphabetic 3+ char tokens",
-          isinstance(ltx_movie._STYLE_BANNED_TOKENS, frozenset) and not bad_tokens,
-          "offending tokens: %r" % bad_tokens)
-
-    w = ltx_movie._style_content_warnings(_echo_panels(_ECHO_STYLE, [_ECHO_GOOD_IMAGE]))
-    check("L38d flags a non-compliant Style: line and names every hit",
-          len(w) == 1
-          and all(tok in w[0] for tok in _BAND_ECHO_STYLE_HITS)
-          and "names 8 subject-level attribute word(s)" in w[0],
-          "got %r" % w)
-
-    check("L38e the warning is a single string with the expected shape",
-          len(w) == 1
-          and w[0].startswith("panel 1: Style: names ")
-          and "extreme wide shots" in w[0]
-          and "pull the camera in" in w[0],
-          "got %r" % w)
-
-    check("L38f a compliant Style: line is silent",
-          ltx_movie._style_content_warnings(
-              _echo_panels(_BAND_GOOD_STYLE, [_ECHO_GOOD_IMAGE])) == [])
-
-    def _never_raises(panels):
-        """_style_content_warnings' contract is "returns [], never raises". A bare
-        call here cannot express that: an exception in a check()'s condition
-        argument propagates before check() is ever entered, killing the run and
-        suppressing both the OK n/n summary and every later row. Catching it turns
-        a raise into an ordinary red check."""
-        try:
-            return ltx_movie._style_content_warnings(panels)
-        except Exception as exc:
-            return "raised %s: %s" % (type(exc).__name__, exc)
-
-    _g_cases = ([], [{"number": 1, "image": "x"}],
-                [{"number": 1, "image": "x", "style": ""}])
-    check("L38g never raises on an empty panel list or a missing/empty style key",
-          all(_never_raises(c) == [] for c in _g_cases),
-          "got %r" % ([_never_raises(c) for c in _g_cases],))
-
-    # Built with _echo_panels (two panels) rather than a bare one-element list: a
-    # one-element fixture cannot survive a panels[0]->panels[1] mutation, so it
-    # crashed the run instead of letting the row's own checks go red (see the
-    # spec's Q-6 finding). Panel 1 still carries the mixed-case Style: text, which
-    # is what this row is actually about.
-    w_case = ltx_movie._style_content_warnings(_echo_panels(
-        "Young Woman With Auburn HAIR And Freckled SKIN, teal palette",
-        [_ECHO_GOOD_IMAGE]))
-    check("L38h case- and punctuation-insensitive matching",
-          len(w_case) == 1
-          and all(tok in w_case[0]
-                  for tok in ("freckled", "hair", "skin", "woman", "young")),
-          "got %r" % w_case)
-
-    w_panel2 = ltx_movie._style_content_warnings(
-        _echo_panels(_BAND_GOOD_STYLE, [_ECHO_BAD_IMAGE], styles={2: _ECHO_STYLE}))
-    check("L38i only panel 1's Style: line is inspected",
-          w_panel2 == [], "got %r" % w_panel2)
-
-
-# ---------------------------------------------------------------------------
-# L39: the band contract and the _style_content_warnings call site
-# ---------------------------------------------------------------------------
-
-def test_band_prompt_and_content_call_site():
-    p_on = ltx_movie.build_story_prompt("n", "sid", 5, False, True)
-    p_off = ltx_movie.build_story_prompt("n", "sid", 5)
-    pre = ltx_movie.SEED_IMAGE_PREFACE
-    post = ltx_movie.SEED_IMAGE_POSTFACE
-    with open(_SCRIPT_PATH) as f:
-        text = f.read()
-
-    check("L39a the content-warning loop appears exactly once, at function indent",
-          text.count(
-              '    for warning in _style_content_warnings(_load_story_panels(story_md)):\n'
-              '        print("Warning: %s" % warning)\n') == 1)
-
-    check("L39b the loop is not nested",
-          '        for warning in _style_content_warnings(' not in text,
-          "the loop must be at function indent, so --no-review runs still log it")
-
-    check("L39c it is advisory, not fatal: _validate_story_md never calls it",
-          "_style_content_warnings"
-          not in text.split("def _validate_story_md")[1].split("return violations")[0])
-
-    check("L39d the Style: template carries the content boundary",
-          "30-55 words on a single line" in pre
-          and "It must name NO person and NO subject attribute" in pre
-          and "It must not mention the subject either" in pre,
-          "missing from preface")
-
-    band_headings = (
-        "FAR BAND -- extreme wide shot, wide shot.", "At most 8 identity words",
-        "MID BAND -- medium shot, medium close-up.", "10 to 20 identity words",
-        "NEAR BAND -- close-up, extreme close-up.", "18 to 30 identity words",
+    top_level_tests = set(
+        node.name for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
     )
-    check("L39e the three band headings and budgets are each present once in the preface",
-          all(pre.count(phrase) == 1 for phrase in band_headings),
-          "missing/duplicated: %r"
-          % [phrase for phrase in band_headings if pre.count(phrase) != 1])
 
-    rationale_phrases = (
-        "write only the identity a viewer could actually resolve at that distance",
-        "which turns a wide shot into a portrait",
-        "the renderer invents a different person",
-        "This is the only band that describes a face",
-        "The mid and near counts are ranges with a floor, not ceilings to stay under",
-    )
-    check("L39f the preface states both directions of the identity trade-off",
-          all(phrase in pre for phrase in rationale_phrases),
-          "missing: %r" % [phrase for phrase in rationale_phrases if phrase not in pre])
+    main_calls = set()
+    for node in tree.body:
+        if isinstance(node, ast.If) and _is_main_guard(node.test):
+            for stmt in node.body:
+                for call in ast.walk(stmt):
+                    if (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                            and call.func.id.startswith("test_")):
+                        main_calls.add(call.func.id)
 
-    check("L39g the identity budget is shared with the composition budget, not additive",
-          "The identity words come out of the same 45-70 words, not on top of them" in pre)
-
-    postface_phrases = (
-        "far band (extreme wide shot, wide shot): at most 8 identity words",
-        "mid band (medium shot, medium close-up): 10 to 20 identity words",
-        "near band (close-up, extreme close-up): 18 to 30 identity words",
-        "The mid and near counts have a floor",
-    )
-    check("L39h the postface restates all three bands and the floor",
-          all(phrase in post for phrase in postface_phrases),
-          "missing: %r" % [phrase for phrase in postface_phrases if phrase not in post])
-
-    leaked_phrases = ("FAR BAND", "MID BAND", "NEAR BAND", "30-55 words", "identity words")
-    check("L39i none of the band language leaks into the unseeded prompt",
-          not any(phrase in p_off for phrase in leaked_phrases),
-          "leaked: %r" % [phrase for phrase in leaked_phrases if phrase in p_off])
-
-    check("L39j the band and content-boundary text is assembled into the seeded prompt once",
-          p_on.count("30-55 words on a single line") == 1
-          and p_on.count("FAR BAND") == 1
-          and p_on.startswith(pre)
-          and p_on.endswith(post))
+    check("L47 every top-level test_* function is called from __main__",
+          top_level_tests == main_calls,
+          "diff: %r" % sorted(top_level_tests ^ main_calls))
 
 
 if __name__ == "__main__":
@@ -1566,16 +1489,19 @@ if __name__ == "__main__":
     test_seed_dry_run_plan()
     test_seed_no_stills_conflict()
     test_seed_source_guards()
-    test_seed_preface_specifies_style_field()
-    test_seed_preface_drops_verbatim_repetition()
-    test_validate_story_md_require_style()
-    test_require_style_call_site_guard()
     test_seed_postface_overrides_last()
-    test_seed_preface_bans_restated_appearance()
-    test_style_echo_warnings()
-    test_style_echo_call_site_guard()
-    test_style_content_warnings()
-    test_band_prompt_and_content_call_site()
+    test_story_server_flag_default()
+    test_phase_sequence_ordering()
+    test_phase_release_story_server()
+    test_dry_run_story_server_block_ordering()
+    test_dry_run_no_story_server_block_by_default()
+    test_dry_run_story_server_block_with_no_stills()
+    test_story_server_source_guards()
+    test_seed_with_explicit_video_dims_rejected()
+    test_video_dims_must_be_64_multiples()
+    test_out_of_range_seed_fails_before_phase1()
+    test_phase4_flags_policy_by_mode()
+    test_main_block_completeness()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
