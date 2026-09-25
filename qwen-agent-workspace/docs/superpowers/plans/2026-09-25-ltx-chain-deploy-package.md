@@ -7041,7 +7041,7 @@ Gaps: none. SC5 is excluded by the caller's instruction (no second Mac) and is f
 
 **4. Review Focus.** Each RF1-RF5 has a named test in its owning task (listed in the Review Focus section). Other risks considered but not added as tests:
 - A path in `MANIFEST-ENTRIES.jsonl` could match `openai_api_key` (for example `_sk-` followed by 32 name characters). This is handled operationally in Task 12 Step 6.
-- Directories created by a failed install run are not re-`chmod`ed on the rerun; spec §12.4 limits chmod to "created by this run". `verify` checks only file modes.
+- Directories created by a failed install run are created via a temp-name-then-atomic-rename pattern (`make_dir`), so a killed run can never leave a manifest directory under its real name at the wrong mode; `verify` now checks directory modes for every manifest directory, not just file modes (Task 8b, commit b79c8918519f6e7d62ebe8238764daeb0b6acecf — closes a real bug found in Task 8's review).
 - If accept's A3 compares combined output lines and the target prints an environment-specific warning, A3 fails (KR2: diagnose, do not loosen the check).
 - `HF_HUB_OFFLINE=1` has never been exercised for the vision server (KR1). `accept --gpu` on the target exposes it.
 
