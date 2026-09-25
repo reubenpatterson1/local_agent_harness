@@ -367,3 +367,359 @@ def copy_regular_file(src, dst, entry, secrets):
         os.unlink(dst)
         raise SourceChanged("copied size differs from the enumerated size: %s" % src)
     return digest.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Components (spec 7)
+# ---------------------------------------------------------------------------
+COMPONENT_ORDER = ("A1", "A2", "B1", "B2", "B3", "B4", "B5", "D1", "F1", "F2", "F3", "H0", "H1", "H2", "H3", "H4", "H5")
+SLUGS = {
+    "A1": "workspace-code", "A2": "hw-gate-seeds", "B1": "ltx2mlx-repo", "B2": "ltx2mlx-venv",
+    "B3": "uv-cpython311", "B4": "ltx25-mlx-q8", "B5": "ltx2mlx-hf-cache-dirs", "D1": "vllm-venv",
+    "F1": "framework-python", "F2": "framework-symlinks", "F3": "user-site", "H0": "hf-home-dirs",
+    "H1": "hf-zimage", "H2": "hf-zimage-te", "H3": "hf-nsfw", "H4": "hf-qwen3vl32b", "H5": "mlx-models-link",
+}
+PIPELINE_FILES = ("z_image_skill.py", "ltx2_mlx_video_skill.py", "ltx_image_fit.py", "content_safety.py",
+                  "bin/ltx-movie", "bin/ltx-story-images", "bin/ltx-story-manifest", "bin/ltx-mlx-render",
+                  "bin/story-server", "bin/qwen-agent")
+TEST_FILES = ("tests/test_ltx_movie_offline.py", "tests/test_ltx_mlx_render.py", "tests/test_ltx_story_images.py",
+              "tests/test_ltx2_mlx_video_skill.py", "tests/test_ltx_image_fit.py",
+              "tests/test_ltx_story_manifest_chain.py", "tests/check_ltx2_mlx_no_forbidden_imports.py")
+A1_FILES = PIPELINE_FILES + TEST_FILES
+A1_DIRS = ("", "bin", "tests")
+A2_DIR_REL = "generated/hw_gate_seeds"
+A2_FILES = ("portrait.png", "wide3x1.png", "square.png")
+L1_NAMES = frozenset(["token", "stored_tokens", ".netrc", ".git-credentials", ".pypirc", ".env", "credentials", "id_rsa", "id_ecdsa", "id_ed25519", "id_dsa"])
+PRUNE_DIRS = frozenset(["__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"])
+B1_EXCLUDES = frozenset(["models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"])
+B4_EXCLUDES = frozenset([".cache"])
+F1_EXCLUDES = frozenset("lib/python3.13/site-packages/" + name for name in (
+    "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable___student_agent_mcp_1_0_0_finder.py",
+    "__editable__.fubotv_mcp_common-0.1.0.pth", "__editable__.student_agent_mcp-1.0.0.pth",
+    "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info"))
+F3_EXCLUDES = frozenset("lib/python/site-packages/" + name for name in (
+    "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable__.fubotv_mcp_common-0.1.0.pth",
+    "fubotv_mcp_common-0.1.0.dist-info"))
+UV_CPYTHON_DIR = "cpython-3.11.13-macos-aarch64-none"
+F2_FRAMEWORK_LINKS = ("Headers", "Python", "Resources", "Versions/Current")
+F2_BIN_LINKS = ("idle3", "idle3.13", "pip3", "pip3.13", "pydoc3", "pydoc3.13", "python3", "python3-config",
+                "python3-intel64", "python3.13", "python3.13-config", "python3.13-intel64", "python")
+LTX25_PACK_FILES = frozenset([
+    ".gitattributes", "LICENSE", "README.md", "audio_vae.safetensors", "chat_template.jinja",
+    "connector.safetensors", "duration_head.safetensors", "embedded_config.json", "generation_config.json",
+    "ltx-2.5-22b-distilled-lora-450-bf16.safetensors", "processor_config.json", "quantize_config.json",
+    "spatial_upscaler_x2_v1_0.safetensors", "spatial_upscaler_x2_v1_0_config.json", "split_model.json",
+    "temporal_upscaler_x2_v1_0.safetensors", "temporal_upscaler_x2_v1_0_config.json",
+    "text_encoder.safetensors", "text_encoder_config.json", "tokenizer.json", "tokenizer_config.json",
+    "transformer-dev.safetensors", "transformer-distilled.safetensors", "vae_decoder_av.safetensors",
+    "vae_decoder_conv.safetensors", "vae_encoder_av.safetensors", "vae_encoder_conv.safetensors",
+    "vocoder.safetensors"])
+HF_PINS = {
+    "H1": ("models--Tongyi-MAI--Z-Image-Turbo", "f332072aa78be7aecdf3ee76d5c247082da564a6"),
+    "H2": ("models--BennyDaBall--Qwen3-4b-Z-Image-Turbo-AbliteratedV1", "ce497d288a7ddfd5d0f337c7139349d5d0236bfa"),
+    "H3": ("models--Falconsai--nsfw_image_detection", "96cb0d0342c7afb80cab76ecc58b265fa44da256"),
+    "H4": ("models--divinetribe--Huihui-Qwen3-VL-32B-Instruct-abliterated-4bit-mlx", "5428d6aaca0103a1e32f47261a20fecaa47700ec"),
+}
+
+
+def default_package_id():
+    return "ltx-chain-deploy-" + time.strftime("%Y%m%d", time.localtime())
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(prog="build_pkg.py", description="Build the ltx-chain USB deployment package.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="the default: run every check, write nothing")
+    mode.add_argument("--apply", action="store_true", help="build the package")
+    mode.add_argument("--verify-only", action="store_true", help="re-verify a finished package; writes nothing")
+    mode.add_argument("--credential-report", action="store_true", help="enumeration + L1 + L2 report; writes nothing")
+    parser.add_argument("--resume", action="store_true", help="with --apply: continue an interrupted build")
+    parser.add_argument("--usb-root", default=None, help="default: %s" % USB_ROOT_DEFAULT)
+    parser.add_argument("--package-id", default=None, help="default: ltx-chain-deploy-<local YYYYMMDD>")
+    args = parser.parse_args(argv)
+    if args.resume and not args.apply:
+        parser.error("--resume requires --apply")
+    if args.package_id is not None and not PACKAGE_ID_RE.match(args.package_id):
+        parser.error("--package-id must match ^ltx-chain-deploy-[0-9]{8}$")
+    return args
+
+
+class BuildCtx(object):
+    """Everything one invocation knows. Never printed: it holds the L3 secret values."""
+
+    def __init__(self, args):
+        self.args = args
+        self.usb_root = os.path.abspath(args.usb_root if args.usb_root else USB_ROOT_DEFAULT)
+        self.package_id = args.package_id if args.package_id else default_package_id()
+        self.package_root = os.path.join(self.usb_root, self.package_id)
+        self.apply = bool(args.apply)
+        self.resume = bool(args.resume)
+        self.started_at = ""
+        self.secrets = []
+        self.l3_sources = []
+        self.l3_errors = []
+        self.entries = []
+        self.comp_stats = {}
+        self.enum_errors = []
+        self.l1_hits = []
+        self.falconsai_hub = None
+        self.allow = set()
+        self.allow_entries = []
+        self.allow_error = None
+        self.l2_hits = []
+        self.l2_new = []
+        self.l2_allowed = []
+        self.l2_errors = []
+        self.host = {}
+        self.host_failures = []
+        self.freezes = {}
+        self.git_record = {}
+        self.git_problems = []
+        self.baseline = None
+        self.script_bytes = {}
+        self.root_files = collections.OrderedDict()
+        self.resume_prefix_len = 0
+        self.resume_keep_bytes = 0
+        self.resume_rename = False
+        self.resume_error = None
+        self.remaining_bytes = 0
+        self.required_bytes = 0
+        self.free_bytes = 0
+        self.partial_fh = None
+        self.entries_sha256 = ""
+
+    def __repr__(self):
+        return "<BuildCtx %s>" % self.package_id
+
+
+def payload_prefix(cid):
+    return "payload/%s-%s" % (cid, SLUGS[cid])
+
+
+def b3_source():
+    return home() + "/.local/share/uv/python/" + UV_CPYTHON_DIR
+
+
+def l1_check(ctx, name, path):
+    if name in L1_NAMES:
+        ctx.l1_hits.append(path)
+
+
+def _lstat_or_error(ctx, cid, path):
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        ctx.enum_errors.append("%s: cannot stat %s: %s" % (cid, path, exc))
+        return None
+
+
+def walk_tree(ctx, cid, src_root, dst_root, excludes):
+    entries = []
+    try:
+        st = os.lstat(src_root)
+    except OSError:
+        ctx.enum_errors.append("%s: source root %s is missing" % (cid, src_root))
+        return entries
+    if not stat.S_ISDIR(st.st_mode):
+        ctx.enum_errors.append("%s: source root %s is not a directory" % (cid, src_root))
+        return entries
+    prefix = payload_prefix(cid)
+    entries.append({"k": "d", "c": cid, "p": prefix, "t": dst_root, "m": mode_str(st), "_src": src_root, "_rel": ""})
+    _walk_dir(ctx, cid, src_root, dst_root, prefix, "", excludes, entries)
+    return entries
+
+
+def _walk_dir(ctx, cid, src_root, dst_root, prefix, rel_dir, excludes, entries):
+    abs_dir = src_root + "/" + rel_dir if rel_dir else src_root
+    try:
+        names = sorted(os.listdir(abs_dir))
+    except OSError as exc:
+        ctx.enum_errors.append("%s: cannot list %s: %s" % (cid, abs_dir, exc))
+        return
+    for name in names:
+        if name == ".DS_Store":
+            continue
+        rel = rel_dir + "/" + name if rel_dir else name
+        if rel in excludes:
+            continue
+        path = src_root + "/" + rel
+        st = _lstat_or_error(ctx, cid, path)
+        if st is None:
+            continue
+        base = {"c": cid, "p": prefix + "/" + rel, "t": dst_root + "/" + rel, "_src": path, "_rel": rel}
+        if stat.S_ISDIR(st.st_mode):
+            if name in PRUNE_DIRS:
+                continue
+            entries.append(dict(base, k="d", m=mode_str(st)))
+            _walk_dir(ctx, cid, src_root, dst_root, prefix, rel, excludes, entries)
+        elif stat.S_ISLNK(st.st_mode):
+            entries.append(dict(base, k="l", l=os.readlink(path)))
+            l1_check(ctx, name, path)
+        elif stat.S_ISREG(st.st_mode):
+            if not os.access(path, os.R_OK):
+                ctx.enum_errors.append("%s: unreadable file %s" % (cid, path))
+                continue
+            entries.append(dict(base, k="f", b=st.st_size, m=mode_str(st), mt=st.st_mtime_ns))
+            l1_check(ctx, name, path)
+        else:
+            ctx.enum_errors.append("%s: special file (not a regular file, directory or symlink) %s" % (cid, path))
+
+
+def _file_entry(ctx, cid, path, p, rel):
+    st = _lstat_or_error(ctx, cid, path)
+    if st is None:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        ctx.enum_errors.append("%s: %s is not a regular file" % (cid, path))
+        return None
+    if not os.access(path, os.R_OK):
+        ctx.enum_errors.append("%s: unreadable file %s" % (cid, path))
+        return None
+    l1_check(ctx, os.path.basename(path), path)
+    return {"k": "f", "c": cid, "p": p, "t": path, "b": st.st_size, "m": mode_str(st),
+            "mt": st.st_mtime_ns, "_src": path, "_rel": rel}
+
+
+def _dir_entry(ctx, cid, path, p, rel):
+    st = _lstat_or_error(ctx, cid, path)
+    if st is None:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        ctx.enum_errors.append("%s: %s is not a directory" % (cid, path))
+        return None
+    return {"k": "d", "c": cid, "p": p, "t": path, "m": mode_str(st), "_src": path, "_rel": rel}
+
+
+def enum_a1(ctx):
+    ws = workspace()
+    prefix = payload_prefix("A1")
+    entries = []
+    for rel in A1_DIRS:
+        entry = _dir_entry(ctx, "A1", ws + "/" + rel if rel else ws, prefix + "/" + rel if rel else prefix, rel)
+        if entry is not None:
+            entries.append(entry)
+    for rel in A1_FILES:
+        entry = _file_entry(ctx, "A1", ws + "/" + rel, prefix + "/" + rel, rel)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def enum_a2(ctx):
+    base = workspace() + "/" + A2_DIR_REL
+    prefix = payload_prefix("A2")
+    entries = []
+    entry = _dir_entry(ctx, "A2", base, prefix, "")
+    if entry is not None:
+        entries.append(entry)
+    for name in A2_FILES:
+        entry = _file_entry(ctx, "A2", base + "/" + name, prefix + "/" + name, name)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def enum_f2(ctx):
+    entries = []
+    for path in (FRAMEWORK_ROOT, FRAMEWORK_ROOT + "/Versions", USR_LOCAL_BIN):
+        st = _lstat_or_error(ctx, "F2", path)
+        if st is None:
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            ctx.enum_errors.append("F2: %s is not a directory" % path)
+            continue
+        entries.append({"k": "d", "c": "F2", "t": path, "m": mode_str(st), "_src": path})
+    links = [FRAMEWORK_ROOT + "/" + n for n in F2_FRAMEWORK_LINKS] + [USR_LOCAL_BIN + "/" + n for n in F2_BIN_LINKS]
+    for path in links:
+        st = _lstat_or_error(ctx, "F2", path)
+        if st is None:
+            continue
+        if not stat.S_ISLNK(st.st_mode):
+            ctx.enum_errors.append("F2: %s is not a symlink" % path)
+            continue
+        l1_check(ctx, os.path.basename(path), path)
+        entries.append({"k": "l", "c": "F2", "t": path, "l": os.readlink(path), "_src": path})
+    return entries
+
+
+def synthetic_dir(cid, target):
+    return {"k": "d", "c": cid, "t": target, "m": "0755", "s": True}
+
+
+def h5_link_value():
+    repo, pin = HF_PINS["H4"]
+    return home() + "/hf_home/hub/" + repo + "/snapshots/" + pin
+
+
+def select_falconsai_hub():
+    repo = HF_PINS["H3"][0]
+    for hub in (home() + "/hf_home/hub", FALCONSAI_USB_HUB):
+        if os.path.isdir(hub + "/" + repo):
+            return hub
+    return None
+
+
+def sort_component(entries):
+    with_p = sorted([e for e in entries if "p" in e], key=lambda e: e["p"])
+    without_p = sorted([e for e in entries if "p" not in e], key=lambda e: e["t"])
+    return with_p + without_p
+
+
+def component_stats(entries):
+    stats = collections.OrderedDict()
+    for cid in COMPONENT_ORDER:
+        stats[cid] = {"slug": SLUGS[cid], "files": 0, "symlinks": 0, "dirs": 0, "bytes": 0}
+    for entry in entries:
+        row = stats[entry["c"]]
+        if entry["k"] == "f":
+            row["files"] += 1
+            row["bytes"] += entry["b"]
+        elif entry["k"] == "l":
+            row["symlinks"] += 1
+        else:
+            row["dirs"] += 1
+    return stats
+
+
+def stats_totals(stats):
+    totals = {"files": 0, "symlinks": 0, "dirs": 0, "bytes": 0}
+    for row in stats.values():
+        for key in totals:
+            totals[key] += row[key]
+    return totals
+
+
+def enumerate_components(ctx):
+    H = home()
+    hub = H + "/hf_home/hub"
+    ctx.falconsai_hub = select_falconsai_hub()
+    parts = {}
+    parts["A1"] = enum_a1(ctx)
+    parts["A2"] = enum_a2(ctx)
+    parts["B1"] = walk_tree(ctx, "B1", H + "/ltx-2-mlx", H + "/ltx-2-mlx", B1_EXCLUDES)
+    parts["B2"] = walk_tree(ctx, "B2", H + "/ltx-2-mlx/.venv", H + "/ltx-2-mlx/.venv", frozenset())
+    parts["B3"] = walk_tree(ctx, "B3", b3_source(), b3_source(), frozenset())
+    parts["B4"] = walk_tree(ctx, "B4", ltx25_model_path(), ltx25_model_path(), B4_EXCLUDES)
+    parts["B5"] = [synthetic_dir("B5", H + "/ltx-2-mlx/hf_cache"), synthetic_dir("B5", H + "/ltx-2-mlx/hf_cache/hub")]
+    parts["D1"] = walk_tree(ctx, "D1", H + "/.venv-vllm-metal", H + "/.venv-vllm-metal", frozenset())
+    parts["F1"] = walk_tree(ctx, "F1", FRAMEWORK_ROOT + "/Versions/3.13", FRAMEWORK_ROOT + "/Versions/3.13", F1_EXCLUDES)
+    parts["F2"] = enum_f2(ctx)
+    parts["F3"] = walk_tree(ctx, "F3", H + "/Library/Python/3.13", H + "/Library/Python/3.13", F3_EXCLUDES)
+    parts["H0"] = [synthetic_dir("H0", H + "/hf_home"), synthetic_dir("H0", hub)]
+    for cid in ("H1", "H2", "H3", "H4"):
+        repo = HF_PINS[cid][0]
+        if cid == "H3":
+            if ctx.falconsai_hub is None:
+                ctx.enum_errors.append("H3: %s not found under %s or %s" % (repo, hub, FALCONSAI_USB_HUB))
+                parts[cid] = []
+                continue
+            source_hub = ctx.falconsai_hub
+        else:
+            source_hub = hub
+        parts[cid] = walk_tree(ctx, cid, source_hub + "/" + repo, hub + "/" + repo, frozenset())
+    parts["H5"] = [synthetic_dir("H5", H + "/mlx_models"),
+                   {"k": "l", "c": "H5", "t": H + "/mlx_models/qwen3-vl", "l": h5_link_value(), "s": True}]
+    ctx.entries = []
+    for cid in COMPONENT_ORDER:
+        ctx.entries.extend(sort_component(parts[cid]))
+    ctx.comp_stats = component_stats(ctx.entries)

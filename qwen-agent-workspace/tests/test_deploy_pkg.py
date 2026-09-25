@@ -278,5 +278,538 @@ class TestPrimitives(DeployTestCase):
         self.assertFalse(os.path.lexists(dst))
 
 
+PIPELINE = ("z_image_skill.py", "ltx2_mlx_video_skill.py", "ltx_image_fit.py", "content_safety.py",
+            "bin/ltx-movie", "bin/ltx-story-images", "bin/ltx-story-manifest", "bin/ltx-mlx-render",
+            "bin/story-server", "bin/qwen-agent")
+TESTS7 = ("tests/test_ltx_movie_offline.py", "tests/test_ltx_mlx_render.py", "tests/test_ltx_story_images.py",
+          "tests/test_ltx2_mlx_video_skill.py", "tests/test_ltx_image_fit.py",
+          "tests/test_ltx_story_manifest_chain.py", "tests/check_ltx2_mlx_no_forbidden_imports.py")
+LEGACY = ("ltx_video_skill.py", "mps_guard.py", "flux_skill.py", "bin/ltx-chain", "bin/ltx-generate",
+          "bin/ltx-host-prep", "bin/ltx-host-restore", "bin/ltx-story-video", "bin/pad-images", "start_vllm.sh")
+PACK28 = (".gitattributes", "LICENSE", "README.md", "audio_vae.safetensors", "chat_template.jinja",
+          "connector.safetensors", "duration_head.safetensors", "embedded_config.json", "generation_config.json",
+          "ltx-2.5-22b-distilled-lora-450-bf16.safetensors", "processor_config.json", "quantize_config.json",
+          "spatial_upscaler_x2_v1_0.safetensors", "spatial_upscaler_x2_v1_0_config.json", "split_model.json",
+          "temporal_upscaler_x2_v1_0.safetensors", "temporal_upscaler_x2_v1_0_config.json",
+          "text_encoder.safetensors", "text_encoder_config.json", "tokenizer.json", "tokenizer_config.json",
+          "transformer-dev.safetensors", "transformer-distilled.safetensors", "vae_decoder_av.safetensors",
+          "vae_decoder_conv.safetensors", "vae_encoder_av.safetensors", "vae_encoder_conv.safetensors",
+          "vocoder.safetensors")
+BIN_LINKS13 = ("idle3", "idle3.13", "pip3", "pip3.13", "pydoc3", "pydoc3.13", "python3", "python3-config",
+               "python3-intel64", "python3.13", "python3.13-config", "python3.13-intel64", "python")
+PINS = {
+    "H1": ("models--Tongyi-MAI--Z-Image-Turbo", "f332072aa78be7aecdf3ee76d5c247082da564a6"),
+    "H2": ("models--BennyDaBall--Qwen3-4b-Z-Image-Turbo-AbliteratedV1", "ce497d288a7ddfd5d0f337c7139349d5d0236bfa"),
+    "H3": ("models--Falconsai--nsfw_image_detection", "96cb0d0342c7afb80cab76ecc58b265fa44da256"),
+    "H4": ("models--divinetribe--Huihui-Qwen3-VL-32B-Instruct-abliterated-4bit-mlx", "5428d6aaca0103a1e32f47261a20fecaa47700ec"),
+}
+ORDER = ("A1", "A2", "B1", "B2", "B3", "B4", "B5", "D1", "F1", "F2", "F3", "H0", "H1", "H2", "H3", "H4", "H5")
+HEAD_SHA = "6ab72ac3f29e8d68e06095574bcbd97d8f621240"
+VLLM_OUT = ("INFO 09-25 07:36:25 [__init__.py:52] Available plugins for group vllm.platform_plugins:\n"
+            "INFO 09-25 07:36:27 [__init__.py:237] Platform plugin metal is activated\n0.27.1\n")
+GATE_OUT = {"G1": "OK 118/118", "G2": "OK 431/431", "G3": "OK 98/98", "G4": "OK 138/138",
+            "G5": "OK 73/73", "G6": "OK 32/32", "G7": "RESULT: ok"}
+GATE_ARGV = {"G1": "tests/test_ltx_movie_offline.py", "G2": "tests/test_ltx_mlx_render.py",
+             "G3": "tests/test_ltx_story_images.py", "G4": "tests/test_ltx2_mlx_video_skill.py",
+             "G5": "tests/test_ltx_image_fit.py", "G6": "tests/test_ltx_story_manifest_chain.py",
+             "G7": "tests/check_ltx2_mlx_no_forbidden_imports.py"}
+X2_ARGV = ("bin/ltx-movie", "a test narrative", "--story-id", "deploy-gate-dry", "--dry-run", "--no-review",
+           "--model", "/Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8")
+GEOMS = {"portrait": (320, 576, 320, 576), "wide": (960, 320, 960, 320),
+         "square": (512, 512, 512, 512), "noseed": (704, 448, 1408, 896)}
+
+
+def git_blob(data):
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _under_path(path, root):
+    return path == root or path.startswith(root + "/")
+
+
+class FixtureRun(object):
+    """Fake HOOKS["run"]: argv-keyed responses for every command build_pkg and install_pkg issue."""
+
+    def __init__(self, fx):
+        self.fx = fx
+        self.overrides = {}
+        self.calls = []
+        self.kwcalls = []
+        self.memsize = "68719476736"
+        self.fw_version = "3.13.0"
+        self.zsh_hf_home = None
+        self.freeze_text = "pkg==1.0\n"
+        self.media_overrides = {}
+
+    def __call__(self, argv, timeout=120, env=None, cwd=None):
+        key = tuple(argv)
+        self.calls.append(key)
+        self.kwcalls.append((key, timeout, cwd))
+        self.fx.events.append(("run", key))
+        if key in self.overrides:
+            value = self.overrides[key]
+            return value(key) if callable(value) else value
+        if key and key[0] == bp.GIT:
+            return self.git(key)
+        table = self.table()
+        if key in table:
+            return table[key]
+        if key and key[0] in (self.fx.ffprobe, self.fx.ffmpeg) and len(key) > 2:
+            return self.media(key)
+        raise AssertionError("unfaked run argv %r" % (key,))
+
+    def table(self):
+        fx = self.fx
+        t = {
+            ("/usr/sbin/sysctl", "-n", "hw.model"): (0, "Mac16,9\n"),
+            ("/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"): (0, "Apple M4 Max\n"),
+            ("/usr/sbin/sysctl", "-n", "hw.memsize"): (0, self.memsize + "\n"),
+            ("/usr/bin/sw_vers", "-productVersion"): (0, "26.0\n"),
+            ("/usr/bin/sw_vers", "-buildVersion"): (0, "25A100\n"),
+            (fx.fw_py, "-c", "import sys;print(sys.version.split()[0])"): (0, self.fw_version + "\n"),
+            (fx.ffmpeg, "-version"): (0, "ffmpeg version 9.0.1 Copyright (c) 2000-2026 the FFmpeg developers\nbuilt with Apple clang\n"),
+            (fx.ffprobe, "-version"): (0, "ffprobe version 9.0.1 Copyright (c) 2007-2026 the FFmpeg developers\n"),
+            (fx.brew_bin, "--version"): (0, "Homebrew 5.0.0\n"),
+            (fx.brew_py312, "--version"): (0, "Python 3.12.9\n"),
+            (fx.vllm_py, "-c", "import vllm; print(vllm.__version__)"): (0, VLLM_OUT),
+            (fx.fw_py, "-m", "pip", "freeze", "--all", "--exclude", "fubotv-mcp-common", "--exclude", "student-agent-mcp"): (0, self.freeze_text),
+            (fx.fw + "/Versions/3.13/bin/uv", "pip", "freeze", "--python", fx.home + "/ltx-2-mlx/.venv/bin/python"): (0, "ltx-core==0.15.4\n"),
+            (fx.vllm_py, "-m", "pip", "freeze", "--all"): (0, "vllm==0.27.1\n"),
+            (fx.fw_py, "bin/ltx-mlx-render", "--help"): (0, "usage: ltx-mlx-render [-h]\n"),
+            (fx.fw_py,) + X2_ARGV: (0, "dry run: 2 panels\n"),
+            ("/bin/zsh", "-c", 'printf "%s" "$HF_HOME"'): (0, self.zsh_hf_home if self.zsh_hf_home is not None else fx.home + "/hf_home"),
+            (fx.fw_py, "-s", "-c", "import sys, psutil, pytest, pexpect; print(sys.version.split()[0])"): (0, "3.13.0\n"),
+            (fx.fw_py, "-c", "import torch, diffusers, transformers, PIL, numpy, safetensors, psutil, pytest, pexpect"): (0, ""),
+            (fx.vllm_py, "-c", "import vllm, vllm_metal, mlx_vlm; print(vllm.__version__)"): (0, VLLM_OUT.replace("07:36:2", "08:00:0")),
+            (fx.home + "/ltx-2-mlx/.venv/bin/ltx-2-mlx", "--help"): (0, "usage: ltx-2-mlx [-h]\n"),
+            (fx.ws + "/bin/story-server",): (2, "usage: story-server [vision|text|status|stop]\n"),
+            (fx.ws + "/bin/story-server", "vision"): (0, ""),
+            (fx.ws + "/bin/story-server", "stop"): (0, ""),
+            ("/usr/bin/pgrep", "-fl", "ltx-2-mlx|z_image|mlx_lm|vllm"): (1, ""),
+            ("/usr/sbin/sysctl", "-n", "vm.swapusage"): (0, "total = 2048.00M  used = 100.00M  free = 1948.00M  (encrypted)\n"),
+        }
+        for gid, rel in GATE_ARGV.items():
+            t[(fx.fw_py, rel)] = (0, "running\n" + GATE_OUT[gid] + "\n")
+        return t
+
+    def git(self, key):
+        fx = self.fx
+        if key[1] != "-C" or key[2] != fx.repo:
+            raise AssertionError("git must run as git -C <repo>: %r" % (key,))
+        cmd = key[3:]
+        if cmd == ("rev-parse", "HEAD"):
+            return (0, HEAD_SHA + "\n")
+        if cmd == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return (0, "ltx2-mlx-video-pipeline\n")
+        if cmd == ("status", "--porcelain", "--", "qwen-agent-workspace"):
+            return (0, "".join(" M %s\n" % rp for rp in sorted(fx.modified)))
+        if cmd[:3] == ("ls-files", "--error-unmatch", "--"):
+            rp = cmd[3]
+            if rp in fx.untracked:
+                return (1, "error: pathspec '%s' did not match any file(s) known to git\n" % rp)
+            return (0, rp + "\n")
+        if cmd[:3] == ("status", "--porcelain", "--"):
+            rp = cmd[3]
+            if rp in fx.untracked:
+                return (0, "?? %s\n" % rp)
+            return (0, " M %s\n" % rp) if rp in fx.modified else (0, "")
+        if cmd[0] == "hash-object":
+            with open(cmd[1], "rb") as fh:
+                return (0, git_blob(fh.read()) + "\n")
+        if cmd[0] == "rev-parse" and cmd[1].startswith("HEAD:"):
+            rp = cmd[1][len("HEAD:"):]
+            if rp in fx.untracked:
+                return (128, "fatal: path '%s' does not exist in 'HEAD'\n" % rp)
+            if rp in fx.committed:
+                return (0, fx.committed[rp] + "\n")
+            with open(fx.repo + "/" + rp, "rb") as fh:
+                return (0, git_blob(fh.read()) + "\n")
+        raise AssertionError("unfaked git argv %r" % (key,))
+
+    def media(self, key):
+        fx = self.fx
+        path = key[-1] if key[0] == fx.ffprobe else key[key.index("-i") + 1]
+        found = re.search(r"deploy-accept-(portrait|wide|square|noseed)-", path)
+        label = found.group(1) if found else "portrait"
+        width, height, still_w, still_h = GEOMS[label]
+        media = self.media_overrides.get(label, {})
+        if key[0] == fx.ffprobe:
+            select = key[key.index("-select_streams") + 1]
+            if path.endswith(".png"):
+                stream = {"width": media.get("still_w", still_w), "height": media.get("still_h", still_h)}
+            elif select == "a:0":
+                stream = {"codec_name": media.get("audio", "aac")}
+            else:
+                stream = {"width": media.get("w", width), "height": media.get("h", height),
+                          "codec_name": media.get("vcodec", "h264"), "nb_read_frames": media.get("frames", "290")}
+            return (0, json.dumps({"streams": [stream]}) + "\n")
+        default = ["0,0,0,1,6220800,ac2833aa09711810c612e6b20955113e"]
+        rows = media.get("rows_seed" if path.endswith(".chainseed.png") else "rows_clip", default)
+        return (0, "#format: frame checksums\n#version: 2\n" + "".join(row + "\n" for row in rows))
+
+
+class Fixture(object):
+    """A fake source host under one temp dir (Task 8's InstallFixture turns it into a fake target)."""
+
+    def __init__(self, tc):
+        self.tc = tc
+        self.root = os.path.realpath(tempfile.mkdtemp(prefix="deploypkg-"))
+        tc.addCleanup(self.cleanup)
+        self.home = self.root + "/Users/reubenpatterson"
+        self.ws = self.home + "/local_model_harness/qwen-agent-workspace"
+        self.repo = self.home + "/local_model_harness"
+        self.fw = self.root + "/Library/Frameworks/Python.framework"
+        self.ulb = self.root + "/usr/local/bin"
+        self.volumes = self.root + "/Volumes"
+        self.usb = self.volumes + "/USB"
+        self.usb2 = self.volumes + "/USB2"
+        self.usb_hub = self.usb + "/hf_home/hub"
+        self.brew_bin = self.root + "/opt/homebrew/bin/brew"
+        self.brew_py312 = self.root + "/opt/homebrew/opt/python@3.12/bin/python3.12"
+        self.ffmpeg = self.root + "/opt/homebrew/bin/ffmpeg"
+        self.ffprobe = self.root + "/opt/homebrew/bin/ffprobe"
+        self.deploy = self.root + "/deploy"
+        self.package_id = "ltx-chain-deploy-20260925"
+        self.pkg = self.usb + "/" + self.package_id
+        self.fw_py = self.fw + "/Versions/3.13/bin/python3"
+        self.vllm_py = self.home + "/.venv-vllm-metal/bin/python"
+        self.mounts = set([self.usb, self.usb2])
+        self.untracked = set()
+        self.modified = set()
+        self.committed = {}
+        self.events = []
+        self.allowlist_entries = []
+        self.run = FixtureRun(self)
+        for path in (self.home, self.usb, self.usb2, self.deploy, self.ulb):
+            os.makedirs(path)
+        self.patch_build_module()
+
+    def cleanup(self):
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            for name in dirnames:
+                path = os.path.join(dirpath, name)
+                if not os.path.islink(path):
+                    os.chmod(path, 0o755)
+        shutil.rmtree(self.root, True)
+
+    def patch_build_module(self):
+        values = {"REQUIRED_HOME": self.home, "FRAMEWORK_ROOT": self.fw, "USR_LOCAL_BIN": self.ulb,
+                  "VOLUMES_ROOT": self.volumes, "FALCONSAI_USB_HUB": self.usb_hub, "BREW_BIN": self.brew_bin,
+                  "BREW_PY312": self.brew_py312, "USB_ROOT_DEFAULT": self.usb}
+        patchers = [mock.patch.object(bp, name, value) for name, value in sorted(values.items())]
+        patchers.append(mock.patch.object(bp, "deploy_dir", lambda: self.deploy))
+        patchers.append(mock.patch.dict(os.environ, {"HOME": self.home}))
+        for patcher in patchers:
+            patcher.start()
+            self.tc.addCleanup(patcher.stop)
+        for name in ("HF_TOKEN", "HF_HOME", "Z_IMAGE_HF_HOME", "LTX2_MLX_HF_HOME", "HF_HUB_CACHE",
+                     "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+            os.environ.pop(name, None)
+
+    def write_deploy_dir(self):
+        for name in ("build_pkg.py", "install_pkg.py"):
+            real = os.path.join(DEPLOY_DIR, name)
+            if os.path.exists(real):
+                with open(real, "rb") as fh:
+                    data = fh.read()
+            else:
+                data = b"# install_pkg.py stand-in written by the test fixture before Task 8 exists\n"
+            write_file(self.deploy + "/" + name, data, 0o755)
+        self.write_allowlist()
+
+    def write_allowlist(self, entries=None):
+        if entries is not None:
+            self.allowlist_entries = entries
+        doc = {"schema_version": 1, "entries": self.allowlist_entries}
+        write_file(self.deploy + "/credential_allowlist.json", (json.dumps(doc, indent=2) + "\n").encode("utf-8"))
+
+    def make_repo(self, hub, repo, pin):
+        root = hub + "/" + repo
+        blob = hashlib.sha1(repo.encode("utf-8")).hexdigest()
+        write_file(root + "/blobs/" + blob, ("weights for %s\n" % repo).encode("utf-8"))
+        write_file(root + "/refs/main", pin.encode("ascii"))
+        make_link(root + "/snapshots/" + pin + "/config.json", "../../blobs/" + blob)
+        write_file(root + "/.DS_Store", b"ds")
+
+    def build_sources(self):
+        H, WS = self.home, self.ws
+        for rel in PIPELINE + TESTS7:
+            write_file(WS + "/" + rel, ("# fixture %s\n" % rel).encode("utf-8"), 0o755 if rel.startswith("bin/") else 0o644)
+        for rel in LEGACY:
+            write_file(WS + "/" + rel, b"# legacy, never shipped\n")
+        for name in ("portrait.png", "wide3x1.png", "square.png"):
+            write_file(WS + "/generated/hw_gate_seeds/" + name, b"\x89PNG fixture " + name.encode("ascii"))
+        write_file(WS + "/generated/hw_gate_seeds/last_portrait.sid", b"sid\n")
+        write_file(WS + "/__pycache__/z_image_skill.cpython-313.pyc", b"pyc")
+        L = H + "/ltx-2-mlx"
+        write_file(L + "/README.md", b"ltx-2-mlx fixture\n")
+        write_file(L + "/packages/ltx_core/__init__.py", b"# core\n")
+        write_file(L + "/packages/ltx_core/__pycache__/__init__.cpython-311.pyc", b"pyc")
+        write_file(L + "/packages/.DS_Store", b"ds")
+        write_file(L + "/.git/HEAD", b"ref: refs/heads/main\n")
+        for name in ("hf_cache/hub", "converted_models", "source_caches", ".claude", "models/other-model"):
+            write_file(L + "/" + name + "/excluded.txt", b"excluded\n")
+        B3 = H + "/.local/share/uv/python/cpython-3.11.13-macos-aarch64-none"
+        write_file(B3 + "/bin/python3.11", b"#!fake\n", 0o755)
+        make_link(B3 + "/bin/python3", "python3.11")
+        write_file(B3 + "/lib/libpython3.11.dylib", b"dylib")
+        V = L + "/.venv"
+        write_file(V + "/pyvenv.cfg", ("home = %s/bin\nversion_info = 3.11.13\n" % B3).encode("utf-8"))
+        make_link(V + "/bin/python", B3 + "/bin/python3.11")
+        write_file(V + "/bin/ltx-2-mlx", b"#!fake\n", 0o755)
+        write_file(V + "/lib/python3.11/site-packages/ltx_pipelines.pth", (L + "/packages/ltx_core\n").encode("utf-8"))
+        write_file(V + "/lib/python3.11/site-packages/__pycache__/x.cpython-311.pyc", b"pyc")
+        P = L + "/models/ltx-2.5-mlx-q8"
+        for name in PACK28:
+            write_file(P + "/" + name, ("pack:%s\n" % name).encode("utf-8"))
+        write_file(P + "/.cache/huggingface/download/x.metadata", b"cache")
+        write_file(P + "/.DS_Store", b"ds")
+        os.chmod(P, 0o750)
+        D = H + "/.venv-vllm-metal"
+        write_file(D + "/pyvenv.cfg", ("home = %s\nversion_info = 3.12.9\n" % os.path.dirname(self.brew_py312)).encode("utf-8"))
+        make_link(D + "/bin/python", self.brew_py312)
+        write_file(D + "/lib/python3.12/site-packages/vllm/__init__.py", b"__version__ = '0.27.1'\n")
+        write_file(D + "/lib/python3.12/site-packages/vllm/.mypy_cache/x", b"cache")
+        F = self.fw + "/Versions/3.13"
+        write_file(F + "/bin/python3.13", b"#!fake\n", 0o755)
+        make_link(F + "/bin/python3", "python3.13")
+        SP = F + "/lib/python3.13/site-packages"
+        write_file(SP + "/psutil/__init__.py", b"# psutil\n")
+        write_file(SP + "/psutil/__pycache__/__init__.cpython-313.pyc", b"pyc")
+        write_file(SP + "/.ruff_cache/x", b"cache")
+        write_file(SP + "/.pytest_cache/x", b"cache")
+        for name in ("__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable___student_agent_mcp_1_0_0_finder.py",
+                     "__editable__.fubotv_mcp_common-0.1.0.pth", "__editable__.student_agent_mcp-1.0.0.pth"):
+            write_file(SP + "/" + name, b"# editable reference\n")
+        write_file(SP + "/fubotv_mcp_common-0.1.0.dist-info/METADATA", b"Name: fubotv-mcp-common\n")
+        write_file(SP + "/student_agent_mcp-1.0.0.dist-info/METADATA", b"Name: student-agent-mcp\n")
+        for name in ("Headers", "Python", "Resources"):
+            make_link(self.fw + "/" + name, "Versions/Current/" + name)
+        make_link(self.fw + "/Versions/Current", "3.13")
+        os.chmod(self.fw + "/Versions", 0o775)
+        for name in BIN_LINKS13:
+            value = self.ulb + "/python3" if name == "python" else "../../../Library/Frameworks/Python.framework/Versions/3.13/bin/" + name
+            make_link(self.ulb + "/" + name, value)
+        U = H + "/Library/Python/3.13"
+        USP = U + "/lib/python/site-packages"
+        write_file(USP + "/torch/__init__.py", b"# torch\n")
+        for name in ("__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable__.fubotv_mcp_common-0.1.0.pth"):
+            write_file(USP + "/" + name, b"# editable reference\n")
+        write_file(USP + "/fubotv_mcp_common-0.1.0.dist-info/METADATA", b"Name: fubotv-mcp-common\n")
+        write_file(U + "/bin/torchrun", b"#!fake\n", 0o755)
+        hub = H + "/hf_home/hub"
+        for cid in ("H1", "H2", "H4"):
+            self.make_repo(hub, PINS[cid][0], PINS[cid][1])
+        self.make_repo(self.usb_hub, PINS["H3"][0], PINS["H3"][1])
+        big27 = "models--ailexleon--Huihui-Qwen3.8-27B-abliterated-mlx-6Bit"
+        self.make_repo(hub, big27, "a68be749cc7a1e762811b899b3af9ca13c97d29d")
+        write_file(H + "/.mtplx/state.json", b"{}")
+        make_link(H + "/mlx_models/qwen3-vl", hub + "/" + PINS["H4"][0] + "/snapshots/" + PINS["H4"][1])
+        make_link(H + "/mlx_models/Huihui-Qwen3.8-27B-abliterated-mlx-6bit", hub + "/" + big27 + "/snapshots/a68be749cc7a1e762811b899b3af9ca13c97d29d")
+        self.write_deploy_dir()
+
+    def configure_build_hooks(self):
+        bp.HOOKS.update({
+            "run": self.run,
+            "ismount": lambda path: path in self.mounts,
+            "diskutil_personality": lambda path: "Case-sensitive APFS",
+            "statvfs_free": lambda path: 10 ** 15,
+            "port_free": lambda port: True,
+            "which": lambda name: {"ffmpeg": self.ffmpeg, "ffprobe": self.ffprobe}.get(name),
+            "now_utc": lambda: FIXED_NOW,
+            "after_chunk": lambda src, nbytes: None,
+            "after_entry": lambda index: None,
+        })
+
+    def ctx(self, *extra):
+        args = bp.parse_args(["--usb-root", self.usb, "--package-id", self.package_id] + list(extra))
+        ctx = bp.BuildCtx(args)
+        bp.enumerate_components(ctx)
+        return ctx
+
+
+def order_by_spec(keys):
+    out = []
+    for cid in ORDER:
+        mine = [k for k in keys if k[1] == cid]
+        out.extend(sorted([k for k in mine if k[2] is not None], key=lambda k: k[2]))
+        out.extend(sorted([k for k in mine if k[2] is None], key=lambda k: k[3]))
+    return out
+
+
+def expected_keys(fx):
+    H, WS = fx.home, fx.ws
+    exp = []
+
+    def tree(cid, slug, target, items):
+        prefix = "payload/%s-%s" % (cid, slug)
+        exp.append(("d", cid, prefix, target))
+        for kind, rel in items:
+            exp.append((kind, cid, prefix + "/" + rel, target + "/" + rel))
+
+    a1 = "payload/A1-workspace-code"
+    exp.extend([("d", "A1", a1, WS), ("d", "A1", a1 + "/bin", WS + "/bin"), ("d", "A1", a1 + "/tests", WS + "/tests")])
+    exp.extend(("f", "A1", a1 + "/" + rel, WS + "/" + rel) for rel in PIPELINE + TESTS7)
+    a2 = "payload/A2-hw-gate-seeds"
+    exp.append(("d", "A2", a2, WS + "/generated/hw_gate_seeds"))
+    exp.extend(("f", "A2", a2 + "/" + n, WS + "/generated/hw_gate_seeds/" + n) for n in ("portrait.png", "wide3x1.png", "square.png"))
+    L = H + "/ltx-2-mlx"
+    tree("B1", "ltx2mlx-repo", L, [("f", "README.md"), ("d", "packages"), ("d", "packages/ltx_core"), ("f", "packages/ltx_core/__init__.py")])
+    tree("B2", "ltx2mlx-venv", L + "/.venv", [("f", "pyvenv.cfg"), ("d", "bin"), ("l", "bin/python"), ("f", "bin/ltx-2-mlx"), ("d", "lib"), ("d", "lib/python3.11"), ("d", "lib/python3.11/site-packages"), ("f", "lib/python3.11/site-packages/ltx_pipelines.pth")])
+    tree("B3", "uv-cpython311", H + "/.local/share/uv/python/cpython-3.11.13-macos-aarch64-none", [("d", "bin"), ("f", "bin/python3.11"), ("l", "bin/python3"), ("d", "lib"), ("f", "lib/libpython3.11.dylib")])
+    tree("B4", "ltx25-mlx-q8", L + "/models/ltx-2.5-mlx-q8", [("f", n) for n in PACK28])
+    exp.extend([("d", "B5", None, L + "/hf_cache"), ("d", "B5", None, L + "/hf_cache/hub")])
+    tree("D1", "vllm-venv", H + "/.venv-vllm-metal", [("f", "pyvenv.cfg"), ("d", "bin"), ("l", "bin/python"), ("d", "lib"), ("d", "lib/python3.12"), ("d", "lib/python3.12/site-packages"), ("d", "lib/python3.12/site-packages/vllm"), ("f", "lib/python3.12/site-packages/vllm/__init__.py")])
+    tree("F1", "framework-python", fx.fw + "/Versions/3.13", [("d", "bin"), ("f", "bin/python3.13"), ("l", "bin/python3"), ("d", "lib"), ("d", "lib/python3.13"), ("d", "lib/python3.13/site-packages"), ("d", "lib/python3.13/site-packages/psutil"), ("f", "lib/python3.13/site-packages/psutil/__init__.py")])
+    exp.extend([("d", "F2", None, fx.fw), ("d", "F2", None, fx.fw + "/Versions"), ("d", "F2", None, fx.ulb)])
+    exp.extend(("l", "F2", None, fx.fw + "/" + n) for n in ("Headers", "Python", "Resources", "Versions/Current"))
+    exp.extend(("l", "F2", None, fx.ulb + "/" + n) for n in BIN_LINKS13)
+    tree("F3", "user-site", H + "/Library/Python/3.13", [("d", "bin"), ("f", "bin/torchrun"), ("d", "lib"), ("d", "lib/python"), ("d", "lib/python/site-packages"), ("d", "lib/python/site-packages/torch"), ("f", "lib/python/site-packages/torch/__init__.py")])
+    exp.extend([("d", "H0", None, H + "/hf_home"), ("d", "H0", None, H + "/hf_home/hub")])
+    slugs = {"H1": "hf-zimage", "H2": "hf-zimage-te", "H3": "hf-nsfw", "H4": "hf-qwen3vl32b"}
+    for cid in ("H1", "H2", "H3", "H4"):
+        repo, pin = PINS[cid]
+        blob = hashlib.sha1(repo.encode("utf-8")).hexdigest()
+        tree(cid, slugs[cid], H + "/hf_home/hub/" + repo, [("d", "blobs"), ("f", "blobs/" + blob), ("d", "refs"), ("f", "refs/main"), ("d", "snapshots"), ("d", "snapshots/" + pin), ("l", "snapshots/" + pin + "/config.json")])
+    exp.extend([("d", "H5", None, H + "/mlx_models"), ("l", "H5", None, H + "/mlx_models/qwen3-vl")])
+    return order_by_spec(exp)
+
+
+class TestComponentCollection(DeployTestCase):
+    def setUp(self):
+        DeployTestCase.setUp(self)
+        self.fx = Fixture(self)
+        self.fx.build_sources()
+
+    def keys(self, ctx):
+        return [(e["k"], e["c"], e.get("p"), e["t"]) for e in ctx.entries]
+
+    def test_T01_golden_entry_list(self):
+        ctx = self.fx.ctx()
+        self.assertEqual(ctx.enum_errors, [])
+        self.assertEqual(ctx.l1_hits, [])
+        self.assertEqual(self.keys(ctx), expected_keys(self.fx))
+
+    def test_T02_exclusions(self):
+        ctx = self.fx.ctx()
+        targets = [e["t"] for e in ctx.entries]
+        sources = [e.get("_src", "") for e in ctx.entries]
+        for pruned in ("__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"):
+            self.assertEqual([t for t in targets if ("/" + pruned + "/") in (t + "/")], [], pruned)
+        self.assertEqual([t for t in targets if t.endswith("/.DS_Store")], [])
+        self.assertEqual([t for t in targets if "/ltx-2.5-mlx-q8/.cache" in t], [])
+        L = self.fx.home + "/ltx-2-mlx"
+        for name in ("models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"):
+            self.assertEqual([e["t"] for e in ctx.entries if e["c"] == "B1" and _under_path(e["t"], L + "/" + name)], [], name)
+        for marker in ("fubotv_mcp_common", "student_agent_mcp"):
+            self.assertEqual([t for t in targets if marker in t], [], marker)
+        a1 = sorted(e["_rel"] for e in ctx.entries if e["c"] == "A1" and e["k"] == "f")
+        self.assertEqual(a1, sorted(PIPELINE + TESTS7))
+        for rel in LEGACY:
+            self.assertTrue(os.path.exists(self.fx.ws + "/" + rel), rel)
+            self.assertNotIn(self.fx.ws + "/" + rel, targets)
+        self.assertEqual([p for p in sources + targets if "Huihui-Qwen3.8-27B" in p or "/.mtplx" in p], [])
+        self.assertNotIn(self.fx.ws + "/generated/hw_gate_seeds/last_portrait.sid", targets)
+
+    def test_T02b_constants_verbatim(self):
+        self.assertEqual(bp.COMPONENT_ORDER, ORDER)
+        self.assertEqual(bp.LTX25_PACK_FILES, frozenset(PACK28))
+        self.assertEqual(len(bp.LTX25_PACK_FILES), 28)
+        self.assertEqual(bp.PIPELINE_FILES, PIPELINE)
+        self.assertEqual(bp.TEST_FILES, TESTS7)
+        self.assertEqual(bp.F2_BIN_LINKS, BIN_LINKS13)
+        self.assertEqual(bp.F2_FRAMEWORK_LINKS, ("Headers", "Python", "Resources", "Versions/Current"))
+        self.assertEqual(bp.HF_PINS, PINS)
+        self.assertEqual(bp.PRUNE_DIRS, frozenset(["__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"]))
+        self.assertEqual(bp.B1_EXCLUDES, frozenset(["models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"]))
+        self.assertEqual(bp.F1_EXCLUDES, frozenset("lib/python3.13/site-packages/" + n for n in (
+            "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable___student_agent_mcp_1_0_0_finder.py",
+            "__editable__.fubotv_mcp_common-0.1.0.pth", "__editable__.student_agent_mcp-1.0.0.pth",
+            "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info")))
+        self.assertEqual(bp.F3_EXCLUDES, frozenset("lib/python/site-packages/" + n for n in (
+            "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable__.fubotv_mcp_common-0.1.0.pth",
+            "fubotv_mcp_common-0.1.0.dist-info")))
+        self.assertEqual(bp.SLUGS["B4"], "ltx25-mlx-q8")
+        self.assertEqual(len(bp.SLUGS), 17)
+
+    def test_T03a_hf_snapshot_links_are_relative_l_entries(self):
+        ctx = self.fx.ctx()
+        for cid in ("H1", "H2", "H3", "H4"):
+            repo, pin = PINS[cid]
+            links = [e for e in ctx.entries if e["c"] == cid and e["k"] == "l"]
+            self.assertEqual([e["l"] for e in links], ["../../blobs/" + hashlib.sha1(repo.encode("utf-8")).hexdigest()])
+
+    def test_T04_synthetic_entries(self):
+        ctx = self.fx.ctx()
+        synth = [e for e in ctx.entries if e["c"] in ("B5", "H0", "H5")]
+        self.assertEqual(len(synth), 6)
+        for e in synth:
+            self.assertIs(e.get("s"), True)
+            self.assertNotIn("p", e)
+            self.assertNotIn("_src", e)
+        link = [e for e in synth if e["k"] == "l"][0]
+        self.assertEqual(link["l"], self.fx.home + "/hf_home/hub/" + PINS["H4"][0] + "/snapshots/" + PINS["H4"][1])
+        self.assertEqual([e["m"] for e in synth if e["k"] == "d"], ["0755"] * 5)
+
+    def test_T05_f2_has_17_links_and_3_dirs(self):
+        ctx = self.fx.ctx()
+        f2 = [e for e in ctx.entries if e["c"] == "F2"]
+        self.assertEqual(sorted(collections.Counter(e["k"] for e in f2).items()), [("d", 3), ("l", 17)])
+        self.assertEqual([e for e in f2 if "p" in e], [])
+        by_t = dict((e["t"], e) for e in f2)
+        self.assertEqual(by_t[self.fx.fw + "/Versions"]["m"], "0775")
+        self.assertEqual(by_t[self.fx.fw + "/Versions/Current"]["l"], "3.13")
+        self.assertEqual(by_t[self.fx.ulb + "/python"]["l"], self.fx.ulb + "/python3")
+
+    def test_T05b_f2_wrong_type_is_an_enumeration_error(self):
+        os.unlink(self.fx.ulb + "/pip3")
+        write_file(self.fx.ulb + "/pip3", b"not a symlink")
+        ctx = self.fx.ctx()
+        self.assertTrue([m for m in ctx.enum_errors if self.fx.ulb + "/pip3" in m and "not a symlink" in m], ctx.enum_errors)
+
+    def test_T07a_fifo_is_an_enumeration_error(self):
+        fifo = self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/pipe"
+        os.mkfifo(fifo)
+        ctx = self.fx.ctx()
+        self.assertTrue([m for m in ctx.enum_errors if fifo in m and "special file" in m], ctx.enum_errors)
+
+    def test_missing_source_root_is_an_enumeration_error(self):
+        B3 = self.fx.home + "/.local/share/uv/python/cpython-3.11.13-macos-aarch64-none"
+        shutil.rmtree(B3)
+        ctx = self.fx.ctx()
+        self.assertTrue([m for m in ctx.enum_errors if m.startswith("B3:") and B3 in m], ctx.enum_errors)
+
+    def test_R6_falconsai_hub_selection(self):
+        ctx = self.fx.ctx()
+        self.assertEqual(ctx.falconsai_hub, self.fx.usb_hub)
+        h3 = [e for e in ctx.entries if e["c"] == "H3"]
+        self.assertTrue(all(e["_src"].startswith(self.fx.usb_hub + "/") for e in h3))
+        self.assertTrue(all(e["t"].startswith(self.fx.home + "/hf_home/hub/") for e in h3))
+        self.fx.make_repo(self.fx.home + "/hf_home/hub", PINS["H3"][0], PINS["H3"][1])
+        self.assertEqual(self.fx.ctx().falconsai_hub, self.fx.home + "/hf_home/hub")
+        shutil.rmtree(self.fx.home + "/hf_home/hub/" + PINS["H3"][0])
+        shutil.rmtree(self.fx.usb_hub + "/" + PINS["H3"][0])
+        ctx = self.fx.ctx()
+        self.assertIsNone(ctx.falconsai_hub)
+        self.assertTrue([m for m in ctx.enum_errors if m.startswith("H3:")])
+
+    def test_stats(self):
+        ctx = self.fx.ctx()
+        self.assertEqual(list(ctx.comp_stats), list(ORDER))
+        self.assertEqual((ctx.comp_stats["A1"]["files"], ctx.comp_stats["A1"]["dirs"]), (17, 3))
+        self.assertEqual(ctx.comp_stats["F2"], {"slug": "framework-symlinks", "files": 0, "symlinks": 17, "dirs": 3, "bytes": 0})
+        totals = bp.stats_totals(ctx.comp_stats)
+        self.assertEqual(totals["bytes"], sum(e["b"] for e in ctx.entries if e["k"] == "f"))
+
+    def test_parse_args_usage_errors(self):
+        for argv in (["--resume"], ["--package-id", "ltx-chain-deploy-2026"], ["--apply", "--verify-only"]):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    bp.parse_args(argv)
+            self.assertEqual(cm.exception.code, 2, argv)
+        args = bp.parse_args(["--usb-root", self.fx.usb + "/"])
+        self.assertEqual(bp.BuildCtx(args).usb_root, self.fx.usb)
+
+
 if __name__ == "__main__":
     unittest.main()
