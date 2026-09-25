@@ -1799,6 +1799,48 @@ class TestRPre(BuildE2ECase):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(seen["present"], ROOT_FILES)
 
+    def test_T24_manifest_absent_while_l4_runs(self):
+        real_l4 = bp.l4_rescan
+        seen = {}
+
+        def spy_l4(ctx):
+            seen["manifest"] = os.path.lexists(ctx.package_root + "/MANIFEST.json")
+            seen["readme"] = os.path.isfile(ctx.package_root + "/README.md")
+            real_l4(ctx)
+        with mock.patch.object(bp, "l4_rescan", spy_l4):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(seen, {"manifest": False, "readme": True})
+        self.assertTrue(os.path.isfile(self.fx.pkg + "/MANIFEST.json"))
+
+    def test_T25_payload_started_is_set_by_the_first_payload_entry(self):
+        flags = {}
+        real_write_root_files = bp.write_root_files
+
+        def spy_write_root_files(ctx):
+            flags["root_files"] = bp.CTX_STATE["payload_started"]
+            real_write_root_files(ctx)
+
+        def after_entry(index):
+            if index == 0:
+                flags["first_entry"] = bp.CTX_STATE["payload_started"]
+        bp.HOOKS["after_entry"] = after_entry
+        with mock.patch.object(bp, "write_root_files", spy_write_root_files):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(flags, {"root_files": False, "first_entry": True})
+        self.assertIs(bp.CTX_STATE["payload_started"], False)
+
+    def test_T26_check_messages_never_print_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        for label, text in (("l3", "KeyError: " + SECRET_CANARY + "\n"), ("l2", "token=" + GITHUB_CANARY + "\n")):
+            self.fx.run.overrides[(self.fx.fw_py, "tests/test_ltx_story_images.py")] = (1, text)
+            rc, out, err = build_dry(self.fx)
+            self.assertEqual(rc, 4, label + out + err)
+            self.assertIn("FAIL B15 (message withheld: it contained secret material)", out.splitlines(), label)
+            self.assertNotIn(SECRET_CANARY, out + err, label)
+            self.assertNotIn(GITHUB_CANARY, out + err, label)
+
 
 class TestCopyEngineE2E(BuildE2ECase):
     def test_T30_payload_matches_sources(self):

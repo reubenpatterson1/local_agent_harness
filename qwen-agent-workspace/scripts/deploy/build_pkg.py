@@ -1924,7 +1924,11 @@ def print_prebuild_report(ctx, results):
     print("SPACE required=%d (%.2f GiB) free=%d (%.2f GiB)"
           % (ctx.required_bytes, ctx.required_bytes / gib, ctx.free_bytes, ctx.free_bytes / gib))
     for result in results:
-        print(format_result(result))
+        line = format_result(result)
+        data = line.encode("utf-8")
+        if KnownSecretScanner(ctx.secrets).feed(data) or l2_scan_bytes(data):
+            line = "%s %s (message withheld: it contained secret material)" % (line.split(" ", 1)[0], result.check_id)
+        print(line)
 
 
 def cmd_build(args):
