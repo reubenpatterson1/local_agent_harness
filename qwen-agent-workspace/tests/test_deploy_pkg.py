@@ -278,6 +278,32 @@ class TestPrimitives(DeployTestCase):
         self.assertNotIn(SECRET_CANARY, str(cm.exception))
         self.assertFalse(os.path.lexists(dst))
 
+    def test_has_secret_and_safe_line_match_install_pkg(self):
+        ctx = types.SimpleNamespace(secrets=[SECRET_CANARY.encode("ascii")])
+        for text, want in (("plain text", False), ("x " + SECRET_CANARY + " y", True),
+                           ("x " + GITHUB_CANARY, True), ("undecodable \udcff name", False)):
+            self.assertIs(bp.has_secret(ctx, text), want)
+            self.assertIs(ip.has_secret(ctx, text), want)
+            self.assertEqual(bp.safe_line(ctx, text, "WITHHELD"), "WITHHELD" if want else text)
+        self.assertFalse(bp.has_secret(types.SimpleNamespace(secrets=[]), "x " + SECRET_CANARY))
+
+    def test_post_copy_write_error_line_withholds_secret_material(self):
+        bp.HOOKS["now_utc"] = lambda: FIXED_NOW
+        ctx = types.SimpleNamespace(package_id="ltx-chain-deploy-20260925", package_root=self.tmp + "/pkg",
+                                    secrets=[SECRET_CANARY.encode("ascii")])
+        os.makedirs(ctx.package_root)
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            def refuse(ctx, rel, data, mode, canary=canary):
+                raise OSError("cannot write %s/%s" % (canary, rel))
+            err = io.StringIO()
+            with mock.patch.object(bp, "write_package_file", refuse), contextlib.redirect_stderr(err):
+                rc = bp.fail_post_copy(ctx, "PC4", RuntimeError("injected post-copy failure"))
+            self.assertEqual(rc, 3, label)
+            self.assertEqual(err.getvalue().splitlines()[:2], [
+                "build_pkg: could not write BUILD-FAILED.json (OSError): (error text withheld: it contained secret material)",
+                "build_pkg: POST-COPY FAILURE at PC4 (RuntimeError): injected post-copy failure"], label)
+            self.assertNotIn(canary, err.getvalue(), label)
+
 
 PIPELINE = ("z_image_skill.py", "ltx2_mlx_video_skill.py", "ltx_image_fit.py", "content_safety.py",
             "bin/ltx-movie", "bin/ltx-story-images", "bin/ltx-story-manifest", "bin/ltx-mlx-render",
@@ -1149,6 +1175,46 @@ class TestCredentialGates(DeployTestCase):
         self.assertEqual(doc["l3_sources"][0], {"source": self.fx.home + "/.cache/huggingface/token", "present": True, "values": 1})
         self.assertEqual(bp.l2_scan_bytes(text.encode("utf-8")), [])
 
+    def test_entries_file_is_l2_scanned_at_any_size(self):
+        pkg = self.fx.root + "/pkgentries"
+        data = ('{"k":"l","c":"F3","p":"payload/F3-user-site/hub_link","t":"/x","l":"../' + GITHUB_CANARY + '"}\n').encode("ascii") * 4
+        for rel in ("MANIFEST-ENTRIES.jsonl", "manifests/MANIFEST-ENTRIES.jsonl", "payload/F3-user-site/MANIFEST-ENTRIES.jsonl"):
+            write_file(pkg + "/" + rel, data)
+        key = ("ROOT", "MANIFEST-ENTRIES.jsonl", hashlib.sha256(data).hexdigest(), "github_token")
+        with mock.patch.object(bp, "L2_MAX_BYTES", 64):
+            self.assertGreater(len(data), bp.L2_MAX_BYTES)
+            self.assertEqual(bp.scan_package(pkg, set()), (["L2 github_token MANIFEST-ENTRIES.jsonl"], []))
+            self.assertEqual(bp.scan_package(pkg, set([key])), ([], [
+                {"component": "ROOT", "relpath": "MANIFEST-ENTRIES.jsonl", "sha256": key[2], "pattern": "github_token"}]))
+        failures, allowed = bp.scan_package(pkg, set())
+        self.assertEqual(sorted(failures), ["L2 github_token MANIFEST-ENTRIES.jsonl",
+                                            "L2 github_token manifests/MANIFEST-ENTRIES.jsonl",
+                                            "L2 github_token payload/F3-user-site/MANIFEST-ENTRIES.jsonl"])
+
+    def test_credential_report_withholds_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        for canary in (SECRET_CANARY, GITHUB_CANARY):
+            write_file(self.torch + "/" + canary + "/token", b"harmless\n")
+            os.mkfifo(self.torch + "/" + canary + ".pipe")
+        stray = self.fx.root + "/" + GITHUB_CANARY + "/deploy"
+        shutil.copytree(self.fx.deploy, stray)
+        write_file(stray + "/credential_allowlist.json", b'{"schema_version": 1, "entries": [{"component": "F3"}]}')
+        args = bp.parse_args(["--credential-report", "--usb-root", self.fx.usb, "--package-id", self.fx.package_id])
+        out = io.StringIO()
+        with mock.patch.object(bp, "deploy_dir", lambda: stray), contextlib.redirect_stdout(out):
+            rc = bp.cmd_credential_report(args)
+        text = out.getvalue()
+        lines = text.splitlines()
+        self.assertEqual(rc, 1)
+        self.assertEqual([l for l in lines if l.startswith("L1 ")], ["L1 (path withheld: it contained secret material)"] * 2)
+        self.assertEqual([l for l in lines if l.startswith("ENUM-ERROR ")],
+                         ["ENUM-ERROR (message withheld: it contained secret material)"] * 2)
+        self.assertEqual([l for l in lines if l.startswith("ALLOWLIST-ERROR ")],
+                         ["ALLOWLIST-ERROR (message withheld: it contained secret material)"])
+        self.assertEqual(lines[-1], "build_pkg: CREDENTIAL REPORT NOT CLEAN: l1=2 new=0 allowlisted=0 stale=0")
+        self.assertNotIn(SECRET_CANARY, text)
+        self.assertNotIn(GITHUB_CANARY, text)
+
 
 def prebuild(fx, *extra):
     args = bp.parse_args(["--usb-root", fx.usb, "--package-id", fx.package_id] + list(extra))
@@ -1174,7 +1240,7 @@ class TestBuildChecks(DeployTestCase):
 
     def test_clean_fixture_passes_every_check_in_table_order(self):
         ctx, results, by_id = prebuild(self.fx)
-        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 20)])
+        self.assertEqual([r.check_id for r in results], ["B%02d" % i for i in range(1, 21)])
         self.assertEqual([bp.format_result(r) for r in results if not r.ok], [])
         self.assertEqual(ctx.baseline["schema_version"], 1)
         self.assertEqual(ctx.baseline["interpreter"], self.fx.fw_py)
@@ -1524,7 +1590,7 @@ class TestBuildChecks(DeployTestCase):
     def test_B19_detects_dirty_build_pkg(self):
         self.fx.modified.add("qwen-agent-workspace/scripts/deploy/build_pkg.py")
         ctx, results, by_id = prebuild(self.fx)
-        self.assertEqual(results[-1].check_id, "B19")
+        self.assertEqual([r.check_id for r in results[-2:]], ["B19", "B20"])
         self.assertEqual(by_id["B19"], bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/build_pkg.py: modified", True))
         self.assertTrue(by_id["B17"].ok, by_id["B17"].message)
         self.assertTrue(ctx.deploy_script_record["files"]["scripts/deploy/credential_allowlist.json"]["clean"])
@@ -1534,6 +1600,37 @@ class TestBuildChecks(DeployTestCase):
         self.assertEqual(result, bp.CheckResult("B19", False, "deploy provenance: scripts/deploy/credential_allowlist.json: blob differs", True))
         self.fx.committed.clear()
         self.assertTrue(self.check("B19").ok)
+
+    def test_B20_known_secret_source_on_the_build_volume(self):
+        def b20(usb_root):
+            ctx = bp.BuildCtx(bp.parse_args(["--usb-root", usb_root, "--package-id", self.fx.package_id]))
+            ctx.secrets, ctx.l3_sources, ctx.l3_errors = bp.load_known_secrets()
+            return bp.check_b20(ctx)
+        usb = self.fx.usb
+        tok = "tokU." + "u" * 20
+        on_volume = ("known-secret source file(s) on the build volume %s: %s; build onto a volume "
+                     "that holds no credential files (pass a different --usb-root)")
+        clean = bp.CheckResult("B20", True, "no present known-secret source file is under %s" % usb, True)
+        self.assertEqual(self.check("B20"), clean)
+        write_file(usb + "/hf_home/token", (tok + "\n").encode("ascii"))
+        result = self.check("B20")
+        self.assertEqual(result, bp.CheckResult("B20", False, on_volume % (usb, usb + "/hf_home/token"), True))
+        self.assertNotIn(tok, result.message)
+        self.assertTrue(b20(self.fx.usb2).ok)
+        link = self.fx.root + "/usb-link"
+        make_link(link, usb)
+        self.assertEqual(b20(link), bp.CheckResult("B20", False, on_volume % (usb, usb + "/hf_home/token"), True))
+        os.unlink(usb + "/hf_home/token")
+        write_file(usb + "/stash/tok", (tok + "\n").encode("ascii"))
+        make_link(self.fx.home + "/alt/tokfile", usb + "/stash/tok")
+        os.environ["HF_TOKEN_PATH"] = self.fx.home + "/alt/tokfile"
+        self.assertEqual(b20(usb), bp.CheckResult(
+            "B20", False, on_volume % (usb, self.fx.home + "/alt/tokfile -> " + usb + "/stash/tok"), True))
+        del os.environ["HF_TOKEN_PATH"]
+        os.environ["HF_TOKEN"] = tok
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(usb)
+        self.assertEqual(b20(usb), clean)
 
 
 class TestReadme(DeployTestCase):
@@ -1624,7 +1721,7 @@ class TestBuildCli(BuildE2ECase):
         self.assertEqual(len(totals), 1)
         self.assertTrue(re.match(r"^TOTAL files=\d+ symlinks=\d+ dirs=\d+ bytes=\d+ \(\d+\.\d\d GiB\)$", totals[0]))
         self.assertEqual(len([line for line in lines if line.startswith("SPACE required=")]), 1)
-        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 20)])
+        self.assertEqual([line.split()[1] for line in lines if line.startswith("PASS ")], ["B%02d" % i for i in range(1, 21)])
         self.assertEqual(snapshot(self.fx.root), before)
 
     def test_default_mode_is_dry_run_and_failures_exit_4(self):
@@ -1987,6 +2084,61 @@ class TestCredentialGatesE2E(BuildE2ECase):
         self.assertEqual(rc, 3, out + err)
         with open(self.fx.pkg + "/BUILD-FAILED.json") as fh:
             self.assertIn("DS_Store", json.load(fh)["error"])
+
+    def test_l4_l2_scans_the_entries_file_above_the_size_cap(self):
+        make_link(self.fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/hub_link", "../" + GITHUB_CANARY)
+        with mock.patch.object(bp, "L2_MAX_BYTES", 1024):
+            rc, out, err = build_apply(self.fx)
+        self.assertEqual(rc, 3)
+        self.assertGreater(os.path.getsize(self.fx.pkg + "/MANIFEST-ENTRIES.jsonl"), 1024)
+        with open(self.fx.pkg + "/BUILD-FAILED.json") as fh:
+            doc = json.load(fh)
+        self.assertEqual((doc["failed_step"], doc["error_type"], doc["error"]),
+                         ("PC4", "CredentialLeak", "L4: 1 finding(s) in the package: L2 github_token MANIFEST-ENTRIES.jsonl"))
+        self.assertFalse(os.path.lexists(self.fx.pkg + "/MANIFEST.json"))
+        self.assertNotIn(GITHUB_CANARY, out + err + json.dumps(doc))
+
+    def test_copy_abort_line_withholds_secret_material(self):
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            fx = self.fresh_fixture()
+            write_file(fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+            target = fx.home + "/Library/Python/3.13/lib/python/site-packages/torch/" + canary + ".txt"
+            write_file(target, b"grows while it is copied\n")
+            state = {"done": False}
+
+            def after_chunk(src, nbytes, target=target, state=state):
+                if src == target and not state["done"]:
+                    state["done"] = True
+                    with open(src, "ab") as fh:
+                        fh.write(b"more\n")
+            bp.HOOKS["after_chunk"] = after_chunk
+            rc, out, err = build_apply(fx)
+            self.assertEqual(rc, 5, label)
+            self.assertTrue(state["done"], label)
+            self.assertIn("build_pkg: COPY ABORTED (SourceChanged): (error text withheld: it contained secret material)",
+                          err.splitlines(), label)
+            self.assertNotIn(canary, out + err, label)
+
+    def test_post_copy_failure_withholds_secret_material(self):
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            fx = self.fresh_fixture()
+            write_file(fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+
+            def after_entry(index, fx=fx, canary=canary):
+                if index == 0:
+                    write_file(fx.pkg + "/payload/" + canary + "/.DS_Store", b"finder")
+            bp.HOOKS["after_entry"] = after_entry
+            rc, out, err = build_apply(fx)
+            self.assertEqual(rc, 3, label)
+            with open(fx.pkg + "/BUILD-FAILED.json") as fh:
+                raw = fh.read()
+            doc = json.loads(raw)
+            self.assertEqual((doc["failed_step"], doc["error_type"], doc["error"]),
+                             ("PC4", "CredentialLeak", "error text withheld: it contained secret material"), label)
+            self.assertIn("build_pkg: POST-COPY FAILURE at PC4 (CredentialLeak): (error text withheld: it contained secret material)",
+                          err.splitlines(), label)
+            self.assertFalse(os.path.lexists(fx.pkg + "/MANIFEST.json"), label)
+            self.assertNotIn(canary, out + err + raw, label)
 
 
 def build_verify(fx, package_id=None):
@@ -2383,6 +2535,17 @@ class TestInstallChecks(InstallCase):
         write_file(self.fx.pkg + "/payload/F3-user-site/leak.txt", ("x " + GITHUB_CANARY).encode("ascii"))
         result = self.check("I08")[0]
         self.assertFalse(result.ok)
+        self.assertNotIn(GITHUB_CANARY, result.message)
+
+    def test_T67b_I08_l2_scans_the_entries_file_above_the_size_cap(self):
+        entries_path = self.fx.pkg + "/MANIFEST-ENTRIES.jsonl"
+        with mock.patch.object(ip._bp, "L2_MAX_BYTES", 64):
+            self.assertGreater(os.path.getsize(entries_path), ip._bp.L2_MAX_BYTES)
+            self.assertTrue(self.check("I08")[0].ok)
+            with open(entries_path, "ab") as fh:
+                fh.write(('{"k":"l","c":"F3","t":"/x","l":"../' + GITHUB_CANARY + '"}\n').encode("ascii"))
+            result = self.check("I08")[0]
+        self.assertEqual(result, ip.CheckResult("I08", False, "1 finding(s): L2 github_token MANIFEST-ENTRIES.jsonl", True))
         self.assertNotIn(GITHUB_CANARY, result.message)
 
     def test_T68_I09_free_space(self):

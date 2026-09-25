@@ -789,6 +789,17 @@ def l2_scan_bytes(data):
     return [pid for pid, rx in L2_PATTERNS if rx.search(data)]
 
 
+def has_secret(ctx, text):
+    """True if text holds a known secret value (L3) or a secret-shaped string (L2)."""
+    data = text.encode("utf-8", "backslashreplace")
+    return bool(KnownSecretScanner(ctx.secrets).feed(data) or l2_scan_bytes(data))
+
+
+def safe_line(ctx, line, withheld):
+    """line, or withheld (fixed words, check ids, reasons and counts only) if line holds secret material."""
+    return withheld if has_secret(ctx, line) else line
+
+
 def l2_scan_sources(ctx):
     hits = []
     errors = []
@@ -971,7 +982,9 @@ def allowlist_key(rel):
 
 
 def scan_package(package_root, allow):
-    """L1 + L2 over every file and symlink under package_root; any .DS_Store fails."""
+    """L1 over every file and symlink under package_root; any .DS_Store fails. L2 over every regular
+    file up to L2_MAX_BYTES, and over MANIFEST-ENTRIES.jsonl at any size (it holds every path and
+    symlink value in the package, and a real one is far larger than L2_MAX_BYTES)."""
     failures = []
     allowed = []
     for rel, st in list_tree(package_root):
@@ -983,7 +996,7 @@ def scan_package(package_root, allow):
             continue
         if name in L1_NAMES:
             failures.append("L1 " + rel)
-        if stat.S_ISREG(st.st_mode) and st.st_size <= L2_MAX_BYTES:
+        if stat.S_ISREG(st.st_mode) and (st.st_size <= L2_MAX_BYTES or rel == "MANIFEST-ENTRIES.jsonl"):
             with open(package_root + "/" + rel, "rb") as fh:
                 data = fh.read()
             pids = l2_scan_bytes(data)
@@ -1048,20 +1061,21 @@ def l4_rescan(ctx):
 
 def cmd_credential_report(args):
     ctx = BuildCtx(args)
+    ctx.secrets = load_known_secrets()[0]   # L3 values for safe_line(): compared only, never printed
     enumerate_components(ctx)
     load_deploy_files(ctx)
     prepare_l2(ctx)
     for path in ctx.l1_hits:
-        print("L1 " + path)
+        print(safe_line(ctx, "L1 " + path, "L1 (path withheld: it contained secret material)"))
     for hit in ctx.l2_hits:
         print("L2 %s %s" % ("ALLOWLISTED" if hit in ctx.l2_allowed else "NEW", report_json(hit)))
     stale = stale_allowlist_entries(ctx.allow_entries, ctx.l2_hits)
     for entry in stale:
         print("STALE " + json.dumps(entry, separators=(", ", ": ")))
     for message in ctx.enum_errors + ctx.l2_errors:
-        print("ENUM-ERROR " + message)
+        print(safe_line(ctx, "ENUM-ERROR " + message, "ENUM-ERROR (message withheld: it contained secret material)"))
     if ctx.allow_error:
-        print("ALLOWLIST-ERROR " + ctx.allow_error)
+        print(safe_line(ctx, "ALLOWLIST-ERROR " + ctx.allow_error, "ALLOWLIST-ERROR (message withheld: it contained secret material)"))
     clean = not (ctx.l1_hits or ctx.l2_new or ctx.enum_errors or ctx.l2_errors or ctx.allow_error)
     print("build_pkg: CREDENTIAL REPORT %s: l1=%d new=%d allowlisted=%d stale=%d" % (
         "CLEAN" if clean else "NOT CLEAN", len(ctx.l1_hits), len(ctx.l2_new), len(ctx.l2_allowed), len(stale)))
@@ -1566,8 +1580,28 @@ def check_b19(ctx):
     return CheckResult("B19", ok, message, True)
 
 
+def check_b20(ctx):
+    """B20: no present file-backed known-secret source (ctx.l3_sources) lies under the volume being
+    built onto. Both sides are realpaths, so a symlink cannot hide a token file on that volume.
+    "$HF_TOKEN"-style env-var sources are not paths and are skipped. Messages name paths only."""
+    root = os.path.realpath(ctx.usb_root)
+    prefix = root.rstrip("/") + "/"
+    hits = []
+    for source in ctx.l3_sources:
+        label = source["source"]
+        if not source["present"] or not label.startswith("/"):
+            continue
+        real = os.path.realpath(label)
+        if real.startswith(prefix):
+            hits.append(label if real == label else "%s -> %s" % (label, real))
+    if hits:
+        return CheckResult("B20", False, "known-secret source file(s) on the build volume %s: %s; build onto a volume "
+                           "that holds no credential files (pass a different --usb-root)" % (root, ", ".join(hits)), True)
+    return CheckResult("B20", True, "no present known-secret source file is under %s" % root, True)
+
+
 def run_prebuild_checks(ctx):
-    """Stage step 4: B01-B17 in table order, then B18, then B19. Reads only; writes nothing."""
+    """Stage step 4: B01-B17 in table order, then B18, then B19, then B20. Reads only; writes nothing."""
     load_deploy_files(ctx)
     prepare_l2(ctx)
     if ctx.resume and os.path.isdir(ctx.package_root) and not os.path.lexists(ctx.package_root + "/MANIFEST.json"):
@@ -1593,6 +1627,7 @@ def run_prebuild_checks(ctx):
     results.append(check_b17(ctx))
     results.append(check_no_employer_packages(ctx))
     results.append(check_b19(ctx))
+    results.append(check_b20(ctx))
     return results
 
 
@@ -1822,7 +1857,9 @@ def abort_copy_stage(ctx, exc):
             fh.close()
         except OSError:
             pass
-    print("build_pkg: COPY ABORTED (%s): %s" % (type(exc).__name__, exc), file=sys.stderr)
+    print(safe_line(ctx, "build_pkg: COPY ABORTED (%s): %s" % (type(exc).__name__, exc),
+                    "build_pkg: COPY ABORTED (%s): (error text withheld: it contained secret material)" % type(exc).__name__),
+          file=sys.stderr)
     print("build_pkg: no MANIFEST.json was written; fix the cause, then rerun with --apply --resume --package-id %s"
           % ctx.package_id, file=sys.stderr)
     return 5
@@ -1874,20 +1911,24 @@ def write_manifest(ctx):
 
 
 def fail_post_copy(ctx, step, exc):
+    error = str(exc)
     doc = {"schema_version": SCHEMA_VERSION, "package_id": ctx.package_id, "failed_step": step,
-           "error_type": type(exc).__name__, "error": str(exc), "created_at": iso_now()}
+           "error_type": type(exc).__name__, "error": error, "created_at": iso_now()}
+    if has_secret(ctx, error):
+        doc["error"] = "error text withheld: it contained secret material"
     data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
-    if KnownSecretScanner(ctx.secrets).feed(data):
-        doc["error"] = "error text withheld: it contained a known secret value"
-        data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
     manifest = ctx.package_root + "/MANIFEST.json"
     if os.path.lexists(manifest):
         os.unlink(manifest)
     try:
         write_package_file(ctx, "BUILD-FAILED.json", data, 0o644)
     except Exception as write_exc:
-        print("build_pkg: could not write BUILD-FAILED.json: %s" % write_exc, file=sys.stderr)
-    print("build_pkg: POST-COPY FAILURE at %s (%s): %s" % (step, doc["error_type"], doc["error"]), file=sys.stderr)
+        print(safe_line(ctx, "build_pkg: could not write BUILD-FAILED.json: %s" % write_exc,
+                        "build_pkg: could not write BUILD-FAILED.json (%s): (error text withheld: it contained secret material)"
+                        % type(write_exc).__name__), file=sys.stderr)
+    print(safe_line(ctx, "build_pkg: POST-COPY FAILURE at %s (%s): %s" % (step, doc["error_type"], error),
+                    "build_pkg: POST-COPY FAILURE at %s (%s): (error text withheld: it contained secret material)"
+                    % (step, doc["error_type"])), file=sys.stderr)
     print("build_pkg: BUILD-FAILED.json written; no MANIFEST.json. Fix the cause, then rerun with --apply --resume --package-id %s"
           % ctx.package_id, file=sys.stderr)
     return 3
