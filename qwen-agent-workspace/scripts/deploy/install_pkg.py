@@ -8,9 +8,11 @@ Plan: docs/superpowers/plans/2026-09-25-ltx-chain-deploy-package.md
         [--apply] [--package-root PATH] [--gpu | --gpu-all]
 
 Runs under Apple's /usr/bin/python3 (3.9.6); stdlib only; Python 3.9 language
-level. The shared helpers (entry I/O, hashing, L1/L2 scanning, CheckResult) are
-loaded from build_pkg.py in this file's own directory (R8). This module keeps its
-own HOOKS and constants; it never calls a build_pkg function that reads HOOKS.
+level. The shared helpers (entry I/O, hashing, L1/L2/L3 scanning, known-secret
+loading, CheckResult) are loaded from build_pkg.py in this file's own directory
+(R8). This module keeps its own HOOKS and constants; it never calls a build_pkg
+function that reads HOOKS. Every printed line that carries package-, manifest-,
+target-, exception- or subprocess-derived text goes through safe_line() first.
 """
 import argparse
 import glob
@@ -123,6 +125,8 @@ class InstallCtx(object):
         self.entries = []
         self.receipt_entries = []
         self.target_status = {}
+        self.dir_modes = {}
+        self.secrets = _bp.load_known_secrets()[0]   # L3 values: compared only, never printed
         self.memsize = -1
         self.ffmpeg = None
         self.ffprobe = None
@@ -131,6 +135,17 @@ class InstallCtx(object):
         if self.manifest and self.manifest.get("package_id"):
             return self.manifest["package_id"]
         return os.path.basename(self.package_root)
+
+
+def has_secret(ctx, text):
+    """True if text holds a known secret value (L3) or a secret-shaped string (L2)."""
+    data = text.encode("utf-8", "backslashreplace")
+    return bool(_bp.KnownSecretScanner(ctx.secrets).feed(data) or _bp.l2_scan_bytes(data))
+
+
+def safe_line(ctx, line, withheld):
+    """line, or withheld (fixed words, check ids, reasons and counts only) if line holds secret material."""
+    return withheld if has_secret(ctx, line) else line
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +343,8 @@ def check_i10(ctx):
             collisions.append((target, reason))
         ctx.target_status[target] = "same" if same else reason
     for target, reason in collisions:
-        print("COLLISION %s: %s" % (reason, target))
+        print(safe_line(ctx, "COLLISION %s: %s" % (reason, target),
+                        "COLLISION %s: (path withheld: it contained secret material)" % reason))
     if collisions:
         print("COLLISIONS %d" % len(collisions))
     ok = not collisions
@@ -461,7 +477,8 @@ PHASE_CHECKS = {
 def run_checks(ctx):
     results = [CHECKS[check_id](ctx) for check_id in PHASE_CHECKS[ctx.phase]]
     for result in results:
-        print(_bp.format_result(result))
+        line = _bp.format_result(result)
+        print(safe_line(ctx, line, "%s %s (message withheld: it contained secret material)" % (line.split(" ", 1)[0], result.check_id)))
     return results
 
 
@@ -490,9 +507,12 @@ def print_plan(ctx):
                 same += 1
             else:
                 collisions += 1
-        print("PLAN %s copy=%d identical=%d collisions=%d" % (cid, copy, same, collisions))
+        print(safe_line(ctx, "PLAN %s copy=%d identical=%d collisions=%d" % (cid, copy, same, collisions),
+                        "PLAN (component id withheld: it contained secret material) copy=%d identical=%d collisions=%d"
+                        % (copy, same, collisions)))
     if ctx.phase == "user":
-        print("PLAN receipts -> %s" % receipts_dir(ctx.package_id()))
+        print(safe_line(ctx, "PLAN receipts -> %s" % receipts_dir(ctx.package_id()),
+                        "PLAN receipts -> (path withheld: it contained secret material)"))
 
 
 def gated_install(ctx, fatal_failures):
@@ -510,7 +530,10 @@ def gated_install(ctx, fatal_failures):
         if ctx.phase == "user":
             return apply_user(ctx)
     except Exception as exc:
-        print("install_pkg: ERROR during --apply (%s): %s" % (type(exc).__name__, exc), file=sys.stderr)
+        name = type(exc).__name__
+        print(safe_line(ctx, "install_pkg: ERROR during --apply (%s): %s" % (name, exc),
+                        "install_pkg: ERROR during --apply (%s): (message withheld: it contained secret material)" % name),
+              file=sys.stderr)
         print("install_pkg: files already installed stay in place; a rerun skips them as identical", file=sys.stderr)
         return EXIT_RUNTIME
     return EXIT_OK
@@ -523,10 +546,32 @@ def _write_all(fd, data):
         offset += os.write(fd, view[offset:])
 
 
-def install_file(src, entry):
+def make_dir(ctx, path):
+    """Create path and its missing ancestors, top down; an existing path is never touched.
+    A manifest directory is made under a temp name, chmod-ed to its recorded mode plus owner
+    rwx (so its children can be installed), then renamed into place: it never appears under
+    its final name with any other mode, even if the run is killed (spec 12.4)."""
+    missing = []
+    while not os.path.lexists(path):
+        missing.append(path)
+        path = os.path.dirname(path)
+    for directory in reversed(missing):
+        mode = ctx.dir_modes.get(directory)
+        if mode is None:
+            os.mkdir(directory)
+            continue
+        tmp = os.path.dirname(directory) + "/." + os.path.basename(directory) + ".ltxdeploy.tmp"
+        if os.path.lexists(tmp):
+            os.rmdir(tmp)   # an empty leftover from a killed run
+        os.mkdir(tmp, 0o700)
+        os.chmod(tmp, mode | 0o700)
+        os.rename(tmp, directory)
+
+
+def install_file(ctx, src, entry):
     target = entry["t"]
     parent = os.path.dirname(target)
-    os.makedirs(parent, exist_ok=True)
+    make_dir(ctx, parent)
     tmp = parent + "/." + os.path.basename(target) + ".ltxdeploy.tmp"
     hasher = hashlib.sha256()
     src_fd = os.open(src, os.O_RDONLY)
@@ -556,10 +601,10 @@ def install_file(src, entry):
     os.replace(tmp, target)
 
 
-def install_symlink(entry):
+def install_symlink(ctx, entry):
     target = entry["t"]
     parent = os.path.dirname(target)
-    os.makedirs(parent, exist_ok=True)
+    make_dir(ctx, parent)
     tmp = parent + "/." + os.path.basename(target) + ".ltxdeploy.tmp"
     if os.path.lexists(tmp):
         os.unlink(tmp)
@@ -577,11 +622,11 @@ def install_entry(ctx, entry):
             return False
         raise InstallError("%s changed after the checks ran (%s)" % (target, reason))
     if entry["k"] == "f":
-        install_file(ctx.package_root + "/" + entry["p"], entry)
+        install_file(ctx, ctx.package_root + "/" + entry["p"], entry)
     elif entry["k"] == "l":
-        install_symlink(entry)
+        install_symlink(ctx, entry)
     else:
-        os.makedirs(target, exist_ok=True)
+        make_dir(ctx, target)
     return True
 
 
@@ -593,6 +638,8 @@ def chmod_created_dirs(ctx, component):
 
 
 def install_components(ctx, components):
+    # every d entry, not only this phase's: F1's first entry creates F2's Python.framework and Versions
+    ctx.dir_modes = dict((e["t"], int(e["m"], 8)) for e in ctx.entries if e["k"] == "d")
     selected = [e for e in ctx.entries if e["c"] in components]
     last = {}
     for index, entry in enumerate(selected):
@@ -614,7 +661,7 @@ def write_receipts(ctx):
     for entry in ctx.receipt_entries:
         if ctx.target_status.get(entry["t"]) == "same":
             continue
-        install_file(entry["_src"], entry)
+        install_file(ctx, entry["_src"], entry)
 
 
 def apply_system_python(ctx):
@@ -623,7 +670,10 @@ def apply_system_python(ctx):
     lines = out.splitlines()
     first = lines[0].strip() if lines else ""
     if rc != 0 or first != "3.13.0":
-        print("install_pkg: system-python post-check FAILED (rc=%d): %s" % (rc, out[-200:]), file=sys.stderr)
+        detail = out[-200:]
+        if has_secret(ctx, out):   # the whole output: a secret cut by the 200-character tail is still caught
+            detail = "(output withheld: it contained secret material)"
+        print("install_pkg: system-python post-check FAILED (rc=%d): %s" % (rc, detail), file=sys.stderr)
         return EXIT_RUNTIME
     print("install_pkg: system-python phase complete")
     return EXIT_OK
@@ -662,6 +712,8 @@ def verify_entry(entry):
         return None
     if not stat.S_ISDIR(st.st_mode):
         return "not a directory"
+    if stat.S_IMODE(st.st_mode) != int(entry["m"], 8):
+        return "mode differs"
     return None
 
 
@@ -676,7 +728,8 @@ def phase_verify(ctx, fatal_failures):
         reason = verify_entry(entry)
         if reason:
             mismatches += 1
-            print("MISMATCH %s: %s" % (reason, entry["t"]))
+            print(safe_line(ctx, "MISMATCH %s: %s" % (reason, entry["t"]),
+                            "MISMATCH %s: (path withheld: it contained secret material)" % reason))
     if mismatches:
         print("install_pkg: verify FAILED: %d mismatch(es)" % mismatches)
         return EXIT_RUNTIME

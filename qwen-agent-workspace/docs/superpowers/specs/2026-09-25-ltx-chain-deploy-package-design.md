@@ -746,7 +746,7 @@ A killed copy therefore never leaves a partial file under the final name. A left
 
 **Symlinks:** `os.symlink(l, tmp)`, then `os.replace(tmp, t)`.
 
-**Directories:** `os.makedirs(t, exist_ok=True)`. A directory **created by this run** is `chmod`ed to `m` after the last entry of its component. Pre-existing directories are never `chmod`ed.
+**Directories:** `make_dir` creates every missing directory on the way to a target, top down. A directory that is a `d` entry of any component is created as `.<name>.ltxdeploy.tmp`, `chmod`ed to `m | 0o700`, then renamed into place, so it never appears under its final name with another mode, even when the run is killed. A directory that is not an entry is created with `os.mkdir` and the umask. A directory **created by this run** is `chmod`ed to `m` after the last entry of its component (this changes only a mode that lacks owner `rwx`; none does in the real manifest). Pre-existing directories are never `chmod`ed.
 
 Ownership is never changed. Files written in S are root-owned, and files written in U are owned by the user.
 
@@ -761,7 +761,7 @@ Ownership is never changed. Files written in S are root-owned, and files written
 - **verify**: V checks. For every entry:
   - `f`: a regular file, sha256 = `h`, `S_IMODE` = `m`;
   - `l`: `readlink == l`;
-  - `d`: a directory.
+  - `d`: a directory with `S_IMODE` = `m` (else `mode differs`). A pre-existing directory whose mode differs is reported too; the installer never changes it (§12.4).
 
   It prints `MISMATCH <reason>: <t>` for each failure (exit 1), or `VERIFY OK <f> files, <l> symlinks, <d> dirs` (exit 0). It reads targets only and writes nothing, so it can run from a receipts root.
 - **accept**: §13.

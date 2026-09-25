@@ -2214,6 +2214,9 @@ class InstallFixture(Fixture):
             patcher = mock.patch.object(ip, name, value)
             patcher.start()
             self.tc.addCleanup(patcher.stop)
+        patcher = mock.patch.object(ip._bp, "VOLUMES_ROOT", self.volumes)   # L3 must never read a real /Volumes/*/hf_home
+        patcher.start()
+        self.tc.addCleanup(patcher.stop)
         os.environ["HF_HOME"] = self.home + "/hf_home"
 
         def getpwnam(name):
@@ -2620,6 +2623,143 @@ class TestInstallApply(InstallCase):
         self.assertEqual(rc, 1)
         self.assertIn("MISMATCH content differs: " + target, out)
         self.assertIn("MISMATCH mode differs: " + self.fx.home + "/ltx-2-mlx/.venv/pyvenv.cfg", out)
+
+    def test_known_secrets_come_only_from_the_fixture(self):
+        # len() and ==-inside-assertTrue only: an assertion message must never show a loaded value
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "preflight", "--package-root", self.fx.pkg]))
+        self.assertEqual(len(ctx.secrets), 0)
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        ctx = ip.InstallCtx(ip.parse_args(["--phase", "preflight", "--package-root", self.fx.pkg]))
+        self.assertEqual(len(ctx.secrets), 1)
+        self.assertTrue(ctx.secrets[0] == SECRET_CANARY.encode("ascii"))
+
+    def test_check_lines_withhold_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            planted = self.fx.pkg + "/payload/F3-user-site/" + canary
+            write_file(planted + "/.DS_Store", b"ds")
+            rc, out, err = self.fx.install("preflight")
+            shutil.rmtree(planted)
+            self.assertEqual(rc, 4, label + out + err)
+            lines = out.splitlines()
+            self.assertIn("FAIL I07 (message withheld: it contained secret material)", lines, label + out)
+            self.assertIn("FAIL I08 (message withheld: it contained secret material)", lines, label + out)
+            self.assertNotIn(canary, out + err, label)
+
+    def test_manifest_id_lines_withhold_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        manifest_path = self.fx.pkg + "/MANIFEST.json"
+        with open(manifest_path, "rb") as fh:
+            original = fh.read()
+        # l2: I08's rescan also finds the pattern in MANIFEST.json ("L2 github_token MANIFEST.json"), so rc is 4
+        for label, canary, want_rc in (("l3", SECRET_CANARY, 0), ("l2", GITHUB_CANARY, 4)):
+            manifest = json.loads(original.decode("utf-8"))
+            manifest["package_id"] = "ltx-chain-deploy-" + canary
+            manifest["components"]["X" + canary] = manifest["components"]["B1"]
+            write_file(manifest_path, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+            rc, out, err = self.fx.install("user")
+            write_file(manifest_path, original)
+            self.assertEqual(rc, want_rc, label + out + err)
+            lines = out.splitlines()
+            self.assertIn("PASS I06 (message withheld: it contained secret material)", lines, label + out)
+            self.assertIn("PLAN (component id withheld: it contained secret material) copy=0 identical=0 collisions=0", lines, label + out)
+            self.assertIn("PLAN receipts -> (path withheld: it contained secret material)", lines, label + out)
+            self.assertNotIn(canary, out + err, label)
+
+    def test_target_path_lines_withhold_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        entries_path = self.fx.pkg + "/MANIFEST-ENTRIES.jsonl"
+        manifest_path = self.fx.pkg + "/MANIFEST.json"
+        with open(entries_path, "rb") as fh:
+            original_entries = fh.read().decode("utf-8")
+        with open(manifest_path, "rb") as fh:
+            original_manifest = fh.read().decode("utf-8")
+        first = [e for e in self.entries() if e["c"] == "A1" and e["k"] == "f"][0]
+        old = '"t":"%s"' % first["t"]
+        self.assertEqual(original_entries.count(old), 1)
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            target = os.path.dirname(first["t"]) + "/" + canary + ".py"
+            data = original_entries.replace(old, '"t":"%s"' % target).encode("utf-8")
+            manifest = json.loads(original_manifest)
+            manifest["entries_sha256"] = hashlib.sha256(data).hexdigest()
+            write_file(entries_path, data)
+            write_file(manifest_path, (json.dumps(manifest, indent=2) + "\n").encode("utf-8"))
+            write_file(target, b"x")
+            rc, out, err = self.fx.install("preflight")
+            self.assertEqual(rc, 4, label + out + err)
+            self.assertIn("COLLISION size differs: (path withheld: it contained secret material)", out.splitlines(), label + out)
+            self.assertNotIn(canary, out + err, label)
+            rc, out, err = self.fx.install("verify")
+            self.assertEqual(rc, 1, label + out + err)
+            self.assertIn("MISMATCH content differs: (path withheld: it contained secret material)", out.splitlines(), label + out)
+            self.assertNotIn(canary, out + err, label)
+            os.unlink(target)
+
+    def test_error_lines_withhold_secret_material(self):
+        write_file(self.fx.home + "/.cache/huggingface/token", (SECRET_CANARY + "\n").encode("ascii"))
+        key = (self.fx.fw_py, "-s", "-c", "import sys, psutil, pytest, pexpect; print(sys.version.split()[0])")
+        for label, canary in (("l3", SECRET_CANARY), ("l2", GITHUB_CANARY)):
+            # the printed tail is out[-200:], which starts 10 characters before the canary ends: only a fragment is in it
+            self.fx.run.overrides[key] = (1, "Traceback (most recent call last):\n  token=" + canary + "\n" + "y" * 189)
+            rc, out, err = self.fx.install("system-python", "--apply")
+            del self.fx.run.overrides[key]
+            self.assertEqual(rc, 1, label + out + err)
+            self.assertIn("install_pkg: system-python post-check FAILED (rc=1): (output withheld: it contained secret material)",
+                          err.splitlines(), label + err)
+            self.assertNotIn(canary[-10:], out + err, label)
+
+            def after_chunk(src, nbytes, canary=canary):
+                raise OSError("injected failure reading " + canary)
+            ip.HOOKS["after_chunk"] = after_chunk
+            rc, out, err = self.fx.install("user", "--apply")
+            ip.HOOKS["after_chunk"] = lambda src, nbytes: None
+            self.assertEqual(rc, 1, label + out + err)
+            self.assertIn("install_pkg: ERROR during --apply (OSError): (message withheld: it contained secret material)",
+                          err.splitlines(), label + err)
+            self.assertNotIn(canary, out + err, label)
+
+    def test_interrupted_runs_leave_created_dirs_at_their_recorded_mode(self):
+        old_umask = os.umask(0o022)   # pin it: the pre-fix code gives 0755 here, never the recorded 0775 / 0750
+        self.addCleanup(os.umask, old_umask)
+        entries = self.entries()
+        versions = [e for e in entries if e["k"] == "d" and e["t"] == self.fx.fw + "/Versions"][0]
+        b4_root = [e for e in entries if e["c"] == "B4" and e["k"] == "d"][0]
+        self.assertEqual((versions["c"], versions["m"], b4_root["m"]), ("F2", "0775", "0750"))
+        for cid, phase in (("F1", "system-python"), ("B4", "user")):
+            first = [e for e in entries if e["c"] == cid and e["k"] == "f"][0]
+
+            def after_chunk(src, nbytes, first=first):
+                if src == self.fx.pkg + "/" + first["p"]:
+                    raise OSError("injected failure on the first %s file" % first["c"])
+            ip.HOOKS["after_chunk"] = after_chunk
+            rc, out, err = self.fx.install(phase, "--apply")
+            ip.HOOKS["after_chunk"] = lambda src, nbytes: None
+            self.assertEqual(rc, 1, phase + out + err)
+            self.assertFalse(os.path.lexists(first["t"]), phase)
+            for entry in entries:
+                if entry["k"] == "d" and os.path.lexists(entry["t"]):
+                    self.assertEqual(stat.S_IMODE(os.lstat(entry["t"]).st_mode), int(entry["m"], 8), phase + " " + entry["t"])
+            rc, out, err = self.fx.install(phase, "--apply")
+            self.assertEqual(rc, 0, phase + out + err)
+        for entry in (versions, b4_root):
+            self.assertEqual(stat.S_IMODE(os.lstat(entry["t"]).st_mode), int(entry["m"], 8), entry["t"])
+        rc, out, err = self.fx.install("verify")
+        self.assertEqual(rc, 0, out + err)
+        self.assertTrue(out.splitlines()[-1].startswith("VERIFY OK "), out)
+
+    def test_verify_reports_a_directory_mode_mismatch(self):
+        self.fx.install_all()
+        rc, out, err = self.fx.install("verify")
+        self.assertEqual(rc, 0, out + err)
+        target = self.fx.home + "/ltx-2-mlx/models/ltx-2.5-mlx-q8"
+        os.chmod(target, 0o755)
+        rc, out, err = self.fx.install("verify")
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("MISMATCH mode differs: " + target, out.splitlines())
+        self.assertEqual(out.splitlines()[-1], "install_pkg: verify FAILED: 1 mismatch(es)")
+        rc, out, err = self.fx.install("user", "--apply")   # spec 12.4: an existing directory is never chmod-ed
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(stat.S_IMODE(os.lstat(target).st_mode), 0o755)
 
 
 if __name__ == "__main__":
