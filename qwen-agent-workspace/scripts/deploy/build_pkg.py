@@ -393,10 +393,10 @@ L1_NAMES = frozenset(["token", "stored_tokens", ".netrc", ".git-credentials", ".
 PRUNE_DIRS = frozenset(["__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"])
 B1_EXCLUDES = frozenset(["models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"])
 B4_EXCLUDES = frozenset([".cache"])
-F1_EXCLUDES = frozenset("lib/python3.13/site-packages/" + name for name in (
+F1_EXCLUDES = frozenset(["bin/student-agent-mcp"] + ["lib/python3.13/site-packages/" + name for name in (
     "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable___student_agent_mcp_1_0_0_finder.py",
     "__editable__.fubotv_mcp_common-0.1.0.pth", "__editable__.student_agent_mcp-1.0.0.pth",
-    "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info"))
+    "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info")])
 F3_EXCLUDES = frozenset("lib/python/site-packages/" + name for name in (
     "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable__.fubotv_mcp_common-0.1.0.pth",
     "fubotv_mcp_common-0.1.0.dist-info"))
@@ -723,3 +723,18 @@ def enumerate_components(ctx):
     for cid in COMPONENT_ORDER:
         ctx.entries.extend(sort_component(parts[cid]))
     ctx.comp_stats = component_stats(ctx.entries)
+
+
+# ---------------------------------------------------------------------------
+# Employer-package leak guard (defense in depth: the F1_EXCLUDES/F3_EXCLUDES
+# above are exact, version-pinned path strings; this catches drift if either
+# employer package gets reinstalled at a different version before a build)
+# ---------------------------------------------------------------------------
+EMPLOYER_PACKAGE_RE = re.compile(r"(?i)fubotv|student[_-]agent")
+
+
+def check_no_employer_packages(ctx):
+    hits = sorted(set(e["t"] for e in ctx.entries if EMPLOYER_PACKAGE_RE.search(e["t"])))
+    if hits:
+        return CheckResult("B18", False, "employer package path(s) shipped: %s" % ", ".join(hits), True)
+    return CheckResult("B18", True, "no employer package paths in %d entries" % len(ctx.entries), True)

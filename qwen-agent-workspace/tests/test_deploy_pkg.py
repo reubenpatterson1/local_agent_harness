@@ -573,6 +573,7 @@ class Fixture(object):
         F = self.fw + "/Versions/3.13"
         write_file(F + "/bin/python3.13", b"#!fake\n", 0o755)
         make_link(F + "/bin/python3", "python3.13")
+        write_file(F + "/bin/student-agent-mcp", b"from student_agent_mcp.__main__ import cli\n", 0o755)
         SP = F + "/lib/python3.13/site-packages"
         write_file(SP + "/psutil/__init__.py", b"# psutil\n")
         write_file(SP + "/psutil/__pycache__/__init__.cpython-313.pyc", b"pyc")
@@ -701,7 +702,7 @@ class TestComponentCollection(DeployTestCase):
         L = self.fx.home + "/ltx-2-mlx"
         for name in ("models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"):
             self.assertEqual([e["t"] for e in ctx.entries if e["c"] == "B1" and _under_path(e["t"], L + "/" + name)], [], name)
-        for marker in ("fubotv_mcp_common", "student_agent_mcp"):
+        for marker in ("fubotv_mcp_common", "student_agent_mcp", "student-agent-mcp"):
             self.assertEqual([t for t in targets if marker in t], [], marker)
         a1 = sorted(e["_rel"] for e in ctx.entries if e["c"] == "A1" and e["k"] == "f")
         self.assertEqual(a1, sorted(PIPELINE + TESTS7))
@@ -722,10 +723,10 @@ class TestComponentCollection(DeployTestCase):
         self.assertEqual(bp.HF_PINS, PINS)
         self.assertEqual(bp.PRUNE_DIRS, frozenset(["__pycache__", ".git", ".pytest_cache", ".mypy_cache", ".ruff_cache"]))
         self.assertEqual(bp.B1_EXCLUDES, frozenset(["models", "hf_cache", "converted_models", "source_caches", ".venv", ".claude", ".git"]))
-        self.assertEqual(bp.F1_EXCLUDES, frozenset("lib/python3.13/site-packages/" + n for n in (
+        self.assertEqual(bp.F1_EXCLUDES, frozenset(["bin/student-agent-mcp"] + ["lib/python3.13/site-packages/" + n for n in (
             "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable___student_agent_mcp_1_0_0_finder.py",
             "__editable__.fubotv_mcp_common-0.1.0.pth", "__editable__.student_agent_mcp-1.0.0.pth",
-            "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info")))
+            "fubotv_mcp_common-0.1.0.dist-info", "student_agent_mcp-1.0.0.dist-info")]))
         self.assertEqual(bp.F3_EXCLUDES, frozenset("lib/python/site-packages/" + n for n in (
             "__editable___fubotv_mcp_common_0_1_0_finder.py", "__editable__.fubotv_mcp_common-0.1.0.pth",
             "fubotv_mcp_common-0.1.0.dist-info")))
@@ -800,6 +801,19 @@ class TestComponentCollection(DeployTestCase):
         self.assertEqual(ctx.comp_stats["F2"], {"slug": "framework-symlinks", "files": 0, "symlinks": 17, "dirs": 3, "bytes": 0})
         totals = bp.stats_totals(ctx.comp_stats)
         self.assertEqual(totals["bytes"], sum(e["b"] for e in ctx.entries if e["k"] == "f"))
+
+    def test_B18_employer_package_leak_guard(self):
+        ctx = self.fx.ctx()
+        result = bp.check_no_employer_packages(ctx)
+        self.assertTrue(result.ok, result.message)
+        self.assertEqual(result.check_id, "B18")
+        self.assertTrue(result.fatal)
+        write_file(self.fx.fw + "/Versions/3.13/bin/fubotv-mcp-common", b"#!fake\n", 0o755)
+        ctx2 = self.fx.ctx()
+        result2 = bp.check_no_employer_packages(ctx2)
+        self.assertFalse(result2.ok)
+        self.assertTrue(result2.fatal)
+        self.assertIn("fubotv-mcp-common", result2.message)
 
     def test_parse_args_usage_errors(self):
         for argv in (["--resume"], ["--package-id", "ltx-chain-deploy-2026"], ["--apply", "--verify-only"]):
