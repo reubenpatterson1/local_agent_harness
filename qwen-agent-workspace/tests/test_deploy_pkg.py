@@ -515,7 +515,7 @@ class Fixture(object):
     def fixture_only(self, reader):
         reader = getattr(reader, "unguarded", reader)   # a second Fixture in one test replaces, not stacks
         def guarded(path, label, add, sources, errors):
-            if not path.startswith(self.root + "/"):
+            if not os.path.realpath(path).startswith(self.root + "/"):   # lstat/readlink only; never opens
                 raise AssertionError("known-secret source outside the fixture: %s" % path)
             return reader(path, label, add, sources, errors)
         guarded.unguarded = reader
