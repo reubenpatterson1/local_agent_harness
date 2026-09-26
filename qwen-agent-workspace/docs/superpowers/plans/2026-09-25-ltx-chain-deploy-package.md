@@ -4,11 +4,11 @@
 >
 > **Save this document to:** `/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/docs/superpowers/plans/2026-09-25-ltx-chain-deploy-package.md`. The Baseline table (Task 0) and the Real Build Results table (Task 12) are filled in inside this file, never in `/private/tmp`.
 
-**Goal:** Build `scripts/deploy/build_pkg.py`, `scripts/deploy/install_pkg.py`, `scripts/deploy/credential_allowlist.json`, `tests/test_deploy_pkg.py` and `tests/mutate_deploy_pkg.py` as specified. Then run a real, verified `--apply` build of the 131.71 GiB ltx-chain package onto `/Volumes/Ollama`.
+**Goal:** Build `scripts/deploy/build_pkg.py`, `scripts/deploy/install_pkg.py`, `scripts/deploy/credential_allowlist.json`, `tests/test_deploy_pkg.py` and `tests/mutate_deploy_pkg.py` as specified. Then run a real, verified `--apply` build of the 131.71 GiB ltx-chain package onto `/Volumes/ltx-chain-deploy` (a fresh dedicated volume created after Task 11's whole-branch review found `/Volumes/Ollama`, the originally-planned target, carrying live HF credentials outside any package's own directory — see Task 12's own header note).
 
 **Architecture:** Two stdlib-only scripts at the Python 3.9 language level. `build_pkg.py` holds the shared helpers (R8): entry I/O, hashing, L1/L2 scanning, `CheckResult`. `install_pkg.py` loads it from its own directory with `importlib.util.spec_from_file_location` and keeps its **own** `HOOKS` dict and path constants. The build flow:
 1. It enumerates 17 components from an explicit list into schema-4 JSONL entries.
-2. It runs every check (B01-B17, including the offline gates) before anything is written.
+2. It runs every check (B01-B20, including the offline gates) before anything is written.
 3. It writes the root files, then copies the payload. The copy hashes while copying, L3-scans every chunk, and aborts on source drift.
 4. It finishes with PC1-PC5, and `MANIFEST.json` is written last.
 
@@ -310,7 +310,7 @@ The spec is silent or factually wrong on these points. Each was decided here wit
 | C10 | P0 is **resolved** at HEAD `6ab72ac`. All 10 pipeline files are tracked, porcelain-clean and blob-equal (verified 2026-09-25 while planning). P1 (allowlist review) is still open and handled in Task 12 with the user. | `git ls-files/status/hash-object/rev-parse` on each file. |
 | C11 | CLI: `--dry-run` (default), `--apply`, `--verify-only`, `--credential-report` are mutually exclusive. `--resume` requires `--apply`, else a usage error (exit 2). `--usb-root` defaults to `USB_ROOT_DEFAULT` read at call time and is `abspath`ed. | Spec lists the flags without their interplay. |
 | C12 | The real `run` hook: stdin is `DEVNULL`. A spawn `OSError` returns `(127, "<argv0>: <error>")`. | Gates and `ltx-movie --dry-run` must never block on stdin. |
-| C13 | If the `BUILD-FAILED.json` bytes would contain a known secret, its `error` field is replaced by `"error text withheld: it contained a known secret value"` before writing. | Spec requires L3 on every written byte, but is silent on the hit case for this file. |
+| C13 | If the `BUILD-FAILED.json` bytes would contain secret material (L3 known value or L2 secret-shaped pattern), its `error` field is replaced by `"error text withheld: it contained secret material"` before writing (Task 11 fix round widened this from an L3-only check). | Spec requires L3 on every written byte, but is silent on the hit case for this file. |
 | C14 | Accept prints `ACCEPT REFUSED (A0: <ids>)` for exit 4 and `ACCEPT REFUSED (GPU precondition; nothing was started)` for exit 5. It writes `accept-<ts>.json` in every outcome. | Spec defines only PASS/FAIL lines. |
 | C15 | If A1 fails, A2-A5 are skipped (`ACCEPT FAIL`). A2-A4 all run regardless of each other. | A1 "runs before anything executes". |
 | C16 | The `user phase complete` counts are the totals of U's install set (installed plus already identical). | Spec wording ambiguous. |
@@ -4289,20 +4289,24 @@ def write_manifest(ctx):
 
 
 def fail_post_copy(ctx, step, exc):
+    error = str(exc)
     doc = {"schema_version": SCHEMA_VERSION, "package_id": ctx.package_id, "failed_step": step,
-           "error_type": type(exc).__name__, "error": str(exc), "created_at": iso_now()}
+           "error_type": type(exc).__name__, "error": error, "created_at": iso_now()}
+    if has_secret(ctx, error):
+        doc["error"] = "error text withheld: it contained secret material"
     data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
-    if KnownSecretScanner(ctx.secrets).feed(data):
-        doc["error"] = "error text withheld: it contained a known secret value"
-        data = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
     manifest = ctx.package_root + "/MANIFEST.json"
     if os.path.lexists(manifest):
         os.unlink(manifest)
     try:
         write_package_file(ctx, "BUILD-FAILED.json", data, 0o644)
     except Exception as write_exc:
-        print("build_pkg: could not write BUILD-FAILED.json: %s" % write_exc, file=sys.stderr)
-    print("build_pkg: POST-COPY FAILURE at %s (%s): %s" % (step, doc["error_type"], doc["error"]), file=sys.stderr)
+        print(safe_line(ctx, "build_pkg: could not write BUILD-FAILED.json: %s" % write_exc,
+                        "build_pkg: could not write BUILD-FAILED.json (%s): (error text withheld: it contained secret material)"
+                        % type(write_exc).__name__), file=sys.stderr)
+    print(safe_line(ctx, "build_pkg: POST-COPY FAILURE at %s (%s): %s" % (step, doc["error_type"], error),
+                    "build_pkg: POST-COPY FAILURE at %s (%s): (error text withheld: it contained secret material)"
+                    % (step, doc["error_type"])), file=sys.stderr)
     print("build_pkg: BUILD-FAILED.json written; no MANIFEST.json. Fix the cause, then rerun with --apply --resume --package-id %s"
           % ctx.package_id, file=sys.stderr)
     return 3
@@ -6806,7 +6810,9 @@ Then rerun the 7 offline gates as in Task 0 Step 3. Expected: the same last line
 
 ---
 
-### Task 12: The real build onto `/Volumes/Ollama` (main thread only — real hardware, real USB drive)
+### Task 12: The real build onto `/Volumes/ltx-chain-deploy` (main thread only — real hardware, real USB drive)
+
+**Target volume changed after Task 11's whole-branch review (Finding C1):** the drive's default volume, `/Volumes/Ollama`, was found to carry live HF credentials (`hf_home/token`, `hf_home/stored_tokens`) and old deploy packages outside any package's own directory — a real gap this whole plan exists to prevent. Rather than rely solely on a code check, a fresh, empty, dedicated, case-sensitive APFS volume, `/Volumes/ltx-chain-deploy`, was created in the same physical drive's APFS container (`disk5`, 255.9 GB free at creation time), leaving `/Volumes/Ollama` and the separate `/Volumes/My Passport` Time Machine backup volume untouched. Every command below targets it explicitly via `--usb-root /Volumes/ltx-chain-deploy` (build_pkg.py's own default, `USB_ROOT_DEFAULT`, is still `/Volumes/Ollama` — do not omit the flag). Task 11 also added a new fatal check, B20, which independently refuses to build onto any volume already holding a present, file-backed known-secret source (defense-in-depth: it would fail loudly if `--usb-root` were ever pointed at `/Volumes/Ollama` by mistake).
 
 **Files:**
 - Modify: `scripts/deploy/credential_allowlist.json` (only with the user-approved notes, Step 4).
@@ -6820,28 +6826,29 @@ Then rerun the 7 offline gates as in Task 0 Step 3. Expected: the same last line
 - [ ] **Step 1: Preconditions.**
 ```bash
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
-mount | /usr/bin/grep -i '/Volumes/Ollama'; /usr/sbin/diskutil info /Volumes/Ollama | /usr/bin/grep -i 'Personality\|Container Free'
+mount | /usr/bin/grep -i '/Volumes/ltx-chain-deploy'; /usr/sbin/diskutil info /Volumes/ltx-chain-deploy | /usr/bin/grep -i 'Personality\|Container Free'
 /usr/sbin/lsof -nP -iTCP:8177 -sTCP:LISTEN; echo "lsof rc=$?"
 pgrep -fl 'ltx-2-mlx|z_image|mlx_lm|vllm' || echo "no GPU job"
-PKG=ltx-chain-deploy-$(date +%Y%m%d); echo "PKG=$PKG"; ls -d /Volumes/Ollama/$PKG 2>&1
+PKG=ltx-chain-deploy-$(date +%Y%m%d); echo "PKG=$PKG"; ls -d /Volumes/ltx-chain-deploy/$PKG 2>&1
 ```
 Expected:
 - the mount is present and `Case-sensitive APFS`, with ≥ 147 GB free (measured 255.9 GB while planning);
 - `lsof rc=1`, meaning nothing is on port 8177;
 - `no GPU job`;
-- `/Volumes/Ollama/$PKG: No such file or directory`.
+- `/Volumes/ltx-chain-deploy/$PKG: No such file or directory`.
 
 If 8177 is held, **ask the user** before running `bin/story-server stop`. If the package dir exists, STOP and ask the user; do not delete it (rm may be blocked).
 
 Write the literal `PKG` value into the results table and use that literal in every later command. Do not recompute it after midnight.
 
-- [ ] **Step 2: First dry run.** Do not open `/Volumes/Ollama` in Finder at any point in this task: Finder writes `.DS_Store`, which fails L4.
+- [ ] **Step 2: First dry run.** Do not open `/Volumes/ltx-chain-deploy` in Finder at any point in this task: Finder writes `.DS_Store`, which fails L4.
 ```bash
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --package-id <PKG> > generated/deploy-dryrun-1.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-1.txt; tail -25 generated/deploy-dryrun-1.txt
+/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-dryrun-1.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-1.txt; tail -25 generated/deploy-dryrun-1.txt
 ```
-Expected: rc=4 with exactly one `FAIL` line, `FAIL B13 …` (P1: roughly 64 un-reviewed L2 hits). All of B01-B12, B14-B17 and B19 are `PASS`; B17 passes now that P0 is resolved at 6ab72ac.
+Expected: rc=4 with exactly one `FAIL` line, `FAIL B13 …` (P1: roughly 64 un-reviewed L2 hits). All of B01-B12 and B14-B20 are `PASS`; B17 passes now that P0 is resolved at 6ab72ac; B20 passes because `/Volumes/ltx-chain-deploy` is a fresh volume with no known-secret source on it.
 - Any other FAIL is a real finding. Read its message, diagnose from the evidence, and report to the user before changing anything.
+- A `FAIL B20` here would mean `--usb-root` was mistyped onto a volume holding a real credential — STOP immediately and do not proceed with any `--apply`.
 - Do not call it an environment issue without evidence.
 
 - [ ] **Step 3: SC3 totals.**
@@ -6878,7 +6885,7 @@ Expected: `SC3 PASS []`. A FAIL names the component. Report it to the user; comp
 - [ ] **Step 4: Credential report and human allowlist review (P1).**
 ```bash
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --credential-report --package-id <PKG> > generated/deploy-credential-report-1.txt 2>&1; echo "rc=$?" >> generated/deploy-credential-report-1.txt
+/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --credential-report --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-credential-report-1.txt 2>&1; echo "rc=$?" >> generated/deploy-credential-report-1.txt
 /usr/bin/grep -c '^L2 NEW ' generated/deploy-credential-report-1.txt; /usr/bin/grep -c '^L1 ' generated/deploy-credential-report-1.txt; tail -2 generated/deploy-credential-report-1.txt
 ```
 Expected: rc=1, 0 `L1` lines, and about 64 `L2 NEW` lines.
@@ -6909,7 +6916,7 @@ with open("scripts/deploy/credential_allowlist.json", "w") as fh:
     fh.write(json.dumps({"schema_version": 1, "entries": entries}, indent=2) + "\n")
 print("allowlist entries:", len(entries))
 PY
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --credential-report --package-id <PKG> > generated/deploy-credential-report-2.txt 2>&1; echo "rc=$?"; tail -1 generated/deploy-credential-report-2.txt
+/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --credential-report --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-credential-report-2.txt 2>&1; echo "rc=$?"; tail -1 generated/deploy-credential-report-2.txt
 ```
 Expected: `allowlist entries: <n>` equal to the NEW count, then rc=0 and `build_pkg: CREDENTIAL REPORT CLEAN: l1=0 new=0 allowlisted=<n> stale=0`. A `KeyError` means a line has no approved note: go back to the user.
 
@@ -6924,13 +6931,13 @@ The new commit leaves B17 unaffected, because B17 checks only the 10 pipeline fi
 - [ ] **Step 5: Second dry run.**
 ```bash
 cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace
-/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --package-id <PKG> > generated/deploy-dryrun-2.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-2.txt; tail -22 generated/deploy-dryrun-2.txt
+/Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --dry-run --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-dryrun-2.txt 2>&1; echo "rc=$?" >> generated/deploy-dryrun-2.txt; tail -22 generated/deploy-dryrun-2.txt
 ```
-Expected: rc=0, the final line `build_pkg: DRY RUN OK`, and 19 `PASS B..` lines (B01-B19). B13's message reads `L2: <n> hit(s), all allowlisted`.
+Expected: rc=0, the final line `build_pkg: DRY RUN OK`, and 20 `PASS B..` lines (B01-B20). B13's message reads `L2: <n> hit(s), all allowlisted`.
 
 - [ ] **Step 6: The real `--apply`.** Launch it as **one** background Bash invocation (`run_in_background: true`), with no `nohup` or `&` inside, and capture rc into the log:
 ```bash
-cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --apply --package-id <PKG> > generated/deploy-apply.log 2>&1; echo "rc=$?" >> generated/deploy-apply.log
+cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --apply --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-apply.log 2>&1; echo "rc=$?" >> generated/deploy-apply.log
 ```
 The expected duration is about 40-60 min at roughly 60 MB/s, plus the L4 rescan. While it runs:
 - start no GPU render and no heavy I/O;
@@ -6940,26 +6947,26 @@ The expected duration is about 40-60 min at roughly 60 MB/s, plus the L4 rescan.
 **Completion is all three of these**; a "background task exited" notification alone is not completion:
 1. `tail -1 generated/deploy-apply.log` is `rc=0`;
 2. `pgrep -f 'build_pkg.py --apply'` prints nothing;
-3. `ls -l /Volumes/Ollama/<PKG>/MANIFEST.json` exists and `/Volumes/Ollama/<PKG>/BUILD-FAILED.json` does not.
+3. `ls -l /Volumes/ltx-chain-deploy/<PKG>/MANIFEST.json` exists and `/Volumes/ltx-chain-deploy/<PKG>/BUILD-FAILED.json` does not.
 
-The line before `rc=0` is `build_pkg: BUILD OK: /Volumes/Ollama/<PKG> (<n> entries, <bytes> bytes)`.
+The line before `rc=0` is `build_pkg: BUILD OK: /Volumes/ltx-chain-deploy/<PKG> (<n> entries, <bytes> bytes)`.
 
 **Failure handling:**
-- **rc=5 (copy-stage abort):** read the `COPY ABORTED` line. For `SourceChanged`, find what touched the source (a running job, a pip install, Spotlight is not one), wait until it is quiet, then run the same command with `--apply --resume --package-id <PKG>`. For `CredentialLeak` (L3), STOP and report to the user **without printing any value**: a real HF token value is in the named source file.
+- **rc=5 (copy-stage abort):** read the `COPY ABORTED` line. For `SourceChanged`, find what touched the source (a running job, a pip install, Spotlight is not one), wait until it is quiet, then run the same command with `--apply --resume --usb-root /Volumes/ltx-chain-deploy --package-id <PKG>`. For `CredentialLeak` (L3), STOP and report to the user **without printing any value**: a real HF token value is in the named source file.
 - **rc=3 (post-copy):** read `BUILD-FAILED.json`'s `failed_step` and `error`.
-  - A PC4 `DS_Store:` failure means Finder touched the drive. Ask the user to allow `find "/Volumes/Ollama/<PKG>" -name .DS_Store -delete`, then run `--apply --resume`.
-  - A PC4 `L2 … MANIFEST-ENTRIES.jsonl` (or another ROOT file) finding needs a `("ROOT", "<rel>", sha256, pattern)` allowlist entry. The user must approve its note, and the sha256 is that of the package file. Add it, commit it, then run `--apply --resume`.
+  - A PC4 `DS_Store:` failure means Finder touched the drive. Ask the user to allow `find "/Volumes/ltx-chain-deploy/<PKG>" -name .DS_Store -delete`, then run `--apply --resume --usb-root /Volumes/ltx-chain-deploy --package-id <PKG>`.
+  - A PC4 `L2 … MANIFEST-ENTRIES.jsonl` (or another ROOT file) finding needs a `("ROOT", "<rel>", sha256, pattern)` allowlist entry. The user must approve its note, and the sha256 is that of the package file. Add it, commit it, then run `--apply --resume --usb-root /Volumes/ltx-chain-deploy --package-id <PKG>`.
 - **rc=4:** a check failed at launch. Read the FAIL lines; nothing was written.
 
 - [ ] **Step 7: `--verify-only` (SC4).** Launch it as one background invocation, the same way:
 ```bash
-cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --verify-only --package-id <PKG> > generated/deploy-verify.log 2>&1; echo "rc=$?" >> generated/deploy-verify.log
+cd /Users/reubenpatterson/local_model_harness/qwen-agent-workspace && /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 scripts/deploy/build_pkg.py --verify-only --usb-root /Volumes/ltx-chain-deploy --package-id <PKG> > generated/deploy-verify.log 2>&1; echo "rc=$?" >> generated/deploy-verify.log
 ```
-Expected (about 40 min): the last two lines are `build_pkg: VERIFY ok: <n> files re-hashed` and `rc=0`. Here `<n>` equals the number of `f` entries (check with `/usr/bin/grep -c '"k":"f"' /Volumes/Ollama/<PKG>/MANIFEST-ENTRIES.jsonl`). Any `FAIL VERIFY` line is a real finding: report it.
+Expected (about 40 min): the last two lines are `build_pkg: VERIFY ok: <n> files re-hashed` and `rc=0`. Here `<n>` equals the number of `f` entries (check with `/usr/bin/grep -c '"k":"f"' /Volumes/ltx-chain-deploy/<PKG>/MANIFEST-ENTRIES.jsonl`). Any `FAIL VERIFY` line is a real finding: report it.
 
 - [ ] **Step 8: Spot checks on the real package.**
 ```bash
-P=/Volumes/Ollama/<PKG>
+P=/Volumes/ltx-chain-deploy/<PKG>
 /Library/Frameworks/Python.framework/Versions/3.13/bin/python3 -c "import json;m=json.load(open('$P/MANIFEST.json'));print(m['schema_version'],m['entries_count'],m['totals'],m['credential_scan'],m['source_git_head'])"
 ls "$P/payload" | sort; ls "$P/manifests"; /usr/bin/grep -c 'bin/ltx-movie' "$P/README.md"
 /usr/bin/grep -n 'bin/ltx-movie' "$P/README.md" | /usr/bin/grep -vc -- '--model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8'
