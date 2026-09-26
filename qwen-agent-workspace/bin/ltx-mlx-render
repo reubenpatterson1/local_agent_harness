@@ -300,7 +300,17 @@ def model_identity(model, *, strict=False):
             resolved = True
             if not revision or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in revision):
                 raise OSError("cached model revision is invalid")
-            bundle = os.path.join(repository, "snapshots", revision)
+            snapshots_root = os.path.join(repository, "snapshots")
+            if os.path.isdir(snapshots_root):
+                bundle = os.path.join(snapshots_root, revision)
+            else:
+                # `hf download --local-dir` writes files flat into the repo root with
+                # no snapshots/ tree at all; use the repo root directly rather than
+                # failing, since the weight files are genuinely there. A snapshots/
+                # tree that exists but is missing this specific revision is a
+                # different, still-fatal case (see the "broken existing snapshot"
+                # test) and is deliberately left alone below.
+                bundle = repository
         bundle = os.path.realpath(bundle)
         if not os.path.isdir(bundle):
             raise FileNotFoundError("resolved model bundle is unavailable: %s" % bundle)

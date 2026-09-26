@@ -2102,6 +2102,17 @@ def test_cached_model_metadata_and_io_failures():
                     raised = True
                 check('R20 broken existing snapshot strict=%s' % strict,raised==strict)
 
+        flat_repo = os.path.join(cache,'hub','models--flat--bundle')
+        os.makedirs(os.path.join(flat_repo,'refs'))
+        with open(os.path.join(flat_repo,'refs','main'),'w') as handle: handle.write('flatrevision')
+        with open(os.path.join(flat_repo,'weights.safetensors'),'wb') as handle: handle.write(b'flat weight bytes')
+        with mock.patch.object(render.SKILL,'LTX2_MLX_HF_HOME',cache):
+            flat_identity = render.model_identity('flat/bundle')
+            check('R20 hf-download --local-dir flat layout (no snapshots/ tree) resolves via the repo root',
+                  flat_identity is not None and flat_identity['resolved_path']==os.path.realpath(flat_repo)
+                  and flat_identity['snapshot_revision']=='flatrevision'
+                  and [entry['path'] for entry in flat_identity['files']]==['weights.safetensors'])
+
         with _Harness(td,'provenanceio-mlx',1) as h:
             args = _stub_args(model=h.model)
             unit = render.build_units(render.load_manifest(h.manifest)['panels'],0,h.clips)[0]
