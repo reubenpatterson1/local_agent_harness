@@ -1638,6 +1638,9 @@ class TestBuildChecks(DeployTestCase):
         write_file(self.fx.usb2 + "/hf_home/token", (tok + "\n").encode("ascii"))
         self.assertEqual(b20(usb), clean)
         self.assertFalse(b20(self.fx.usb2).ok)
+        with mock.patch.object(bp.os.path, "ismount", lambda path: path == usb):
+            self.assertEqual(b20(usb), bp.CheckResult(
+                "B20", False, on_volume % (usb, self.fx.usb2 + "/hf_home/token"), True))
 
 
 class TestReadme(DeployTestCase):
