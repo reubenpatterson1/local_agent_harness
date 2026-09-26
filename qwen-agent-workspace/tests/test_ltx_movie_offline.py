@@ -983,8 +983,8 @@ def test_seed_dry_run_plan():
         check("L27d exactly one phase-2 command line found", len(phase2_lines) == 1,
               "got %r" % phase2_lines)
         if phase2_lines:
-            check("L27d phase 2 renders panel 1 only, at the derived video size",
-                  "--only 1 --width 576 --height 320" in phase2_lines[0], "got %r" % phase2_lines[0])
+            check("L27d phase 2 renders panel 1 only, at twice the derived video size",
+                  "--only 1 --width 1152 --height 640" in phase2_lines[0], "got %r" % phase2_lines[0])
             check("L27d phase-2 command carries --seed-image with the ORIGINAL path",
                   ("--seed-image " + seed) in phase2_lines[0], "got %r" % phase2_lines[0])
             check("L27d phase-2 command does not carry the downscaled path",
