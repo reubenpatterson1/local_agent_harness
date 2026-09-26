@@ -6982,24 +6982,27 @@ Expected:
 
 - [ ] **Step 9: Record the results and report to the user.**
 
-**Real Build Results (fill in):**
+**Real Build Results (filled in 2026-09-26, `--usb-root /Volumes/ltx-chain-deploy` — retargeted from the plan's original `/Volumes/Ollama` per Task 11's whole-branch review, Finding C1):**
 
 | Step | Command | rc | Key line | Time (UTC) |
 |---|---|---|---|---|
-| PKG id | — | — | | |
-| dry run 1 | `--dry-run` | | | |
-| SC3 | totals check | | | |
-| credential report 1 | `--credential-report` | | NEW=… | |
-| user allowlist approval | — | — | (quote the user) | |
-| credential report 2 | `--credential-report` | | | |
-| dry run 2 | `--dry-run` | | | |
-| apply | `--apply` | | `BUILD OK …` | |
-| verify-only | `--verify-only` | | `VERIFY ok: … files re-hashed` | |
+| PKG id | — | — | `PKG=ltx-chain-deploy-20260925` | 2026-09-26 02:43 |
+| dry run 1 | `--dry-run` | 4 | `FAIL B13 64 L2 hit(s) not allowlisted`; all other B01-B20 PASS | 2026-09-26 02:44 |
+| SC3 | totals check | — | `SC3 PASS []` | 2026-09-26 02:44 |
+| credential report 1 | `--credential-report` | 1 | `CREDENTIAL REPORT NOT CLEAN: l1=0 new=64 allowlisted=0 stale=0` | 2026-09-26 02:46 |
+| user allowlist approval | — | — | "Approve all as written" (all 64 hits grouped by pattern/library family, notes describing legitimate open-source library internals — self-tests, PEM-parsers, docs, deprecated example data — none containing matched bytes) | 2026-09-26 02:47 |
+| credential report 2 | `--credential-report` | 0 | `CREDENTIAL REPORT CLEAN: l1=0 new=0 allowlisted=64 stale=0` | 2026-09-26 02:55 |
+| dry run 2 | `--dry-run` | 0 | `build_pkg: DRY RUN OK`; 20 `PASS B..` lines (B01-B20) | 2026-09-26 02:57 |
+| apply | `--apply` | 0 | `build_pkg: BUILD OK: /Volumes/ltx-chain-deploy/ltx-chain-deploy-20260925 (172694 entries, 141426845403 bytes)` | 2026-09-26 03:37 |
+| verify-only | `--verify-only` | 0 | `build_pkg: VERIFY ok: 152670 files re-hashed`, 0 `FAIL VERIFY` lines | 2026-09-26 04:12 |
+
+Step 8 spot checks, all as expected: `MANIFEST.json` schema 4, 172694 entries, 141,426,845,403 bytes, `credential_scan={'l1': 'clean', 'l2_allowlisted': 64, 'l3_values_loaded': 2, 'l4': 'clean'}`, `source_git_head=05903afbb48611329b7f07419f9bf26a6f1b3de1`; 13 payload dirs present (B5/F2/H0/H5 correctly absent — symlink/dir-only components); 7 manifest files present; `bin/ltx-movie` appears 2 times in the README, 0 of those lines missing `--model`.
 
 Report to the user:
-- the table;
+- the table (above);
 - correction C1 (vllm last line) and addition C3 (B11 normpath), which need their explicit acknowledgement;
-- the fact that SC5 (install plus `accept --gpu` on the second Mac) is still outstanding by design.
+- the fact that SC5 (install plus `accept --gpu` on the second Mac) is still outstanding by design;
+- the target-volume change (Finding C1 from Task 11's review): built onto a fresh dedicated `/Volumes/ltx-chain-deploy` volume instead of the originally-planned `/Volumes/Ollama`, which was found to carry live HF credentials outside any package's own directory.
 
 ---
 
