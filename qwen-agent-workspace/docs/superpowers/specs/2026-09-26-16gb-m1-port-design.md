@@ -23,14 +23,14 @@ Counterintuitively, seed-image mode is the *lighter* pipeline shape here, not te
 
 | Stage | Model | Size | Why |
 |---|---|---|---|
-| Video DiT | `baa-ai/LTX-2.3-22B-RAM-12GB-MLX` | DiT ~9.97GB (mixed 2–8 bit, avg ~4.6) | Smallest known LTX-2.3 DiT pack found; its own model card claims ~14GB unified memory / M1+, though this project has not validated it against the installed `ltx-2-mlx` v0.15.4 |
-| Text encoder | `Gemma-3-12B-4bit` | ~7.5GB | Paired with the LTX-2.3 pack family; not streamable, loaded with the connector as one stage |
-| Connector | (ships with the LTX-2.3 pack) | ~6.34GB | Must stay bf16 per `ltx-2-mlx`'s own constraints; cannot be quantized further |
+| Video DiT | `dgrauet/ltx-2.3-mlx-q4` (distilled transformer) | ~10.54GB (uniform int4, group_size 64) | Officially published by the same author as `ltx-2-mlx` itself; its own README documents the exact `ltx-2-mlx generate --distilled --model dgrauet/ltx-2.3-mlx-q4` invocation already matching this project's usage pattern — genuinely zero-new-code compatible. **Correction, 2026-09-26:** the previously-recommended `baa-ai/LTX-2.3-22B-RAM-12GB-MLX` (~9.97GB DiT) was found to require a custom per-layer mixed-precision quantization loader (its own `generate.py`, not the installed `ltx-2-mlx`'s standard `apply_quantization`, which only derives one uniform bit-width for the whole model) — using it would need new code, contradicting the user's "no new code" decision. `dgrauet`'s pack is ~1.2GB bigger but requires no new code. |
+| Text encoder | `mlx-community/gemma-3-12b-it-4bit` | ~7.5GB | Paired with the LTX-2.3 pack family; not streamable, loaded with the connector as one stage. Confirmed as the correct repo — already present in this dev machine's HF cache from earlier work, resolving what was an unconfirmed guess in the original spec draft. |
+| Connector | (ships with the LTX-2.3 pack) | ~6.34GB | Must stay bf16 per `ltx-2-mlx`'s own constraints; cannot be quantized further. Byte-identical (same sha256) across the `dgrauet` and `baa-ai` packs — a fixed component of LTX-2.3, not specific to either quantization scheme. |
 | Story/vision LLM | `alexgusevski/Huihui-Qwen3-VL-4B-Instruct-abliterated-q4-mlx` | ~3.11GB | Smallest vision-capable model found; a known risk flagged in this project's own prior route-options doc ("4B prose quality is a real risk") — untested at the current, much-shortened seed-story prompt length |
 
 No Wan, ComfyUI, mflux, or diffusers-based alternative is considered — this project deliberately removed all of those in favor of `z_image_skill.py` + `ltx2_mlx_video_skill.py` only (commit `8043a09`, 2026-09-25), and reintroducing any of them for this port would contradict that decision.
 
-Total download footprint: roughly 26–30GB (leaner pack + Gemma + connector) + ~3GB (vision model) ≈ 30–33GB, well within the confirmed 100GB+ free space on the target disk.
+Total download footprint: DiT (~10.54GB) + Gemma (~7.5GB) + connector (~6.34GB) + the pack's smaller components (VAE encoder/decoder, audio VAE, vocoder — combined ~1.7GB) + vision model (~3.1GB) ≈ 29GB, well within the confirmed 100GB+ free space on the target disk.
 
 ## 4. Memory-safety adjustments
 
@@ -55,11 +55,10 @@ Total download footprint: roughly 26–30GB (leaner pack + Gemma + connector) + 
 ## 7. Deliverables
 
 - `scripts/setup-lean-16gb.sh` — downloads the three models above to their expected local paths, performs (or documents, if it can't be automated) the `iogpu.wired_limit_mb` adjustment, and prints the resulting exact command line to run the pipeline with all required explicit flags.
-- `docs/16gb-m1-port.md` — the exact flags/env vars to use, the quality/speed tradeoff versus the 48GB setup, and the known risks (unvalidated `baa-ai` pack compatibility with the installed `ltx-2-mlx` version; unvalidated 4B vision-model prose quality at the current shortened seed-story prompt).
+- `docs/16gb-m1-port.md` — the exact flags/env vars to use, the quality/speed tradeoff versus the 48GB setup, and the known risks (unvalidated 4B vision-model prose quality at the current shortened seed-story prompt).
 
 ## 8. Open risks carried into implementation (not resolved by this spec)
 
 - Whether the ~13.8GB text-encoding stage actually loads on a real 16GB M1 Pro/Max at all (Section 6, step 1 — the load-bearing unknown).
-- Whether `baa-ai/LTX-2.3-22B-RAM-12GB-MLX`'s mixed-bit pack format is actually compatible with the installed `ltx-2-mlx` v0.15.4 (unverified by this project; the tool's `derive_quant_params` infers bits per tensor, which makes it plausible but unconfirmed).
 - 4B-class vision-model prose quality for multi-panel seed-story generation (a known, previously-flagged risk in this project's own prior research, never tested at the current, shortened prompt length).
 - Whether the GPU wired-memory cap raise persists across reboots or needs a persistence mechanism.
