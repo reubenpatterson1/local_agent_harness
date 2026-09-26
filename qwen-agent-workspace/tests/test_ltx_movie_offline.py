@@ -1248,15 +1248,20 @@ def _phase_names(phases):
 
 def test_story_server_flag_default():
     parser = ltx_movie.build_parser()
-    args_off = parser.parse_args(["a narrative", "--story-id", "l40"])
-    check("L40a --story-server-stop-after-story defaults to False",
-          args_off.story_server_stop_after_story is False,
-          "got %r" % (args_off.story_server_stop_after_story,))
+    args_default = parser.parse_args(["a narrative", "--story-id", "l40"])
+    check("L40a --story-server-stop-after-story defaults to True",
+          args_default.story_server_stop_after_story is True,
+          "got %r" % (args_default.story_server_stop_after_story,))
     args_on = parser.parse_args(["a narrative", "--story-id", "l40",
                                   "--story-server-stop-after-story"])
-    check("L40b --story-server-stop-after-story sets True",
+    check("L40b --story-server-stop-after-story (redundant) still sets True",
           args_on.story_server_stop_after_story is True,
           "got %r" % (args_on.story_server_stop_after_story,))
+    args_off = parser.parse_args(["a narrative", "--story-id", "l40",
+                                   "--no-story-server-stop-after-story"])
+    check("L40b2 --no-story-server-stop-after-story sets False",
+          args_off.story_server_stop_after_story is False,
+          "got %r" % (args_off.story_server_stop_after_story,))
     check("L40c the flag's dest is exactly story_server_stop_after_story",
           any(getattr(a, "dest", None) == "story_server_stop_after_story"
               for a in parser._actions),
@@ -1374,16 +1379,16 @@ def test_dry_run_story_server_block_ordering():
           "i_1=%r i_1b=%r i_2=%r" % (i_1, i_1b, i_2))
 
 
-def test_dry_run_no_story_server_block_by_default():
+def test_dry_run_no_story_server_block_with_opt_out():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-storyserver-l44",
-         "--panels", "6", "--dry-run"],
+         "--panels", "6", "--no-story-server-stop-after-story", "--dry-run"],
         capture_output=True, text=True, cwd=WS,
     )
     out = result.stdout
     check("L44a exits 0", result.returncode == 0, "rc=%r" % result.returncode)
-    check("L44b no Phase 1b block without the flag", "Phase 1b" not in out, "got %r" % out)
-    check("L44c no story-server mention without the flag", "story-server" not in out,
+    check("L44b no Phase 1b block with the opt-out flag", "Phase 1b" not in out, "got %r" % out)
+    check("L44c no story-server mention with the opt-out flag", "story-server" not in out,
           "got %r" % out)
 
 
@@ -1494,7 +1499,7 @@ if __name__ == "__main__":
     test_phase_sequence_ordering()
     test_phase_release_story_server()
     test_dry_run_story_server_block_ordering()
-    test_dry_run_no_story_server_block_by_default()
+    test_dry_run_no_story_server_block_with_opt_out()
     test_dry_run_story_server_block_with_no_stills()
     test_story_server_source_guards()
     test_seed_with_explicit_video_dims_rejected()

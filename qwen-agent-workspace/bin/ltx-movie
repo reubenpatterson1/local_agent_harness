@@ -26,16 +26,17 @@ Four phases and host state:
                          and never touch the servers.
   Phase 4 (render)    -- calls bin/ltx-mlx-render for real. Unlike the old
                          bin/ltx-story-video path, this tool does NOT take
-                         the vLLM/MTPLX servers down: it never imports
+                         the vLLM/MTPLX servers down directly: it never imports
                          mps_guard, never runs bin/ltx-host-prep or
-                         bin/ltx-host-restore, and never touches ports
-                         8177/8178 (one
-                         exception, below). One ltx-2-mlx clip per panel, stitched
-                         with ffmpeg's concat demuxer under -c copy. The one exception is the opt-in
-                         --story-server-stop-after-story flag, which runs
-                         bin/story-server stop between Phase 1 and Phase 2 so the
-                         render gets the story LLM's ~22 GiB back; without the flag
-                         this tool still never touches any server.
+                         bin/ltx-host-restore. The one exception is
+                         --story-server-stop-after-story (ON by default, use
+                         --no-story-server-stop-after-story to opt out), which runs
+                         bin/story-server stop between Phase 1 and Phase 2 so
+                         Phases 2-4 get the story LLM's ~22 GiB back -- chained
+                         panels (2+) reuse the previous clip's last frame via
+                         ffmpeg, never the story server, so it is never needed
+                         past Phase 1. One ltx-2-mlx clip per panel, stitched
+                         with ffmpeg's concat demuxer under -c copy.
 
 Three design problems this wrapper solves, on top of the (unchanged)
 phase tools:
@@ -225,12 +226,16 @@ def build_parser():
     parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=25.0)
     parser.add_argument("--avail-timeout", dest="avail_timeout", type=int, default=1800)
     parser.add_argument("--story-server-stop-after-story",
-                         dest="story_server_stop_after_story", action="store_true",
-                         default=False,
+                         dest="story_server_stop_after_story",
+                         action=argparse.BooleanOptionalAction,
+                         default=True,
                          help="after Phase 1 (story), run bin/story-server stop and wait "
                               "for --min-avail-gib, so Phases 2-4 get the story LLM's "
-                              "memory back. OFF by default: without it this tool never "
-                              "touches any server.")
+                              "memory back. ON by default: chained panels (2+) reuse the "
+                              "previous clip's last frame via ffmpeg, never the story "
+                              "server, so it is never needed past Phase 1. Use "
+                              "--no-story-server-stop-after-story to keep it resident "
+                              "(e.g. for rapid successive runs).")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
     return parser
 
