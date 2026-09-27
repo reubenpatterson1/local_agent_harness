@@ -24,13 +24,13 @@ Counterintuitively, seed-image mode is the *lighter* pipeline shape here, not te
 | Stage | Model | Size | Why |
 |---|---|---|---|
 | Video DiT | `dgrauet/ltx-2.3-mlx-q4` (distilled transformer) | ~10.54GB (uniform int4, group_size 64) | Officially published by the same author as `ltx-2-mlx` itself; its own README documents the exact `ltx-2-mlx generate --distilled --model dgrauet/ltx-2.3-mlx-q4` invocation already matching this project's usage pattern — genuinely zero-new-code compatible. **Correction, 2026-09-26:** the previously-recommended `baa-ai/LTX-2.3-22B-RAM-12GB-MLX` (~9.97GB DiT) was found to require a custom per-layer mixed-precision quantization loader (its own `generate.py`, not the installed `ltx-2-mlx`'s standard `apply_quantization`, which only derives one uniform bit-width for the whole model) — using it would need new code, contradicting the user's "no new code" decision. `dgrauet`'s pack is ~1.2GB bigger but requires no new code. |
-| Text encoder | `mlx-community/gemma-3-12b-it-4bit` | ~7.5GB | Paired with the LTX-2.3 pack family; not streamable, loaded with the connector as one stage. Confirmed as the correct repo — already present in this dev machine's HF cache from earlier work, resolving what was an unconfirmed guess in the original spec draft. |
+| Text encoder | `mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit` | ~6.85GB (2 safetensors shards, 5,357,465,200 + 1,999,038,214 bytes) | **Correction, 2026-09-26 (real hardware):** validated directly on the target 16GB M1 Pro/Max — the originally-planned `mlx-community/gemma-3-12b-it-4bit` OOM'd; this QAT (quantization-aware-trained) variant is smaller and loads cleanly. Confirmed stable with the unchanged video DiT below at `-W 640 -H 384 --frames 169 --frame-rate 24`. |
 | Connector | (ships with the LTX-2.3 pack) | ~6.34GB | Must stay bf16 per `ltx-2-mlx`'s own constraints; cannot be quantized further. Byte-identical (same sha256) across the `dgrauet` and `baa-ai` packs — a fixed component of LTX-2.3, not specific to either quantization scheme. |
 | Story/vision LLM | `alexgusevski/Huihui-Qwen3-VL-4B-Instruct-abliterated-q4-mlx` | ~3.11GB | Smallest vision-capable model found; a known risk flagged in this project's own prior route-options doc ("4B prose quality is a real risk") — untested at the current, much-shortened seed-story prompt length |
 
 No Wan, ComfyUI, mflux, or diffusers-based alternative is considered — this project deliberately removed all of those in favor of `z_image_skill.py` + `ltx2_mlx_video_skill.py` only (commit `8043a09`, 2026-09-25), and reintroducing any of them for this port would contradict that decision.
 
-Total download footprint: DiT (~10.54GB) + Gemma (~7.5GB) + connector (~6.34GB) + the pack's smaller components (VAE encoder/decoder, audio VAE, vocoder — combined ~1.7GB) + vision model (~3.1GB) ≈ 29GB, well within the confirmed 100GB+ free space on the target disk.
+Total download footprint: DiT (~10.54GB) + Gemma (~6.85GB) + connector (~6.34GB) + the pack's smaller components (VAE encoder/decoder, audio VAE, vocoder — combined ~1.7GB) + vision model (~3.1GB) ≈ 28.5GB, well within the confirmed 100GB+ free space on the target disk.
 
 ## 4. Memory-safety adjustments
 
@@ -59,6 +59,6 @@ Total download footprint: DiT (~10.54GB) + Gemma (~7.5GB) + connector (~6.34GB) 
 
 ## 8. Open risks carried into implementation (not resolved by this spec)
 
-- Whether the ~13.8GB text-encoding stage actually loads on a real 16GB M1 Pro/Max at all (Section 6, step 1 — the load-bearing unknown).
-- 4B-class vision-model prose quality for multi-panel seed-story generation (a known, previously-flagged risk in this project's own prior research, never tested at the current, shortened prompt length).
-- Whether the GPU wired-memory cap raise persists across reboots or needs a persistence mechanism.
+- ~~Whether the ~13.8GB text-encoding stage actually loads on a real 16GB M1 Pro/Max at all~~ **RESOLVED, 2026-09-26 (real hardware):** the originally-planned Gemma variant OOM'd; swapping to `mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit` fixed it, confirmed stable at `-W 640 -H 384 --frames 169 --frame-rate 24` with the video DiT unchanged (`dgrauet/ltx-2.3-mlx-q4`). Exact peak-swap/pressure figures and the `--min-avail-gib`/`iogpu.wired_limit_mb` values used are still needed for Task 4's deliverables — not yet reported.
+- 4B-class vision-model prose quality for multi-panel seed-story generation (a known, previously-flagged risk in this project's own prior research, never tested at the current, shortened prompt length) — still open, not exercised by this result.
+- Whether the GPU wired-memory cap raise persists across reboots or needs a persistence mechanism — still open.
