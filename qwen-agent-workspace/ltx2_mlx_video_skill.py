@@ -47,6 +47,7 @@ LTX2_MLX_HF_HOME = os.environ.get("LTX2_MLX_HF_HOME",
                                   os.path.join(LTX2_MLX_DIR, "hf_cache"))
 
 MODEL_ID = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
+GEMMA_MODEL_ID = "mlx-community/gemma-3-12b-it-4bit"
 DEFAULT_WIDTH = 704            # 704 % 32 == 0
 DEFAULT_HEIGHT = 448           # 448 % 64 == 0; distilled two-stage snaps H down to a multiple of 64
 DEFAULT_NUM_FRAMES = 241       # (241 - 1) % 8 == 0; 240 / 24 == 10.000 s
@@ -119,7 +120,8 @@ def _resolve_bin():
 
 
 def build_command(*, prompt, output_path, image_path=None, width, height,
-                  num_frames, frame_rate, seed, model=MODEL_ID, low_ram=True,
+                  num_frames, frame_rate, seed, model=MODEL_ID, gemma=GEMMA_MODEL_ID,
+                  lora_path=None, low_ram=True,
                   tile_frames=1, tile_spatial=1, quiet=False):
     """Emit the ltx-2-mlx argv in a fixed token order so golden tests can
     assert on the list.
@@ -131,10 +133,15 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
     bare PATH so the anchor index and strength show up in the logged command
     instead of depending on ImageAction's legacy defaulting; frame_idx 0
     selects VideoConditionByLatentIndex, which replaces latent frame 0 --
-    the single-anchor I2V semantics this pipeline relies on."""
+    the single-anchor I2V semantics this pipeline relies on. lora_path is
+    prep for future fine-tuning: omitted unless explicitly set, always
+    applied at ltx-2-mlx's own --lora strength argument fixed to 1.0."""
     cmd = [_resolve_bin(), "generate",
            "--model", str(model),
-           "--distilled",
+           "--gemma", str(gemma)]
+    if lora_path is not None:
+        cmd += ["--lora", str(lora_path), "1.0"]
+    cmd += ["--distilled",
            "--prompt", str(prompt),
            "--output", str(output_path)]
     if image_path is not None:
@@ -204,7 +211,8 @@ def _validate_generate_args(prompt, output_path, image_path, width, height,
 def generate_video(prompt, output_path, image_path=None, *,
                    width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
                    num_frames=DEFAULT_NUM_FRAMES, frame_rate=DEFAULT_FRAME_RATE,
-                   seed=0, model=MODEL_ID, low_ram=DEFAULT_LOW_RAM,
+                   seed=0, model=MODEL_ID, gemma=GEMMA_MODEL_ID, lora_path=None,
+                   low_ram=DEFAULT_LOW_RAM,
                    tile_frames=DEFAULT_TILE_FRAMES, tile_spatial=DEFAULT_TILE_SPATIAL,
                    log_path=None, timeout_s=None, force=False, quiet=False):
     """Render one clip and return the ABSOLUTE path of the written .mp4.
@@ -233,7 +241,8 @@ def generate_video(prompt, output_path, image_path=None, *,
 
     cmd = build_command(prompt=prompt, output_path=output_path, image_path=image_path,
                         width=width, height=height, num_frames=num_frames,
-                        frame_rate=frame_rate, seed=seed, model=model, low_ram=low_ram,
+                        frame_rate=frame_rate, seed=seed, model=model, gemma=gemma,
+                        lora_path=lora_path, low_ram=low_ram,
                         tile_frames=tile_frames, tile_spatial=tile_spatial, quiet=quiet)
     print("[ltx2_mlx_video_skill] %s" % shlex.join(cmd))
     sys.stdout.flush()
@@ -349,6 +358,10 @@ def build_cli_parser():
                         default=DEFAULT_FRAME_RATE)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model", default=MODEL_ID)
+    parser.add_argument("--gemma", default=GEMMA_MODEL_ID)
+    parser.add_argument("--lora", dest="lora_path", default=None,
+                        help="LoRA .safetensors file or HF repo ID, prep for future "
+                             "fine-tuning; always applied at strength 1.0")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                         default=False)
     parser.add_argument("--tile-frames", dest="tile_frames", type=int,
@@ -369,6 +382,7 @@ def main(argv=None):
             args.prompt, args.output, image_path=args.image,
             width=args.width, height=args.height, num_frames=args.frames,
             frame_rate=args.frame_rate, seed=args.seed, model=args.model,
+            gemma=args.gemma, lora_path=args.lora_path,
             low_ram=(not args.no_low_ram), tile_frames=args.tile_frames,
             tile_spatial=args.tile_spatial, log_path=args.log,
             timeout_s=args.timeout, force=args.force, quiet=args.quiet)

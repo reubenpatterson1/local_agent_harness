@@ -73,6 +73,9 @@ def test_parser_defaults():
     check("L1 panel_timeout == 7200", args.panel_timeout == 7200, "got %r" % args.panel_timeout)
     check("L1 model is the pack id",
           args.model == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8", "got %r" % args.model)
+    check("L1 gemma is the ltx-2-mlx default text encoder",
+          args.gemma == "mlx-community/gemma-3-12b-it-4bit", "got %r" % args.gemma)
+    check("L1 lora_path defaults to None", args.lora_path is None, "got %r" % args.lora_path)
     check("L1 low-ram is ON by default (no_low_ram False)", args.no_low_ram is False,
           "got %r" % args.no_low_ram)
     check("L1 tile_frames == 1", args.tile_frames == 1, "got %r" % args.tile_frames)
@@ -85,6 +88,31 @@ def test_parser_defaults():
     check("L1 dry_run is False", args.dry_run is False, "got %r" % args.dry_run)
     check("L1 length is None", args.length is None, "got %r" % args.length)
     check("L1 seed_image is None", args.seed_image is None, "got %r" % args.seed_image)
+
+
+def test_render_flags_gemma_lora():
+    args = ltx_movie.build_parser().parse_args(["a narrative", "--story-id", "test"])
+    args.video_width, args.video_height = 704, 448
+    default_flags = ltx_movie._render_flags(args)
+    check("L1z1 --gemma with the default value is always present",
+          "--gemma" in default_flags
+          and default_flags[default_flags.index("--gemma") + 1]
+          == "mlx-community/gemma-3-12b-it-4bit",
+          "got %r" % default_flags)
+    check("L1z2 no --lora when lora_path is unset", "--lora" not in default_flags,
+          "got %r" % default_flags)
+
+    args.gemma = "Other/Gemma"
+    args.lora_path = "/tmp/my.safetensors"
+    with_lora = ltx_movie._render_flags(args)
+    check("L1z3 --gemma Other/Gemma reaches the render flags",
+          "--gemma" in with_lora
+          and with_lora[with_lora.index("--gemma") + 1] == "Other/Gemma",
+          "got %r" % with_lora)
+    check("L1z4 --lora PATH reaches the render flags",
+          "--lora" in with_lora
+          and with_lora[with_lora.index("--lora") + 1] == "/tmp/my.safetensors",
+          "got %r" % with_lora)
 
 
 def test_removed_flags_rejected():
@@ -1466,6 +1494,7 @@ def test_main_block_completeness():
 
 if __name__ == "__main__":
     test_parser_defaults()
+    test_render_flags_gemma_lora()
     test_removed_flags_rejected()
     test_dry_run_prints_phases_and_prompt()
     test_ast_guard_no_toplevel_heavy_imports()

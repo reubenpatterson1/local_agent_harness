@@ -101,6 +101,10 @@ def build_parser():
     parser.add_argument("--seed", type=int, default=0,
                         help="base seed; panel i uses seed S+i")
     parser.add_argument("--model", default=SKILL.MODEL_ID)
+    parser.add_argument("--gemma", default=SKILL.GEMMA_MODEL_ID)
+    parser.add_argument("--lora", dest="lora_path", default=None,
+                        help="LoRA .safetensors file or HF repo ID, prep for future "
+                             "fine-tuning; always applied at strength 1.0")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                         default=False)
     parser.add_argument("--tile-frames", dest="tile_frames", type=int, default=1)
@@ -363,6 +367,8 @@ def build_clip_provenance(unit, args, *, strict=False):
         "backend": "ltx-2-mlx",
         "model": args.model,
         "model_identity": model_identity(args.model, strict=strict),
+        "gemma": args.gemma,
+        "lora_path": args.lora_path,
         "prompt_sha256": hashlib.sha256(unit["prompt"].encode("utf-8")).hexdigest(),
         "conditioning": conditioning,
         "image_sha256": file_sha256(unit["image_path"]) if conditioning == "still" else None,
@@ -719,7 +725,8 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
             prompt=first["prompt"], output_path=first["clip_path"],
             image_path=first["image_path"], width=args.width, height=args.height,
             num_frames=args.frames, frame_rate=args.frame_rate, seed=first["seed"],
-            model=args.model, low_ram=(not args.no_low_ram),
+            model=args.model, gemma=args.gemma, lora_path=args.lora_path,
+            low_ram=(not args.no_low_ram),
             tile_frames=args.tile_frames, tile_spatial=args.tile_spatial)
         print("first render command: %s" % shlex.join(cmd))
     else:
@@ -800,6 +807,7 @@ def render_panel(unit, args):
             unit["prompt"], unit["clip_path"], image_path=unit["image_path"],
             width=args.width, height=args.height, num_frames=args.frames,
             frame_rate=args.frame_rate, seed=unit["seed"], model=args.model,
+            gemma=args.gemma, lora_path=args.lora_path,
             low_ram=(not args.no_low_ram), tile_frames=args.tile_frames,
             tile_spatial=args.tile_spatial, log_path=unit["log_path"],
             timeout_s=args.panel_timeout, force=True)

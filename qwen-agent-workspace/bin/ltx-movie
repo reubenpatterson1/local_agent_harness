@@ -203,6 +203,14 @@ def build_parser():
     parser.add_argument("--video-width", dest="video_width", type=int, default=None)
     parser.add_argument("--video-height", dest="video_height", type=int, default=None)
     parser.add_argument("--model", default="MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8")
+    parser.add_argument("--gemma", default="mlx-community/gemma-3-12b-it-4bit",
+                         help="Gemma model for text encoding, passed through to "
+                              "ltx-2-mlx's own --gemma. Override this to swap the text "
+                              "encoder (e.g. a smaller variant on a memory-constrained "
+                              "host); the DiT pack selected by --model is unaffected.")
+    parser.add_argument("--lora", dest="lora_path", default=None,
+                         help="LoRA .safetensors file or HF repo ID, prep for future "
+                              "fine-tuning; always applied at strength 1.0")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                          default=False,
                          help="ltx-2-mlx --low-ram is ON by default on this 48 GiB host; "
@@ -304,8 +312,11 @@ def _render_flags(args):
              "--height", str(args.video_height),
              "--frame-rate", str(args.fps),
              "--model", args.model,
+             "--gemma", args.gemma,
              "--tile-frames", str(args.tile_frames),
              "--tile-spatial", str(args.tile_spatial)]
+    if args.lora_path:
+        flags += ["--lora", args.lora_path]
     if args.no_low_ram:
         flags.append("--no-low-ram")
     flags.append("--resume")

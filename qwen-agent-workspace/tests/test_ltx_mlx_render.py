@@ -53,6 +53,9 @@ def test_parser_defaults():
     check("R1g seed 0", a.seed == 0, "got %r" % a.seed)
     check("R1h model is the pack id", a.model == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8",
           "got %r" % a.model)
+    check("R1h1 gemma is SKILL.GEMMA_MODEL_ID", a.gemma == render.SKILL.GEMMA_MODEL_ID,
+          "got %r" % a.gemma)
+    check("R1h2 lora_path defaults to None", a.lora_path is None, "got %r" % a.lora_path)
     check("R1i no_low_ram False", a.no_low_ram is False, "got %r" % a.no_low_ram)
     check("R1j tile_frames 1", a.tile_frames == 1, "got %r" % a.tile_frames)
     check("R1k tile_spatial 1", a.tile_spatial == 1, "got %r" % a.tile_spatial)
@@ -893,6 +896,13 @@ def test_dry_run_output():
         check("R10j the first render command is shown, shlex-joined",
               "first render command:" in o and "--distilled" in o and "--frame-rate 24" in o,
               "got %r" % o)
+        check("R10j1 the first render command carries --gemma with the default GEMMA_MODEL_ID",
+              ("--gemma %s" % render.SKILL.GEMMA_MODEL_ID) in o, "got %r" % o)
+
+        r2 = _run_render([manifest, out, "--clips-dir", clips, "--dry-run",
+                          "--gemma", "Other/Gemma"])
+        check("R10j2 a non-default --gemma reaches the first render command",
+              "--gemma Other/Gemma" in r2.stdout, "got %r" % r2.stdout)
         check("R10k the estimate line is present",
               "estimated render time: 3 panels x" in o and "[source: default estimate" in o,
               "got %r" % o)
@@ -1733,6 +1743,7 @@ class _Harness(object):
         self.td = td
         self.story_id = story_id
         self.rendered_seeds = []
+        self.received_kwargs = []
         self.fail_indices = set(fail_indices)
         self.fail_status = fail_status
         self.saved = {}
@@ -1768,6 +1779,7 @@ class _Harness(object):
 
         def _gen(prompt, output_path, image_path=None, **kw):
             harness.rendered_seeds.append(kw["seed"])
+            harness.received_kwargs.append(kw)
             idx = int(os.path.basename(output_path)[len("panel_"):-len(".mp4")])
             if idx in harness.fail_indices:
                 if harness.fail_status == "invalid":
@@ -1960,6 +1972,21 @@ def test_failure_state_machine():
             check("R16z stop + retry still exits 1", rc == 1, "rc=%r" % rc)
 
 
+def test_gemma_lora_reach_generate_video():
+    with tempfile.TemporaryDirectory() as td:
+        with _Harness(td, "gemma-lora-wiring", 1) as h:
+            rc = h.run("--gemma", "Other/Gemma", "--lora", "/tmp/my.safetensors")
+            check("R33a run exits 0", rc == 0, "got %r" % rc)
+            check("R33b exactly one panel rendered", len(h.received_kwargs) == 1,
+                  "got %r" % h.received_kwargs)
+            if h.received_kwargs:
+                kw = h.received_kwargs[0]
+                check("R33c gemma reached SKILL.generate_video",
+                      kw.get("gemma") == "Other/Gemma", "got %r" % kw)
+                check("R33d lora_path reached SKILL.generate_video",
+                      kw.get("lora_path") == "/tmp/my.safetensors", "got %r" % kw)
+
+
 def test_clip_provenance_contract():
     from unittest import mock
     import hashlib
@@ -1974,8 +2001,11 @@ def test_clip_provenance_contract():
         with open(clip,'wb') as handle: handle.write(b'video bytes')
         unit = dict(prompt='literal prompt\n',image_path=image,seed=4,clip_path=clip,
                     conditioning='still',chain_source=None)
-        args = _stub_args(model=model)
+        args = _stub_args(model=model, gemma='Other/Gemma', lora_path='/tmp/my.safetensors')
         expected = render.build_clip_provenance(unit,args)
+        check('R18z provenance records gemma and lora_path',
+              expected['gemma'] == 'Other/Gemma' and expected['lora_path'] == '/tmp/my.safetensors',
+              "got %r" % {k: expected.get(k) for k in ('gemma', 'lora_path')})
         check('R18 schema_version 2 and the ltx-2-mlx backend constant',
               expected['schema_version']==2 and expected['backend']=='ltx-2-mlx')
         check('R18 no VAE decode budget key','vae_decode_budget_gb' not in expected)
@@ -2875,6 +2905,7 @@ def test_single_panel_v3_manifest_is_not_chained():
 
 if __name__ == "__main__":
     test_parser_defaults()
+    test_gemma_lora_reach_generate_video()
     test_clip_provenance_contract()
     test_cached_model_metadata_and_io_failures()
     test_provenance_rejects_changes_during_generation()

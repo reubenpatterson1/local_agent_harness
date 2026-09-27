@@ -57,6 +57,8 @@ def test_constants():
           skill.LTX2_MLX_BIN.endswith(os.path.join(".venv", "bin", "ltx-2-mlx"))
           or os.environ.get("LTX2_MLX_BIN") is not None,
           "got %r" % skill.LTX2_MLX_BIN)
+    check("M1k GEMMA_MODEL_ID", skill.GEMMA_MODEL_ID == "mlx-community/gemma-3-12b-it-4bit",
+          "got %r" % skill.GEMMA_MODEL_ID)
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +184,7 @@ def test_build_command_i2v_defaults():
     check("M4a I2V golden argv",
           cmd == [skill._resolve_bin(), "generate",
                   "--model", skill.MODEL_ID,
+                  "--gemma", skill.GEMMA_MODEL_ID,
                   "--distilled",
                   "--prompt", "a prompt",
                   "--output", "/tmp/out.mp4",
@@ -200,6 +203,7 @@ def test_build_command_t2v():
     check("M4c T2V golden argv",
           cmd == [skill._resolve_bin(), "generate",
                   "--model", skill.MODEL_ID,
+                  "--gemma", skill.GEMMA_MODEL_ID,
                   "--distilled",
                   "--prompt", "p",
                   "--output", "/tmp/o.mp4",
@@ -230,7 +234,7 @@ def test_build_command_flags():
 
     custom = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=1024,
                                  height=576, num_frames=121, frame_rate=30, seed=99,
-                                 model="Other/Model", quiet=True)
+                                 model="Other/Model", gemma="Other/Gemma", quiet=True)
     check("M4g custom seed/model/geometry/quiet",
           custom[2:4] == ["--model", "Other/Model"]
           and "--seed" in custom and custom[custom.index("--seed") + 1] == "99"
@@ -240,6 +244,23 @@ def test_build_command_flags():
           and custom[custom.index("-f") + 1] == "121"
           and custom[custom.index("--frame-rate") + 1] == "30",
           "got %r" % (custom,))
+    check("M4g2 custom gemma reaches the argv right after --model",
+          custom[4:6] == ["--gemma", "Other/Gemma"], "got %r" % (custom,))
+
+
+def test_build_command_lora():
+    default = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                  height=448, num_frames=241, frame_rate=24, seed=0)
+    check("M4l no lora_path omits --lora entirely", "--lora" not in default,
+          "got %r" % (default,))
+
+    with_lora = skill.build_command(prompt="p", output_path="/tmp/o.mp4", width=704,
+                                    height=448, num_frames=241, frame_rate=24, seed=0,
+                                    lora_path="/tmp/my.safetensors")
+    li = with_lora.index("--lora") if "--lora" in with_lora else -1
+    check("M4m --lora PATH 1.0 reaches the argv, always at strength 1.0",
+          li >= 0 and with_lora[li:li + 3] == ["--lora", "/tmp/my.safetensors", "1.0"],
+          "got %r" % (with_lora,))
 
 
 def test_build_command_invariants():
@@ -665,6 +686,8 @@ def test_cli_parser_defaults():
     check("M11e frame_rate 24", a.frame_rate == 24, "got %r" % a.frame_rate)
     check("M11f seed 0", a.seed == 0, "got %r" % a.seed)
     check("M11g model MODEL_ID", a.model == skill.MODEL_ID, "got %r" % a.model)
+    check("M11g1 gemma GEMMA_MODEL_ID", a.gemma == skill.GEMMA_MODEL_ID, "got %r" % a.gemma)
+    check("M11g2 lora_path defaults to None", a.lora_path is None, "got %r" % a.lora_path)
     check("M11h no_low_ram False", a.no_low_ram is False, "got %r" % a.no_low_ram)
     check("M11i tile_frames 1", a.tile_frames == 1, "got %r" % a.tile_frames)
     check("M11j tile_spatial 1", a.tile_spatial == 1, "got %r" % a.tile_spatial)
@@ -725,7 +748,8 @@ def test_cli_full_flag_wiring():
                 "--width", "1024", "--height", "576", "--frames", "121",
                 "--frame-rate", "30", "--seed", "99", "--no-low-ram",
                 "--tile-frames", "3", "--tile-spatial", "2", "--quiet",
-                "--model", "Other/Model", "--log", cli_log,
+                "--model", "Other/Model", "--gemma", "Other/Gemma",
+                "--lora", "/tmp/my.safetensors", "--log", cli_log,
                 "--timeout", "60",
             ])
             check("M11t full-flag CLI invocation exits 0", rc == 0, "got %r" % rc)
@@ -753,6 +777,15 @@ def test_cli_full_flag_wiring():
             mi = argv.index("--model") if "--model" in argv else -1
             check("M11z1 --model Other/Model reached the child argv",
                   mi >= 0 and argv[mi + 1] == "Other/Model", "got %r" % argv)
+
+            gi = argv.index("--gemma") if "--gemma" in argv else -1
+            check("M11z1a --gemma Other/Gemma reached the child argv",
+                  gi >= 0 and argv[gi + 1] == "Other/Gemma", "got %r" % argv)
+
+            li = argv.index("--lora") if "--lora" in argv else -1
+            check("M11z1b --lora PATH 1.0 reached the child argv",
+                  li >= 0 and argv[li:li + 3] == ["--lora", "/tmp/my.safetensors", "1.0"],
+                  "got %r" % argv)
 
             check("M11z2 --log path was created and is non-empty (--log reached generate_video)",
                   os.path.isfile(cli_log) and os.path.getsize(cli_log) > 0,
@@ -917,6 +950,7 @@ if __name__ == "__main__":
     test_build_command_i2v_defaults()
     test_build_command_t2v()
     test_build_command_flags()
+    test_build_command_lora()
     test_build_command_invariants()
     test_generate_video_value_errors()
     test_generate_video_subprocess_outcomes()
