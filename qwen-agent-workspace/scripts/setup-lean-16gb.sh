@@ -27,20 +27,29 @@ cd "$WS"
 # ---------------------------------------------------------------------------
 
 echo "=== 1. ltx-2-mlx ==="
-if command -v ltx-2-mlx >/dev/null 2>&1; then
-    echo "Found on PATH: $(command -v ltx-2-mlx)"
+# Check the EXACT path ltx2_mlx_video_skill.py itself resolves by default
+# (LTX2_MLX_BIN, or LTX2_MLX_DIR/.venv/bin/ltx-2-mlx) -- not just "is something
+# called ltx-2-mlx on PATH". A non-login, non-interactive `bash script.sh`
+# invocation does not source ~/.zshrc, so PATH additions that only live there
+# (e.g. from `uv tool install`) are invisible here even though the same
+# binary resolves fine in an interactive shell.
+LTX2_MLX_DIR="${LTX2_MLX_DIR:-$HOME/ltx-2-mlx}"
+LTX2_MLX_BIN="${LTX2_MLX_BIN:-$LTX2_MLX_DIR/.venv/bin/ltx-2-mlx}"
+
+if [ -x "$LTX2_MLX_BIN" ]; then
+    echo "Found: $LTX2_MLX_BIN"
 else
-    echo "Not found on PATH. Installing to \$HOME/ltx-2-mlx-tool ..."
+    echo "Not found at $LTX2_MLX_BIN. Installing to $LTX2_MLX_DIR ..."
     if ! command -v uv >/dev/null 2>&1; then
         echo "Error: uv is not installed. Install it first:" >&2
         echo "  https://docs.astral.sh/uv/getting-started/installation/" >&2
         exit 1
     fi
-    git clone https://github.com/dgrauet/ltx-2-mlx.git "$HOME/ltx-2-mlx-tool"
-    (cd "$HOME/ltx-2-mlx-tool" && uv sync --all-extras)
+    git clone https://github.com/dgrauet/ltx-2-mlx.git "$LTX2_MLX_DIR"
+    (cd "$LTX2_MLX_DIR" && uv sync --all-extras)
 fi
-ltx-2-mlx --help >/dev/null
-echo "ltx-2-mlx OK"
+"$LTX2_MLX_BIN" --help >/dev/null
+echo "ltx-2-mlx OK ($LTX2_MLX_BIN)"
 
 if ! command -v hf >/dev/null 2>&1; then
     echo "Error: the 'hf' CLI (huggingface_hub) is not installed or not on PATH." >&2
