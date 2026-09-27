@@ -75,8 +75,14 @@ def _pick_dtype(device: torch.device):
     return torch.bfloat16 if device.type in ("cuda", "mps") else torch.float32
 
 
-def load_pipeline():
-    """Load the Z-Image-Turbo pipeline with the abliterated text encoder, moved to the best device."""
+def load_pipeline(lora_path=None):
+    """Load the Z-Image-Turbo pipeline with the abliterated text encoder, moved to the
+    best device.
+
+    lora_path: local .safetensors file or HF repo ID, prep for future fine-tuning.
+    Omitted unless explicitly set; when given, it is fused into the transformer at
+    strength 1.0 (diffusers' ZImageLoraLoaderMixin.load_lora_weights + fuse_lora),
+    so every later generate_image() call uses it with no per-call overhead."""
     device = _pick_device()
     dtype = _pick_dtype(device)
     token = os.environ.get("HF_TOKEN")
@@ -94,6 +100,10 @@ def load_pipeline():
         cache_dir=base_cache,
     ).to(device)
     pipeline.vae.to(torch.float32)
+    if lora_path is not None:
+        print(f"[z_image_skill] loading LoRA {lora_path} (fused at strength 1.0)")
+        pipeline.load_lora_weights(lora_path)
+        pipeline.fuse_lora(lora_scale=1.0)
     return pipeline
 
 
@@ -101,20 +111,26 @@ def load_pipeline():
 _pipeline = None
 
 
-def _get_pipeline():
+def _get_pipeline(lora_path=None):
+    """lora_path only takes effect on the FIRST call that constructs the singleton
+    (same constraint as Z_IMAGE_HF_HOME): a later call with a different lora_path
+    against an already-loaded pipeline is silently ignored."""
     global _pipeline
     if _pipeline is None:
-        _pipeline = load_pipeline()
+        _pipeline = load_pipeline(lora_path=lora_path)
     return _pipeline
 
 
-def generate_image(prompt: str, output_path: str = None, **kwargs):
+def generate_image(prompt: str, output_path: str = None, lora_path=None, **kwargs):
     """Generate an image from a text prompt using Z-Image-Turbo with the abliterated text encoder.
 
     Args:
         prompt: Text describing the desired image.
         output_path: Optional file path to save the PNG. If given, the image
             is saved there.
+        lora_path: local .safetensors file or HF repo ID, prep for future
+            fine-tuning; forwarded to load_pipeline() (see its docstring for
+            the singleton-timing caveat). Omitted unless explicitly set.
         **kwargs: Extra args forwarded to the pipeline call (e.g. height,
             width). Defaults num_inference_steps=9, guidance_scale=0.0 (this
             is a distilled turbo model -- higher steps/CFG do not help), and
@@ -124,7 +140,7 @@ def generate_image(prompt: str, output_path: str = None, **kwargs):
     Returns:
         PIL.Image.Image: The generated image.
     """
-    pipeline = _get_pipeline()
+    pipeline = _get_pipeline(lora_path=lora_path)
     kwargs.setdefault("num_inference_steps", 9)
     kwargs.setdefault("guidance_scale", 0.0)
     kwargs.setdefault("generator", torch.Generator("cpu"))

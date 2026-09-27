@@ -83,6 +83,11 @@ def build_parser():
                              "canvas and saved as panel_01.png instead of being generated. "
                              "Panel 1 takes this path even with --force (there is no "
                              "txt2img output to regenerate).")
+    parser.add_argument("--lora", dest="lora_path", default=None,
+                        help="LoRA .safetensors file or HF repo ID for z_image_skill, "
+                             "prep for future fine-tuning; always applied at strength "
+                             "1.0. Never used by --seed-image panels (there is no "
+                             "generation to apply it to).")
     return parser
 
 
@@ -274,6 +279,7 @@ def main(argv=None):
                 width=args.width,
                 height=args.height,
                 generator=torch.Generator("cpu").manual_seed(seed_used),
+                lora_path=args.lora_path,
             )
             elapsed = time.monotonic() - start
             print("panel %d -> %s (seed %d, %.1fs)" % (i, path, seed_used, elapsed))

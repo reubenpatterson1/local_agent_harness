@@ -592,6 +592,27 @@ def test_seed_and_style_source_guards():
     check("I20 grounded = bool(style) present", "grounded = bool(style)" in src)
 
 
+# ---------------------------------------------------------------------------
+# I21: --lora parser default + wiring into the generate_image call
+# ---------------------------------------------------------------------------
+
+def test_lora_parser_default():
+    args = story_images.build_parser().parse_args(["--story-md", "s.md", "--out-dir", "o"])
+    check("I21 --lora defaults to lora_path=None", args.lora_path is None,
+          "got %r" % args.lora_path)
+    args2 = story_images.build_parser().parse_args(
+        ["--story-md", "s.md", "--out-dir", "o", "--lora", "my_lora.safetensors"])
+    check("I21 --lora captured as lora_path", args2.lora_path == "my_lora.safetensors",
+          "got %r" % args2.lora_path)
+
+
+def test_lora_reaches_generate_image_call():
+    with open(_IMAGES_PATH) as f:
+        src = f.read()
+    check("I21 generate_image( is called with lora_path=args.lora_path",
+          "lora_path=args.lora_path" in src, "got source without the kwarg")
+
+
 if __name__ == "__main__":
     test_labeled_section_parses_three_fields()
     test_unlabeled_section_keeps_text_and_empty_labels()
@@ -612,6 +633,8 @@ if __name__ == "__main__":
     test_grounded_dry_run_output()
     test_ungrounded_dry_run_output_unchanged()
     test_seed_and_style_source_guards()
+    test_lora_parser_default()
+    test_lora_reaches_generate_image_call()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
