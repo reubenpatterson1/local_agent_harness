@@ -76,6 +76,8 @@ def test_parser_defaults():
     check("L1 gemma is the ltx-2-mlx default text encoder",
           args.gemma == "mlx-community/gemma-3-12b-it-4bit", "got %r" % args.gemma)
     check("L1 lora_path defaults to None", args.lora_path is None, "got %r" % args.lora_path)
+    check("L1 stills_lora_path defaults to None", args.stills_lora_path is None,
+          "got %r" % args.stills_lora_path)
     check("L1 low-ram is ON by default (no_low_ram False)", args.no_low_ram is False,
           "got %r" % args.no_low_ram)
     check("L1 tile_frames == 1", args.tile_frames == 1, "got %r" % args.tile_frames)
@@ -113,6 +115,33 @@ def test_render_flags_gemma_lora():
           "--lora" in with_lora
           and with_lora[with_lora.index("--lora") + 1] == "/tmp/my.safetensors",
           "got %r" % with_lora)
+
+
+def test_stills_lora_reaches_phase2():
+    text = inspect.getsource(ltx_movie)
+    check("L1z5 both Phase 2 command-construction sites gate --lora on stills_lora_path",
+          text.count('["--lora", args.stills_lora_path]') == 2,
+          "got %r occurrences" % text.count('["--lora", args.stills_lora_path]'))
+
+    from PIL import Image
+    story_id = "unittest-stills-lora-%d" % os.getpid()
+    with tempfile.TemporaryDirectory() as tmp:
+        seed = os.path.join(tmp, "seed.png")
+        Image.new("RGB", (704, 448), (10, 20, 30)).save(seed, format="PNG")
+        result = subprocess.run(
+            [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+             "--panels", "1", "--seed-image", seed,
+             "--stills-lora", "/tmp/my_stills.safetensors", "--dry-run"],
+            capture_output=True, text=True, cwd=WS)
+        check("L1z6 exits 0", result.returncode == 0,
+              "rc=%r stderr=%r" % (result.returncode, result.stderr))
+        phase2_lines = [l for l in result.stdout.splitlines() if "ltx-story-images" in l]
+        check("L1z7 exactly one phase-2 command line found", len(phase2_lines) == 1,
+              "got %r" % phase2_lines)
+        if phase2_lines:
+            check("L1z8 --stills-lora reaches ltx-story-images as --lora PATH",
+                  "--lora /tmp/my_stills.safetensors" in phase2_lines[0],
+                  "got %r" % phase2_lines[0])
 
 
 def test_removed_flags_rejected():
@@ -1495,6 +1524,7 @@ def test_main_block_completeness():
 if __name__ == "__main__":
     test_parser_defaults()
     test_render_flags_gemma_lora()
+    test_stills_lora_reaches_phase2()
     test_removed_flags_rejected()
     test_dry_run_prints_phases_and_prompt()
     test_ast_guard_no_toplevel_heavy_imports()

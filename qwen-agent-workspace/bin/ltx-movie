@@ -209,8 +209,16 @@ def build_parser():
                               "encoder (e.g. a smaller variant on a memory-constrained "
                               "host); the DiT pack selected by --model is unaffected.")
     parser.add_argument("--lora", dest="lora_path", default=None,
-                         help="LoRA .safetensors file or HF repo ID, prep for future "
-                              "fine-tuning; always applied at strength 1.0")
+                         help="LoRA .safetensors file or HF repo ID for the VIDEO DiT "
+                              "(ltx-2-mlx), prep for future fine-tuning; always applied "
+                              "at strength 1.0. See --stills-lora for the stills side.")
+    parser.add_argument("--stills-lora", dest="stills_lora_path", default=None,
+                         help="LoRA .safetensors file or HF repo ID for Phase 2's "
+                              "stills generation (z_image_skill), prep for future "
+                              "fine-tuning; always applied at strength 1.0. Independent "
+                              "of --lora, which is the video DiT's LoRA. Never used by "
+                              "--seed-image panels (there is no generation to apply it "
+                              "to).")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                          default=False,
                          help="ltx-2-mlx --low-ram is ON by default on this 48 GiB host; "
@@ -730,6 +738,8 @@ def phase2_stills(args):
            "--seed", str(args.image_seed)]
     if getattr(args, "seed_image", None):
         cmd += ["--seed-image", args.seed_image]
+    if args.stills_lora_path:
+        cmd += ["--lora", args.stills_lora_path]
     print("Running: %s" % shlex.join(cmd))
     proc = subprocess.run(cmd, cwd=WS)
     if proc.returncode != 0:
@@ -989,6 +999,8 @@ def _print_dry_run_plan(args):
                       "--seed", str(args.image_seed)]
         if getattr(args, "seed_image", None):
             phase2_cmd += ["--seed-image", args.seed_image]
+        if args.stills_lora_path:
+            phase2_cmd += ["--lora", args.stills_lora_path]
         print("Command: %s" % shlex.join(phase2_cmd))
         print()
 
