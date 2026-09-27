@@ -32,6 +32,25 @@ machine. This QAT (quantization-aware-trained) variant is the one that was
 actually confirmed stable there. `bin/ltx-movie --gemma` (added for this
 port, commit `59dfc2d`) is what makes overriding it possible at all.
 
+## Hard requirement: always pass `--seed-image`
+
+**Text-only mode (no `--seed-image`) does not work on this machine — confirmed by a
+real failure, not just predicted.** Omitting `--seed-image` falls back to Z-Image-Turbo
+for panel 1's still, and its base transformer alone is ~24.6GB (3 safetensors shards:
+9.97 + 9.97 + 4.67GB) — 1.5x the entire machine's unified memory, before the text
+encoder or any activations are even counted. No amount of text-encoder quantization
+changes this; only the DiT's own size matters here, and it isn't quantized. Real
+failure observed on this target:
+
+```
+panel 1 ERROR: MPS backend out of memory (MPS allocated: 19.80 GiB, other
+allocations: 2.80 MiB, max allowed: 20.13 GiB). Tried to allocate 708.98 MiB on
+private pool.
+```
+
+Every invocation of `bin/ltx-movie` on this machine must include `--seed-image <a
+real photo>`.
+
 ## Confirmed-stable geometry
 
 ```

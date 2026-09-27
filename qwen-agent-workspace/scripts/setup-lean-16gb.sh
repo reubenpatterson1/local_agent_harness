@@ -143,6 +143,11 @@ fi
 # ---------------------------------------------------------------------------
 
 echo "=== 5. Pipeline command ==="
+echo "REQUIRED: always pass --seed-image. Omitting it falls back to Z-Image-Turbo,"
+echo "whose ~24.6GB transformer alone exceeds this machine's entire unified memory --"
+echo "confirmed by a real MPS OOM on this exact target, not just predicted. See"
+echo "docs/16gb-m1-port.md's 'Hard requirement' section."
+echo
 echo "Vision server (start before the render, stop when done):"
 echo "  export STORY_SERVER_VISION_MODEL_DIR=\"$VISION_MODEL_DIR\""
 echo "  export STORY_SERVER_VISION_GPU_MEM_UTIL=0.50"
