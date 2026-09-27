@@ -17,12 +17,19 @@ resize_and_center_crop crops nothing.
 
 The area cap. 704x448 (77 cells of 64x64) is the ONLY resolution ever measured on the
 MLX path (acceptance run A1: 704x448 x 241 frames, 160 s per panel, 13.5 GiB), so
-derived sizes never exceed that area. Raising the cap is a follow-up gated on a
-hardware measurement.
+derived sizes never exceed that area by default. Raising the cap is a follow-up gated
+on a hardware measurement. LTX_MAX_AREA_CELLS lowers it instead, for a memory-
+constrained host: a real Metal OOM during VAE decode on a 16GB M1 Pro/Max, at the
+full 77-cell area derived from a portrait seed photo, is the hardware measurement
+that gated this direction (2026-09-27) -- A1's 13.5 GiB peak was only ever measured
+on a 48GB+ machine. Read at call time, not import time, so tests and callers can
+change it without reloading (same pattern as z_image_skill.py's Z_IMAGE_HF_HOME).
 
 Stdlib-only at import time: PIL is imported inside the functions that need it, so
 bin/ltx-movie --dry-run and the offline tests can load this module without Pillow.
 """
+
+import os
 
 GRID_PX = 64            # ltx-2-mlx two-stage snap modulus (patchifiers.py snap_output_dimensions)
 MIN_CELLS = 5           # 320 px minimum edge; stage-1 half-size edge 160 px = 5 latent cells
@@ -32,6 +39,13 @@ MIN_AREA_CELLS = 40     # 163,840 px = 0.52x of 704x448; resolution floor
 PAD_TOLERANCE_PX = 8    # total residual pad (width deficit + height deficit) treated as "no bar"
 DEFAULT_VIDEO_WIDTH = 704
 DEFAULT_VIDEO_HEIGHT = 448
+
+
+def _max_area_cells():
+    """$LTX_MAX_AREA_CELLS if set, else the MAX_AREA_CELLS default. See the module
+    docstring's "area cap" section."""
+    override = os.environ.get("LTX_MAX_AREA_CELLS")
+    return MAX_AREA_CELLS if override is None else int(override)
 
 
 def load_oriented_rgb(path):
@@ -58,23 +72,25 @@ def fit_pad_px(src_w, src_h, width, height):
 
 def derive_video_dims(src_w, src_h):
     """(W, H, pad_px): the video geometry for a src_w x src_h seed. Pure and
-    deterministic.
+    deterministic given the current $LTX_MAX_AREA_CELLS (see _max_area_cells()).
 
     Candidates are every (a, b) cell pair with MIN_CELLS <= a, b <= MAX_CELLS and
-    MIN_AREA_CELLS <= a*b <= MAX_AREA_CELLS, at W = a*GRID_PX, H = b*GRID_PX. If any
-    candidate leaves at most PAD_TOLERANCE_PX of residual pad, the largest area wins
-    (ties: smaller pad, then larger a). Otherwise the smallest pad wins (ties: larger
-    area, then larger a). Raises ValueError for a seed outside 1:3 .. 3:1; exactly
-    3:1 and exactly 1:3 are accepted (integer comparison, no float rounding)."""
+    MIN_AREA_CELLS <= a*b <= the current max area cells, at W = a*GRID_PX,
+    H = b*GRID_PX. If any candidate leaves at most PAD_TOLERANCE_PX of residual pad,
+    the largest area wins (ties: smaller pad, then larger a). Otherwise the smallest
+    pad wins (ties: larger area, then larger a). Raises ValueError for a seed outside
+    1:3 .. 3:1; exactly 3:1 and exactly 1:3 are accepted (integer comparison, no
+    float rounding)."""
     if src_w * MIN_CELLS > src_h * MAX_CELLS or src_w * MAX_CELLS < src_h * MIN_CELLS:
         raise ValueError(
             "seed image is %dx%d (aspect ratio %.3f:1), outside the supported range 1:3 to "
             "3:1; supply a seed image whose width/height ratio is between 0.333 and 3.0"
             % (src_w, src_h, src_w / src_h))
+    max_area_cells = _max_area_cells()
     candidates = []
     for a in range(MIN_CELLS, MAX_CELLS + 1):
         for b in range(MIN_CELLS, MAX_CELLS + 1):
-            if MIN_AREA_CELLS <= a * b <= MAX_AREA_CELLS:
+            if MIN_AREA_CELLS <= a * b <= max_area_cells:
                 width, height = a * GRID_PX, b * GRID_PX
                 pad = fit_pad_px(src_w, src_h, width, height)[2]
                 candidates.append((a, b, width, height, pad))

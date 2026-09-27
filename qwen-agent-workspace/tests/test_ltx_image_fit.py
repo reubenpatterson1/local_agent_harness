@@ -107,6 +107,32 @@ def test_range_errors():
     check("F2e exactly 1:3 is accepted", fit.derive_video_dims(1000, 3000) == (320, 960, 0))
 
 
+def test_max_area_cells_override():
+    saved = os.environ.pop("LTX_MAX_AREA_CELLS", None)
+    try:
+        check("F3a unset: default MAX_AREA_CELLS (77) behavior unchanged",
+              fit.derive_video_dims(704, 448) == (704, 448, 0),
+              "got %r" % (fit.derive_video_dims(704, 448),))
+
+        os.environ["LTX_MAX_AREA_CELLS"] = "60"
+        check("F3b 704x448 capped at 60 cells no longer reaches 77",
+              fit.derive_video_dims(704, 448) == (512, 320, 9),
+              "got %r" % (fit.derive_video_dims(704, 448),))
+        check("F3c a portrait aspect (real 16GB-port seed photo) also respects the cap",
+              fit.derive_video_dims(1290, 2037) == (320, 512, 7),
+              "got %r" % (fit.derive_video_dims(1290, 2037),))
+
+        os.environ["LTX_MAX_AREA_CELLS"] = "77"
+        check("F3d explicitly set back to 77 matches the unset default",
+              fit.derive_video_dims(704, 448) == (704, 448, 0),
+              "got %r" % (fit.derive_video_dims(704, 448),))
+    finally:
+        if saved is None:
+            os.environ.pop("LTX_MAX_AREA_CELLS", None)
+        else:
+            os.environ["LTX_MAX_AREA_CELLS"] = saved
+
+
 def test_ratio_sweep():
     bad = []
     lo, hi = math.log(1 / 3.0), math.log(3.0)
@@ -234,6 +260,7 @@ if __name__ == "__main__":
     test_fit_pad_px()
     test_golden_table()
     test_range_errors()
+    test_max_area_cells_override()
     test_ratio_sweep()
     test_fit_letterbox()
     test_load_oriented_rgb()
