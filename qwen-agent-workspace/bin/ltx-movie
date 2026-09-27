@@ -219,6 +219,15 @@ def build_parser():
                               "of --lora, which is the video DiT's LoRA. Never used by "
                               "--seed-image panels (there is no generation to apply it "
                               "to).")
+    parser.add_argument("--story-model", dest="story_model", default=None,
+                         help="model name to declare to bin/qwen-agent's --model for "
+                              "Phase 1 story generation; must match whatever the "
+                              "story/vision server actually reports as its model (e.g. "
+                              "mlx_lm.server's own --model value) -- a mismatch can make "
+                              "the server reject the request outright, not just ignore "
+                              "the field (confirmed 2026-09-27). Omitted by default: "
+                              "bin/qwen-agent's own default (matched to the standard "
+                              "bin/story-server vLLM-Metal path) governs unless set.")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                          default=False,
                          help="ltx-2-mlx --low-ram is ON by default on this 48 GiB host; "
@@ -647,6 +656,8 @@ def phase1_story(args):
                "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
                "--request-timeout", "600"]
+        if args.story_model:
+            cmd += ["--model", args.story_model]
         if getattr(args, "seed_downscaled_path", None):
             cmd += ["--image", args.seed_downscaled_path]
         cmd += ["--user-prompt", prompt]
@@ -971,6 +982,8 @@ def _print_dry_run_plan(args):
                   "--workspace", WS,
                   "--max-tokens", str(max_tokens), "--max-rounds", "4",
                   "--request-timeout", "600"]
+    if args.story_model:
+        phase1_cmd += ["--model", args.story_model]
     if getattr(args, "seed_image", None):
         phase1_cmd += ["--image", paths["seed_downscaled"]]
     phase1_cmd += ["--user-prompt", prompt]

@@ -78,6 +78,8 @@ def test_parser_defaults():
     check("L1 lora_path defaults to None", args.lora_path is None, "got %r" % args.lora_path)
     check("L1 stills_lora_path defaults to None", args.stills_lora_path is None,
           "got %r" % args.stills_lora_path)
+    check("L1 story_model defaults to None", args.story_model is None,
+          "got %r" % args.story_model)
     check("L1 low-ram is ON by default (no_low_ram False)", args.no_low_ram is False,
           "got %r" % args.no_low_ram)
     check("L1 tile_frames == 1", args.tile_frames == 1, "got %r" % args.tile_frames)
@@ -142,6 +144,36 @@ def test_stills_lora_reaches_phase2():
             check("L1z8 --stills-lora reaches ltx-story-images as --lora PATH",
                   "--lora /tmp/my_stills.safetensors" in phase2_lines[0],
                   "got %r" % phase2_lines[0])
+
+
+def test_story_model_reaches_phase1():
+    text = inspect.getsource(ltx_movie)
+    check("L1z9 both Phase 1 command-construction sites gate --model on story_model",
+          text.count('["--model", args.story_model]') == 2,
+          "got %r occurrences" % text.count('["--model", args.story_model]'))
+
+    story_id = "unittest-story-model-%d" % os.getpid()
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+         "--panels", "1", "--story-model",
+         "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L1z10 exits 0", result.returncode == 0,
+          "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", result.stdout)
+    check("L1z11 phase-1 command line found", m is not None, "got %r" % result.stdout[:1500])
+    if m:
+        check("L1z12 --story-model reaches qwen-agent as --model VALUE",
+              "--model andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit" in m.group(1),
+              "got %r" % m.group(1))
+
+    default_result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id + "-default",
+         "--panels", "1", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    m2 = re.search(r"Command \(subprocess timeout \d+s\): (.*)", default_result.stdout)
+    check("L1z13 no --story-model omits --model entirely (qwen-agent's own default governs)",
+          m2 is not None and "--model" not in m2.group(1), "got %r" % (m2.group(1) if m2 else None))
 
 
 def test_removed_flags_rejected():
@@ -1525,6 +1557,7 @@ if __name__ == "__main__":
     test_parser_defaults()
     test_render_flags_gemma_lora()
     test_stills_lora_reaches_phase2()
+    test_story_model_reaches_phase1()
     test_removed_flags_rejected()
     test_dry_run_prints_phases_and_prompt()
     test_ast_guard_no_toplevel_heavy_imports()
