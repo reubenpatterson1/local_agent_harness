@@ -52,6 +52,37 @@ private pool.
 Every invocation of `bin/ltx-movie` on this machine must include `--seed-image <a
 real photo>`.
 
+## Some seed photos OOM during VAE decode: `LTX_MAX_AREA_CELLS`
+
+**Confirmed by a real failure (2026-09-27), not just predicted.** `derive_video_dims`
+(`ltx_image_fit.py`) derives the video's geometry from the seed photo's own aspect
+ratio, and can pick up to 77 grid cells of area (704×448-equivalent, e.g. 448×704 for
+a portrait photo) — a cap validated only on the 48GB dev machine (13.5 GiB peak,
+acceptance run A1). A portrait seed photo that lands at the full 77-cell area OOM'd
+on this 16GB target during VAE decode specifically (`RuntimeError: [METAL] Command
+buffer execution failed: Insufficient Memory`), even with `--tile-spatial 2
+--tile-frames 2` and a reduced frame count — while the confirmed-stable 640×384
+(60-cell) landscape geometry, same model/gemma/`--low-ram`, renders fine. Model
+choice, `--gemma`, `--low-ram`, audio decode, and frame count were all ruled out by
+direct comparison against a working raw `ltx-2-mlx` invocation; geometry/area was
+the one variable left that actually differed.
+
+Fix: cap the area below 77 cells with `LTX_MAX_AREA_CELLS` (added this session,
+`ltx_image_fit.py`, defaults to 77 — unset, every other host is unaffected):
+
+```bash
+export LTX_MAX_AREA_CELLS=60
+```
+
+**Real caveat, not a guess:** for at least one portrait aspect ratio tested, there is
+no viable candidate between 41 and 76 cells with acceptable padding — any cap from
+41 to 76 drops straight to 40 cells (e.g. 320×512), not something in between. This is
+a real quality tradeoff (a noticeably lower-resolution output), not a bug in the
+override. The safe value for a *specific* seed photo's aspect ratio is not yet
+characterized beyond "below 77 works"; if resolution matters, try a few `LTX_MAX_AREA_CELLS`
+values and inspect what `derive_video_dims` actually picks (Phase 0 prints the
+derived geometry) before committing to a full multi-panel render.
+
 ## Confirmed-stable geometry
 
 ```
