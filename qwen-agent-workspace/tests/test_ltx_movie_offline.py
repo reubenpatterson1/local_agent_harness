@@ -80,6 +80,8 @@ def test_parser_defaults():
           "got %r" % args.stills_lora_path)
     check("L1 story_model defaults to None", args.story_model is None,
           "got %r" % args.story_model)
+    check("L1 story_context_window defaults to None", args.story_context_window is None,
+          "got %r" % args.story_context_window)
     check("L1 low-ram is ON by default (no_low_ram False)", args.no_low_ram is False,
           "got %r" % args.no_low_ram)
     check("L1 tile_frames == 1", args.tile_frames == 1, "got %r" % args.tile_frames)
@@ -174,6 +176,37 @@ def test_story_model_reaches_phase1():
     m2 = re.search(r"Command \(subprocess timeout \d+s\): (.*)", default_result.stdout)
     check("L1z13 no --story-model omits --model entirely (qwen-agent's own default governs)",
           m2 is not None and "--model" not in m2.group(1), "got %r" % (m2.group(1) if m2 else None))
+
+
+def test_story_context_window_reaches_phase1():
+    text = inspect.getsource(ltx_movie)
+    check("L1z14 both Phase 1 command-construction sites gate --context-window on story_context_window",
+          text.count('["--context-window", str(args.story_context_window)]') == 2,
+          "got %r occurrences"
+          % text.count('["--context-window", str(args.story_context_window)]'))
+
+    story_id = "unittest-story-ctx-%d" % os.getpid()
+    result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id,
+         "--panels", "1", "--story-context-window", "262144", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    check("L1z15 exits 0", result.returncode == 0,
+          "rc=%r stderr=%r" % (result.returncode, result.stderr))
+    m = re.search(r"Command \(subprocess timeout \d+s\): (.*)", result.stdout)
+    check("L1z16 phase-1 command line found", m is not None, "got %r" % result.stdout[:1500])
+    if m:
+        check("L1z17 --story-context-window reaches qwen-agent as --context-window VALUE",
+              "--context-window 262144" in m.group(1), "got %r" % m.group(1))
+
+    default_result = subprocess.run(
+        [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", story_id + "-default",
+         "--panels", "1", "--dry-run"],
+        capture_output=True, text=True, cwd=WS)
+    m2 = re.search(r"Command \(subprocess timeout \d+s\): (.*)", default_result.stdout)
+    check("L1z18 no --story-context-window omits --context-window entirely "
+          "(qwen-agent's own discovery/default governs)",
+          m2 is not None and "--context-window" not in m2.group(1),
+          "got %r" % (m2.group(1) if m2 else None))
 
 
 def test_removed_flags_rejected():
@@ -1558,6 +1591,7 @@ if __name__ == "__main__":
     test_render_flags_gemma_lora()
     test_stills_lora_reaches_phase2()
     test_story_model_reaches_phase1()
+    test_story_context_window_reaches_phase1()
     test_removed_flags_rejected()
     test_dry_run_prints_phases_and_prompt()
     test_ast_guard_no_toplevel_heavy_imports()

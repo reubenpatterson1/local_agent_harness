@@ -228,6 +228,19 @@ def build_parser():
                               "the field (confirmed 2026-09-27). Omitted by default: "
                               "bin/qwen-agent's own default (matched to the standard "
                               "bin/story-server vLLM-Metal path) governs unless set.")
+    parser.add_argument("--story-context-window", dest="story_context_window", type=int,
+                         default=None,
+                         help="tokens to declare to bin/qwen-agent's --context-window for "
+                              "Phase 1 story generation, overriding its own /v1/models "
+                              "discovery. Needed when the story server doesn't report a "
+                              "context-length field: bin/qwen-agent then assumes a "
+                              "conservative 16384, which -- since --max-tokens scales up "
+                              "with --panels and is subtracted from the same window -- can "
+                              "make longer stories fail with status=context_budget even "
+                              "though the real model supports far more (confirmed "
+                              "2026-09-27: andrevp/Qwen3.5-9B-...-MLX-VLM-8bit's real "
+                              "window is 262144, 16x the wrongly-assumed default). Omitted "
+                              "by default: bin/qwen-agent's own discovery/default governs.")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                          default=False,
                          help="ltx-2-mlx --low-ram is ON by default on this 48 GiB host; "
@@ -658,6 +671,8 @@ def phase1_story(args):
                "--request-timeout", "600"]
         if args.story_model:
             cmd += ["--model", args.story_model]
+        if args.story_context_window:
+            cmd += ["--context-window", str(args.story_context_window)]
         if getattr(args, "seed_downscaled_path", None):
             cmd += ["--image", args.seed_downscaled_path]
         cmd += ["--user-prompt", prompt]
@@ -984,6 +999,8 @@ def _print_dry_run_plan(args):
                   "--request-timeout", "600"]
     if args.story_model:
         phase1_cmd += ["--model", args.story_model]
+    if args.story_context_window:
+        phase1_cmd += ["--context-window", str(args.story_context_window)]
     if getattr(args, "seed_image", None):
         phase1_cmd += ["--image", paths["seed_downscaled"]]
     phase1_cmd += ["--user-prompt", prompt]
