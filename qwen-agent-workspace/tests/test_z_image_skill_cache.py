@@ -163,3 +163,118 @@ def test_load_pipeline_no_lora_by_default(monkeypatch):
 
     assert record["lora_calls"] == []
     assert record["fuse_calls"] == []
+
+
+def test_quantize_weights_env_default_none(monkeypatch):
+    monkeypatch.delenv("Z_IMAGE_QUANTIZE_WEIGHTS", raising=False)
+    assert z_image_skill._quantize_weights_env() is None
+
+
+def test_quantize_weights_env_int8(monkeypatch):
+    monkeypatch.setenv("Z_IMAGE_QUANTIZE_WEIGHTS", "int8")
+    assert z_image_skill._quantize_weights_env() == "int8"
+
+
+def test_quantize_weights_env_invalid_raises(monkeypatch):
+    monkeypatch.setenv("Z_IMAGE_QUANTIZE_WEIGHTS", "int4")
+    with pytest.raises(ValueError, match="int4"):
+        z_image_skill._quantize_weights_env()
+
+
+def test_quantize_transformer_real_int8():
+    """Real (unmocked) optimum-quanto quantization on a throwaway module --
+    cheap and fast even though it's not a fake, confirmed on the real
+    Z-Image-Turbo transformer too (11.46 GiB bf16 -> 5.74 GiB, 2026-09-27)."""
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16)
+
+    m = Wrapper()
+    z_image_skill._quantize_transformer(m, "int8")
+
+    assert type(m.proj).__name__ == "QLinear"
+    assert m.proj.weight._data.dtype == torch.int8
+
+
+def _fake_transformer_class(record):
+    class _FakeTransformer:
+        pass
+
+    class FakeZImageTransformer2DModel:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            record["transformer_calls"] += 1
+            record["transformer_kwargs"] = kwargs
+            return _FakeTransformer()
+
+    return FakeZImageTransformer2DModel, _FakeTransformer
+
+
+def test_load_pipeline_skips_quantization_by_default(monkeypatch):
+    monkeypatch.delenv("Z_IMAGE_QUANTIZE_WEIGHTS", raising=False)
+    monkeypatch.setattr(z_image_skill, "_pick_device", lambda: torch.device("cpu"))
+    record = {"lora_calls": [], "fuse_calls": [], "transformer_calls": 0,
+              "quantize_calls": []}
+    FakeQwen3Model, FakeZImagePipeline = _fake_pipeline_classes(record)
+    FakeZImageTransformer2DModel, _ = _fake_transformer_class(record)
+    monkeypatch.setattr(z_image_skill, "Qwen3Model", FakeQwen3Model)
+    monkeypatch.setattr(z_image_skill, "ZImagePipeline", FakeZImagePipeline)
+    monkeypatch.setattr(z_image_skill, "ZImageTransformer2DModel", FakeZImageTransformer2DModel)
+    monkeypatch.setattr(z_image_skill, "_quantize_transformer",
+                         lambda t, q: record["quantize_calls"].append((t, q)))
+
+    z_image_skill.load_pipeline()
+
+    assert record["transformer_calls"] == 0
+    assert record["quantize_calls"] == []
+
+
+def test_load_pipeline_quantizes_transformer_when_env_set(monkeypatch):
+    monkeypatch.setenv("Z_IMAGE_QUANTIZE_WEIGHTS", "int8")
+    monkeypatch.setattr(z_image_skill, "_pick_device", lambda: torch.device("cpu"))
+
+    class FakeQwen3Model:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            return "FAKE_TEXT_ENCODER"
+
+    class _FakeVAE:
+        def to(self, dtype):
+            pass
+
+    class _FakePipeline:
+        def __init__(self):
+            self.vae = _FakeVAE()
+
+        def to(self, device):
+            return self
+
+    pipeline_calls = []
+
+    class FakeZImagePipeline:
+        @staticmethod
+        def from_pretrained(model_id, **kwargs):
+            pipeline_calls.append(kwargs)
+            return _FakePipeline()
+
+    transformer_record = {"transformer_calls": 0}
+    FakeZImageTransformer2DModel, FakeTransformer = _fake_transformer_class(transformer_record)
+    quantize_calls = []
+
+    monkeypatch.setattr(z_image_skill, "Qwen3Model", FakeQwen3Model)
+    monkeypatch.setattr(z_image_skill, "ZImagePipeline", FakeZImagePipeline)
+    monkeypatch.setattr(z_image_skill, "ZImageTransformer2DModel", FakeZImageTransformer2DModel)
+    monkeypatch.setattr(z_image_skill, "_quantize_transformer",
+                         lambda t, q: quantize_calls.append((t, q)))
+
+    z_image_skill.load_pipeline()
+
+    assert transformer_record["transformer_calls"] == 1
+    assert len(quantize_calls) == 1
+    transformer_obj, qtype = quantize_calls[0]
+    assert isinstance(transformer_obj, FakeTransformer)
+    assert qtype == "int8"
+    assert len(pipeline_calls) == 1
+    assert pipeline_calls[0]["transformer"] is transformer_obj

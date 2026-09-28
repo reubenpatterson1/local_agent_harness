@@ -29,6 +29,13 @@ Environment:
               when it already contains `hub/models--<org>--<name>`; otherwise
               that model falls back to the default HF cache, so a missing copy
               degrades to slow, never to a silent re-download into an empty dir.
+    Z_IMAGE_QUANTIZE_WEIGHTS  Quantize the transformer's weights via
+              optimum-quanto (a lazy import -- not a hard dependency unless
+              this is set). Only "int8" is implemented. Confirmed 2026-09-27
+              on Tongyi-MAI/Z-Image-Turbo's transformer: cuts its real bf16
+              footprint from 11.46 GiB to 5.74 GiB, with no visible quality
+              loss in a real test generation. The text encoder and VAE are
+              never quantized by this.
 
 Explicit content IS allowed.
 """
@@ -37,7 +44,7 @@ import os
 import sys
 
 import torch
-from diffusers import ZImagePipeline
+from diffusers import ZImagePipeline, ZImageTransformer2DModel
 from transformers import Qwen3Model
 
 import content_safety
@@ -75,6 +82,34 @@ def _pick_dtype(device: torch.device):
     return torch.bfloat16 if device.type in ("cuda", "mps") else torch.float32
 
 
+QUANTIZE_WEIGHTS_SUPPORTED = ("int8",)
+
+
+def _quantize_weights_env():
+    """$Z_IMAGE_QUANTIZE_WEIGHTS if set, else None (no quantization, unchanged
+    behavior). Read at call time, not import time. Raises ValueError for any
+    value other than the currently-implemented ones."""
+    value = os.environ.get("Z_IMAGE_QUANTIZE_WEIGHTS")
+    if not value:
+        return None
+    if value not in QUANTIZE_WEIGHTS_SUPPORTED:
+        raise ValueError(
+            "Z_IMAGE_QUANTIZE_WEIGHTS=%r is not supported; only %r is currently "
+            "implemented" % (value, QUANTIZE_WEIGHTS_SUPPORTED))
+    return value
+
+
+def _quantize_transformer(transformer, qtype_name):
+    """Quantize transformer's weights in place to qtype_name ("int8" only, so
+    far), via optimum-quanto. Imported lazily so it is not a hard dependency
+    unless Z_IMAGE_QUANTIZE_WEIGHTS is actually set."""
+    from optimum.quanto import freeze, qint8, quantize
+    qtype_map = {"int8": qint8}
+    print(f"[z_image_skill] quantizing transformer weights to {qtype_name} ...")
+    quantize(transformer, weights=qtype_map[qtype_name])
+    freeze(transformer)
+
+
 def load_pipeline(lora_path=None):
     """Load the Z-Image-Turbo pipeline with the abliterated text encoder, moved to the
     best device.
@@ -82,23 +117,31 @@ def load_pipeline(lora_path=None):
     lora_path: local .safetensors file or HF repo ID, prep for future fine-tuning.
     Omitted unless explicitly set; when given, it is fused into the transformer at
     strength 1.0 (diffusers' ZImageLoraLoaderMixin.load_lora_weights + fuse_lora),
-    so every later generate_image() call uses it with no per-call overhead."""
+    so every later generate_image() call uses it with no per-call overhead.
+
+    $Z_IMAGE_QUANTIZE_WEIGHTS (see the module docstring) quantizes the transformer
+    only, before it is handed to the pipeline; omitted unless explicitly set."""
     device = _pick_device()
     dtype = _pick_dtype(device)
     token = os.environ.get("HF_TOKEN")
+    quantize_weights = _quantize_weights_env()
     print(f"[z_image_skill] loading {BASE_MODEL_ID} + {TEXT_ENCODER_ID} on {device.type} ({dtype}) ...")
     te_cache = _cache_dir_for(TEXT_ENCODER_ID)
     base_cache = _cache_dir_for(BASE_MODEL_ID)
     print(f"[z_image_skill] cache: {TEXT_ENCODER_ID} <- {te_cache or 'default HF cache'}")
     print(f"[z_image_skill] cache: {BASE_MODEL_ID} <- {base_cache or 'default HF cache'}")
     text_encoder = Qwen3Model.from_pretrained(TEXT_ENCODER_ID, dtype=dtype, token=token, cache_dir=te_cache)
-    pipeline = ZImagePipeline.from_pretrained(
-        BASE_MODEL_ID,
-        text_encoder=text_encoder,
-        torch_dtype=dtype,
-        token=token,
-        cache_dir=base_cache,
-    ).to(device)
+
+    pipeline_kwargs = dict(text_encoder=text_encoder, torch_dtype=dtype, token=token, cache_dir=base_cache)
+    if quantize_weights:
+        print(f"[z_image_skill] loading transformer separately for quantization "
+              f"(Z_IMAGE_QUANTIZE_WEIGHTS={quantize_weights}) ...")
+        transformer = ZImageTransformer2DModel.from_pretrained(
+            BASE_MODEL_ID, subfolder="transformer", torch_dtype=dtype, token=token, cache_dir=base_cache)
+        _quantize_transformer(transformer, quantize_weights)
+        pipeline_kwargs["transformer"] = transformer
+
+    pipeline = ZImagePipeline.from_pretrained(BASE_MODEL_ID, **pipeline_kwargs).to(device)
     pipeline.vae.to(torch.float32)
     if lora_path is not None:
         print(f"[z_image_skill] loading LoRA {lora_path} (fused at strength 1.0)")
