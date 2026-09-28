@@ -37,17 +37,29 @@ port, commit `59dfc2d`) is what makes overriding it possible at all.
 
 **Text-only mode (no `--seed-image`) does not work on this machine — confirmed by a
 real failure, not just predicted.** Omitting `--seed-image` falls back to Z-Image-Turbo
-for panel 1's still, and its base transformer alone is ~24.6GB (3 safetensors shards:
-9.97 + 9.97 + 4.67GB) — 1.5x the entire machine's unified memory, before the text
-encoder or any activations are even counted. No amount of text-encoder quantization
-changes this; only the DiT's own size matters here, and it isn't quantized. Real
-failure observed on this target:
+for panel 1's still. Real failure observed on this target:
 
 ```
 panel 1 ERROR: MPS backend out of memory (MPS allocated: 19.80 GiB, other
 allocations: 2.80 MiB, max allowed: 20.13 GiB). Tried to allocate 708.98 MiB on
 private pool.
 ```
+
+**Correction, 2026-09-27:** the transformer's real bf16-loaded size is **11.46 GiB**,
+not the ~24.6GB previously stated here (that figure came from on-disk fp32 shard
+sizes, not what `torch_dtype=torch.bfloat16` actually loads into memory). The
+19.80 GiB in the failure above matches almost exactly: 11.46 GiB transformer +
+7.49 GiB text encoder + VAE + overhead — a real, un-padded ceiling this machine's
+20.13 GiB `max allowed` couldn't absorb.
+
+**A real path to fixing this properly (not yet validated on this hardware):**
+`z_image_skill.py` now supports `Z_IMAGE_QUANTIZE_WEIGHTS=int8` (added this session,
+`optimum-quanto`), confirmed on the dev machine to shrink the transformer to 5.74 GiB
+with no visible quality loss in a real test generation — bringing the full pipeline
+to ~13.39 GiB, a real ~6.7 GiB margin instead of the 0.33 GiB margin in the failure
+above. This has only been tested on a 48GB machine with huge slack; it has not yet
+been run on this 16GB target. Until it's confirmed there, treat text-only mode as
+still unsupported:
 
 Every invocation of `bin/ltx-movie` on this machine must include `--seed-image <a
 real photo>`.
