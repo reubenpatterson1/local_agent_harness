@@ -1,7 +1,12 @@
 #!/bin/bash
 # story-server -- single lifecycle tool for the Phase-1 story LLM: `vision` mode serves
 # Qwen3-VL-32B abliterated 4-bit via vLLM-Metal; `text` mode serves the 27B MTPLX text
-# model. See docs/superpowers/plans/2026-09-17-story-server-lifecycle-plan.md.
+# model; `mlx-vision` mode serves a real VLM via `python -m mlx_vlm.server` (added
+# 2026-09-29 for the 16GB M1 port -- vLLM-Metal's own vision path needs more memory
+# than that host has; mlx_vlm.server is a genuinely different backend, confirmed to
+# handle multimodal image_url content, unlike mlx_lm.server which cannot process
+# images at all regardless of model). See
+# docs/superpowers/plans/2026-09-17-story-server-lifecycle-plan.md.
 #
 # Contract and known hazards (plan D2/R1/R3 -- these are documented, NOT defended in
 # code; there is no lock file and no health watchdog):
@@ -40,6 +45,15 @@ VISION_LOG="$WS/generated/vllm_vl_serve.log"
 # pushed swap past the supervisor's absolute 3.0 GiB gate; 0.70 is qwen-serve-guard's
 # production value.
 VISION_GPU_MEM_UTIL="${STORY_SERVER_VISION_GPU_MEM_UTIL:-0.70}"
+
+# mlx-vision: a real VLM served via `python -m mlx_vlm.server` (a separate package
+# from mlx_lm, which cannot process images at all -- confirmed 2026-09-27). No
+# --served-model-name equivalent exists, so MODEL_ID itself is overridden to this
+# value for this mode (see the CMD dispatch below) rather than aliased.
+MLX_VISION_MODEL_ID="${STORY_SERVER_MLX_VISION_MODEL_ID:-andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit}"
+MLX_VLM_PYTHON="${STORY_SERVER_MLX_VLM_PYTHON:-python3}"
+MLX_VISION_LOG="$WS/generated/mlx_vlm_serve.log"
+MLX_VISION_MAX_TOKENS="${STORY_SERVER_MLX_VISION_MAX_TOKENS:-16384}"
 
 MTPLX_BIN="${STORY_SERVER_MTPLX_BIN:-/opt/homebrew/bin/mtplx}"
 MTPLX_VERSION_REQUIRED="${STORY_SERVER_MTPLX_VERSION:-2.10.1}"
@@ -157,6 +171,8 @@ is_server_pid() {
         # followed by its first flag, and requiring it keeps this from matching a
         # command that merely mentions the module name as its last argument.
         *" -m mtplx.server.openai "*) return 0 ;;
+        *" -m mlx_vlm.server "*) return 0 ;;
+        *" -m mlx_vlm.server")   return 0 ;;
     esac
     return 1
 }
@@ -227,7 +243,8 @@ serve_cmd_pids() {
           if (base !~ /^([Pp]ython|vllm|mtplx|bash)/) next          # argv[0] allowlist (guard:361-364)
           if (index(cmd, portarg) == 0) next                        # only OUR port
           if (index(cmd, "vllm serve") > 0 || index(cmd, "mtplx serve") > 0 ||
-              index(cmd, " -m mtplx.server.openai ") > 0) printf "%s ", pid }'
+              index(cmd, " -m mtplx.server.openai ") > 0 ||
+              index(cmd, " -m mlx_vlm.server") > 0) printf "%s ", pid }'
 }
 
 # Usage: CAND=$(add_pid "$CAND" "$p")  -- appends $p to a space-separated list
@@ -296,6 +313,15 @@ cmd_serve() {
             die2 "vision mode needs the model directory $VISION_MODEL_DIR; create it with: ln -sfn /Users/reubenpatterson/hf_home/hub/models--divinetribe--Huihui-Qwen3-VL-32B-Instruct-abliterated-4bit-mlx/snapshots/5428d6aaca0103a1e32f47261a20fecaa47700ec $VISION_MODEL_DIR (on the dev host the snapshot lives under /Volumes/Ollama/hf_home/hub/... -- see Step 6)"   # M11
             exit 4
         fi
+    elif [ "$MODE" = "mlx-vision" ]; then
+        if ! command -v "$MLX_VLM_PYTHON" >/dev/null 2>&1; then
+            die2 "mlx-vision mode needs $MLX_VLM_PYTHON on PATH or as an absolute path"   # M28
+            exit 4
+        fi
+        if ! "$MLX_VLM_PYTHON" -c "import mlx_vlm" >/dev/null 2>&1; then
+            die2 "mlx-vision mode needs the mlx_vlm package importable by $MLX_VLM_PYTHON (pip install mlx-vlm)"   # M29
+            exit 4
+        fi
     else
         if [ ! -x "$MTPLX_BIN" ]; then
             die2 "text mode needs an executable $MTPLX_BIN; see README section \"MTPLX provisioning\""   # M12
@@ -325,7 +351,10 @@ cmd_serve() {
     # S-5. Log + spawn.
     /bin/mkdir -p "$WS/generated"
     local log
-    if [ "$MODE" = "vision" ]; then log="$VISION_LOG"; else log="$TEXT_LOG"; fi
+    if [ "$MODE" = "vision" ]; then log="$VISION_LOG"
+    elif [ "$MODE" = "mlx-vision" ]; then log="$MLX_VISION_LOG"
+    else log="$TEXT_LOG"
+    fi
     printf '\n===== story-server spawn %s %s =====\n' "$MODE" "$(iso_now)" >> "$log"
 
     if [ "$MODE" = "vision" ]; then
@@ -338,6 +367,13 @@ cmd_serve() {
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
             --gpu-memory-utilization "$VISION_GPU_MEM_UTIL" \
+            >>"$log" 2>&1 </dev/null &
+        SPAWN_PID=$!
+    elif [ "$MODE" = "mlx-vision" ]; then
+        /usr/bin/nohup "$MLX_VLM_PYTHON" -m mlx_vlm.server \
+            --model "$MLX_VISION_MODEL_ID" \
+            --host 127.0.0.1 --port "$PORT" \
+            --max-tokens "$MLX_VISION_MAX_TOKENS" \
             >>"$log" 2>&1 </dev/null &
         SPAWN_PID=$!
     else
@@ -404,7 +440,10 @@ cmd_serve() {
 
     # S-8. Ready line.
     local source
-    if [ "$MODE" = "vision" ]; then source="$VISION_MODEL_DIR"; else source="$TEXT_MODEL_REPO"; fi
+    if [ "$MODE" = "vision" ]; then source="$VISION_MODEL_DIR"
+    elif [ "$MODE" = "mlx-vision" ]; then source="$MLX_VISION_MODEL_ID"
+    else source="$TEXT_MODEL_REPO"
+    fi
     say "ready after ${waited}s; serving $source as $MODEL_ID in $MODE mode on 127.0.0.1:$PORT"   # M17
 
     # S-9. Warm-up (D6). Exactly one attempt -- vllm-metal crashes under overlapping
@@ -434,6 +473,11 @@ EOF
 
 cmd_status() {
     read_mode_file
+    # mlx-vision has no --served-model-name equivalent, so its real reported id is
+    # MLX_VISION_MODEL_ID, not the vision/text alias -- must be resolved from the
+    # RECORDED mode here, since $CMD (a fixed "status") never tells us which server
+    # is actually running.
+    if [ "$MODE_REC" = "mlx-vision" ]; then MODEL_ID="$MLX_VISION_MODEL_ID"; fi
 
     local pids served code state firstpid cmd120 pid_cmd_text first_line log tail_line
 
@@ -481,6 +525,7 @@ cmd_status() {
     fi
     log=""
     if [ "$MODE_REC" = "vision" ]; then log="$VISION_LOG"
+    elif [ "$MODE_REC" = "mlx-vision" ]; then log="$MLX_VISION_LOG"
     elif [ "$MODE_REC" = "text" ]; then log="$TEXT_LOG"
     fi
     if [ -n "$log" ]; then
@@ -505,6 +550,9 @@ cmd_status() {
 
 cmd_stop() {
     read_mode_file
+    # See cmd_status's identical comment: mlx-vision's real reported id must be
+    # resolved from the RECORDED mode, not the fixed "stop" $CMD.
+    if [ "$MODE_REC" = "mlx-vision" ]; then MODEL_ID="$MLX_VISION_MODEL_ID"; fi
 
     local port_list serve_list eng_list pid cmd120 accepted
 
@@ -595,9 +643,16 @@ cmd_stop() {
 CMD="${1:-}"
 
 if [ "$#" -ne 1 ] || { [ "$CMD" != "vision" ] && [ "$CMD" != "text" ] \
+                        && [ "$CMD" != "mlx-vision" ] \
                         && [ "$CMD" != "status" ] && [ "$CMD" != "stop" ]; }; then
-    printf 'usage: story-server [vision|text|status|stop]\n' >&2   # M01
+    printf 'usage: story-server [vision|text|mlx-vision|status|stop]\n' >&2   # M01
     exit 2
+fi
+
+# mlx-vision has no --served-model-name equivalent, so MODEL_ID itself becomes the
+# real model id for this mode rather than an alias (see the module comment above).
+if [ "$CMD" = "mlx-vision" ]; then
+    MODEL_ID="$MLX_VISION_MODEL_ID"
 fi
 
 [ -x "$LSOF" ] || {
@@ -614,7 +669,7 @@ fi
 }
 
 case "$CMD" in
-    vision|text)
+    vision|text|mlx-vision)
         cmd_serve
         ;;
     status)
