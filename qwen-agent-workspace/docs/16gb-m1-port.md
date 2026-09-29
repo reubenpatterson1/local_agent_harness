@@ -111,15 +111,21 @@ chosen "biggest model that fits alone" choice. **Confirmed end to end
 `movie.mp4` produced), with the vision server stopped manually before
 Phase 4, as required below.
 
+**Now natively supported (2026-09-29): `bin/story-server mlx-vision`.** No more manual
+start/kill — `bin/story-server` starts, stops, and reports status for this backend
+the same way it always has for `vision`/`text` (idempotence, mode-file, readiness
+poll, warm-up, stop-recognition all apply). `--no-story-server-stop-after-story` and
+manually killing the process before Phase 4 are no longer needed:
+
 ```bash
-python3 -m mlx_vlm.server --model "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit" --port 8177
+export STORY_SERVER_MLX_VISION_MODEL_ID="andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit"
+bin/story-server mlx-vision
 ```
 
 ```
 python3 bin/ltx-movie "..." --seed-image <photo> --story-id <id> \
   --story-model "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit" \
   --story-context-window 262144 \
-  --no-story-server-stop-after-story \
   ... (the confirmed-stable geometry/model flags above)
 ```
 
@@ -131,15 +137,10 @@ field, so `bin/qwen-agent` assumes a conservative 16384 by default, which
 native window is 262144 (confirmed via its own `config.json`). `--story-context-window`
 (`bin/ltx-movie` commit `eb49f6a`) overrides the wrong assumption.
 
-`--story-model` is required — without it, `bin/ltx-movie` never tells `bin/qwen-agent`
-which model to declare, so it falls back to a hardcoded default that doesn't match
-whatever's actually serving (a real bug found and fixed this session, `bin/ltx-movie`
-commit `6118804`). `--no-story-server-stop-after-story` is also required: `bin/story-server
-stop` only recognizes `vllm serve`/`mtplx serve` command lines, so it can never
-find or release `mlx_vlm.server` — **you must kill it yourself, and you must do
-it before Phase 4 starts**, since with `--no-review` there is no pause point at
-all between phases. If you don't kill it in time, Phase 4 (video DiT + Gemma)
-will try to load while the ~9GB vision model is still resident.
+`--story-model` is still required — without it, `bin/ltx-movie` never tells
+`bin/qwen-agent` which model to declare, so it falls back to a hardcoded default that
+doesn't match whatever's actually serving (a real bug found and fixed this session,
+`bin/ltx-movie` commit `6118804`).
 
 **Not `mlx_lm.server`.** A real dead end hit on this exact port: `mlx_lm.server`
 (the `mlx-lm` package) unconditionally rejects any multimodal request with
@@ -148,7 +149,8 @@ will try to load while the ~9GB vision model is still resident.
 declared. This is not fixable by matching `--story-model` to the server; the
 server itself cannot process images at all. The correct tool for a real VLM
 checkpoint is the separate `mlx_vlm` package's own server (`python3 -m
-mlx_vlm.server`), confirmed to actually handle `image_url` content parts.
+mlx_vlm.server`), confirmed to actually handle `image_url` content parts, and
+now what `bin/story-server mlx-vision` runs internally.
 
 **Original, fully-validated alternative:** `alexgusevski/Huihui-Qwen3-VL-4B-Instruct-abliterated-q4-mlx`
 via the standard `bin/story-server vision` path (`STORY_SERVER_VISION_GPU_MEM_UTIL=0.50`
@@ -181,12 +183,9 @@ once the calibration above has also been done.
 
 ## Known risks
 
-- **The 9B `mlx_vlm.server` path has no automated memory release.**
-  `bin/story-server` cannot start, stop, or manage it — you must kill it
-  manually, and you must do so before Phase 4 starts. Combined with
-  `--no-review`, there is no pause point at all between phases, so this is
-  genuinely timing-sensitive: watch the console for `=== Phase 4: render ===`
-  and kill the server before that line appears, not after.
+- ~~The 9B `mlx_vlm.server` path has no automated memory release~~ **RESOLVED
+  2026-09-29:** `bin/story-server mlx-vision` now starts/stops/manages it the same
+  way it always has for `vision`/`text` — no manual kill, no timing sensitivity.
 - **4B-class vision-model prose quality.** Confirmed working on one real
   3-panel chain test. This is one data point, not a guarantee across many
   different prompts — this project's own prior research flagged 4B-class
