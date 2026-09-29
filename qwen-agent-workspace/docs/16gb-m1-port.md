@@ -106,9 +106,10 @@ derived geometry) before committing to a full multi-panel render.
 **Preferred vision backend (2026-09-27): `andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit` via `mlx_vlm.server`.**
 Phase 1 releases the vision server before Phase 4 needs its memory back, so
 there's no reason to stay small during story generation — this is the
-chosen "biggest model that fits alone" choice. **Confirmed so far: Phase 1
-only** (a real, image-grounded story generated successfully). Phase 2-4
-completion with this backend has not yet been confirmed end to end.
+chosen "biggest model that fits alone" choice. **Confirmed end to end
+(2026-09-29): a real 15-panel run completed successfully** (Phase 1-4,
+`movie.mp4` produced), with the vision server stopped manually before
+Phase 4, as required below.
 
 ```bash
 python3 -m mlx_vlm.server --model "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit" --port 8177
@@ -117,9 +118,18 @@ python3 -m mlx_vlm.server --model "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX
 ```
 python3 bin/ltx-movie "..." --seed-image <photo> --story-id <id> \
   --story-model "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit" \
+  --story-context-window 262144 \
   --no-story-server-stop-after-story \
   ... (the confirmed-stable geometry/model flags above)
 ```
+
+`--story-context-window 262144` is required for longer stories (confirmed with a
+real 15-panel run): `mlx_vlm.server`'s `/v1/models` doesn't report a context-length
+field, so `bin/qwen-agent` assumes a conservative 16384 by default, which
+`--max-tokens` (scaling up with `--panels`) then eats directly into — producing
+`status=context_budget` failures on longer stories even though the real model's
+native window is 262144 (confirmed via its own `config.json`). `--story-context-window`
+(`bin/ltx-movie` commit `eb49f6a`) overrides the wrong assumption.
 
 `--story-model` is required — without it, `bin/ltx-movie` never tells `bin/qwen-agent`
 which model to declare, so it falls back to a hardcoded default that doesn't match
