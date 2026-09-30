@@ -95,6 +95,15 @@ characterized beyond "below 77 works"; if resolution matters, try a few `LTX_MAX
 values and inspect what `derive_video_dims` actually picks (Phase 0 prints the
 derived geometry) before committing to a full multi-panel render.
 
+**`LTX_MAX_AREA_CELLS` does not apply without `--seed-image`.** Confirmed by a real
+failure (2026-09-30): text-only mode (no seed photo) never calls `derive_video_dims`
+at all — `bin/ltx-movie` hardcodes `704`/`448` as the default whenever
+`--video-width`/`--video-height` aren't passed explicitly (`bin/ltx-movie:1094-1097`).
+That's the exact same 77-cell area that OOM's during VAE decode, reached by a
+different code path. The env var genuinely has no effect here; pass
+`--video-width 640 --video-height 384` explicitly instead (the confirmed-stable
+geometry) — those flags work fine in text-only mode, only `--seed-image` rejects them.
+
 ## Confirmed-stable geometry
 
 ```
