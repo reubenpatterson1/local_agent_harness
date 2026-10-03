@@ -261,6 +261,12 @@ def build_parser():
                               "between panels; no continuity, no chaining.")
     parser.add_argument("--no-review", dest="no_review", action="store_true", default=False)
     parser.add_argument("--force-story", dest="force_story", action="store_true", default=False)
+    parser.add_argument("--story-prompt-override", dest="story_prompt_override",
+                         metavar="PATH", default=None,
+                         help="use the content of PATH verbatim as the Phase 1 story prompt "
+                              "instead of building it from the narrative; it is still "
+                              "persisted to story_prompt.txt. Only takes effect when Phase 1 "
+                              "actually runs (story.md absent, or --force-story).")
     parser.add_argument("--force", action="store_true", default=False)
     parser.add_argument("--min-avail-gib", dest="min_avail_gib", type=float, default=25.0)
     parser.add_argument("--avail-timeout", dest="avail_timeout", type=int, default=1800)
@@ -660,9 +666,13 @@ def phase1_story(args):
               % story_md)
     else:
         print("=== Phase 1: story ===")
-        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
-                                     bool(getattr(args, "seed_image", None)),
-                                     seconds=_clip_seconds(args))
+        if args.story_prompt_override is not None:
+            with open(args.story_prompt_override, encoding="utf-8") as f:
+                prompt = f.read()
+        else:
+            prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
+                                         bool(getattr(args, "seed_image", None)),
+                                         seconds=_clip_seconds(args))
         with open(os.path.join(_story_dir(args.story_id), "story_prompt.txt"), "w",
                   encoding="utf-8") as f:
             f.write(prompt)
@@ -1108,6 +1118,11 @@ def main(argv=None):
     if getattr(args, "seed_image", None) and args.no_stills:
         print("Error: --seed-image is incompatible with --no-stills: --no-stills removes "
               "Phase 2 entirely, so the seed image would never become panel_01.png.",
+              file=sys.stderr)
+        return 2
+
+    if args.story_prompt_override is not None and not os.path.isfile(args.story_prompt_override):
+        print("Error: --story-prompt-override file not found: %s" % args.story_prompt_override,
               file=sys.stderr)
         return 2
 
