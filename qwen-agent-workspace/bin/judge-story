@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""judge-story -- judge a generated story.md with Claude and propose a revised prompt.
+
+Phase 1 of the story-pipeline self-improvement loop
+(docs/superpowers/specs/2026-10-02-judge-story-design.md). Observational only:
+it reads a story.md and the sibling story_prompt.txt that bin/ltx-movie's
+Phase 1 wrote next to it, asks Claude (extended thinking) to call the
+submit_judgment tool with four 1-10 scores, a panel-specific critique, and a
+revised story-generation prompt, then writes judgment.json and
+story_prompt.revised.txt next to story.md and prints the scores, critique,
+and revised prompt. It never regenerates anything.
+
+Usage:
+  bin/judge-story --story-id <id>               # generated/stories/<id>/story.md
+  bin/judge-story --story-md <path/to/story.md>
+
+Requires ANTHROPIC_API_KEY in the environment. Exit codes: 0 success,
+1 runtime or API failure, 2 argument or precondition failure. If Claude never
+calls submit_judgment (after one retry) or its input fails schema validation,
+the raw API responses are written to judgment.raw.json and no scores are
+reported.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import sys
+
+import anthropic
+import jsonschema
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+MODEL = "claude-opus-5-5"
+THINKING_BUDGET_TOKENS = 16000
+# 21333 is the SDK's largest non-streaming max_tokens without an explicit timeout=;
+# it leaves ~5,300 visible-output tokens above the thinking budget (spec 4.1, G1).
+MAX_TOKENS = 21333
+TOOL_NAME = "submit_judgment"
+TOOL_DESCRIPTION = ("Submit your judgment of the story: four 1-10 scores, a critique naming "
+                    "specific panels by number, and a full revised story-generation prompt. "
+                    "You must call this exactly once.")
+
+# Output order of the scores in judgment.json and on stdout (spec 5.1, 5.3).
+SCORE_KEYS = ("pacing_progression", "action_plausibility", "visual_specificity", "continuity")
+
+SUBMIT_JUDGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "object",
+            "properties": {
+                "pacing_progression": {"type": "integer", "minimum": 1, "maximum": 10},
+                "action_plausibility": {"type": "integer", "minimum": 1, "maximum": 10},
+                "visual_specificity": {"type": "integer", "minimum": 1, "maximum": 10},
+                "continuity": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["pacing_progression", "action_plausibility", "visual_specificity",
+                         "continuity"],
+        },
+        "critique": {
+            "type": "string",
+            "description": "Free-text critique. Name specific panels by number (e.g. 'Panel 7').",
+        },
+        "revised_prompt": {
+            "type": "string",
+            "description": ("A complete replacement for the original story-generation prompt "
+                            "that addresses the critique."),
+        },
+    },
+    "required": ["scores", "critique", "revised_prompt"],
+}
+
+
+def validate_judgment_input(tool_input):
+    """Raise jsonschema.ValidationError unless tool_input matches SUBMIT_JUDGMENT_SCHEMA.
+
+    The schema has no $schema key, so jsonschema uses its latest draft, which does not
+    count booleans as integers. Extra keys are tolerated (no additionalProperties).
+    """
+    jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)
