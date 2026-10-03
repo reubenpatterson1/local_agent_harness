@@ -227,3 +227,124 @@ def test_t8_key_unset_never_constructs_client(tmp_path, monkeypatch, capsys):
     _, err = capsys.readouterr()
     assert err.startswith("Error: ANTHROPIC_API_KEY is not set")
     assert sorted(os.listdir(tmp_path)) == ["story.md", "story_prompt.txt"]
+
+
+# --- SDK response builders: real anthropic.types.Message objects (spec 7.1) ----------
+
+THINKING_BLOCK = {"type": "thinking", "thinking": "Weighing panel-to-panel momentum.",
+                  "signature": "sig-abc123"}
+
+
+def _usage(input_tokens, output_tokens, thinking_tokens):
+    """thinking_tokens=None omits output_tokens_details, as when the API does not report it."""
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if thinking_tokens is not None:
+        usage["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
+    return usage
+
+
+def _message(content, usage, stop_reason):
+    return anthropic.types.Message.model_validate({
+        "id": "msg_test_%s" % uuid.uuid4().hex, "type": "message", "role": "assistant",
+        "model": "claude-opus-5-5", "stop_reason": stop_reason, "stop_sequence": None,
+        "content": content, "usage": usage})
+
+
+def _tool_response(tool_input, usage):
+    return _message([THINKING_BLOCK, {"type": "tool_use", "id": "toolu_test",
+                                      "name": "submit_judgment", "input": tool_input}],
+                    usage, "tool_use")
+
+
+def _text_response(text, usage):
+    return _message([THINKING_BLOCK, {"type": "text", "text": text}], usage, "end_turn")
+
+
+# --- T7: successful run (spec 4.1, 5.1-5.3) ------------------------------------------
+
+def test_t7_successful_run(tmp_path, monkeypatch, capsys):
+    story_md = _make_story(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(1200, 3400, 2100))])
+
+    assert judge_story.main(["--story-md", str(story_md)]) == 0
+
+    with open(tmp_path / "judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    assert list(judgment) == ["story_md_path", "story_prompt_path", "model",
+                              "thinking_budget_tokens", "timestamp", "usage", "scores",
+                              "critique", "revised_prompt"]
+    assert judgment["story_md_path"] == str(story_md)
+    assert judgment["story_prompt_path"] == str(tmp_path / "story_prompt.txt")
+    assert judgment["model"] == "claude-opus-5-5"
+    assert judgment["thinking_budget_tokens"] == 16000
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", judgment["timestamp"])
+    assert judgment["usage"] == {"input_tokens": 1200, "output_tokens": 3400,
+                                 "thinking_tokens": 2100}
+    assert list(judgment["scores"]) == list(SCORE_NAMES)
+    assert judgment["scores"] == VALID_INPUT["scores"]
+    assert judgment["critique"] == VALID_INPUT["critique"]
+    assert judgment["revised_prompt"] == VALID_INPUT["revised_prompt"]
+    assert "—" in raw_text            # ensure_ascii=False
+    assert raw_text.endswith("}\n")        # trailing newline after json.dump
+
+    assert ((tmp_path / "story_prompt.revised.txt").read_bytes()
+            == VALID_INPUT["revised_prompt"].encode("utf-8"))
+    assert not (tmp_path / "judgment.raw.json").exists()
+
+    out, err = capsys.readouterr()
+    score_lines = "".join("  %-20s  %d\n" % (name, VALID_INPUT["scores"][name])
+                          for name in SCORE_NAMES)
+    assert "  pacing_progression    7\n" in score_lines   # pins the %-20s layout itself
+    assert out == ("Scores:\n" + score_lines
+                   + "\n--- Critique ---\n" + VALID_INPUT["critique"] + "\n"
+                   + "\n--- Revised prompt ---\n" + VALID_INPUT["revised_prompt"] + "\n")
+    assert err == ""
+
+    assert fake.constructions == [((), {})]               # Anthropic() with no arguments
+    assert len(fake.calls) == 1
+    kwargs = fake.calls[0]
+    assert sorted(kwargs) == ["max_tokens", "messages", "model", "system", "thinking",
+                              "tool_choice", "tools"]
+    assert kwargs["model"] == "claude-opus-5-5"
+    assert kwargs["max_tokens"] == 21333
+    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+    assert kwargs["tool_choice"] == {"type": "auto"}
+    assert kwargs["system"] == judge_story.SYSTEM_PROMPT
+    assert [tool["name"] for tool in kwargs["tools"]] == ["submit_judgment"]
+    assert kwargs["tools"][0]["input_schema"] == judge_story.SUBMIT_JUDGMENT_SCHEMA
+    assert kwargs["tools"][0]["description"] == judge_story.TOOL_DESCRIPTION
+    messages = kwargs["messages"]
+    assert len(messages) == 1 and messages[0]["role"] == "user"
+    assert STORY_MD_TEXT in messages[0]["content"]
+    assert STORY_PROMPT_TEXT in messages[0]["content"]
+    assert messages[0]["content"] == (
+        "Below are the original story-generation prompt and the story it produced.\n"
+        "\n<story_prompt>\n" + STORY_PROMPT_TEXT + "\n</story_prompt>\n"
+        "\n<story_md>\n" + STORY_MD_TEXT + "\n</story_md>\n"
+        "\nJudge the story and call submit_judgment.")
+
+
+# --- T10b: schema-invalid tool input (spec 4.4, E7) ----------------------------------
+
+def test_t10b_schema_invalid_tool_input(tmp_path, monkeypatch, capsys):
+    story_md = _make_story(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    bad = copy.deepcopy(VALID_INPUT)
+    bad["scores"]["continuity"] = 11
+    fake = _install_fake(monkeypatch, [_tool_response(bad, _usage(10, 20, 5))])
+
+    assert judge_story.main(["--story-md", str(story_md)]) == 1
+
+    assert len(fake.calls) == 1            # no retry on a validation failure (spec G3)
+    with open(tmp_path / "judgment.raw.json", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert len(raw["responses"]) == 1
+    assert raw["responses"][0]["content"][1]["input"]["scores"]["continuity"] == 11
+    assert not (tmp_path / "judgment.json").exists()
+    assert not (tmp_path / "story_prompt.revised.txt").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: submit_judgment input failed schema validation: ")
