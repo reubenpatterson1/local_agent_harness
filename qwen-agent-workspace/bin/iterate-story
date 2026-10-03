@@ -188,6 +188,12 @@ def _write_summary(story_dir, stop_reason, best_round, records):
         f.write("\n")
 
 
+def story_md_hash(story_md_path):
+    """sha256 hex digest of story.md's raw bytes (spec 3.5). Not pure: reads the file."""
+    with open(story_md_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -218,10 +224,16 @@ def main(argv=None):
     rounds = []
     records = []
     stop_reason = None
+    failure = None
     round_number = 0
     while True:
         round_number += 1
-        _run(build_judge_cmd(args.story_id))
+        judge = _run(build_judge_cmd(args.story_id))
+        if judge.returncode != 0:
+            failure = ("judge-story failed",
+                       "Error: round %d: judge-story exited %d; last output:\n%s"
+                       % (round_number, judge.returncode, _tail(judge.stdout)))
+            break
         with open(os.path.join(story_dir, "judgment.json"), encoding="utf-8") as f:
             judgment = json.load(f)
         scores = tuple(judgment["scores"][key] for key in SCORE_KEYS)
@@ -241,21 +253,45 @@ def main(argv=None):
         stop_reason = evaluate_stop(history, args.threshold, args.max_rounds)
         if stop_reason is not None:
             break
+        pre_hash = story_md_hash(story_md_path)
         fd, override_path = tempfile.mkstemp(prefix="iterate-story-prompt-", suffix=".txt")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(build_next_prompt(judgment["revised_prompt"], pinned_panel_count))
-            _run(build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count))
+            regen = _run(build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count))
         finally:
             os.remove(override_path)
+        if regen.returncode != 0:
+            failure = ("ltx-movie failed",
+                       "Error: round %d: ltx-movie exited %d; last output:\n%s"
+                       % (round_number, regen.returncode, _tail(regen.stdout)))
+            break
+        if story_md_hash(story_md_path) == pre_hash:
+            failure = ("ltx-movie no-op",
+                       "Error: round %d: ltx-movie exited 0 but story.md was not regenerated "
+                       "(unchanged content); last output:\n%s"
+                       % (round_number, _tail(regen.stdout)))
+            break
 
-    best_round = select_best_round(rounds)
-    best_version = version_base + best_round
-    promote(story_dir, best_version)
-    _write_summary(story_dir, stop_reason, best_round, records)
-    print("Stopped: %s. Best round: %d (v%d), promoted to story.md, story_prompt.txt, "
-          "judgment.json." % (stop_reason, best_round, best_version))
-    return 0
+    best_round = None
+    best_version = None
+    if rounds:
+        best_round = select_best_round(rounds)
+        best_version = version_base + best_round
+        promote(story_dir, best_version)
+    _write_summary(story_dir, stop_reason if failure is None else failure[0], best_round,
+                   records)
+    if failure is None:
+        print("Stopped: %s. Best round: %d (v%d), promoted to story.md, story_prompt.txt, "
+              "judgment.json." % (stop_reason, best_round, best_version))
+        return 0
+    print(failure[1], file=sys.stderr)
+    if best_round is None:
+        print("No round completed; live files left unchanged.", file=sys.stderr)
+    else:
+        print("Promoted best round %d (v%d) to story.md, story_prompt.txt, judgment.json."
+              % (best_round, best_version), file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

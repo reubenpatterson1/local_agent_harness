@@ -369,3 +369,76 @@ def test_tm8_argument_errors_exit_2(capsys):
             iterate_story.main(argv)
         assert excinfo.value.code == 2, argv
         assert message in capsys.readouterr().err, argv
+
+
+# --- T-M5, T-M6, T-M6b, T-M9: failure paths and no-op detection (spec 3.5, 6) ---------
+
+def test_tm5_judge_failure_mid_loop_promotes_best_so_far(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    fake = FakeRun(story_dir, [(6, 6, 6, 6), (7, 3, 3, 3), 1])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "9"]) == 1
+    out, err = capsys.readouterr()
+    assert "round 3" in err
+    assert "judge-story exited 1" in err
+    assert "judge boom" in err
+    assert ("Promoted best round 1 (v1) to story.md, story_prompt.txt, judgment.json."
+            in err)
+    assert "Stopped:" not in out
+    assert (fake.judge_calls, fake.ltx_calls) == (3, 2)
+    _assert_live_equals_archive(story_dir, 1)
+    summary = _summary(story_dir)
+    assert summary["stop_reason"] == "judge-story failed"
+    assert summary["best_round"] == 1
+    assert len(summary["rounds"]) == 2
+
+
+def test_tm6_ltx_movie_failure_restores_best_round(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    fake = FakeRun(story_dir, [(5, 5, 5, 5)], ltx_script=[1])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "9"]) == 1
+    err = capsys.readouterr().err
+    assert "round 1" in err
+    assert "ltx-movie exited 1" in err
+    assert "ltx boom" in err
+    assert _read_bytes(os.path.join(story_dir, "story.md")) != b"GARBAGE"
+    _assert_live_equals_archive(story_dir, 1)
+    assert not os.path.exists(fake.overrides[0][0])
+    summary = _summary(story_dir)
+    assert summary["stop_reason"] == "ltx-movie failed"
+    assert summary["best_round"] == 1
+
+
+def test_tm6b_round1_judge_failure_leaves_live_files(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    before = _read_bytes(os.path.join(story_dir, "story.md"))
+    fake = FakeRun(story_dir, [1])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "9"]) == 1
+    err = capsys.readouterr().err
+    assert "round 1" in err
+    assert "judge-story exited 1" in err
+    assert "No round completed; live files left unchanged." in err
+    assert _read_bytes(os.path.join(story_dir, "story.md")) == before
+    assert not os.path.exists(os.path.join(story_dir, "story.v1.md"))
+    summary = _summary(story_dir)
+    assert summary["best_round"] is None
+    assert summary["rounds"] == []
+    assert summary["stop_reason"] == "judge-story failed"
+
+
+def test_tm9_noop_regeneration_is_failure(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    fake = FakeRun(story_dir, [(5, 4, 4, 3)], ltx_script=["noop"])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "9"]) == 1
+    err = capsys.readouterr().err
+    assert "round 1" in err
+    assert "ltx-movie exited 0 but story.md was not regenerated" in err
+    assert (fake.judge_calls, fake.ltx_calls) == (1, 1)
+    _assert_live_equals_archive(story_dir, 1)
+    summary = _summary(story_dir)
+    assert summary["stop_reason"] == "ltx-movie no-op"
+    assert summary["best_round"] == 1
+    assert len(summary["rounds"]) == 1
