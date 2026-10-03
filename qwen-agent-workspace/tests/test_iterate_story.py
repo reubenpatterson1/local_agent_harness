@@ -450,3 +450,16 @@ def test_tm9_noop_regeneration_is_failure(tmp_path, monkeypatch, capsys):
     assert summary["stop_reason"] == "ltx-movie no-op"
     assert summary["best_round"] == 1
     assert len(summary["rounds"]) == 1
+
+
+def test_story_model_and_context_window_passthrough(tmp_path, monkeypatch):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    fake = FakeRun(story_dir, [(4, 4, 4, 4), (7, 7, 7, 7)])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "7",
+                               "--story-model", "qwen38-6bit",
+                               "--story-context-window", "262144"]) == 0
+    ltx_calls = [cmd for cmd, _ in fake.calls if os.path.basename(cmd[1]) == "ltx-movie"]
+    assert len(ltx_calls) == 1
+    assert ltx_calls[0][-4:] == ["--story-model", "qwen38-6bit",
+                                 "--story-context-window", "262144"]

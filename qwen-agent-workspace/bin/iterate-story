@@ -120,6 +120,13 @@ def build_parser():
     parser.add_argument("--max-rounds", dest="max_rounds", type=int, metavar="N",
                         default=DEFAULT_MAX_ROUNDS,
                         help="the maximum number of judged rounds (default: %(default)s)")
+    parser.add_argument("--story-model", dest="story_model", default=None, metavar="NAME",
+                        help="passed through to bin/ltx-movie's --story-model on every "
+                             "regeneration call")
+    parser.add_argument("--story-context-window", dest="story_context_window", type=int,
+                        default=None, metavar="N",
+                        help="passed through to bin/ltx-movie's --story-context-window on "
+                             "every regeneration call")
     return parser
 
 
@@ -140,13 +147,20 @@ def build_judge_cmd(story_id, target_panels):
             "--target-panels", str(target_panels)]
 
 
-def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count):
-    """bin/ltx-movie regeneration argv (spec 3.4.2). Never passes narrative or
+def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count, story_model=None,
+                        story_context_window=None):
+    """bin/ltx-movie regeneration argv (spec 3.4.2, extended). Never passes narrative or
     --danger-auto-approve: bin/ltx-movie adds the latter itself because --force-story
-    and --no-review are both present."""
-    return [sys.executable, os.path.join(WS, "bin", "ltx-movie"),
-            "--story-id", story_id, "--panels", str(pinned_panel_count), "--force-story",
-            "--no-review", "--story-only", "--story-prompt-override", override_path]
+    and --no-review are both present. --story-model/--story-context-window are appended
+    only when given, so the resulting argv is unchanged for a caller that omits them."""
+    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-movie"),
+           "--story-id", story_id, "--panels", str(pinned_panel_count), "--force-story",
+           "--no-review", "--story-only", "--story-prompt-override", override_path]
+    if story_model is not None:
+        cmd += ["--story-model", story_model]
+    if story_context_window is not None:
+        cmd += ["--story-context-window", str(story_context_window)]
+    return cmd
 
 
 def _run(cmd):
@@ -287,7 +301,8 @@ def main(argv=None):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(build_next_prompt(judgment["revised_prompt"], pinned_panel_count))
-            regen_cmd = build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count)
+            regen_cmd = build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count,
+                                            args.story_model, args.story_context_window)
             regen = _run(regen_cmd)
         finally:
             os.remove(override_path)
