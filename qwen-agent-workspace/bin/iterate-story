@@ -105,3 +105,158 @@ def select_best_round(rounds):
         if best_key is None or key > best_key:
             best_round, best_key = round_number, key
     return best_round
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="iterate-story",
+        description="Judge, revise, regenerate and re-judge one story until a stopping "
+                    "condition is met, then promote the best-scoring round.")
+    parser.add_argument("--story-id", dest="story_id", metavar="ID", required=True,
+                        help="iterate on generated/stories/ID/story.md")
+    parser.add_argument("--threshold", dest="threshold", type=int, metavar="N", required=True,
+                        help="the per-dimension bar (1-10) that all four scores must meet "
+                             "or exceed")
+    parser.add_argument("--max-rounds", dest="max_rounds", type=int, metavar="N",
+                        default=DEFAULT_MAX_ROUNDS,
+                        help="the maximum number of judged rounds (default: %(default)s)")
+    return parser
+
+
+def resolve_paths(story_id):
+    """(story_dir, story_md_path, story_prompt_path) for story_id (spec 2.2). Reads WS
+    at call time so tests can monkeypatch it."""
+    story_dir = os.path.join(WS, "generated", "stories", story_id)
+    story_md_path = os.path.join(story_dir, "story.md")
+    story_prompt_path = os.path.join(story_dir, "story_prompt.txt")
+    return story_dir, story_md_path, story_prompt_path
+
+
+def build_judge_cmd(story_id):
+    """bin/judge-story argv (spec 3.4.1)."""
+    return [sys.executable, os.path.join(WS, "bin", "judge-story"), "--story-id", story_id]
+
+
+def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count):
+    """bin/ltx-movie regeneration argv (spec 3.4.2). Never passes narrative or
+    --danger-auto-approve: bin/ltx-movie adds the latter itself because --force-story
+    and --no-review are both present."""
+    return [sys.executable, os.path.join(WS, "bin", "ltx-movie"),
+            "--story-id", story_id, "--panels", str(pinned_panel_count), "--force-story",
+            "--no-review", "--story-only", "--story-prompt-override", override_path]
+
+
+def _run(cmd):
+    """Run one child (spec 3.4): combined output captured, stdin closed, no timeout,
+    environment inherited."""
+    return subprocess.run(cmd, cwd=WS, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def _tail(output):
+    return "\n".join((output or "").splitlines()[-TAIL_LINES:])
+
+
+def _archive(story_dir, version):
+    """Copy the live judged triple to its .v<version> archive (spec 1.2 step 3)."""
+    for live_name, archive_name in (("story.md", "story.v%d.md" % version),
+                                    ("story_prompt.txt", "story_prompt.v%d.txt" % version),
+                                    ("judgment.json", "judgment.v%d.json" % version)):
+        shutil.copyfile(os.path.join(story_dir, live_name),
+                        os.path.join(story_dir, archive_name))
+
+
+def promote(story_dir, version):
+    """Overwrite the live files from the .v<version> archive, and story_prompt.revised.txt
+    from that judgment's revised_prompt with no added newline (spec 1.5, G6)."""
+    for archive_name, live_name in (("story.v%d.md" % version, "story.md"),
+                                    ("story_prompt.v%d.txt" % version, "story_prompt.txt"),
+                                    ("judgment.v%d.json" % version, "judgment.json")):
+        shutil.copyfile(os.path.join(story_dir, archive_name),
+                        os.path.join(story_dir, live_name))
+    with open(os.path.join(story_dir, "judgment.v%d.json" % version), encoding="utf-8") as f:
+        revised_prompt = json.load(f)["revised_prompt"]
+    with open(os.path.join(story_dir, "story_prompt.revised.txt"), "w", encoding="utf-8") as f:
+        f.write(revised_prompt)
+
+
+def _write_summary(story_dir, stop_reason, best_round, records):
+    """run-summary.json (spec 5.2): keys in this order, judgment.json's formatting."""
+    summary = {"stop_reason": stop_reason, "best_round": best_round, "rounds": records}
+    with open(os.path.join(story_dir, "run-summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not 1 <= args.threshold <= 10:
+        parser.error("--threshold must be an integer from 1 to 10")
+    if args.max_rounds < 1:
+        parser.error("--max-rounds must be at least 1")
+
+    story_dir, story_md_path, story_prompt_path = resolve_paths(args.story_id)
+    if not os.path.isfile(story_md_path):
+        print("Error: story.md not found: %s" % story_md_path, file=sys.stderr)
+        return 2
+    if not os.path.isfile(story_prompt_path):
+        print("Error: story_prompt.txt not found: %s. iterate-story needs the original "
+              "story-generation prompt to produce revised_prompt. This story may predate "
+              "bin/ltx-movie's story_prompt.txt persistence (re-run its Phase 1 with "
+              "--force-story)." % story_prompt_path, file=sys.stderr)
+        return 2
+    with open(story_md_path, encoding="utf-8") as f:
+        pinned_panel_count = count_panels(f.read())
+    if pinned_panel_count == 0:
+        print('Error: no "## Panel" headers found in story.md: %s; cannot pin the panel '
+              'count.' % story_md_path, file=sys.stderr)
+        return 2
+
+    version_base = find_version_base(story_dir)
+    history = []
+    rounds = []
+    records = []
+    stop_reason = None
+    round_number = 0
+    while True:
+        round_number += 1
+        _run(build_judge_cmd(args.story_id))
+        with open(os.path.join(story_dir, "judgment.json"), encoding="utf-8") as f:
+            judgment = json.load(f)
+        scores = tuple(judgment["scores"][key] for key in SCORE_KEYS)
+        version = version_base + round_number
+        _archive(story_dir, version)
+        history.append(scores)
+        rounds.append((round_number, scores))
+        records.append({
+            "round": round_number,
+            "version": "v%d" % version,
+            "scores": dict(zip(SCORE_KEYS, scores)),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+        })
+        print("Round %d: pacing_progression=%d action_plausibility=%d visual_specificity=%d "
+              "continuity=%d" % ((round_number,) + scores))
+        stop_reason = evaluate_stop(history, args.threshold, args.max_rounds)
+        if stop_reason is not None:
+            break
+        fd, override_path = tempfile.mkstemp(prefix="iterate-story-prompt-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(build_next_prompt(judgment["revised_prompt"], pinned_panel_count))
+            _run(build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count))
+        finally:
+            os.remove(override_path)
+
+    best_round = select_best_round(rounds)
+    best_version = version_base + best_round
+    promote(story_dir, best_version)
+    _write_summary(story_dir, stop_reason, best_round, records)
+    print("Stopped: %s. Best round: %d (v%d), promoted to story.md, story_prompt.txt, "
+          "judgment.json." % (stop_reason, best_round, best_version))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
