@@ -104,6 +104,11 @@ SYSTEM_PROMPT = (
     "would address your critique. The revised prompt must be a full replacement for the "
     "original prompt, usable as-is, not a list of suggested edits.\n"
     "\n"
+    "If the user message below states a target panel count, your revised_prompt must be "
+    "written for exactly that many panels: both its panel-count declaration and its full "
+    "beat plan must match that count, not whatever count the original story or your own "
+    "critique might otherwise suggest.\n"
+    "\n"
     "You must deliver your judgment by calling the submit_judgment tool exactly once. Do not "
     "put the judgment in a plain text reply; a response without a submit_judgment call is a "
     "failure."
@@ -123,10 +128,12 @@ def validate_judgment_input(tool_input):
     jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)
 
 
-def build_user_message(story_md_text, story_prompt_text):
+def build_user_message(story_md_text, story_prompt_text, target_panels=None):
     """The single user turn (spec 4.5). Both texts are inserted in full: no truncation,
-    escaping, or stripping."""
-    return ("Below are the original story-generation prompt and the story it produced.\n"
+    escaping, or stripping. When target_panels is given, appends an explicit panel-count
+    instruction so the judge's own beat plan is built for that count from the start, instead
+    of proposing a different count that then has to be patched after the fact."""
+    message = ("Below are the original story-generation prompt and the story it produced.\n"
             "\n"
             "<story_prompt>\n"
             + story_prompt_text
@@ -135,8 +142,11 @@ def build_user_message(story_md_text, story_prompt_text):
             "<story_md>\n"
             + story_md_text
             + "\n</story_md>\n"
-            "\n"
-            "Judge the story and call submit_judgment.")
+            "\n")
+    if target_panels is not None:
+        message += "The revised_prompt must target exactly %d panels.\n\n" % target_panels
+    message += "Judge the story and call submit_judgment."
+    return message
 
 
 def find_tool_use(response):
@@ -157,6 +167,10 @@ def build_parser():
                             "story_prompt.txt")
     group.add_argument("--story-md", dest="story_md", metavar="PATH",
                        help="judge the story.md at PATH; story_prompt.txt must sit next to it")
+    parser.add_argument("--target-panels", dest="target_panels", type=int, metavar="N",
+                       help="instruct the judge that revised_prompt must target exactly N "
+                            "panels (used by bin/iterate-story to keep the panel count "
+                            "stable across rounds)")
     return parser
 
 
@@ -231,7 +245,7 @@ def main(argv=None):
         return 1
     client = anthropic.Anthropic()
 
-    user_message = build_user_message(story_md_text, story_prompt_text)
+    user_message = build_user_message(story_md_text, story_prompt_text, args.target_panels)
     responses = []
     try:
         responses.append(_create_message(client, [{"role": "user", "content": user_message}]))

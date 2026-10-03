@@ -271,7 +271,7 @@ def test_tm2_subprocess_argv_and_override_file(tmp_path, monkeypatch):
     assert ([os.path.basename(cmd[1]) for cmd, _ in fake.calls]
             == ["judge-story", "ltx-movie", "judge-story"])
     judge_cmd = [sys.executable, os.path.join(iterate_story.WS, "bin", "judge-story"),
-                 "--story-id", STORY_ID]
+                 "--story-id", STORY_ID, "--target-panels", str(PINNED)]
     assert fake.calls[0][0] == judge_cmd
     assert fake.calls[2][0] == judge_cmd
     override_path, override_content = fake.overrides[0]
@@ -287,6 +287,14 @@ def test_tm2_subprocess_argv_and_override_file(tmp_path, monkeypatch):
         assert kwargs == {"cwd": iterate_story.WS, "stdin": subprocess.DEVNULL,
                           "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
                           "text": True}
+
+    with open(os.path.join(story_dir, iterate_story.LOG_FILE_NAME), encoding="utf-8") as f:
+        log_text = f.read()
+    assert log_text.count("=== round 1: judge-story ===") == 1
+    assert log_text.count("=== round 1: ltx-movie ===") == 1
+    assert log_text.count("=== round 2: judge-story ===") == 1
+    assert "exit: 0" in log_text
+    assert "judged 1" in log_text and "regenerated 1" in log_text and "judged 2" in log_text
 
 
 def test_tm3_existing_versions_and_earliest_tie_promotion(tmp_path, monkeypatch, capsys):

@@ -132,9 +132,12 @@ def resolve_paths(story_id):
     return story_dir, story_md_path, story_prompt_path
 
 
-def build_judge_cmd(story_id):
-    """bin/judge-story argv (spec 3.4.1)."""
-    return [sys.executable, os.path.join(WS, "bin", "judge-story"), "--story-id", story_id]
+def build_judge_cmd(story_id, target_panels):
+    """bin/judge-story argv (spec 3.4.1, extended). Passes --target-panels so the judge
+    builds its revised_prompt's beat plan for the pinned count from the start, instead of
+    proposing a different count that then has to be patched after the fact."""
+    return [sys.executable, os.path.join(WS, "bin", "judge-story"), "--story-id", story_id,
+            "--target-panels", str(target_panels)]
 
 
 def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count):
@@ -151,6 +154,30 @@ def _run(cmd):
     environment inherited."""
     return subprocess.run(cmd, cwd=WS, stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+LOG_FILE_NAME = "iterate-story.log"
+
+
+def _log_run(story_dir, round_number, label, cmd, result):
+    """Append a full, unredacted record of one child call to iterate-story.log. Restores
+    the tiered-approval audit trail (docs/specs/2026-08-21-qwen-agent-tiered-approval-design.md
+    SS1.4) that discarding captured output on success would otherwise lose, now that
+    --danger-auto-approve is reachable from this script without a human typing it each round.
+    Called for every judge-story and ltx-movie call, success or failure."""
+    path = os.path.join(story_dir, LOG_FILE_NAME)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("=== round %d: %s === %s\n" % (
+            round_number, label,
+            datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")))
+        f.write("cmd: %r\n" % cmd)
+        f.write("exit: %d\n" % result.returncode)
+        f.write("--- output ---\n")
+        output = result.stdout or ""
+        f.write(output)
+        if output and not output.endswith("\n"):
+            f.write("\n")
+        f.write("--- end ---\n\n")
 
 
 def _tail(output):
@@ -228,7 +255,9 @@ def main(argv=None):
     round_number = 0
     while True:
         round_number += 1
-        judge = _run(build_judge_cmd(args.story_id))
+        judge_cmd = build_judge_cmd(args.story_id, pinned_panel_count)
+        judge = _run(judge_cmd)
+        _log_run(story_dir, round_number, "judge-story", judge_cmd, judge)
         if judge.returncode != 0:
             failure = ("judge-story failed",
                        "Error: round %d: judge-story exited %d; last output:\n%s"
@@ -258,9 +287,11 @@ def main(argv=None):
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(build_next_prompt(judgment["revised_prompt"], pinned_panel_count))
-            regen = _run(build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count))
+            regen_cmd = build_ltx_movie_cmd(args.story_id, override_path, pinned_panel_count)
+            regen = _run(regen_cmd)
         finally:
             os.remove(override_path)
+        _log_run(story_dir, round_number, "ltx-movie", regen_cmd, regen)
         if regen.returncode != 0:
             failure = ("ltx-movie failed",
                        "Error: round %d: ltx-movie exited %d; last output:\n%s"

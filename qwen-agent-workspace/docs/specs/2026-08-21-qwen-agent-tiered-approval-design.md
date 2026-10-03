@@ -197,6 +197,30 @@ tradeoff to be re-opened rather than re-asserted:
 command into a chain with no human review at any point. That composition is named and accepted in
 `docs/specs/2026-09-02-qwen-agent-session-memory-design.md` Section 17; it is not repeated here.
 
+### 1.4.1 Reopened and re-accepted: `bin/iterate-story` (2026-10-03)
+
+A new caller, `bin/iterate-story` (`docs/superpowers/specs/2026-10-03-iterate-story-design.md`),
+triggers the third bullet of "What would change the calculus" above: `bin/ltx-movie` passes
+`--danger-auto-approve` to its own `qwen-agent` subprocess whenever both `--force-story` and
+`--no-review` are given, and `bin/iterate-story` passes both on every regeneration round, across
+however many rounds a run takes, with no human typing the flag at any point. This is exactly the
+"wrapper script... any caller that passes it implicitly" trigger named above.
+
+**Re-opened, and re-accepted as implemented, with one addition.** The user reviewed this trigger
+and chose to keep the automatic passthrough rather than build a narrower bypass mechanism. The
+automatic passthrough itself is unchanged — this is not "making the flag safer" in the sense
+Section 1.4 forbids (no narrower scope, no allowlist, no per-tool opt-in was added to the flag or
+to `should_auto_approve()`).
+
+What was added instead is a property of the new caller, not the flag: `bin/iterate-story` writes a
+full, unredacted record of every `judge-story` and `ltx-movie` call it makes — command, exit code,
+and complete captured output, success or failure — to `iterate-story.log` in the story's own
+directory. This restores the "a transcript reader can always tell what ran unconfirmed" property
+for this caller specifically, which discarding captured output on success had silently lost
+(`_log_run()` in `bin/iterate-story`). It does not touch `--danger-auto-approve` itself,
+`should_auto_approve()`, or the `[danger-auto]` trace mechanism in `bin/qwen-agent` — those remain
+exactly as Section 1.4 describes them.
+
 ---
 
 ## 2. Complete list of parent-spec revisions

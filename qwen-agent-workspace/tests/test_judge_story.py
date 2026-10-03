@@ -469,3 +469,14 @@ def test_t11_api_key_never_leaks(tmp_path, monkeypatch, capsys):
     for text in [ok_out, ok_err, fail_out, fail_err] + [p.read_text(encoding="utf-8")
                                                          for p in written]:
         assert SENTINEL_KEY not in text
+
+
+def test_target_panels_optional():
+    assert judge_story.build_parser().parse_args(["--story-id", "x"]).target_panels is None
+    assert judge_story.build_parser().parse_args(
+        ["--story-id", "x", "--target-panels", "20"]).target_panels == 20
+    with_target = judge_story.build_user_message("MD", "PROMPT", 20)
+    assert "target exactly 20 panels" in with_target
+    without_target = judge_story.build_user_message("MD", "PROMPT")
+    assert "target exactly" not in without_target
+    assert judge_story.build_user_message("MD", "PROMPT", None) == without_target
