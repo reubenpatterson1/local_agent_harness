@@ -128,3 +128,40 @@ def test_tl4_no_flags_omit_danger_auto_approve(popen_calls):
     _phase1_with_narrative([])
     assert len(popen_calls) == 1
     assert "--danger-auto-approve" not in popen_calls[0]
+
+
+# --- T-L8..T-L11: --story-only and optional narrative (spec 4.3) ------------------------
+
+def test_tl8_story_only_runs_phase1_only():
+    args = ltx_movie.build_parser().parse_args(["a narrative", "--story-id", STORY_ID,
+                                                "--story-only"])
+    assert args.story_server_stop_after_story is True
+    names = tuple(f.__name__ for f in ltx_movie._phase_sequence(args))
+    assert names == ("phase1_story",)
+
+
+def test_tl9_story_only_with_seed_image_keeps_phase0():
+    args = ltx_movie.build_parser().parse_args(["a narrative", "--story-id", STORY_ID,
+                                                "--story-only", "--seed-image", "x.png"])
+    names = tuple(f.__name__ for f in ltx_movie._phase_sequence(args))
+    assert names == ("phase0_seed", "phase1_story")
+
+
+def test_tl10_no_narrative_and_no_override_exits_2(popen_calls, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        ltx_movie.main(["--story-id", STORY_ID])
+    assert excinfo.value.code == 2
+    assert ("either a narrative argument or --story-prompt-override is required"
+            in capsys.readouterr().err)
+    assert popen_calls == []
+
+
+def test_tl11_override_without_narrative_does_not_crash_phase1(tmp_path, popen_calls):
+    override = tmp_path / "override.txt"
+    override.write_text("Override only\n", encoding="utf-8")
+    args = _run_phase1(["--story-id", STORY_ID, "--panels", "1",
+                        "--story-prompt-override", str(override)])
+    assert args.narrative is None
+    assert len(popen_calls) == 1
+    assert popen_calls[0][-1] == "Override only\n"
+    assert _story_prompt_txt(tmp_path) == "Override only\n"

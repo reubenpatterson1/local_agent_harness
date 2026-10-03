@@ -178,7 +178,9 @@ def build_parser():
             "individually usable."
         ),
     )
-    parser.add_argument("narrative", help="the story narrative to adapt into panels")
+    parser.add_argument("narrative", nargs="?", default=None,
+                         help="the story narrative to adapt into panels; omit only when "
+                              "--story-prompt-override is given")
     parser.add_argument("--story-id", dest="story_id", required=True)
     parser.add_argument("--seed-image", dest="seed_image", default=None,
                          help="image that becomes the movie's literal first frame: Phase 0 "
@@ -281,6 +283,13 @@ def build_parser():
                               "server, so it is never needed past Phase 1. Use "
                               "--no-story-server-stop-after-story to keep it resident "
                               "(e.g. for rapid successive runs).")
+    parser.add_argument("--story-only", dest="story_only", action="store_true", default=False,
+                         help="run Phase 0 (if --seed-image) and Phase 1 only, then stop. "
+                              "Skips phase_release_story_server as well as Phases 2-4, so a "
+                              "caller that regenerates story.md repeatedly (e.g. "
+                              "bin/iterate-story) keeps the story server resident across "
+                              "calls, with no need to also pass "
+                              "--no-story-server-stop-after-story.")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
     return parser
 
@@ -1084,6 +1093,11 @@ def _print_dry_run_plan(args):
 def _phase_sequence(args):
     """The ordered phase tuple. Pure: no I/O, no side effects -- it is the unit under test
     for the --story-server-stop-after-story insertion point."""
+    if getattr(args, "story_only", False):
+        phases = (phase1_story,)
+        if getattr(args, "seed_image", None):
+            phases = (phase0_seed,) + phases
+        return phases
     phases = ((phase1_story, phase3_manifest, phase4_render) if args.no_stills
               else (phase1_story, phase2_stills, phase3_manifest, phase4_render))
     if getattr(args, "story_server_stop_after_story", False):
@@ -1098,6 +1112,8 @@ def main(argv=None):
     raw_argv = argv if argv is not None else sys.argv[1:]
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.narrative is None and args.story_prompt_override is None:
+        parser.error("either a narrative argument or --story-prompt-override is required")
     _resolve_length(args, raw_argv)
 
     if getattr(args, "seed_image", None):
