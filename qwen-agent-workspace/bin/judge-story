@@ -73,6 +73,39 @@ SUBMIT_JUDGMENT_SCHEMA = {
 }
 
 
+SYSTEM_PROMPT = (
+    "You are an expert story editor judging a story written for an AI image-and-video "
+    "generation pipeline. The story is intended to become a multi-panel, action-focused "
+    "storyboard. The target output goal is the most realistic action scenes possible, with "
+    "relatively little dialogue.\n"
+    "\n"
+    "Score the story on four dimensions, each an integer from 1 (worst) to 10 (best):\n"
+    "- pacing_progression: whether the action builds and progresses panel to panel, without "
+    "stalls, repeats, or jumps.\n"
+    "- action_plausibility: whether each panel depicts physically realistic action that a "
+    "camera could plausibly capture.\n"
+    "- visual_specificity: whether each panel gives concrete, filmable visual detail rather "
+    "than abstract or emotional description.\n"
+    "- continuity: whether characters, setting, props, and positions stay consistent across "
+    "panels.\n"
+    "\n"
+    "Then write a critique that names specific panels by number (for example, \"Panel 7\") "
+    "when identifying strengths and problems.\n"
+    "\n"
+    "Finally, write a complete revised version of the original story-generation prompt that "
+    "would address your critique. The revised prompt must be a full replacement for the "
+    "original prompt, usable as-is, not a list of suggested edits.\n"
+    "\n"
+    "You must deliver your judgment by calling the submit_judgment tool exactly once. Do not "
+    "put the judgment in a plain text reply; a response without a submit_judgment call is a "
+    "failure."
+)
+
+RETRY_USER_MESSAGE = ("You did not call the submit_judgment tool. Call submit_judgment now "
+                      "with your scores, critique, and revised_prompt. Do not reply with "
+                      "plain text.")
+
+
 def validate_judgment_input(tool_input):
     """Raise jsonschema.ValidationError unless tool_input matches SUBMIT_JUDGMENT_SCHEMA.
 
@@ -80,3 +113,27 @@ def validate_judgment_input(tool_input):
     count booleans as integers. Extra keys are tolerated (no additionalProperties).
     """
     jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)
+
+
+def build_user_message(story_md_text, story_prompt_text):
+    """The single user turn (spec 4.5). Both texts are inserted in full: no truncation,
+    escaping, or stripping."""
+    return ("Below are the original story-generation prompt and the story it produced.\n"
+            "\n"
+            "<story_prompt>\n"
+            + story_prompt_text
+            + "\n</story_prompt>\n"
+            "\n"
+            "<story_md>\n"
+            + story_md_text
+            + "\n</story_md>\n"
+            "\n"
+            "Judge the story and call submit_judgment.")
+
+
+def find_tool_use(response):
+    """First content block that is a submit_judgment tool call, else None."""
+    for block in response.content:
+        if block.type == "tool_use" and block.name == TOOL_NAME:
+            return block
+    return None
