@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""iterate-story -- automate the judge -> revise prompt -> regenerate -> re-judge loop.
+
+Phase 2 of the story-pipeline self-improvement loop
+(docs/superpowers/specs/2026-10-03-iterate-story-design.md). Each round runs
+bin/judge-story against the live story.md, archives the judged story.md,
+story_prompt.txt and judgment.json under the next free .vN suffix (never
+overwriting an existing .vN file), and then -- unless a stopping condition is met
+(threshold met, plateaued, max-rounds reached) -- regenerates story.md through
+bin/ltx-movie --story-only, using the judge's revised prompt with the story's
+original panel count re-pinned as its last sentence. At exit the best round
+(highest per-dimension minimum, then highest average, then earliest) is promoted
+back to the live story.md, story_prompt.txt and judgment.json, and
+run-summary.json records every round. Text only: no stills, clips or renders.
+
+Usage:
+  bin/iterate-story --story-id <id> --threshold <N> [--max-rounds <N>]
+
+Requires ANTHROPIC_API_KEY in the environment for bin/judge-story; this script
+does not check it itself (an unset key fails round 1's judge call). Exit codes:
+0 a stopping condition was met, 1 a judge-story or ltx-movie subprocess failed or
+ltx-movie left story.md unchanged, 2 argument or precondition failure.
+"""
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# Same order as bin/judge-story's SCORE_KEYS: stdout round lines and run-summary.json.
+SCORE_KEYS = ("pacing_progression", "action_plausibility", "visual_specificity", "continuity")
+DEFAULT_MAX_ROUNDS = 5
+STOP_THRESHOLD = "threshold met"
+STOP_PLATEAU = "plateaued"
+STOP_MAX_ROUNDS = "max-rounds reached"
+# The three archived-file families; the highest N across all of them is the base (spec 1.4).
+VERSION_RE = re.compile(r"(?:story\.v(\d+)\.md|story_prompt\.v(\d+)\.txt|judgment\.v(\d+)\.json)")
+# Lines of captured child output shown on failure; bin/ltx-movie's splitlines()[-40:].
+TAIL_LINES = 40
+# The one panel-count sentence removed from the judge's revised_prompt (spec 3.2, G19).
+PANEL_COUNT_DECLARATION_RE = re.compile(
+    r"The file must contain EXACTLY \d+ panel sections?, numbered 1 through \d+ in order\.")
+
+
+def count_panels(story_md_text):
+    """Number of lines that start with '## Panel' (spec 3.1). Pure."""
+    return len(re.findall(r"^## Panel", story_md_text, flags=re.MULTILINE))
+
+
+def build_reinjection(pinned_panel_count):
+    """The pinned panel-count sentence appended last to every regeneration prompt, in
+    bin/ltx-movie STORY_PROMPT_TEMPLATE's own wording (spec 3.2). Pure."""
+    return ("\n\nThe file must contain EXACTLY %d panel sections, numbered 1 through %d in order."
+            % (pinned_panel_count, pinned_panel_count))
+
+
+def build_next_prompt(revised_prompt, pinned_panel_count):
+    """revised_prompt with every "EXACTLY N panel sections" declaration removed and the
+    pinned one appended last, so the prompt states the panel count exactly once
+    (spec 3.2). Zero matches leave revised_prompt unchanged before the append. Pure."""
+    cleaned = PANEL_COUNT_DECLARATION_RE.sub("", revised_prompt)
+    return cleaned + build_reinjection(pinned_panel_count)
