@@ -1,7 +1,7 @@
 # bin/iterate-story -- Design Spec (Phase 2 of the self-improvement loop: text-level orchestration)
 
 Date: 2026-10-03
-Status: The design was approved section by section with the user in brainstorming, and this document transcribes it. Choices made while writing this document to remove ambiguity are marked **[spec choice]**. Items the brainstorm did not settle are listed in Section 8 (Known gaps / open questions). **G1 and G2 are RESOLVED** (Sections 4.3 and 3.5 respectively; see Section 8 for pointers). Nothing in this spec is blocked. G3 through G19 remain documented spec choices / known limitations, unchanged.
+Status: The design was approved section by section with the user in brainstorming, and this document transcribes it. Choices made while writing this document to remove ambiguity are marked **[spec choice]**. Items the brainstorm did not settle are listed in Section 8 (Known gaps / open questions). **G1 and G2 are RESOLVED** (Sections 4.3 and 3.5 respectively; see Section 8 for pointers). **G19 is RESOLVED, partially** (Section 3.2's conflicting-declaration removal; see Section 8 for the residual uncertainty that remains open). Nothing in this spec is blocked. G3 through G18 remain documented spec choices / known limitations, unchanged.
 
 Workspace root (`WS`): `/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/`
 
@@ -240,8 +240,9 @@ The implementer must use these names so tests can target them:
 | `build_parser()` | function | Returns the `argparse.ArgumentParser` (Section 2.1) |
 | `resolve_paths(story_id)` | function | Returns `(story_dir, story_md_path, story_prompt_path)`. Reads `WS` at call time so tests can monkeypatch it |
 | `count_panels(story_md_text)` | function | Section 3.1 |
+| `PANEL_COUNT_DECLARATION_RE` | module constant | Compiled `re.compile(r"The file must contain EXACTLY \d+ panel sections?, numbered 1 through \d+ in order\.")` (Section 3.2) |
 | `build_reinjection(pinned_panel_count)` | function | Returns the exact appended string (Section 3.2) |
-| `build_next_prompt(revised_prompt, pinned_panel_count)` | function | `revised_prompt + build_reinjection(pinned_panel_count)` |
+| `build_next_prompt(revised_prompt, pinned_panel_count)` | function | `PANEL_COUNT_DECLARATION_RE.sub("", revised_prompt) + build_reinjection(pinned_panel_count)` (Section 3.2) |
 | `find_version_base(story_dir)` | function | Section 1.4 |
 | `evaluate_stop(history, threshold, max_rounds)` | function | Section 3.3. `history` is the list of 4-tuples of scores for rounds 1..r in order, with the current round last. Returns one of the three `STOP_*` strings, or `None` |
 | `select_best_round(rounds)` | function | Section 1.5 |
@@ -324,7 +325,34 @@ len(re.findall(r"^## Panel", story_md_text, flags=re.MULTILINE))
 
 ### 3.2 Re-injection
 
-Before each regeneration call, the prompt is `build_next_prompt(revised_prompt, pinned_panel_count)`. That is the judge's `revised_prompt` verbatim (no stripping, no editing) with this string appended:
+Before each regeneration call, the prompt is `build_next_prompt(revised_prompt, pinned_panel_count)`.
+
+**Conflicting declaration removal `[spec choice]`.** Every real `revised_prompt` observed in this session (three samples, two different pinned counts: 20 and 30) contains this exact sentence, verbatim except for the number, matching the project's own `STORY_PROMPT_TEMPLATE` phrasing convention:
+
+```
+The file must contain EXACTLY {N} panel sections, numbered 1 through {N} in order.
+```
+
+Left untouched, that sentence states whatever panel count the judge's `revised_prompt` asked for, which can differ from `pinned_panel_count` (the live `ronin-generalship` example: the judge's text asks for 30, the pinned count is 20). Appending the pinned-count sentence after it, as a prior version of this spec did, leaves two contradictory panel-count instructions in the same prompt and relies on recency/salience for the correct one to win. Instead, `build_next_prompt` removes any such declaration before appending its own:
+
+```python
+PANEL_COUNT_DECLARATION_RE = re.compile(
+    r"The file must contain EXACTLY \d+ panel sections?, numbered 1 through \d+ in order\."
+)
+
+def build_next_prompt(revised_prompt, pinned_panel_count):
+    cleaned = PANEL_COUNT_DECLARATION_RE.sub("", revised_prompt)
+    return cleaned + build_reinjection(pinned_panel_count)
+```
+
+- The `s?` handles a possible singular/plural edge case; all three real samples used "sections" (plural).
+- **If the pattern matches one or more times** in `revised_prompt`, every match is removed (`.sub` replaces all occurrences, not just the first -- defensive, since one occurrence is the expected case), and the pinned-count sentence is appended at the end, exactly as in the prior design. Net effect: the final prompt contains the sentence exactly once, stating the pinned count, never two contradicting counts.
+- **If the pattern does not match** -- the judge omitted the sentence, or phrased it differently than expected -- `.sub` is a no-op and the function falls back to the original behavior: `revised_prompt` unmodified, with the pinned-count sentence appended. This is the defensive fallback, not the expected common case.
+- Because `.sub` on zero matches returns the input unchanged, both cases are implemented by the same unconditional call; there is no separate `if` branch for "pattern found" versus "not found".
+- This is a textual removal only. No whitespace cleanup runs afterward, so removing a match from the middle of the text can leave adjacent blank lines where the sentence used to be. That is accepted: the spec only fixes the one structural, mechanically-parseable declaration, not surrounding prose.
+- This does not touch anything else in `revised_prompt` -- in particular, it does not detect or fix a beat plan that still internally lists a different number of beats than the pinned count. That is a secondary consistency the generation model has to reconcile on its own; only the "EXACTLY N panel sections" sentence is corrected, because it is the one instruction simple enough to find-and-replace reliably without risking a bad edit to freeform prose.
+
+The pinned-count string appended by `build_reinjection(n)`:
 
 ```python
 "\n\nThe file must contain EXACTLY %d panel sections, numbered 1 through %d in order." % (n, n)
@@ -333,7 +361,7 @@ Before each regeneration call, the prompt is `build_next_prompt(revised_prompt, 
 - `n` is `pinned_panel_count`. Python escape sequences apply: two real newline characters, then the sentence.
 - No trailing newline follows the period.
 - The sentence matches `bin/ltx-movie`'s own `STORY_PROMPT_TEMPLATE` wording at `bin/ltx-movie:101`.
-- It is always the **last** text in the prompt. That is the highest-salience position, read most recently by the model, whatever the judge's text said about panel count earlier. Example: the current live `story_prompt.revised.txt` for `ronin-generalship` asks for 30 panels; the appended line still says 20.
+- It is always the **last** text in the prompt. That is the highest-salience position, read most recently by the model. With the conflicting-declaration removal above, it is now also the **only** panel-count declaration in the prompt, not merely the most recent of two.
 
 The prompt is written to a temp file:
 
@@ -697,7 +725,8 @@ Python exceptions outside this table propagate as tracebacks **[spec choice; sam
 | ID | Test | Assertion |
 |---|---|---|
 | T-P1 | `count_panels` on a 20-header synthesized story, and on a text with 3 `## Panel` lines plus one `### Panel 9`, one ` ## Panel 8` (leading space), and body text containing `Panel 4` | `== 20`; `== 3` |
-| T-P2 | `build_reinjection(20)`; `build_next_prompt("ABC\n", 20)` | `== "\n\nThe file must contain EXACTLY 20 panel sections, numbered 1 through 20 in order."`; `== "ABC\n" + build_reinjection(20)` (verbatim prefix, appended last) |
+| T-P2 | `build_reinjection(20)`; `build_next_prompt("ABC\n", 20)` -- fallback-append path, the pattern is absent | `== "\n\nThe file must contain EXACTLY 20 panel sections, numbered 1 through 20 in order."`; `== "ABC\n" + build_reinjection(20)` (verbatim prefix, appended last) |
+| T-P2b | `build_next_prompt("Here is the revised prompt.\n\nThe file must contain EXACTLY 30 panel sections, numbered 1 through 30 in order.\n\nFocus more on pacing in the middle act.", 20)` -- find-and-replace path, the pattern is present with a conflicting count (paraphrase of a real `revised_prompt` observed this session) | Result does not contain the substring `"EXACTLY 30"`. Result contains the substring `"EXACTLY 20"` exactly once (`result.count("EXACTLY 20") == 1`). Result `== "Here is the revised prompt.\n\n\n\nFocus more on pacing in the middle act." + build_reinjection(20)` (the matched sentence is deleted in place, leaving the surrounding blank lines untouched per Section 3.2; the pinned sentence is still appended last) |
 | T-P3 | `find_version_base` on: (a) a `tmp_path` dir with `story.v1.md`, `story.v2.md`, `story_prompt.v1.txt`, `story_prompt.v2.txt`, `judgment.v1.json`, `judgment.v2.json` (the `ronin-generalship` shape); (b) an empty dir; (c) a dir with only `judgment.v7.json`; (d) a dir with only `story.v2.md.bak`, `story.vX.md`, `story.v.md` | (a) `== 2`, so the next archive is `.v3`; (b) `== 0`; (c) `== 7`; (d) `== 0` |
 | T-P4 | `evaluate_stop` cases, listed below the table | each returns exactly the listed value |
 | T-P5 | `select_best_round` cases, listed below the table | each returns exactly the listed value |
@@ -772,6 +801,7 @@ Before declaring D2 and D4 complete, the implementer applies each mutation below
 | Full tie picks the latest instead of the earliest | T-P5 case 3, T-M3 |
 | `find_version_base` returns 0 without scanning | T-P3, T-M3 |
 | Re-injection prepended instead of appended | T-P2, T-M2 |
+| `PANEL_COUNT_DECLARATION_RE.sub` call removed (old append-only behavior restored, conflicting declaration left in place) | T-P2b |
 | Archive taken after regeneration instead of after judging | T-M3 |
 | Promotion skipped on the failure path | T-M5, T-M6 |
 | `--danger-auto-approve` condition reduced to `args.force_story` | T-L2 |
@@ -797,7 +827,7 @@ Before declaring D2 and D4 complete, the implementer applies each mutation below
 
 ## 8. Known gaps / open questions
 
-G1 and G2 are RESOLVED. Every other item has a spec choice recorded above, which the user may override.
+G1 and G2 are RESOLVED. G19 is RESOLVED, partially (a residual uncertainty remains open; see its entry below). Every other item has a spec choice recorded above, which the user may override.
 
 - **G1 -- RESOLVED.** Resolution: Section 4.3 (`--story-only` and optional `narrative`) plus Section 3.4.2's final argv (`--panels <pinned_panel_count>`, `--story-only`). The analysis below is left in place for traceability; it describes the problem this resolved, not current behavior.
   - **Originally: the approved regeneration command could not run against the then-current `bin/ltx-movie`.** Confirmed against the source on 2026-10-03:
@@ -835,4 +865,4 @@ G1 and G2 are RESOLVED. Every other item has a spec choice recorded above, which
 - **G16: scope of the Section 4.2 bypass.** It applies to every `bin/ltx-movie --force-story --no-review` invocation, not only those from `bin/iterate-story`, and it covers every `qwen-agent` tool except `promote`. This is per the approved design and recorded here for visibility.
 - **G17: no cost guard.** Each round makes one Opus judging call, or two on `bin/judge-story`'s internal retry. The only cap is `--max-rounds`.
 - **G18: `stdin=subprocess.DEVNULL` for both children.** This prevents hangs (Section 3.4). It means any prompt in a child that was not anticipated is answered with EOF (denied) rather than surfaced to the user.
-- **G19: re-injection versus a conflicting revised prompt.** When the judge's `revised_prompt` asks for a different panel count, as the live `ronin-generalship` one does (30), the prompt sent to the model contains two contradictory counts. The design relies on the last instruction winning. Whether `qwen38-6bit` follows the last instruction is unverified until M1. If G1's resolution passes `--panels <pinned>`, `bin/ltx-movie`'s validation will reject any drifted output as an E6 failure.
+- **G19 -- RESOLVED (partially).** Resolution: Section 3.2's conflicting-declaration removal. `build_next_prompt` now finds and deletes any `"The file must contain EXACTLY N panel sections..."` sentence already present in the judge's `revised_prompt` (via `PANEL_COUNT_DECLARATION_RE`) before appending the pinned-count version, so the final prompt states the panel count exactly once, not twice with contradicting numbers. This removes the stated-instruction contradiction this gap originally described. It does not fully close the gap: a `revised_prompt` can still contain a beat-by-beat plan that lists, say, 30 distinct beats while the pinned count is 20, and nothing in Section 3.2 detects or reconciles that -- only the single mechanically-parseable "EXACTLY N panel sections" sentence is corrected. Whether `qwen38-6bit` nonetheless drifts toward a beat plan's implied count, even with the contradictory declaration removed, is unverified until a real run (M1). If G1's resolution passes `--panels <pinned>`, `bin/ltx-movie`'s validation will still reject any drifted output as an E6 failure.
