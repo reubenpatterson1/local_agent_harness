@@ -663,6 +663,9 @@ def phase1_story(args):
         prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
                                      bool(getattr(args, "seed_image", None)),
                                      seconds=_clip_seconds(args))
+        with open(os.path.join(_story_dir(args.story_id), "story_prompt.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write(prompt)
         max_tokens = _phase1_max_tokens(args.panels)
         timeout = _phase1_timeout(args.panels)
         cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
