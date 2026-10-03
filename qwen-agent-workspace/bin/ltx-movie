@@ -688,6 +688,8 @@ def phase1_story(args):
             cmd += ["--context-window", str(args.story_context_window)]
         if getattr(args, "seed_downscaled_path", None):
             cmd += ["--image", args.seed_downscaled_path]
+        if args.force_story and args.no_review:
+            cmd += ["--danger-auto-approve"]
         cmd += ["--user-prompt", prompt]
         print("Running (timeout %ds): %s" % (
             timeout, shlex.join(cmd[:-1] + ["--user-prompt", "<%d chars>" % len(prompt)])

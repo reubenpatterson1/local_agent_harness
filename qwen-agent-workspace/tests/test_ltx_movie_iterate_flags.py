@@ -99,3 +99,32 @@ def test_tl7_missing_override_file_exits_2(tmp_path, popen_calls, capsys):
     assert rc == 2
     assert "--story-prompt-override file not found" in capsys.readouterr().err
     assert popen_calls == []
+
+
+# --- T-L1..T-L4: --danger-auto-approve only with --force-story + --no-review (spec 4.2) ---
+
+def test_tl1_force_story_and_no_review_add_danger_auto_approve(popen_calls):
+    _phase1_with_narrative(["--force-story", "--no-review"])
+    assert len(popen_calls) == 1
+    cmd = popen_calls[0]
+    assert "--danger-auto-approve" in cmd
+    assert cmd.count("--danger-auto-approve") == 1
+    assert cmd[-2] == "--user-prompt"
+
+
+def test_tl2_force_story_alone_omits_danger_auto_approve(popen_calls):
+    _phase1_with_narrative(["--force-story"])
+    assert len(popen_calls) == 1
+    assert "--danger-auto-approve" not in popen_calls[0]
+
+
+def test_tl3_no_review_alone_omits_danger_auto_approve(popen_calls):
+    _phase1_with_narrative(["--no-review"])
+    assert len(popen_calls) == 1
+    assert "--danger-auto-approve" not in popen_calls[0]
+
+
+def test_tl4_no_flags_omit_danger_auto_approve(popen_calls):
+    _phase1_with_narrative([])
+    assert len(popen_calls) == 1
+    assert "--danger-auto-approve" not in popen_calls[0]
