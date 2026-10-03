@@ -274,12 +274,12 @@ def test_t7_successful_run(tmp_path, monkeypatch, capsys):
         raw_text = f.read()
     judgment = json.loads(raw_text)
     assert list(judgment) == ["story_md_path", "story_prompt_path", "model",
-                              "thinking_budget_tokens", "timestamp", "usage", "scores",
+                              "effort", "timestamp", "usage", "scores",
                               "critique", "revised_prompt"]
     assert judgment["story_md_path"] == str(story_md)
     assert judgment["story_prompt_path"] == str(tmp_path / "story_prompt.txt")
     assert judgment["model"] == "claude-opus-5-5"
-    assert judgment["thinking_budget_tokens"] == 16000
+    assert judgment["effort"] == "high"
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", judgment["timestamp"])
     assert judgment["usage"] == {"input_tokens": 1200, "output_tokens": 3400,
                                  "thinking_tokens": 2100}
@@ -306,11 +306,12 @@ def test_t7_successful_run(tmp_path, monkeypatch, capsys):
     assert fake.constructions == [((), {})]               # Anthropic() with no arguments
     assert len(fake.calls) == 1
     kwargs = fake.calls[0]
-    assert sorted(kwargs) == ["max_tokens", "messages", "model", "system", "thinking",
-                              "tool_choice", "tools"]
+    assert sorted(kwargs) == ["max_tokens", "messages", "model", "output_config", "system",
+                              "thinking", "tool_choice", "tools"]
     assert kwargs["model"] == "claude-opus-5-5"
     assert kwargs["max_tokens"] == 21333
-    assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 16000}
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "high"}
     assert kwargs["tool_choice"] == {"type": "auto"}
     assert kwargs["system"] == judge_story.SYSTEM_PROMPT
     assert [tool["name"] for tool in kwargs["tools"]] == ["submit_judgment"]
