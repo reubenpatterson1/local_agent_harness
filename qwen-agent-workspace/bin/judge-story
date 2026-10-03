@@ -223,8 +223,30 @@ def main(argv=None):
     client = anthropic.Anthropic()
 
     user_message = build_user_message(story_md_text, story_prompt_text)
-    responses = [_create_message(client, [{"role": "user", "content": user_message}])]
-    block = find_tool_use(responses[0])
+    responses = []
+    try:
+        responses.append(_create_message(client, [{"role": "user", "content": user_message}]))
+        block = find_tool_use(responses[0])
+        if block is None:
+            # One retry in the same conversation. r1.content goes back exactly as
+            # received: the API requires thinking blocks and signatures unmodified.
+            responses.append(_create_message(client, [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": responses[0].content},
+                {"role": "user", "content": RETRY_USER_MESSAGE},
+            ]))
+            block = find_tool_use(responses[1])
+    except anthropic.APIError as e:
+        # Covers APIStatusError subclasses, APIConnectionError, and APITimeoutError. A
+        # failed retry discards r1 rather than dumping it (spec 6, E5).
+        print("Error: Anthropic API call failed: %s: %s" % (type(e).__name__, e),
+              file=sys.stderr)
+        return 1
+    if block is None:
+        raw_path = _write_raw(story_dir, responses)
+        print("Error: Claude did not call submit_judgment after one retry; raw responses "
+              "written to %s" % raw_path, file=sys.stderr)
+        return 1
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
