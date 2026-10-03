@@ -67,3 +67,25 @@ def test_tp2b_build_next_prompt_replaces_conflicting_declaration():
              " X The file must contain EXACTLY 1 panel section, numbered 1 through 1 in order.")
     assert (iterate_story.build_next_prompt(twice, 20)
             == " X " + iterate_story.build_reinjection(20))
+
+
+# --- T-P3: version-suffix scan (spec 1.4) ---------------------------------------------
+
+def test_tp3_find_version_base(tmp_path):
+    def _dir(name, files):
+        d = tmp_path / name
+        d.mkdir()
+        for f in files:
+            (d / f).write_text("x", encoding="utf-8")
+        return str(d)
+
+    ronin_shape = _dir("a", ["story.v1.md", "story.v2.md", "story_prompt.v1.txt",
+                             "story_prompt.v2.txt", "judgment.v1.json", "judgment.v2.json"])
+    assert iterate_story.find_version_base(ronin_shape) == 2
+    assert iterate_story.find_version_base(_dir("b", [])) == 0
+    assert iterate_story.find_version_base(_dir("c", ["judgment.v7.json"])) == 7
+    assert iterate_story.find_version_base(
+        _dir("d", ["story.v2.md.bak", "story.vX.md", "story.v.md"])) == 0
+    # Numeric, not lexicographic, maximum across families.
+    assert iterate_story.find_version_base(
+        _dir("e", ["story.v9.md", "story_prompt.v10.txt"])) == 10
