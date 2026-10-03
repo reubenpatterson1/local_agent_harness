@@ -89,3 +89,36 @@ def test_tp3_find_version_base(tmp_path):
     # Numeric, not lexicographic, maximum across families.
     assert iterate_story.find_version_base(
         _dir("e", ["story.v9.md", "story_prompt.v10.txt"])) == 10
+
+
+# --- T-P4, T-P5: stopping criteria and best-round selection (spec 3.3, 1.5) -----------
+
+def test_tp4_evaluate_stop():
+    assert (iterate_story.STOP_THRESHOLD, iterate_story.STOP_PLATEAU,
+            iterate_story.STOP_MAX_ROUNDS) == ("threshold met", "plateaued",
+                                               "max-rounds reached")
+    cases = [
+        ([(7, 7, 7, 7)], 7, 5, "threshold met"),
+        ([(7, 7, 7, 6)], 7, 5, None),
+        ([(5, 5, 5, 4), (5, 5, 5, 4)], 9, 5, "plateaued"),
+        ([(5, 5, 5, 4), (6, 4, 4, 3)], 9, 5, None),
+        ([(4, 4, 4, 4), (6, 6, 6, 6), (6, 6, 6, 6)], 9, 5, "plateaued"),
+        ([(8, 8, 8, 8), (8, 8, 8, 8)], 7, 2, "threshold met"),
+        ([(5, 5, 5, 4), (5, 5, 5, 4)], 9, 2, "plateaued"),
+        ([(4, 4, 4, 4), (5, 4, 4, 4)], 9, 2, "max-rounds reached"),
+        ([(4, 4, 4, 4)], 9, 1, "max-rounds reached"),
+    ]
+    for i, (history, threshold, max_rounds, expected) in enumerate(cases, 1):
+        got = iterate_story.evaluate_stop(history, threshold, max_rounds)
+        assert got == expected, "case %d: got %r, expected %r" % (i, got, expected)
+
+
+def test_tp5_select_best_round():
+    cases = [
+        ([(1, (5, 4, 4, 3)), (2, (5, 5, 5, 4)), (3, (9, 9, 9, 3))], 2),
+        ([(1, (4, 4, 4, 4)), (2, (9, 4, 4, 4))], 2),
+        ([(1, (5, 5, 5, 4)), (2, (5, 5, 5, 4))], 1),
+    ]
+    for i, (rounds, expected) in enumerate(cases, 1):
+        got = iterate_story.select_best_round(rounds)
+        assert got == expected, "case %d: got %r, expected %r" % (i, got, expected)

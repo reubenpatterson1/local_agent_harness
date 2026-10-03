@@ -79,3 +79,29 @@ def find_version_base(story_dir):
         if match:
             highest = max(highest, int(next(g for g in match.groups() if g is not None)))
     return highest
+
+
+def evaluate_stop(history, threshold, max_rounds):
+    """Stop reason after the round just archived, or None (spec 3.3). history is the list
+    of 4-tuples of scores for rounds 1..r, current round last. First match wins:
+    threshold, then plateau (against the immediately previous round only; no dimension
+    strictly improved), then max-rounds. Pure."""
+    if all(s >= threshold for s in history[-1]):
+        return STOP_THRESHOLD
+    if len(history) >= 2 and not any(c > p for c, p in zip(history[-1], history[-2])):
+        return STOP_PLATEAU
+    if len(history) >= max_rounds:
+        return STOP_MAX_ROUNDS
+    return None
+
+
+def select_best_round(rounds):
+    """Round number with the highest minimum score, then the highest sum (the same order
+    as the average, for 4 scores), then the earliest (spec 1.5). rounds is a list of
+    (round_number, scores_tuple) pairs in round order. Pure."""
+    best_round, best_key = None, None
+    for round_number, scores in rounds:
+        key = (min(scores), sum(scores))
+        if best_key is None or key > best_key:
+            best_round, best_key = round_number, key
+    return best_round
