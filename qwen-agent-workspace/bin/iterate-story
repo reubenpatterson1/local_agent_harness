@@ -34,6 +34,8 @@ import sys
 import tempfile
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
 
 # Same order as bin/judge-story's SCORE_KEYS: stdout round lines and run-summary.json.
 SCORE_KEYS = ("pacing_progression", "action_plausibility", "visual_specificity", "continuity")
@@ -165,9 +167,10 @@ def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count, story_model
 
 def _run(cmd):
     """Run one child (spec 3.4): combined output captured, stdin closed, no timeout,
-    environment inherited."""
+    environment inherited plus pipeline_log.ENV_FLAG, so children skip their own iterate-story.log record (this script logs them)."""
     return subprocess.run(cmd, cwd=WS, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                          env=dict(os.environ, **{pipeline_log.ENV_FLAG: "1"}))
 
 
 LOG_FILE_NAME = "iterate-story.log"

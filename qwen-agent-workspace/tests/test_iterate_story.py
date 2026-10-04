@@ -21,6 +21,8 @@ import sys
 import pytest
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
 iterate_story = importlib.machinery.SourceFileLoader(
     "iterate_story", os.path.join(WS, "bin", "iterate-story")).load_module()
 
@@ -286,7 +288,8 @@ def test_tm2_subprocess_argv_and_override_file(tmp_path, monkeypatch):
     for _, kwargs in fake.calls:
         assert kwargs == {"cwd": iterate_story.WS, "stdin": subprocess.DEVNULL,
                           "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT,
-                          "text": True}
+                          "text": True,
+                          "env": dict(os.environ, **{pipeline_log.ENV_FLAG: "1"})}
 
     with open(os.path.join(story_dir, iterate_story.LOG_FILE_NAME), encoding="utf-8") as f:
         log_text = f.read()

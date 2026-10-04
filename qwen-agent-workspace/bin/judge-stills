@@ -35,6 +35,8 @@ import anthropic
 import jsonschema
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
 
 MODEL = "claude-opus-5-5"
 EFFORT = "high"
@@ -430,5 +432,10 @@ def main(argv=None):
     return 0
 
 
+def _pipeline_log_story_dir(argv):
+    story_id = pipeline_log.argv_value(argv, "--story-id")
+    return os.path.join(WS, "generated", "stories", story_id) if story_id else None
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(pipeline_log.run_logged("judge-stills", _pipeline_log_story_dir(sys.argv[1:]), main, sys.argv))

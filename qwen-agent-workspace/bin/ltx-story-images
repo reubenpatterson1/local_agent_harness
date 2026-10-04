@@ -57,6 +57,7 @@ import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
 
 
 def build_parser():
@@ -321,5 +322,10 @@ def main(argv=None):
     return 0
 
 
+def _pipeline_log_story_dir(argv):
+    story_md = pipeline_log.argv_value(argv, "--story-md")
+    return os.path.dirname(os.path.abspath(story_md)) if story_md else None
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(pipeline_log.run_logged("ltx-story-images", _pipeline_log_story_dir(sys.argv[1:]), main, sys.argv))

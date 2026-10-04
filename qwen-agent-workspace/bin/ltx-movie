@@ -84,6 +84,8 @@ import threading
 import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
 
 # --seed-image pre-flight (Phase 0). The long-edge cap bounds the multimodal request
 # payload; the minimum edge rejects a degenerate input before a 27B call or any GPU
@@ -1198,5 +1200,10 @@ def main(argv=None):
             pass
 
 
+def _pipeline_log_story_dir(argv):
+    story_id = pipeline_log.argv_value(argv, "--story-id")
+    return os.path.join(WS, "generated", "stories", story_id) if story_id else None
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(pipeline_log.run_logged("ltx-movie", _pipeline_log_story_dir(sys.argv[1:]), main, sys.argv))
