@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""judge-clips -- judge a story's rendered panel clips with Claude against the manifest text.
+
+Loop Phase 4 of the story-pipeline self-improvement loop
+(docs/superpowers/specs/2026-10-04-judge-clips-design.md). Observational only:
+it finds every clips/panel_NN.mp4 rendered under generated/stories/<id>/, pairs
+each clip with the manifest.json panel whose index equals its number, samples 4
+frames from each clip with ffmpeg (the first frame, two evenly spaced middle
+frames, and the last frame), and sends every frame, with each panel's Motion:
+and Narration: text (and panel 1's Opening still: text), to Claude in one
+request (adaptive thinking, high effort). Claude calls the submit_judgment tool
+with 1-10 scores per clip for motion_fidelity, physical_realism, and
+temporal_stability; 1-10 movie scores for narrative_clarity and, when 2 or more
+clips are judged, seam_continuity; and a critique naming specific panels. The
+tool writes clips_judgment.json to the story directory and prints the scores and
+critique. It never regenerates anything. Audio is not judged: the API takes no
+audio input.
+
+Usage:
+  bin/judge-clips --story-id <id>    # generated/stories/<id>/clips/ + manifest.json
+
+Requires ANTHROPIC_API_KEY in the environment, and ffmpeg and ffprobe on PATH.
+Exit codes: 0 success, 1 runtime or API failure, 2 argument or precondition
+failure. If Claude never calls submit_judgment (after one retry) or its input
+fails validation, the raw API responses are written to clips_judgment.raw.json
+and no scores are reported.
+"""
+
+import argparse
+import base64
+import datetime
+import fractions
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import anthropic
+import jsonschema
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import pipeline_log  # noqa: E402
+
+MODEL = "claude-opus-5-5"
+EFFORT = "high"
+# Same value and rationale as bin/judge-stills: the SDK's largest non-streaming
+# max_tokens without an explicit timeout= (spec 1.3).
+MAX_TOKENS = 21333
+TOOL_NAME = "submit_judgment"
+
+# Frames sampled from every clip (spec 3.5), and the most clips one run judges:
+# 25 clips x 4 frames = 100 images (spec 0.2, G1).
+FRAMES_PER_CLIP = 4
+MAX_CLIPS = 25
+
+# ffmpeg writes every sampled frame as a JPEG (spec 3.6).
+MEDIA_TYPE = "image/jpeg"
+
+# Clip filenames: two or more digits, as bin/ltx-mlx-render's "panel_%02d.mp4" % i
+# writes them. Matched with fullmatch over os.listdir, never glob (spec 3.1).
+CLIP_NAME_RE = re.compile(r"panel_(\d{2,})\.mp4")
+
+# Output order of the scores in clips_judgment.json and on stdout (spec 5.1, 5.3).
+CLIP_SCORE_KEYS = ("motion_fidelity", "physical_realism", "temporal_stability")
+MOVIE_SCORE_KEYS = ("seam_continuity", "narrative_clarity")
+
+# seam_continuity is deliberately NOT in movie.required: it is required when 2 or more
+# clips are judged and must be absent for 1, which this schema does not express, so
+# validate_judgment_input enforces both directions (spec 4.3, 4.4).
+SUBMIT_JUDGMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "clips": {
+            "type": "array",
+            "description": "Exactly one entry per clip judged.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "panel": {"type": "integer",
+                              "description": "The clip's panel number as an integer, e.g. 3."},
+                    "motion_fidelity": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "physical_realism": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "temporal_stability": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["panel", "motion_fidelity", "physical_realism",
+                             "temporal_stability"],
+            },
+        },
+        "movie": {
+            "type": "object",
+            "properties": {
+                "seam_continuity": {"type": "integer", "minimum": 1, "maximum": 10},
+                "narrative_clarity": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["narrative_clarity"],
+        },
+        "critique": {
+            "type": "string",
+            "description": "Free-text critique. Name specific panels by number (e.g. 'Panel 3').",
+        },
+    },
+    "required": ["clips", "movie", "critique"],
+}
+
+
+def _panel_list(panels):
+    """Panel numbers joined as "1, 2, 4" for messages (spec 1.3)."""
+    return ", ".join(str(p) for p in panels)
+
+
+def validate_judgment_input(tool_input, panels):
+    """Raise jsonschema.ValidationError unless tool_input is a complete judgment of exactly
+    the judged panels (spec 4.4). panels is the list of judged clip numbers."""
+    jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)
+    submitted = [entry["panel"] for entry in tool_input["clips"]]
+    duplicates = sorted({p for p in submitted if submitted.count(p) > 1})
+    if duplicates:
+        raise jsonschema.ValidationError(
+            "clips lists these panels more than once: %s" % _panel_list(duplicates))
+    missing = sorted(set(panels) - set(submitted))
+    if missing:
+        raise jsonschema.ValidationError(
+            "clips is missing these judged panels: %s" % _panel_list(missing))
+    extra = sorted(set(submitted) - set(panels))
+    if extra:
+        raise jsonschema.ValidationError(
+            "clips includes panels that were not judged: %s" % _panel_list(extra))
+    if len(panels) >= 2 and "seam_continuity" not in tool_input["movie"]:
+        raise jsonschema.ValidationError(
+            "seam_continuity is required when judging 2 or more clips")
+    if len(panels) < 2 and "seam_continuity" in tool_input["movie"]:
+        raise jsonschema.ValidationError(
+            "seam_continuity must be omitted when judging fewer than 2 clips")
