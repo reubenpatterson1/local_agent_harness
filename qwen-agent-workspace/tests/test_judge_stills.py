@@ -259,3 +259,166 @@ def test_t7b_build_user_content_one_still():
 def test_t7c_build_user_content_zero_entries():
     assert judge_stills.build_user_content([]) == [
         {"type": "text", "text": judge_stills.FINAL_USER_TEXT_SINGLE}]
+
+
+# --- shared fixtures for main() tests -------------------------------------------------
+
+STORY_ID = "stills-test"
+
+
+def _make_story(tmp_path, monkeypatch, story_md=CHAIN_STORY_MD, stills=(1, 3),
+                story_id=STORY_ID, with_images_dir=True):
+    """Build tmp_path/generated/stories/<story_id>/ and point judge_stills.WS at tmp_path.
+    story_md=None skips story.md; with_images_dir=False skips images/. Each index in
+    stills becomes images/panel_%02d.png holding _still_bytes(index). Returns the story
+    directory as a pathlib.Path."""
+    monkeypatch.setattr(judge_stills, "WS", str(tmp_path))
+    story_dir = tmp_path / "generated" / "stories" / story_id
+    story_dir.mkdir(parents=True)
+    if story_md is not None:
+        (story_dir / "story.md").write_text(story_md, encoding="utf-8")
+    if with_images_dir:
+        images_dir = story_dir / "images"
+        images_dir.mkdir()
+        for k in stills:
+            (images_dir / ("panel_%02d.png" % k)).write_bytes(_still_bytes(k))
+    return story_dir
+
+
+def _listing(directory):
+    """Every path under directory, relative and sorted, to prove nothing was written."""
+    return sorted(os.path.relpath(os.path.join(root, name), directory)
+                  for root, dirs, files in os.walk(directory) for name in dirs + files)
+
+
+class _FakeAnthropic:
+    """Stands in for anthropic.Anthropic. Calling it records the construction and returns
+    itself as the client; .messages.create(**kwargs) records kwargs and returns (or
+    raises, for exception instances) the scripted items in order."""
+
+    def __init__(self, scripted):
+        self.scripted = list(scripted)
+        self.constructions = []
+        self.calls = []
+        self.messages = types.SimpleNamespace(create=self._create)
+
+    def __call__(self, *args, **kwargs):
+        self.constructions.append((args, kwargs))
+        return self
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        item = self.scripted.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _install_fake(monkeypatch, scripted):
+    fake = _FakeAnthropic(scripted)
+    monkeypatch.setattr(judge_stills.anthropic, "Anthropic", fake)
+    return fake
+
+
+# --- T1-T2, T9, T11: arguments, paths, preconditions, key gate (spec 2, 4.2, 6) ------
+
+def test_t1a_no_args_exit_2():
+    with pytest.raises(SystemExit) as exc:
+        judge_stills.main([])
+    assert exc.value.code == 2
+
+
+def test_t1b_story_md_flag_rejected():
+    with pytest.raises(SystemExit) as exc:
+        judge_stills.main(["--story-md", "x"])
+    assert exc.value.code == 2
+
+
+def test_t2_resolve_paths(monkeypatch, tmp_path):
+    assert judge_stills.WS == WS
+    base = os.path.join(WS, "generated", "stories", "abc")
+    assert judge_stills.resolve_paths("abc") == (
+        base, os.path.join(base, "images"), os.path.join(base, "story.md"))
+    # WS is read at call time, not import time (spec 2.2).
+    monkeypatch.setattr(judge_stills, "WS", str(tmp_path))
+    assert judge_stills.resolve_paths("abc")[0] == os.path.join(
+        str(tmp_path), "generated", "stories", "abc")
+
+
+def test_t9a_missing_images_dir(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, with_images_dir=False)
+    before = _listing(story_dir)
+    assert judge_stills.main(["--story-id", STORY_ID]) == 2
+    out, err = capsys.readouterr()
+    assert err == "Error: stills directory not found: %s\n" % (story_dir / "images")
+    assert out == ""
+    assert _listing(story_dir) == before
+
+
+def test_t9b_no_matching_stills(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, stills=())
+    (story_dir / "images" / "panel_1.png").write_bytes(_still_bytes(1))
+    (story_dir / "images" / "images.json").write_text("{}", encoding="utf-8")
+    before = _listing(story_dir)
+    assert judge_stills.main(["--story-id", STORY_ID]) == 2
+    out, err = capsys.readouterr()
+    assert err == "Error: no panel_NN.png stills found in %s\n" % (story_dir / "images")
+    assert out == ""
+    assert _listing(story_dir) == before
+
+
+def test_t9c_missing_story_md(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, story_md=None, stills=(1,))
+    before = _listing(story_dir)
+    assert judge_stills.main(["--story-id", STORY_ID]) == 2
+    out, err = capsys.readouterr()
+    assert err == "Error: story.md not found: %s\n" % (story_dir / "story.md")
+    assert out == ""
+    assert _listing(story_dir) == before
+
+
+def test_t9d_nonexistent_story_checks_images_first(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(judge_stills, "WS", str(tmp_path))
+    story_id = "judge-stills-test-nonexistent-%s" % uuid.uuid4().hex
+    assert judge_stills.main(["--story-id", story_id]) == 2
+    out, err = capsys.readouterr()
+    # The images/ check runs before the story.md check (spec 1.2 steps 3-5).
+    assert err.startswith("Error: stills directory not found:")
+    assert out == ""
+    assert not (tmp_path / "generated").exists()
+
+
+def test_t9e_still_without_panel_section(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 4))
+    before = _listing(story_dir)
+    assert judge_stills.main(["--story-id", STORY_ID]) == 2
+    out, err = capsys.readouterr()
+    assert err == ("Error: %s has no matching panel section in story.md (story.md has 3 "
+                   "panel sections); the stills may be stale relative to story.md.\n"
+                   % (story_dir / "images" / "panel_04.png"))
+    assert out == ""
+    assert _listing(story_dir) == before
+
+
+def test_t11_key_unset_never_constructs_client(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch)
+    before = _listing(story_dir)
+    fake = _install_fake(monkeypatch, [])
+    expected_err = ("Error: ANTHROPIC_API_KEY is not set; export it in your environment to "
+                    "run judge-stills.\n")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert judge_stills.main(["--story-id", STORY_ID]) == 1
+    assert fake.constructions == []
+    assert fake.calls == []
+    out, err = capsys.readouterr()
+    assert err == expected_err
+    assert out == ""
+    # An empty value counts as unset (spec 4.2).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    assert judge_stills.main(["--story-id", STORY_ID]) == 1
+    assert fake.constructions == []
+    assert fake.calls == []
+    out, err = capsys.readouterr()
+    assert err == expected_err
+    assert out == ""
+    assert _listing(story_dir) == before

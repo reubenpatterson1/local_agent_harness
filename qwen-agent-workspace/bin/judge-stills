@@ -247,3 +247,65 @@ def build_user_content(entries):
         final_text = FINAL_USER_TEXT_SINGLE
     content.append({"type": "text", "text": final_text})
     return content
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="judge-stills",
+        description="Judge a story's generated panel stills with Claude against the story text.")
+    parser.add_argument("--story-id", dest="story_id", metavar="ID", required=True,
+                        help="judge generated/stories/ID/images/panel_NN.png against "
+                             "generated/stories/ID/story.md")
+    return parser
+
+
+def resolve_paths(story_id):
+    """(story_dir, images_dir, story_md_path) for --story-id (spec 2.2). Reads WS at call
+    time, not import time."""
+    story_dir = os.path.join(WS, "generated", "stories", story_id)
+    images_dir = os.path.join(story_dir, "images")
+    story_md_path = os.path.join(story_dir, "story.md")
+    return story_dir, images_dir, story_md_path
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    story_dir, images_dir, story_md_path = resolve_paths(args.story_id)
+
+    # Every local file precondition runs before the env check (spec 1.2, 2.3).
+    if not os.path.isdir(images_dir):
+        print("Error: stills directory not found: %s" % images_dir, file=sys.stderr)
+        return 2
+    stills = find_stills(images_dir)
+    if not stills:
+        print("Error: no panel_NN.png stills found in %s" % images_dir, file=sys.stderr)
+        return 2
+    if not os.path.isfile(story_md_path):
+        print("Error: story.md not found: %s" % story_md_path, file=sys.stderr)
+        return 2
+    with open(story_md_path, encoding="utf-8") as f:
+        panels = parse_panels(f.read())
+    # Still N pairs with the N-th panel section by position, exactly how
+    # bin/ltx-story-images rendered it; a still with no section there is stale (spec 3.3).
+    for index, path in stills:
+        if not 1 <= index <= len(panels):
+            print("Error: %s has no matching panel section in story.md (story.md has %d "
+                  "panel sections); the stills may be stale relative to story.md."
+                  % (path, len(panels)), file=sys.stderr)
+            return 2
+    entries = [(format_panel_text(panels[index - 1]), encode_still(path))
+               for index, path in stills]
+    user_content = build_user_content(entries)
+
+    # Checked before the client exists; the key is never read into a variable -- the
+    # SDK picks it up from the environment itself (spec 4.2).
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY is not set; export it in your environment to run "
+              "judge-stills.", file=sys.stderr)
+        return 1
+    client = anthropic.Anthropic()
+    raise NotImplementedError("judging call is added by plan Task 5")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
