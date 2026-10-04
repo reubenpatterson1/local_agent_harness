@@ -218,3 +218,194 @@ def test_t5_load_manifest_pairs_by_index(tmp_path):
     path.write_text(json.dumps({"schema_version": 3, "panels": [PANEL_2, PANEL_1]}),
                     encoding="utf-8")
     assert judge_clips.load_manifest_panels(str(path)) == {1: PANEL_1, 2: PANEL_2}
+
+
+# --- synthetic clips and the frame-number oracle (spec 7.1) ---------------------------
+
+GARBAGE_CLIP = b"not a real clip"
+
+
+def _make_clip(path, frames):
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y",
+                    "-f", "lavfi", "-i",
+                    "color=c=black:s=64x48:r=24,format=yuv420p,geq=lum='16+N*8':cb=128:cr=128",
+                    "-f", "lavfi", "-t", "2", "-i", "anullsrc=r=48000:cl=mono",
+                    "-map", "0:v", "-map", "1:a", "-frames:v", str(frames),
+                    "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(path)], check=True)
+
+
+def _frame_number(jpeg_bytes, tmp_path):
+    path = tmp_path / ("oracle_%s.jpg" % uuid.uuid4().hex)
+    path.write_bytes(jpeg_bytes)
+    out = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+                          "-vf", "scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                         capture_output=True, check=True).stdout
+    return round(out[0] * 219 / 255 / 8)
+
+
+@pytest.fixture(scope="session")
+def synthetic_clips(tmp_path_factory):
+    """{25: path, 3: path, 1: path}: real h264+aac clips whose frame N has uniform luma
+    16 + 8N, generated once per session (spec 7.1)."""
+    directory = tmp_path_factory.mktemp("synthetic")
+    paths = {}
+    for frames in (25, 3, 1):
+        path = directory / ("clip%d.mp4" % frames)
+        _make_clip(path, frames)
+        paths[frames] = str(path)
+    return paths
+
+
+def _fake_run(monkeypatch, returncode, stdout="", stderr=""):
+    """Replace judge_clips.subprocess.run with a recorder that returns one canned
+    CompletedProcess. Returns the list of (argv, kwargs) calls."""
+    calls = []
+
+    def _run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr=stderr)
+    monkeypatch.setattr(judge_clips.subprocess, "run", _run)
+    return calls
+
+
+CAPTURE_KWARGS = {"capture_output": True, "encoding": "utf-8", "errors": "replace"}
+
+
+# --- T4, T9, T10: frame indices, probing, extraction (spec 3.4-3.6) -------------------
+
+def test_t4a_frame_indices_table():
+    table = {241: [0, 80, 160, 240], 145: [0, 48, 96, 144], 25: [0, 8, 16, 24],
+             9: [0, 3, 5, 8], 5: [0, 1, 3, 4], 4: [0, 1, 2, 3], 3: [0, 1, 1, 2],
+             2: [0, 0, 1, 1], 1: [0, 0, 0, 0]}
+    for n, expected in table.items():
+        assert judge_clips.frame_indices(n) == expected, n
+
+
+def test_t4b_frame_indices_properties():
+    for n in range(1, 2001):
+        idx = judge_clips.frame_indices(n)
+        assert len(idx) == 4, n
+        assert idx[0] == 0, n
+        assert idx[3] == n - 1, n
+        assert idx == sorted(idx), n
+        for k in range(4):
+            assert abs(idx[k] - k * (n - 1) / 3) <= 0.5, (n, k)
+
+
+def test_t9a_probe_synthetic_clips(synthetic_clips):
+    for frames in (25, 3, 1):
+        assert judge_clips.probe_clip(synthetic_clips[frames]) == (frames, fractions.Fraction(24))
+
+
+def test_t9b_probe_real_failures(tmp_path):
+    garbage = tmp_path / "garbage.mp4"
+    garbage.write_bytes(GARBAGE_CLIP)
+    with pytest.raises(judge_clips.ClipError) as exc:
+        judge_clips.probe_clip(str(garbage))
+    assert str(exc.value).startswith("ffprobe failed on %s (exit 1): " % garbage)
+
+    audio_only = tmp_path / "audio_only.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-t", "1",
+                    "-i", "anullsrc=r=48000:cl=mono", "-c:a", "aac", str(audio_only)], check=True)
+    zero_frames = tmp_path / "zero_frames.mp4"
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                    "-i", "color=c=black:s=64x48:r=24", "-frames:v", "0", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", str(zero_frames)], check=True)
+    for path in (audio_only, zero_frames):
+        with pytest.raises(judge_clips.ClipError) as exc:
+            judge_clips.probe_clip(str(path))
+        assert str(exc.value) == "%s has no video stream" % path
+
+
+def test_t9c_probe_canned_output(monkeypatch):
+    clip = "/x/panel_01.mp4"
+    calls = _fake_run(monkeypatch, 0,
+                      stdout='{"streams": [{"avg_frame_rate": "24/1", "nb_read_frames": "145"}]}')
+    assert judge_clips.probe_clip(clip) == (145, fractions.Fraction(24))
+    assert calls == [(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                       "-show_entries", "stream=nb_read_frames,avg_frame_rate", "-of", "json",
+                       "/x/panel_01.mp4"], CAPTURE_KWARGS)]
+    cases = [
+        (0, '{"streams": [{"avg_frame_rate": "24/1", "nb_read_frames": "0"}]}', "",
+         "/x/panel_01.mp4 has no decodable video frames"),                          # (b)
+        (0, '{"streams": [{"avg_frame_rate": "24/1"}]}', "",
+         "/x/panel_01.mp4 has no decodable video frames"),                          # (c)
+        (0, '{"streams": [{"avg_frame_rate": "0/0", "nb_read_frames": "145"}]}', "",
+         "/x/panel_01.mp4 has no usable frame rate (avg_frame_rate='0/0')"),        # (d)
+        (0, "not json", "", "ffprobe returned unreadable output for /x/panel_01.mp4"),  # (e)
+        (1, "", "line one\nlast line\n\n",
+         "ffprobe failed on /x/panel_01.mp4 (exit 1): last line"),                  # (f)
+        (1, "", "", "ffprobe failed on /x/panel_01.mp4 (exit 1): (no error output)"),  # (g)
+    ]
+    for returncode, stdout, stderr, message in cases:
+        _fake_run(monkeypatch, returncode, stdout=stdout, stderr=stderr)
+        with pytest.raises(judge_clips.ClipError) as exc:
+            judge_clips.probe_clip(clip)
+        assert str(exc.value) == message
+
+
+def test_t10a_extract_four_distinct_frames(tmp_path, synthetic_clips):
+    out = tmp_path / "out"
+    out.mkdir()
+    images = judge_clips.extract_frames(synthetic_clips[25], [0, 8, 16, 24], str(out))
+    assert len(images) == 4
+    assert all(image.startswith(b"\xff\xd8") for image in images)
+    assert [_frame_number(image, tmp_path) for image in images] == [0, 8, 16, 24]
+    size = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height",
+                           "-of", "csv=p=0", str(out / "frame_1.jpg")],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    assert size == "64,48"
+    assert sorted(os.listdir(out)) == ["frame_1.jpg", "frame_2.jpg", "frame_3.jpg", "frame_4.jpg"]
+
+
+def test_t10b_extract_repeated_indices(tmp_path, synthetic_clips):
+    out = tmp_path / "out"
+    out.mkdir()
+    images = judge_clips.extract_frames(synthetic_clips[3], [0, 1, 1, 2], str(out))
+    assert len(images) == 4
+    assert images[1] == images[2]
+    assert [_frame_number(image, tmp_path) for image in images] == [0, 1, 1, 2]
+    assert len(os.listdir(out)) == 3
+
+    out2 = tmp_path / "out2"
+    out2.mkdir()
+    images = judge_clips.extract_frames(synthetic_clips[1], [0, 0, 0, 0], str(out2))
+    assert len(images) == 4
+    assert images[0] == images[1] == images[2] == images[3]
+    assert [_frame_number(image, tmp_path) for image in images] == [0, 0, 0, 0]
+    assert len(os.listdir(out2)) == 1
+
+
+def test_t10c_extract_canned_output(tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+    calls = _fake_run(monkeypatch, 0)
+    with pytest.raises(judge_clips.ClipError) as exc:
+        judge_clips.extract_frames("/x/panel_02.mp4", [0, 1, 1, 2], str(out))
+    assert calls == [(["ffmpeg", "-nostdin", "-v", "error", "-i", "/x/panel_02.mp4",
+                       "-map", "0:v:0", "-vf", "select=eq(n\\,0)+eq(n\\,1)+eq(n\\,2)",
+                       "-fps_mode", "passthrough", "-q:v", "2", "-f", "image2",
+                       os.path.join(str(out), "frame_%d.jpg")], CAPTURE_KWARGS)]
+    assert str(exc.value) == "ffmpeg wrote 0 frames from /x/panel_02.mp4; expected 3"
+
+    _fake_run(monkeypatch, 1, stderr="bad\nworse\n")
+    with pytest.raises(judge_clips.ClipError) as exc:
+        judge_clips.extract_frames("/x/panel_02.mp4", [0, 1, 1, 2], str(out))
+    assert str(exc.value) == "ffmpeg failed on /x/panel_02.mp4 (exit 1): worse"
+
+
+def test_t10d_extract_real_failures(tmp_path, synthetic_clips):
+    out = tmp_path / "out"
+    out.mkdir()
+    with pytest.raises(judge_clips.ClipError) as exc:
+        judge_clips.extract_frames(synthetic_clips[3], [0, 1, 2, 5], str(out))
+    assert str(exc.value) == "ffmpeg wrote 3 frames from %s; expected 4" % synthetic_clips[3]
+
+    garbage = tmp_path / "garbage.mp4"
+    garbage.write_bytes(GARBAGE_CLIP)
+    out3 = tmp_path / "out3"
+    out3.mkdir()
+    with pytest.raises(judge_clips.ClipError) as exc:
+        judge_clips.extract_frames(str(garbage), [0], str(out3))
+    assert str(exc.value).startswith("ffmpeg failed on %s (exit " % garbage)

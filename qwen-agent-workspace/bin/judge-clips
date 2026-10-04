@@ -176,3 +176,76 @@ def load_manifest_panels(manifest_path):
                                 % (index, manifest_path))
         by_index[index] = panel
     return by_index
+
+
+class ClipError(Exception):
+    """A clip cannot be probed or its frames cannot be extracted; str() is the E15 detail
+    (spec 3.4, 3.6)."""
+
+
+def _stderr_tail(stderr):
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    return lines[-1] if lines else "(no error output)"
+
+
+def probe_clip(path):
+    """(frame_count, fps) of the clip's first video stream. frame_count is the number of
+    frames the decoder actually produces (-count_frames nb_read_frames), never the
+    container header's nb_frames; fps is avg_frame_rate as a Fraction (spec 3.4)."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+         "-show_entries", "stream=nb_read_frames,avg_frame_rate", "-of", "json", path],
+        capture_output=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise ClipError("ffprobe failed on %s (exit %d): %s"
+                        % (path, proc.returncode, _stderr_tail(proc.stderr)))
+    try:
+        streams = json.loads(proc.stdout).get("streams")
+    except ValueError:
+        raise ClipError("ffprobe returned unreadable output for %s" % path)
+    if not streams:
+        raise ClipError("%s has no video stream" % path)
+    count = streams[0].get("nb_read_frames", "")
+    if not count.isdigit() or int(count) == 0:
+        raise ClipError("%s has no decodable video frames" % path)
+    rate = streams[0].get("avg_frame_rate", "")
+    try:
+        fps = fractions.Fraction(rate)
+    except (ValueError, ZeroDivisionError):
+        fps = fractions.Fraction(0)
+    if fps <= 0:
+        raise ClipError("%s has no usable frame rate (avg_frame_rate=%r)" % (path, rate))
+    return int(count), fps
+
+
+def frame_indices(n):
+    """The FRAMES_PER_CLIP frame indices sampled from a clip of n >= 1 frames:
+    round(k * (n - 1) / 3) for k = 0..3 -- first frame, two evenly spaced middle frames,
+    last frame. Repeats are kept when n < 4 (spec 3.5). Pure."""
+    return [round(k * (n - 1) / (FRAMES_PER_CLIP - 1)) for k in range(FRAMES_PER_CLIP)]
+
+
+def extract_frames(path, indices, out_dir):
+    """JPEG bytes for each entry of indices, in the same order. Each distinct index is
+    extracted once (a repeated select term yields one frame, not two) and its bytes are
+    reused for repeats. out_dir must be an existing empty directory (spec 3.6)."""
+    unique = sorted(set(indices))
+    select = "select=" + "+".join("eq(n\\,%d)" % i for i in unique)
+    proc = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:v:0",
+         "-vf", select, "-fps_mode", "passthrough", "-q:v", "2",
+         "-f", "image2", os.path.join(out_dir, "frame_%d.jpg")],
+        capture_output=True, encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise ClipError("ffmpeg failed on %s (exit %d): %s"
+                        % (path, proc.returncode, _stderr_tail(proc.stderr)))
+    expected = ["frame_%d.jpg" % j for j in range(1, len(unique) + 1)]
+    written = os.listdir(out_dir)
+    if sorted(written) != sorted(expected):
+        raise ClipError("ffmpeg wrote %d frames from %s; expected %d"
+                        % (len(written), path, len(unique)))
+    by_index = {}
+    for j, index in enumerate(unique, 1):
+        with open(os.path.join(out_dir, "frame_%d.jpg" % j), "rb") as f:
+            by_index[index] = f.read()
+    return [by_index[i] for i in indices]
