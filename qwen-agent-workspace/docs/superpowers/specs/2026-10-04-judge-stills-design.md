@@ -517,7 +517,7 @@ client.messages.create(
   - JSON Schema (the draft this project uses, with no `$schema` key) cannot express "required only when some external fact — the runtime stills count — holds." `required` is static and has no access to data outside the instance being validated. So the condition is enforced in two other places instead:
     - the system prompt (Section 4.5) and the final user-message text block (Section 3.6), which tell the judge which case applies and what to do in each; and
     - for the 2+-stills case only, an additional check in the script itself, run immediately after `jsonschema.validate` succeeds (Section 4.4), since the schema alone cannot catch a judge that ignores the instruction.
-  - For the <2-stills case, `visual_continuity`'s absence from `tool_input` is schema-valid and expected; nothing further checks it.
+  - For the <2-stills case, `visual_continuity`'s absence from `tool_input` is schema-valid and expected. Its *presence* there is rejected by a symmetric script-side check (Section 4.4, final-review fix): a score with nothing to compare would be fabricated.
 
 ### 4.4 Tool-input validation
 
@@ -532,6 +532,10 @@ This is mostly identical to `bin/judge-story`, with one addition for the conditi
           raise jsonschema.ValidationError(
               "visual_continuity is required when judging 2 or more stills"
           )
+      if stills_count < 2 and "visual_continuity" in tool_input["scores"]:
+          raise jsonschema.ValidationError(
+              "visual_continuity must be omitted when judging fewer than 2 stills"
+          )
   ```
   Called as `validate_judgment_input(block.input, len(stills))` (Section 1.2, step 12). Because the schema has no `$schema` key, `jsonschema.validate` uses its latest draft, which does not count booleans as integers.
 - **[spec choice, point 3 of the G1 fix]:** for the 2+-stills case, `visual_continuity`'s absence from `tool_input` is schema-valid (it is unconditionally optional in `SUBMIT_JUDGMENT_SCHEMA`) but is a **failure of instruction-following** by the judge: the system prompt and the final user-message text block both told it, for this stills count, to score and include `visual_continuity`. Two ways to handle this were considered:
@@ -544,6 +548,7 @@ This is mostly identical to `bin/judge-story`, with one addition for the conditi
   - a missing `visual_continuity` when `stills_count >= 2` (rejected by the additional check above, not by the schema's `required` array — the schema itself allows `visual_continuity` to be absent in every case; see Section 4.3);
   - a score below 1 or above 10, for any score key that is present;
   - a non-integer score, including strings, floats, and booleans, for any score key that is present.
+  - a **present** `visual_continuity` when `stills_count < 2` (final-review fix, symmetric to the 2+ case: otherwise a judge that ignored "omit it" would have a fabricated integer written through; with the check, `scores.visual_continuity` in the output is an integer exactly when 2+ stills were judged and `null` exactly when fewer were).
   - A missing `visual_continuity` when `stills_count < 2` is **not** rejected; it is the expected shape (Section 5.1).
 - On a validation failure (from either the schema or the additional check) there is no retry. Write `stills_judgment.raw.json` with every response received so far, print E9, and return 1.
 
@@ -727,7 +732,7 @@ All error messages go to stderr and begin with `Error: `. The wording of each is
 | E6 | `ANTHROPIC_API_KEY` unset or empty | 9 | `Error: ANTHROPIC_API_KEY is not set; export it in your environment to run judge-stills.` | 1 | none |
 | E7 | Anthropic API error (auth, rate limit, overloaded, connection, timeout, request too large, invalid image, or any other `anthropic.APIError`) on either call | 11 | `Error: Anthropic API call failed: <type(e).__name__>: <str(e)>` | 1 | none |
 | E8 | No `submit_judgment` tool_use after one retry | 11 | `Error: Claude did not call submit_judgment after one retry; raw responses written to <raw_path>` | 1 | `stills_judgment.raw.json` |
-| E9 | Tool input fails schema validation, **or** (G1 fix) 2 or more stills were judged and the tool input omits `visual_continuity` | 12 | `Error: submit_judgment input failed schema validation: <ValidationError.message>` (the latter case's `ValidationError.message` is the literal `"visual_continuity is required when judging 2 or more stills"`, Section 4.4) | 1 | `stills_judgment.raw.json` |
+| E9 | Tool input fails schema validation, **or** (G1 fix) 2 or more stills were judged and the tool input omits `visual_continuity`, **or** (final-review fix) fewer than 2 stills were judged and the tool input includes it | 12 | `Error: submit_judgment input failed schema validation: <ValidationError.message>` (the two G1 cases' `ValidationError.message` is the literal `"visual_continuity is required when judging 2 or more stills"` or `"visual_continuity must be omitted when judging fewer than 2 stills"`, Section 4.4) | 1 | `stills_judgment.raw.json` |
 
 - The brief combines "missing directory" and "no stills" into one row. This spec splits it into E2 and E3 so the message names the actual problem; both exit 2.
 - E7: the tool adds no retry or backoff of its own. The SDK's built-in default `max_retries` (2) is left unchanged, as in `bin/judge-story` (its G2).
@@ -797,7 +802,7 @@ All error messages go to stderr and begin with `Error: `. The wording of each is
 | T8b | Each of `prompt_fidelity`, `rendering_quality`, `composition` removed in turn, `stills_count=2` (3 cases) | raises `jsonschema.ValidationError` (schema-level: these three are unconditionally required) |
 | T8c | Each of the four score keys (including `visual_continuity`) set in turn to `0`, `11`, `"7"`, `7.5`, `True`, `stills_count=2` so `visual_continuity` is present to be checked | raises `jsonschema.ValidationError` |
 | T8d | All four scores at 1, then at 10, `stills_count=2`; then a valid payload plus an extra top-level key and an extra score key, `stills_count=2`; then a payload with `visual_continuity` omitted and the other three valid, `stills_count=1` | does not raise, in every case |
-| T8e | `visual_continuity` removed, `stills_count=1` | does not raise (schema allows the omission, and the count is below 2 so the additional check does not apply) |
+| T8e | `visual_continuity` removed, `stills_count=1`; then the full valid input (with `visual_continuity`), `stills_count=1` | the first does not raise (schema allows the omission, and the count is below 2 so the 2+ check does not apply); the second raises `ValidationError` with message `"visual_continuity must be omitted when judging fewer than 2 stills"` |
 | T8f | `visual_continuity` removed, `stills_count=2` | raises `jsonschema.ValidationError`, with `.message == "visual_continuity is required when judging 2 or more stills"` (the additional check, not the schema's `required` array) |
 | T9a | Story dir with `story.md` but no `images/` | `main(["--story-id", id]) == 2`; stderr `== "Error: stills directory not found: <images_dir>\n"`; stdout empty |
 | T9b | `images/` exists, containing only `panel_1.png` and `images.json` | `== 2`; stderr `== "Error: no panel_NN.png stills found in <images_dir>\n"` |
@@ -873,6 +878,7 @@ Before declaring D2 complete, the implementer applies each mutation below to `bi
 | `stills_judgment.raw.json` write skipped | T13 |
 | `visual_continuity` left in (or restored to) `scores.required` in `SUBMIT_JUDGMENT_SCHEMA` | T8e, T10b |
 | The post-validation `stills_count >= 2` check in `validate_judgment_input` removed or short-circuited | T14b |
+| The post-validation `stills_count < 2` (must-be-omitted) check in `validate_judgment_input` removed | T8e |
 | `build_user_content` always uses `FINAL_USER_TEXT_MULTI_TEMPLATE`, regardless of count | T7b, T7c, T10b |
 | `build_user_content` always uses `FINAL_USER_TEXT_SINGLE`, regardless of count | T7, T10 |
 | `format_score_line` formats every value with `"%d"` unconditionally (no `None` branch) | T10b (raises or mis-renders instead of printing `n/a (only 1 still)`) |

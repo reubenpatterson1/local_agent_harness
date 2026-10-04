@@ -110,6 +110,11 @@ def test_t8e_visual_continuity_optional_for_one_still():
     # The schema alone allows the omission too (it is not in scores.required).
     jsonschema.validate(instance=_without_vc(VALID_INPUT),
                         schema=judge_stills.SUBMIT_JUDGMENT_SCHEMA)
+    # And a 1-still judgment that scores it anyway is rejected, never written through.
+    with pytest.raises(jsonschema.ValidationError) as exc:
+        judge_stills.validate_judgment_input(copy.deepcopy(VALID_INPUT), 1)
+    assert exc.value.message == ("visual_continuity must be omitted when judging fewer "
+                                 "than 2 stills")
 
 
 def test_t8f_visual_continuity_required_for_two_stills():

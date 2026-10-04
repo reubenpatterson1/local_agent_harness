@@ -146,11 +146,17 @@ def validate_judgment_input(tool_input, stills_count):
     does not count booleans as integers; extra keys are tolerated). Then, when 2 or more
     stills were judged, visual_continuity must be present: its absence there is an
     instruction-following failure, not the legitimate 1-still omission (spec 4.4, G1).
+    Symmetrically, with fewer than 2 stills it must be absent: there is nothing to
+    compare, so any score there would be fabricated.
     """
     jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)
     if stills_count >= 2 and "visual_continuity" not in tool_input["scores"]:
         raise jsonschema.ValidationError(
             "visual_continuity is required when judging 2 or more stills"
+        )
+    if stills_count < 2 and "visual_continuity" in tool_input["scores"]:
+        raise jsonschema.ValidationError(
+            "visual_continuity must be omitted when judging fewer than 2 stills"
         )
 
 
