@@ -3,7 +3,8 @@
 Same record layout as bin/iterate-story's _log_run, labelled "stage: <tool>" instead of
 "round N: <tool>". Skipped when STORY_PIPELINE_LOGGED is set (bin/iterate-story sets it
 for its children, whose output it already logs) or when the story directory does not
-exist. Only output written through sys.stdout/sys.stderr is captured; subprocesses that
+exist when the run ends (a tool that creates it, such as ltx-movie on a new story id, is
+logged). Only output written through sys.stdout/sys.stderr is captured; subprocesses that
 inherit the file descriptors bypass it.
 """
 
@@ -83,7 +84,7 @@ def run_logged(label, story_dir, main_fn, argv):
     """Call main_fn() and return its result, appending a record of the run to
     story_dir/iterate-story.log. Exceptions (SystemExit included) are re-raised
     unchanged after the record is written; a log-write failure only warns."""
-    if os.environ.get(ENV_FLAG) or story_dir is None or not os.path.isdir(story_dir):
+    if os.environ.get(ENV_FLAG) or story_dir is None:
         return main_fn()
     buf = []
     old_out, old_err = sys.stdout, sys.stderr
@@ -104,6 +105,7 @@ def run_logged(label, story_dir, main_fn, argv):
         raise
     finally:
         sys.stdout, sys.stderr = old_out, old_err
-        _append(story_dir, format_record(
-            label, list(argv), exit_code, collapse_cr("".join(buf)),
-            datetime.datetime.now(datetime.timezone.utc)))
+        if os.path.isdir(story_dir):
+            _append(story_dir, format_record(
+                label, list(argv), exit_code, collapse_cr("".join(buf)),
+                datetime.datetime.now(datetime.timezone.utc)))

@@ -198,6 +198,21 @@ def test_p12_progress_collapsed(tmp_path):
     assert "--- output ---\n100%\n--- end ---" in text
 
 
+def test_p13_story_dir_created_during_run(tmp_path):
+    new_dir = tmp_path / "new"
+
+    def main():
+        new_dir.mkdir()
+        print("made")
+        return 0
+
+    rc = pipeline_log.run_logged("ltx-movie", str(new_dir), main, ["prog"])
+    assert rc == 0
+    text = (new_dir / "iterate-story.log").read_text(encoding="utf-8")
+    assert "=== stage: ltx-movie ===" in text
+    assert "--- output ---\nmade\n--- end ---" in text
+
+
 # --- Wiring tests ---
 
 def test_w1_story_dir_resolvers():
