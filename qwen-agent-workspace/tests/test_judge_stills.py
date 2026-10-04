@@ -213,3 +213,49 @@ def test_t5_format_panel_text():
         "## Panel 2 —\nMotion: The frog leaps.\nNarration: He jumps.")
     assert judge_stills.format_panel_text(
         {"header": "## Panel 9 — X", "image": "", "motion": "", "narration": ""}) == "## Panel 9 — X"
+
+
+# --- T6-T7: encoding and user-message content (spec 3.5, 3.6) ------------------------
+
+def _still_bytes(k):
+    """Distinct fake PNG bytes for still k (spec 7.1): nothing decodes them, and distinct
+    bytes let a test check panel order by decoding the base64 back."""
+    return b"\x89PNG\r\n\x1a\n" + b"still-%d" % k
+
+
+def test_t6_encode_still(tmp_path):
+    data = _still_bytes(1)
+    path = tmp_path / "panel_01.png"
+    path.write_bytes(data)
+    result = judge_stills.encode_still(str(path))
+    assert result == base64.standard_b64encode(data).decode("ascii")
+    assert base64.b64decode(result) == data
+
+
+def test_t7_build_user_content_two_stills():
+    assert judge_stills.build_user_content([("T1", "QQ=="), ("T3", "Qg==")]) == [
+        {"type": "text", "text": "T1"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "QQ=="}},
+        {"type": "text", "text": "T3"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "Qg=="}},
+        {"type": "text", "text": judge_stills.FINAL_USER_TEXT_MULTI_TEMPLATE % 2},
+    ]
+    assert judge_stills.FINAL_USER_TEXT_MULTI_TEMPLATE % 2 == (
+        "You are judging all 2 stills above against their panel text. Score all four "
+        "dimensions, including visual_continuity, and call submit_judgment.")
+
+
+def test_t7b_build_user_content_one_still():
+    assert judge_stills.build_user_content([("T1", "QQ==")]) == [
+        {"type": "text", "text": "T1"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                     "data": "QQ=="}},
+        {"type": "text", "text": judge_stills.FINAL_USER_TEXT_SINGLE},
+    ]
+
+
+def test_t7c_build_user_content_zero_entries():
+    assert judge_stills.build_user_content([]) == [
+        {"type": "text", "text": judge_stills.FINAL_USER_TEXT_SINGLE}]
