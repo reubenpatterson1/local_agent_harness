@@ -614,3 +614,118 @@ def test_t14b_two_stills_missing_visual_continuity(tmp_path, monkeypatch, capsys
     assert out == ""
     assert err == ("Error: submit_judgment input failed schema validation: "
                    "visual_continuity is required when judging 2 or more stills\n")
+
+
+# --- T12, T13, T15, T16: retry, double failure, API errors, key leakage (spec 4.6, 6) -
+
+def test_t12_retry_after_missing_tool_call(tmp_path, monkeypatch):
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 3))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    # r1 reports no thinking_tokens; r2 does: the sum covers only the responses that
+    # report it (spec 5.1).
+    r1 = _text_response("Here is my judgment in prose.", _usage(100, 200, None))
+    r2 = _tool_response(copy.deepcopy(VALID_INPUT), _usage(1000, 3000, 2500))
+    fake = _install_fake(monkeypatch, [r1, r2])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 0
+
+    assert len(fake.calls) == 2
+    first, second = fake.calls
+    assert len(first["messages"]) == 1     # the retry builds a new list, not an append
+    retry_messages = second["messages"]
+    assert len(retry_messages) == 3
+    assert [m["role"] for m in retry_messages] == ["user", "assistant", "user"]
+    assert retry_messages[0] == first["messages"][0]      # same images re-sent
+    assert len(retry_messages[0]["content"]) == 5
+    assert retry_messages[1]["content"] == r1.content
+    assert retry_messages[1]["content"][0].type == "thinking"
+    assert retry_messages[1]["content"][0].signature == "sig-abc123"
+    assert retry_messages[2]["content"] == judge_stills.RETRY_USER_MESSAGE
+    assert ({k: v for k, v in second.items() if k != "messages"}
+            == {k: v for k, v in first.items() if k != "messages"})
+    with open(story_dir / "stills_judgment.json", encoding="utf-8") as f:
+        judgment = json.load(f)
+    assert judgment["usage"] == {"input_tokens": 1100, "output_tokens": 3200,
+                                 "thinking_tokens": 2500}
+    assert judgment["scores"] == VALID_INPUT["scores"]
+    assert not (story_dir / "stills_judgment.raw.json").exists()
+
+
+def test_t13_double_failure_writes_raw_and_no_judgment(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 3))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    r1 = _text_response("Prose judgment, attempt one.", _usage(100, 200, 50))
+    r2 = _text_response("Prose judgment, attempt two.", _usage(110, 210, 60))
+    fake = _install_fake(monkeypatch, [r1, r2])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 2
+    raw_path = story_dir / "stills_judgment.raw.json"
+    with open(raw_path, encoding="utf-8") as f:
+        raw = json.load(f)
+    assert raw["responses"] == [r1.model_dump(mode="json"), r2.model_dump(mode="json")]
+    assert not (story_dir / "stills_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == ("Error: Claude did not call submit_judgment after one retry; raw "
+                   "responses written to %s\n" % raw_path)
+
+
+def test_t15_api_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+
+    def connection_error():
+        return anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"))
+
+    # (a) The first call raises.
+    first_dir = _make_story(tmp_path, monkeypatch, story_id="api-first")
+    before = _listing(first_dir)
+    fake = _install_fake(monkeypatch, [connection_error()])
+    assert judge_stills.main(["--story-id", "api-first"]) == 1
+    assert len(fake.calls) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: Anthropic API call failed: APIConnectionError: ")
+    assert _listing(first_dir) == before
+
+    # (b) r1 has no tool call and the retry raises: E7, and r1 is not dumped.
+    retry_dir = _make_story(tmp_path, monkeypatch, story_id="api-retry")
+    before = _listing(retry_dir)
+    fake = _install_fake(monkeypatch, [
+        _text_response("Prose only.", _usage(100, 200, 50)), connection_error()])
+    assert judge_stills.main(["--story-id", "api-retry"]) == 1
+    assert len(fake.calls) == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: Anthropic API call failed: APIConnectionError: ")
+    assert _listing(retry_dir) == before
+
+
+def test_t16_api_key_never_leaks(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+
+    # T10 scenario (success). These responses omit output_tokens_details, so this run
+    # also pins usage.thinking_tokens == null rather than a fabricated 0 (spec 5.1).
+    ok_dir = _make_story(tmp_path, monkeypatch, story_id="leak-ok")
+    _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(1200, 3400, None))])
+    assert judge_stills.main(["--story-id", "leak-ok"]) == 0
+    ok_out, ok_err = capsys.readouterr()
+
+    # T13 scenario (double failure).
+    fail_dir = _make_story(tmp_path, monkeypatch, story_id="leak-fail")
+    _install_fake(monkeypatch, [_text_response("Prose one.", _usage(1, 2, None)),
+                                _text_response("Prose two.", _usage(3, 4, None))])
+    assert judge_stills.main(["--story-id", "leak-fail"]) == 1
+    fail_out, fail_err = capsys.readouterr()
+
+    written = [ok_dir / "stills_judgment.json", fail_dir / "stills_judgment.raw.json"]
+    for path in written:
+        assert path.is_file(), path
+    with open(ok_dir / "stills_judgment.json", encoding="utf-8") as f:
+        assert json.load(f)["usage"]["thinking_tokens"] is None
+    for text in [ok_out, ok_err, fail_out, fail_err] + [p.read_text(encoding="utf-8")
+                                                         for p in written]:
+        assert SENTINEL_KEY not in text
