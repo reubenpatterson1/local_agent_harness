@@ -189,7 +189,7 @@ Every requirement in Sections 1-7 is a must-have. This phase has no nice-to-have
 9. If `ANTHROPIC_API_KEY` is unset or empty: print E6 to stderr and return 1. This happens before `anthropic.Anthropic` is constructed.
 10. Construct `anthropic.Anthropic()` with no arguments.
 11. Run the judging call and its single possible retry (Section 4.6).
-12. Validate the tool input: `validate_judgment_input(block.input, len(stills))` (Section 4.4). This runs the JSON Schema check and then, when `len(stills) >= 2`, the additional check that `visual_continuity` is present. Either kind of failure is handled identically: raw dump, print E9, return 1 (no retry).
+12. Validate the tool input: `validate_judgment_input(block.input, len(stills))` (Section 4.4). This runs the JSON Schema check and then the two-way `visual_continuity` check: it must be present when `len(stills) >= 2` and absent when `len(stills) < 2`. Any kind of failure is handled identically: raw dump, print E9, return 1 (no retry).
 13. Write `stills_judgment.json` (Section 5.1).
 14. Print the stdout summary (Section 5.3). Return 0.
 
@@ -223,7 +223,7 @@ The implementer must use these names so that tests can target them:
 | `encode_still(path)` | function | Section 3.5 |
 | `build_user_content(entries)` | function | Section 3.6. Pure |
 | `find_tool_use(response)` | function | Returns the first content block with `type == "tool_use"` and `name == TOOL_NAME`, else `None`. Identical to `bin/judge-story` |
-| `validate_judgment_input(tool_input, stills_count)` | function | Runs `jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)`, then the additional `visual_continuity`-presence check for the 2+-stills case (Section 4.4). `stills_count` is `len(stills)` |
+| `validate_judgment_input(tool_input, stills_count)` | function | Runs `jsonschema.validate(instance=tool_input, schema=SUBMIT_JUDGMENT_SCHEMA)`, then the two-way `visual_continuity` check: required for 2+ stills, rejected for fewer (Section 4.4). `stills_count` is `len(stills)` |
 | `format_score_line(name, value)` | function | Section 5.3. Returns one stdout line for a score, formatting `None` as the `n/a` text instead of `%d` |
 | `_create_message(client, messages)` | function | One API call with the Section 4.1 parameters |
 | `_write_raw(story_dir, responses)` | function | Writes `stills_judgment.raw.json` and returns its path (Section 5.2) |
@@ -516,12 +516,12 @@ client.messages.create(
 - **Schema change (G1 resolution): `visual_continuity` moves out of `scores`'s `required` array.** Its own property definition (`{"type": "integer", "minimum": 1, "maximum": 10}`) is unchanged; only its membership in `required` changes. The schema goes from 4 unconditionally required score fields to **3 always-required** (`prompt_fidelity`, `rendering_quality`, `composition`) **+ 1 conditionally-required** (`visual_continuity`, required only when 2 or more stills are judged).
   - JSON Schema (the draft this project uses, with no `$schema` key) cannot express "required only when some external fact — the runtime stills count — holds." `required` is static and has no access to data outside the instance being validated. So the condition is enforced in two other places instead:
     - the system prompt (Section 4.5) and the final user-message text block (Section 3.6), which tell the judge which case applies and what to do in each; and
-    - for the 2+-stills case only, an additional check in the script itself, run immediately after `jsonschema.validate` succeeds (Section 4.4), since the schema alone cannot catch a judge that ignores the instruction.
+    - for both cases, an additional two-way check in the script itself (required for 2+ stills, rejected for fewer), run immediately after `jsonschema.validate` succeeds (Section 4.4), since the schema alone cannot catch a judge that ignores the instruction.
   - For the <2-stills case, `visual_continuity`'s absence from `tool_input` is schema-valid and expected. Its *presence* there is rejected by a symmetric script-side check (Section 4.4, final-review fix): a score with nothing to compare would be fabricated.
 
 ### 4.4 Tool-input validation
 
-This is mostly identical to `bin/judge-story`, with one addition for the conditional `visual_continuity` requirement (**[spec choice]**, the point 3 decision below):
+This is mostly identical to `bin/judge-story`, with one addition: a two-way check on `visual_continuity` (**[spec choice]**, the point 3 decision below, plus its final-review inverse):
 
 - `find_tool_use(response)` scans `response.content` in order and returns the first block with `block.type == "tool_use"` and `block.name == "submit_judgment"`, or `None`.
 - `validate_judgment_input(tool_input, stills_count)` is:
@@ -659,7 +659,7 @@ Field rules:
   - `prompt_fidelity`, `rendering_quality`, and `composition` are copied from the validated tool input's `scores` object. Validation (Section 4.4) guarantees all three are present, so this never needs a fallback.
   - `visual_continuity` is `tool_input["scores"].get("visual_continuity")`:
     - when `len(stills) >= 2`, validation (Section 4.4) guarantees the key is present, so this copies the judge's real score;
-    - when `len(stills) < 2`, the key is normally absent (the schema allows this, and the system prompt instructs the judge to omit it), and `.get(...)` yields Python `None`, written as JSON `null` — never a fabricated integer.
+    - when `len(stills) < 2`, the key is always absent (the system prompt instructs the judge to omit it, and Section 4.4 validation rejects a judgment that includes it), and `.get(...)` yields Python `None`, written as JSON `null` — never a fabricated integer.
 - `critique`: copied verbatim from the validated tool input.
 
 The list of stills judged is not recorded **[the brief's key list followed exactly; see G9]**.
@@ -920,6 +920,7 @@ No item here blocks implementation. Every item has a spec choice recorded above,
     - **Section 4.5** (system prompt) and **Section 3.6** (final user-message text block): explicit instructions for both the <2-stills and 2+-stills cases, and the final text block states the actual stills count so the judge does not have to infer which case applies.
     - **Section 4.4**: a post-validation check, run after `jsonschema.validate` succeeds, that treats a 2+-stills judgment missing `visual_continuity` as equivalent to any other schema-validation failure (same raw-dump-and-exit-1 handling, same E9 code path) — a deliberate choice that an instruction-following failure in the 2+-stills case is not the same as the legitimate <2-stills omission, and must not be silently written as `null`.
     - **Section 5.1**: `scores.visual_continuity` is JSON `null`, never a fabricated integer, when the tool call omitted it (the <2-stills case only, since the 2+-stills case now fails before this point if it's missing).
+    - **Section 4.4 (final-review fix)**: the inverse check — a <2-stills judgment that *includes* `visual_continuity` is rejected through the same E9 path, so the output holds an integer exactly when 2+ stills were judged and `null` exactly when fewer were.
     - **Section 5.3**: stdout prints `n/a (only 1 still)` instead of crashing on `"%d" % None`.
     - **Section 7.2/7.3**: new test IDs T7b, T7c, T8e, T8f, T10b, T14b cover the <2-stills success path, the 2+-stills normal path (already covered by the existing T10), and the 2+-stills-but-omitted failure path, with matching Section 7.4 mutation rows.
   - For chain stories, what panels 2..N actually look like still exists only in the rendered clips — that remains the clip-level, frame-extraction sub-project this spec puts out of scope, unaffected by this resolution.
