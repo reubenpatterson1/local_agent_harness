@@ -528,8 +528,28 @@ def main(argv=None):
     user_content = build_user_content(clip_inputs)
     client = anthropic.Anthropic()
 
-    responses = [_create_message(client, [{"role": "user", "content": user_content}])]
-    block = find_tool_use(responses[0])
+    responses = []
+    try:
+        responses.append(_create_message(client, [{"role": "user", "content": user_content}]))
+        block = find_tool_use(responses[0])
+        if block is None:
+            # One retry in the same conversation, re-sending every frame. r1.content goes
+            # back exactly as received (thinking blocks and signatures) (spec 4.6).
+            responses.append(_create_message(client, [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": responses[0].content},
+                {"role": "user", "content": RETRY_USER_MESSAGE},
+            ]))
+            block = find_tool_use(responses[1])
+    except anthropic.APIError as e:
+        print("Error: Anthropic API call failed: %s: %s" % (type(e).__name__, e),
+              file=sys.stderr)
+        return 1
+    if block is None:
+        raw_path = _write_raw(story_dir, responses)
+        print("Error: Claude did not call submit_judgment after one retry; raw responses "
+              "written to %s" % raw_path, file=sys.stderr)
+        return 1
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
