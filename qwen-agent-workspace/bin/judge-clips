@@ -380,3 +380,89 @@ def build_user_content(clips):
         final_text = FINAL_USER_TEXT_SINGLE
     content.append({"type": "text", "text": final_text})
     return content
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="judge-clips",
+        description="Judge a story's rendered panel clips with Claude against the manifest text.")
+    parser.add_argument("--story-id", dest="story_id", metavar="ID", required=True,
+                        help="judge generated/stories/ID/clips/panel_NN.mp4 against "
+                             "generated/stories/ID/manifest.json")
+    return parser
+
+
+def resolve_paths(story_id):
+    story_dir = os.path.join(WS, "generated", "stories", story_id)
+    clips_dir = os.path.join(story_dir, "clips")
+    manifest_path = os.path.join(story_dir, "manifest.json")
+    return story_dir, clips_dir, manifest_path
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    story_dir, clips_dir, manifest_path = resolve_paths(args.story_id)
+
+    # Cheap filesystem and manifest checks first; all exit 2 (spec 1.2, 2.3).
+    if not os.path.isdir(clips_dir):
+        print("Error: clips directory not found: %s" % clips_dir, file=sys.stderr)
+        return 2
+    clips = find_clips(clips_dir)
+    if not clips:
+        print("Error: no panel_NN.mp4 clips found in %s" % clips_dir, file=sys.stderr)
+        return 2
+    numbers = [number for number, _ in clips]
+    for number in sorted(set(numbers)):
+        if numbers.count(number) > 1:
+            names = [os.path.basename(path) for n, path in clips if n == number]
+            print("Error: more than one clip for panel %d in %s: %s"
+                  % (number, clips_dir, ", ".join(names)), file=sys.stderr)
+            return 2
+    if len(clips) > MAX_CLIPS:
+        print("Error: %d clips found in %s; judge-clips sends 4 frames per clip in one request "
+              "and judges at most 25 clips (100 images, the Anthropic API's per-request image "
+              "limit for 200k-context models)." % (len(clips), clips_dir), file=sys.stderr)
+        return 2
+    if not os.path.isfile(manifest_path):
+        print("Error: manifest.json not found: %s" % manifest_path, file=sys.stderr)
+        return 2
+    try:
+        panels_by_index = load_manifest_panels(manifest_path)
+    except ManifestError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    extra = [os.path.basename(path) for number, path in clips if number not in panels_by_index]
+    if extra:
+        print("Error: clips with no matching panel in manifest.json: %s; the clips in %s may "
+              "be stale relative to manifest.json." % (", ".join(extra), clips_dir),
+              file=sys.stderr)
+        return 2
+    missing = sorted(set(panels_by_index) - set(numbers))
+    if missing:
+        print("Error: manifest.json panels with no rendered clip in %s: %s; judge-clips "
+              "judges only complete renders." % (clips_dir, _panel_list(missing)),
+              file=sys.stderr)
+        return 2
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            print("Error: %s not found on PATH; judge-clips needs ffmpeg and ffprobe to "
+                  "extract frames." % tool, file=sys.stderr)
+            return 2
+
+    # Checked before any subprocess runs and before the client exists; the key is never
+    # read into a variable (spec 4.2).
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY is not set; export it in your environment to run "
+              "judge-clips.", file=sys.stderr)
+        return 1
+
+    raise NotImplementedError("frame extraction and the judging call are added by plan Task 6")
+
+
+def _pipeline_log_story_dir(argv):
+    story_id = pipeline_log.argv_value(argv, "--story-id")
+    return os.path.join(WS, "generated", "stories", story_id) if story_id else None
+
+
+if __name__ == "__main__":
+    sys.exit(pipeline_log.run_logged("judge-clips", _pipeline_log_story_dir(sys.argv[1:]), main, sys.argv))

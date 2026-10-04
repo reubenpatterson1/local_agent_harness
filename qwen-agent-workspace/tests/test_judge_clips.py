@@ -495,3 +495,304 @@ def test_t8c_system_prompt_content():
                    "exactly once"):
         assert phrase in judge_clips.SYSTEM_PROMPT, phrase
     assert not judge_clips.SYSTEM_PROMPT.endswith("\n")
+
+
+# --- shared fixtures for main() tests -------------------------------------------------
+
+def _dummy(n):
+    """Placeholder clip bytes for precondition tests: nothing decodes a clip before E14."""
+    return b"dummy clip %d" % n
+
+
+def _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1, PANEL_2]), clips={1: 25, 2: 3},
+                story_id=STORY_ID, with_clips_dir=True, synthetic=None):
+    """Build tmp_path/generated/stories/<story_id>/ and point judge_clips.WS at tmp_path
+    (spec 7.1). manifest: a dict or list is written with json.dumps, a str as-is, bytes
+    with write_bytes; None writes no manifest.json. Unless with_clips_dir is False,
+    clips/ is created, and each (number, spec) in clips becomes clips/panel_%02d.mp4 (a
+    str number is used verbatim as the filename): an int spec copies synthetic[spec], a
+    bytes spec is written as-is. Returns the story directory as a pathlib.Path."""
+    monkeypatch.setattr(judge_clips, "WS", str(tmp_path))
+    story_dir = tmp_path / "generated" / "stories" / story_id
+    story_dir.mkdir(parents=True)
+    manifest_path = story_dir / "manifest.json"
+    if isinstance(manifest, (dict, list)):
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif isinstance(manifest, str):
+        manifest_path.write_text(manifest, encoding="utf-8")
+    elif isinstance(manifest, bytes):
+        manifest_path.write_bytes(manifest)
+    if with_clips_dir:
+        clips_dir = story_dir / "clips"
+        clips_dir.mkdir()
+        for number, spec in clips.items():
+            name = number if isinstance(number, str) else "panel_%02d.mp4" % number
+            if isinstance(spec, int):
+                shutil.copyfile(synthetic[spec], str(clips_dir / name))
+            else:
+                (clips_dir / name).write_bytes(spec)
+    return story_dir
+
+
+def _listing(directory):
+    """Every path under directory, relative and sorted, to prove nothing was written."""
+    return sorted(os.path.relpath(os.path.join(root, name), directory)
+                  for root, dirs, files in os.walk(directory) for name in dirs + files)
+
+
+class _FakeAnthropic:
+    """Stands in for anthropic.Anthropic. Calling it records the construction and returns
+    itself as the client; .messages.create(**kwargs) records kwargs and returns (or
+    raises, for exception instances) the scripted items in order."""
+
+    def __init__(self, scripted):
+        self.scripted = list(scripted)
+        self.constructions = []
+        self.calls = []
+        self.messages = types.SimpleNamespace(create=self._create)
+
+    def __call__(self, *args, **kwargs):
+        self.constructions.append((args, kwargs))
+        return self
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        item = self.scripted.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+def _install_fake(monkeypatch, scripted):
+    fake = _FakeAnthropic(scripted)
+    monkeypatch.setattr(judge_clips.anthropic, "Anthropic", fake)
+    return fake
+
+
+def _no_subprocess(monkeypatch):
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("subprocess ran")
+    monkeypatch.setattr(judge_clips.subprocess, "run", _forbidden)
+
+
+def _no_tempdir(monkeypatch):
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("temporary directory created")
+    monkeypatch.setattr(judge_clips.tempfile, "TemporaryDirectory", _forbidden)
+
+
+def _run_precondition(monkeypatch, capsys, story_dir, story_id=STORY_ID):
+    """The spec 7.2 T14 harness. No subprocess or temporary directory may be created, a
+    recording fake client is installed, and the key IS set, so a check that wrongly ran
+    after the key gate would still trip a guard. Asserts exit 2, empty stdout, no client
+    constructed, and (when story_dir is given) nothing written. Returns stderr."""
+    _no_subprocess(monkeypatch)
+    _no_tempdir(monkeypatch)
+    fake = _install_fake(monkeypatch, [])
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    before = _listing(story_dir) if story_dir is not None else None
+    assert judge_clips.main(["--story-id", story_id]) == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert fake.constructions == []
+    if story_dir is not None:
+        assert _listing(story_dir) == before
+    return err
+
+
+# --- T1, T2, T14, T15, T24: arguments, paths, preconditions, key gate, wiring ----------
+
+def test_t1a_no_args_exit_2():
+    with pytest.raises(SystemExit) as exc:
+        judge_clips.main([])
+    assert exc.value.code == 2
+
+
+def test_t1b_unknown_flag_exit_2():
+    with pytest.raises(SystemExit) as exc:
+        judge_clips.main(["--story-md", "x"])
+    assert exc.value.code == 2
+
+
+def test_t2_resolve_paths(monkeypatch, tmp_path):
+    assert judge_clips.WS == WS
+    base = os.path.join(WS, "generated", "stories", "abc")
+    assert judge_clips.resolve_paths("abc") == (
+        base, os.path.join(base, "clips"), os.path.join(base, "manifest.json"))
+    # WS is read at call time, not import time (spec 2.2).
+    monkeypatch.setattr(judge_clips, "WS", str(tmp_path))
+    assert judge_clips.resolve_paths("abc")[0] == os.path.join(
+        str(tmp_path), "generated", "stories", "abc")
+
+
+def test_t14a_missing_clips_dir(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, clips={}, with_clips_dir=False)
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == "Error: clips directory not found: %s\n" % (story_dir / "clips")
+
+
+def test_t14b_no_matching_clips(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, clips={
+        "panel_1.mp4": _dummy(1), "panel_01.mp4.provenance.json": b"{}",
+        "panel_02.chainseed.png": b"png"})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == "Error: no panel_NN.mp4 clips found in %s\n" % (story_dir / "clips")
+
+
+def test_t14c_duplicate_clip_number(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                            clips={1: _dummy(1), "panel_001.mp4": _dummy(1)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: more than one clip for panel 1 in %s: panel_001.mp4, panel_01.mp4\n"
+                   % (story_dir / "clips"))
+
+
+def test_t14d_more_than_25_clips(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=None,
+                            clips={n: _dummy(n) for n in range(1, 27)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: 26 clips found in %s; judge-clips sends 4 frames per clip in one "
+                   "request and judges at most 25 clips (100 images, the Anthropic API's "
+                   "per-request image limit for 200k-context models).\n" % (story_dir / "clips"))
+
+
+def test_t14e_exactly_25_clips_passes_cap(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=None,
+                            clips={n: _dummy(n) for n in range(1, 26)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == "Error: manifest.json not found: %s\n" % (story_dir / "manifest.json")
+
+
+def test_t14f_missing_manifest(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=None, clips={1: _dummy(1)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == "Error: manifest.json not found: %s\n" % (story_dir / "manifest.json")
+
+
+def test_t14g_manifest_not_valid_json(tmp_path, monkeypatch, capsys):
+    for i, manifest in enumerate(("{not json", b"\xff\xfe{}")):
+        story_id = "bad-json-%d" % i
+        story_dir = _make_story(tmp_path, monkeypatch, manifest=manifest,
+                                clips={1: _dummy(1)}, story_id=story_id)
+        err = _run_precondition(monkeypatch, capsys, story_dir, story_id=story_id)
+        assert err.startswith("Error: manifest.json is not valid JSON: %s: "
+                              % (story_dir / "manifest.json"))
+        assert err.endswith("\n") and err.count("\n") == 1
+
+
+def test_t14h_manifest_without_panels_list(tmp_path, monkeypatch, capsys):
+    for i, manifest in enumerate(([], {}, {"panels": {}}, {"panels": []})):
+        story_id = "no-panels-%d" % i
+        story_dir = _make_story(tmp_path, monkeypatch, manifest=manifest,
+                                clips={1: _dummy(1)}, story_id=story_id)
+        err = _run_precondition(monkeypatch, capsys, story_dir, story_id=story_id)
+        assert err == ("Error: manifest.json has no panels list: %s\n"
+                       % (story_dir / "manifest.json"))
+
+
+def test_t14i_panel_entry_without_integer_index(tmp_path, monkeypatch, capsys):
+    cases = [({"panels": [{"title": "x"}]}, 1),
+             ({"panels": [{"index": 1}, {"index": "2"}]}, 2),
+             ({"panels": [{"index": True}]}, 1),
+             ({"panels": ["panel"]}, 1)]
+    for i, (manifest, position) in enumerate(cases):
+        story_id = "bad-index-%d" % i
+        story_dir = _make_story(tmp_path, monkeypatch, manifest=manifest,
+                                clips={1: _dummy(1)}, story_id=story_id)
+        err = _run_precondition(monkeypatch, capsys, story_dir, story_id=story_id)
+        assert err == ("Error: manifest.json panel entry %d has no integer index: %s\n"
+                       % (position, story_dir / "manifest.json"))
+
+
+def test_t14j_duplicate_manifest_index(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch,
+                            manifest={"panels": [{"index": 1}, {"index": 1}]},
+                            clips={1: _dummy(1)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: manifest.json lists panel index 1 more than once: %s\n"
+                   % (story_dir / "manifest.json"))
+
+
+def test_t14k_extra_clip(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch,
+                            clips={1: _dummy(1), 2: _dummy(2), 3: _dummy(3)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: clips with no matching panel in manifest.json: panel_03.mp4; the "
+                   "clips in %s may be stale relative to manifest.json.\n" % (story_dir / "clips"))
+
+
+def test_t14l_partial_render(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch,
+                            manifest=_manifest([{"index": i} for i in (1, 2, 3, 4)]),
+                            clips={1: _dummy(1), 3: _dummy(3)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: manifest.json panels with no rendered clip in %s: 2, 4; "
+                   "judge-clips judges only complete renders.\n" % (story_dir / "clips"))
+
+
+def test_t14m_nonexistent_story(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(judge_clips, "WS", str(tmp_path))
+    story_id = "judge-clips-test-nonexistent-%s" % uuid.uuid4().hex
+    err = _run_precondition(monkeypatch, capsys, None, story_id=story_id)
+    assert err.startswith("Error: clips directory not found:")
+    assert not (tmp_path / "generated").exists()
+
+
+def test_t14n_ffmpeg_or_ffprobe_missing(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, clips={1: _dummy(1), 2: _dummy(2)})
+    monkeypatch.setattr(judge_clips.shutil, "which",
+                        lambda t: None if t == "ffprobe" else "/bin/" + t)
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: ffprobe not found on PATH; judge-clips needs ffmpeg and ffprobe "
+                   "to extract frames.\n")
+    # Both missing: ffmpeg is reported, which pins the check order.
+    monkeypatch.setattr(judge_clips.shutil, "which", lambda t: None)
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: ffmpeg not found on PATH; judge-clips needs ffmpeg and ffprobe "
+                   "to extract frames.\n")
+
+
+def test_t14o_extra_clip_reported_before_missing(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, clips={1: _dummy(1), 3: _dummy(3)})
+    err = _run_precondition(monkeypatch, capsys, story_dir)
+    assert err == ("Error: clips with no matching panel in manifest.json: panel_03.mp4; the "
+                   "clips in %s may be stale relative to manifest.json.\n" % (story_dir / "clips"))
+
+
+def test_t15_key_unset_runs_nothing(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, synthetic=synthetic_clips)
+    before = _listing(story_dir)
+    _no_subprocess(monkeypatch)
+    _no_tempdir(monkeypatch)
+    fake = _install_fake(monkeypatch, [])
+    expected_err = ("Error: ANTHROPIC_API_KEY is not set; export it in your environment to "
+                    "run judge-clips.\n")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+    out, err = capsys.readouterr()
+    assert err == expected_err
+    assert out == ""
+    assert fake.constructions == []
+    assert fake.calls == []
+    # An empty value counts as unset (spec 4.2).
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+    out, err = capsys.readouterr()
+    assert err == expected_err
+    assert out == ""
+    assert fake.constructions == []
+    assert fake.calls == []
+    assert _listing(story_dir) == before
+
+
+def test_t24_pipeline_log_wiring():
+    with open(_SCRIPT_PATH, encoding="utf-8") as f:
+        text = f.read()
+    assert ('pipeline_log.run_logged("judge-clips", _pipeline_log_story_dir(sys.argv[1:]), '
+            'main, sys.argv)') in text
+    assert "sys.path.insert(0, WS)" in text
+    assert "import pipeline_log" in text
+    assert "    sys.exit(main())" not in text
+    assert (judge_clips._pipeline_log_story_dir(["--story-id", "abc"])
+            == os.path.join(WS, "generated", "stories", "abc"))
+    assert judge_clips._pipeline_log_story_dir([]) is None
