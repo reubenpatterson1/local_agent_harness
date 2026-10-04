@@ -268,6 +268,52 @@ def resolve_paths(story_id):
     return story_dir, images_dir, story_md_path
 
 
+def find_tool_use(response):
+    """First content block that is a submit_judgment tool call, else None."""
+    for block in response.content:
+        if block.type == "tool_use" and block.name == TOOL_NAME:
+            return block
+    return None
+
+
+def format_score_line(name, value):
+    """One stdout score line (spec 5.3). None is reached only for visual_continuity when
+    exactly 1 still was judged, so the "1 still" wording is always accurate."""
+    if value is None:
+        return "  %-20s  n/a (only 1 still)" % name
+    return "  %-20s  %d" % (name, value)
+
+
+def _create_message(client, messages):
+    """One non-streaming judging call with the fixed spec 4.1 parameters. No temperature,
+    top_k, or top_p, and no budget_tokens thinking shape (the live API rejects it)."""
+    return client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        thinking={"type": "adaptive"},
+        output_config={"effort": EFFORT},
+        system=SYSTEM_PROMPT,
+        tools=[{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": SUBMIT_JUDGMENT_SCHEMA,
+        }],
+        # Extended thinking cannot force a specific tool; SYSTEM_PROMPT requires the call.
+        tool_choice={"type": "auto"},
+        messages=messages,
+    )
+
+
+def _write_raw(story_dir, responses):
+    """Dump every API response received this run to stills_judgment.raw.json; return its
+    path. Response bodies only: neither the key nor the request's images (spec 5.2)."""
+    path = os.path.join(story_dir, "stills_judgment.raw.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"responses": [r.model_dump(mode="json") for r in responses]}, f,
+                  indent=2, ensure_ascii=False)
+    return path
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     story_dir, images_dir, story_md_path = resolve_paths(args.story_id)
@@ -304,7 +350,55 @@ def main(argv=None):
               "judge-stills.", file=sys.stderr)
         return 1
     client = anthropic.Anthropic()
-    raise NotImplementedError("judging call is added by plan Task 5")
+
+    responses = [_create_message(client, [{"role": "user", "content": user_content}])]
+    block = find_tool_use(responses[0])
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        validate_judgment_input(block.input, len(stills))
+    except jsonschema.ValidationError as e:
+        _write_raw(story_dir, responses)
+        print("Error: submit_judgment input failed schema validation: %s" % e.message,
+              file=sys.stderr)
+        return 1
+
+    tool_input = block.input
+    thinking_counts = [r.usage.output_tokens_details.thinking_tokens for r in responses
+                       if r.usage.output_tokens_details is not None
+                       and r.usage.output_tokens_details.thinking_tokens is not None]
+    judgment = {
+        "story_id": args.story_id,
+        "model": MODEL,
+        "effort": EFFORT,
+        "timestamp": timestamp,
+        "usage": {
+            "input_tokens": sum(r.usage.input_tokens for r in responses),
+            "output_tokens": sum(r.usage.output_tokens for r in responses),
+            # null, never a fabricated 0, when no response reports it (spec 5.1)
+            "thinking_tokens": sum(thinking_counts) if thinking_counts else None,
+        },
+        "scores": {
+            "prompt_fidelity": tool_input["scores"]["prompt_fidelity"],
+            # Absent (-> JSON null) only in the 1-still case; validation already rejected
+            # a 2+-stills judgment that omits it (spec 4.4, 5.1).
+            "visual_continuity": tool_input["scores"].get("visual_continuity"),
+            "rendering_quality": tool_input["scores"]["rendering_quality"],
+            "composition": tool_input["scores"]["composition"],
+        },
+        "critique": tool_input["critique"],
+    }
+    with open(os.path.join(story_dir, "stills_judgment.json"), "w", encoding="utf-8") as f:
+        json.dump(judgment, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    print("Scores:")
+    for name in SCORE_KEYS:
+        print(format_score_line(name, judgment["scores"][name]))
+    print()
+    print("--- Critique ---")
+    print(judgment["critique"])
+    return 0
 
 
 if __name__ == "__main__":

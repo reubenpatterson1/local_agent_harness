@@ -422,3 +422,195 @@ def test_t11_key_unset_never_constructs_client(tmp_path, monkeypatch, capsys):
     assert err == expected_err
     assert out == ""
     assert _listing(story_dir) == before
+
+
+# --- SDK response builders: real anthropic.types.Message objects (spec 7.1) ----------
+
+THINKING_BLOCK = {"type": "thinking", "thinking": "Comparing the stills to the panel text.",
+                  "signature": "sig-abc123"}
+
+ONE_PANEL_STORY_MD = (
+    "## Panel 1 — Only\n"
+    "Image: A green frog on a lily pad at dawn.\n"
+    "Motion: The frog blinks once.\n"
+    "Narration: Morning comes.\n"
+)
+
+
+def _usage(input_tokens, output_tokens, thinking_tokens):
+    """thinking_tokens=None omits output_tokens_details, as when the API does not report it."""
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if thinking_tokens is not None:
+        usage["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
+    return usage
+
+
+def _message(content, usage, stop_reason):
+    return anthropic.types.Message.model_validate({
+        "id": "msg_test_%s" % uuid.uuid4().hex, "type": "message", "role": "assistant",
+        "model": "claude-opus-5-5", "stop_reason": stop_reason, "stop_sequence": None,
+        "content": content, "usage": usage})
+
+
+def _tool_response(tool_input, usage):
+    return _message([THINKING_BLOCK, {"type": "tool_use", "id": "toolu_test",
+                                      "name": "submit_judgment", "input": tool_input}],
+                    usage, "tool_use")
+
+
+def _text_response(text, usage):
+    return _message([THINKING_BLOCK, {"type": "text", "text": text}], usage, "end_turn")
+
+
+def _expected_stdout(scores, critique):
+    return ("Scores:\n"
+            + "".join(judge_stills.format_score_line(k, scores[k]) + "\n"
+                      for k in SCORE_NAMES)
+            + "\n--- Critique ---\n" + critique + "\n")
+
+
+# --- T10, T10b, T14, T14b: judging call, outputs, validation failures (spec 4-6) -----
+
+def test_t10_successful_run_two_stills(tmp_path, monkeypatch, capsys):
+    # CHAIN_STORY_MD has 3 panels; panel 2 has no still.
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 3))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(1200, 3400, 2100))])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 0
+
+    with open(story_dir / "stills_judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    assert list(judgment) == ["story_id", "model", "effort", "timestamp", "usage",
+                              "scores", "critique"]
+    assert judgment["story_id"] == STORY_ID
+    assert judgment["model"] == "claude-opus-5-5"
+    assert judgment["effort"] == "high"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", judgment["timestamp"])
+    assert judgment["usage"] == {"input_tokens": 1200, "output_tokens": 3400,
+                                 "thinking_tokens": 2100}
+    assert list(judgment["scores"]) == list(judge_stills.SCORE_KEYS) == list(SCORE_NAMES)
+    assert judgment["scores"] == VALID_INPUT["scores"]
+    assert judgment["critique"] == VALID_INPUT["critique"]
+    assert "—" in raw_text            # ensure_ascii=False
+    assert raw_text.endswith("}\n")        # trailing newline after json.dump
+    for name in ("stills_judgment.raw.json", "judgment.json", "judgment.raw.json"):
+        assert not (story_dir / name).exists(), name
+
+    out, err = capsys.readouterr()
+    score_lines = "".join("  %-20s  %d\n" % (k, VALID_INPUT["scores"][k]) for k in SCORE_NAMES)
+    assert "  prompt_fidelity       7\n" in score_lines   # pins the %-20s layout itself
+    assert out == _expected_stdout(VALID_INPUT["scores"], VALID_INPUT["critique"])
+    assert out == "Scores:\n" + score_lines + "\n--- Critique ---\n" + VALID_INPUT["critique"] + "\n"
+    assert err == ""
+
+    assert fake.constructions == [((), {})]               # Anthropic() with no arguments
+    assert len(fake.calls) == 1
+    kwargs = fake.calls[0]
+    assert sorted(kwargs) == ["max_tokens", "messages", "model", "output_config", "system",
+                              "thinking", "tool_choice", "tools"]
+    assert kwargs["model"] == "claude-opus-5-5"
+    assert kwargs["max_tokens"] == 21333
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "high"}
+    assert kwargs["tool_choice"] == {"type": "auto"}
+    assert kwargs["system"] == judge_stills.SYSTEM_PROMPT
+    assert [tool["name"] for tool in kwargs["tools"]] == ["submit_judgment"]
+    assert kwargs["tools"][0]["input_schema"] == judge_stills.SUBMIT_JUDGMENT_SCHEMA
+    assert kwargs["tools"][0]["description"] == judge_stills.TOOL_DESCRIPTION
+    messages = kwargs["messages"]
+    assert len(messages) == 1 and messages[0]["role"] == "user"
+    content = messages[0]["content"]
+    assert [block["type"] for block in content] == ["text", "image", "text", "image", "text"]
+    assert content[0]["text"] == judge_stills.format_panel_text(CHAIN_PANELS[0])
+    assert base64.b64decode(content[1]["source"]["data"]) == _still_bytes(1)
+    assert content[2]["text"] == judge_stills.format_panel_text(CHAIN_PANELS[2])
+    assert base64.b64decode(content[3]["source"]["data"]) == _still_bytes(3)
+    assert content[4]["text"] == judge_stills.FINAL_USER_TEXT_MULTI_TEMPLATE % 2
+    for block in (content[1], content[3]):
+        assert block["source"]["type"] == "base64"
+        assert block["source"]["media_type"] == "image/png"
+
+
+def test_t10b_successful_run_one_still(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, story_md=ONE_PANEL_STORY_MD, stills=(1,))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    # The judge followed the 1-still instruction: visual_continuity is absent entirely.
+    tool_input = _without_vc(VALID_INPUT)
+    fake = _install_fake(monkeypatch, [_tool_response(tool_input, _usage(900, 2500, 1500))])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 0
+
+    with open(story_dir / "stills_judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    assert judgment["scores"] == {"prompt_fidelity": 7, "visual_continuity": None,
+                                  "rendering_quality": 8, "composition": 5}
+    assert list(judgment["scores"]) == list(SCORE_NAMES)
+    assert '"visual_continuity": null' in raw_text
+    assert not (story_dir / "stills_judgment.raw.json").exists()
+
+    out, err = capsys.readouterr()
+    assert judge_stills.format_score_line("visual_continuity", None) == (
+        "  visual_continuity     n/a (only 1 still)")
+    assert out == ("Scores:\n"
+                   "  prompt_fidelity       7\n"
+                   "  visual_continuity     n/a (only 1 still)\n"
+                   "  rendering_quality     8\n"
+                   "  composition           5\n"
+                   "\n--- Critique ---\n" + VALID_INPUT["critique"] + "\n")
+    assert out == _expected_stdout(judgment["scores"], VALID_INPUT["critique"])
+    assert err == ""
+
+    assert len(fake.calls) == 1                       # a valid tool_use: no retry
+    content = fake.calls[0]["messages"][0]["content"]
+    assert [block["type"] for block in content] == ["text", "image", "text"]
+    assert content[0]["text"] == ("## Panel 1 — Only\n"
+                                  "Image: A green frog on a lily pad at dawn.\n"
+                                  "Motion: The frog blinks once.\n"
+                                  "Narration: Morning comes.")
+    assert base64.b64decode(content[1]["source"]["data"]) == _still_bytes(1)
+    assert content[2]["text"] == judge_stills.FINAL_USER_TEXT_SINGLE
+
+
+def test_t14_schema_invalid_tool_input(tmp_path, monkeypatch, capsys):
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 3))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    bad = copy.deepcopy(VALID_INPUT)
+    bad["scores"]["composition"] = 11
+    fake = _install_fake(monkeypatch, [_tool_response(bad, _usage(10, 20, 5))])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 1            # no retry on a validation failure
+    with open(story_dir / "stills_judgment.raw.json", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert len(raw["responses"]) == 1
+    assert raw["responses"][0]["content"][1]["input"]["scores"]["composition"] == 11
+    assert not (story_dir / "stills_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: submit_judgment input failed schema validation: ")
+
+
+def test_t14b_two_stills_missing_visual_continuity(tmp_path, monkeypatch, capsys):
+    # A submit_judgment block WAS found (unlike T13); its input omits visual_continuity
+    # although 2 stills were judged. Caught by the post-schema check (spec 4.4, E9).
+    story_dir = _make_story(tmp_path, monkeypatch, stills=(1, 3))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(_without_vc(VALID_INPUT), _usage(10, 20, 5))])
+
+    assert judge_stills.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 1            # validation failure: no retry
+    with open(story_dir / "stills_judgment.raw.json", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert len(raw["responses"]) == 1
+    assert not (story_dir / "stills_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == ("Error: submit_judgment input failed schema validation: "
+                   "visual_continuity is required when judging 2 or more stills\n")
