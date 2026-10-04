@@ -116,3 +116,100 @@ def test_t8f_visual_continuity_required_for_two_stills():
     with pytest.raises(jsonschema.ValidationError) as exc:
         judge_stills.validate_judgment_input(_without_vc(VALID_INPUT), 2)
     assert exc.value.message == VC_MISSING_MESSAGE
+
+
+# --- shared story.md fixtures (spec 7.1) ----------------------------------------------
+
+# Synthesized chain-format story: Panel 1 has Image: (with a continuation line) and a
+# Style: line that must close Image; a "## Notes" section must not attach anywhere;
+# Panel 2 has an empty title; Panels 2-3 have no Image:.
+CHAIN_STORY_MD = (
+    "## Panel 1 — Dawn on the Pad\n"
+    "Image: A green frog on a lily pad — dawn.\n"
+    "Second image line.\n"
+    "Style: photorealistic, natural light\n"
+    "Motion: The frog crouches.\n"
+    "Narration: He waits.\n"
+    "\n"
+    "## Notes\n"
+    "Not a panel; must not attach anywhere.\n"
+    "\n"
+    "## Panel 2 —\n"
+    "Motion: The frog leaps.\n"
+    "Narration: He jumps.\n"
+    "\n"
+    "## Panel 3 — Landing\n"
+    "Motion: The frog lands on the log.\n"
+    "Narration: Safe.\n"
+)
+CHAIN_PANELS = [
+    {"header": "## Panel 1 — Dawn on the Pad",
+     "image": "A green frog on a lily pad — dawn. Second image line.",
+     "motion": "The frog crouches.", "narration": "He waits."},
+    {"header": "## Panel 2 —", "image": "",
+     "motion": "The frog leaps.", "narration": "He jumps."},
+    {"header": "## Panel 3 — Landing", "image": "",
+     "motion": "The frog lands on the log.", "narration": "Safe."},
+]
+
+# Pre-chain (frogjump) shape: every panel has Image:, Motion:, Narration: on single lines.
+ALL_IMAGE_STORY_MD = (
+    "## Panel 1 — A\n"
+    "Image: A frog sits on a lily pad.\n"
+    "Motion: The frog crouches low.\n"
+    "Narration: Morning on the pond.\n"
+    "\n"
+    "## Panel 2 — B\n"
+    "Image: The frog hangs mid-air over the water.\n"
+    "Motion: The frog leaps forward.\n"
+    "Narration: He jumps.\n"
+)
+
+
+# --- T3-T5: still discovery and panel-text parsing (spec 3.1-3.4) --------------------
+
+def test_t3_find_stills_numeric_sort_and_filter(tmp_path):
+    images_dir = tmp_path / "images"
+    images_dir.mkdir()
+    for name in ("panel_03.png", "panel_01.png", "panel_100.png", "panel_99.png",
+                 "panel_02.png", "panel_1.png", "panel_01.jpg", "panel_01.png.bak",
+                 "Panel_04.png", "images.json"):
+        (images_dir / name).write_bytes(b"x")
+    d = str(images_dir)
+    assert judge_stills.find_stills(d) == [
+        (1, os.path.join(d, "panel_01.png")),
+        (2, os.path.join(d, "panel_02.png")),
+        (3, os.path.join(d, "panel_03.png")),
+        (99, os.path.join(d, "panel_99.png")),
+        (100, os.path.join(d, "panel_100.png")),
+    ]
+
+
+def test_t4a_parse_panels_chain_fixture():
+    assert judge_stills.parse_panels(CHAIN_STORY_MD) == CHAIN_PANELS
+
+
+def test_t4b_parse_panels_all_image_fixture():
+    assert judge_stills.parse_panels(ALL_IMAGE_STORY_MD) == [
+        {"header": "## Panel 1 — A", "image": "A frog sits on a lily pad.",
+         "motion": "The frog crouches low.", "narration": "Morning on the pond."},
+        {"header": "## Panel 2 — B", "image": "The frog hangs mid-air over the water.",
+         "motion": "The frog leaps forward.", "narration": "He jumps."},
+    ]
+
+
+def test_t4c_parse_panels_no_panels():
+    assert judge_stills.parse_panels("") == []
+    assert judge_stills.parse_panels("# Title\nno panels\n") == []
+
+
+def test_t5_format_panel_text():
+    assert judge_stills.format_panel_text(CHAIN_PANELS[0]) == (
+        "## Panel 1 — Dawn on the Pad\n"
+        "Image: A green frog on a lily pad — dawn. Second image line.\n"
+        "Motion: The frog crouches.\n"
+        "Narration: He waits.")
+    assert judge_stills.format_panel_text(CHAIN_PANELS[1]) == (
+        "## Panel 2 —\nMotion: The frog leaps.\nNarration: He jumps.")
+    assert judge_stills.format_panel_text(
+        {"header": "## Panel 9 — X", "image": "", "motion": "", "narration": ""}) == "## Panel 9 — X"

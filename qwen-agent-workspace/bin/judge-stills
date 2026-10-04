@@ -49,6 +49,15 @@ SCORE_KEYS = ("prompt_fidelity", "visual_continuity", "rendering_quality", "comp
 # The pipeline always writes PNG stills (spec 3.5).
 MEDIA_TYPE = "image/png"
 
+# Still filenames: two or more digits, exactly what bin/ltx-story-images's
+# "panel_%02d.png" % i can produce (spec 3.1).
+STILL_NAME_RE = re.compile(r"panel_(\d{2,})\.png")
+
+# Verbatim copies of bin/ltx-story-manifest:81-82 (_PANEL_HEADER_RE, _PANEL_LABEL_RE).
+# Duplicated rather than loaded, per spec 1.1 / G7: if those change, change these too.
+PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
+PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
+
 # visual_continuity is deliberately NOT in scores.required: it is required only when
 # 2 or more stills are judged, which JSON Schema cannot express, so
 # validate_judgment_input enforces that case (spec 4.3, 4.4, G1).
@@ -87,3 +96,71 @@ def validate_judgment_input(tool_input, stills_count):
         raise jsonschema.ValidationError(
             "visual_continuity is required when judging 2 or more stills"
         )
+
+
+def find_stills(images_dir):
+    """[(index, path)] for every panel_NN.png in images_dir, sorted numerically by index
+    (path breaks ties). os.listdir + fullmatch, not glob, so a story id containing
+    [ ] * ? is never treated as a wildcard (spec 3.1)."""
+    found = []
+    for name in os.listdir(images_dir):
+        m = STILL_NAME_RE.fullmatch(name)
+        if m:
+            found.append((int(m.group(1)), os.path.join(images_dir, name)))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return found
+
+
+def parse_panels(story_md_text):
+    """Panel sections of story.md, in file order, as dicts with header/image/motion/
+    narration. The section and field rules duplicate bin/ltx-story-manifest's
+    _parse_prompts_md (:202-245) verbatim, so pairing matches what was rendered.
+    Prompt: and Style: are recognized only to close the open field, then dropped
+    (spec 3.2, G5). Pure."""
+    sections = []
+    current = None
+    for line in story_md_text.splitlines():
+        if PANEL_HEADER_RE.match(line):
+            if current is not None:
+                sections.append(current)
+            current = {"header": line, "body": []}
+            continue
+        if line.startswith("##"):
+            if current is not None:
+                sections.append(current)
+                current = None
+            continue
+        if current is not None:
+            current["body"].append(line)
+    if current is not None:
+        sections.append(current)
+
+    panels = []
+    for section in sections:
+        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": []}
+        open_field = None
+        for line in section["body"]:
+            m = PANEL_LABEL_RE.match(line)
+            if m:
+                open_field = m.group(1)
+                value = m.group(2).strip()
+                if value:
+                    fields[open_field].append(value)
+                continue
+            if open_field is not None and line.strip():
+                fields[open_field].append(line.strip())
+        panels.append({"header": section["header"],
+                       "image": " ".join(fields["Image"]),
+                       "motion": " ".join(fields["Motion"]),
+                       "narration": " ".join(fields["Narration"])})
+    return panels
+
+
+def format_panel_text(panel):
+    """The panel's header line, then one line per non-empty field in the fixed order
+    Image, Motion, Narration; no trailing newline (spec 3.4). Pure."""
+    lines = [panel["header"]]
+    for label, key in (("Image", "image"), ("Motion", "motion"), ("Narration", "narration")):
+        if panel[key]:
+            lines.append("%s: %s" % (label, panel[key]))
+    return "\n".join(lines)
