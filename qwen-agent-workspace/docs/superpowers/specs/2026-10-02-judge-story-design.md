@@ -532,3 +532,33 @@ These points were not settled in the brainstorm. No item in this section is bloc
 - **G7: no automated test for the `bin/ltx-movie` change (D3).** The brief limits changes to `bin/judge-story`, its test file, and the `bin/ltx-movie` edit, so D3 has no new automated test. It is covered by R1 (no regression) and M1 (manual). If the user wants an automated check, the natural place is a new test in `tests/test_ltx_movie_offline.py` that stubs `subprocess.Popen` and calls `phase1_story` with a temporary story id. That would change a fourth file.
 - **G8: prompt wording.** The verbatim `SYSTEM_PROMPT`, user-message template, `TOOL_DESCRIPTION`, `RETRY_USER_MESSAGE`, the four dimension glosses, and all error-message wording were written for this spec from the approved requirements. The brainstorm approved their content requirements, not their exact wording. The user should review Section 4.5 in particular, since it directly shapes judgment quality.
 - **G9 (FIXED): 20-panel framing vs the actual panel count.** The original draft's prompt framing said the story is "intended to become a 20-panel ... storyboard," hardcoded from the one 20-panel Ronin story that motivated this project. `bin/judge-story` is a general-purpose Phase 1 tool (Section 0), `bin/ltx-movie` accepts a variable `--panels`, and existing stories have other counts (for example the 15-panel M1 run). Fixed: `SYSTEM_PROMPT` (Section 4.5) now reads "a multi-panel, action-focused storyboard," with no fixed panel number. The spec still does not read or count panels from `story.md` content — that would be an unneeded addition beyond what was asked.
+
+
+---
+
+## Amendments (post-implementation)
+
+This spec describes the design as originally approved. The following real changes were
+made after implementation, during real-hardware use, and are NOT reflected in the sections
+above -- treat the commits below as the current source of truth where they conflict with
+this document's original text:
+
+- **G6 is resolved, not open.** The live Anthropic API rejected `thinking={"type": "enabled",
+  "budget_tokens": 16000}` for `claude-opus-5-5` (`"thinking.type.enabled" is not supported
+  for this model. Use thinking.type.adaptive and output_config.effort..."`). Every
+  `thinking={"type": "enabled", ...}` reference above, and every `judgment.json`
+  `thinking_budget_tokens` field reference above, is superseded by
+  `thinking={"type": "adaptive"}` plus a new top-level `output_config={"effort": "high"}`
+  request field, and the `judgment.json` field is named `effort` (value `"high"`), not
+  `thinking_budget_tokens`. Commit `3203d8c`.
+- **SYSTEM_PROMPT gained a rule-by-rule compliance check.** Real usage found the judge's
+  critique sometimes buried a violation of the story prompt's own stated hard rules inside
+  general prose. `SYSTEM_PROMPT` now instructs the judge to check for a numbered rule list
+  in the story-generation prompt and, when present, run an explicit compliance check
+  (followed/violated, with the violating panel number) first in the critique. Commit
+  `a7a2c5c`.
+- **A new `--target-panels <N>` flag was added**, threaded into `build_user_message` and a
+  new `SYSTEM_PROMPT` paragraph, so a caller (specifically `bin/iterate-story`) can tell the
+  judge to build its `revised_prompt`'s beat plan for an exact panel count from the start,
+  instead of the judge proposing a different count that then has to be patched after the
+  fact. Optional, defaults to `None` (no behavior change when omitted). Commit `ce886cd`.

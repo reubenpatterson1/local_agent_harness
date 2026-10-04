@@ -716,6 +716,15 @@ def phase1_story(args):
                   "attempting to self-verify, which the prompt forbids); log tail:\n%s"
                   % (timeout, tail), file=sys.stderr)
             return 1
+        if "--danger-auto-approve" in cmd:
+            # Every tool call qwen-agent ran unconfirmed under this flag traces as
+            # [danger-auto]; print the full output (not just the failure-path tail
+            # below) regardless of exit code, so that trail actually reaches whatever
+            # captures this process's stdout -- a human's terminal, or bin/iterate-story's
+            # own per-round log (tiered-approval spec SS1.4.1). Silently discarding it on
+            # success would make the audit-trail property that flag's acceptance depends
+            # on false exactly when nothing went wrong.
+            print(out or "")
         if proc.returncode != 0:
             tail = "\n".join((out or "").splitlines()[-40:])
             if os.path.isfile(story_md):

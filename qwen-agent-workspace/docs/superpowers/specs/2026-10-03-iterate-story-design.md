@@ -866,3 +866,32 @@ G1 and G2 are RESOLVED. G19 is RESOLVED, partially (a residual uncertainty remai
 - **G17: no cost guard.** Each round makes one Opus judging call, or two on `bin/judge-story`'s internal retry. The only cap is `--max-rounds`.
 - **G18: `stdin=subprocess.DEVNULL` for both children.** This prevents hangs (Section 3.4). It means any prompt in a child that was not anticipated is answered with EOF (denied) rather than surfaced to the user.
 - **G19 -- RESOLVED (partially).** Resolution: Section 3.2's conflicting-declaration removal. `build_next_prompt` now finds and deletes any `"The file must contain EXACTLY N panel sections..."` sentence already present in the judge's `revised_prompt` (via `PANEL_COUNT_DECLARATION_RE`) before appending the pinned-count version, so the final prompt states the panel count exactly once, not twice with contradicting numbers. This removes the stated-instruction contradiction this gap originally described. It does not fully close the gap: a `revised_prompt` can still contain a beat-by-beat plan that lists, say, 30 distinct beats while the pinned count is 20, and nothing in Section 3.2 detects or reconciles that -- only the single mechanically-parseable "EXACTLY N panel sections" sentence is corrected. Whether `qwen38-6bit` nonetheless drifts toward a beat plan's implied count, even with the contradictory declaration removed, is unverified until a real run (M1). If G1's resolution passes `--panels <pinned>`, `bin/ltx-movie`'s validation will still reject any drifted output as an E6 failure.
+
+
+---
+
+## Amendments (post-implementation)
+
+This spec describes the design as originally approved. The following real changes were
+made after implementation, during real-hardware use, and are NOT reflected in the sections
+above (including Section 3.4.1's judge argv and Section 3.4.2's `build_ltx_movie_cmd`
+signature) -- treat the commits below as the current source of truth where they conflict
+with this document's original text:
+
+- **The judge argv now includes `--target-panels`.** Section 3.4.1's command list is
+  missing `--target-panels <pinned_count>`, added so the judge builds its own beat plan for
+  the correct count from the start (see the judge-story spec's own amendments). Every
+  judge call `bin/iterate-story` makes, round 1 included, passes this flag. Commit `ce886cd`.
+- **`build_ltx_movie_cmd` gained two more optional parameters.** Section 3.4.2's signature
+  (`story_id, override_path, pinned_panel_count`) is missing `story_model=None,
+  story_context_window=None`, added after a real run hit `qwen-agent`'s own
+  `context_budget`/`context_length` exhaustion because nothing told `bin/ltx-movie` which
+  model was actually serving or its real context window. Both are appended to the argv
+  only when given, so a caller that omits them reproduces the prior exact command.
+  `bin/iterate-story`'s own CLI gained matching `--story-model`/`--story-context-window`
+  passthrough flags. Commit `845a0f2`.
+- **G1 and G2 resolutions (already in Section 8) were real-hardware-validated**, not just
+  designed: two full live runs of `bin/iterate-story` against a real Claude API and a real
+  local vLLM vision server completed, one hitting both E6 and E6b for real (a genuine
+  `qwen-agent` `context_length` failure correctly caught as a no-op regeneration) and the
+  second completing cleanly across 4 real rounds to a threshold-met stop.

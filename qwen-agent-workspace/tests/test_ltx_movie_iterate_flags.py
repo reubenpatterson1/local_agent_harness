@@ -7,7 +7,8 @@ Plain pytest asserts only -- no check() helper, which reports false greens under
 pytest. No test makes a real subprocess call: the autouse fixture below makes
 subprocess.Popen and subprocess.run fail the test, and tests that reach Phase 1's
 qwen-agent call install a recording fake over Popen first (the popen_calls fixture).
-Exactly one test function per spec test ID, T-L1 through T-L11 (11 total).
+Exactly one test function per spec test ID, T-L1 through T-L11 (11 total), plus two
+post-ship tests for the C1 audit-trail fix (13 total).
 """
 
 import importlib.machinery
@@ -165,3 +166,50 @@ def test_tl11_override_without_narrative_does_not_crash_phase1(tmp_path, popen_c
     assert len(popen_calls) == 1
     assert popen_calls[0][-1] == "Override only\n"
     assert _story_prompt_txt(tmp_path) == "Override only\n"
+
+
+def test_danger_auto_approve_trace_reaches_stdout_on_success(tmp_path, monkeypatch, capsys):
+    """C1 fix: the [danger-auto] trail must not be silently discarded on a successful
+    (exit 0) qwen-agent call -- that's exactly the case the prior code dropped it in."""
+    monkeypatch.setattr(ltx_movie, "WS", str(tmp_path))
+    story_dir = tmp_path / "generated" / "stories" / STORY_ID
+    story_dir.mkdir(parents=True)
+    (story_dir / "story.md").write_text(
+        "## Panel 1\nImage: a test image.\nMotion: a test motion.\nNarration: a line.\n",
+        encoding="utf-8")
+    out = ("some qwen-agent chatter\n"
+           "[danger-auto] write_file generated/stories/%s/story.md\n" % STORY_ID)
+
+    class _FakeProcSuccess(object):
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return out, None
+
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", lambda cmd, **kw: _FakeProcSuccess())
+    _run_phase1(["a narrative", "--story-id", STORY_ID, "--panels", "1",
+                "--force-story", "--no-review"])
+    assert "[danger-auto] write_file" in capsys.readouterr().out
+
+
+def test_danger_auto_approve_trace_not_printed_without_the_flag(tmp_path, monkeypatch, capsys):
+    """The same captured output must NOT be printed when --danger-auto-approve was never
+    in the command (--force-story alone) -- this isn't a blanket verbosity change."""
+    monkeypatch.setattr(ltx_movie, "WS", str(tmp_path))
+    story_dir = tmp_path / "generated" / "stories" / STORY_ID
+    story_dir.mkdir(parents=True)
+    (story_dir / "story.md").write_text(
+        "## Panel 1\nImage: a test image.\nMotion: a test motion.\nNarration: a line.\n",
+        encoding="utf-8")
+    out = ("some qwen-agent chatter\n"
+           "[danger-auto] write_file generated/stories/%s/story.md\n" % STORY_ID)
+
+    class _FakeProcSuccess(object):
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return out, None
+
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", lambda cmd, **kw: _FakeProcSuccess())
+    _run_phase1(["a narrative", "--story-id", STORY_ID, "--panels", "1", "--force-story"])
+    assert "[danger-auto]" not in capsys.readouterr().out

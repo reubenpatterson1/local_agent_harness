@@ -206,6 +206,13 @@ triggers the third bullet of "What would change the calculus" above: `bin/ltx-mo
 however many rounds a run takes, with no human typing the flag at any point. This is exactly the
 "wrapper script... any caller that passes it implicitly" trigger named above.
 
+The same trigger also fires for a direct, human-typed `bin/ltx-movie --force-story --no-review`
+invocation, with no `bin/iterate-story` involved at all: typing `--no-review` is not typing
+`--danger-auto-approve`, and the bypass still composes in silently. `bin/iterate-story`'s own
+design spec names this directly (`docs/superpowers/specs/2026-10-03-iterate-story-design.md`
+Section 8, G16); it is not unique to that tool, and this note's scope should be read to cover
+both paths, not `bin/iterate-story` alone.
+
 **Re-opened, and re-accepted as implemented, with one addition.** The user reviewed this trigger
 and chose to keep the automatic passthrough rather than build a narrower bypass mechanism. The
 automatic passthrough itself is unchanged — this is not "making the flag safer" in the sense
