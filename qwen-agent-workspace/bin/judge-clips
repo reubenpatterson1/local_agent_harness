@@ -51,6 +51,12 @@ EFFORT = "high"
 # max_tokens without an explicit timeout= (spec 1.3).
 MAX_TOKENS = 21333
 TOOL_NAME = "submit_judgment"
+TOOL_DESCRIPTION = ("Submit your judgment of the clips: for every clip, its panel number and "
+                    "1-10 scores for motion_fidelity, physical_realism, and "
+                    "temporal_stability; for the movie, a 1-10 narrative_clarity score "
+                    "always, plus seam_continuity when you are judging 2 or more clips; and a "
+                    "critique naming specific panels by number. You must call this exactly "
+                    "once.")
 
 # Frames sampled from every clip (spec 3.5), and the most clips one run judges:
 # 25 clips x 4 frames = 100 images (spec 0.2, G1).
@@ -105,6 +111,81 @@ SUBMIT_JUDGMENT_SCHEMA = {
     },
     "required": ["clips", "movie", "critique"],
 }
+
+
+SYSTEM_PROMPT = (
+    "You are an expert film director and visual-effects supervisor judging the video clips "
+    "generated for a story by an AI image-and-video generation pipeline. The target output "
+    "goal is the most realistic action scenes possible.\n"
+    "\n"
+    "The story is told in panels. A video model rendered each panel as one short clip from "
+    "that panel's Motion: text, and the clips are joined in panel order into one movie. Clip "
+    "1 starts from an opening still image described by Panel 1's Opening still: text. Each "
+    "later clip starts from the last frame of the previous clip, so the movie is meant to "
+    "play as one continuous take.\n"
+    "\n"
+    "You cannot watch the video. You will receive the panels in panel order. For each panel "
+    "you get its \"## Panel N\" header and whichever of its Opening still:, Motion:, and "
+    "Narration: text it has, followed by 4 frames sampled from its clip: the first frame, "
+    "two evenly spaced middle frames, and the last frame. Each frame is preceded by a label "
+    "giving its panel, its position (frame 1 of 4 to frame 4 of 4), and its time in seconds "
+    "from the start of that clip. A clip shorter than 4 frames repeats some frames. The "
+    "final message tells you exactly how many clips you are judging. Judge motion by "
+    "comparing a clip's frames with each other and with its Motion: text; you cannot see "
+    "what happens between the sampled frames, so do not reward or penalize anything the "
+    "frames cannot show.\n"
+    "\n"
+    "The movie also has a soundtrack and spoken narration, but you receive no audio. Do not "
+    "judge audio, voice, music, or sound effects. The Narration: text is what is spoken "
+    "over that panel's clip.\n"
+    "\n"
+    "Score each clip on these dimensions, each an integer from 1 (worst) to 10 (best):\n"
+    "- motion_fidelity: whether the clip actually performs the action its Motion: text "
+    "describes.\n"
+    "- physical_realism: whether the action, anatomy, and physics are plausible: people, "
+    "animals, objects, water, and cloth move and interact the way they would in real "
+    "footage.\n"
+    "- temporal_stability: whether people, animals, objects, and the setting keep their "
+    "identity, shape, and appearance across the clip's frames, with no morphing, melting, "
+    "or identity drift.\n"
+    "\n"
+    "Score the movie as a whole on these dimensions, on the same 1-10 scale:\n"
+    "- seam_continuity: whether each clip's first frame continues from the previous clip's "
+    "last frame, so the joins between clips read as one continuous take, with no jump in "
+    "character appearance, position, setting, lighting, or camera.\n"
+    "- narrative_clarity: whether a viewer could follow the story from the visuals together "
+    "with the Narration: text.\n"
+    "\n"
+    "Put exactly one entry in clips for every panel you receive, with its panel number as "
+    "an integer. If you are judging fewer than 2 clips, do not include seam_continuity in "
+    "your movie object at all: with a single clip there is no join to judge. If you are "
+    "judging 2 or more clips, you must include seam_continuity, scored normally.\n"
+    "\n"
+    "Then write a critique that names specific panels by number (for example, \"Panel 3\") "
+    "when identifying strengths and problems.\n"
+    "\n"
+    "You must deliver your judgment by calling the submit_judgment tool exactly once. Do not "
+    "put the judgment in a plain text reply; a response without a submit_judgment call is a "
+    "failure."
+)
+
+# Final text block of the user message; it states the clip count so the judge knows
+# whether seam_continuity applies (spec 3.9).
+FINAL_USER_TEXT_SINGLE = ("You are judging 1 clip above, shown as 4 sampled frames, against "
+                          "its panel text. There is only one clip, so there is no join "
+                          "between clips to judge: omit seam_continuity from your movie "
+                          "object entirely. Score motion_fidelity, physical_realism, and "
+                          "temporal_stability for the clip, score narrative_clarity for the "
+                          "movie, and call submit_judgment.")
+FINAL_USER_TEXT_MULTI_TEMPLATE = ("You are judging all %d clips above, 4 sampled frames from "
+                                  "each, against their panel text. Submit one clips entry per "
+                                  "panel with motion_fidelity, physical_realism, and "
+                                  "temporal_stability, score both seam_continuity and "
+                                  "narrative_clarity for the movie, and call submit_judgment.")
+
+RETRY_USER_MESSAGE = ("You did not call the submit_judgment tool. Call submit_judgment now "
+                      "with your clip scores, movie scores, and critique. Do not reply with "
+                      "plain text.")
 
 
 def _panel_list(panels):
@@ -249,3 +330,53 @@ def extract_frames(path, indices, out_dir):
         with open(os.path.join(out_dir, "frame_%d.jpg" % j), "rb") as f:
             by_index[index] = f.read()
     return [by_index[i] for i in indices]
+
+
+def _text_field(panel, key):
+    """panel[key] stripped when it is a string; "" when missing, null, or not a string."""
+    value = panel.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def format_panel_text(number, panel):
+    """Header, then Opening still: (panel 1 only, when it has a still), Motion:, Narration:,
+    each only when non-empty; no trailing newline (spec 3.7). Pure."""
+    title = _text_field(panel, "title")
+    lines = ["## Panel %d — %s" % (number, title) if title else "## Panel %d —" % number]
+    if number == 1 and _text_field(panel, "image_path"):
+        opening = _text_field(panel, "panel_text")
+        if opening:
+            lines.append("Opening still: %s" % opening)
+    for label, key in (("Motion", "motion_prompt"), ("Narration", "narration")):
+        value = _text_field(panel, key)
+        if value:
+            lines.append("%s: %s" % (label, value))
+    return "\n".join(lines)
+
+
+def format_frame_label(panel, position, t):
+    """Text block placed immediately before each frame image (spec 3.8). Pure."""
+    return "Panel %d, frame %d of %d (t=%.2fs)" % (panel, position, FRAMES_PER_CLIP, t)
+
+
+def build_user_content(clips):
+    """The single user turn's content blocks (spec 3.9). clips is a list, in panel order, of
+    {"panel": int, "text": str, "frames": [{"t": float, "data": base64 str}] * 4}. Per clip:
+    its text block, then a label text block and an image block for each frame; then one
+    final text block. Always 9 * len(clips) + 1 blocks. Pure."""
+    content = []
+    for clip in clips:
+        content.append({"type": "text", "text": clip["text"]})
+        for position, frame in enumerate(clip["frames"], 1):
+            content.append({"type": "text",
+                            "text": format_frame_label(clip["panel"], position, frame["t"])})
+            content.append({"type": "image",
+                            "source": {"type": "base64", "media_type": MEDIA_TYPE,
+                                       "data": frame["data"]}})
+    count = len(clips)
+    if count >= 2:
+        final_text = FINAL_USER_TEXT_MULTI_TEMPLATE % count
+    else:
+        final_text = FINAL_USER_TEXT_SINGLE
+    content.append({"type": "text", "text": final_text})
+    return content

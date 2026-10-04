@@ -409,3 +409,89 @@ def test_t10d_extract_real_failures(tmp_path, synthetic_clips):
     with pytest.raises(judge_clips.ClipError) as exc:
         judge_clips.extract_frames(str(garbage), [0], str(out3))
     assert str(exc.value).startswith("ffmpeg failed on %s (exit " % garbage)
+
+
+# --- T6-T8: panel text, frame labels, user content, system prompt (spec 3.7-3.9, 4.5) -
+
+def _clip_input(panel, text, prefix):
+    """A build_user_content input entry: frames at t = 0.0, 0.5, 1.0, 1.5 whose data are
+    "<prefix>0" .. "<prefix>3" (spec 7.2 T8a)."""
+    return {"panel": panel, "text": text,
+            "frames": [{"t": t, "data": "%s%d" % (prefix, k)}
+                       for k, t in enumerate((0.0, 0.5, 1.0, 1.5))]}
+
+
+def test_t6_format_panel_text():
+    expected_a = ("## Panel 1 — The Beach at Dawn\n"
+                  "Opening still: A wide shot of a woman in a yellow sundress at the water's "
+                  "edge — dawn.\n"
+                  "Motion: She takes a slow step into the surf.\n"
+                  "Narration: She came to the shore for solitude.")
+    expected_b = ("## Panel 2 — The Horse Appears\n"
+                  "Motion: A chestnut horse trots out of the mist.\n"
+                  "Narration: A wild horse appeared.")
+    without_opening = ("## Panel 1 — The Beach at Dawn\n"
+                       "Motion: She takes a slow step into the surf.\n"
+                       "Narration: She came to the shore for solitude.")
+    assert judge_clips.format_panel_text(1, PANEL_1) == expected_a                     # (a)
+    assert judge_clips.format_panel_text(2, PANEL_2) == expected_b                     # (b)
+    assert judge_clips.format_panel_text(1, dict(PANEL_1, image_path=None)) == without_opening  # (c)
+    assert judge_clips.format_panel_text(1, dict(PANEL_1, panel_text="   ")) == without_opening  # (d)
+    assert judge_clips.format_panel_text(
+        3, {"index": 3, "title": "", "motion_prompt": None}) == "## Panel 3 —"           # (e)
+    assert judge_clips.format_panel_text(
+        4, {"index": 4, "title": "  Padded  ", "motion_prompt": "  Runs.  ",
+            "narration": 7}) == "## Panel 4 — Padded\nMotion: Runs."                    # (f)
+    # (g) a still path on a panel other than 1 never adds an Opening still: line
+    assert judge_clips.format_panel_text(
+        2, dict(PANEL_2, image_path="/abs/story/images/panel_02.png")) == expected_b
+
+
+def test_t7_format_frame_label():
+    assert judge_clips.format_frame_label(3, 2, 2.0) == "Panel 3, frame 2 of 4 (t=2.00s)"
+    assert judge_clips.format_frame_label(1, 4, 6.0) == "Panel 1, frame 4 of 4 (t=6.00s)"
+    assert judge_clips.format_frame_label(2, 1, 1 / 3) == "Panel 2, frame 1 of 4 (t=0.33s)"
+
+
+def test_t8a_build_user_content_two_clips():
+    content = judge_clips.build_user_content([_clip_input(1, "T1", "A"), _clip_input(2, "T2", "B")])
+    expected = []
+    for panel, text, prefix in ((1, "T1", "A"), (2, "T2", "B")):
+        expected.append({"type": "text", "text": text})
+        for k, t in enumerate((0.0, 0.5, 1.0, 1.5)):
+            expected.append({"type": "text",
+                             "text": judge_clips.format_frame_label(panel, k + 1, t)})
+            expected.append({"type": "image",
+                             "source": {"type": "base64", "media_type": "image/jpeg",
+                                        "data": "%s%d" % (prefix, k)}})
+    expected.append({"type": "text", "text": judge_clips.FINAL_USER_TEXT_MULTI_TEMPLATE % 2})
+    assert len(content) == 19
+    assert content == expected
+    assert content[1]["text"] == "Panel 1, frame 1 of 4 (t=0.00s)"
+    assert judge_clips.FINAL_USER_TEXT_MULTI_TEMPLATE % 2 == (
+        "You are judging all 2 clips above, 4 sampled frames from each, against their panel "
+        "text. Submit one clips entry per panel with motion_fidelity, physical_realism, and "
+        "temporal_stability, score both seam_continuity and narrative_clarity for the movie, "
+        "and call submit_judgment.")
+
+
+def test_t8b_build_user_content_one_clip():
+    content = judge_clips.build_user_content([_clip_input(1, "T1", "A")])
+    assert len(content) == 10
+    assert content[-1] == {"type": "text", "text": judge_clips.FINAL_USER_TEXT_SINGLE}
+    assert judge_clips.FINAL_USER_TEXT_SINGLE == (
+        "You are judging 1 clip above, shown as 4 sampled frames, against its panel text. "
+        "There is only one clip, so there is no join between clips to judge: omit "
+        "seam_continuity from your movie object entirely. Score motion_fidelity, "
+        "physical_realism, and temporal_stability for the clip, score narrative_clarity for "
+        "the movie, and call submit_judgment.")
+
+
+def test_t8c_system_prompt_content():
+    for phrase in ("the most realistic action scenes possible", "you receive no audio",
+                   "Do not judge audio", "motion_fidelity:", "physical_realism:",
+                   "temporal_stability:", "seam_continuity:", "narrative_clarity:",
+                   "do not include seam_continuity", "you must include seam_continuity",
+                   "exactly once"):
+        assert phrase in judge_clips.SYSTEM_PROMPT, phrase
+    assert not judge_clips.SYSTEM_PROMPT.endswith("\n")
