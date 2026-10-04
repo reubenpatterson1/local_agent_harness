@@ -796,3 +796,285 @@ def test_t24_pipeline_log_wiring():
     assert (judge_clips._pipeline_log_story_dir(["--story-id", "abc"])
             == os.path.join(WS, "generated", "stories", "abc"))
     assert judge_clips._pipeline_log_story_dir([]) is None
+
+
+# --- SDK response builders: real anthropic.types.Message objects (spec 7.1) ----------
+
+THINKING_BLOCK = {"type": "thinking", "thinking": "Comparing the clips to the panel text.",
+                  "signature": "sig-abc123"}
+
+
+def _usage(input_tokens, output_tokens, thinking_tokens):
+    """thinking_tokens=None omits output_tokens_details, as when the API does not report it."""
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if thinking_tokens is not None:
+        usage["output_tokens_details"] = {"thinking_tokens": thinking_tokens}
+    return usage
+
+
+def _message(content, usage, stop_reason):
+    return anthropic.types.Message.model_validate({
+        "id": "msg_test_%s" % uuid.uuid4().hex, "type": "message", "role": "assistant",
+        "model": "claude-opus-5-5", "stop_reason": stop_reason, "stop_sequence": None,
+        "content": content, "usage": usage})
+
+
+def _tool_response(tool_input, usage):
+    return _message([THINKING_BLOCK, {"type": "tool_use", "id": "toolu_test",
+                                      "name": "submit_judgment", "input": tool_input}],
+                    usage, "tool_use")
+
+
+def _text_response(text, usage):
+    return _message([THINKING_BLOCK, {"type": "text", "text": text}], usage, "end_turn")
+
+
+_REAL_TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
+
+
+def _record_tempdirs(monkeypatch):
+    """Wrap the real tempfile.TemporaryDirectory (captured at import, before any patch)
+    so each directory judge-clips creates is recorded. Returns the list of names."""
+    created = []
+
+    def _recording(*args, **kwargs):
+        tmp = _REAL_TEMPORARY_DIRECTORY(*args, **kwargs)
+        created.append(tmp.name)
+        return tmp
+    monkeypatch.setattr(judge_clips.tempfile, "TemporaryDirectory", _recording)
+    return created
+
+
+TWO_CLIP_STDOUT = ("Clip scores:\n"
+                   "  panel  motion_fidelity   physical_realism  temporal_stability\n"
+                   "  1      7                 6                 8\n"
+                   "  2      4                 3                 5\n"
+                   "\n"
+                   "Movie scores:\n"
+                   "  seam_continuity       9\n"
+                   "  narrative_clarity     2\n"
+                   "\n"
+                   "--- Critique ---\n")
+
+
+# --- T16-T18, T21, T25: extraction in main, judging call, outputs (spec 1.4, 4-6) ----
+
+def test_t16_extraction_failure(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, clips={1: 25, 2: GARBAGE_CLIP},
+                            synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    fake = _install_fake(monkeypatch, [])
+    created = _record_tempdirs(monkeypatch)
+    before = _listing(story_dir)
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+
+    out, err = capsys.readouterr()
+    assert err.startswith("Error: frame extraction failed: ffprobe failed on %s (exit 1): "
+                          % (story_dir / "clips" / "panel_02.mp4"))
+    assert out == ""
+    assert fake.constructions == []
+    assert len(created) == 1
+    assert not os.path.exists(created[0])
+    assert _listing(story_dir) == before
+
+
+def test_t17_successful_run_two_clips(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    created = _record_tempdirs(monkeypatch)
+    clips_before = _listing(story_dir / "clips")
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(1200, 3400, 2100))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 0
+
+    with open(story_dir / "clips_judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    assert list(judgment) == ["story_id", "model", "effort", "timestamp", "frames_per_clip",
+                              "usage", "clips", "movie", "critique"]
+    assert judgment["story_id"] == STORY_ID
+    assert judgment["model"] == "claude-opus-5-5"
+    assert judgment["effort"] == "high"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", judgment["timestamp"])
+    assert judgment["frames_per_clip"] == 4
+    assert judgment["usage"] == {"input_tokens": 1200, "output_tokens": 3400,
+                                 "thinking_tokens": 2100}
+    assert judgment["clips"] == [
+        {"panel": 1, "frames": [0, 8, 16, 24], "motion_fidelity": 7, "physical_realism": 6,
+         "temporal_stability": 8},
+        {"panel": 2, "frames": [0, 1, 1, 2], "motion_fidelity": 4, "physical_realism": 3,
+         "temporal_stability": 5}]
+    for entry in judgment["clips"]:
+        assert list(entry) == ["panel", "frames", "motion_fidelity", "physical_realism",
+                               "temporal_stability"]
+    assert judgment["movie"] == {"seam_continuity": 9, "narrative_clarity": 2}
+    assert list(judgment["movie"]) == ["seam_continuity", "narrative_clarity"]
+    assert judgment["critique"] == VALID_INPUT["critique"]
+    assert "—" in raw_text                 # ensure_ascii=False
+    assert raw_text.endswith("}\n")        # trailing newline after json.dump
+    for name in ("clips_judgment.raw.json", "judgment.json", "stills_judgment.json"):
+        assert not (story_dir / name).exists(), name
+
+    out, err = capsys.readouterr()
+    assert out == TWO_CLIP_STDOUT + VALID_INPUT["critique"] + "\n"
+    assert err == ""
+
+    assert fake.constructions == [((), {})]               # Anthropic() with no arguments
+    assert len(fake.calls) == 1
+    kwargs = fake.calls[0]
+    assert sorted(kwargs) == ["max_tokens", "messages", "model", "output_config", "system",
+                              "thinking", "tool_choice", "tools"]
+    assert kwargs["model"] == "claude-opus-5-5"
+    assert kwargs["max_tokens"] == 21333
+    assert kwargs["thinking"] == {"type": "adaptive"}
+    assert kwargs["output_config"] == {"effort": "high"}
+    assert kwargs["tool_choice"] == {"type": "auto"}
+    assert kwargs["system"] == judge_clips.SYSTEM_PROMPT
+    assert [tool["name"] for tool in kwargs["tools"]] == ["submit_judgment"]
+    assert kwargs["tools"][0]["input_schema"] == judge_clips.SUBMIT_JUDGMENT_SCHEMA
+    assert kwargs["tools"][0]["description"] == judge_clips.TOOL_DESCRIPTION
+    messages = kwargs["messages"]
+    assert len(messages) == 1 and messages[0]["role"] == "user"
+    content = messages[0]["content"]
+    assert [block["type"] for block in content] == (
+        ["text"] + ["text", "image"] * 4 + ["text"] + ["text", "image"] * 4 + ["text"])
+    assert content[0]["text"] == judge_clips.format_panel_text(1, PANEL_1)
+    assert content[9]["text"] == judge_clips.format_panel_text(2, PANEL_2)
+    # 24-fps values; the manifest's fps of 30 would give 0.27, 0.53, 0.80 and 0.03, 0.03, 0.07.
+    assert [content[i]["text"] for i in (1, 3, 5, 7)] == [
+        "Panel 1, frame 1 of 4 (t=0.00s)", "Panel 1, frame 2 of 4 (t=0.33s)",
+        "Panel 1, frame 3 of 4 (t=0.67s)", "Panel 1, frame 4 of 4 (t=1.00s)"]
+    assert [content[i]["text"] for i in (10, 12, 14, 16)] == [
+        "Panel 2, frame 1 of 4 (t=0.00s)", "Panel 2, frame 2 of 4 (t=0.04s)",
+        "Panel 2, frame 3 of 4 (t=0.04s)", "Panel 2, frame 4 of 4 (t=0.08s)"]
+    for i in (2, 4, 6, 8, 11, 13, 15, 17):
+        assert content[i]["source"]["type"] == "base64"
+        assert content[i]["source"]["media_type"] == "image/jpeg"
+    assert [_frame_number(base64.b64decode(content[i]["source"]["data"]), tmp_path)
+            for i in (2, 4, 6, 8)] == [0, 8, 16, 24]
+    assert [_frame_number(base64.b64decode(content[i]["source"]["data"]), tmp_path)
+            for i in (11, 13, 15, 17)] == [0, 1, 1, 2]
+    assert content[18]["text"] == judge_clips.FINAL_USER_TEXT_MULTI_TEMPLATE % 2
+
+    assert len(created) == 1
+    assert os.path.basename(created[0]).startswith("judge-clips-")
+    assert not os.path.exists(created[0])
+    assert not os.path.realpath(created[0]).startswith(os.path.realpath(str(story_dir)))
+    assert _listing(story_dir / "clips") == clips_before
+
+
+def test_t18_successful_run_one_clip(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                            clips={1: 1}, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(ONE_CLIP_INPUT), _usage(900, 2500, 1500))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 0
+
+    with open(story_dir / "clips_judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    assert judgment["clips"] == [{"panel": 1, "frames": [0, 0, 0, 0], "motion_fidelity": 7,
+                                  "physical_realism": 6, "temporal_stability": 8}]
+    assert judgment["movie"] == {"seam_continuity": None, "narrative_clarity": 2}
+    assert '"seam_continuity": null' in raw_text
+    out, err = capsys.readouterr()
+    assert out == ("Clip scores:\n"
+                   "  panel  motion_fidelity   physical_realism  temporal_stability\n"
+                   "  1      7                 6                 8\n"
+                   "\n"
+                   "Movie scores:\n"
+                   "  seam_continuity       n/a (only 1 clip)\n"
+                   "  narrative_clarity     2\n"
+                   "\n"
+                   "--- Critique ---\n" + ONE_CLIP_INPUT["critique"] + "\n")
+    assert err == ""
+    assert len(fake.calls) == 1                       # a valid tool_use: no retry
+    content = fake.calls[0]["messages"][0]["content"]
+    assert len(content) == 10
+    assert len({content[i]["source"]["data"] for i in (2, 4, 6, 8)}) == 1
+    assert [content[i]["text"] for i in (1, 3, 5, 7)] == [
+        "Panel 1, frame %d of 4 (t=0.00s)" % k for k in (1, 2, 3, 4)]
+    assert content[9]["text"] == judge_clips.FINAL_USER_TEXT_SINGLE
+
+
+def test_t21a_schema_invalid_tool_input(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    bad = copy.deepcopy(VALID_INPUT)
+    bad["clips"][0]["temporal_stability"] = 11            # clips[0] is panel 2
+    fake = _install_fake(monkeypatch, [_tool_response(bad, _usage(10, 20, 5))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 1            # no retry on a validation failure
+    with open(story_dir / "clips_judgment.raw.json", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert len(raw["responses"]) == 1
+    assert not (story_dir / "clips_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith("Error: submit_judgment input failed schema validation: ")
+
+
+def test_t21b_missing_judged_panel(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    partial = copy.deepcopy(VALID_INPUT)
+    partial["clips"] = [partial["clips"][1]]               # panel 1 only
+    fake = _install_fake(monkeypatch, [_tool_response(partial, _usage(10, 20, 5))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 1
+    with open(story_dir / "clips_judgment.raw.json", encoding="utf-8") as f:
+        assert len(json.load(f)["responses"]) == 1
+    assert not (story_dir / "clips_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == ("Error: submit_judgment input failed schema validation: clips is missing "
+                   "these judged panels: 2\n")
+
+
+def test_t21c_two_clips_missing_seam(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    no_seam = copy.deepcopy(VALID_INPUT)
+    del no_seam["movie"]["seam_continuity"]
+    fake = _install_fake(monkeypatch, [_tool_response(no_seam, _usage(10, 20, 5))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 1
+
+    assert len(fake.calls) == 1
+    with open(story_dir / "clips_judgment.raw.json", encoding="utf-8") as f:
+        assert len(json.load(f)["responses"]) == 1
+    assert not (story_dir / "clips_judgment.json").exists()
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == ("Error: submit_judgment input failed schema validation: seam_continuity "
+                   "is required when judging 2 or more clips\n")
+
+
+def test_t25_float_scores_written_as_integers(tmp_path, monkeypatch, capsys, synthetic_clips):
+    story_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                            clips={1: 1}, synthetic=synthetic_clips)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+    _install_fake(monkeypatch, [_tool_response(
+        {"clips": [{"panel": 1.0, "motion_fidelity": 7.0, "physical_realism": 6.0,
+                    "temporal_stability": 8.0}],
+         "movie": {"narrative_clarity": 2.0}, "critique": "c"}, _usage(10, 20, 5))])
+
+    assert judge_clips.main(["--story-id", STORY_ID]) == 0
+
+    with open(story_dir / "clips_judgment.json", encoding="utf-8") as f:
+        raw_text = f.read()
+    judgment = json.loads(raw_text)
+    for entry in judgment["clips"]:
+        for key in ("panel", "motion_fidelity", "physical_realism", "temporal_stability"):
+            assert type(entry[key]) is int, key
+    assert type(judgment["movie"]["narrative_clarity"]) is int
+    assert judgment["movie"]["seam_continuity"] is None
+    assert '"panel": 1,' in raw_text

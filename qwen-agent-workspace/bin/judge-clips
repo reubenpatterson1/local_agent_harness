@@ -399,6 +399,54 @@ def resolve_paths(story_id):
     return story_dir, clips_dir, manifest_path
 
 
+def find_tool_use(response):
+    """First content block that is a submit_judgment tool call, else None."""
+    for block in response.content:
+        if block.type == "tool_use" and block.name == TOOL_NAME:
+            return block
+    return None
+
+
+CLIP_TABLE_FORMAT = "  %-5s  %-16s  %-16s  %s"
+
+
+def format_clip_row(entry):
+    return CLIP_TABLE_FORMAT % (entry["panel"], entry["motion_fidelity"],
+                                entry["physical_realism"], entry["temporal_stability"])
+
+
+def format_movie_line(name, value):
+    """None is reached only for seam_continuity when exactly 1 clip was judged."""
+    if value is None:
+        return "  %-20s  n/a (only 1 clip)" % name
+    return "  %-20s  %d" % (name, value)
+
+
+def _create_message(client, messages):
+    return client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        thinking={"type": "adaptive"},
+        output_config={"effort": EFFORT},
+        system=SYSTEM_PROMPT,
+        tools=[{
+            "name": TOOL_NAME,
+            "description": TOOL_DESCRIPTION,
+            "input_schema": SUBMIT_JUDGMENT_SCHEMA,
+        }],
+        tool_choice={"type": "auto"},
+        messages=messages,
+    )
+
+
+def _write_raw(story_dir, responses):
+    path = os.path.join(story_dir, "clips_judgment.raw.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"responses": [r.model_dump(mode="json") for r in responses]}, f,
+                  indent=2, ensure_ascii=False)
+    return path
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     story_dir, clips_dir, manifest_path = resolve_paths(args.story_id)
@@ -456,7 +504,93 @@ def main(argv=None):
               "judge-clips.", file=sys.stderr)
         return 1
 
-    raise NotImplementedError("frame extraction and the judging call are added by plan Task 6")
+    clip_inputs = []
+    frames_by_panel = {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="judge-clips-") as tmp_dir:
+            for number, path in clips:
+                frame_count, fps = probe_clip(path)
+                indices = frame_indices(frame_count)
+                out_dir = os.path.join(tmp_dir, "panel_%02d" % number)
+                os.mkdir(out_dir)
+                images = extract_frames(path, indices, out_dir)
+                frames_by_panel[number] = indices
+                clip_inputs.append({
+                    "panel": number,
+                    "text": format_panel_text(number, panels_by_index[number]),
+                    "frames": [{"t": float(index / fps),
+                                "data": base64.standard_b64encode(data).decode("ascii")}
+                               for index, data in zip(indices, images)],
+                })
+    except ClipError as e:
+        print("Error: frame extraction failed: %s" % e, file=sys.stderr)
+        return 1
+    user_content = build_user_content(clip_inputs)
+    client = anthropic.Anthropic()
+
+    responses = [_create_message(client, [{"role": "user", "content": user_content}])]
+    block = find_tool_use(responses[0])
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    try:
+        validate_judgment_input(block.input, numbers)
+    except jsonschema.ValidationError as e:
+        _write_raw(story_dir, responses)
+        print("Error: submit_judgment input failed schema validation: %s" % e.message,
+              file=sys.stderr)
+        return 1
+
+    tool_input = block.input
+    movie = tool_input["movie"]
+    thinking_counts = [r.usage.output_tokens_details.thinking_tokens for r in responses
+                       if r.usage.output_tokens_details is not None
+                       and r.usage.output_tokens_details.thinking_tokens is not None]
+    judgment = {
+        "story_id": args.story_id,
+        "model": MODEL,
+        "effort": EFFORT,
+        "timestamp": timestamp,
+        "frames_per_clip": FRAMES_PER_CLIP,
+        "usage": {
+            "input_tokens": sum(r.usage.input_tokens for r in responses),
+            "output_tokens": sum(r.usage.output_tokens for r in responses),
+            "thinking_tokens": sum(thinking_counts) if thinking_counts else None,
+        },
+        # int(): jsonschema accepts 7.0 as an integer; the file always holds JSON integers
+        # (spec 5.1). Sorted by panel regardless of the order the judge listed them.
+        "clips": [
+            {"panel": int(entry["panel"]),
+             "frames": frames_by_panel[int(entry["panel"])],
+             "motion_fidelity": int(entry["motion_fidelity"]),
+             "physical_realism": int(entry["physical_realism"]),
+             "temporal_stability": int(entry["temporal_stability"])}
+            for entry in sorted(tool_input["clips"], key=lambda entry: entry["panel"])
+        ],
+        "movie": {
+            # Absent (-> JSON null) only in the 1-clip case; validation rejects every other
+            # absence and every 1-clip presence (spec 4.4).
+            "seam_continuity": (int(movie["seam_continuity"]) if "seam_continuity" in movie
+                                else None),
+            "narrative_clarity": int(movie["narrative_clarity"]),
+        },
+        "critique": tool_input["critique"],
+    }
+    with open(os.path.join(story_dir, "clips_judgment.json"), "w", encoding="utf-8") as f:
+        json.dump(judgment, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    print("Clip scores:")
+    print(CLIP_TABLE_FORMAT % (("panel",) + CLIP_SCORE_KEYS))
+    for entry in judgment["clips"]:
+        print(format_clip_row(entry))
+    print()
+    print("Movie scores:")
+    for name in MOVIE_SCORE_KEYS:
+        print(format_movie_line(name, judgment["movie"][name]))
+    print()
+    print("--- Critique ---")
+    print(judgment["critique"])
+    return 0
 
 
 def _pipeline_log_story_dir(argv):
