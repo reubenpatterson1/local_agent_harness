@@ -135,3 +135,44 @@ def validate_judgment_input(tool_input, panels):
     if len(panels) < 2 and "seam_continuity" in tool_input["movie"]:
         raise jsonschema.ValidationError(
             "seam_continuity must be omitted when judging fewer than 2 clips")
+
+
+class ManifestError(Exception):
+    """manifest.json cannot be used; str() is the E7-E10 message without "Error: "
+    (spec 3.2, 6)."""
+
+
+def find_clips(clips_dir):
+    """[(panel_number, path)] for every panel_NN.mp4 in clips_dir, sorted numerically (path
+    breaks ties). os.listdir + fullmatch, not glob (spec 3.1)."""
+    found = []
+    for name in os.listdir(clips_dir):
+        m = CLIP_NAME_RE.fullmatch(name)
+        if m:
+            found.append((int(m.group(1)), os.path.join(clips_dir, name)))
+    found.sort(key=lambda item: (item[0], item[1]))
+    return found
+
+
+def load_manifest_panels(manifest_path):
+    """{index: panel dict} from manifest.json. Raises ManifestError for E7-E10 (spec 3.2)."""
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    except ValueError as e:
+        # json.JSONDecodeError and UnicodeDecodeError are both ValueError subclasses.
+        raise ManifestError("manifest.json is not valid JSON: %s: %s" % (manifest_path, e))
+    panels = manifest.get("panels") if isinstance(manifest, dict) else None
+    if not isinstance(panels, list) or not panels:
+        raise ManifestError("manifest.json has no panels list: %s" % manifest_path)
+    by_index = {}
+    for position, panel in enumerate(panels, 1):
+        index = panel.get("index") if isinstance(panel, dict) else None
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise ManifestError("manifest.json panel entry %d has no integer index: %s"
+                                % (position, manifest_path))
+        if index in by_index:
+            raise ManifestError("manifest.json lists panel index %d more than once: %s"
+                                % (index, manifest_path))
+        by_index[index] = panel
+    return by_index

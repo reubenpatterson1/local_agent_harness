@@ -175,3 +175,46 @@ def test_t13_seam_two_way_rule():
     assert exc.value.message == "seam_continuity must be omitted when judging fewer than 2 clips"
     assert judge_clips.validate_judgment_input(copy.deepcopy(ONE_CLIP_INPUT), [1]) is None
     assert judge_clips.validate_judgment_input(copy.deepcopy(VALID_INPUT), [1, 2]) is None
+
+
+# --- shared manifest panel fixtures (spec 7.1) -----------------------------------------
+
+PANEL_1 = {"index": 1, "image_path": "/abs/story/images/panel_01.png", "title": "The Beach at Dawn",
+           "panel_text": "A wide shot of a woman in a yellow sundress at the water's edge — dawn.",
+           "narration": "She came to the shore for solitude.", "num_frames": 25,
+           "motion_prompt": "She takes a slow step into the surf.", "conditioning": "still"}
+PANEL_2 = {"index": 2, "image_path": None, "title": "The Horse Appears",
+           "panel_text": "A chestnut horse trots out of the mist.",
+           "narration": "A wild horse appeared.", "num_frames": 3,
+           "motion_prompt": "A chestnut horse trots out of the mist.", "conditioning": "chain"}
+
+def _manifest(panels):
+    # fps 30 deliberately differs from the clips' real 24 fps, so a label computed from
+    # the manifest fps instead of ffprobe's avg_frame_rate is caught (T17).
+    return {"schema_version": 3, "story_id": STORY_ID, "fps": 30, "panels": panels}
+
+
+# --- T3, T5: clip discovery and manifest loading (spec 3.1-3.3) -----------------------
+
+def test_t3_find_clips_numeric_sort_and_filter(tmp_path):
+    clips_dir = tmp_path / "clips"
+    clips_dir.mkdir()
+    for name in ("panel_03.mp4", "panel_01.mp4", "panel_100.mp4", "panel_99.mp4",
+                 "panel_02.mp4", "panel_1.mp4", "panel_01.mp4.provenance.json",
+                 "panel_02.chainseed.png", "panel_01.mov", "Panel_04.mp4", "panel_05.mp4.bak"):
+        (clips_dir / name).write_bytes(b"x")
+    d = str(clips_dir)
+    assert judge_clips.find_clips(d) == [
+        (1, os.path.join(d, "panel_01.mp4")),
+        (2, os.path.join(d, "panel_02.mp4")),
+        (3, os.path.join(d, "panel_03.mp4")),
+        (99, os.path.join(d, "panel_99.mp4")),
+        (100, os.path.join(d, "panel_100.mp4")),
+    ]
+
+
+def test_t5_load_manifest_pairs_by_index(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"schema_version": 3, "panels": [PANEL_2, PANEL_1]}),
+                    encoding="utf-8")
+    assert judge_clips.load_manifest_panels(str(path)) == {1: PANEL_1, 2: PANEL_2}
