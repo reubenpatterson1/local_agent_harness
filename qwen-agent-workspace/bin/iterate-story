@@ -14,7 +14,7 @@ back to the live story.md, story_prompt.txt and judgment.json, and
 run-summary.json records every round. Text only: no stills, clips or renders.
 
 Usage:
-  bin/iterate-story --story-id <id> --threshold <N> [--max-rounds <N>]
+  bin/iterate-story --story-id <id> --threshold <N> [--max-rounds <N>] [--goal TEXT]
 
 Requires ANTHROPIC_API_KEY in the environment for bin/judge-story; this script
 does not check it itself (an unset key fails round 1's judge call). Exit codes:
@@ -129,6 +129,9 @@ def build_parser():
                         default=None, metavar="N",
                         help="passed through to bin/ltx-movie's --story-context-window on "
                              "every regeneration call")
+    parser.add_argument("--goal", dest="goal", default=None, metavar="TEXT",
+                        help="passed through verbatim to bin/judge-story's --goal on every "
+                             "judging call; bin/judge-story validates it")
     return parser
 
 
@@ -141,12 +144,16 @@ def resolve_paths(story_id):
     return story_dir, story_md_path, story_prompt_path
 
 
-def build_judge_cmd(story_id, target_panels):
+def build_judge_cmd(story_id, target_panels, goal=None):
     """bin/judge-story argv (spec 3.4.1, extended). Passes --target-panels so the judge
     builds its revised_prompt's beat plan for the pinned count from the start, instead of
-    proposing a different count that then has to be patched after the fact."""
-    return [sys.executable, os.path.join(WS, "bin", "judge-story"), "--story-id", story_id,
-            "--target-panels", str(target_panels)]
+    proposing a different count that then has to be patched after the fact. --goal is
+    appended verbatim only when given, so the argv is unchanged for a caller that omits it."""
+    cmd = [sys.executable, os.path.join(WS, "bin", "judge-story"), "--story-id", story_id,
+           "--target-panels", str(target_panels)]
+    if goal is not None:
+        cmd += ["--goal", goal]
+    return cmd
 
 
 def build_ltx_movie_cmd(story_id, override_path, pinned_panel_count, story_model=None,
@@ -272,7 +279,7 @@ def main(argv=None):
     round_number = 0
     while True:
         round_number += 1
-        judge_cmd = build_judge_cmd(args.story_id, pinned_panel_count)
+        judge_cmd = build_judge_cmd(args.story_id, pinned_panel_count, args.goal)
         judge = _run(judge_cmd)
         _log_run(story_dir, round_number, "judge-story", judge_cmd, judge)
         if judge.returncode != 0:

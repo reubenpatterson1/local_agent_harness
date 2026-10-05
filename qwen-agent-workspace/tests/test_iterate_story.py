@@ -466,3 +466,30 @@ def test_story_model_and_context_window_passthrough(tmp_path, monkeypatch):
     assert len(ltx_calls) == 1
     assert ltx_calls[0][-4:] == ["--story-model", "qwen38-6bit",
                                  "--story-context-window", "262144"]
+
+
+def test_goal_passthrough_to_every_judge_call(tmp_path, monkeypatch):
+    # spec 2026-10-05 section 3.5: --goal reaches every judge-story call verbatim and no
+    # ltx-movie call; omitted, every argv is unchanged (test_tm2 pins that exact argv).
+    story_dir = _make_story(tmp_path, monkeypatch)
+    fake = FakeRun(story_dir, [(4, 4, 4, 4), (7, 7, 7, 7)])
+    monkeypatch.setattr(iterate_story.subprocess, "run", fake)
+    assert iterate_story.main(["--story-id", STORY_ID, "--threshold", "7",
+                               "--goal", "a quiet 100% drama"]) == 0
+    judge_calls = [cmd for cmd, _ in fake.calls if os.path.basename(cmd[1]) == "judge-story"]
+    ltx_calls = [cmd for cmd, _ in fake.calls if os.path.basename(cmd[1]) == "ltx-movie"]
+    assert (len(judge_calls), len(ltx_calls)) == (2, 1)
+    expected = [sys.executable, os.path.join(iterate_story.WS, "bin", "judge-story"),
+                "--story-id", STORY_ID, "--target-panels", str(PINNED),
+                "--goal", "a quiet 100% drama"]
+    assert judge_calls == [expected, expected]
+    assert "--goal" not in ltx_calls[0]
+    with open(os.path.join(story_dir, iterate_story.LOG_FILE_NAME), encoding="utf-8") as f:
+        assert f.read().count("'--goal', 'a quiet 100% drama'") == 2
+    assert list(_summary(story_dir)) == ["stop_reason", "best_round", "rounds"]
+    # Passed verbatim (judge-story normalizes and validates), and only when given.
+    assert iterate_story.build_parser().parse_args(
+        ["--story-id", "x", "--threshold", "7"]).goal is None
+    assert iterate_story.build_judge_cmd("s", 3)[-2:] == ["--target-panels", "3"]
+    assert iterate_story.build_judge_cmd("s", 3, " x. ")[-2:] == ["--goal", " x. "]
+    assert iterate_story.build_judge_cmd("s", 3, "")[-2:] == ["--goal", ""]
