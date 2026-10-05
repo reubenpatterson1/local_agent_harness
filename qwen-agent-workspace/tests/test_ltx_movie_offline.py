@@ -331,6 +331,17 @@ def test_story_prompt_template():
     except TypeError:
         raised = True
     check("L5j seconds is keyword-only and required", raised)
+    new_phrase_rule = ("Introduce each character with a referring phrase of at most four words "
+                       "built only from details you already gave them in this Image: field or "
+                       "that the narrative states, and use that exact phrase for them "
+                       "everywhere else in the file. Never add a colour, garment or trait just "
+                       "to make the phrase.")
+    check("L5k the referring-phrase rule builds the phrase only from given details",
+          new_phrase_rule in prompt, "got %r" % prompt[:1800])
+    every_prompt = [ltx_movie.build_story_prompt("n", "sid", 3, no_stills, seed_image, seconds="6")
+                    for no_stills in (False, True) for seed_image in (False, True)]
+    check("L5l no story prompt carries the copied 'woman in grey' example",
+          all("woman in grey" not in p for p in every_prompt))
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +631,16 @@ def test_no_stills_story_prompt_template():
     check("L15k seed_image=True does not change the no-stills prompt",
           ltx_movie.build_story_prompt("some narrative", "some_id", 7, True, True,
                                        seconds="6") == p)
+    check("L15y the production-quality phrases are the model's own choice",
+          "Keep each panel's wording plain and factual apart from at most two short "
+          "production-quality phrases of your own choosing that suit the narrative." in p,
+          "got %r" % p[-1400:])
+    every_prompt = [ltx_movie.build_story_prompt("n", "sid", 3, no_stills, seed_image, seconds="6")
+                    for no_stills in (False, True) for seed_image in (False, True)]
+    check("L15z no story prompt names a fixed production-value phrase",
+          all(s not in q for q in every_prompt
+              for s in ("warm cinematic lighting", "film-grade color", "crisp fine detail",
+                        "production-value")))
 
 
 # ---------------------------------------------------------------------------
