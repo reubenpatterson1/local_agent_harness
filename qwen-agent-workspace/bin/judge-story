@@ -13,6 +13,8 @@ and revised prompt. It never regenerates anything.
 Usage:
   bin/judge-story --story-id <id>               # generated/stories/<id>/story.md
   bin/judge-story --story-md <path/to/story.md>
+  Either form also takes --goal TEXT, which replaces DEFAULT_GOAL in the judge's
+  system prompt; judgment.json records the goal used.
 
 Requires ANTHROPIC_API_KEY in the environment. Exit codes: 0 success,
 1 runtime or API failure, 2 argument or precondition failure. If Claude never
@@ -73,11 +75,19 @@ SUBMIT_JUDGMENT_SCHEMA = {
 }
 
 
-SYSTEM_PROMPT = (
+# The target output goal stated in the system prompt; --goal replaces it. With --goal
+# omitted, the prompt sent is byte-identical to the constant this template replaced
+# (spec 2026-10-05-prompt-anchoring-fixes.md section 3).
+DEFAULT_GOAL = "the most realistic action scenes possible, with relatively little dialogue"
+# Substituted with str.replace, never %-formatting or str.format, so a literal %, { or }
+# in the template or in a goal needs no escaping.
+GOAL_TOKEN = "@@GOAL@@"
+GOAL_MAX_CHARS = 300
+
+SYSTEM_PROMPT_TEMPLATE = (
     "You are an expert story editor judging a story written for an AI image-and-video "
     "generation pipeline. The story is intended to become a multi-panel, action-focused "
-    "storyboard. The target output goal is the most realistic action scenes possible, with "
-    "relatively little dialogue.\n"
+    "storyboard. The target output goal is @@GOAL@@.\n"
     "\n"
     "Score the story on four dimensions, each an integer from 1 (worst) to 10 (best):\n"
     "- pacing_progression: whether the action builds and progresses panel to panel, without "
@@ -113,6 +123,15 @@ SYSTEM_PROMPT = (
     "put the judgment in a plain text reply; a response without a submit_judgment call is a "
     "failure."
 )
+
+
+def build_system_prompt(goal):
+    """SYSTEM_PROMPT_TEMPLATE with its single GOAL_TOKEN replaced by goal, verbatim. Pure."""
+    return SYSTEM_PROMPT_TEMPLATE.replace(GOAL_TOKEN, goal)
+
+
+# The system prompt when --goal is omitted: byte-identical to the constant it replaced.
+SYSTEM_PROMPT = build_system_prompt(DEFAULT_GOAL)
 
 RETRY_USER_MESSAGE = ("You did not call the submit_judgment tool. Call submit_judgment now "
                       "with your scores, critique, and revised_prompt. Do not reply with "
@@ -157,6 +176,24 @@ def find_tool_use(response):
     return None
 
 
+def parse_goal(text):
+    """argparse type= for --goal (spec 2026-10-05 section 3.1 D5). Strips surrounding
+    whitespace and then one trailing "." (the prompt supplies its own), and rejects an
+    empty result, a line break, or more than GOAL_MAX_CHARS characters. Returns the goal
+    exactly as it is inserted into the system prompt."""
+    goal = text.strip()
+    if goal.endswith("."):
+        goal = goal[:-1].rstrip()
+    if not goal:
+        raise argparse.ArgumentTypeError("must not be empty")
+    if "\n" in goal or "\r" in goal:
+        raise argparse.ArgumentTypeError("must be a single line")
+    if len(goal) > GOAL_MAX_CHARS:
+        raise argparse.ArgumentTypeError("must be at most %d characters (got %d)"
+                                         % (GOAL_MAX_CHARS, len(goal)))
+    return goal
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="judge-story",
@@ -171,6 +208,10 @@ def build_parser():
                        help="instruct the judge that revised_prompt must target exactly N "
                             "panels (used by bin/iterate-story to keep the panel count "
                             "stable across rounds)")
+    parser.add_argument("--goal", dest="goal", type=parse_goal, default=None, metavar="TEXT",
+                        help="the target output goal stated in the judge's system prompt, "
+                             "worded to complete 'The target output goal is TEXT.' "
+                             "(default: '" + DEFAULT_GOAL + "')")
     return parser
 
 
@@ -189,15 +230,16 @@ def resolve_paths(story_id, story_md):
     return story_dir, story_md_path, story_prompt_path
 
 
-def _create_message(client, messages):
-    """One non-streaming judging call with the fixed spec 4.1 parameters. No temperature,
-    top_k, or top_p: extended thinking rejects non-default values."""
+def _create_message(client, system_prompt, messages):
+    """One non-streaming judging call with the fixed spec 4.1 parameters and the given
+    system prompt. No temperature, top_k, or top_p: extended thinking rejects non-default
+    values."""
     return client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive"},
         output_config={"effort": EFFORT},
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         tools=[{
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
@@ -246,14 +288,17 @@ def main(argv=None):
     client = anthropic.Anthropic()
 
     user_message = build_user_message(story_md_text, story_prompt_text, args.target_panels)
+    goal = DEFAULT_GOAL if args.goal is None else args.goal
+    system_prompt = build_system_prompt(goal)
     responses = []
     try:
-        responses.append(_create_message(client, [{"role": "user", "content": user_message}]))
+        responses.append(_create_message(client, system_prompt,
+                                         [{"role": "user", "content": user_message}]))
         block = find_tool_use(responses[0])
         if block is None:
             # One retry in the same conversation. r1.content goes back exactly as
             # received: the API requires thinking blocks and signatures unmodified.
-            responses.append(_create_message(client, [
+            responses.append(_create_message(client, system_prompt, [
                 {"role": "user", "content": user_message},
                 {"role": "assistant", "content": responses[0].content},
                 {"role": "user", "content": RETRY_USER_MESSAGE},
@@ -289,6 +334,7 @@ def main(argv=None):
         "story_prompt_path": story_prompt_path,
         "model": MODEL,
         "effort": EFFORT,
+        "goal": goal,
         "timestamp": timestamp,
         "usage": {
             "input_tokens": sum(r.usage.input_tokens for r in responses),

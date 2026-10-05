@@ -16,6 +16,7 @@ written to the real generated/ tree. Exactly one test function per spec test ID
 import base64
 import copy
 import fractions
+import hashlib
 import importlib.machinery
 import json
 import os
@@ -892,8 +893,9 @@ def test_t17_successful_run_two_clips(tmp_path, monkeypatch, capsys, synthetic_c
     with open(story_dir / "clips_judgment.json", encoding="utf-8") as f:
         raw_text = f.read()
     judgment = json.loads(raw_text)
-    assert list(judgment) == ["story_id", "model", "effort", "timestamp", "frames_per_clip",
-                              "usage", "clips", "movie", "critique"]
+    assert list(judgment) == ["story_id", "model", "effort", "goal", "timestamp",
+                              "frames_per_clip", "usage", "clips", "movie", "critique"]
+    assert judgment["goal"] == judge_clips.DEFAULT_GOAL
     assert judgment["story_id"] == STORY_ID
     assert judgment["model"] == "claude-opus-5-5"
     assert judgment["effort"] == "high"
@@ -1193,3 +1195,93 @@ def test_t23_api_key_never_leaks(tmp_path, monkeypatch, capsys, synthetic_clips)
     for text in [ok_out, ok_err, fail_out, fail_err] + [p.read_text(encoding="utf-8")
                                                          for p in written]:
         assert SENTINEL_KEY not in text
+
+
+# --- --goal: the target output goal as a parameter (spec 2026-10-05 section 3) --------
+
+# sha256 of the SYSTEM_PROMPT constant at commit 1d8580b, before --goal existed (3166 chars).
+LEGACY_SYSTEM_PROMPT_SHA256 = "ac604f73c470bae702f8380aab81418258ea9cc3e9db75f26a319f2342594c3d"
+# "%" and "{...}" prove the goal is inserted verbatim, never formatted.
+CUSTOM_GOAL = "a slow 100% {literal} dialogue-driven drama"
+
+
+def test_goal_default_prompt_byte_identical():
+    assert judge_clips.DEFAULT_GOAL == "the most realistic action scenes possible"
+    assert judge_clips.GOAL_TOKEN == "@@GOAL@@"
+    assert judge_clips.GOAL_MAX_CHARS == 300
+    assert judge_clips.SYSTEM_PROMPT_TEMPLATE.count(judge_clips.GOAL_TOKEN) == 1
+    rendered = judge_clips.build_system_prompt(judge_clips.DEFAULT_GOAL)
+    assert rendered == judge_clips.SYSTEM_PROMPT
+    assert len(rendered) == 3166
+    assert hashlib.sha256(rendered.encode("utf-8")).hexdigest() == LEGACY_SYSTEM_PROMPT_SHA256
+    assert "The target output goal is the most realistic action scenes possible.\n" in rendered
+
+
+def test_goal_custom_rendering_and_validation(capsys):
+    rendered = judge_clips.build_system_prompt(CUSTOM_GOAL)
+    assert "The target output goal is " + CUSTOM_GOAL + ".\n" in rendered
+    assert judge_clips.GOAL_TOKEN not in rendered
+    assert judge_clips.DEFAULT_GOAL not in rendered
+    assert rendered == judge_clips.SYSTEM_PROMPT.replace(judge_clips.DEFAULT_GOAL, CUSTOM_GOAL)
+    parse = judge_clips.build_parser().parse_args
+    assert parse(["--story-id", "x"]).goal is None
+    assert parse(["--story-id", "x", "--goal", CUSTOM_GOAL]).goal == CUSTOM_GOAL
+    assert parse(["--story-id", "x", "--goal", "  calm drama.  "]).goal == "calm drama"
+    assert parse(["--story-id", "x", "--goal", "x" * 300]).goal == "x" * 300
+    for bad, message in (("", "must not be empty"), ("   ", "must not be empty"),
+                         (" . ", "must not be empty"),
+                         ("two\nlines", "must be a single line"),
+                         ("two\rlines", "must be a single line"),
+                         ("x" * 301, "must be at most 300 characters (got 301)")):
+        with pytest.raises(SystemExit) as exc:
+            parse(["--story-id", "x", "--goal", bad])
+        assert exc.value.code == 2, repr(bad)
+        assert "argument --goal: " + message in capsys.readouterr().err, repr(bad)
+    helptext = " ".join(judge_clips.build_parser().format_help().split())
+    assert judge_clips.DEFAULT_GOAL in helptext
+
+
+def test_goal_reaches_api_and_judgment(tmp_path, monkeypatch, capsys, synthetic_clips):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+
+    # --goal omitted: the legacy prompt is sent and the default goal is recorded.
+    default_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                              clips={1: 1}, story_id="goal-default", synthetic=synthetic_clips)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(ONE_CLIP_INPUT), _usage(10, 20, 5))])
+    assert judge_clips.main(["--story-id", "goal-default"]) == 0
+    assert fake.calls[0]["system"] == judge_clips.SYSTEM_PROMPT
+    with open(default_dir / "clips_judgment.json", encoding="utf-8") as f:
+        assert json.load(f)["goal"] == judge_clips.DEFAULT_GOAL
+
+    # --goal given: the normalized goal reaches the first call AND the retry, and
+    # clips_judgment.json records exactly the text that was inserted.
+    custom_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                             clips={1: 1}, story_id="goal-custom", synthetic=synthetic_clips)
+    fake = _install_fake(monkeypatch, [
+        _text_response("Prose only.", _usage(10, 20, None)),
+        _tool_response(copy.deepcopy(ONE_CLIP_INPUT), _usage(10, 20, 5))])
+    assert judge_clips.main(["--story-id", "goal-custom",
+                             "--goal", " " + CUSTOM_GOAL + ". "]) == 0
+    assert len(fake.calls) == 2
+    for call in fake.calls:
+        assert call["system"] == judge_clips.build_system_prompt(CUSTOM_GOAL)
+    with open(custom_dir / "clips_judgment.json", encoding="utf-8") as f:
+        judgment = json.load(f)
+    assert list(judgment)[2:4] == ["effort", "goal"]
+    assert judgment["goal"] == CUSTOM_GOAL
+    capsys.readouterr()
+
+    # An invalid --goal exits 2 before any check, subprocess, temp dir or client.
+    bad_dir = _make_story(tmp_path, monkeypatch, manifest=_manifest([PANEL_1]),
+                          clips={1: _dummy(1)}, story_id="goal-bad")
+    before = _listing(bad_dir)
+    _no_subprocess(monkeypatch)
+    _no_tempdir(monkeypatch)
+    fake = _install_fake(monkeypatch, [])
+    with pytest.raises(SystemExit) as exc:
+        judge_clips.main(["--story-id", "goal-bad", "--goal", "   "])
+    assert exc.value.code == 2
+    assert fake.constructions == []
+    assert _listing(bad_dir) == before
+    assert "argument --goal: must not be empty" in capsys.readouterr().err

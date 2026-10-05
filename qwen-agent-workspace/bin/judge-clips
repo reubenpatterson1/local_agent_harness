@@ -18,6 +18,7 @@ audio input.
 
 Usage:
   bin/judge-clips --story-id <id>    # generated/stories/<id>/clips/ + manifest.json
+  bin/judge-clips --story-id <id> --goal TEXT    # replace DEFAULT_GOAL in the system prompt
 
 Requires ANTHROPIC_API_KEY in the environment, and ffmpeg and ffprobe on PATH.
 Exit codes: 0 success, 1 runtime or API failure, 2 argument or precondition
@@ -113,10 +114,19 @@ SUBMIT_JUDGMENT_SCHEMA = {
 }
 
 
-SYSTEM_PROMPT = (
+# The target output goal stated in the system prompt; --goal replaces it. With --goal
+# omitted, the prompt sent is byte-identical to the constant this template replaced
+# (spec 2026-10-05-prompt-anchoring-fixes.md section 3).
+DEFAULT_GOAL = "the most realistic action scenes possible"
+# Substituted with str.replace, never %-formatting or str.format, so a literal %, { or }
+# in the template or in a goal needs no escaping.
+GOAL_TOKEN = "@@GOAL@@"
+GOAL_MAX_CHARS = 300
+
+SYSTEM_PROMPT_TEMPLATE = (
     "You are an expert film director and visual-effects supervisor judging the video clips "
     "generated for a story by an AI image-and-video generation pipeline. The target output "
-    "goal is the most realistic action scenes possible.\n"
+    "goal is @@GOAL@@.\n"
     "\n"
     "The story is told in panels. A video model rendered each panel as one short clip from "
     "that panel's Motion: text, and the clips are joined in panel order into one movie. Clip "
@@ -168,6 +178,15 @@ SYSTEM_PROMPT = (
     "put the judgment in a plain text reply; a response without a submit_judgment call is a "
     "failure."
 )
+
+
+def build_system_prompt(goal):
+    """SYSTEM_PROMPT_TEMPLATE with its single GOAL_TOKEN replaced by goal, verbatim. Pure."""
+    return SYSTEM_PROMPT_TEMPLATE.replace(GOAL_TOKEN, goal)
+
+
+# The system prompt when --goal is omitted: byte-identical to the constant it replaced.
+SYSTEM_PROMPT = build_system_prompt(DEFAULT_GOAL)
 
 # Final text block of the user message; it states the clip count so the judge knows
 # whether seam_continuity applies (spec 3.9).
@@ -382,6 +401,24 @@ def build_user_content(clips):
     return content
 
 
+def parse_goal(text):
+    """argparse type= for --goal (spec 2026-10-05 section 3.1 D5). Strips surrounding
+    whitespace and then one trailing "." (the prompt supplies its own), and rejects an
+    empty result, a line break, or more than GOAL_MAX_CHARS characters. Returns the goal
+    exactly as it is inserted into the system prompt."""
+    goal = text.strip()
+    if goal.endswith("."):
+        goal = goal[:-1].rstrip()
+    if not goal:
+        raise argparse.ArgumentTypeError("must not be empty")
+    if "\n" in goal or "\r" in goal:
+        raise argparse.ArgumentTypeError("must be a single line")
+    if len(goal) > GOAL_MAX_CHARS:
+        raise argparse.ArgumentTypeError("must be at most %d characters (got %d)"
+                                         % (GOAL_MAX_CHARS, len(goal)))
+    return goal
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="judge-clips",
@@ -389,6 +426,10 @@ def build_parser():
     parser.add_argument("--story-id", dest="story_id", metavar="ID", required=True,
                         help="judge generated/stories/ID/clips/panel_NN.mp4 against "
                              "generated/stories/ID/manifest.json")
+    parser.add_argument("--goal", dest="goal", type=parse_goal, default=None, metavar="TEXT",
+                        help="the target output goal stated in the judge's system prompt, "
+                             "worded to complete 'The target output goal is TEXT.' "
+                             "(default: '" + DEFAULT_GOAL + "')")
     return parser
 
 
@@ -422,13 +463,13 @@ def format_movie_line(name, value):
     return "  %-20s  %d" % (name, value)
 
 
-def _create_message(client, messages):
+def _create_message(client, system_prompt, messages):
     return client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive"},
         output_config={"effort": EFFORT},
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         tools=[{
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
@@ -527,15 +568,18 @@ def main(argv=None):
         return 1
     user_content = build_user_content(clip_inputs)
     client = anthropic.Anthropic()
+    goal = DEFAULT_GOAL if args.goal is None else args.goal
+    system_prompt = build_system_prompt(goal)
 
     responses = []
     try:
-        responses.append(_create_message(client, [{"role": "user", "content": user_content}]))
+        responses.append(_create_message(client, system_prompt,
+                                         [{"role": "user", "content": user_content}]))
         block = find_tool_use(responses[0])
         if block is None:
             # One retry in the same conversation, re-sending every frame. r1.content goes
             # back exactly as received (thinking blocks and signatures) (spec 4.6).
-            responses.append(_create_message(client, [
+            responses.append(_create_message(client, system_prompt, [
                 {"role": "user", "content": user_content},
                 {"role": "assistant", "content": responses[0].content},
                 {"role": "user", "content": RETRY_USER_MESSAGE},
@@ -569,6 +613,7 @@ def main(argv=None):
         "story_id": args.story_id,
         "model": MODEL,
         "effort": EFFORT,
+        "goal": goal,
         "timestamp": timestamp,
         "frames_per_clip": FRAMES_PER_CLIP,
         "usage": {

@@ -11,6 +11,7 @@ API installs a recording fake first. Exactly one test function per spec test ID
 """
 
 import copy
+import hashlib
 import importlib.machinery
 import json
 import os
@@ -274,8 +275,9 @@ def test_t7_successful_run(tmp_path, monkeypatch, capsys):
         raw_text = f.read()
     judgment = json.loads(raw_text)
     assert list(judgment) == ["story_md_path", "story_prompt_path", "model",
-                              "effort", "timestamp", "usage", "scores",
+                              "effort", "goal", "timestamp", "usage", "scores",
                               "critique", "revised_prompt"]
+    assert judgment["goal"] == judge_story.DEFAULT_GOAL
     assert judgment["story_md_path"] == str(story_md)
     assert judgment["story_prompt_path"] == str(tmp_path / "story_prompt.txt")
     assert judgment["model"] == "claude-opus-5-5"
@@ -480,3 +482,93 @@ def test_target_panels_optional():
     without_target = judge_story.build_user_message("MD", "PROMPT")
     assert "target exactly" not in without_target
     assert judge_story.build_user_message("MD", "PROMPT", None) == without_target
+
+
+# --- --goal: the target output goal as a parameter (spec 2026-10-05 section 3) --------
+
+# sha256 of the SYSTEM_PROMPT constant at commit 1d8580b, before --goal existed (2223 chars).
+LEGACY_SYSTEM_PROMPT_SHA256 = "39be908ef72c563313398c1a0f1ff4a69bd948a0e5f90c030aaea879694cb97b"
+# "%" and "{...}" prove the goal is inserted verbatim, never formatted.
+CUSTOM_GOAL = "a quiet 100% {literal} drama, mostly dialogue"
+
+
+def test_goal_default_prompt_byte_identical():
+    assert judge_story.DEFAULT_GOAL == ("the most realistic action scenes possible, with "
+                                        "relatively little dialogue")
+    assert judge_story.GOAL_TOKEN == "@@GOAL@@"
+    assert judge_story.GOAL_MAX_CHARS == 300
+    assert judge_story.SYSTEM_PROMPT_TEMPLATE.count(judge_story.GOAL_TOKEN) == 1
+    rendered = judge_story.build_system_prompt(judge_story.DEFAULT_GOAL)
+    assert rendered == judge_story.SYSTEM_PROMPT
+    assert len(rendered) == 2223
+    assert hashlib.sha256(rendered.encode("utf-8")).hexdigest() == LEGACY_SYSTEM_PROMPT_SHA256
+    assert ("The target output goal is the most realistic action scenes possible, with "
+            "relatively little dialogue.\n") in rendered
+
+
+def test_goal_custom_rendering_and_validation(capsys):
+    rendered = judge_story.build_system_prompt(CUSTOM_GOAL)
+    assert "The target output goal is " + CUSTOM_GOAL + ".\n" in rendered
+    assert judge_story.GOAL_TOKEN not in rendered
+    assert judge_story.DEFAULT_GOAL not in rendered
+    # Only the goal differs: every other byte of the default prompt is kept.
+    assert rendered == judge_story.SYSTEM_PROMPT.replace(judge_story.DEFAULT_GOAL, CUSTOM_GOAL)
+    parse = judge_story.build_parser().parse_args
+    assert parse(["--story-id", "x"]).goal is None
+    assert parse(["--story-id", "x", "--goal", CUSTOM_GOAL]).goal == CUSTOM_GOAL
+    assert parse(["--story-id", "x", "--goal", "  calm drama.  "]).goal == "calm drama"
+    assert parse(["--story-id", "x", "--goal", "x" * 300]).goal == "x" * 300
+    for bad, message in (("", "must not be empty"), ("   ", "must not be empty"),
+                         (" . ", "must not be empty"),
+                         ("two\nlines", "must be a single line"),
+                         ("two\rlines", "must be a single line"),
+                         ("x" * 301, "must be at most 300 characters (got 301)")):
+        with pytest.raises(SystemExit) as exc:
+            parse(["--story-id", "x", "--goal", bad])
+        assert exc.value.code == 2, repr(bad)
+        assert "argument --goal: " + message in capsys.readouterr().err, repr(bad)
+    helptext = " ".join(judge_story.build_parser().format_help().split())
+    assert judge_story.DEFAULT_GOAL in helptext
+
+
+def test_goal_reaches_api_and_judgment(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SENTINEL_KEY)
+
+    # --goal omitted: the legacy prompt is sent and the default goal is recorded.
+    default_dir = tmp_path / "default"
+    story_md = _make_story(default_dir)
+    fake = _install_fake(monkeypatch, [
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(10, 20, 5))])
+    assert judge_story.main(["--story-md", str(story_md)]) == 0
+    assert fake.calls[0]["system"] == judge_story.SYSTEM_PROMPT
+    with open(default_dir / "judgment.json", encoding="utf-8") as f:
+        assert json.load(f)["goal"] == judge_story.DEFAULT_GOAL
+
+    # --goal given: the normalized goal reaches the first call AND the retry, and
+    # judgment.json records exactly the text that was inserted.
+    custom_dir = tmp_path / "custom"
+    story_md = _make_story(custom_dir)
+    fake = _install_fake(monkeypatch, [
+        _text_response("Prose only.", _usage(10, 20, None)),
+        _tool_response(copy.deepcopy(VALID_INPUT), _usage(10, 20, 5))])
+    assert judge_story.main(["--story-md", str(story_md),
+                             "--goal", " " + CUSTOM_GOAL + ". "]) == 0
+    assert len(fake.calls) == 2
+    for call in fake.calls:
+        assert call["system"] == judge_story.build_system_prompt(CUSTOM_GOAL)
+    with open(custom_dir / "judgment.json", encoding="utf-8") as f:
+        judgment = json.load(f)
+    assert list(judgment)[3:5] == ["effort", "goal"]
+    assert judgment["goal"] == CUSTOM_GOAL
+    capsys.readouterr()
+
+    # An invalid --goal exits 2 before any file is read or written or any client exists.
+    bad_dir = tmp_path / "bad"
+    story_md = _make_story(bad_dir)
+    fake = _install_fake(monkeypatch, [])
+    with pytest.raises(SystemExit) as exc:
+        judge_story.main(["--story-md", str(story_md), "--goal", "   "])
+    assert exc.value.code == 2
+    assert fake.constructions == []
+    assert sorted(os.listdir(bad_dir)) == ["story.md", "story_prompt.txt"]
+    assert "argument --goal: must not be empty" in capsys.readouterr().err
