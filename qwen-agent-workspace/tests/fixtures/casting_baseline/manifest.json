@@ -1,0 +1,52 @@
+{
+  "schema_version": 3,
+  "story_id": "casting-baseline-manifest",
+  "title": "",
+  "narrative": "A woman in grey walks a forest trail at dawn.",
+  "fps": 24,
+  "target_seconds": 18.125,
+  "pace": "proportional",
+  "total_num_frames": 435,
+  "total_duration_s": 18.125,
+  "panels": [
+    {
+      "index": 1,
+      "image_path": "<IMAGE>",
+      "title": "The Trail",
+      "panel_text": "A medium shot, eye level, of the woman in grey standing on a packed-dirt forest trail and facing the camera. The woman in grey is a young woman, slender, with long black hair pinned up with jade hairpins, wearing a pale grey kimono. Tall cedar trunks line the trail behind her. The light is overcast and flat, with a muted green and grey palette. The rendering is photorealistic live-action film still.",
+      "narration": "She has walked this trail before.",
+      "narration_words": 6,
+      "num_frames": 145,
+      "duration_s": 6.042,
+      "motion_prompt": "The woman in grey takes two slow steps toward the camera; the camera stays static.",
+      "transition_to_next": null,
+      "conditioning": "still"
+    },
+    {
+      "index": 2,
+      "image_path": null,
+      "title": "The Pause",
+      "panel_text": "The woman in grey stops and turns her head to the left.",
+      "narration": "Something moves between the trees.",
+      "narration_words": 5,
+      "num_frames": 145,
+      "duration_s": 6.042,
+      "motion_prompt": "The woman in grey stops and turns her head to the left.",
+      "transition_to_next": null,
+      "conditioning": "chain"
+    },
+    {
+      "index": 3,
+      "image_path": null,
+      "title": "The Look",
+      "panel_text": "The woman in grey's eyes narrow as she leans forward.",
+      "narration": "She waits.",
+      "narration_words": 2,
+      "num_frames": 145,
+      "duration_s": 6.042,
+      "motion_prompt": "The woman in grey's eyes narrow as she leans forward.",
+      "transition_to_next": null,
+      "conditioning": "chain"
+    }
+  ]
+}

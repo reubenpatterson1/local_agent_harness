@@ -1,0 +1,71 @@
+=== DRY RUN: ltx-movie phase plan (story-id=casting-baseline-dry) ===
+
+--- Phase 1: story ---
+Would skip if <WS>/generated/stories/casting-baseline-dry/story.md already exists (pass --force-story to regenerate).
+Command (subprocess timeout 1350s): <PY> <WS>/bin/qwen-agent --workspace <WS> --max-tokens 8250 --max-rounds 4 --request-timeout 600 --user-prompt 'You are authoring the shot list for a short narrated movie (story-id "casting-baseline-dry").
+
+Narrative to adapt:
+a test narrative
+
+How this movie is made: it is ONE continuous take, built 6 seconds at a time. Panel 1'"'"'s Image: field is rendered as a single still picture, and that picture becomes the movie'"'"'s first frame. Every later panel is a 6-second continuation that starts from the exact last frame of the panel before it. The picture is never re-described after Panel 1: the characters, their appearance, the setting, the lighting and the style all carry forward automatically from the frames already on screen. There are no cuts, no scene changes and no jumps in time or place between panels. If the story needs a new location, a new prop or a new character, it must arrive through visible movement inside a panel -- someone walks through a door, turns a corner, or picks something up.
+
+Write the complete story to generated/stories/casting-baseline-dry/story.md using the write_file tool. The file must contain EXACTLY 15 panel sections, numbered 1 through 15 in order.
+
+Panel 1 has exactly three fields, in this order:
+
+## Panel 1 — <short title>
+Image: <120-170 words describing the movie'"'"'s opening frame as one still picture: every character who is on screen, each with their full visual description (apparent age group, build, skin tone, hair colour, length and style, clothing and accessories), where each one stands and which way they face, the setting and background, the lighting and colour palette, the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up), the camera viewpoint, and the rendering style. Introduce each character with a referring phrase of at most four words built only from details you already gave them in this Image: field or that the narrative states, and use that exact phrase for them everywhere else in the file. Never add a colour, garment or trait just to make the phrase.>
+Motion: <25-50 words: what the characters physically do during these first 6 seconds, and how the camera moves -- or that it stays static.>
+Narration: <one sentence of voice-over narration>
+
+Every later panel has exactly two fields, in this order, and no Image: field:
+
+## Panel N — <short title>
+Motion: <15-35 words in one or two plain sentences: what the characters physically do during these 6 seconds, continuing from where the previous panel left them. Name each character only by their referring phrase from Panel 1, word for word. Describe only ONE continuous physical motion, not a sequence of separate steps. 6 seconds is enough for a single gesture, a few footsteps, or the start of a movement -- it is not enough for a whole sequence like walking to a door, opening it, stepping through, and closing it behind them. If the story needs that whole sequence, show only its first beat here and continue the rest in a later panel. Do not describe appearance, clothing, setting, lighting, colour, style, camera or lens -- all of that is already on screen.>
+Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
+
+Give the story a narrative arc -- an introduction, a middle, a climax and a conclusion -- carried by what the characters do from panel to panel and by the narration. Each panel should move the action forward instead of repeating the previous panel'"'"'s movement.
+
+Write the file in a single write_file call. Trust your first draft: do NOT read the file back, do NOT run run_python or any other tool to check it, and do NOT count or recount words. Once the write_file call returns, stop immediately and emit no further text or tool calls.'
+
+Rendered story prompt:
+You are authoring the shot list for a short narrated movie (story-id "casting-baseline-dry").
+
+Narrative to adapt:
+a test narrative
+
+How this movie is made: it is ONE continuous take, built 6 seconds at a time. Panel 1's Image: field is rendered as a single still picture, and that picture becomes the movie's first frame. Every later panel is a 6-second continuation that starts from the exact last frame of the panel before it. The picture is never re-described after Panel 1: the characters, their appearance, the setting, the lighting and the style all carry forward automatically from the frames already on screen. There are no cuts, no scene changes and no jumps in time or place between panels. If the story needs a new location, a new prop or a new character, it must arrive through visible movement inside a panel -- someone walks through a door, turns a corner, or picks something up.
+
+Write the complete story to generated/stories/casting-baseline-dry/story.md using the write_file tool. The file must contain EXACTLY 15 panel sections, numbered 1 through 15 in order.
+
+Panel 1 has exactly three fields, in this order:
+
+## Panel 1 — <short title>
+Image: <120-170 words describing the movie's opening frame as one still picture: every character who is on screen, each with their full visual description (apparent age group, build, skin tone, hair colour, length and style, clothing and accessories), where each one stands and which way they face, the setting and background, the lighting and colour palette, the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up), the camera viewpoint, and the rendering style. Introduce each character with a referring phrase of at most four words built only from details you already gave them in this Image: field or that the narrative states, and use that exact phrase for them everywhere else in the file. Never add a colour, garment or trait just to make the phrase.>
+Motion: <25-50 words: what the characters physically do during these first 6 seconds, and how the camera moves -- or that it stays static.>
+Narration: <one sentence of voice-over narration>
+
+Every later panel has exactly two fields, in this order, and no Image: field:
+
+## Panel N — <short title>
+Motion: <15-35 words in one or two plain sentences: what the characters physically do during these 6 seconds, continuing from where the previous panel left them. Name each character only by their referring phrase from Panel 1, word for word. Describe only ONE continuous physical motion, not a sequence of separate steps. 6 seconds is enough for a single gesture, a few footsteps, or the start of a movement -- it is not enough for a whole sequence like walking to a door, opening it, stepping through, and closing it behind them. If the story needs that whole sequence, show only its first beat here and continue the rest in a later panel. Do not describe appearance, clothing, setting, lighting, colour, style, camera or lens -- all of that is already on screen.>
+Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
+
+Give the story a narrative arc -- an introduction, a middle, a climax and a conclusion -- carried by what the characters do from panel to panel and by the narration. Each panel should move the action forward instead of repeating the previous panel's movement.
+
+Write the file in a single write_file call. Trust your first draft: do NOT read the file back, do NOT run run_python or any other tool to check it, and do NOT count or recount words. Once the write_file call returns, stop immediately and emit no further text or tool calls.
+
+--- Phase 1b: release the story server ---
+Command: <WS>/bin/story-server stop
+Then wait until psutil.virtual_memory().available/2**30 >= 25.0 GiB (timeout 1800s) before Phase 2.
+
+--- Phase 2: stills ---
+Command: <PY> <WS>/bin/ltx-story-images --story-md <WS>/generated/stories/casting-baseline-dry/story.md --out-dir <WS>/generated/stories/casting-baseline-dry/images --only 1 --width 1408 --height 896 --seed 0
+
+--- Phase 3: manifest + dry-run ---
+Command: <PY> <WS>/bin/ltx-story-manifest --story-id casting-baseline-dry --prompts-md <WS>/generated/stories/casting-baseline-dry/story.md --chain --image <WS>/generated/stories/casting-baseline-dry/images/panel_01.png --fps 24 --target-seconds 90.625 --min-frames 145 --max-frames 145 --force
+Command: <PY> <WS>/bin/ltx-mlx-render <WS>/generated/stories/casting-baseline-dry/manifest.json <WS>/generated/stories/casting-baseline-dry/movie.mp4 --frames 145 --width 704 --height 448 --frame-rate 24 --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8 --gemma mlx-community/gemma-3-12b-it-4bit --tile-frames 1 --tile-spatial 1 --resume --dry-run
+
+--- Phase 4: render ---
+Avail gate: wait until psutil.virtual_memory().available/2**30 >= 25.0 GiB (timeout 1800s).
+Command: <PY> <WS>/bin/ltx-mlx-render <WS>/generated/stories/casting-baseline-dry/manifest.json <WS>/generated/stories/casting-baseline-dry/movie.mp4 --frames 145 --width 704 --height 448 --frame-rate 24 --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8 --gemma mlx-community/gemma-3-12b-it-4bit --tile-frames 1 --tile-spatial 1 --resume --panel-timeout 7200 --on-panel-failure stop --retry-failed 1 --retry-idle 120 --max-consecutive-failures 3
