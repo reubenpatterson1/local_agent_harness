@@ -12,6 +12,14 @@ Workspace root (`WS`): `/Users/reubenpatterson/local_model_harness/qwen-agent-wo
 
 Both helpers live in `character_lib.py`: see Sections 3.9 and 5.6(i), the rows E-P6a, E-P23 and E-P24, the tests C42-C46, K2 and P50-P57, the new mutation rows, and Section 10 tasks 3, 9 and 12.
 
+**Amendment 2, 2026-10-05 (user-approved): global LoRAs combine with the cast.**
+
+- `--lora`/`--stills-lora` become repeatable `PATH[:STRENGTH]` flags.
+- Global (non-character) LoRAs are applied on every panel, alongside the character LoRAs. They are no longer mutually exclusive with them.
+- **Section 5.7 is normative and supersedes** every earlier passage that refuses `--lora` with a cast: the former E-P3, E-P15 and E-P19, and the `--cast` + `--lora` bullet in 5.5.
+
+See also the rows E-P25 to E-P29, the tests P60-P75, the gaps G19-G23, and the gates L6b and L6m.
+
 Two terms are used throughout:
 
 - A **character** is one entry in the library: a name, a trigger token, a referring phrase, a descriptor, a dataset, and up to two LoRAs (one video, one stills).
@@ -166,6 +174,7 @@ No other tracked file changes. In particular, none of the existing test files li
 | SC9 | With no `--character`/`--cast`, every existing render argv, manifest, still prompt, and provenance is byte-identical. The existing suites pass with their 0.2 counts unchanged, and the B-golden tests pass | R1, B1-B3 |
 | SC10 | The deploy package ships `character_lib.py`. `tests/test_deploy_pkg.py` stays at 165 under both interpreters | R2 |
 | SC11 | Live gates L0-L7 pass (Section 9.7). L6 sets the multi-character default strength | L0-L7 |
+| SC13 | Global LoRAs (`--lora`/`--stills-lora`, repeatable, `PATH[:STRENGTH]`) apply on every panel ahead of that panel's character LoRAs. Only character LoRAs are counted for the multi-character strength rule, and a global LoRA's strength is never reduced automatically. A path given twice, or also used as a character LoRA, exits 2. The full ordered set, each entry with `kind`, is in provenance. A single `--lora PATH` with no cast stays byte-identical to today | P60-P75, B1-B3, R1 |
 | SC12 | An unknown or unusable `--character`/`--cast` name in `bin/ltx-movie` exits 2 with the error plus an `available characters:` line. `bin/ltx-movie --list-characters` prints exactly the `bin/character list` table and exits 0, with no `--story-id`, no narrative, and no server, GPU or lockfile activity | C42-C46, K2, P50-P57 |
 
 ### 0.6 Must-have vs nice-to-have
@@ -185,11 +194,12 @@ bin/character train NAME       ──>  .../lora/video.safetensors (+ lora/still
 bin/ltx-movie --character NAME / --cast "PHRASE=NAME"
   ├─ resolve cast via character_lib (exit 2 on any library problem, before any phase)
   ├─ Phase 1: STORY_PROMPT_TEMPLATE + CAST block (only for --character on a new story)
-  ├─ Phase 2: bin/ltx-story-images ... --cast PHRASE=NAME ... --character-strength S
+  ├─ Phase 2: bin/ltx-story-images ... [--lora PATH:S ...] --cast PHRASE=NAME ... --character-strength S
   │            -> trigger inserted into panel 1's Image: prompt; z_image_skill loads stills LoRAs
   ├─ Phase 3: bin/ltx-story-manifest ... --cast PHRASE=NAME ... --character-strength S
   │            -> trigger inserted into each motion_prompt; per-panel "characters" list
-  └─ Phase 4: bin/ltx-mlx-render (unchanged CLI) reads panel["characters"]
+  └─ Phase 4: bin/ltx-mlx-render [--lora PATH:S ...] reads panel["characters"]
+               -> per panel: global LoRAs (CLI order) + that panel's character LoRAs (amendment 2, 5.7)
                -> ltx2_mlx_video_skill: --lora PATH STRENGTH per character; LoRA set in provenance
 ```
 
@@ -1238,6 +1248,9 @@ The one-time mflux training adapter download goes into `~/hf_home` and is shared
 ```
 
   The strength token is `repr(float(s))`, so `1.0 → "1.0"`, `0.8 → "0.8"`, and `0.6 → "0.6"` **[spec choice]**.
+- **(Amendment 2)** The module gains `parse_lora_spec` (5.7.1).
+  - The `lora_path`/`loras` mutual-exclusion `ValueError`s here and in z_image_skill (5.2) are **kept, as internal API invariants** **[spec choice]**. Every caller merges global and character LoRAs into the single ordered `loras` list, or uses `lora_path` alone on the legacy route (5.7.2), so the combination the user wants never needs both.
+  - Keeping one list means the argv, the adapter order and the provenance list are all the same object. Allowing both would leave two orderings to reconcile.
 - **`generate_video`.** It gains a keyword `loras=None` (last), and passes `loras=loras` to `build_command`. It also passes `lora_path=lora_path, loras=loras` as **keywords** to `_validate_generate_args`, which gains `lora_path=None, loras=None` at the end of its signature. These checks are added **after** the tile checks:
 
 ```python
@@ -1354,16 +1367,19 @@ def generate_image(prompt: str, output_path: str = None, lora_path=None, loras=N
                                      "got %r" % (index, name, strength))
 ```
 
-**(b) `build_units`.** The unit dict is built exactly as today. Then:
+**(b) `build_units`.** It is superseded by amendment 2. The signature becomes `build_units(panels, seed, clips_dir, run_root=None, global_loras=())`. The unit dict is built exactly as today. Then:
 
 ```python
-        characters = panel.get("characters") or []
-        if characters:
-            unit["loras"] = [{"name": c["name"], "path": c["video_lora"],
-                              "strength": float(c["strength"])} for c in characters]
+        loras = [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
+                 for g in global_loras]
+        loras += [{"kind": "character", "name": c["name"], "path": c["video_lora"],
+                   "strength": float(c["strength"])} for c in (panel.get("characters") or [])]
+        if loras:
+            unit["loras"] = loras
 ```
 
-The `"loras"` key exists **only** when the panel has characters, so test R4l's 9-key set holds for every uncast unit.
+- The `"loras"` key exists **only** when the list is non-empty, so test R4l's 9-key set holds for every uncast unit. The legacy route (5.7.2) has `global_loras == []`.
+- Both `main` call sites (dry run and real run) pass `global_loras=args.global_loras`.
 
 **(c) Provenance.** A module cache, plus the addition at the end of `build_clip_provenance` (the dict literal is unchanged):
 
@@ -1384,12 +1400,16 @@ def lora_sha256(path):
 ```python
     provenance = { ...unchanged literal... }
     if unit.get("loras"):
-        provenance["loras"] = [{"path": l["path"], "sha256": lora_sha256(l["path"]),
-                                "strength": l["strength"]} for l in unit["loras"]]
+        provenance["loras"] = [{"kind": l["kind"], "path": l["path"],
+                                "sha256": lora_sha256(l["path"]), "strength": l["strength"]}
+                               for l in unit["loras"]]
     return provenance
 ```
 
 - The character name is not part of provenance **[spec choice]**: identity is the bytes plus the strength.
+- **(Amendment 2)** Each entry records `kind` (`global` or `character`), and the list is **ordered**: globals in CLI order, then characters by name. Order and kind are part of the reuse decision **[spec choice]**.
+  - The deltas sum, so order does not change the math. Recording it exactly is the conservative choice: a reordered `--lora` list re-renders rather than risk a wrong reuse.
+  - On the legacy route, `lora_path` carries the single global LoRA exactly as today, and there is no `loras` key.
 - `clip_is_reusable` is unchanged. It compares the full canonical JSON, so:
   - a different LoRA set is not reused;
   - different bytes are not reused;
@@ -1410,20 +1430,9 @@ def lora_sha256(path):
 **(e) `print_dry_run`.**
 
 - The same `extra` is built for `first`, and `**extra` is passed into `SKILL.build_command`.
-- In the per-panel listing, after each panel's existing line, for each `l in unit.get("loras", [])` it prints `"            lora: %s @ %s (%s)" % (l["path"], repr(l["strength"]), l["name"])`.
+- In the per-panel listing, after each panel's existing line, for each `l in unit.get("loras", [])` it prints `"            lora: %s @ %s (%s)" % (l["path"], repr(l["strength"]), l["name"] or "global")`.
 
-**(f) `main`.** Directly after the chained `--on-panel-failure skip` check, before the `--dry-run` short-circuit:
-
-```python
-    cast_panels = [p["index"] for p in panels if p.get("characters")]
-    if args.lora_path and cast_panels:
-        print("Error: --lora cannot be combined with a manifest that casts characters (panel %d "
-              "has characters); cast characters carry their own LoRAs" % cast_panels[0],
-              file=sys.stderr)
-        return 2
-```
-
-The CLI is unchanged (no new flags).
+**(f) `main`.** It is superseded by amendment 2: the `--lora` + cast refusal is **removed**. Directly after the chained `--on-panel-failure skip` check, and before the `--dry-run` short-circuit, `main` runs the 5.7.3 global-LoRA resolution. The `--lora` flag becomes repeatable `PATH[:STRENGTH]` (5.7.1). There are no other CLI changes.
 
 ### 5.4 `bin/ltx-story-manifest`
 
@@ -1514,11 +1523,11 @@ The docstring gains a paragraph describing `--cast` and the `characters` key.
 **Validation** (after the `--seed-image` existence check, before the dry-run). `strength` and `members` are resolved exactly as in 5.4's resolution block. Each failure exits 2:
 
 - `--character-strength` without `--cast` → `Error: --character-strength requires --cast`.
-- `--cast` with `--lora` → `Error: --cast cannot be combined with --lora: cast characters bring their own stills LoRAs`.
+- ~~`--cast` with `--lora`~~: **removed by amendment 2.** Global stills LoRAs combine with the cast (5.7.4).
 - `--character-strength` outside (0, 1] → the same message as in 5.4.
 - `resolve_cast` raises `CharacterError` → `Error: <e>`.
 
-**Planning** (only when `members`):
+**Planning** (only when `members`; amendment 2 then prepends the global stills LoRAs, 5.7.4):
 
 ```python
     stills_members = [m for m in members if m.stills_lora]
@@ -1534,8 +1543,8 @@ The docstring gains a paragraph describing `--cast` and the `characters` key.
         prompt, names = lib.cast_text(_compose_prompt(panels[i - 1]["image"], style), stills_members)
         strengths = lib.panel_strengths(names, stills_members, strength)
         by_name = {m.name: m for m in stills_members}
-        plans[i] = (prompt, [{"name": n, "path": by_name[n].stills_lora, "strength": strengths[n]}
-                             for n in names])
+        plans[i] = (prompt, [{"kind": "character", "name": n, "path": by_name[n].stills_lora,
+                              "strength": strengths[n]} for n in names])
     lora_sets = sorted({tuple((l["path"], l["strength"]) for l in v[1]) for v in plans.values()})
     if len(lora_sets) > 1:
         print("Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
@@ -1610,10 +1619,6 @@ def _resolve_casting(args):
     if args.no_stills:
         print("Error: --character/--cast are not supported with --no-stills: casting needs the "
               "chained flow", file=sys.stderr)
-        return 2
-    if args.lora_path or args.stills_lora_path:
-        print("Error: --character/--cast cannot be combined with --lora/--stills-lora: cast "
-              "characters bring their own LoRAs", file=sys.stderr)
         return 2
     lib = _character_lib()
     strength = (args.character_strength if args.character_strength is not None
@@ -1714,6 +1719,7 @@ The block therefore sits between `Narrative to adapt:\n<narrative>` and `How thi
 
 - Before `Running:`: if `cast_members` is set, `--seed-image` is not given, and `images/panel_01.png` exists, it prints `Warning: <path> exists and will be reused as-is; it was not necessarily rendered with the cast's stills LoRAs (delete it to regenerate)`.
 - `cmd += _cast_flags(args)` is appended after the `--lora` line. The dry-run mirror does the same.
+- **(Amendment 2)** The `--lora` line itself becomes the 5.7.5 stills form.
 
 **(g) `phase3_manifest`.** `cmd_manifest += _cast_flags(args)` is appended after `"--force"`. The dry-run mirror does the same. Phase 4 is unchanged: the manifest carries the LoRAs.
 
@@ -1755,6 +1761,219 @@ def _list_characters(raw_argv):
   - `__main__`'s `pipeline_log.run_logged` gets `story_dir None`, because there is no `--story-id`. It therefore calls `main` directly and writes no log (`pipeline_log.py:88`).
 - **The uncast path is untouched.** Without the token, `main` proceeds exactly as before. The B1 golden (an uncast `--dry-run`) and every existing ltx-movie argv and output stay byte-identical. P49 still holds: `character_lib` is loaded only by `_list_characters` or by casting.
 
+### 5.7 Global LoRAs combine with the cast (amendment 2; normative)
+
+A **global LoRA** is a non-character LoRA, such as an action-sequence or style LoRA, given by `--lora` (video) or `--stills-lora` (bin/ltx-movie; on bin/ltx-story-images it is that tool's `--lora`). It applies to every panel.
+
+#### 5.7.1 Flag syntax and parsing
+
+`ltx2_mlx_video_skill.py` (stdlib only) gains:
+
+```python
+def parse_lora_spec(value):
+    """(path, strength, explicit) from PATH or PATH:STRENGTH. The value is split on its LAST ':'
+    only when the text after it parses as a float; otherwise the whole value is the path
+    (so 'org/repo:main' and ':0.5' are paths). STRENGTH must be finite and in (0, 2]. Default
+    strength 1.0 (spec 5.7.1)."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("LoRA value must be a non-empty PATH or PATH:STRENGTH, got %r" % (value,))
+    head, sep, tail = value.rpartition(":")
+    if sep and head:
+        try:
+            strength = float(tail)
+        except ValueError:
+            return value, 1.0, False
+        if not (math.isfinite(strength) and 0 < strength <= 2.0):
+            raise ValueError("LoRA strength must be in (0, 2], got %r in %r" % (tail, value))
+        return head, strength, True
+    return value, 1.0, False
+```
+
+`import math` is added to the stdlib imports. The forbidden-imports check still passes.
+
+| Value | Result |
+|---|---|
+| `a.safetensors` | `("a.safetensors", 1.0, False)` |
+| `a.safetensors:0.5` | `("a.safetensors", 0.5, True)` |
+| `/p/a:b.safetensors:0.8` | `("/p/a:b.safetensors", 0.8, True)` |
+| `org/repo:main` | `("org/repo:main", 1.0, False)` |
+| `:0.5` | `(":0.5", 1.0, False)` |
+| `a.safetensors:2` | `("a.safetensors", 2.0, True)` |
+| `a.safetensors:0`, `:2.5`, `:-1`, `:nan`, `:inf`; `""` | `ValueError` |
+
+A path whose own name ends in `:<number>` must be given as `PATH:1.0` (G20).
+
+**Repeatable flag action.** bin/ltx-movie (`--lora`, `--stills-lora`), bin/ltx-mlx-render (`--lora`) and bin/ltx-story-images (`--lora`) each define this identical class, and use `action=_RepeatableLoraAction, default=None` on their existing `dest`. It is copied, not imported, because each parser is built before any lazy import **[spec choice]**. P75 pins that the copies are identical.
+
+```python
+class _RepeatableLoraAction(argparse.Action):
+    """Repeatable --lora: the dest (lora_path / stills_lora_path) keeps the FIRST value as a
+    string, exactly like the old single-valued flag; <dest>_specs collects every value in
+    command-line order (spec 5.7.1)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        specs = list(getattr(namespace, self.dest + "_specs", None) or [])
+        specs.append(values)
+        setattr(namespace, self.dest + "_specs", specs)
+        if getattr(namespace, self.dest, None) is None:
+            setattr(namespace, self.dest, values)
+```
+
+The existing pins `lora_path is None` by default, `--lora x` giving `lora_path == "x"`, and the source text `lora_path=args.lora_path` (I21) all keep holding.
+
+**Help text (exact additions).** The existing `--lora` help sentence is replaced. On `--stills-lora`, "video DiT" becomes "Phase 2 stills":
+
+> `repeatable; PATH or PATH:STRENGTH (0 < STRENGTH <= 2, default 1.0). Every global LoRA applies to every panel, ahead of that panel's cast-character LoRAs, at its own strength (never reduced automatically).`
+
+#### 5.7.2 The legacy route (byte-identity)
+
+The **legacy route** is taken when a tool receives **exactly one** global LoRA value, its parsed strength is `1.0`, **and** the run has no character LoRAs. In that case:
+
+- the flag behaves exactly as today: the single value goes through `lora_path`;
+- there is no file-existence check, so HF repo IDs still work;
+- there is no `loras` key in units or provenance.
+
+"No character LoRAs" means, for each tool:
+
+- **bin/ltx-mlx-render:** no manifest panel has a non-empty `characters`.
+- **bin/ltx-story-images:** no planned panel matched a cast member that has a stills LoRA.
+- **bin/ltx-movie:** for video, no cast members; for stills, no cast member has a stills LoRA.
+
+On the legacy route, bin/ltx-movie forwards the **raw** value unchanged. bin/ltx-mlx-render and bin/ltx-story-images set `args.lora_path` to the parsed path, so `x:1.0` and `x` are the same render with the same provenance (P61).
+
+Every other case takes the **merged route** (5.7.3-5.7.5). Therefore `--lora PATH` with no cast produces today's argv, manifest, still prompt and provenance (B1-B3 and R1 unchanged).
+
+#### 5.7.3 bin/ltx-mlx-render (merged route)
+
+This replaces the former 5.3(f) refusal, in the same position:
+
+```python
+    specs = getattr(args, "lora_path_specs", None) or []
+    try:
+        parsed = [SKILL.parse_lora_spec(v) for v in specs]
+    except ValueError as e:
+        print("Error: --lora: %s" % e, file=sys.stderr)
+        return 2
+    cast_entries = [(p["index"], c) for p in panels for c in (p.get("characters") or [])]
+    args.global_loras = []
+    if len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries:
+        args.lora_path = parsed[0][0]                       # legacy route (5.7.2)
+    elif parsed:
+        args.lora_path = None
+        seen = {}
+        for path, strength, _explicit in parsed:
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                print("Error: --lora %s: not a readable file" % path, file=sys.stderr)
+                return 2
+            real = os.path.realpath(path)
+            if real in seen:
+                print("Error: --lora %s is given more than once" % path, file=sys.stderr)
+                return 2
+            seen[real] = path
+            args.global_loras.append({"path": os.path.abspath(path), "strength": strength})
+        for index, c in cast_entries:
+            real = os.path.realpath(c["video_lora"])
+            if real in seen:
+                print("Error: --lora %s is also character %s's video LoRA (panel %d); pass it "
+                      "once" % (seen[real], c["name"], index), file=sys.stderr)
+                return 2
+```
+
+- Units carry `global loras + panel character loras` (5.3(b)), and render with `lora_path=None`. `render_panel` and `print_dry_run` already pass `unit["loras"]` as `loras` (5.3(d)/(e)), with globals listed as `(global)`.
+- The `--lora` value now means "global LoRA(s)". It is not tied to the manifest.
+
+#### 5.7.4 bin/ltx-story-images (merged route) and z_image_skill
+
+- After `--cast` is resolved, it parses `getattr(args, "lora_path_specs", None) or []` with `ltx2_mlx_video_skill.parse_lora_spec`, using `import ltx2_mlx_video_skill` inside `main` (stdlib only; WS is on `sys.path`). A `ValueError` → `Error: --lora: <e>`, exit 2.
+- The character plans are computed as in 5.5 into `char_plans`. They are empty without `--cast`.
+- **Legacy check:** `len(parsed) == 1 and parsed[0][1] == 1.0 and not any(v[1] for v in char_plans.values())` → `args.lora_path = parsed[0][0]`, `global_stills = []`.
+- **Otherwise (merged):** `args.lora_path = None`. Each path is validated with the same three checks and messages as 5.7.3, with these differences:
+  - the character comparison uses every resolved member's `stills_lora` (`Error: --lora %s is also character %s's stills LoRA; pass it once`);
+  - `global_stills = [{"kind": "global", "name": None, "path": abspath, "strength": s} …]`.
+- **Plans.** When `members or global_stills`, every selected non-seed panel `i` gets `plans[i] = (prompt, global_stills + chars)`. `(prompt, chars) = char_plans.get(i, (_compose_prompt(panels[i - 1]["image"], style), []))`.
+- The E-P16 one-set-per-process check, the `lora_kwargs`, the dry-run `loras:` line, and the `images.json` `"loras"` entries all use this combined list.
+  - The `"loras"` key is present when `--cast` is given **or** the merged route is used. Its entries are `{"kind", "name", "path", "strength"}`.
+  - The legacy single LoRA is not listed, the same as today.
+- The `--seed-image` panel 1 is still never generated, so no LoRA applies to it.
+- **z_image_skill needs no code change.** `loras` is already an ordered list. Adapter names `lora0…` follow it, so globals come first, and `set_adapters` weights are each entry's own strength.
+
+#### 5.7.5 bin/ltx-movie
+
+`_resolve_casting` loses its `--lora`/`--stills-lora` refusal. `main` calls `_resolve_global_loras(args)` right after `_resolve_casting`, with the same `if rc: return rc` pattern:
+
+```python
+def _video_skill():
+    return importlib.machinery.SourceFileLoader(
+        "ltx2_mlx_video_skill", os.path.join(WS, "ltx2_mlx_video_skill.py")).load_module()
+
+
+def _resolve_global_loras(args):
+    """Validate --lora/--stills-lora (spec 5.7). Sets args.global_video_loras and
+    args.global_stills_loras to [(abs path, strength)] on the merged route; both stay [] on the
+    legacy route, where the single raw value is forwarded exactly as before. Returns 0 or 2."""
+    args.global_video_loras, args.global_stills_loras = [], []
+    members = getattr(args, "cast_members", None) or []
+    checks = (
+        ("--lora", "lora_path_specs", "global_video_loras", "video",
+         {os.path.realpath(m.video_lora): m.name for m in members}),
+        ("--stills-lora", "stills_lora_path_specs", "global_stills_loras", "stills",
+         {os.path.realpath(m.stills_lora): m.name for m in members if m.stills_lora}),
+    )
+    for flag, specs_attr, out_attr, kind, char_paths in checks:
+        specs = getattr(args, specs_attr, None) or []
+        if not specs:
+            continue
+        skill = _video_skill()
+        try:
+            parsed = [skill.parse_lora_spec(v) for v in specs]
+        except ValueError as e:
+            print("Error: %s: %s" % (flag, e), file=sys.stderr)
+            return 2
+        if len(parsed) == 1 and parsed[0][1] == 1.0 and not char_paths:
+            continue                                        # legacy route (5.7.2)
+        seen, resolved = {}, []
+        for path, strength, _explicit in parsed:
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                print("Error: %s %s: not a readable file" % (flag, path), file=sys.stderr)
+                return 2
+            real = os.path.realpath(path)
+            if real in seen:
+                print("Error: %s %s is given more than once" % (flag, path), file=sys.stderr)
+                return 2
+            if real in char_paths:
+                print("Error: %s %s is also character %s's %s LoRA; pass it once"
+                      % (flag, path, char_paths[real], kind), file=sys.stderr)
+                return 2
+            seen[real] = path
+            resolved.append((os.path.abspath(path), strength))
+        setattr(args, out_attr, resolved)
+    return 0
+```
+
+**Forwarding.** `_render_flags` (shared by the Phase 3 dry run and Phase 4) replaces its `if args.lora_path:` line with:
+
+```python
+    if getattr(args, "global_video_loras", None):
+        for path, strength in args.global_video_loras:
+            flags += ["--lora", "%s:%s" % (path, repr(float(strength)))]
+    elif args.lora_path:
+        flags += ["--lora", args.lora_path]
+```
+
+Phase 2 and its dry-run mirror replace `if args.stills_lora_path: cmd += ["--lora", args.stills_lora_path]` with the same shape:
+
+- `global_stills_loras` gives `["--lora", "<path>:<repr(strength)>"]` per entry;
+- otherwise it falls back to the legacy raw `args.stills_lora_path`.
+
+`"%s:%s"` always re-parses to the same path, because the split is on the last `:` and the suffix is always a float.
+
+#### 5.7.6 Strength rules with globals [spec choice: as recommended]
+
+- Every global LoRA applies on **every** panel, at its own CLI strength. It is **never** reduced automatically.
+- `panel_strengths` counts **only character LoRAs**. A panel with one character and two globals gives that character 1.0. A panel with two characters and one global gives each character 0.8 (or its override), and the global keeps its own strength.
+- The per-panel order is globals (CLI order), then characters (sorted by name). This applies to video (units) and to stills (adapter list).
+- The same file may not appear twice in a panel's list, or across the global and character lists (compared by `os.path.realpath`): exit 2.
+
 ---
 
 ## 6. Strengths and bleed
@@ -1762,6 +1981,7 @@ def _list_characters(raw_argv):
 - A panel that names exactly one cast character uses 1.0.
 - A panel that names two or more uses, for each character, its `character.json` `strength` if set, else `--character-strength`. That default is `DEFAULT_CHARACTER_STRENGTH = 0.8`.
 - This rule applies identically to the video LoRAs (5.4) and to the stills LoRAs (5.5). For stills, only members **with** a stills LoRA count toward "two or more".
+- **(Amendment 2)** Global LoRAs never count toward "two or more", and their strength is never changed (5.7.6).
 - **The 0.8 default is provisional.** Acceptance gate L6 (Section 9.7) renders a two-character panel at 1.0/1.0, 0.8/0.8, and 0.6/0.6. The winner becomes `DEFAULT_CHARACTER_STRENGTH` in a follow-up one-line commit, which also updates tests C36 and C37. That commit is part of this feature's acceptance.
 - **Known limit (G5):** an on-screen character whose phrase is not in that panel's prompt gets no LoRA.
 
@@ -1824,7 +2044,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 |---|---|---|---|
 | E-P1 | ltx-movie | `--character-strength` without casting | 2 (5.6b) |
 | E-P2 | ltx-movie | casting with `--no-stills` | 2 |
-| E-P3 | ltx-movie | casting with `--lora`/`--stills-lora` | 2 |
+| E-P3 | ltx-movie | ~~casting with `--lora`/`--stills-lora`~~ | **removed by amendment 2.** They combine (5.7) |
 | E-P4 | ltx-movie, manifest, images | `--character-strength` outside (0, 1] | 2 |
 | E-P5 | ltx-movie, manifest, images | malformed `--cast` | 2, `Error: --cast must be PHRASE=NAME, got '<v>'` |
 | E-P6a | ltx-movie | `UnusableCharacterError` (3.5): invalid or unknown name, invalid `character.json`, not trained, video LoRA missing or empty | 2. Two stderr lines: `Error: <message>`, then `format_available_line(usable_characters())`, e.g. `available characters: kyra (the woman in grey), ronin (the ronin)`, or `available characters: none (create one with bin/character create)`. Before any phase and any GPU work |
@@ -1838,15 +2058,20 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | E-P12 | ltx-story-manifest | `--cast` without `--chain` | 2 (`parser.error`) |
 | E-P13 | ltx-story-manifest, images | `--character-strength` without `--cast` | 2 |
 | E-P14 | ltx-story-manifest | cast phrase in no panel's Motion: text | `WARNING:` (stdout), continues |
-| E-P15 | ltx-story-images | `--cast` + `--lora` | 2 |
+| E-P15 | ltx-story-images | ~~`--cast` + `--lora`~~ | **removed by amendment 2** (5.7.4) |
 | E-P16 | ltx-story-images | selected panels need different stills LoRA sets | 2 |
 | E-P17 | ltx-story-images | a cast member has no stills LoRA | `WARNING:` (stdout), its trigger is not inserted, continues |
 | E-P18 | ltx-mlx-render | malformed `characters` entry (not a list, nameless, duplicate, unreadable or relative `video_lora`, bad strength) | 2, `Error: panel <n>: …` (5.3a) |
-| E-P19 | ltx-mlx-render | `--lora` + a cast manifest | 2 (5.3f) |
+| E-P19 | ltx-mlx-render | ~~`--lora` + a cast manifest~~ | **removed by amendment 2.** They combine (5.7.3) |
 | E-P20 | ltx-mlx-render | LoRA unreadable when provenance is built | the existing `panel N FAILED (provenance)` path |
 | E-P21 | ltx2_mlx_video_skill | `loras` invalid, or combined with `lora_path` | `ValueError` before any subprocess (5.1). The CLI maps it to exit 2 |
 | E-P23 | ltx-movie | `--list-characters` alone | 0. stdout = `"\n".join(character_table_lines()) + "\n"`. No other effect (5.6(i)) |
 | E-P24 | ltx-movie | `--list-characters` with any other argument | 2, `Error: --list-characters takes no other arguments`, stdout empty |
+| E-P25 | ltx-movie, render, images | a `--lora`/`--stills-lora` value fails `parse_lora_spec` | 2, `Error: <flag>: <ValueError>` |
+| E-P26 | ltx-movie, render, images | merged route: a global LoRA path is not a readable file | 2, `Error: <flag> <path>: not a readable file` |
+| E-P27 | ltx-movie, render, images | the same file given twice as a global LoRA (realpath) | 2, `Error: <flag> <path> is given more than once` |
+| E-P28 | ltx-movie, render, images | a global LoRA is also a cast character's LoRA (realpath) | 2. ltx-movie: `Error: <flag> <path> is also character <n>'s <video|stills> LoRA; pass it once`. render adds ` (panel <i>)` before `; pass it once`. images says `stills LoRA` |
+| E-P29 | ltx-movie, render, images | legacy route (one value at 1.0, no character LoRAs) | not validated, exactly as today (HF repo IDs allowed; G19) |
 | E-P22 | z_image_skill | `lora_path` + `loras` / adapter not registered / a different LoRA set on a loaded singleton | `ValueError` / `ValueError` / `RuntimeError` (5.2) |
 
 ---
@@ -2007,10 +2232,10 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | P7 | `load_manifest` invalid `characters` cases: a dict; an entry without a name; a duplicate name; a relative `video_lora`; a missing file; strength `0`, `1.2`, `True` | `ValueError` each, message `panel 2: …` |
 | P8 | `build_units` on panels with `characters: []` and with no key | the unit key set is exactly R4l's 9 keys |
 | P9 | harness run, 3-panel chain manifest, panel 1 `characters` [kyra@1.0], panel 2 [kyra@0.8, ronin@0.8], panel 3 none | `received_kwargs[0]["loras"] == [(k, 1.0)]`; `[1]["loras"] == [(k, 0.8), (r, 0.8)]`; `"loras" not in received_kwargs[2]`; `lora_path is None` in all |
-| P10 | `main(["m.json", "o.mp4", "--lora", "/x.safetensors"])` on a cast manifest | exit 2, E-P19 message. `generate_video` never called |
+| P10 | (amendment 2) `main(["m.json", "o.mp4", "--lora", g])` on the P9 cast manifest, `g` a real tmp file | exit 0. `received_kwargs[0]["loras"] == [(g, 1.0), (k, 1.0)]`, `[1]["loras"] == [(g, 1.0), (k, 0.8), (r, 0.8)]`, `[2]["loras"] == [(g, 1.0)]`. `lora_path is None` in all |
 | P11 | `--dry-run` on the P9 manifest | stdout has `"            lora: <k> @ 1.0 (kyra)"` under panel 1 and two lora lines under panel 2. The `first render command:` line contains `--lora <k> 1.0` |
 | P12 | `--dry-run` on an uncast manifest | contains no `"lora:"` line and no `--lora` |
-| P13 | `build_clip_provenance` for a cast unit | it has a `loras` key `== [{"path": k, "sha256": sha256(k bytes), "strength": 1.0}]`. An uncast unit has no `loras` key |
+| P13 | `build_clip_provenance` for a cast unit | it has a `loras` key `== [{"kind": "character", "path": k, "sha256": sha256(k bytes), "strength": 1.0}]`. An uncast unit has no `loras` key |
 | P14 | reuse: render the P9 manifest, then rerun with `--resume` and the same manifest | the second run renders nothing (all `resumed: True`) |
 | P15 | rerun with `--resume` after (a) panel 2's ronin strength changes to 0.6; (b) kyra's LoRA file bytes change (rewrite with new content and a new mtime); (c) panel 1's characters removed | (a) panels 2 and 3 re-render (3 is chained to 2); (b) all panels re-render; (c) panels 1-3 re-render |
 | P16 | `lora_sha256` is called twice on the same file | `file_sha256` runs once (patched counter). After `os.utime` changes the mtime_ns, it runs again |
@@ -2021,15 +2246,15 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | P23 | `--cast` without `--chain`; `--character-strength` without `--cast`; an unknown character; `--character-strength 0` | `SystemExit 2` / `SystemExit 2` / rc 2 / rc 2. No manifest written |
 | P24 | the uncast run's manifest | has no `characters` key on any panel |
 | P25 | `_prompt_length_warning` sees the cast prompt (a Motion: of 149 words plus one inserted trigger) | the `WARNING: unit 1 prompt is 150 words` line does not appear, but a 150-word Motion: plus a trigger (151) does |
-| P30 | `bin/ltx-story-images --cast "the woman in grey=kyra" --only 1` with kyra having a stills LoRA. Fake `torch`/`z_image_skill`/`content_safety` modules are in `sys.modules`; the fake `generate_image` records kwargs | the call has `loras == [(stills, 1.0)]` and `lora_path is None`. The prompt has `the kyrawmn woman in grey`. `images.json` panel `loras == [{"name": "kyra", "path": stills, "strength": 1.0}]` and `prompt` is the cast prompt |
+| P30 | `bin/ltx-story-images --cast "the woman in grey=kyra" --only 1` with kyra having a stills LoRA. Fake `torch`/`z_image_skill`/`content_safety` modules are in `sys.modules`; the fake `generate_image` records kwargs | the call has `loras == [(stills, 1.0)]` and `lora_path is None`. The prompt has `the kyrawmn woman in grey`. `images.json` panel `loras == [{"kind": "character", "name": "kyra", "path": stills, "strength": 1.0}]` and `prompt` is the cast prompt |
 | P31 | kyra without a stills LoRA | stdout has the E-P17 `WARNING:`. The prompt has no trigger. The call has no `loras` key. `images.json` panel `loras == []` |
 | P32 | `--only 1,2` where panel 1 names kyra and panel 2 names ronin (both with stills) | rc 2, E-P16. `generate_image` never called |
-| P33 | `--cast` + `--lora x` | rc 2, E-P15 |
+| P33 | (amendment 2) `--cast "the woman in grey=kyra" --lora g:0.5 --only 1` (kyra with a stills LoRA, `g` real) | rc 0. The call has `loras == [(g, 0.5), (stills, 1.0)]` and `lora_path is None`. `images.json` panel `loras` kinds are `["global", "character"]` |
 | P34 | `--dry-run --cast …` | stdout shows the cast prompt and `    loras: kyra=<p>@1.0`. `torch` not imported (subprocess check, as in the existing I-tests) |
 | P35 | the uncast run with the same fake modules | the call kwargs have no `loras` key. `images.json` panels have no `loras` key |
 | P40 | `ltx_movie.build_story_prompt("n", "sid", 3, seconds="6", cast_block="CAST")` | equals the uncast prompt with `"\n\nCAST"` inserted immediately before `"\n\nHow this movie is made:"`. With `seed_image=True`, the preface and postface are unchanged and the block is inside |
 | P41 | `build_story_prompt(..., cast_block=None)` and `cast_block=""` | identical to the call without the keyword |
-| P42 | `_resolve_casting` E-P1, E-P2, E-P3, E-P4, E-P5, E-P6a (unknown), E-P6b (duplicate phrase), E-P7, E-P8, E-P9 | each returns 2 with the exact message: E-P6a is two lines (P50), every other case is exactly one line. `args.cast_members == []` |
+| P42 | `_resolve_casting` E-P1, E-P2, E-P4, E-P5, E-P6a (unknown), E-P6b (duplicate phrase), E-P7, E-P8, E-P9 | each returns 2 with the exact message: E-P6a is two lines (P50), every other case is exactly one line. `args.cast_members == []` |
 | P43 | `_resolve_casting` with `--character kyra` and no story.md | 0. `cast_block == build_cast_block([kyra])`. `character_strength == 0.8` |
 | P44 | `_resolve_casting` with story.md present containing `the woman in grey`, `--character kyra --cast "the ronin=ronin"` | 0. `cast_block is None`. Members `[kyra, ronin]`. `_cast_flags(args) == ["--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin", "--character-strength", "0.8"]` |
 | P45 | `_cast_flags` on a `Namespace` without `cast_members`, and with `[]` | `[]` |
@@ -2045,6 +2270,22 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | P55 | subprocess: `[sys.executable, "bin/ltx-movie", "--list-characters"]` vs `[sys.executable, "bin/character", "list"]`, both with `CHARACTER_LIBRARY_DIR` = the C45 lib, `cwd=WS` | both rc 0, byte-identical stdout, empty stderr |
 | P56 | `ltx_movie.build_parser().format_help()` | contains `--list-characters`. The L1-style substring checks (`"145 frames @ 24 fps = 6.04s per clip."`) still hold. B1 still passes |
 | P57 | manifest `--cast "the ronin=ghost"`; images `--cast "the ronin=ghost"` | rc 2. stderr is the single `Error: unknown character: …` line, with no `available characters:` (E-P6c) |
+| P60 | `SKILL.parse_lora_spec` on every 5.7.1 table row | each result or `ValueError` exactly as tabled |
+| P61 | render legacy route: `--lora /tmp/my.safetensors` (nonexistent) on an uncast manifest; then `--lora <real g>` and `--lora <real g>:1.0` | the first behaves like R33 (`kw["lora_path"] == "/tmp/my.safetensors"`, no `loras` kwarg, no file check). The last two give identical `received_kwargs` and identical provenance JSON (`lora_path == g`, no `loras` key) |
+| P62 | render merged, uncast: `--lora a:1.0 --lora b:0.5` (real files) | every call has `loras == [(a, 1.0), (b, 0.5)]`, `lora_path is None`. Provenance `loras` kinds `["global", "global"]` |
+| P63 | render, cast + globals: P9 manifest with `--lora a:0.7` | panel 1 `[(a, 0.7), (k, 1.0)]`, panel 2 `[(a, 0.7), (k, 0.8), (r, 0.8)]`, panel 3 `[(a, 0.7)]`: the global's strength is untouched, and globals do not count toward the character rule |
+| P64 | render duplicates: `--lora a --lora a`; `--lora <symlink to a> --lora a`; `--lora k` where k is kyra's `video_lora` on the cast manifest (also via a symlink) | each exits 2 with E-P27 / E-P27 / E-P28 (`… (panel 1); pass it once`). `generate_video` never called |
+| P65 | render merged-route errors: `--lora a --lora /missing.safetensors`; `--lora a:0`; `--lora a:3` | E-P26; E-P25; E-P25. Each exits 2 |
+| P66 | `--resume` with globals on the P9 manifest: rerun after (a) the same flags; (b) `a:0.7` → `a:0.6`; (c) `--lora a --lora b` → `--lora b --lora a`; (d) LoRA X used as the global on run 1, and as a character LoRA (no global) on run 2 for an uncast→cast manifest change on panel 3 only | (a) nothing re-renders; (b) all panels re-render; (c) all re-render (order is identity); (d) panel 3 re-renders (kind differs) |
+| P67 | render `--dry-run` with `--lora a:0.7` on the P9 manifest | each panel lists `            lora: <a> @ 0.7 (global)` first, then its character lines |
+| P68 | ltx-story-images, no `--cast`: (a) `--lora my_lora.safetensors` (nonexistent); (b) `--lora g1 --lora g2:0.5` (real) | (a) `lora_path == "my_lora.safetensors"`, no `loras` kwarg, `images.json` has no `loras` key (today's behavior). (b) `loras == [(g1, 1.0), (g2, 0.5)]`, `lora_path is None`, `images.json` `loras` kinds `["global", "global"]` |
+| P69 | ltx-story-images errors: `--lora <kyra's stills_lora>` with `--cast …=kyra`; `--lora /missing:0.5`; `--only 1,2 --lora g:0.5` where panels 1 and 2 match different characters | E-P28 (`stills LoRA`); E-P26; E-P16. `generate_image` never called |
+| P70 | ltx-movie legacy: `--lora x` (nonexistent, no cast) | `_resolve_global_loras` returns 0 with both lists `[]`. `_render_flags(args)` equals today's (contains `["--lora", "x"]`). The B1 golden still matches |
+| P71 | ltx-movie merged: `--character kyra --lora g:0.7 --stills-lora s` (real files, kyra with a stills LoRA, no story.md) | rc 0. `_render_flags` contains `["--lora", "<abs g>:0.7"]` and no raw `g`. The Phase 2 dry-run command contains `--lora <abs s>:1.0` (merged, because kyra has a stills LoRA), then the `_cast_flags` |
+| P72 | ltx-movie: `--character kyra --lora <kyra video_lora>`; `--stills-lora s --stills-lora s`; `--lora g:abc` (treated as path `g:abc`, missing) with a cast | E-P28 (`video LoRA`); E-P27; E-P26. Also, `--character kyra --lora g` is accepted (the former E-P3 is gone) |
+| P73 | `_RepeatableLoraAction`: parse `["--lora", "a", "--lora", "b"]`; parse with no `--lora` | `lora_path == "a"`, `lora_path_specs == ["a", "b"]`; `lora_path is None` and `not hasattr(ns, "lora_path_specs")` |
+| P74 | `SKILL.generate_video(..., loras=[(g, 2.0), (k, 1.0)])`; `loras=[(g, 2.0001)]` | the first is accepted (argv `--lora g 2.0 --lora k 1.0`); the second raises `ValueError` |
+| P75 | `inspect.getsource` of `_RepeatableLoraAction` in bin/ltx-movie, bin/ltx-mlx-render, bin/ltx-story-images | all three are identical strings |
 
 ### 9.6 `tests/test_z_image_skill_multi_lora.py`
 
@@ -2105,7 +2346,24 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 | provenance omits `strength` | P15(a) |
 | provenance adds `"loras": []` for uncast units | P13, R1 |
 | `render_panel` always passes `loras=` | P9 (panel 3), R1 (R33) |
-| E-P19 check removed | P10 |
+| (amendment 2) the old E-P19 refusal retained (`--lora` + cast exits 2) | P10 |
+| legacy route removed (always merged) | P61, R1 (R33, R18z) |
+| legacy condition ignores the cast | P63, P10 |
+| globals placed after the characters | P10, P63 |
+| global strength reduced in multi-character panels | P63 |
+| `panel_strengths` counts globals | P63 (panel 1 kyra would drop to 0.8) |
+| duplicate-global check removed | P64 |
+| duplicate check by path string instead of realpath | P64 (symlink cases) |
+| global-vs-character duplicate check removed | P64, P69, P72 |
+| `parse_lora_spec` splits on the first `:` | P60 (`/p/a:b.safetensors:0.8`) |
+| `parse_lora_spec` errors on a non-float suffix | P60 (`org/repo:main`) |
+| `parse_lora_spec` accepts strength 2.5 | P60, P65 |
+| provenance omits `kind` | P66(d) |
+| provenance list sorted (order not identity) | P66(c) |
+| ltx-movie keeps the E-P3 refusal | P72 |
+| ltx-story-images keeps the E-P15 refusal | P33 |
+| `_render_flags` forwards raw values on the merged route | P71 |
+| `_RepeatableLoraAction` overwrites the dest with the last value | P73, R1 (I21) |
 | `lora_sha256` cache keyed on path only | P16 |
 | manifest inserts triggers into `panel_text` too | P20 |
 | manifest omits `characters: []` on uncast-in-cast panels | P20 |
@@ -2153,9 +2411,11 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 | L4 | `bin/story-server stop`; `bin/character train kyra` | exit 0. A skipped or incompatible stills LoRA (CT9/CT13) still exits 0 here, because `--stills` was not given. Exit 1 only on CT10, CT11, or CT12. `lora/video.safetensors` is 641,974,104 bytes. A/B eyeballed: `tests/video_lora.mp4` shows the character; `video_control.mp4` shows a stranger. If the stills LoRA trained: `tests/stills_lora.png` shows her, and the control shows a stranger. Record the wall-clock time (~47 min expected for video) and the peak footprint |
 | L5 | `bin/character train ronin` | as L4 for the ronin |
 | L6 | **Bleed sweep (acceptance gate).** Three story dirs, `generated/stories/bleed-sweep-s10`, `-s08`, `-s06`, each holding the 9.8 `story.md`. Run `bin/ltx-movie "two-character bleed sweep" --story-id bleed-sweep-sNN --panels 2 --no-review --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8 --cast "the woman in grey=kyra" --cast "the ronin=ronin" --character-strength S` for S = 1.0, 0.8, 0.6. Then `bin/judge-clips --story-id bleed-sweep-sNN` for each | Each run exits 0, and the manifests show both characters at S on both panels. **Winner rule:** the highest S at which, in both panels, she shows her trained identity (face, three jade hairpins, grey kimono) with no male or ronin traits, **and** he shows topknot, scarred brow, and indigo haori with no female, kimono, or hairpin traits, by the user's eyeball. judge-clips `physical_realism` breaks ties (higher wins). If no S passes, the default stays 0.8 and G4 is recorded as unresolved. The winner is written into `DEFAULT_CHARACTER_STRENGTH` (plus C36/C37 and the help texts "default 0.8") in a follow-up commit |
+| L6b | **Character + global quality case: DEFERRED** **[spec choice: defer, do not download]** | Run when the user provides a real non-character LTX LoRA `G`. Repeat the L6 `bleed-sweep-s08` command with `--lora G:1.0`, then with `--lora G:0.6` (new story ids `bleed-sweep-s08-gG10`/`-gG06`). Pass: G's effect is visible, and both identities hold by the L6 rule. Until then, record "L6b deferred: no non-character LoRA available locally (G22)" in the acceptance notes |
+| L6m | **Mechanical global + character check** (not a quality signal) | Story id `bleed-sweep-globalmech` with the 9.8 `story.md`. Run the L6 command at S = 0.8 plus `--lora generated/charlora/kyrawmn-v1/out_full/checkpoints/lora_weights_step_00250.safetensors:0.3`. This is the spike's out-of-library checkpoint, used **only** as a stand-in global file. Pass: exit 0. Each clip's provenance `loras` has kinds `["global", "character", "character"]`, with the global at 0.3 and the characters at 0.8. The logged ltx-2-mlx argv has three `--lora` triples. Record the wall-clock time per panel against L6 |
 | L7 | **Cast re-render.** Create `generated/stories/ronin-e2e-appearance-20261005-cast/` holding only a copy of the original `story.md`. Run `bin/ltx-movie "re-render of an existing story" --story-id ronin-e2e-appearance-20261005-cast --panels 20 --no-review --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8 --cast "the woman in grey=kyra" --cast "the ronin=ronin"`. Then `bin/judge-clips --story-id ronin-e2e-appearance-20261005-cast` | exit 0, 20 clips. Each panel's `characters` in `manifest.json` equals `cast_text(<that panel's Motion: text>, members)[1]`, computed in a REPL from the copied `story.md`. Record the 20 lists. Note that panel 1's Motion: does not name her, so panel 1's clip gets no LoRA (G5) while its still does. Eyeball against the original `movie.mp4`: she stays recognizably the same across her panels, and he is recognizable from panel 12. Record both clips judgments (original movie: seam 7, narrative 2) side by side. The user's eyeball is decisive |
 
-**Ordering note.** L2/L3 need the vision server up; L4-L7 need it down. The plan sequences them as L1, L1b, L2, L3 (server up), then `bin/story-server stop`, then L4, L5, L6, L7.
+**Ordering note.** L2/L3 need the vision server up; L4-L7 need it down. The plan sequences them as L1, L1b, L2, L3 (server up), then `bin/story-server stop`, then L4, L5, L6, L6m, L7. L6b is deferred (G22).
 
 ### 9.8 Bleed-sweep `story.md` (exact)
 
@@ -2181,12 +2441,12 @@ Narration: A silent agreement passes between them.
 1. **L0: mflux install (user-gated) + compat gate.** This is a throwaway check that touches no repo code. Report the result before building 4.9.
 2. **B-golden capture** (`tests/test_casting_regression.py --capture`, plus the fixtures), committed before any production edit.
 3. `character_lib.py` + `tests/test_character_lib.py`, including the 3.9 cast-discovery helpers and C42-C46.
-4. `ltx2_mlx_video_skill.py` `loras` + P1-P5.
-5. `z_image_skill.py` multi-adapter + Z1-Z6.
-6. `bin/ltx-mlx-render` + P6-P17.
-7. `bin/ltx-story-manifest --cast` + P20-P25.
-8. `bin/ltx-story-images --cast` + P30-P35.
-9. `bin/ltx-movie` casting + P40-P49, then the amendment: the E-P6a available line (P50-P52), `--list-characters` (P53-P56), and P57 (manifest/images unchanged).
+4. `ltx2_mlx_video_skill.py` `loras` + P1-P5, plus amendment 2's `parse_lora_spec` (P60, P74).
+5. `z_image_skill.py` multi-adapter + Z1-Z6. Amendment 2 needs no code change: the order is globals then characters, which callers build.
+6. `bin/ltx-mlx-render` + P6-P17, plus amendment 2: `_RepeatableLoraAction`, 5.7.3, `kind` in units and provenance, and the E-P19 removal (P10, P13, P61-P67, P75).
+7. `bin/ltx-story-manifest --cast` + P20-P25. Amendment 2 does not change the manifest: globals are render and stills flags, not manifest content.
+8. `bin/ltx-story-images --cast` + P30-P35, plus amendment 2: 5.7.4 and the E-P15 removal (P33, P68, P69).
+9. `bin/ltx-movie` casting + P40-P49, plus amendment 2: `_RepeatableLoraAction`, `_resolve_global_loras`, the forwarding, and the E-P3 removal (P70-P73). Then amendment 1: the E-P6a available line (P50-P52), `--list-characters` (P53-P56), and P57 (manifest/images unchanged).
 10. `character_dataset.py`: create half (prompts, face, describe, score, contact sheet, child protocol, gates) + D1-D19, D35-D37.
 11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34.
 12. `bin/character` + K1-K18. `list` reuses `character_table_lines()` (K2, P55).
@@ -2220,6 +2480,11 @@ Tasks 3-9 and 10-12 are independent chains. Within each chain the order matters.
 - **G16. Hashing cost.** Provenance hashes each LoRA once per render process: about 0.5-1 s per 642 MB file. The dry run hashes too, when `--resume` predicts.
 - **G17. Process scan false positives.** `busy_process` matches on command-line substrings, so an unrelated process whose argv contains `bin/ltx-movie` (for example an editor) blocks create and train (fail-closed by design).
 - **G18. No pruning.** About 2.6 GB of intermediate video checkpoints are kept per character. Pruning is out of scope.
+- **G19. The legacy route keeps today's lax validation.** A single `--lora` at 1.0 with no cast is not checked for existence (HF repo IDs still work), but the same file with a cast, or with a second LoRA, is validated. A typo is therefore caught only on the merged route.
+- **G20. Colon ambiguity.** A local LoRA whose filename itself ends in `:<number>` is read as `PATH:STRENGTH`. The workaround is to append `:1.0`. HF repo IDs containing `:` followed by a number are not supported on the merged route.
+- **G21. Order is part of identity.** Reordering `--lora` flags re-renders every clip, although the summed deltas are the same.
+- **G22. No quality check for globals.** No non-character LTX LoRA exists on this machine. The only other LoRA file is the pack's own `ltx-2.5-22b-distilled-lora-450-bf16.safetensors`, which the distilled pipeline already applies internally, so it is not usable as a global. The quality of a global combined with the cast (L6b) is unverified until the user supplies one. L6m checks only the mechanics.
+- **G23. Global plus character overload.** A global LoRA trained on a different base, or at a high strength, may overpower the character LoRAs. Globals are never auto-reduced (5.7.6), so the user tunes `PATH:STRENGTH` by hand.
 
 ---
 
