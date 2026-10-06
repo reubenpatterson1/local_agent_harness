@@ -997,3 +997,413 @@ def test_p69_global_stills_errors(tmp_path, monkeypatch, capsys, lib_dir):
         "Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
         "set per process); run one --only panel per invocation\n")
     assert calls == []
+
+
+# --- P40-P49: bin/ltx-movie --character / --cast (spec 5.6) ------------------------------
+ANCHOR = "\n\nHow this movie is made:"
+MOVIE_STORY = """# Movie cast test
+
+Two travellers.
+
+## Panel 1 — One
+Image: A medium shot of {phrase} standing on a forest trail. Photorealistic live-action film still.
+Motion: {phrase_cap} turns; the camera stays static.
+Narration: A pause.
+
+## Panel 2 — Two
+Motion: {phrase_cap} steps forward.
+Narration: A step.
+
+## Panel 3 — Three
+Motion: {phrase_cap} stops.
+Narration: A stop.
+"""
+
+
+def _movie_stories(tmp_path, monkeypatch):
+    """Point bin/ltx-movie's story dirs at tmp_path/stories (WS itself is unchanged, so
+    _character_lib() and the story.md validator still load from the real workspace)."""
+    stories = tmp_path / "stories"
+    monkeypatch.setattr(ltx_movie, "_story_dir", lambda sid: str(stories / sid))
+    return stories
+
+
+def _write_story(stories, story_id, phrase):
+    directory = stories / story_id
+    directory.mkdir(parents=True)
+    path = directory / "story.md"
+    path.write_text(MOVIE_STORY.format(phrase=phrase, phrase_cap=phrase[0].upper() + phrase[1:]),
+                    encoding="utf-8")
+    return str(path)
+
+
+def _movie_args(*argv):
+    return ltx_movie.build_parser().parse_args(list(argv))
+
+
+def test_p40_cast_block_sits_before_the_how_anchor():
+    plain = ltx_movie.build_story_prompt("n", "sid", 3, seconds="6")
+    expected = plain.replace(ANCHOR, "\n\nCAST" + ANCHOR)
+    assert plain.count(ANCHOR) == 1
+    assert ltx_movie.build_story_prompt("n", "sid", 3, seconds="6", cast_block="CAST") == expected
+    assert ltx_movie.build_story_prompt("n", "sid", 3, seed_image=True, seconds="6",
+                                        cast_block="CAST") == (
+        ltx_movie.SEED_IMAGE_PREFACE + "\n\n" + expected + "\n\n" + ltx_movie.SEED_IMAGE_POSTFACE)
+
+
+def test_p41_no_cast_block_means_no_change():
+    plain = ltx_movie.build_story_prompt("n", "sid", 3, seconds="6")
+    assert ltx_movie.build_story_prompt("n", "sid", 3, seconds="6", cast_block=None) == plain
+    assert ltx_movie.build_story_prompt("n", "sid", 3, seconds="6", cast_block="") == plain
+
+
+def test_p42_resolve_casting_errors(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir)
+    stories = _movie_stories(tmp_path, monkeypatch)
+    override = tmp_path / "prompt.txt"
+    override.write_text("verbatim prompt", encoding="utf-8")
+    new_md = str(stories / "new" / "story.md")
+    old_md = _write_story(stories, "old", "the traveller")
+    cases = [
+        (["n", "--story-id", "new", "--character-strength", "0.5"],
+         "Error: --character-strength requires --character or --cast"),
+        (["n", "--story-id", "new", "--character", "kyra", "--no-stills"],
+         "Error: --character/--cast are not supported with --no-stills: casting needs the "
+         "chained flow"),
+        (["n", "--story-id", "new", "--character", "kyra", "--character-strength", "1.5"],
+         "Error: --character-strength must be in (0, 1], got 1.5"),
+        (["n", "--story-id", "new", "--cast", "the ronin"],
+         "Error: --cast must be PHRASE=NAME, got 'the ronin'"),
+        (["n", "--story-id", "new", "--character", "ghost"],
+         "Error: unknown character: ghost (no %s)\n"
+         "available characters: kyra (the woman in grey), ronin (the ronin)"
+         % os.path.join(lib_dir, "ghost", "character.json")),
+        (["n", "--story-id", "new", "--character", "kyra", "--cast", "the woman in grey=ronin"],
+         "Error: cast phrase 'the woman in grey' is used for both kyra and ronin"),
+        (["n", "--story-id", "new", "--cast", "the ronin=ronin"],
+         "Error: --cast needs an existing story.md that already uses the phrase, and Phase 1 is "
+         "about to write a new one (%s); use --character to cast a new story" % new_md),
+        (["--story-id", "new", "--character", "kyra", "--story-prompt-override", str(override)],
+         "Error: --character cannot be combined with --story-prompt-override when Phase 1 runs: "
+         "the override is used verbatim, so the Cast block cannot be added"),
+        (["n", "--story-id", "old", "--character", "kyra"],
+         "Error: cast phrase 'the woman in grey' (character kyra) does not occur in %s" % old_md),
+    ]
+    for argv, message in cases:
+        args = _movie_args(*argv)
+        assert ltx_movie._resolve_casting(args) == 2, argv
+        assert capsys.readouterr().err == message + "\n"
+        assert args.cast_members == []
+
+
+def test_p43_character_on_a_new_story_builds_the_cast_block(tmp_path, monkeypatch, lib_dir):
+    make_character(lib_dir)
+    _movie_stories(tmp_path, monkeypatch)
+    args = _movie_args("n", "--story-id", "new", "--character", "kyra")
+    assert ltx_movie._resolve_casting(args) == 0
+    members = character_lib.resolve_cast([(None, "kyra")])
+    assert args.cast_block == character_lib.build_cast_block(members)
+    assert args.cast_members == members
+    assert args.character_strength == 0.8
+
+
+def test_p44_existing_story_mixes_character_and_cast(tmp_path, monkeypatch, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir)
+    stories = _movie_stories(tmp_path, monkeypatch)
+    path = _write_story(stories, "old", "the woman in grey")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n## Panel 4 — Four\nMotion: The ronin waits.\nNarration: He waits.\n")
+    args = _movie_args("n", "--story-id", "old", "--character", "kyra",
+                       "--cast", "the ronin=ronin")
+    assert ltx_movie._resolve_casting(args) == 0
+    assert args.cast_block is None
+    assert [m.name for m in args.cast_members] == ["kyra", "ronin"]
+    assert ltx_movie._cast_flags(args) == [
+        "--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin",
+        "--character-strength", "0.8"]
+
+
+def test_p45_cast_flags_empty_when_uncast():
+    import argparse
+    assert ltx_movie._cast_flags(argparse.Namespace()) == []
+    assert ltx_movie._cast_flags(argparse.Namespace(cast_members=[],
+                                                    character_strength=0.8)) == []
+
+
+def test_p46_dry_run_with_character(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _movie_stories(tmp_path, monkeypatch)
+    assert ltx_movie.main(["two travellers", "--story-id", "casting-p46", "--dry-run",
+                           "--no-review", "--character", "kyra"]) == 0
+    out = capsys.readouterr().out
+    video = os.path.join(lib_dir, "kyra", "lora", "video.safetensors")
+    assert "--- Cast ---" in out.splitlines()
+    assert ('cast: kyra as "the woman in grey" (trigger kyrawmn; video LoRA %s; stills LoRA '
+            'none: not trained)' % video) in out.splitlines()
+    block = character_lib.build_cast_block(character_lib.resolve_cast([(None, "kyra")]))
+    assert "\n\n" + block + ANCHOR in out
+    commands = [line for line in out.splitlines() if line.startswith("Command: ")]
+    flags = "--cast 'the woman in grey=kyra' --character-strength 0.8"
+    assert flags in next(c for c in commands if "ltx-story-images" in c)
+    assert flags in next(c for c in commands if "ltx-story-manifest" in c)
+
+
+def test_p47_phase1_warns_when_story_md_omits_a_cast_phrase(tmp_path, monkeypatch, capsys,
+                                                            lib_dir):
+    make_character(lib_dir)
+    stories = _movie_stories(tmp_path, monkeypatch)
+    _write_story(stories, "old", "the traveller")
+    args = _movie_args("n", "--story-id", "old", "--panels", "3", "--no-review")
+    args.cast_members = character_lib.resolve_cast([(None, "kyra")])
+    assert ltx_movie.phase1_story(args) == 0
+    assert ("Warning: story.md does not use cast phrase 'the woman in grey'; character kyra "
+            "gets no LoRA in this story") in capsys.readouterr().out
+
+
+def test_p48_phase2_warns_about_a_reused_panel_01(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    stories = _movie_stories(tmp_path, monkeypatch)
+    _write_story(stories, "old", "the woman in grey")
+    images = stories / "old" / "images"
+    images.mkdir()
+    (images / "panel_01.png").write_bytes(b"png")
+    runs = []
+    monkeypatch.setattr(ltx_movie.subprocess, "run",
+                        lambda cmd, **kw: runs.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    args = _movie_args("n", "--story-id", "old")
+    args.video_width, args.video_height = 704, 448
+    args.cast_members = character_lib.resolve_cast([(None, "kyra")])
+    args.character_strength = 0.8
+    assert ltx_movie.phase2_stills(args) == 0
+    assert ("Warning: %s exists and will be reused as-is; it was not necessarily rendered with "
+            "the cast's stills LoRAs (delete it to regenerate)" % (images / "panel_01.png")
+            in capsys.readouterr().out)
+    assert runs[0][-4:] == ["--cast", "the woman in grey=kyra", "--character-strength", "0.8"]
+
+
+def test_p49_uncast_ltx_movie_never_loads_character_lib():
+    script = (
+        "import contextlib, io, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import importlib.machinery\n"
+        "m = importlib.machinery.SourceFileLoader('ltx_movie', %r).load_module()\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "    rc = m.main(['n', '--story-id', 'x', '--dry-run', '--no-review'])\n"
+        "print('RC=%%d' %% rc)\n"
+        "print('CHARACTER_LIB_LOADED=%%s' %% ('character_lib' in sys.modules))\n"
+    ) % (WS, os.path.join(WS, "bin", "ltx-movie"))
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    lines = proc.stdout.splitlines()
+    assert "RC=0" in lines
+    assert "CHARACTER_LIB_LOADED=False" in lines
+
+
+
+# --- P50-P57: cast discovery and --list-characters (spec 3.9, 5.6(i), amendment) ---------
+def _c45_library(lib):
+    """kyra (trained, no stills), ronin (untrained) and an invalid bad (spec C45)."""
+    make_character(lib)
+    _ronin(lib, status="untrained")
+    os.makedirs(os.path.join(lib, "bad"))
+    with open(os.path.join(lib, "bad", "character.json"), "w") as f:
+        f.write("{bad")
+
+
+def _casting_stderr(capsys, *argv):
+    args = _movie_args(*argv)
+    assert ltx_movie._resolve_casting(args) == 2
+    assert args.cast_members == []
+    return capsys.readouterr().err
+
+
+def test_p50_unknown_character_lists_the_usable_ones(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir)
+    _movie_stories(tmp_path, monkeypatch)
+    assert _casting_stderr(capsys, "n", "--story-id", "new", "--character", "ghost") == (
+        "Error: unknown character: ghost (no %s)\n"
+        "available characters: kyra (the woman in grey), ronin (the ronin)\n"
+        % os.path.join(lib_dir, "ghost", "character.json"))
+
+
+def test_p51_no_usable_characters(tmp_path, monkeypatch, capsys, lib_dir):
+    _movie_stories(tmp_path, monkeypatch)
+    none = "available characters: none (create one with bin/character create)"
+    err = _casting_stderr(capsys, "n", "--story-id", "new", "--character", "ghost")
+    assert err.splitlines()[1] == none
+    make_character(lib_dir, name="zed", trigger="zedtrig", phrase="the zed", status="untrained")
+    err = _casting_stderr(capsys, "n", "--story-id", "new", "--character", "zed")
+    assert err.splitlines() == [
+        "Error: character zed is not trained (status untrained); run bin/character train zed",
+        none]
+
+
+def test_p52_which_errors_list_alternatives(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir)
+    _movie_stories(tmp_path, monkeypatch)
+    both = "available characters: kyra (the woman in grey), ronin (the ronin)"
+    assert _casting_stderr(capsys, "n", "--story-id", "new", "--cast", "the ronin=Ronin") == (
+        "Error: character name must match [a-z][a-z0-9-]{1,23}, got 'Ronin'\n" + both + "\n")
+    assert _casting_stderr(capsys, "n", "--story-id", "new", "--character", "kyra",
+                           "--character", "kyra") == (
+        "Error: character kyra is cast more than once\n")
+    assert _casting_stderr(capsys, "n", "--story-id", "new", "--cast", "the ronin") == (
+        "Error: --cast must be PHRASE=NAME, got 'the ronin'\n")
+    video = os.path.join(lib_dir, "kyra", "lora", "video.safetensors")
+    os.remove(video)
+    assert _casting_stderr(capsys, "n", "--story-id", "new", "--character", "kyra") == (
+        "Error: character kyra's video LoRA is missing or empty: %s\n"
+        "available characters: ronin (the ronin)\n" % video)
+
+
+def _story_locks():
+    return set(glob.glob(os.path.join(WS, "generated", "stories", "**", ".movie.lock"),
+                         recursive=True))
+
+
+def test_p53_list_characters_prints_the_table_and_touches_nothing(monkeypatch, capsys,
+                                                                  lib_dir):
+    import builtins
+    _c45_library(lib_dir)
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("--list-characters ran a subprocess or prompted")
+
+    monkeypatch.setattr(ltx_movie.subprocess, "run", _forbidden)
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", _forbidden)
+    monkeypatch.setattr(builtins, "input", _forbidden)
+    before = _story_locks()
+    assert ltx_movie.main(["--list-characters"]) == 0
+    out, err = capsys.readouterr()
+    assert out == "\n".join(character_lib.character_table_lines()) + "\n"
+    assert err == ""
+    assert _story_locks() == before
+
+
+def test_p54_list_characters_must_be_alone(capsys):
+    for argv in (["--list-characters", "--story-id", "x"], ["a narrative", "--list-characters"],
+                 ["--list-characters", "--help"]):
+        assert ltx_movie.main(argv) == 2, argv
+        out, err = capsys.readouterr()
+        assert err == "Error: --list-characters takes no other arguments\n"
+        assert out == ""
+
+
+def test_p56_help_lists_the_flag():
+    helptext = " ".join(ltx_movie.build_parser().format_help().split())
+    assert "--list-characters" in helptext
+    assert "145 frames @ 24 fps = 6.04s per clip." in helptext
+
+
+def test_p57_manifest_and_images_print_no_available_line(tmp_path, monkeypatch, capsys,
+                                                         lib_dir):
+    make_character(lib_dir)
+    unknown = "Error: unknown character: ghost (no %s)\n" % os.path.join(
+        lib_dir, "ghost", "character.json")
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_manifest_argv("p57", story_md, image,
+                                              "--cast", "the ronin=ghost")) == 2
+    assert capsys.readouterr().err == unknown
+    calls = _fake_zimage(monkeypatch)
+    images_dir = tmp_path / "images-case"
+    images_dir.mkdir()
+    images_md, out_dir = _images_env(images_dir)
+    assert story_images.main(["--story-md", images_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the ronin=ghost"]) == 2
+    assert capsys.readouterr().err == unknown
+    assert calls == []
+
+
+
+# --- P70-P73, P75: global LoRAs in bin/ltx-movie (spec 5.7.1, 5.7.5, amendment 2) ---------
+def _global_args(*argv):
+    args = _movie_args(*argv)
+    args.video_width, args.video_height = 704, 448
+    return args
+
+
+def _resolve_both(args):
+    rc = ltx_movie._resolve_casting(args)
+    return rc or ltx_movie._resolve_global_loras(args)
+
+
+def _real_file(tmp_path, name):
+    path = str(tmp_path / name)
+    with open(path, "wb") as f:
+        f.write(name.encode())
+    return path
+
+
+def test_p70_legacy_lora_is_forwarded_raw(tmp_path, monkeypatch):
+    _movie_stories(tmp_path, monkeypatch)
+    args = _global_args("n", "--story-id", "new", "--lora", "x")
+    assert _resolve_both(args) == 0
+    assert (args.global_video_loras, args.global_stills_loras) == ([], [])
+    flags = ltx_movie._render_flags(args)
+    assert flags[flags.index("--lora"):flags.index("--lora") + 2] == ["--lora", "x"]
+    assert flags.count("--lora") == 1
+    regression = _load("casting_regression_for_p70", "tests/test_casting_regression.py")
+    with open(regression.GOLDEN_B1, encoding="utf-8") as f:
+        assert regression.b1_text() == f.read()
+
+
+def test_p71_merged_globals_are_forwarded_with_strengths(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir, stills=True)
+    _movie_stories(tmp_path, monkeypatch)
+    _real_file(tmp_path, "g.safetensors")
+    _real_file(tmp_path, "s.safetensors")
+    monkeypatch.chdir(tmp_path)
+    abs_g, abs_s = os.path.abspath("g.safetensors"), os.path.abspath("s.safetensors")
+    args = _global_args("n", "--story-id", "new", "--character", "kyra",
+                        "--lora", "g.safetensors:0.7", "--stills-lora", "s.safetensors")
+    assert _resolve_both(args) == 0
+    flags = ltx_movie._render_flags(args)
+    assert flags[flags.index("--lora"):flags.index("--lora") + 2] == ["--lora", abs_g + ":0.7"]
+    assert "g.safetensors:0.7" not in flags and "g.safetensors" not in flags
+    assert ltx_movie.main(["n", "--story-id", "new", "--dry-run", "--no-review",
+                           "--character", "kyra", "--lora", "g.safetensors:0.7",
+                           "--stills-lora", "s.safetensors"]) == 0
+    phase2 = next(line for line in capsys.readouterr().out.splitlines()
+                  if line.startswith("Command: ") and "ltx-story-images" in line)
+    assert phase2.endswith("--lora %s:1.0 --cast 'the woman in grey=kyra' --character-strength 0.8"
+                           % abs_s)
+
+
+def test_p72_ltx_movie_global_lora_errors(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _movie_stories(tmp_path, monkeypatch)
+    video = os.path.join(lib_dir, "kyra", "lora", "video.safetensors")
+    s, g = _real_file(tmp_path, "s.safetensors"), _real_file(tmp_path, "g.safetensors")
+    cases = [
+        (["--character", "kyra", "--lora", video],
+         "Error: --lora %s is also character kyra's video LoRA; pass it once\n" % video),
+        (["--stills-lora", s, "--stills-lora", s],
+         "Error: --stills-lora %s is given more than once\n" % s),
+        (["--character", "kyra", "--lora", "g:abc"],
+         "Error: --lora g:abc: not a readable file\n"),
+    ]
+    for extra, message in cases:
+        assert _resolve_both(_global_args("n", "--story-id", "new", *extra)) == 2, extra
+        assert capsys.readouterr().err == message
+    args = _global_args("n", "--story-id", "new", "--character", "kyra", "--lora", g)
+    assert _resolve_both(args) == 0
+    assert args.global_video_loras == [(g, 1.0)]
+
+
+def test_p73_repeatable_lora_action():
+    ns = _movie_args("n", "--story-id", "s", "--lora", "a", "--lora", "b")
+    assert ns.lora_path == "a"
+    assert ns.lora_path_specs == ["a", "b"]
+    ns = _movie_args("n", "--story-id", "s")
+    assert ns.lora_path is None
+    assert not hasattr(ns, "lora_path_specs")
+
+
+def test_p75_repeatable_lora_action_copies_are_identical():
+    import inspect
+    sources = [inspect.getsource(module._RepeatableLoraAction)
+               for module in (ltx_movie, render, story_images)]
+    assert sources[0] == sources[1] == sources[2]
