@@ -42,6 +42,16 @@ field, not the --seed-image flag, is the switch -- so a single-panel rerun
 (--only 5 --force) reproduces the same seed and the same prompt as the original
 batch whether or not --seed-image is passed again.
 
+Casting: --cast PHRASE=NAME (repeatable) casts a trained character from the character
+library (docs/superpowers/specs/2026-10-05-character-library-design.md). For each cast
+character that has a stills LoRA, its trigger token is inserted into every Image: prompt
+that names PHRASE, and the panel is generated with those characters' stills LoRAs
+(strength 1.0 for one character, else --character-strength or the character's own
+strength). A character without a stills LoRA gets a warning and no trigger. Every planned
+images.json entry then gains a "loras" list. z_image_skill loads one LoRA set per
+process, so the selected panels must all need the same set. character_lib.py is loaded by
+path only when --cast is given.
+
 Dependencies: stdlib only at import time. torch/z_image_skill/content_safety
 are imported inside main(), after arg parsing and the --dry-run exit, so a
 --dry-run invocation never touches the GPU/model stack. PIL is imported
@@ -58,6 +68,19 @@ import time
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 import pipeline_log  # noqa: E402
+
+
+class _RepeatableLoraAction(argparse.Action):
+    """Repeatable --lora: the dest (lora_path / stills_lora_path) keeps the FIRST value as a
+    string, exactly like the old single-valued flag; <dest>_specs collects every value in
+    command-line order (spec 5.7.1)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        specs = list(getattr(namespace, self.dest + "_specs", None) or [])
+        specs.append(values)
+        setattr(namespace, self.dest + "_specs", specs)
+        if getattr(namespace, self.dest, None) is None:
+            setattr(namespace, self.dest, values)
 
 
 def build_parser():
@@ -84,12 +107,29 @@ def build_parser():
                              "canvas and saved as panel_01.png instead of being generated. "
                              "Panel 1 takes this path even with --force (there is no "
                              "txt2img output to regenerate).")
-    parser.add_argument("--lora", dest="lora_path", default=None,
-                        help="LoRA .safetensors file or HF repo ID for z_image_skill, "
-                             "prep for future fine-tuning; always applied at strength "
-                             "1.0. Never used by --seed-image panels (there is no "
-                             "generation to apply it to).")
+    parser.add_argument("--lora", dest="lora_path", action=_RepeatableLoraAction, default=None,
+                        help="global LoRA for z_image_skill stills: repeatable; PATH or "
+                             "PATH:STRENGTH (0 < STRENGTH <= 2, default 1.0). Every global LoRA "
+                             "applies to every panel, ahead of that panel's cast-character LoRAs, "
+                             "at its own strength (never reduced automatically). Never used by "
+                             "--seed-image panels (there is no generation to apply it to).")
+    parser.add_argument("--cast", dest="cast", action="append", default=None,
+                        metavar="PHRASE=NAME",
+                        help="cast a trained character (generated/characters/NAME) under PHRASE "
+                             "(repeatable): for a character with a stills LoRA, its trigger is "
+                             "inserted into every Image: prompt that names PHRASE and the panel "
+                             "is generated with that LoRA")
+    parser.add_argument("--character-strength", dest="character_strength", type=float,
+                        default=None,
+                        help="stills LoRA strength for each cast character in a panel that names "
+                             "two or more of them (default 0.8, provisional); one character "
+                             "always uses 1.0")
     return parser
+
+
+def _character_lib():
+    return importlib.machinery.SourceFileLoader(
+        "character_lib", os.path.join(WS, "character_lib.py")).load_module()
 
 
 def _parse_only(only, n_panels):
@@ -200,6 +240,30 @@ def main(argv=None):
         print("Error: --seed-image not found: %s" % args.seed_image, file=sys.stderr)
         return 2
 
+    members, strength, plans = [], None, {}
+    if args.character_strength is not None and not args.cast:
+        print("Error: --character-strength requires --cast", file=sys.stderr)
+        return 2
+    if args.cast:
+        lib = _character_lib()
+        strength = (args.character_strength if args.character_strength is not None
+                    else lib.DEFAULT_CHARACTER_STRENGTH)
+        if not 0 < strength <= 1.0:
+            print("Error: --character-strength must be in (0, 1], got %r" % strength, file=sys.stderr)
+            return 2
+        try:
+            members = lib.resolve_cast([lib.parse_cast_arg(v) for v in args.cast])
+        except lib.CharacterError as e:
+            print("Error: %s" % e, file=sys.stderr)
+            return 2
+    import ltx2_mlx_video_skill
+    try:
+        parsed = [ltx2_mlx_video_skill.parse_lora_spec(v)
+                  for v in (getattr(args, "lora_path_specs", None) or [])]
+    except ValueError as e:
+        print("Error: --lora: %s" % e, file=sys.stderr)
+        return 2
+
     # Grounded mode (see the module docstring): a non-empty Panel 1 Style: field
     # means this story.md was authored against a reference image and every panel
     # shares one visual identity. Two things then change, together: the style text
@@ -208,6 +272,59 @@ def main(argv=None):
     # single-panel rerun reproduces the batch exactly.
     style = _style_text(panels)
     grounded = bool(style)
+
+    # A bound name, not a literal call: tests/test_ltx_story_images.py I20 pins how
+    # many times the composing function's call text appears in this file.
+    compose = _compose_prompt
+    char_plans = {}
+    if members:
+        stills_members = [m for m in members if m.stills_lora]
+        for m in members:
+            if not m.stills_lora:
+                print("WARNING: character %s has no stills LoRA (%s); its trigger is not inserted into "
+                      "Image: prompts and panel stills render without it"
+                      % (m.name, m.stills_skip_reason or "not trained"))
+        for i in selected_indices:
+            if args.seed_image is not None and i == 1:
+                continue
+            prompt, names = lib.cast_text(compose(panels[i - 1]["image"], style), stills_members)
+            strengths = lib.panel_strengths(names, stills_members, strength)
+            by_name = {m.name: m for m in stills_members}
+            char_plans[i] = (prompt, [{"kind": "character", "name": n, "path": by_name[n].stills_lora,
+                                       "strength": strengths[n]} for n in names])
+    global_stills = []
+    if len(parsed) == 1 and parsed[0][1] == 1.0 and not any(v[1] for v in char_plans.values()):
+        args.lora_path = parsed[0][0]                       # legacy route (spec 5.7.2)
+    elif parsed:
+        args.lora_path = None
+        seen = {}
+        for path, lora_strength, _explicit in parsed:
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                print("Error: --lora %s: not a readable file" % path, file=sys.stderr)
+                return 2
+            real = os.path.realpath(path)
+            if real in seen:
+                print("Error: --lora %s is given more than once" % path, file=sys.stderr)
+                return 2
+            seen[real] = path
+            global_stills.append({"kind": "global", "name": None, "path": os.path.abspath(path),
+                                  "strength": lora_strength})
+        for m in members:
+            if m.stills_lora and os.path.realpath(m.stills_lora) in seen:
+                print("Error: --lora %s is also character %s's stills LoRA; pass it once"
+                      % (seen[os.path.realpath(m.stills_lora)], m.name), file=sys.stderr)
+                return 2
+    if members or global_stills:
+        for i in selected_indices:
+            if args.seed_image is not None and i == 1:
+                continue
+            prompt, chars = char_plans.get(i, (compose(panels[i - 1]["image"], style), []))
+            plans[i] = (prompt, global_stills + chars)
+    lora_sets = sorted({tuple((l["path"], l["strength"]) for l in v[1]) for v in plans.values()})
+    if len(lora_sets) > 1:
+        print("Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
+              "set per process); run one --only panel per invocation", file=sys.stderr)
+        return 2
 
     # panel_%02d.png matches bin/ltx-story-manifest's own _PANEL_NUM_RE, so
     # a later `--glob 'panel_*.png'` sorts numerically and never falls back
@@ -224,9 +341,15 @@ def main(argv=None):
             elif grounded:
                 print("%d | %s | rng %d | +style | %r"
                       % (i, out_paths[i], _panel_seed(args.seed, i, grounded),
-                         _compose_prompt(panels[i - 1]["image"], style)[:100]))
+                         (plans[i][0] if i in plans
+                          else _compose_prompt(panels[i - 1]["image"], style))[:100]))
             else:
-                print("%d | %s | %r" % (i, out_paths[i], panels[i - 1]["image"][:100]))
+                print("%d | %s | %r" % (i, out_paths[i],
+                                        (plans[i][0] if i in plans
+                                         else panels[i - 1]["image"])[:100]))
+            if i in plans:
+                print("    loras: %s" % (", ".join("%s=%s@%s" % (l["name"] or "global", l["path"], repr(l["strength"]))
+                                                   for l in plans[i][1]) or "none"))
         return 0
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -241,8 +364,12 @@ def main(argv=None):
     any_bad = False
     for i in selected_indices:
         prompt = _compose_prompt(panels[i - 1]["image"], style)
+        if i in plans:
+            prompt = plans[i][0]
         seed_used = _panel_seed(args.seed, i, grounded)
         path = out_paths[i]
+        lora_kwargs = ({"loras": [(l["path"], l["strength"]) for l in plans[i][1]]}
+                       if i in plans and plans[i][1] else {})
 
         if args.seed_image is not None and i == 1:
             # Section 3.5: panel 1 takes this path regardless of --force and
@@ -281,6 +408,7 @@ def main(argv=None):
                 height=args.height,
                 generator=torch.Generator("cpu").manual_seed(seed_used),
                 lora_path=args.lora_path,
+                **lora_kwargs,
             )
             elapsed = time.monotonic() - start
             print("panel %d -> %s (seed %d, %.1fs)" % (i, path, seed_used, elapsed))
@@ -304,6 +432,10 @@ def main(argv=None):
                              "status": "error", "source": "generated",
                              "seconds": round(elapsed, 1)})
             any_bad = True
+
+    for r in results:
+        if r["index"] in plans:
+            r["loras"] = plans[r["index"]][1]
 
     with open(os.path.join(args.out_dir, "images.json"), "w") as f:
         json.dump({

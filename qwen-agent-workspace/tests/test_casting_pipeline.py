@@ -801,3 +801,199 @@ def test_p25_length_warning_measures_the_cast_prompt(tmp_path, monkeypatch, caps
         out = capsys.readouterr().out
         assert ("WARNING: unit 1 prompt is 151 words" in out) is warned
         assert "WARNING: unit 1 prompt is 150 words" not in out
+
+
+# --- P30-P35: bin/ltx-story-images --cast (spec 5.5) -------------------------------------
+IMAGES_STORY = """# Stills cast test
+
+Two travellers.
+
+## Panel 1 — One
+Image: A medium shot of the woman in grey standing on a forest trail. Photorealistic live-action film still.
+Motion: The woman in grey turns her head.
+Narration: She listens.
+
+## Panel 2 — Two
+Image: A medium shot of the ronin waiting under a cedar. Photorealistic live-action film still.
+Motion: The ronin nods.
+Narration: He waits.
+"""
+
+
+class _FakeContentSafetyError(Exception):
+    pass
+
+
+def _fake_zimage(monkeypatch):
+    """Fake torch, z_image_skill and content_safety modules in sys.modules; returns the list
+    of (prompt, kwargs) generate_image calls."""
+    calls = []
+
+    class _Generator(object):
+        def __init__(self, device):
+            self.device = device
+
+        def manual_seed(self, seed):
+            self.seed = seed
+            return self
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.Generator = _Generator
+    fake_zimage = types.ModuleType("z_image_skill")
+    fake_zimage.generate_image = lambda prompt, **kwargs: calls.append((prompt, kwargs))
+    fake_safety = types.ModuleType("content_safety")
+    fake_safety.ContentSafetyError = _FakeContentSafetyError
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "z_image_skill", fake_zimage)
+    monkeypatch.setitem(sys.modules, "content_safety", fake_safety)
+    return calls
+
+
+def _images_env(tmp_path):
+    story_md = tmp_path / "story.md"
+    story_md.write_text(IMAGES_STORY, encoding="utf-8")
+    return str(story_md), str(tmp_path / "images")
+
+
+def _images_json(out_dir):
+    with open(os.path.join(out_dir, "images.json")) as f:
+        return json.load(f)
+
+
+def test_p30_still_renders_with_the_stills_lora(tmp_path, monkeypatch, lib_dir):
+    make_character(lib_dir, stills=True)
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the woman in grey=kyra"]) == 0
+    stills = os.path.join(lib_dir, "kyra", "lora", "stills.safetensors")
+    assert len(calls) == 1
+    prompt, kwargs = calls[0]
+    assert kwargs["loras"] == [(stills, 1.0)]
+    assert kwargs["lora_path"] is None
+    assert "the kyrawmn woman in grey" in prompt
+    panel = _images_json(out_dir)["panels"][0]
+    assert panel["loras"] == [{"kind": "character", "name": "kyra", "path": stills,
+                               "strength": 1.0}]
+    assert panel["prompt"] == prompt
+
+
+def test_p31_member_without_stills_lora_warns(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the woman in grey=kyra"]) == 0
+    assert ("WARNING: character kyra has no stills LoRA (not trained); its trigger is not "
+            "inserted into Image: prompts and panel stills render without it"
+            in capsys.readouterr().out)
+    prompt, kwargs = calls[0]
+    assert "kyrawmn" not in prompt
+    assert "loras" not in kwargs
+    assert _images_json(out_dir)["panels"][0]["loras"] == []
+
+
+def test_p32_different_lora_sets_are_refused(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir, stills=True)
+    _ronin(lib_dir, stills=True)
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1,2",
+                              "--cast", "the woman in grey=kyra",
+                              "--cast", "the ronin=ronin"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
+        "set per process); run one --only panel per invocation\n")
+    assert calls == []
+
+
+def test_p33_global_stills_lora_combines_with_the_cast(tmp_path, monkeypatch, lib_dir):
+    make_character(lib_dir, stills=True)
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    g = str(tmp_path / "g.safetensors")
+    with open(g, "wb") as f:
+        f.write(b"global")
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the woman in grey=kyra", "--lora", g + ":0.5"]) == 0
+    stills = os.path.join(lib_dir, "kyra", "lora", "stills.safetensors")
+    assert calls[0][1]["loras"] == [(g, 0.5), (stills, 1.0)]
+    assert calls[0][1]["lora_path"] is None
+    assert [l["kind"] for l in _images_json(out_dir)["panels"][0]["loras"]] == ["global",
+                                                                               "character"]
+
+
+def test_p34_dry_run_shows_the_cast_plan_without_torch(tmp_path, lib_dir):
+    make_character(lib_dir, stills=True)
+    story_md, out_dir = _images_env(tmp_path)
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import importlib.machinery\n"
+        "m = importlib.machinery.SourceFileLoader('ltx_story_images', %r).load_module()\n"
+        "rc = m.main(['--story-md', %r, '--out-dir', %r, '--only', '1', '--dry-run',\n"
+        "             '--cast', 'the woman in grey=kyra'])\n"
+        "print('TORCH_IMPORTED=%%s' %% ('torch' in sys.modules))\n"
+        "print('RC=%%d' %% rc)\n"
+    ) % (WS, os.path.join(WS, "bin", "ltx-story-images"), story_md, out_dir)
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          env=dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir))
+    lines = proc.stdout.splitlines()
+    stills = os.path.join(lib_dir, "kyra", "lora", "stills.safetensors")
+    assert "RC=0" in lines
+    assert "TORCH_IMPORTED=False" in lines
+    assert any(line.startswith("1 | ") and "the kyrawmn woman in grey" in line for line in lines)
+    assert "    loras: kyra=%s@1.0" % stills in lines
+
+
+def test_p35_uncast_run_is_unchanged(tmp_path, monkeypatch, lib_dir):
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1"]) == 0
+    assert "loras" not in calls[0][1]
+    assert all("loras" not in p for p in _images_json(out_dir)["panels"])
+
+
+# --- P68-P69: global stills LoRAs (spec 5.7.4, amendment 2) -------------------------------
+def test_p68_global_stills_without_a_cast(tmp_path, monkeypatch, lib_dir):
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--lora", "my_lora.safetensors"]) == 0
+    assert calls[0][1]["lora_path"] == "my_lora.safetensors"
+    assert "loras" not in calls[0][1]
+    assert all("loras" not in p for p in _images_json(out_dir)["panels"])
+    g1, g2 = str(tmp_path / "g1.safetensors"), str(tmp_path / "g2.safetensors")
+    for path in (g1, g2):
+        with open(path, "wb") as f:
+            f.write(b"global")
+    calls[:] = []
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--force", "--lora", g1, "--lora", g2 + ":0.5"]) == 0
+    assert calls[0][1]["loras"] == [(g1, 1.0), (g2, 0.5)]
+    assert calls[0][1]["lora_path"] is None
+    assert [l["kind"] for l in _images_json(out_dir)["panels"][0]["loras"]] == ["global", "global"]
+
+
+def test_p69_global_stills_errors(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir, stills=True)
+    _ronin(lib_dir, stills=True)
+    calls = _fake_zimage(monkeypatch)
+    story_md, out_dir = _images_env(tmp_path)
+    stills = os.path.join(lib_dir, "kyra", "lora", "stills.safetensors")
+    g = str(tmp_path / "g.safetensors")
+    with open(g, "wb") as f:
+        f.write(b"global")
+    base = ["--story-md", story_md, "--out-dir", out_dir]
+    assert story_images.main(base + ["--only", "1", "--cast", "the woman in grey=kyra",
+                                     "--lora", stills]) == 2
+    assert capsys.readouterr().err == (
+        "Error: --lora %s is also character kyra's stills LoRA; pass it once\n" % stills)
+    assert story_images.main(base + ["--only", "1", "--lora", "/missing:0.5"]) == 2
+    assert capsys.readouterr().err == "Error: --lora /missing: not a readable file\n"
+    assert story_images.main(base + ["--only", "1,2", "--cast", "the woman in grey=kyra",
+                                     "--cast", "the ronin=ronin", "--lora", g + ":0.5"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
+        "set per process); run one --only panel per invocation\n")
+    assert calls == []
