@@ -110,7 +110,7 @@ def _quantize_transformer(transformer, qtype_name):
     freeze(transformer)
 
 
-def load_pipeline(lora_path=None):
+def load_pipeline(lora_path=None, loras=None):
     """Load the Z-Image-Turbo pipeline with the abliterated text encoder, moved to the
     best device.
 
@@ -119,8 +119,14 @@ def load_pipeline(lora_path=None):
     strength 1.0 (diffusers' ZImageLoraLoaderMixin.load_lora_weights + fuse_lora),
     so every later generate_image() call uses it with no per-call overhead.
 
+    loras: a list of (local .safetensors path, strength) pairs, mutually exclusive with
+    lora_path; each is loaded under the adapter name lora0, lora1, ..., checked to have
+    registered on the transformer, weighted with set_adapters, and fused in ONE fuse_lora.
+
     $Z_IMAGE_QUANTIZE_WEIGHTS (see the module docstring) quantizes the transformer
     only, before it is handed to the pipeline; omitted unless explicitly set."""
+    if lora_path is not None and loras:
+        raise ValueError("lora_path and loras are mutually exclusive")
     device = _pick_device()
     dtype = _pick_dtype(device)
     token = os.environ.get("HF_TOKEN")
@@ -147,24 +153,45 @@ def load_pipeline(lora_path=None):
         print(f"[z_image_skill] loading LoRA {lora_path} (fused at strength 1.0)")
         pipeline.load_lora_weights(lora_path)
         pipeline.fuse_lora(lora_scale=1.0)
+    elif loras:
+        names = []
+        for i, (path, strength) in enumerate(loras):
+            name = "lora%d" % i
+            print(f"[z_image_skill] loading LoRA {path} as adapter {name} (strength {strength})")
+            pipeline.load_lora_weights(path, adapter_name=name)
+            if name not in pipeline.get_list_adapters().get("transformer", []):
+                raise ValueError(f"LoRA {path} matched no Z-Image transformer weights; it is not "
+                                 f"a compatible Z-Image LoRA")
+            names.append(name)
+        pipeline.set_adapters(names, adapter_weights=[float(s) for _, s in loras])
+        pipeline.fuse_lora(adapter_names=names, lora_scale=1.0)
+        print(f"[z_image_skill] fused {len(names)} LoRA adapter(s)")
     return pipeline
 
 
 # Lazily-loaded singleton so importing the module doesn't load the model.
 _pipeline = None
+_pipeline_loras = None
 
 
-def _get_pipeline(lora_path=None):
+def _get_pipeline(lora_path=None, loras=None):
     """lora_path only takes effect on the FIRST call that constructs the singleton
     (same constraint as Z_IMAGE_HF_HOME): a later call with a different lora_path
-    against an already-loaded pipeline is silently ignored."""
-    global _pipeline
+    against an already-loaded pipeline is silently ignored. A later call with a
+    different loras set raises RuntimeError instead: that set needs a new process."""
+    global _pipeline, _pipeline_loras
+    key = tuple((str(p), float(s)) for p, s in loras) if loras else None
     if _pipeline is None:
-        _pipeline = load_pipeline(lora_path=lora_path)
+        _pipeline = (load_pipeline(lora_path=lora_path, loras=loras) if loras
+                     else load_pipeline(lora_path=lora_path))
+        _pipeline_loras = key
+    elif key is not None and key != _pipeline_loras:
+        raise RuntimeError("z_image_skill's pipeline is already loaded with LoRA set %r; LoRA set "
+                           "%r needs a new process" % (_pipeline_loras, key))
     return _pipeline
 
 
-def generate_image(prompt: str, output_path: str = None, lora_path=None, **kwargs):
+def generate_image(prompt: str, output_path: str = None, lora_path=None, loras=None, **kwargs):
     """Generate an image from a text prompt using Z-Image-Turbo with the abliterated text encoder.
 
     Args:
@@ -174,6 +201,9 @@ def generate_image(prompt: str, output_path: str = None, lora_path=None, **kwarg
         lora_path: local .safetensors file or HF repo ID, prep for future
             fine-tuning; forwarded to load_pipeline() (see its docstring for
             the singleton-timing caveat). Omitted unless explicitly set.
+        loras: list of (local .safetensors path, strength) pairs, mutually exclusive
+            with lora_path; fused once when the singleton is built, and a later call
+            with a different set raises RuntimeError (see load_pipeline).
         **kwargs: Extra args forwarded to the pipeline call (e.g. height,
             width). Defaults num_inference_steps=9, guidance_scale=0.0 (this
             is a distilled turbo model -- higher steps/CFG do not help), and
@@ -183,7 +213,8 @@ def generate_image(prompt: str, output_path: str = None, lora_path=None, **kwarg
     Returns:
         PIL.Image.Image: The generated image.
     """
-    pipeline = _get_pipeline(lora_path=lora_path)
+    pipeline = (_get_pipeline(lora_path=lora_path, loras=loras) if loras
+                else _get_pipeline(lora_path=lora_path))
     kwargs.setdefault("num_inference_steps", 9)
     kwargs.setdefault("guidance_scale", 0.0)
     kwargs.setdefault("generator", torch.Generator("cpu"))
