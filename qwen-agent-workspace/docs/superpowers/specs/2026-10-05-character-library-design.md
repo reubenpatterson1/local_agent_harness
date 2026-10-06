@@ -5,6 +5,13 @@ Status: The user approved the design in a sectioned dialogue (Sections 1-4 of th
 
 Workspace root (`WS`): `/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/`. Branch `qwen-agent-redteam`.
 
+**Amendment 2026-10-05 (user-approved): cast discovery.** This amendment adds two things:
+
+- `bin/ltx-movie` appends an `available characters: …` line to every unknown/unusable-character error.
+- `bin/ltx-movie --list-characters` prints the `bin/character list` table.
+
+Both helpers live in `character_lib.py`: see Sections 3.9 and 5.6(i), the rows E-P6a, E-P23 and E-P24, the tests C42-C46, K2 and P50-P57, the new mutation rows, and Section 10 tasks 3, 9 and 12.
+
 Two terms are used throughout:
 
 - A **character** is one entry in the library: a name, a trigger token, a referring phrase, a descriptor, a dataset, and up to two LoRAs (one video, one stills).
@@ -159,6 +166,7 @@ No other tracked file changes. In particular, none of the existing test files li
 | SC9 | With no `--character`/`--cast`, every existing render argv, manifest, still prompt, and provenance is byte-identical. The existing suites pass with their 0.2 counts unchanged, and the B-golden tests pass | R1, B1-B3 |
 | SC10 | The deploy package ships `character_lib.py`. `tests/test_deploy_pkg.py` stays at 165 under both interpreters | R2 |
 | SC11 | Live gates L0-L7 pass (Section 9.7). L6 sets the multi-character default strength | L0-L7 |
+| SC12 | An unknown or unusable `--character`/`--cast` name in `bin/ltx-movie` exits 2 with the error plus an `available characters:` line. `bin/ltx-movie --list-characters` prints exactly the `bin/character list` table and exits 0, with no `--story-id`, no narrative, and no server, GPU or lockfile activity | C42-C46, K2, P50-P57 |
 
 ### 0.6 Must-have vs nice-to-have
 
@@ -203,9 +211,9 @@ bin/ltx-movie --character NAME / --cast "PHRASE=NAME"
 
 ### 1.3 Internal names [spec choice]
 
-`character_lib.py` constants: `WS`, `LIBRARY_ENV = "CHARACTER_LIBRARY_DIR"`, `SCHEMA_VERSION = 1`, `NAME_RE`, `TRIGGER_RE`, `CLASS_RE`, `PHRASE_WORD_RE`, `MAX_PHRASE_WORDS = 6`, `ARTICLES = ("the", "a", "an")`, `STATUSES = ("dataset", "untrained", "trained")`, `SOURCE_TYPES = ("seed_image", "descriptor")`, `MIN_SCORE = 7`, `MIN_KEEP = 12`, `DEFAULT_CHARACTER_STRENGTH = 0.8`, `SINGLE_CHARACTER_STRENGTH = 1.0`, `TRIGGER_REGISTRY = ".triggers"`, `LOCK_NAME = ".lock"`, `SHA256_RE`, `UTC_RE`, `CAST_BLOCK_HEADER`, `CAST_BLOCK_RULES`.
+`character_lib.py` constants: `WS`, `LIBRARY_ENV = "CHARACTER_LIBRARY_DIR"`, `SCHEMA_VERSION = 1`, `NAME_RE`, `TRIGGER_RE`, `CLASS_RE`, `PHRASE_WORD_RE`, `MAX_PHRASE_WORDS = 6`, `ARTICLES = ("the", "a", "an")`, `STATUSES = ("dataset", "untrained", "trained")`, `SOURCE_TYPES = ("seed_image", "descriptor")`, `MIN_SCORE = 7`, `MIN_KEEP = 12`, `DEFAULT_CHARACTER_STRENGTH = 0.8`, `SINGLE_CHARACTER_STRENGTH = 1.0`, `TRIGGER_REGISTRY = ".triggers"`, `LOCK_NAME = ".lock"`, `SHA256_RE`, `UTC_RE`, `CAST_BLOCK_HEADER`, `CAST_BLOCK_RULES`, `LIST_ROW_FORMAT`, `NO_CHARACTERS_AVAILABLE`.
 
-`character_lib.py` names: `CharacterError(Exception)` and `CastMember` (namedtuple). Its functions are listed in 3.1.
+`character_lib.py` names: `CharacterError(Exception)`, `UnusableCharacterError(CharacterError)` (3.9), and `CastMember` (namedtuple). Its functions are listed in 3.1.
 
 `character_dataset.py` names: `DatasetError(Exception)`. Its constants and functions are listed in 4.1.
 
@@ -374,6 +382,9 @@ def auto_trigger(name, class_noun, taken, avoid=()):
 | `cast_text(text, members)` | 3.6 |
 | `panel_strengths(names, members, character_strength)` | 3.7 |
 | `build_cast_block(members)` | 3.8 |
+| `usable_characters()` | 3.9 |
+| `format_available_line(characters)` | 3.9 |
+| `character_table_lines()` | 3.9 |
 
 ### 3.2 Phrases
 
@@ -414,6 +425,7 @@ CastMember = collections.namedtuple("CastMember", [
 - It splits on the **last** `=`: `phrase, name = value.rsplit("=", 1)`.
 - If there is no `=`: `CharacterError("--cast must be PHRASE=NAME, got %r" % (value,))`.
 - It returns `(normalize_phrase(phrase), name.strip())`, after `validate_name(name.strip())`.
+- **(Amendment)** A `validate_name` failure here is re-raised as `UnusableCharacterError` with the same message: `raise UnusableCharacterError(str(e))`. A missing `=` and an invalid phrase stay plain `CharacterError`.
 
 ### 3.5 `resolve_cast(entries)`
 
@@ -423,13 +435,19 @@ CastMember = collections.namedtuple("CastMember", [
 def resolve_cast(entries):
     members = []
     for phrase, name in entries:
-        data = load_character(name)
+        try:
+            data = load_character(name)
+        except UnusableCharacterError:
+            raise
+        except CharacterError as e:
+            raise UnusableCharacterError(str(e))
         if data["status"] != "trained":
-            raise CharacterError("character %s is not trained (status %s); run bin/character "
-                                 "train %s" % (name, data["status"], name))
+            raise UnusableCharacterError("character %s is not trained (status %s); run "
+                                         "bin/character train %s" % (name, data["status"], name))
         video = data["loras"]["video"]["path"]
         if not _readable_nonempty(video):
-            raise CharacterError("character %s's video LoRA is missing or empty: %s" % (name, video))
+            raise UnusableCharacterError("character %s's video LoRA is missing or empty: %s"
+                                         % (name, video))
         stills = data["loras"]["stills"]["path"] if data["loras"]["stills"] else None
         if stills is not None and not _readable_nonempty(stills):
             raise CharacterError("character %s's stills LoRA is missing or empty: %s" % (name, stills))
@@ -456,7 +474,15 @@ def resolve_cast(entries):
     return members
 ```
 
-`_readable_nonempty(p)` is `os.path.isfile(p) and os.access(p, os.R_OK) and os.path.getsize(p) > 0`. Members keep entry order. LoRA bytes are **not** hashed here **[spec choice]**: the cost would be about 0.5 s per 642 MB file per tool invocation. The render hashes them for provenance (5.3).
+`_readable_nonempty(p)` is `os.path.isfile(p) and os.access(p, os.R_OK) and os.path.getsize(p) > 0`. Members keep entry order.
+
+**(Amendment)** Message texts are unchanged; only the exception class changes. `UnusableCharacterError` is raised for:
+
+- an invalid name, an unknown character, or an invalid `character.json` (anything `load_character` raises);
+- status other than `trained`;
+- a video LoRA that is missing or empty.
+
+Every other `resolve_cast` failure stays a plain `CharacterError`: a missing or empty stills LoRA, the trigger being a phrase word, an invalid phrase, a duplicate name, phrase or trigger. Those are errors in the request, not in the choice of character, so no alternatives are listed **[spec choice]**. LoRA bytes are **not** hashed here **[spec choice]**: the cost would be about 0.5 s per 642 MB file per tool invocation. The render hashes them for provenance (5.3).
 
 ### 3.6 Matching and trigger insertion
 
@@ -547,6 +573,65 @@ def build_cast_block(members):
 
 The block contains no `{` or `}` (C40), so it can never disturb `str.format` or the deploy X2 brace check.
 
+### 3.9 Cast discovery (amendment)
+
+```python
+class UnusableCharacterError(CharacterError):
+    """The named character does not exist, cannot be loaded, or cannot render (not trained, or
+    its video LoRA is missing or empty). Callers that can offer alternatives append
+    format_available_line(usable_characters()) (spec 3.9)."""
+
+
+NO_CHARACTERS_AVAILABLE = "available characters: none (create one with bin/character create)"
+LIST_ROW_FORMAT = "%-16s %-16s %-9s %-5s %-6s %s"
+
+
+def usable_characters():
+    """[(name, referring_phrase)] sorted by name, for every library character that
+    resolve_cast would accept on its own (loadable, trained, video LoRA readable and non-empty,
+    stills LoRA readable and non-empty when recorded)."""
+    usable = []
+    for name in list_names():
+        try:
+            member = resolve_cast([(None, name)])[0]
+        except CharacterError:
+            continue
+        usable.append((member.name, member.phrase))
+    return usable
+
+
+def format_available_line(characters):
+    """One line naming the usable characters; characters is usable_characters()'s list."""
+    if not characters:
+        return NO_CHARACTERS_AVAILABLE
+    return "available characters: " + ", ".join("%s (%s)" % (n, p) for n, p in characters)
+
+
+def character_table_lines():
+    """The library table printed by bin/character list and bin/ltx-movie --list-characters."""
+    names = list_names()
+    if not names:
+        return ["no characters in %s" % library_dir()]
+    lines = [LIST_ROW_FORMAT % ("NAME", "TRIGGER", "STATUS", "VIDEO", "STILLS", "PHRASE")]
+    for name in names:
+        try:
+            data = load_character(name)
+        except CharacterError as e:
+            lines.append("%-16s (invalid: %s)" % (name, e))
+            continue
+        lines.append(LIST_ROW_FORMAT % (
+            name, data["trigger"], data["status"],
+            "yes" if data["loras"]["video"] else "no",
+            "yes" if data["loras"]["stills"] else "no",
+            data["referring_phrase"]))
+    return lines
+```
+
+- `usable_characters()` is ordered by `list_names()`, which is already sorted. Each phrase listed is the character's `referring_phrase`, not a `--cast` override.
+- The table's `VIDEO`/`STILLS` columns report what `character.json` records. They do not check files: a character can show `yes` and still be absent from `available characters:`, because its file is missing.
+- Only `bin/ltx-movie` appends the `available characters:` line **[spec choice]**. `bin/ltx-story-manifest` and `bin/ltx-story-images` run only after `bin/ltx-movie` has resolved the cast, or by hand, so their error messages are unchanged.
+- `bin/character`'s own errors (CT1, CS1) are also unchanged. It reuses `character_table_lines()` for `list`, and `format_available_line` remains available to it.
+
 ---
 
 ## 4. `bin/character` and `character_dataset.py`
@@ -617,11 +702,10 @@ def build_parser():
 
 ### 4.3 `list` and `show`
 
-- **`list`.**
-  - If `list_names()` is empty, it prints `no characters in <library_dir()>` and exits 0.
-  - Otherwise it prints a header line, then one line per name. Both use `"%-16s %-16s %-9s %-5s %-6s %s"`, with the header columns `NAME TRIGGER STATUS VIDEO STILLS PHRASE`.
-  - `VIDEO`/`STILLS` are `yes` or `no`.
-  - A character whose `load_character` fails prints `"%-16s (invalid: %s)" % (name, e)` instead. The command still exits 0.
+- **`list`.** It runs `print("\n".join(character_lib.character_table_lines()))` and exits 0 (3.9).
+  - An empty library gives the single line `no characters in <library_dir()>`.
+  - Otherwise the output is a `NAME TRIGGER STATUS VIDEO STILLS PHRASE` header and one row per name, both in `LIST_ROW_FORMAT`. `VIDEO`/`STILLS` are `yes`/`no`.
+  - A character whose `load_character` fails gets the row `"%-16s (invalid: %s)" % (name, e)`, and the exit code is still 0.
 - **`show NAME`.**
   - It runs `load_character` (on `CharacterError`: `Error: <e>`, exit 2).
   - It prints `json.dumps(data, indent=2, ensure_ascii=False)`, then `files:`.
@@ -1493,7 +1577,13 @@ The docstring gains a paragraph describing `--cast` and the `characters` key.
                          help="LoRA strength for each cast character in a panel that names two "
                               "or more of them (default 0.8, provisional); a panel that names "
                               "one cast character always uses 1.0")
+    parser.add_argument("--list-characters", dest="list_characters", action="store_true",
+                         default=False,
+                         help="print the character library table (the same as bin/character "
+                              "list) and exit; must be the only argument")
 ```
+
+`--list-characters` is registered so that it appears in `--help`. `main` handles it before argparse runs (5.6(i)), so argparse never acts on it. This adds one `--help` entry and changes no existing help substring, so test L1 still passes.
 
 **(b) Helpers.**
 
@@ -1534,6 +1624,10 @@ def _resolve_casting(args):
     try:
         entries = [(None, name) for name in characters] + [lib.parse_cast_arg(v) for v in casts]
         members = lib.resolve_cast(entries)
+    except lib.UnusableCharacterError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        print(lib.format_available_line(lib.usable_characters()), file=sys.stderr)
+        return 2
     except lib.CharacterError as e:
         print("Error: %s" % e, file=sys.stderr)
         return 2
@@ -1588,6 +1682,8 @@ These rules are **[spec choice]**, for a consistent single mechanism downstream:
         return rc
 ```
 
+`main` also gains the 5.6(i) pre-scan as its first statement after `raw_argv` is computed.
+
 **(d) `build_story_prompt`.** It gains a keyword `cast_block=None` (after `seconds`). Right after `rendered = template.format(...)`:
 
 ```python
@@ -1628,6 +1724,36 @@ The block therefore sits between `Narrative to adapt:\n<narrative>` and `How thi
 - then a blank line.
 
 The module docstring gains a paragraph on casting that cites this spec.
+
+**(i) `--list-characters` (amendment).** `main` begins:
+
+```python
+def main(argv=None):
+    raw_argv = argv if argv is not None else sys.argv[1:]
+    if "--list-characters" in raw_argv:
+        return _list_characters(raw_argv)
+    parser = build_parser()
+    ... (unchanged) ...
+```
+
+```python
+def _list_characters(raw_argv):
+    """--list-characters: print bin/character list's table and exit, before argparse (so no
+    --story-id or narrative is required) and before the lockfile, the sudo check, the review
+    gate or any phase (spec 5.6(i))."""
+    if raw_argv != ["--list-characters"]:
+        print("Error: --list-characters takes no other arguments", file=sys.stderr)
+        return 2
+    print("\n".join(_character_lib().character_table_lines()))
+    return 0
+```
+
+- **Bypassing argparse's required arguments.** The pre-scan matches the exact token `--list-characters` anywhere in `raw_argv`, the same pattern as `make_dataset_seed.py`'s `--self-test` pre-scan. That runs before `build_parser().parse_args`, so `--story-id` and the narrative are never required.
+- **Combined with anything else [spec choice: refuse].** If the token appears together with any other argument (including `--help`, `--dry-run`, or a narrative), the result is exit 2, `Error: --list-characters takes no other arguments` on stderr, and nothing on stdout.
+  - `--list-characters=x` does not match the token. argparse then rejects it with its usual usage error (exit 2).
+- **No side effects.** It writes nothing, takes no lockfile, runs no `sudo -n true`, spawns no subprocess, and touches no server, story directory or GPU.
+  - `__main__`'s `pipeline_log.run_logged` gets `story_dir None`, because there is no `--story-id`. It therefore calls `main` directly and writes no log (`pipeline_log.py:88`).
+- **The uncast path is untouched.** Without the token, `main` proceeds exactly as before. The B1 golden (an uncast `--dry-run`) and every existing ltx-movie argv and output stay byte-identical. P49 still holds: `character_lib` is loaded only by `_list_characters` or by casting.
 
 ---
 
@@ -1701,7 +1827,9 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | E-P3 | ltx-movie | casting with `--lora`/`--stills-lora` | 2 |
 | E-P4 | ltx-movie, manifest, images | `--character-strength` outside (0, 1] | 2 |
 | E-P5 | ltx-movie, manifest, images | malformed `--cast` | 2, `Error: --cast must be PHRASE=NAME, got '<v>'` |
-| E-P6 | ltx-movie, manifest, images | unknown character / not trained / LoRA file missing or empty / duplicate name, phrase or trigger / trigger is a phrase word | 2, `Error: <CharacterError>` (3.5). Before any phase and any GPU work |
+| E-P6a | ltx-movie | `UnusableCharacterError` (3.5): invalid or unknown name, invalid `character.json`, not trained, video LoRA missing or empty | 2. Two stderr lines: `Error: <message>`, then `format_available_line(usable_characters())`, e.g. `available characters: kyra (the woman in grey), ronin (the ronin)`, or `available characters: none (create one with bin/character create)`. Before any phase and any GPU work |
+| E-P6b | ltx-movie | other `CharacterError` from `resolve_cast`/`parse_cast_arg`: stills LoRA missing or empty, duplicate name, phrase or trigger, trigger is a phrase word, malformed `--cast` | 2, `Error: <message>` only |
+| E-P6c | manifest, images | any `CharacterError`, including `UnusableCharacterError` | 2, `Error: <message>` only (3.9: no available line) |
 | E-P7 | ltx-movie | `--cast` while Phase 1 will run | 2 |
 | E-P8 | ltx-movie | `--character` + `--story-prompt-override` while Phase 1 will run | 2 |
 | E-P9 | ltx-movie | cast phrase not in the existing story.md | 2 |
@@ -1717,6 +1845,8 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | E-P19 | ltx-mlx-render | `--lora` + a cast manifest | 2 (5.3f) |
 | E-P20 | ltx-mlx-render | LoRA unreadable when provenance is built | the existing `panel N FAILED (provenance)` path |
 | E-P21 | ltx2_mlx_video_skill | `loras` invalid, or combined with `lora_path` | `ValueError` before any subprocess (5.1). The CLI maps it to exit 2 |
+| E-P23 | ltx-movie | `--list-characters` alone | 0. stdout = `"\n".join(character_table_lines()) + "\n"`. No other effect (5.6(i)) |
+| E-P24 | ltx-movie | `--list-characters` with any other argument | 2, `Error: --list-characters takes no other arguments`, stdout empty |
 | E-P22 | z_image_skill | `lora_path` + `loras` / adapter not registered / a different LoRA set on a loaded singleton | `ValueError` / `ValueError` / `RuntimeError` (5.2) |
 
 ---
@@ -1773,7 +1903,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | C19 | `list_names` with dirs `kyra` (valid), `bad` (no json), `.hidden`, `Upper` (json present), and the file `.triggers` | `["kyra"]`; a missing lib dir gives `[]` |
 | C20 | `registered_triggers` with `.triggers` = `"kyrawmn kyra\ngarbage\nroninmn ronin\n"` and a dir `ghost` whose JSON is invalid but has `"trigger": "ghosttt"` | `{"kyrawmn": "kyra", "roninmn": "ronin", "ghosttt": "ghost"}` |
 | C21 | `parse_cast_arg("the woman in grey=kyra")`, `"a=b=kyra"`, `"the ronin = ronin"` | `("the woman in grey", "kyra")`; `CharacterError` (the phrase `"a=b"` fails `PHRASE_WORD_RE`); `("the ronin", "ronin")` |
-| C22 | `parse_cast_arg("the ronin")`, `"the ronin=Bad Name"` | raises |
+| C22 | `parse_cast_arg("the ronin")`, `"the ronin=Bad Name"` | the first raises `CharacterError` and is **not** an `UnusableCharacterError`. The second raises `UnusableCharacterError` |
 | C23 | `cast_text("The woman in grey rides.", [kyra])` | `("The kyrawmn woman in grey rides.", ["kyra"])` |
 | C24 | mid-sentence and multiple occurrences: `"He bows to the woman in grey; the woman in grey nods."` | both inserted, names `["kyra"]` |
 | C25 | possessives: `"the ronin's blade"`, `"the ronin’s blade"` (phrase `the ronin`, trigger `roninmn`) | `"the roninmn ronin's blade"`, `"the roninmn ronin’s blade"` |
@@ -1789,9 +1919,14 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | C35 | `resolve_cast` happy path: kyra via `(None, "kyra")`, ronin via `("the swordsman", "ronin")` | members in entry order; kyra's phrase is her `referring_phrase`; ronin's is `"the swordsman"`; `video_lora` absolute; `stills_lora is None` |
 | C36 | `panel_strengths(["kyra"], members, 0.8)` | `{"kyra": 1.0}` |
 | C37 | `panel_strengths(["kyra", "ronin"], members, 0.8)` with ronin `strength=0.6` | `{"kyra": 0.8, "ronin": 0.6}` |
-| C38 | `resolve_cast` errors: unknown; `status untrained`; video file deleted; video file emptied; stills entry set but file missing; duplicate name; duplicate phrase differing only in case; two characters with the same trigger (hand-written JSON); trigger is a phrase word | each raises `CharacterError` with the 3.5 message |
+| C38 | `resolve_cast` errors: unknown; `status untrained`; video file deleted; video file emptied; stills entry set but file missing; duplicate name; duplicate phrase differing only in case; two characters with the same trigger (hand-written JSON); trigger is a phrase word | each raises `CharacterError` with the 3.5 message. The exception is an `UnusableCharacterError` exactly for: unknown, untrained, video deleted, video emptied (plus an invalid `character.json` and the name `"Bad"`, both added to this case list). For the rest it is not |
 | C39 | `build_cast_block([kyra, ronin])` | `== CAST_BLOCK_HEADER + "\n" + '- "the woman in grey": <descriptor>.' + "\n" + '- "the ronin": <descriptor>.' + "\n" + CAST_BLOCK_RULES` |
 | C40 | `CAST_BLOCK_HEADER + CAST_BLOCK_RULES` | contains no `{` or `}`. Contains `"word for word"` twice and `"longer than four words"` |
+| C42 | `format_available_line([])`; `format_available_line([("kyra", "the woman in grey"), ("ronin", "the ronin")])` | `"available characters: none (create one with bin/character create)"`; `"available characters: kyra (the woman in grey), ronin (the ronin)"` |
+| C43 | `usable_characters()` in a lib created in this order: `zed` (untrained), `ronin` (trained), `bad` (invalid JSON), `gone` (trained, video file deleted), `stl` (trained, stills entry whose file is missing), `kyra` (trained) | `[("kyra", "the woman in grey"), ("ronin", "the ronin")]`. An empty or missing lib gives `[]` |
+| C44 | `character_table_lines()` on an empty lib | `["no characters in <lib>"]` |
+| C45 | `character_table_lines()` on kyra (trained, no stills), ronin (untrained), and `bad` (invalid) | exactly `[LIST_ROW_FORMAT % ("NAME", "TRIGGER", "STATUS", "VIDEO", "STILLS", "PHRASE"), "%-16s (invalid: %s)" % ("bad", <load_character message>), LIST_ROW_FORMAT % ("kyra", "kyrawmn", "trained", "yes", "no", "the woman in grey"), LIST_ROW_FORMAT % ("ronin", "roninmn", "untrained", "no", "no", "the ronin")]` |
+| C46 | `UnusableCharacterError` | is a subclass of `CharacterError` (an existing `except CharacterError` in manifest and images still catches it) |
 | C41 | `character_lib.py` source, parsed with `ast` | every top-level `Import`/`ImportFrom` is a stdlib module from the set `{collections, datetime, json, os, re, uuid}` |
 
 ### 9.3 `tests/test_character_dataset.py`
@@ -1841,7 +1976,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | ID | Test | Assertion |
 |---|---|---|
 | K1 | `main([])`, `main(["create"])`, `main(["train"])`, `main(["show"])` | `SystemExit` code 2 |
-| K2 | `list` on an empty lib; on a lib with kyra (trained, no stills) and ronin (untrained) plus an invalid `bad` | `"no characters in <lib>\n"`. Otherwise exact lines per 4.3 (header + `kyra`, `ronin` rows and `bad (invalid: …)`), exit 0 |
+| K2 | `list` on an empty lib; on a lib with kyra (trained, no stills) and ronin (untrained) plus an invalid `bad` | stdout `== "\n".join(character_lib.character_table_lines()) + "\n"` in both cases (the C44/C45 lines), exit 0 |
 | K3 | `show kyra`; `show ghost` | the JSON dump + `files:` lines (`ok` for an existing LoRA, `MISSING` for a deleted sample); `show ghost` exits 2 |
 | K4 | `create` CE2-CE12 cases, one run each | the exact exit 2 and message. `<lib>` gains no directory. The fake VLM was never called (its call list is empty) |
 | K5 | `create` CE13a-c | 2 each |
@@ -1894,7 +2029,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | P35 | the uncast run with the same fake modules | the call kwargs have no `loras` key. `images.json` panels have no `loras` key |
 | P40 | `ltx_movie.build_story_prompt("n", "sid", 3, seconds="6", cast_block="CAST")` | equals the uncast prompt with `"\n\nCAST"` inserted immediately before `"\n\nHow this movie is made:"`. With `seed_image=True`, the preface and postface are unchanged and the block is inside |
 | P41 | `build_story_prompt(..., cast_block=None)` and `cast_block=""` | identical to the call without the keyword |
-| P42 | `_resolve_casting` E-P1, E-P2, E-P3, E-P4, E-P5, E-P6 (unknown), E-P7, E-P8, E-P9 | each returns 2 with the exact message. `args.cast_members == []` |
+| P42 | `_resolve_casting` E-P1, E-P2, E-P3, E-P4, E-P5, E-P6a (unknown), E-P6b (duplicate phrase), E-P7, E-P8, E-P9 | each returns 2 with the exact message: E-P6a is two lines (P50), every other case is exactly one line. `args.cast_members == []` |
 | P43 | `_resolve_casting` with `--character kyra` and no story.md | 0. `cast_block == build_cast_block([kyra])`. `character_strength == 0.8` |
 | P44 | `_resolve_casting` with story.md present containing `the woman in grey`, `--character kyra --cast "the ronin=ronin"` | 0. `cast_block is None`. Members `[kyra, ronin]`. `_cast_flags(args) == ["--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin", "--character-strength", "0.8"]` |
 | P45 | `_cast_flags` on a `Namespace` without `cast_members`, and with `[]` | `[]` |
@@ -1902,6 +2037,14 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | P47 | `phase1_story` with Phase 1 skipped (story.md exists without the phrase, forced through by setting `args.cast_members` directly) | the E-P10 warning is printed. rc 0 |
 | P48 | `phase2_stills` with casting and an existing `images/panel_01.png` (`subprocess.run` patched) | the E-P11 warning. The cmd ends with the `_cast_flags` |
 | P49 | `ltx-movie` uncast: `sys.modules` after `main(["n", "--story-id", "x", "--dry-run", "--no-review"])` | no module named `character_lib` was loaded |
+| P50 | `_resolve_casting` with `--character ghost`, lib = kyra + ronin (trained) | rc 2. stderr `== "Error: unknown character: ghost (no <lib>/ghost/character.json)\navailable characters: kyra (the woman in grey), ronin (the ronin)\n"` |
+| P51 | as P50 with an empty lib; and with a lib holding only `zed` (untrained) via `--character zed` | stderr second line `== "available characters: none (create one with bin/character create)"` in both. In the second case the first line is the 3.5 not-trained message |
+| P52 | `--cast "the ronin=Ronin"` (invalid name); `--character kyra` where kyra's video file is deleted; `--character kyra --character kyra`; `--cast "the ronin"` (no `=`) | the first two: error line plus the available line (in the second, kyra is absent from it). The last two: exactly one stderr line, with no `available characters:` |
+| P53 | `main(["--list-characters"])` with the C45 lib. `subprocess.run`, `subprocess.Popen` and `builtins.input` are patched to raise; `_story_dir` is unchanged | rc 0. stdout `== "\n".join(lib.character_table_lines()) + "\n"`. stderr empty. No `.movie.lock` created anywhere under `WS/generated/stories`. Nothing patched was called |
+| P54 | `main(["--list-characters", "--story-id", "x"])`, `main(["a narrative", "--list-characters"])`, `main(["--list-characters", "--help"])` | each rc 2. stderr `== "Error: --list-characters takes no other arguments\n"`. stdout `""` (no `SystemExit` from argparse) |
+| P55 | subprocess: `[sys.executable, "bin/ltx-movie", "--list-characters"]` vs `[sys.executable, "bin/character", "list"]`, both with `CHARACTER_LIBRARY_DIR` = the C45 lib, `cwd=WS` | both rc 0, byte-identical stdout, empty stderr |
+| P56 | `ltx_movie.build_parser().format_help()` | contains `--list-characters`. The L1-style substring checks (`"145 frames @ 24 fps = 6.04s per clip."`) still hold. B1 still passes |
+| P57 | manifest `--cast "the ronin=ghost"`; images `--cast "the ronin=ghost"` | rc 2. stderr is the single `Error: unknown character: …` line, with no `available characters:` (E-P6c) |
 
 ### 9.6 `tests/test_z_image_skill_multi_lora.py`
 
@@ -1976,6 +2119,18 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 | `_resolve_casting` allows `--cast` when Phase 1 runs | P42 |
 | `_cast_flags` omits `--character-strength` | P44 |
 | ltx-movie imports `character_lib` at top level | P49 |
+| `resolve_cast` raises plain `CharacterError` for not-trained | P51, C38 |
+| `parse_cast_arg` keeps a plain `CharacterError` for an invalid name | P52, C22 |
+| `_resolve_casting` catches only `CharacterError` (drops the available line) | P50 |
+| `_resolve_casting` prints the available line for every `CharacterError` | P52 |
+| `usable_characters` skips the `resolve_cast` check (lists every name) | C43, P52 |
+| `format_available_line` returns `"available characters: "` for an empty list | C42, P51 |
+| `usable_characters` iterates in creation order, not sorted | C43 |
+| `bin/character list` keeps its own table code with a different column width | K2, P55 |
+| `--list-characters` pre-scan removed (left to argparse) | P53 (argparse `SystemExit` for the missing `--story-id`) |
+| `_list_characters` accepts extra arguments | P54 |
+| `--list-characters` handled after the lockfile or sudo check | P53 |
+| manifest/images print the available line | P57 |
 | `train()` checks memory before the story server | D26 (order) |
 | `story_server_state` returns `"STOPPED"` on failure | D16 |
 | `train_video` records the LoRA after the test renders | D24 |
@@ -2025,16 +2180,16 @@ Narration: A silent agreement passes between them.
 
 1. **L0: mflux install (user-gated) + compat gate.** This is a throwaway check that touches no repo code. Report the result before building 4.9.
 2. **B-golden capture** (`tests/test_casting_regression.py --capture`, plus the fixtures), committed before any production edit.
-3. `character_lib.py` + `tests/test_character_lib.py`.
+3. `character_lib.py` + `tests/test_character_lib.py`, including the 3.9 cast-discovery helpers and C42-C46.
 4. `ltx2_mlx_video_skill.py` `loras` + P1-P5.
 5. `z_image_skill.py` multi-adapter + Z1-Z6.
 6. `bin/ltx-mlx-render` + P6-P17.
 7. `bin/ltx-story-manifest --cast` + P20-P25.
 8. `bin/ltx-story-images --cast` + P30-P35.
-9. `bin/ltx-movie` casting + P40-P49.
+9. `bin/ltx-movie` casting + P40-P49, then the amendment: the E-P6a available line (P50-P52), `--list-characters` (P53-P56), and P57 (manifest/images unchanged).
 10. `character_dataset.py`: create half (prompts, face, describe, score, contact sheet, child protocol, gates) + D1-D19, D35-D37.
 11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34.
-12. `bin/character` + K1-K18.
+12. `bin/character` + K1-K18. `list` reuses `character_table_lines()` (K2, P55).
 13. Deploy tuple (Section 8) + R2.
 14. R1 + B + the full mutation table, run by the main thread. Then the design-reviewer (Opus high) code review.
 15. Live gates L1 → L7 in the 9.7 order. L6 is the **acceptance gate** that sets `DEFAULT_CHARACTER_STRENGTH`, followed by the one-line follow-up commit.
