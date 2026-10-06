@@ -20,6 +20,13 @@ Both helpers live in `character_lib.py`: see Sections 3.9 and 5.6(i), the rows E
 
 See also the rows E-P25 to E-P29, the tests P60-P75, the gaps G19-G23, and the gates L6b and L6m.
 
+**Amendment 4, 2026-10-05 (user-approved, "test option 1 and evaluate"): stills LoRA settings from L0 and the 512 test.** The coordinator numbers this amendment 4; no amendment 3 is recorded in this file.
+
+- The measured facts are in 0.2 ("mflux, measured").
+- The stills config now trains at `max_resolution` 512 for about 672 steps, saving only the final checkpoint (4.9).
+- `train_stills` must not pre-create mflux's `output_path`. It finds checkpoints only under `<output_path>/checkpoints/` (4.9 steps 1 and 4).
+- Also updated: the budget (4.13), CT12, D9, D10, D13, D14 and D29 plus the new D38-D39, L0 (recorded as passed), L4, G1, G2 and G14, and Section 10 task 11 (the coordinator's plan Task 12).
+
 Two terms are used throughout:
 
 - A **character** is one entry in the library: a name, a trigger token, a referring phrase, a descriptor, a dataset, and up to two LoRAs (one video, one stills).
@@ -112,6 +119,25 @@ This feature turns the spike into a durable library (`bin/character`) and wires 
   - outputs `checkpoints/0000030_checkpoint.zip`, `loss/`, and `preview/`.
 - `src/mflux/models/common/training/state/training_state.py:28,50,70`: each checkpoint zip contains `{iterations:07d}_adapter.safetensors`.
 - **Unverified:** the adapter's key naming and its loadability into diffusers' `ZImageTransformer2DModel` (Section 11, G1).
+
+**mflux, measured (amendment 4; `generated/charlora/mflux-compat/` = L0, `generated/charlora/mflux-512/` = follow-up).**
+
+- **L0, `max_resolution` 1024 (kyrawmn-v1 data, 24 images):**
+  - 13.07 s/step, peak 38.7 GB, so 2400 steps would take about 8.7 h. **Rejected.**
+  - Adapter keys are `diffusion_model.layers.N.{attention.to_q, attention.to_k, attention.to_v, attention.to_out.0, feed_forward.w1, feed_forward.w2, feed_forward.w3}.lora_A/B.weight`: 210 modules.
+  - The adapter loads through the **existing** `z_image_skill` (injected 210 == expected 210). So G1 is resolved positively for this key format.
+- **Checkpoint zip** `NNNNNNN_checkpoint.zip` (verified with `unzip -l`):
+  - members: `NNNNNNN_adapter.safetensors` (140,136,769 B), `NNNNNNN_optimizer.safetensors` (280,273,360 B), `NNNNNNN_{iterator,loss,config}.json`, `checkpoint.json`, `run.json`;
+  - about 389 MB per zip;
+  - mflux also writes a `0000000_checkpoint.zip` (about 128 MB) at step 0;
+  - zips land under `<output_path>/checkpoints/`, next to `<output_path>/preview/` and `<output_path>/loss/`.
+- **Output-path rule (observed):** mflux appends `_<YYYYMMDD_HHMMSS>` to `output_path` when that directory **already exists**. L0 pre-created `out/` and got `out_20261005_194009/`. When the directory does not exist, it writes to `output_path` exactly (the 512 test).
+- **512 test, `max_resolution` 512, 1008 steps (42 epochs × 24 images):**
+  - about 4.6-5.1 s/step, 82 min wall-clock with concurrent CPU load, peak 38.66 GB;
+  - evaluated at 1024x640 with a trigger-only prompt **through `z_image_skill`, that is, with the abliterated text encoder**:
+    - step 336: the face is right, but the costume is not learned;
+    - **step 672: face, hairpins, kimono and obi are consistent across close-up, street and beach;**
+    - step 1008: no visible gain over 672.
 
 **Baseline test counts (run this session, before any change).**
 
@@ -662,15 +688,15 @@ def character_table_lines():
 - `TRAIN_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8-dev")`
 - `TEST_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.5-mlx-q8")`
 - `VIDEO_RANK = 32`, `VIDEO_STEPS = 1000`, `VIDEO_FINAL_CKPT = "lora_weights_step_01000.safetensors"`
-- `STILLS_RANK = 16`, `STILLS_TARGET_STEPS = 2400`
+- `STILLS_RANK = 16`, `STILLS_TARGET_STEPS = 672`, `STILLS_MAX_RESOLUTION = 512` (amendment 4)
 - `MFLUX_TRAIN = os.environ.get("CHARACTER_MFLUX_TRAIN", os.path.expanduser("~/mflux/.venv/bin/mflux-train"))` (the env var is test infrastructure)
 - `MFLUX_HF_HOME = os.environ.get("Z_IMAGE_HF_HOME", os.path.expanduser("~/hf_home"))`
-- Timeouts: `PREPROCESS_TIMEOUT_S = 1800`, `VIDEO_TRAIN_TIMEOUT_S = 14400`, `STILLS_TRAIN_TIMEOUT_S = 21600`, `TEST_RENDER_TIMEOUT_S = 1800`, `ZIMAGE_CHILD_TIMEOUT_S = 3600`
+- Timeouts: `PREPROCESS_TIMEOUT_S = 1800`, `VIDEO_TRAIN_TIMEOUT_S = 14400`, `STILLS_TRAIN_TIMEOUT_S = 10800` (3 h, about 3x the expected 55 min; amendment 4), `TEST_RENDER_TIMEOUT_S = 1800`, `ZIMAGE_CHILD_TIMEOUT_S = 3600`
 - `TEST_SEED = 42`
 
 Functions (signatures are normative; behavior is specified in the subsections below):
 
-`trigger_test_prompt(trigger, class_noun)`, `validate_face(d)`, `vlm_ready()`, `story_server(cmd)`, `story_server_state()`, `wait_for_vlm(timeout_s)`, `wait_for_avail(min_gib, timeout_s)`, `busy_process()`, `free_gib(path)`, `library_lock()` (context manager), `run_logged(cmd, log_path, cwd, env, timeout_s)`, `step_log_path(char_dir, step)`, `run_zimage_child(spec, char_dir, step)`, `face_height(seed_path)`, `describe(seed_path)`, `score_still(ref_path, cand_path)`, `wrap_still(png, mp4)`, `write_contact_sheet(items, stills_dir, out_path)`, `build_dataset(data, face_height)`, `create(args)`, `video_train_config(data_root, validation_prompt, output_dir)`, `preprocess_argv(videos, captions, out_dir)`, `train_argv(config_path)`, `train_video(data)`, `stills_epochs(kept)`, `stills_train_config(data_dir, output_dir, seed, kept)`, `safetensors_keys(path)`, `lora_module_count(keys)`, `extract_mflux_adapter(out_dir, dest)`, `train_stills(data)`, `train(args)`, `child_zimage(spec_path)`, `main(argv)`.
+`trigger_test_prompt(trigger, class_noun)`, `validate_face(d)`, `vlm_ready()`, `story_server(cmd)`, `story_server_state()`, `wait_for_vlm(timeout_s)`, `wait_for_avail(min_gib, timeout_s)`, `busy_process()`, `free_gib(path)`, `library_lock()` (context manager), `run_logged(cmd, log_path, cwd, env, timeout_s)`, `step_log_path(char_dir, step)`, `run_zimage_child(spec, char_dir, step)`, `face_height(seed_path)`, `describe(seed_path)`, `score_still(ref_path, cand_path)`, `wrap_still(png, mp4)`, `write_contact_sheet(items, stills_dir, out_path)`, `build_dataset(data, face_height)`, `create(args)`, `video_train_config(data_root, validation_prompt, output_dir)`, `preprocess_argv(videos, captions, out_dir)`, `train_argv(config_path)`, `train_video(data)`, `stills_epochs(kept)`, `stills_train_config(data_dir, output_dir, seed, kept)`, `safetensors_keys(path)`, `lora_module_count(keys)`, `extract_mflux_adapter(out_dir, dest, total_steps)`, `train_stills(data)`, `train(args)`, `child_zimage(spec_path)`, `main(argv)`.
 
 ### 4.2 `bin/character` CLI
 
@@ -1022,18 +1048,29 @@ trigger-only A/B (compare by eye; the LoRA clip should show the character, the c
 
 ### 4.9 Stills LoRA training (mflux) and the compat gate
 
-**Epoch arithmetic [spec choice].** The run gets about 2400 steps whatever the kept count, and exactly 4 checkpoints, the last one at the final step:
+**Epoch arithmetic (amendment 4).** The run gets about 672 steps (the 512-test sweet spot, 0.2) whatever the kept count. Only the final checkpoint is saved **[spec choice: final only]**: the 512 test showed no gain past 672, and intermediate zips cost about 389 MB each.
 
 ```python
 def stills_epochs(kept):
-    """(num_epochs, total_steps, save_frequency): num_epochs is a multiple of 4 and
-    save_frequency divides total_steps exactly (spec 4.9)."""
-    quarter = -(-STILLS_TARGET_STEPS // (4 * kept))     # ceil
-    num_epochs = 4 * quarter
-    return num_epochs, num_epochs * kept, quarter * kept
+    """(num_epochs, total_steps, save_frequency) for about STILLS_TARGET_STEPS steps; one
+    checkpoint, at the final step (spec 4.9, amendment 4)."""
+    num_epochs = max(1, round(STILLS_TARGET_STEPS / kept))
+    total_steps = num_epochs * kept
+    return num_epochs, total_steps, total_steps
 ```
 
-`stills_epochs(24) == (100, 2400, 600)`, `stills_epochs(12) == (200, 2400, 600)`, and `stills_epochs(17) == (144, 2448, 612)`. The 2400 figure follows the published Z-Image Turbo practice for 10-30 images (lr 1e-4, rank 16, 2500-3000 steps). It is provisional: L0 measures s/step (G14).
+| kept | result |
+|---|---|
+| 24 | `(28, 672, 672)` |
+| 12 | `(56, 672, 672)` |
+| 16 | `(42, 672, 672)` |
+| 17 | `(40, 680, 680)` |
+| 25 | `(27, 675, 675)` |
+| 13 | `(52, 676, 676)` |
+
+- `672 / kept` is never exactly x.5 for `kept` in 1..25, so Python's round-half-even never applies.
+- The expected run time is about 55 min per character (672 × 4.6-5.1 s, no CPU contention).
+- mflux additionally writes its own `0000000_checkpoint.zip` at step 0. It is ignored (step 4).
 
 **Config (`stills_train_config`).** `json.dump(..., indent=2)` writes it to `<dir>/train/stills/train.json`. The keys come from mflux's `_example/train.json`, plus `gradient_checkpointing` from mflux's common README:
 
@@ -1049,15 +1086,15 @@ def stills_train_config(data_dir, output_dir, seed, kept):
         "steps": 9,
         "guidance": 0.0,
         "quantize": None,
-        "max_resolution": 1024,
+        "max_resolution": STILLS_MAX_RESOLUTION,
         "low_ram": False,
         "gradient_checkpointing": True,
         "training_loop": {"num_epochs": num_epochs, "batch_size": 1,
                           "timestep_low": 4, "timestep_high": 9},
         "optimizer": {"name": "AdamW", "learning_rate": 1e-4},
         "checkpoint": {"save_frequency": save_frequency, "output_path": output_dir},
-        "monitoring": {"preview_width": 1024, "preview_height": 640,
-                       "plot_frequency": 100, "generate_image_frequency": total_steps},
+        "monitoring": {"preview_width": 512, "preview_height": 320,
+                       "plot_frequency": 100, "generate_image_frequency": total_steps + 1},
         "lora_layers": {"targets": [
             {"module_path": "layers.{block}." + m, "blocks": {"start": 0, "end": 30},
              "rank": STILLS_RANK} for m in modules]},
@@ -1068,19 +1105,28 @@ Choices made here:
 
 - **Targets [spec choice]:** attention and feed-forward only, across all 30 blocks. The example's `cap_embedder.1` and `all_final_layer.2-1.linear` are dropped, because their diffusers-side names are the least likely to map (G1).
 - `"quantize": None` (bf16 base) matches the bf16 base that z_image_skill fuses into **[spec choice]**.
+- **(Amendment 4)** `max_resolution` is 512 (L0 at 1024 measured 13.07 s/step, rejected; 0.2).
+- **(Amendment 4)** `generate_image_frequency` is `total_steps + 1` so that mflux renders **no** mid-run or final preview **[spec choice]**. The run's real trigger-only test is the compat gate's 1024x640 render (step 6). Previews are 512x320 should mflux render one anyway.
+- **(Amendment 4)** These targets produced the L0-validated key format: 210 modules = 7 targets × 30 blocks, all injected. So G1 is resolved for them.
 
 **`train_stills(data)`.** It returns `"ok"`, `"skipped"` (incompatible; the reason is recorded), or `"failed"` (a runtime failure).
 
-1. `sdir = <dir>/train/stills`. If it exists, `shutil.rmtree(sdir)`. Then `os.makedirs(sdir/data)` and `os.makedirs(sdir/out)`.
+1. `sdir = <dir>/train/stills`. If it exists, `shutil.rmtree(sdir)`. Then `os.makedirs(sdir/data)` **only**.
+   - **(Amendment 4)** The mflux `output_path` is `sdir/out`, and it must **not** be pre-created: mflux would write to a timestamped sibling `out_<YYYYMMDD_HHMMSS>/` instead (0.2).
+   - Only its parent `sdir` exists, because `os.makedirs(sdir/data)` creates `sdir`.
+   - Directly before step 3, if `os.path.lexists(sdir/out)` (the rmtree failed, or something created it) → print `Error: stills LoRA training refused: mflux output directory already exists: <sdir>/out (mflux would write to a timestamped sibling); move it aside and retry`, return `"failed"`.
 2. For each kept item: `shutil.copy2` `dataset/stills/char_NN.png` → `sdir/data/char_NN.png`, and `dataset/captions/char_NN.txt` → `sdir/data/char_NN.txt`. Write `sdir/data/preview_1.txt` = `trigger_test_prompt(...)`.
 3. Write `sdir/train.json`. Run `[MFLUX_TRAIN, "--config", sdir/train.json]` with cwd `sdir`, env `dict(os.environ, HF_HOME=MFLUX_HF_HOME)`, timeout `STILLS_TRAIN_TIMEOUT_S`, and log step `train-stills`.
    - `HF_HOME` points at the internal `~/hf_home`, so the 31 G Z-Image-Turbo cache is reused and the training adapter downloads there, not to the USB global cache **[spec choice]**.
    - rc != 0 → `Error: stills LoRA training failed: mflux-train exited <rc>; log: <log>`, return `"failed"`.
-4. Run `extract_mflux_adapter(sdir/out, <dir>/lora/stills.candidate.safetensors)`:
-   - `zips = glob.glob(os.path.join(out_dir, "**", "*_checkpoint.zip"), recursive=True)`. A recursive glob is used because the exact subfolder layout is unverified (G14).
-   - Take the zip whose basename's leading integer is largest.
+4. Run `extract_mflux_adapter(sdir/out, <dir>/lora/stills.candidate.safetensors, total_steps)`, where `total_steps` comes from `stills_epochs(kept)`:
+   - **(Amendment 4)** The signature becomes `extract_mflux_adapter(out_dir, dest, total_steps)`.
+   - `zips = glob.glob(os.path.join(out_dir, "checkpoints", "[0-9]" * 7 + "_checkpoint.zip"))`. That is **only** `<output_path>/checkpoints/`: no recursion, and no timestamped siblings.
+   - Take the zip whose 7-digit leading integer is largest.
    - Its members ending in `_adapter.safetensors` must be exactly 1; extract that member's bytes to `dest`.
-   - No zip, or not exactly 1 adapter member → `DatasetError("mflux-train wrote no checkpoint zip with exactly one *_adapter.safetensors under %s" % out_dir)` → print `Error: <e>`, return `"failed"`.
+   - No zip, or not exactly 1 adapter member → `DatasetError("mflux-train wrote no checkpoint zip with exactly one *_adapter.safetensors under %s" % os.path.join(out_dir, "checkpoints"))`.
+   - The largest step is not `total_steps` (for example only `0000000_checkpoint.zip` exists) → `DatasetError("mflux-train's last checkpoint is step %d, expected %d (the run stopped early)" % (step, total_steps))`.
+   - Both print `Error: <e>` and return `"failed"`.
 5. `expected = lora_module_count(safetensors_keys(candidate))`. The stdlib parsers are:
 
 ```python
@@ -1157,7 +1203,12 @@ if spec["loras"] and z_image_skill._pipeline is not None:
 ```
 
 - **Verified from mflux's docs:** the `mflux-train --config PATH` CLI; `mflux-train --resume CHECKPOINT.zip`; every key in 4.9 except `gradient_checkpointing` (that one is documented in prose, not in the example); the data layout (`NN.txt` + image, optional `preview*.txt`); and the checkpoint zip naming.
-- **Unverified:** whether `gradient_checkpointing` is a top-level key; the output subfolder layout; whether "steps" = epochs x images; the adapter's tensor key names; and the s/step and peak memory on this host. L0 measures these.
+- **Measured by L0 and the 512 test (amendment 4; 0.2):**
+  - the output layout and the existing-directory timestamp rule;
+  - steps = epochs × images (42 × 24 = 1008 checkpoints observed);
+  - the adapter key names;
+  - s/step and peak memory.
+- **Still unverified:** whether `gradient_checkpointing` is honored as a top-level key. The config was accepted and peak memory was 38.7 GB at 1024 and 38.66 GB at 512, but no A/B without the key was run.
 
 ### 4.11 `train(args)` (normative order)
 
@@ -1225,10 +1276,12 @@ Everything after the preflights runs inside `library_lock()`.
 | `train/video/preprocessed` | ~0.6 GB | spike: 578 M |
 | `train/video/out` (4 checkpoints + sample) | ~2.6 GB | spike: 4 x 641,974,104 B |
 | `lora/video.safetensors` | 0.64 GB | copy of the final checkpoint |
-| `train/stills/out` (4 zips with adapter + optimizer state) | ~1.5-2 GB | **estimate**: rank-16 adapter on 210 modules ~70-140 MB; AdamW state ~2x |
-| `lora/stills.safetensors` | ~70-140 MB | estimate |
+| `train/stills/out` (step-0 zip + the final zip, plus `loss/` and `preview/`) | ~0.52 GB | **measured** (amendment 4): about 128 MB step-0 zip + about 389 MB final zip |
+| `lora/stills.safetensors` | 140 MB | **measured**: 140,136,769 B |
 | `tests/` | <1 MB | spike A/B: 104 KB + 132 KB |
-| **Total** | **~4 GB video-only; ~6 GB with stills** | |
+| **Total** | **~4 GB video-only; ~4.7 GB with stills** | |
+
+**Training memory (amendment 4).** The stills run peaks at about 38.7 GB, close to the video run's 40 GB. The `TRAIN_MIN_AVAIL_GIB = 30` preflight is unchanged, because the 512 test ran with 38.66 GB peak under that regime. The two kinds always run sequentially, never at the same time (4.11).
 
 The one-time mflux training adapter download goes into `~/hf_home` and is shared.
 
@@ -2033,7 +2086,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | CT9 | mflux-train missing | 1 iff `--stills` given, else 0 | 4.11 step 5. The video LoRA proceeds or is kept |
 | CT10 | preprocess or train rc != 0, wrong latent count, or missing final checkpoint | 1 | `Error: video LoRA training failed at <step> (exit <rc>); log: <log>; character <n> stays <status>`. `status` unchanged. Stills not attempted |
 | CT11 | video test render failed | 1 | `Error: video test render failed: <e>`. The LoRA stays recorded, `status` = `trained` |
-| CT12 | mflux-train rc != 0, or no adapter in its output | 1 | 4.9 steps 3-4 |
+| CT12 | mflux-train rc != 0; `sdir/out` already exists before the run (amendment 4); no adapter under `<out>/checkpoints/`; or the last checkpoint step != `total_steps` | 1 | 4.9 steps 1, 3 and 4 |
 | CT13 | adapter incompatible | 1 iff `--stills` given, else 0 | 4.9 step 7. `lora/stills.rejected.safetensors` is kept |
 | CS1 | `show` unknown/invalid | 2 | `Error: <CharacterError>` |
 | CS2 | `list` with an invalid entry | 0 | a row `(invalid: <e>)` |
@@ -2166,12 +2219,14 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | D6 | `trigger_test_prompt("kyrawmn", "woman")` | `"kyrawmn woman, medium shot, standing and facing the camera, photorealistic live-action film still, natural light."` |
 | D7 | `video_train_config("/d/pre", "p, q.", "/d/out")` | equals the template with `"…"` JSON-quoted values. Parsing it with a minimal check (`yaml` is not required): it contains the lines `  model_path: "<TRAIN_MODEL_DIR>"`, `  preprocessed_data_root: "/d/pre"`, `    - "p, q."`, `output_dir: "/d/out"`, `  rank: 32`, `  alpha: 32`, `  steps: 1000`, `  interval: 250`, `  keep_last_n: 10`. Contains no `{` |
 | D8 | `preprocess_argv("/v", "/c", "/o")`; `train_argv("/t.yaml")` | `[BIN, "preprocess", "--videos", "/v", "--captions", "/c", "-o", "/o", "-m", TRAIN_MODEL_DIR, "-H", "320", "-W", "512", "--max-frames", "1"]`; `[BIN, "train", "--config", "/t.yaml", "--low-ram"]` |
-| D9 | `stills_epochs(24)`, `(12)`, `(17)`, `(25)`; and for k in 1..30 | `(100, 2400, 600)`, `(200, 2400, 600)`, `(144, 2448, 612)`, `(96, 2400, 600)`. For all k: `epochs % 4 == 0`, `total % save == 0`, `total // save == 4`, `total >= 2400` |
-| D10 | `stills_train_config("/d", "/o", 0, 24)` | the 4.9 dict exactly: 7 targets, each `"blocks": {"start": 0, "end": 30}`, `"rank": 16`; `checkpoint == {"save_frequency": 600, "output_path": "/o"}`; `monitoring.generate_image_frequency == 2400` |
+| D9 | `stills_epochs` for the 4.9 table rows; and for k in 1..30 | each row exactly. For all k: `epochs >= 1`, `total == epochs * k`, `save == total`, `abs(total - 672) <= k / 2` |
+| D10 | `stills_train_config("/d", "/o", 0, 24)` | the 4.9 dict exactly: `max_resolution == 512`; 7 targets, each `"blocks": {"start": 0, "end": 30}`, `"rank": 16`; `training_loop.num_epochs == 28`; `checkpoint == {"save_frequency": 672, "output_path": "/o"}`; `monitoring == {"preview_width": 512, "preview_height": 320, "plot_frequency": 100, "generate_image_frequency": 673}` |
 | D11 | `safetensors_keys` on a hand-built file (8-byte header length + JSON with `__metadata__` and 3 tensors) | the 3 sorted keys |
 | D12 | `lora_module_count` on `["layers.0.attention.to_q.lora_A.weight", "layers.0.attention.to_q.lora_B.weight", "lora_unet_x.lora_down.weight", "lora_unet_x.alpha", "other.weight"]` | `2` |
-| D13 | `extract_mflux_adapter` on a tmp tree `out/run/checkpoints/0000600_checkpoint.zip` and `0002400_checkpoint.zip`, each holding `NNNNNNN_adapter.safetensors` + `NNNNNNN_optimizer.safetensors` | the dest bytes equal the 2400 zip's adapter member |
-| D14 | `extract_mflux_adapter` with no zips; with a zip holding 2 adapter members | `DatasetError` each |
+| D13 | `extract_mflux_adapter(out, dest, 672)` on `out/checkpoints/0000000_checkpoint.zip` and `out/checkpoints/0000672_checkpoint.zip`. Each holds the 0.2 member set (`NNNNNNN_adapter.safetensors`, `NNNNNNN_optimizer.safetensors`, `NNNNNNN_{iterator,loss,config}.json`, `checkpoint.json`, `run.json`) | the dest bytes equal the 672 zip's adapter member |
+| D14 | `extract_mflux_adapter` with no zips; with a zip holding 2 adapter members; with only `0000000_checkpoint.zip` (step-mismatch message `"…last checkpoint is step 0, expected 672…"`); with the only zip in a timestamped sibling `out_20261005_194009/checkpoints/` (not searched) | `DatasetError` each |
+| D38 | `train_stills` with `run_logged` patched to record `os.path.exists(sdir/out)` at the moment mflux is invoked | it records `False`, and `sdir` exists. A pre-existing `sdir/out` that survives (rmtree patched to a no-op) → `"failed"`, the CT12 "already exists" message, and mflux never invoked |
+| D39 | `STILLS_TARGET_STEPS`, `STILLS_MAX_RESOLUTION`, `STILLS_TRAIN_TIMEOUT_S` | `672`, `512`, `10800` |
 | D15 | `write_contact_sheet` with 25 items (item 5 dropped, item 7's PNG missing) | a 1280x900 JPEG. The pixel at the red border of tile 5 (`(5 % 5) * 256 + 1, (5 // 5) * 180 + 1`) is red-dominant (R > 200, G < 60). Tile 7's centre is black |
 | D16 | `story_server_state` with `subprocess.run` patched to return the real `status` output captured in 0.2 (`"  state:          SERVING vision"`), then `STOPPED`, then `LOADING vision`, then rc 1 with no state line, then `OSError` | `"SERVING vision"`, `"STOPPED"`, `"LOADING vision"`, `"UNKNOWN"`, `"UNKNOWN"` |
 | D17 | `busy_process` with `psutil.process_iter` patched to yield cmdlines `["/x/ltx-2-mlx", "generate", …]`, `["python3", "bin/ltx-mlx-render", …]`, `["/x/mflux-train", "--config", "c"]`, `["vim", "notes-ltx-2-mlx.txt"]`, `["python3", "character_dataset.py", "zimage", "--spec", "s"]` (one per run) | a match for 1, 2, 3, 5; `None` for 4 |
@@ -2186,7 +2241,7 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | D26 | `train()` preflight order: each of lock, busy, `story_server_state() == "SERVING vision"`, avail 29.9 GiB, free disk 15.9 GiB for both kinds, dev dir containing `transformer-distilled.safetensors` | each returns 2 with the 7.2 message. `train_video` is never called (a sentinel patch raises if called). An extra case with the server `SERVING vision` **and** avail 29.9 GiB reports CT5, which pins the order |
 | D27 | `train()`: `--video` only on a character that has a video LoRA, without `--force`; with `--force` | 2 (CT3); proceeds |
 | D28 | `train()` default kinds with `MFLUX_TRAIN` pointing at a missing path | video trains. `stills_skip_reason == "mflux-train not found at <p>"`. Exit 0. The same with `--stills` → exit 1 |
-| D29 | `train_stills` happy path: `run_logged` writes a checkpoint zip whose adapter has 2 modules; `run_zimage_child` returns `injected_lora_modules: 2` and writes the PNG | `"ok"`. `lora/stills.safetensors` exists. `loras.stills.rank == 16`, `steps == 2400` (24 kept). The control child spec has `"loras": None`. The data dir holds 24 png+txt pairs plus `preview_1.txt == trigger_test_prompt(...)`. `train.json` equals `stills_train_config(...)`. The env passed has `HF_HOME == MFLUX_HF_HOME` |
+| D29 | `train_stills` happy path: `run_logged` writes a checkpoint zip whose adapter has 2 modules; `run_zimage_child` returns `injected_lora_modules: 2` and writes the PNG | `"ok"`. `lora/stills.safetensors` exists. `loras.stills.rank == 16`, `steps == 672` (24 kept). The patched mflux writes `sdir/out/checkpoints/0000672_checkpoint.zip`. The control child spec has `"loras": None`. The data dir holds 24 png+txt pairs plus `preview_1.txt == trigger_test_prompt(...)`. `train.json` equals `stills_train_config(...)`. The env passed has `HF_HOME == MFLUX_HF_HOME` |
 | D30 | `train_stills`: injected 1 of 2 | `"skipped"`. `lora/stills.rejected.safetensors` exists and `stills.safetensors` does not. `stills_skip_reason` contains `"only 1 of 2 LoRA modules"`. `loras.stills` unchanged |
 | D31 | `train_stills`: the compat child raises `DatasetError` | `"skipped"`, with the reason containing `"could not load or render"` |
 | D32 | `train_stills`: the adapter has zero `.lora` keys | `"skipped"`, reason `"the adapter file has no LoRA modules"` |
@@ -2392,7 +2447,13 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 | `train()` checks memory before the story server | D26 (order) |
 | `story_server_state` returns `"STOPPED"` on failure | D16 |
 | `train_video` records the LoRA after the test renders | D24 |
-| `stills_epochs` uses floor | D9 |
+| `stills_epochs` uses floor | D9 (`kept=17` gives 39 × 17 = 663) |
+| `stills_epochs` saves 4 checkpoints again | D9, D10 |
+| `max_resolution` back to 1024 | D10 |
+| `train_stills` pre-creates `sdir/out` | D38 |
+| `extract_mflux_adapter` searches recursively | D14 (timestamped-sibling case) |
+| step-mismatch check removed | D14 (step-0-only case) |
+| `generate_image_frequency` set to `total_steps` | D10 |
 | compat gate accepts `injected != expected` | D30 |
 | incompatible adapter overwrites a good previous stills LoRA | D34 |
 | `create` writes the dir before the face check | K7 |
@@ -2403,12 +2464,12 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 
 | ID | Gate | Pass condition |
 |---|---|---|
-| L0 | **mflux compat gate (plan task 1).** After the user approves 4.10, install it. Run a smoke train in the gitignored scratch dir `generated/charlora/mflux-compat/` (not `/tmp`). Data: copies of `generated/charlora/kyrawmn-v1/stills/char_NN.png` with `captions/char_NN.txt`. Config: `stills_train_config(…, kept=24)` with `num_epochs` overridden to 4 (96 steps) and `save_frequency` 48. Command: `HF_HOME=~/hf_home ~/mflux/.venv/bin/mflux-train --config …`. Extract the adapter (4.9 step 4). Then, in a throwaway `python3 -c` using the **existing** `z_image_skill.load_pipeline(lora_path=<adapter>)`, count `lora_A` modules against `lora_module_count(safetensors_keys(adapter))`, and render `kyrawmn woman, medium shot, standing and facing the camera, …` at 1024x640, seed 42 | `mflux-train` exits 0. Record s/step, the peak footprint (`/usr/bin/time -l`), the checkpoint dir layout, and the adapter key sample (first 5 keys) in the plan's notes. **Compatible** iff injected == expected > 0 and the image renders. If incompatible, report to the user before building 4.9; the code is still built per spec (it then always skips). If s/step x 2400 > 4 h, report it to the user |
+| L0 | **PASSED 2026-10-05 (amendment 4; results in 0.2).** At 1024, compatible: 210/210 injected via the existing z_image_skill. 13.07 s/step at 1024 was rejected, so the 512 follow-up chose the 4.9 settings. Original gate text, kept for the record: **mflux compat gate (plan task 1).** After the user approves 4.10, install it. Run a smoke train in the gitignored scratch dir `generated/charlora/mflux-compat/` (not `/tmp`). Data: copies of `generated/charlora/kyrawmn-v1/stills/char_NN.png` with `captions/char_NN.txt`. Config: `stills_train_config(…, kept=24)` with `num_epochs` overridden to 4 (96 steps) and `save_frequency` 48. Command: `HF_HOME=~/hf_home ~/mflux/.venv/bin/mflux-train --config …`. Extract the adapter (4.9 step 4). Then, in a throwaway `python3 -c` using the **existing** `z_image_skill.load_pipeline(lora_path=<adapter>)`, count `lora_A` modules against `lora_module_count(safetensors_keys(adapter))`, and render `kyrawmn woman, medium shot, standing and facing the camera, …` at 1024x640, seed 42 | `mflux-train` exits 0. Record s/step, the peak footprint (`/usr/bin/time -l`), the checkpoint dir layout, and the adapter key sample (first 5 keys) in the plan's notes. **Compatible** iff injected == expected > 0 and the image renders. If incompatible, report to the user before building 4.9; the code is still built per spec (it then always skips). If s/step x 2400 > 4 h, report it to the user |
 | L1 | Face-measure calibration (VLM only): `face_height` on `generated/charlora/kyrawmn-v1/stills/char_01.png`, and on `generated/stories/ronin-e2e-appearance-20261005/images/panel_01.png` | char_01 >= 0.25. ronin panel_01 < 0.15, or None. Record both values. If they do not separate, report (G3) |
 | L1b | DESCRIBE on the ronin `panel_01.png` (a riding scene) | the descriptor does not contain `boots`, `riding`, `horse`, or `reins`. It mentions apparent ethnicity if the VLM states one. Record it |
 | L2 | `bin/character create kyra --phrase "the woman in grey" --seed-image generated/charlora/kyrawmn-v1/stills/char_01.png` | exit 0. kept >= 12. Contact sheet eyeballed (consistent face, hairpins, kimono). Trigger `kyrawmn`. The vision server is serving again afterwards |
 | L3 | `bin/character create ronin --phrase "the ronin" --descriptor "a lean man in his late thirties with a topknot and a scarred brow, wearing a faded indigo haori and dark hakama" --class man` | exit 0. kept >= 12. Contact sheet eyeballed. Trigger `roninmn` |
-| L4 | `bin/story-server stop`; `bin/character train kyra` | exit 0. A skipped or incompatible stills LoRA (CT9/CT13) still exits 0 here, because `--stills` was not given. Exit 1 only on CT10, CT11, or CT12. `lora/video.safetensors` is 641,974,104 bytes. A/B eyeballed: `tests/video_lora.mp4` shows the character; `video_control.mp4` shows a stranger. If the stills LoRA trained: `tests/stills_lora.png` shows her, and the control shows a stranger. Record the wall-clock time (~47 min expected for video) and the peak footprint |
+| L4 | `bin/story-server stop`; `bin/character train kyra` | exit 0. (Amendment 4) The stills phase should take about 55 min (672 steps at 512), peak about 38.7 GB. `train/stills/out/checkpoints/0000672_checkpoint.zip` exists, and there is no `out_*` sibling. A skipped or incompatible stills LoRA (CT9/CT13) still exits 0 here, because `--stills` was not given. Exit 1 only on CT10, CT11, or CT12. `lora/video.safetensors` is 641,974,104 bytes. A/B eyeballed: `tests/video_lora.mp4` shows the character; `video_control.mp4` shows a stranger. If the stills LoRA trained: `tests/stills_lora.png` shows her, and the control shows a stranger. Record the wall-clock time (~47 min expected for video) and the peak footprint |
 | L5 | `bin/character train ronin` | as L4 for the ronin |
 | L6 | **Bleed sweep (acceptance gate).** Three story dirs, `generated/stories/bleed-sweep-s10`, `-s08`, `-s06`, each holding the 9.8 `story.md`. Run `bin/ltx-movie "two-character bleed sweep" --story-id bleed-sweep-sNN --panels 2 --no-review --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8 --cast "the woman in grey=kyra" --cast "the ronin=ronin" --character-strength S` for S = 1.0, 0.8, 0.6. Then `bin/judge-clips --story-id bleed-sweep-sNN` for each | Each run exits 0, and the manifests show both characters at S on both panels. **Winner rule:** the highest S at which, in both panels, she shows her trained identity (face, three jade hairpins, grey kimono) with no male or ronin traits, **and** he shows topknot, scarred brow, and indigo haori with no female, kimono, or hairpin traits, by the user's eyeball. judge-clips `physical_realism` breaks ties (higher wins). If no S passes, the default stays 0.8 and G4 is recorded as unresolved. The winner is written into `DEFAULT_CHARACTER_STRENGTH` (plus C36/C37 and the help texts "default 0.8") in a follow-up commit |
 | L6b | **Character + global quality case: DEFERRED** **[spec choice: defer, do not download]** | Run when the user provides a real non-character LTX LoRA `G`. Repeat the L6 `bleed-sweep-s08` command with `--lora G:1.0`, then with `--lora G:0.6` (new story ids `bleed-sweep-s08-gG10`/`-gG06`). Pass: G's effect is visible, and both identities hold by the L6 rule. Until then, record "L6b deferred: no non-character LoRA available locally (G22)" in the acceptance notes |
@@ -2448,7 +2509,7 @@ Narration: A silent agreement passes between them.
 8. `bin/ltx-story-images --cast` + P30-P35, plus amendment 2: 5.7.4 and the E-P15 removal (P33, P68, P69).
 9. `bin/ltx-movie` casting + P40-P49, plus amendment 2: `_RepeatableLoraAction`, `_resolve_global_loras`, the forwarding, and the E-P3 removal (P70-P73). Then amendment 1: the E-P6a available line (P50-P52), `--list-characters` (P53-P56), and P57 (manifest/images unchanged).
 10. `character_dataset.py`: create half (prompts, face, describe, score, contact sheet, child protocol, gates) + D1-D19, D35-D37.
-11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34.
+11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34. The coordinator's plan **Task 12** is this item. Amendment 4 sets the stills config: `max_resolution` 512, `round(672/kept)` epochs, final-only checkpoint, `generate_image_frequency = total_steps + 1`, 3 h timeout. It also adds: never pre-create `sdir/out`; search only `<out>/checkpoints/`; the step-mismatch check; and D9, D10, D13, D14, D29, D38, D39.
 12. `bin/character` + K1-K18. `list` reuses `character_table_lines()` (K2, P55).
 13. Deploy tuple (Section 8) + R2.
 14. R1 + B + the full mutation table, run by the main thread. Then the design-reviewer (Opus high) code review.
@@ -2460,10 +2521,13 @@ Tasks 3-9 and 10-12 are independent chains. Within each chain the order matters.
 
 ## 11. Known gaps
 
-- **G1. mflux → diffusers key compatibility is unverified.**
-  - mflux saves `{n:07d}_adapter.safetensors` inside a zip, with key names not seen. diffusers converts only `lora_unet_` / `diffusion_model.` / `.alpha` / `default.` formats, and silently ignores unmatched keys.
-  - The compat gate (4.9) and L0 are the only proof. The stills half may ship permanently skipped.
-- **G2. Text-encoder mismatch.** mflux trains with stock Z-Image-Turbo (Qwen3-4B text encoder), but `z_image_skill` renders with the abliterated `BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1`. A LoRA learned against one encoder's embeddings is applied under the other's. L4's stills A/B is the only check.
+- **G1. mflux → diffusers key compatibility: RESOLVED by L0 (amendment 4).**
+  - The keys are `diffusion_model.layers.N.<module>.lora_A/B.weight`, which diffusers converts. All 210 modules were injected through the existing z_image_skill.
+  - The compat gate (4.9) stays as a per-run guard, against a future mflux version changing the format.
+- **G2. Text-encoder mismatch: partly verified.**
+  - mflux trains with stock Z-Image-Turbo (Qwen3-4B text encoder), but `z_image_skill` renders with the abliterated `BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1`.
+  - **(Amendment 4)** The 512 test's evaluation rendered through z_image_skill, so with the abliterated encoder. Identity held at step 672 (face, hairpins, kimono, obi; close-up, street, beach) for one character, kyrawmn.
+  - Still unverified: whether the mismatch costs fidelity relative to rendering with the stock encoder (no stock-encoder A/B was run), and whether it holds for other characters (L4/L5 cover kyra and ronin).
 - **G3. Face-box convention.** That `qwen38-6bit` (Qwen3-VL-32B, 6-bit) returns 0-1000 relative boxes is assumed from the model family, and L1 calibrates it. If it returns pixel coordinates of its resized input, the threshold is meaningless until it is re-derived.
 - **G4.** The multi-character default strength of 0.8 is provisional until L6.
 - **G5.** An on-screen character whose phrase is absent from a panel's prompt gets no LoRA (approved limit). Pronoun-only panels (`"she turns"`) are the common case.
@@ -2475,7 +2539,12 @@ Tasks 3-9 and 10-12 are independent chains. Within each chain the order matters.
 - **G11. Seed-image and CAST block conflict.** `--seed-image` + `--character` gives the story model two instructions that can conflict: describe the image literally, and use the cast description word for word. Not refused.
 - **G12. Deploy targets.** They get `character_lib.py` but no tooling. Copied library dirs carry absolute LoRA paths that must match the target's layout.
 - **G13. Concurrency is enforced only by `bin/character`.** `bin/ltx-movie` does not refuse to start during a training run. Its avail-memory gate (25 GiB) normally blocks it, because training holds about 40 GB.
-- **G14. Unverified mflux details.** The placement of `gradient_checkpointing`, the checkpoint subfolder layout (handled by the recursive glob), steps-per-epoch semantics (hence the "highest step" rule), and runtime and memory. L0 records them.
+- **G14. mflux details: mostly measured (amendment 4).**
+  - Measured: the layout, the existing-directory timestamp rule, steps = epochs × images, about 4.6-5.1 s/step and 38.7 GB at 512.
+  - Remaining:
+    - whether `gradient_checkpointing` takes effect;
+    - the 0.2 timestamp rule being mflux 0.21.0 behavior, which a future version may change (D38 and the refusal in step 1 guard the known form);
+    - the 82-min measurement was taken with concurrent CPU load, so the 55-min estimate is unverified on an idle host.
 - **G15. Trigger tokenization.** Whether Gemma-3 (the LTX encoder) and Qwen3-4B tokenize a trigger like `kyrawmn` into stable sub-tokens is unverified beyond the spike's success with exactly `kyrawmn`.
 - **G16. Hashing cost.** Provenance hashes each LoRA once per render process: about 0.5-1 s per 642 MB file. The dry run hashes too, when `--resume` predicts.
 - **G17. Process scan false positives.** `busy_process` matches on command-line substrings, so an unrelated process whose argv contains `bin/ltx-movie` (for example an editor) blocks create and train (fail-closed by design).
