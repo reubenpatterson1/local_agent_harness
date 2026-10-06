@@ -32,6 +32,7 @@ pipeline needs, leaving the global HF_HOME and every other tool untouched.
 """
 
 import argparse
+import math
 import os
 import shlex
 import shutil
@@ -107,6 +108,25 @@ def validate_geometry(width, height, num_frames):
         raise ValueError("num_frames must be >= 9, got %d" % num_frames)
 
 
+def parse_lora_spec(value):
+    """(path, strength, explicit) from PATH or PATH:STRENGTH. The value is split on its LAST ':'
+    only when the text after it parses as a float; otherwise the whole value is the path
+    (so 'org/repo:main' and ':0.5' are paths). STRENGTH must be finite and in (0, 2]. Default
+    strength 1.0 (spec 5.7.1)."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("LoRA value must be a non-empty PATH or PATH:STRENGTH, got %r" % (value,))
+    head, sep, tail = value.rpartition(":")
+    if sep and head:
+        try:
+            strength = float(tail)
+        except ValueError:
+            return value, 1.0, False
+        if not (math.isfinite(strength) and 0 < strength <= 2.0):
+            raise ValueError("LoRA strength must be in (0, 2], got %r in %r" % (tail, value))
+        return head, strength, True
+    return value, 1.0, False
+
+
 def _resolve_bin():
     """Absolute path to the ltx-2-mlx binary. A bare name (no path
     separator) is resolved through PATH; anything else is used verbatim so
@@ -122,7 +142,7 @@ def _resolve_bin():
 def build_command(*, prompt, output_path, image_path=None, width, height,
                   num_frames, frame_rate, seed, model=MODEL_ID, gemma=GEMMA_MODEL_ID,
                   lora_path=None, low_ram=True,
-                  tile_frames=1, tile_spatial=1, quiet=False):
+                  tile_frames=1, tile_spatial=1, quiet=False, loras=None):
     """Emit the ltx-2-mlx argv in a fixed token order so golden tests can
     assert on the list.
 
@@ -135,12 +155,18 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
     selects VideoConditionByLatentIndex, which replaces latent frame 0 --
     the single-anchor I2V semantics this pipeline relies on. lora_path is
     prep for future fine-tuning: omitted unless explicitly set, always
-    applied at ltx-2-mlx's own --lora strength argument fixed to 1.0."""
+    applied at ltx-2-mlx's own --lora strength argument fixed to 1.0. loras is a list of
+    (path, strength) pairs, emitted as one --lora PATH STRENGTH each, in order, right
+    after the lora_path slot; it is mutually exclusive with lora_path."""
+    if lora_path is not None and loras:
+        raise ValueError("lora_path and loras are mutually exclusive")
     cmd = [_resolve_bin(), "generate",
            "--model", str(model),
            "--gemma", str(gemma)]
     if lora_path is not None:
         cmd += ["--lora", str(lora_path), "1.0"]
+    for path, strength in (loras or ()):
+        cmd += ["--lora", str(path), repr(float(strength))]
     cmd += ["--distilled",
            "--prompt", str(prompt),
            "--output", str(output_path)]
@@ -164,7 +190,7 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
 
 def _validate_generate_args(prompt, output_path, image_path, width, height,
                             num_frames, tile_frames, tile_spatial, force,
-                            log_path=None, timeout_s=None):
+                            log_path=None, timeout_s=None, lora_path=None, loras=None):
     """Every ValueError this module can raise is raised here, before any
     subprocess is spawned. Order matches the design doc section 5.3 list."""
     if not isinstance(prompt, str) or not prompt.strip():
@@ -207,6 +233,23 @@ def _validate_generate_args(prompt, output_path, image_path, width, height,
     if tile_spatial < 1:
         raise ValueError("tile_spatial must be >= 1, got %d" % tile_spatial)
 
+    if loras is not None:
+        if lora_path is not None and loras:
+            raise ValueError("lora_path and loras are mutually exclusive")
+        if not isinstance(loras, (list, tuple)):
+            raise ValueError("loras must be a list of (path, strength) pairs, got %r" % (loras,))
+        for i, item in enumerate(loras):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError("loras[%d] must be a (path, strength) pair, got %r" % (i, item))
+            path, strength = item
+            if (not isinstance(path, str) or not os.path.isfile(path)
+                    or not os.access(path, os.R_OK)):
+                raise ValueError("loras[%d]: path is not a readable file: %r" % (i, path))
+            if (isinstance(strength, bool) or not isinstance(strength, (int, float))
+                    or not 0 < strength <= 2.0):
+                raise ValueError("loras[%d]: strength must be a number in (0, 2], got %r"
+                                 % (i, strength))
+
 
 def generate_video(prompt, output_path, image_path=None, *,
                    width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT,
@@ -214,7 +257,7 @@ def generate_video(prompt, output_path, image_path=None, *,
                    seed=0, model=MODEL_ID, gemma=GEMMA_MODEL_ID, lora_path=None,
                    low_ram=DEFAULT_LOW_RAM,
                    tile_frames=DEFAULT_TILE_FRAMES, tile_spatial=DEFAULT_TILE_SPATIAL,
-                   log_path=None, timeout_s=None, force=False, quiet=False):
+                   log_path=None, timeout_s=None, force=False, quiet=False, loras=None):
     """Render one clip and return the ABSOLUTE path of the written .mp4.
 
     Never returns PIL images. There is no --resume, no three-stage split and
@@ -226,7 +269,8 @@ def generate_video(prompt, output_path, image_path=None, *,
     jetsam signature (exit 0 with no usable output file)."""
     _validate_generate_args(prompt, output_path, image_path, width, height,
                             num_frames, tile_frames, tile_spatial, force,
-                            log_path=log_path, timeout_s=timeout_s)
+                            log_path=log_path, timeout_s=timeout_s,
+                            lora_path=lora_path, loras=loras)
     resolved_bin = _resolve_bin()
     if not os.path.isfile(resolved_bin) or not os.access(resolved_bin, os.X_OK):
         raise Ltx2MlxError(
@@ -243,7 +287,8 @@ def generate_video(prompt, output_path, image_path=None, *,
                         width=width, height=height, num_frames=num_frames,
                         frame_rate=frame_rate, seed=seed, model=model, gemma=gemma,
                         lora_path=lora_path, low_ram=low_ram,
-                        tile_frames=tile_frames, tile_spatial=tile_spatial, quiet=quiet)
+                        tile_frames=tile_frames, tile_spatial=tile_spatial, quiet=quiet,
+                        loras=loras)
     print("[ltx2_mlx_video_skill] %s" % shlex.join(cmd))
     sys.stdout.flush()
 
