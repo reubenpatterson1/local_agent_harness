@@ -137,14 +137,15 @@ VIDEO_RANK = 32
 VIDEO_STEPS = 1000
 VIDEO_FINAL_CKPT = "lora_weights_step_01000.safetensors"
 STILLS_RANK = 16
-STILLS_TARGET_STEPS = 2400
+STILLS_TARGET_STEPS = 672
+STILLS_MAX_RESOLUTION = 512
 MFLUX_TRAIN = os.environ.get("CHARACTER_MFLUX_TRAIN",
                              os.path.expanduser("~/mflux/.venv/bin/mflux-train"))
 MFLUX_HF_HOME = os.environ.get("Z_IMAGE_HF_HOME", os.path.expanduser("~/hf_home"))
 
 PREPROCESS_TIMEOUT_S = 1800
 VIDEO_TRAIN_TIMEOUT_S = 14400
-STILLS_TRAIN_TIMEOUT_S = 21600
+STILLS_TRAIN_TIMEOUT_S = 10800
 TEST_RENDER_TIMEOUT_S = 1800
 ZIMAGE_CHILD_TIMEOUT_S = 3600
 
@@ -1181,6 +1182,181 @@ def train(args):
                 or (stills_outcome == "skipped" and explicit_stills)):
             return 1
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Stills LoRA training through mflux, and the compat gate (spec 4.9)
+# ---------------------------------------------------------------------------
+
+def stills_epochs(kept):
+    """(num_epochs, total_steps, save_frequency) for about STILLS_TARGET_STEPS steps; one
+    checkpoint, at the final step (spec 4.9, amendment 4)."""
+    num_epochs = max(1, round(STILLS_TARGET_STEPS / kept))
+    total_steps = num_epochs * kept
+    return num_epochs, total_steps, total_steps
+
+
+def stills_train_config(data_dir, output_dir, seed, kept):
+    num_epochs, total_steps, save_frequency = stills_epochs(kept)
+    modules = ["attention.to_q", "attention.to_k", "attention.to_v", "attention.to_out.0",
+               "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"]
+    return {
+        "model": "z-image-turbo",
+        "data": data_dir,
+        "seed": seed,
+        "steps": 9,
+        "guidance": 0.0,
+        "quantize": None,
+        "max_resolution": STILLS_MAX_RESOLUTION,
+        "low_ram": False,
+        "gradient_checkpointing": True,
+        "training_loop": {"num_epochs": num_epochs, "batch_size": 1,
+                          "timestep_low": 4, "timestep_high": 9},
+        "optimizer": {"name": "AdamW", "learning_rate": 1e-4},
+        "checkpoint": {"save_frequency": save_frequency, "output_path": output_dir},
+        "monitoring": {"preview_width": 512, "preview_height": 320,
+                       "plot_frequency": 100, "generate_image_frequency": total_steps + 1},
+        "lora_layers": {"targets": [
+            {"module_path": "layers.{block}." + m, "blocks": {"start": 0, "end": 30},
+             "rank": STILLS_RANK} for m in modules]},
+    }
+
+
+def safetensors_keys(path):
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n).decode("utf-8"))
+    return sorted(k for k in header if k != "__metadata__")
+
+
+def lora_module_count(keys):
+    return len({k.split(".lora")[0] for k in keys if ".lora" in k})
+
+
+def extract_mflux_adapter(out_dir, dest, total_steps):
+    """Write the single *_adapter.safetensors member of the highest-step
+    <out_dir>/checkpoints/NNNNNNN_checkpoint.zip to dest and return that zip's path. Only
+    <out_dir>/checkpoints/ is searched (no recursion, no timestamped siblings), and its last
+    step must be total_steps (spec 4.9 step 4, amendment 4)."""
+    checkpoints = os.path.join(out_dir, "checkpoints")
+    zips = glob.glob(os.path.join(checkpoints, "[0-9]" * 7 + "_checkpoint.zip"))
+    if zips:
+        newest = max(zips, key=lambda p: int(os.path.basename(p)[:7]))
+        step = int(os.path.basename(newest)[:7])
+        if step != total_steps:
+            raise DatasetError("mflux-train's last checkpoint is step %d, expected %d (the run "
+                               "stopped early)" % (step, total_steps))
+        with zipfile.ZipFile(newest) as archive:
+            members = [m for m in archive.namelist() if m.endswith("_adapter.safetensors")]
+            if len(members) == 1:
+                with open(dest, "wb") as f:
+                    f.write(archive.read(members[0]))
+                return newest
+    raise DatasetError("mflux-train wrote no checkpoint zip with exactly one "
+                       "*_adapter.safetensors under %s" % checkpoints)
+
+
+def train_stills(data):
+    """Train the stills LoRA with mflux and keep it only if it passes the compat gate (spec
+    4.9). Returns "ok", "skipped" (incompatible; the reason is recorded) or "failed"."""
+    name = data["name"]
+    char_dir = character_lib.character_dir(name)
+    sdir = os.path.join(char_dir, "train", "stills")
+    if os.path.exists(sdir):
+        shutil.rmtree(sdir)
+    os.makedirs(os.path.join(sdir, "data"))
+    out = os.path.join(sdir, "out")
+    for sub in ("lora", "tests", "logs"):
+        os.makedirs(os.path.join(char_dir, sub), exist_ok=True)
+    with open(os.path.join(char_dir, "dataset", "manifest.json"), encoding="utf-8") as f:
+        kept_ns = [item["n"] for item in json.load(f)["items"] if item["kept"]]
+    for n in kept_ns:
+        for sub, ext in (("stills", "png"), ("captions", "txt")):
+            shutil.copy2(os.path.join(char_dir, "dataset", sub, "char_%02d.%s" % (n, ext)),
+                         os.path.join(sdir, "data", "char_%02d.%s" % (n, ext)))
+    prompt = trigger_test_prompt(data["trigger"], data["class_noun"])
+    with open(os.path.join(sdir, "data", "preview_1.txt"), "w", encoding="utf-8") as f:
+        f.write(prompt)
+    if os.path.lexists(out):
+        print("Error: stills LoRA training refused: mflux output directory already exists: %s "
+              "(mflux would write to a timestamped sibling); move it aside and retry" % out,
+              file=sys.stderr)
+        return "failed"
+    config_path = os.path.join(sdir, "train.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(stills_train_config(os.path.join(sdir, "data"), out, data["seed"],
+                                      len(kept_ns)), f, indent=2)
+    _num_epochs, total_steps, _save = stills_epochs(len(kept_ns))
+
+    log = step_log_path(char_dir, "train-stills")
+    rc = run_logged([MFLUX_TRAIN, "--config", config_path], log, sdir,
+                    dict(os.environ, HF_HOME=MFLUX_HF_HOME), STILLS_TRAIN_TIMEOUT_S)
+    if rc != 0:
+        print("Error: stills LoRA training failed: mflux-train exited %d; log: %s" % (rc, log),
+              file=sys.stderr)
+        return "failed"
+    candidate = os.path.join(char_dir, "lora", "stills.candidate.safetensors")
+    try:
+        extract_mflux_adapter(out, candidate, total_steps)
+    except DatasetError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return "failed"
+    try:
+        expected = lora_module_count(safetensors_keys(candidate))
+    except (ValueError, struct.error):
+        expected = 0
+
+    sample = os.path.join(char_dir, "tests", "stills_lora.png")
+    job = {"prompt": prompt, "output_path": sample, "seed": TEST_SEED, "width": 1024,
+           "height": 640}
+    report = child_error = None
+    try:
+        report = run_zimage_child({"jobs": [job], "loras": [[candidate, 1.0]]}, char_dir,
+                                  "test-stills-lora")
+    except DatasetError as e:
+        child_error = e
+    if child_error is not None:
+        reason = ("Z-Image could not load or render with it (see %s)"
+                  % getattr(child_error, "log_path", child_error))
+    elif expected == 0:
+        reason = "the adapter file has no LoRA modules"
+    elif report["injected_lora_modules"] != expected:
+        reason = ("only %s of %d LoRA modules in the adapter matched the Z-Image transformer"
+                  % (report["injected_lora_modules"], expected))
+    else:
+        reason = None
+
+    if reason is not None:
+        os.replace(candidate, os.path.join(char_dir, "lora", "stills.rejected.safetensors"))
+        data["stills_skip_reason"] = "mflux adapter incompatible with z_image_skill: " + reason
+        character_lib.write_character(data)
+        print("stills LoRA skipped: %s; the video LoRA is unaffected" % data["stills_skip_reason"])
+        return "skipped"
+
+    stills_path = os.path.join(char_dir, "lora", "stills.safetensors")
+    os.replace(candidate, stills_path)
+    control = os.path.join(char_dir, "tests", "stills_control.png")
+    control_path = None
+    try:
+        control_report = run_zimage_child({"jobs": [dict(job, output_path=control)],
+                                           "loras": None}, char_dir, "test-stills-control")
+        if control_report["jobs"][0]["status"] == "ok":
+            control_path = control
+    except DatasetError as e:
+        print("Error: stills control render failed: %s" % e, file=sys.stderr)
+    data["loras"]["stills"] = {"path": stills_path, "sha256": _sha256(stills_path),
+                               "base_model": "Tongyi-MAI/Z-Image-Turbo", "rank": STILLS_RANK,
+                               "alpha": STILLS_RANK, "steps": total_steps,
+                               "trained_at": character_lib.utc_now(),
+                               "sample_path": (sample if report["jobs"][0]["status"] == "ok"
+                                               else None),
+                               "control_path": control_path}
+    data["stills_skip_reason"] = None
+    character_lib.write_character(data)
+    print("stills LoRA: %s" % stills_path)
+    print("  with LoRA: %s" % data["loras"]["stills"]["sample_path"])
+    print("  control:   %s" % control_path)
+    return "ok"
 
 
 # --- Z-Image child process (spec 4.9) ---

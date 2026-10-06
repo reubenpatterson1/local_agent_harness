@@ -591,6 +591,28 @@ def test_d23_missing_final_checkpoint(lib_dir, monkeypatch, capsys):
     _fake_video_tools(monkeypatch, write_checkpoint=False)
     assert character_dataset.train_video(data) == "failed"
     assert "failed at train" in capsys.readouterr().err
+    # Plan-added (Task 11 review): only the exact final step counts, and it must be non-empty.
+    for name, ckpt, content in (("early", "lora_weights_step_00750.safetensors", b"lora"),
+                                ("empty", character_dataset.VIDEO_FINAL_CKPT, b"")):
+        other = _untrained(lib_dir, name=name)
+        _fake_video_tools(monkeypatch, write_checkpoint=False)
+        fake_run = character_dataset.run_logged
+
+        def _run(cmd, log_path, cwd, env, timeout_s, ckpt=ckpt, content=content, fake_run=fake_run):
+            rc = fake_run(cmd, log_path, cwd, env, timeout_s)
+            if cmd[1] == "train":
+                ckpt_dir = os.path.join(os.path.dirname(cmd[cmd.index("--config") + 1]), "out",
+                                        "checkpoints")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                with open(os.path.join(ckpt_dir, ckpt), "wb") as f:
+                    f.write(content)
+            return rc
+
+        monkeypatch.setattr(character_dataset, "run_logged", _run)
+        assert character_dataset.train_video(other) == "failed", name
+        assert "failed at train (exit 0)" in capsys.readouterr().err, name
+        assert _load(name)["status"] == "untrained", name
+        assert not os.path.exists(os.path.join(lib_dir, name, "lora", "video.safetensors")), name
 
 
 def test_d24_test_render_failure_keeps_the_lora(tmp_path, lib_dir, monkeypatch, capsys):
@@ -678,6 +700,20 @@ def test_d26_preflight_order(tmp_path, lib_dir, monkeypatch, capsys):
     _case("order", _server_and_memory,
           "Error: the story server is SERVING vision; stop it first with bin/story-server stop "
           "(training needs its memory)")
+    # Plan-added (Task 11 review): UNKNOWN fails closed, and a plain transformer.safetensors
+    # in the dev dir is refused as well as transformer-distilled.safetensors.
+    _case("unknown", lambda m, dev: m.setattr(character_dataset, "story_server_state",
+                                              lambda: "UNKNOWN"),
+          "Error: the story server is UNKNOWN; stop it first with bin/story-server stop "
+          "(training needs its memory)")
+
+    def _plain(m, dev):
+        (dev / "transformer.safetensors").write_bytes(b"x")
+
+    _case("plain", _plain,
+          "Error: %s must contain transformer-dev.safetensors and neither "
+          "transformer.safetensors nor transformer-distilled.safetensors (the trainer would "
+          "pick those first)" % (tmp_path / "plain" / "dev-model"))
     assert not os.path.exists(lock)
 
 
@@ -712,3 +748,256 @@ def test_d28_missing_mflux_skips_stills(tmp_path, lib_dir, monkeypatch, capsys):
             % missing) in capsys.readouterr().out
     assert character_dataset.train(_train_args(stills=True)) == 1
     assert calls == ["kyra"]
+
+
+# --- D9-D14, D29-D34: stills LoRA through mflux and the compat gate (spec 4.9) -----------
+def test_d9_stills_epochs():
+    se = character_dataset.stills_epochs
+    assert se(24) == (28, 672, 672)
+    assert se(12) == (56, 672, 672)
+    assert se(16) == (42, 672, 672)
+    assert se(17) == (40, 680, 680)
+    assert se(25) == (27, 675, 675)
+    assert se(13) == (52, 676, 676)
+    for kept in range(1, 31):
+        epochs, total, save = se(kept)
+        assert epochs >= 1 and total == epochs * kept and save == total
+        assert abs(total - 672) <= kept / 2
+
+
+def test_d10_stills_train_config():
+    modules = ["attention.to_q", "attention.to_k", "attention.to_v", "attention.to_out.0",
+               "feed_forward.w1", "feed_forward.w2", "feed_forward.w3"]
+    assert character_dataset.stills_train_config("/d", "/o", 0, 24) == {
+        "model": "z-image-turbo", "data": "/d", "seed": 0, "steps": 9, "guidance": 0.0,
+        "quantize": None, "max_resolution": 512, "low_ram": False,
+        "gradient_checkpointing": True,
+        "training_loop": {"num_epochs": 28, "batch_size": 1, "timestep_low": 4,
+                          "timestep_high": 9},
+        "optimizer": {"name": "AdamW", "learning_rate": 1e-4},
+        "checkpoint": {"save_frequency": 672, "output_path": "/o"},
+        "monitoring": {"preview_width": 512, "preview_height": 320, "plot_frequency": 100,
+                       "generate_image_frequency": 673},
+        "lora_layers": {"targets": [
+            {"module_path": "layers.{block}." + m, "blocks": {"start": 0, "end": 30},
+             "rank": 16} for m in modules]},
+    }
+
+
+def _safetensors_bytes(keys):
+    header = {"__metadata__": {"format": "pt"}}
+    for i, key in enumerate(keys):
+        header[key] = {"dtype": "F32", "shape": [1], "data_offsets": [4 * i, 4 * i + 4]}
+    raw = json.dumps(header).encode("utf-8")
+    return struct.pack("<Q", len(raw)) + raw + b"\0" * (4 * len(keys))
+
+
+TWO_MODULE_KEYS = ["layers.0.attention.to_q.lora_A.weight", "layers.0.attention.to_q.lora_B.weight",
+                   "layers.0.attention.to_k.lora_A.weight", "layers.0.attention.to_k.lora_B.weight"]
+
+
+def test_d11_safetensors_keys(tmp_path):
+    path = str(tmp_path / "a.safetensors")
+    with open(path, "wb") as f:
+        f.write(_safetensors_bytes(["b.weight", "a.weight", "c.bias"]))
+    assert character_dataset.safetensors_keys(path) == ["a.weight", "b.weight", "c.bias"]
+
+
+def test_d12_lora_module_count():
+    assert character_dataset.lora_module_count([
+        "layers.0.attention.to_q.lora_A.weight", "layers.0.attention.to_q.lora_B.weight",
+        "lora_unet_x.lora_down.weight", "lora_unet_x.alpha", "other.weight"]) == 2
+
+
+def _checkpoint_zip(path, step, adapters=1):
+    """A checkpoint zip with the measured mflux member set (spec 0.2)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("%07d_adapter.safetensors" % step, ("adapter %d" % step).encode())
+        if adapters == 2:
+            archive.writestr("%07d_extra_adapter.safetensors" % step, b"second adapter")
+        archive.writestr("%07d_optimizer.safetensors" % step, b"optimizer")
+        for name in ("iterator", "loss", "config"):
+            archive.writestr("%07d_%s.json" % (step, name), b"{}")
+        archive.writestr("checkpoint.json", b"{}")
+        archive.writestr("run.json", b"{}")
+
+
+def test_d13_extract_takes_the_final_step(tmp_path):
+    out = tmp_path / "out"
+    _checkpoint_zip(str(out / "checkpoints" / "0000000_checkpoint.zip"), 0)
+    _checkpoint_zip(str(out / "checkpoints" / "0000672_checkpoint.zip"), 672)
+    dest = str(tmp_path / "adapter.safetensors")
+    character_dataset.extract_mflux_adapter(str(out), dest, 672)
+    with open(dest, "rb") as f:
+        assert f.read() == b"adapter 672"
+
+
+def test_d14_extract_errors(tmp_path):
+    message = ("mflux-train wrote no checkpoint zip with exactly one *_adapter.safetensors "
+               "under %s")
+    cases = []
+    empty = tmp_path / "empty" / "out"
+    empty.mkdir(parents=True)
+    cases.append((empty, message % (empty / "checkpoints")))
+    two = tmp_path / "two" / "out"
+    _checkpoint_zip(str(two / "checkpoints" / "0000672_checkpoint.zip"), 672, adapters=2)
+    cases.append((two, message % (two / "checkpoints")))
+    early = tmp_path / "early" / "out"
+    _checkpoint_zip(str(early / "checkpoints" / "0000000_checkpoint.zip"), 0)
+    cases.append((early, "mflux-train's last checkpoint is step 0, expected 672 (the run "
+                         "stopped early)"))
+    sibling = tmp_path / "sibling" / "out"
+    _checkpoint_zip(str(tmp_path / "sibling" / "out_20261005_194009" / "checkpoints"
+                        / "0000672_checkpoint.zip"), 672)
+    cases.append((sibling, message % (sibling / "checkpoints")))
+    nested = tmp_path / "nested" / "out"
+    _checkpoint_zip(str(nested / "run" / "checkpoints" / "0000672_checkpoint.zip"), 672)
+    cases.append((nested, message % (nested / "checkpoints")))
+    for out, expected in cases:
+        with pytest.raises(DatasetError) as info:
+            character_dataset.extract_mflux_adapter(str(out), str(tmp_path / "x"), 672)
+        assert str(info.value) == expected, out
+
+
+def _fake_stills_tools(monkeypatch, adapter_keys=TWO_MODULE_KEYS, mflux_rc=0, injected=2,
+                       compat_error=False):
+    """run_logged (mflux-train) and run_zimage_child fakes; returns the recorded calls."""
+    record = {"run": [], "children": []}
+
+    def _run(cmd, log_path, cwd, env, timeout_s):
+        record["run"].append({"cmd": cmd, "cwd": cwd, "env": env})
+        with open(cmd[cmd.index("--config") + 1]) as f:
+            config = json.load(f)
+        out = config["checkpoint"]["output_path"]
+        record["out_existed"] = os.path.exists(out)
+        zip_path = os.path.join(out, "checkpoints",
+                                "%07d_checkpoint.zip" % config["checkpoint"]["save_frequency"])
+        os.makedirs(os.path.dirname(zip_path))
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("0002400_adapter.safetensors", _safetensors_bytes(adapter_keys))
+        return mflux_rc
+
+    def _child(spec, char_dir, step):
+        record["children"].append((spec, step))
+        if compat_error and spec["loras"]:
+            raise DatasetError("Z-Image child process exited 1; log: /x/logs/test.log")
+        for job in spec["jobs"]:
+            Image.new("RGB", (16, 10), (1, 2, 3)).save(job["output_path"])
+        return {"jobs": [{"output_path": j["output_path"], "status": "ok", "seconds": 1.0}
+                         for j in spec["jobs"]],
+                "injected_lora_modules": injected if spec["loras"] else None}
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run)
+    monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
+    return record
+
+
+def test_d29_train_stills_happy_path(lib_dir, monkeypatch):
+    data = _untrained(lib_dir)
+    record = _fake_stills_tools(monkeypatch)
+    assert character_dataset.train_stills(data) == "ok"
+    cdir = os.path.join(lib_dir, "kyra")
+    assert os.path.isfile(os.path.join(cdir, "lora", "stills.safetensors"))
+    entry = _load()["loras"]["stills"]
+    assert (entry["rank"], entry["alpha"], entry["steps"]) == (16, 16, 672)
+    assert os.path.isfile(os.path.join(cdir, "train", "stills", "out", "checkpoints",
+                                       "0000672_checkpoint.zip"))
+    assert entry["sample_path"] == os.path.join(cdir, "tests", "stills_lora.png")
+    assert entry["control_path"] == os.path.join(cdir, "tests", "stills_control.png")
+    (gate, gate_step), (control, control_step) = record["children"]
+    assert gate["loras"] == [[os.path.join(cdir, "lora", "stills.candidate.safetensors"), 1.0]]
+    assert (gate_step, control_step) == ("test-stills-lora", "test-stills-control")
+    assert control["loras"] is None
+    data_dir = os.path.join(cdir, "train", "stills", "data")
+    names = sorted(os.listdir(data_dir))
+    assert len([n for n in names if n.endswith(".png")]) == 24
+    assert len([n for n in names if n.startswith("char_") and n.endswith(".txt")]) == 24
+    with open(os.path.join(data_dir, "preview_1.txt")) as f:
+        assert f.read() == character_dataset.trigger_test_prompt("kyrawmn", "woman")
+    with open(os.path.join(cdir, "train", "stills", "train.json")) as f:
+        assert json.load(f) == character_dataset.stills_train_config(
+            data_dir, os.path.join(cdir, "train", "stills", "out"), 0, 24)
+    run = record["run"][0]
+    assert run["cmd"][0] == character_dataset.MFLUX_TRAIN
+    assert run["env"]["HF_HOME"] == character_dataset.MFLUX_HF_HOME
+    assert run["cwd"] == os.path.join(cdir, "train", "stills")
+
+
+def test_d30_partial_injection_is_rejected(lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_stills_tools(monkeypatch, injected=1)
+    assert character_dataset.train_stills(data) == "skipped"
+    lora = os.path.join(lib_dir, "kyra", "lora")
+    assert os.path.isfile(os.path.join(lora, "stills.rejected.safetensors"))
+    assert not os.path.exists(os.path.join(lora, "stills.safetensors"))
+    saved = _load()
+    assert "only 1 of 2 LoRA modules" in saved["stills_skip_reason"]
+    assert saved["stills_skip_reason"].startswith("mflux adapter incompatible with z_image_skill: ")
+    assert saved["loras"]["stills"] is None
+    assert "the video LoRA is unaffected" in capsys.readouterr().out
+
+
+def test_d31_child_failure_is_rejected(lib_dir, monkeypatch):
+    data = _untrained(lib_dir)
+    _fake_stills_tools(monkeypatch, compat_error=True)
+    assert character_dataset.train_stills(data) == "skipped"
+    assert "could not load or render" in _load()["stills_skip_reason"]
+
+
+def test_d32_adapter_without_lora_keys_is_rejected(lib_dir, monkeypatch):
+    data = _untrained(lib_dir)
+    _fake_stills_tools(monkeypatch, adapter_keys=["layers.0.attention.to_q.weight"], injected=0)
+    assert character_dataset.train_stills(data) == "skipped"
+    assert _load()["stills_skip_reason"] == (
+        "mflux adapter incompatible with z_image_skill: the adapter file has no LoRA modules")
+
+
+def test_d33_mflux_failure_fails_train(tmp_path, lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_stills_tools(monkeypatch, mflux_rc=2)
+    assert character_dataset.train_stills(data) == "failed"
+    assert "Error: stills LoRA training failed: mflux-train exited 2; log: " in (
+        capsys.readouterr().err)
+    _train_ready(monkeypatch, tmp_path)
+    monkeypatch.setattr(character_dataset, "train_video", lambda d: "ok")
+    assert character_dataset.train(_train_args()) == 1
+
+
+def test_d34_failed_retrain_keeps_the_previous_stills_lora(tmp_path, lib_dir, monkeypatch):
+    _untrained(lib_dir)
+    data = make_character(lib_dir, stills=True)
+    previous = data["loras"]["stills"]
+    stills = previous["path"]
+    _fake_stills_tools(monkeypatch, injected=1)
+    _train_ready(monkeypatch, tmp_path)
+    assert character_dataset.train(_train_args(stills=True, force=True)) == 1
+    saved = _load()
+    assert saved["loras"]["stills"] == previous
+    with open(stills, "rb") as f:
+        assert f.read() == STILLS_BYTES
+    assert saved["stills_skip_reason"].startswith("mflux adapter incompatible with z_image_skill: ")
+
+
+def test_d40_mflux_output_dir_is_never_pre_created(lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    record = _fake_stills_tools(monkeypatch)
+    assert character_dataset.train_stills(data) == "ok"
+    assert record["out_existed"] is False
+    assert os.path.isdir(os.path.join(lib_dir, "kyra", "train", "stills"))
+    other = _untrained(lib_dir, name="ronin")
+    out = os.path.join(lib_dir, "ronin", "train", "stills", "out")
+    os.makedirs(out)
+    record["run"][:] = []
+    monkeypatch.setattr(character_dataset.shutil, "rmtree", lambda path, *a, **kw: None)
+    assert character_dataset.train_stills(other) == "failed"
+    assert capsys.readouterr().err == (
+        "Error: stills LoRA training refused: mflux output directory already exists: %s "
+        "(mflux would write to a timestamped sibling); move it aside and retry\n" % out)
+    assert record["run"] == []
+
+
+def test_d41_stills_constants():
+    assert character_dataset.STILLS_TARGET_STEPS == 672
+    assert character_dataset.STILLS_MAX_RESOLUTION == 512
+    assert character_dataset.STILLS_TRAIN_TIMEOUT_S == 10800
