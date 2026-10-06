@@ -335,6 +335,7 @@ def test_k8_small_face_with_force(tmp_path, lib_dir, monkeypatch, capsys):
 def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
     scores = [9] * 25
     scores[5] = 4
+    scores[6] = 7
     fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=scores)
     seed = _seed_image(tmp_path)
     assert tool.main(["create", "kyra", "--phrase", "the woman in grey",
