@@ -891,6 +891,15 @@ def test_p31_member_without_stills_lora_warns(tmp_path, monkeypatch, capsys, lib
     assert "kyrawmn" not in prompt
     assert "loras" not in kwargs
     assert _images_json(out_dir)["panels"][0]["loras"] == []
+    # plan-added (final review): a longer phrase owned by a member WITHOUT a stills LoRA
+    # must not lend its span to a shorter phrase owned by a member with one.
+    make_character(lib_dir, name="mira", trigger="miragrl", phrase="the woman", stills=True)
+    del calls[:]
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir + "2", "--only", "1",
+                              "--cast", "the woman in grey=kyra", "--cast", "the woman=mira"]) == 0
+    prompt, kwargs = calls[0]
+    assert "miragrl" not in prompt and "kyrawmn" not in prompt
+    assert "loras" not in kwargs
 
 
 def test_p32_different_lora_sets_are_refused(tmp_path, monkeypatch, capsys, lib_dir):
@@ -904,6 +913,12 @@ def test_p32_different_lora_sets_are_refused(tmp_path, monkeypatch, capsys, lib_
     assert capsys.readouterr().err == (
         "Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
         "set per process); run one --only panel per invocation\n")
+    assert calls == []
+    # plan-added (final review): a LoRA set and an EMPTY set also differ (z_image_skill would
+    # keep the fused LoRA for the uncast panel).
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1,2",
+                              "--cast", "the woman in grey=kyra"]) == 2
+    assert "need different stills LoRA sets" in capsys.readouterr().err
     assert calls == []
 
 
@@ -1285,7 +1300,8 @@ def test_p53_list_characters_prints_the_table_and_touches_nothing(monkeypatch, c
 
 def test_p54_list_characters_must_be_alone(capsys):
     for argv in (["--list-characters", "--story-id", "x"], ["a narrative", "--list-characters"],
-                 ["--list-characters", "--help"]):
+                 ["--list-characters", "--help"],
+                 ["--list-char", "--story-id", "x", "--dry-run", "a narrative"]):
         assert ltx_movie.main(argv) == 2, argv
         out, err = capsys.readouterr()
         assert err == "Error: --list-characters takes no other arguments\n"

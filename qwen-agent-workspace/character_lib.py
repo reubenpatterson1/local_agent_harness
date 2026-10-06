@@ -437,10 +437,12 @@ def phrase_occurs(text, phrase):
     return _phrase_regex(normalize_phrase(phrase)).search(text) is not None
 
 
-def cast_text(text, members):
+def cast_text(text, members, insert=None):
     """(text with each cast phrase's trigger inserted, sorted names of the members found).
     Longest phrase first; a match overlapping an already-claimed span is ignored; an
-    occurrence that already carries the trigger is counted but not re-inserted (spec 3.6)."""
+    occurrence that already carries the trigger is counted but not re-inserted (spec 3.6).
+    insert: if given, a set of names; every member still claims its spans, but only these
+    members get a trigger and are reported."""
     found = []
     for member in sorted(members, key=lambda m: (-len(m.phrase), m.phrase.lower(), m.name)):
         for match in _phrase_regex(member.phrase, member.trigger).finditer(text):
@@ -450,7 +452,7 @@ def cast_text(text, members):
             found.append((start, end, member, match.group("trig") is not None))
     out = text
     for start, _end, member, already in sorted(found, key=lambda f: f[0], reverse=True):
-        if already:
+        if already or (insert is not None and member.name not in insert):
             continue
         words = member.phrase.split()
         if len(words) > 1 and words[0].lower() in ARTICLES:
@@ -458,7 +460,8 @@ def cast_text(text, members):
             out = out[:cut] + " " + member.trigger + out[cut:]
         else:
             out = out[:start] + member.trigger + " " + out[start:]
-    return out, sorted({member.name for _, _, member, _ in found})
+    return out, sorted({member.name for _, _, member, _ in found
+                        if insert is None or member.name in insert})
 
 
 def panel_strengths(names, members, character_strength):

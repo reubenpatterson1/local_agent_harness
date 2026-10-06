@@ -1351,6 +1351,9 @@ def main(argv=None):
         return _list_characters(raw_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.list_characters:                 # an abbreviation (--list-char) got past the pre-scan
+        print("Error: --list-characters takes no other arguments", file=sys.stderr)
+        return 2
     if args.narrative is None and args.story_prompt_override is None:
         parser.error("either a narrative argument or --story-prompt-override is required")
     _resolve_length(args, raw_argv)

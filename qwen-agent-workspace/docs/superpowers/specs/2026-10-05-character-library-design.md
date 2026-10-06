@@ -1586,6 +1586,8 @@ The docstring gains a paragraph describing `--cast` and the `characters` key.
 
 ### 5.5 `bin/ltx-story-images`
 
+**Final-review amendment (I3).** The stills prompt is built with `cast_text(text, members, insert={m.name for m in stills_members})`, not `cast_text(text, stills_members)`: every cast member claims its own phrase spans (longest first), but only members with a stills LoRA get a trigger inserted and are reported. Otherwise a shorter phrase owned by a stills-LoRA member (e.g. "the woman") could claim the span of a longer phrase owned by a member without one ("the woman in red") and put the wrong identity on the panel-1 still. Test: P31 (extended). Also final-review: `z_image_skill.load_pipeline` refuses `Z_IMAGE_QUANTIZE_WEIGHTS` combined with any LoRA (silent no-op merge into quantized weights) — test Z7; `bin/ltx-movie` refuses an abbreviated `--list-characters` (e.g. `--list-char`) with exit 2 — P54 extended; the E-P16 empty-set case is pinned — P32 extended.
+
 **Arguments.** These go after `--lora`, with the same `--cast` and `--character-strength` definitions as 5.4. The help says the trigger is inserted into Image: prompts for characters that have a stills LoRA. `_character_lib()` is the same helper; `importlib.machinery` is already imported.
 
 **Validation** (after the `--seed-image` existence check, before the dry-run). `strength` and `members` are resolved exactly as in 5.4's resolution block. Each failure exits 2:

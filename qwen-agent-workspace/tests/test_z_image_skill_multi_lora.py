@@ -139,3 +139,15 @@ def test_z6_single_lora_path_unchanged(monkeypatch):
     assert record["lora_calls"] == ["my_lora.safetensors"]
     assert record["fuse_calls"] == [{"lora_scale": 1.0}]
     assert record["set_adapters"] == []
+
+
+def test_z7_quantized_weights_refuse_every_lora(monkeypatch):
+    # plan-added (final review): peft's merge into an optimum-quanto WeightQBytesTensor is a
+    # silent no-op, so int8 + any LoRA would render the base model while logging success.
+    record = _install(monkeypatch)
+    monkeypatch.setenv("Z_IMAGE_QUANTIZE_WEIGHTS", "int8")
+    for kwargs in ({"lora_path": "my_lora.safetensors"}, {"loras": [("a.st", 1.0)]}):
+        with pytest.raises(ValueError, match="cannot be combined with a LoRA"):
+            z_image_skill.load_pipeline(**kwargs)
+    assert record["constructed"] == []
+    assert record["lora_calls"] == []

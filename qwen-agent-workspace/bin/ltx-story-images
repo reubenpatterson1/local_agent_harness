@@ -287,7 +287,8 @@ def main(argv=None):
         for i in selected_indices:
             if args.seed_image is not None and i == 1:
                 continue
-            prompt, names = lib.cast_text(compose(panels[i - 1]["image"], style), stills_members)
+            prompt, names = lib.cast_text(compose(panels[i - 1]["image"], style), members,
+                                          insert={m.name for m in stills_members})
             strengths = lib.panel_strengths(names, stills_members, strength)
             by_name = {m.name: m for m in stills_members}
             char_plans[i] = (prompt, [{"kind": "character", "name": n, "path": by_name[n].stills_lora,

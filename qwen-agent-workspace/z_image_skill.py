@@ -131,6 +131,11 @@ def load_pipeline(lora_path=None, loras=None):
     dtype = _pick_dtype(device)
     token = os.environ.get("HF_TOKEN")
     quantize_weights = _quantize_weights_env()
+    if quantize_weights and (lora_path is not None or loras):
+        raise ValueError(
+            "Z_IMAGE_QUANTIZE_WEIGHTS=%s cannot be combined with a LoRA: fuse_lora into "
+            "quantized weights is a silent no-op, so the image would render without it; "
+            "unset Z_IMAGE_QUANTIZE_WEIGHTS to use LoRAs" % quantize_weights)
     print(f"[z_image_skill] loading {BASE_MODEL_ID} + {TEXT_ENCODER_ID} on {device.type} ({dtype}) ...")
     te_cache = _cache_dir_for(TEXT_ENCODER_ID)
     base_cache = _cache_dir_for(BASE_MODEL_ID)
