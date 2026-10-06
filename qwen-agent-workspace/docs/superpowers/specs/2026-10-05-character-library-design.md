@@ -25,7 +25,7 @@ See also the rows E-P25 to E-P29, the tests P60-P75, the gaps G19-G23, and the g
 - The measured facts are in 0.2 ("mflux, measured").
 - The stills config now trains at `max_resolution` 512 for about 672 steps, saving only the final checkpoint (4.9).
 - `train_stills` must not pre-create mflux's `output_path`. It finds checkpoints only under `<output_path>/checkpoints/` (4.9 steps 1 and 4).
-- Also updated: the budget (4.13), CT12, D9, D10, D13, D14 and D29 plus the new D38-D39, L0 (recorded as passed), L4, G1, G2 and G14, and Section 10 task 11 (the coordinator's plan Task 12).
+- Also updated: the budget (4.13), CT12, D9, D10, D13, D14 and D29 plus the new D40-D41, L0 (recorded as passed), L4, G1, G2 and G14, and Section 10 task 11 (the coordinator's plan Task 12).
 
 Two terms are used throughout:
 
@@ -674,7 +674,7 @@ def character_table_lines():
 
 ### 4.1 `character_dataset.py` names
 
-**Copied verbatim from `generated/charlora/tools/make_dataset_seed.py`:** `VLM_URL`, `MODELS_URL`, `VLM_MODEL`, `WIDTH = 1024`, `HEIGHT = 640`, `STYLE`, `SHOTS`, `VARIANTS` (24 entries), `CHECK_PROMPT`, `extract_json`, `validate_description`, `validate_check`, `gen_prompt`, `caption`, `image_data_url`, `vlm_call`.
+**Copied verbatim from `generated/charlora/tools/make_dataset_seed.py`:** `VLM_URL`, `MODELS_URL`, `VLM_MODEL`, `WIDTH = 1024`, `HEIGHT = 640`, `STYLE`, `SHOTS`, `VARIANTS` (24 entries), `CHECK_PROMPT`, `extract_json`, `validate_description`, `validate_check`, `gen_prompt`, `caption`, `image_data_url` (EXIF fix below), `vlm_call`.
 
 **Changed:**
 
@@ -682,6 +682,7 @@ def character_table_lines():
 - `STORY_SERVER = os.path.join(WS, "bin", "story-server")`.
 - `verify_ffprobe(mp4)` raises `DatasetError("ffprobe: expected 1 frame in %s, got %r" % ...)` and `DatasetError("ffprobe failed for %s: %s" % ...)` instead of calling `sys.exit`.
 - `DESCRIBE_PROMPT` is replaced (4.5).
+- **(Task 10 review fix, commit beedc77; normative.)** `image_data_url` opens the image as `ImageOps.exif_transpose(Image.open(path)).convert("RGB")`. The original used `Image.open(path).convert("RGB")`. This way the VLM's face, describe and check calls see the same orientation as `ltx_image_fit.load_oriented_rgb`, and therefore the same orientation as `seed.png` and `char_00`. The thumbnail, JPEG quality 90, and data-URL format are unchanged.
 
 **New:** `FACE_PROMPT` (4.5), `FACE_MIN_HEIGHT = 0.15`, `CREATE_MIN_FREE_GIB = 2.0`, `TRAIN_MIN_FREE_GIB_PER_KIND = 8.0`, `TRAIN_MIN_AVAIL_GIB = 30.0`, `GENERATE_MIN_AVAIL_GIB = 20.0`, `VLM_WAIT_S = 600`, `AVAIL_WAIT_S = 600`.
 
@@ -1019,6 +1020,20 @@ def train_argv(config_path):
 - It streams each line to `sys.stdout` and to `log_path` (opened `"a"`).
 - A `threading.Timer(timeout_s)` calls `os.killpg(os.getpgid(pid), SIGKILL)`, the same as `ltx2_mlx_video_skill._run_subprocess`.
 - It returns the returncode, or `-9` after a timeout kill. It first prints `Running: <shlex.join(cmd)>` and `log: <log_path>`.
+- **(Task 10 review fix, commit beedc77; normative.)** In its `finally` block, after `timer.cancel()`, it kills and reaps the child's whole process group if the child is still alive:
+
+```python
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+```
+
+  This way a Ctrl-C (`KeyboardInterrupt`) or any exception while streaming never leaves Z-Image, ltx-2-mlx, or mflux running. In particular, `build_dataset`'s `finally` then restarts the vision server (4.4) next to a still-resident ~20-40 GB child. The exception still propagates after the cleanup.
 - `step_log_path(char_dir, step)` = `<char_dir>/logs/<UTC %Y%m%dT%H%M%SZ>-<step>.log`. Every "log step `<s>`" in this section means `step_log_path(<dir>, "<s>")`.
 
 **`train_video(data)`.** It returns `"ok"`, `"failed"` (CT10: nothing recorded, after printing an `Error:` line), or `"test_failed"` (CT11: the LoRA is recorded, but a test render failed).
@@ -2225,8 +2240,8 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | D12 | `lora_module_count` on `["layers.0.attention.to_q.lora_A.weight", "layers.0.attention.to_q.lora_B.weight", "lora_unet_x.lora_down.weight", "lora_unet_x.alpha", "other.weight"]` | `2` |
 | D13 | `extract_mflux_adapter(out, dest, 672)` on `out/checkpoints/0000000_checkpoint.zip` and `out/checkpoints/0000672_checkpoint.zip`. Each holds the 0.2 member set (`NNNNNNN_adapter.safetensors`, `NNNNNNN_optimizer.safetensors`, `NNNNNNN_{iterator,loss,config}.json`, `checkpoint.json`, `run.json`) | the dest bytes equal the 672 zip's adapter member |
 | D14 | `extract_mflux_adapter` with no zips; with a zip holding 2 adapter members; with only `0000000_checkpoint.zip` (step-mismatch message `"…last checkpoint is step 0, expected 672…"`); with the only zip in a timestamped sibling `out_20261005_194009/checkpoints/` (not searched) | `DatasetError` each |
-| D38 | `train_stills` with `run_logged` patched to record `os.path.exists(sdir/out)` at the moment mflux is invoked | it records `False`, and `sdir` exists. A pre-existing `sdir/out` that survives (rmtree patched to a no-op) → `"failed"`, the CT12 "already exists" message, and mflux never invoked |
-| D39 | `STILLS_TARGET_STEPS`, `STILLS_MAX_RESOLUTION`, `STILLS_TRAIN_TIMEOUT_S` | `672`, `512`, `10800` |
+| D40 | `train_stills` with `run_logged` patched to record `os.path.exists(sdir/out)` at the moment mflux is invoked | it records `False`, and `sdir` exists. A pre-existing `sdir/out` that survives (rmtree patched to a no-op) → `"failed"`, the CT12 "already exists" message, and mflux never invoked |
+| D41 | `STILLS_TARGET_STEPS`, `STILLS_MAX_RESOLUTION`, `STILLS_TRAIN_TIMEOUT_S` | `672`, `512`, `10800` |
 | D15 | `write_contact_sheet` with 25 items (item 5 dropped, item 7's PNG missing) | a 1280x900 JPEG. The pixel at the red border of tile 5 (`(5 % 5) * 256 + 1, (5 // 5) * 180 + 1`) is red-dominant (R > 200, G < 60). Tile 7's centre is black |
 | D16 | `story_server_state` with `subprocess.run` patched to return the real `status` output captured in 0.2 (`"  state:          SERVING vision"`), then `STOPPED`, then `LOADING vision`, then rc 1 with no state line, then `OSError` | `"SERVING vision"`, `"STOPPED"`, `"LOADING vision"`, `"UNKNOWN"`, `"UNKNOWN"` |
 | D17 | `busy_process` with `psutil.process_iter` patched to yield cmdlines `["/x/ltx-2-mlx", "generate", …]`, `["python3", "bin/ltx-mlx-render", …]`, `["/x/mflux-train", "--config", "c"]`, `["vim", "notes-ltx-2-mlx.txt"]`, `["python3", "character_dataset.py", "zimage", "--spec", "s"]` (one per run) | a match for 1, 2, 3, 5; `None` for 4 |
@@ -2250,6 +2265,8 @@ Every `Error:` and `Warning:` line goes to stderr except where marked (stdout). 
 | D35 | `child_zimage` with fake `torch`, `z_image_skill`, and `content_safety` modules inserted in `sys.modules`. The fake `generate_image` raises `ContentSafetyError` for job 2. The fake `_pipeline.transformer.modules()` yields 3 modules with `lora_A = torch.nn.ModuleDict`-like objects containing `"lora0"` | report `jobs[1].status == "blocked"`, `injected_lora_modules == 3`. Returns 0. Every `generate_image` call received `loras` as a list of tuples |
 | D36 | the `run_zimage_child` parent with `run_logged` patched to rc 1 | `DatasetError` naming the log |
 | D37 | `character_dataset.py` source, parsed with `ast` | no top-level import of `torch`, `z_image_skill`, `content_safety`, `diffusers` |
+| D38 | `test_d38_run_logged_kills_child_on_interrupt`: `run_logged` on a long-running child (`sleep`-style, in its own session), with `sys.stdout.write` patched to raise `KeyboardInterrupt` on the first streamed line after `Popen` | `KeyboardInterrupt` propagates. The child was killed and reaped: `returncode == -9` |
+| D39 | `test_d39_image_data_url_applies_exif_orientation`: a 200x100 JPEG saved with EXIF orientation 6 | decoding the data URL's JPEG gives size `(100, 200)` |
 
 ### 9.4 `tests/test_character_tool.py` (`bin/character` end to end, with 9.1 fakes)
 
@@ -2450,7 +2467,9 @@ It uses the `_fake_pipeline_classes` pattern from `tests/test_z_image_skill_cach
 | `stills_epochs` uses floor | D9 (`kept=17` gives 39 × 17 = 663) |
 | `stills_epochs` saves 4 checkpoints again | D9, D10 |
 | `max_resolution` back to 1024 | D10 |
-| `train_stills` pre-creates `sdir/out` | D38 |
+| `train_stills` pre-creates `sdir/out` | D40 |
+| `run_logged`'s `finally` kill-and-wait block removed | D38 |
+| `image_data_url` drops `ImageOps.exif_transpose` | D39 |
 | `extract_mflux_adapter` searches recursively | D14 (timestamped-sibling case) |
 | step-mismatch check removed | D14 (step-0-only case) |
 | `generate_image_frequency` set to `total_steps` | D10 |
@@ -2508,8 +2527,8 @@ Narration: A silent agreement passes between them.
 7. `bin/ltx-story-manifest --cast` + P20-P25. Amendment 2 does not change the manifest: globals are render and stills flags, not manifest content.
 8. `bin/ltx-story-images --cast` + P30-P35, plus amendment 2: 5.7.4 and the E-P15 removal (P33, P68, P69).
 9. `bin/ltx-movie` casting + P40-P49, plus amendment 2: `_RepeatableLoraAction`, `_resolve_global_loras`, the forwarding, and the E-P3 removal (P70-P73). Then amendment 1: the E-P6a available line (P50-P52), `--list-characters` (P53-P56), and P57 (manifest/images unchanged).
-10. `character_dataset.py`: create half (prompts, face, describe, score, contact sheet, child protocol, gates) + D1-D19, D35-D37.
-11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34. The coordinator's plan **Task 12** is this item. Amendment 4 sets the stills config: `max_resolution` 512, `round(672/kept)` epochs, final-only checkpoint, `generate_image_frequency = total_steps + 1`, 3 h timeout. It also adds: never pre-create `sdir/out`; search only `<out>/checkpoints/`; the step-mismatch check; and D9, D10, D13, D14, D29, D38, D39.
+10. `character_dataset.py`: create half (prompts, face, describe, score, contact sheet, child protocol, gates) + D1-D19, D35-D37, plus the beedc77 review fixes (`run_logged` kill-on-interrupt, `image_data_url` EXIF) + D38, D39.
+11. `character_dataset.py`: train half (4.8, 4.9, 4.11) + D20-D34. The coordinator's plan **Task 12** is this item. Amendment 4 sets the stills config: `max_resolution` 512, `round(672/kept)` epochs, final-only checkpoint, `generate_image_frequency = total_steps + 1`, 3 h timeout. It also adds: never pre-create `sdir/out`; search only `<out>/checkpoints/`; the step-mismatch check; and D9, D10, D13, D14, D29, D40, D41.
 12. `bin/character` + K1-K18. `list` reuses `character_table_lines()` (K2, P55).
 13. Deploy tuple (Section 8) + R2.
 14. R1 + B + the full mutation table, run by the main thread. Then the design-reviewer (Opus high) code review.
@@ -2543,7 +2562,7 @@ Tasks 3-9 and 10-12 are independent chains. Within each chain the order matters.
   - Measured: the layout, the existing-directory timestamp rule, steps = epochs × images, about 4.6-5.1 s/step and 38.7 GB at 512.
   - Remaining:
     - whether `gradient_checkpointing` takes effect;
-    - the 0.2 timestamp rule being mflux 0.21.0 behavior, which a future version may change (D38 and the refusal in step 1 guard the known form);
+    - the 0.2 timestamp rule being mflux 0.21.0 behavior, which a future version may change (D40 and the refusal in step 1 guard the known form);
     - the 82-min measurement was taken with concurrent CPU load, so the 55-min estimate is unverified on an idle host.
 - **G15. Trigger tokenization.** Whether Gemma-3 (the LTX encoder) and Qwen3-4B tokenize a trigger like `kyrawmn` into stable sub-tokens is unverified beyond the spike's success with exactly `kyrawmn`.
 - **G16. Hashing cost.** Provenance hashes each LoRA once per render process: about 0.5-1 s per 642 MB file. The dry run hashes too, when `--resume` predicts.
