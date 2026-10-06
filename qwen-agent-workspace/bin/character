@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""character -- build, train and inspect the character LoRA library
+(generated/characters/).
+
+  bin/character create NAME --phrase PHRASE (--seed-image PATH | --descriptor TEXT --class NOUN)
+                        [--trigger WORD] [--seed N] [--force]
+  bin/character create NAME --regenerate
+  bin/character train NAME [--video] [--stills] [--force]
+  bin/character list
+  bin/character show NAME
+
+create builds the training dataset and stops for review (dataset/contact_sheet.jpg); train
+trains the video LoRA (ltx-2-mlx) and, when mflux is installed and its adapter passes the
+compat gate, the stills LoRA. list and show read the library only. A trained character is
+cast into a movie with bin/ltx-movie --character NAME or --cast "PHRASE=NAME".
+
+Exit codes: 0 success, 1 runtime failure, 2 argument or precondition failure, 3 create kept
+fewer than 12 stills.
+
+list/show import character_lib only (stdlib); create/train import character_dataset, which
+needs PIL and psutil. See docs/superpowers/specs/2026-10-05-character-library-design.md.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import character_lib  # noqa: E402
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="character",
+        description="Build, train and inspect the character LoRA library (generated/characters/).")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+    p = sub.add_parser("create", help="build a character's training dataset and stop for review")
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("--phrase", default=None, metavar="PHRASE",
+                   help='fixed referring phrase used in stories, e.g. "the ronin"')
+    p.add_argument("--seed-image", dest="seed_image", default=None, metavar="PATH")
+    p.add_argument("--descriptor", default=None, metavar="TEXT")
+    p.add_argument("--class", dest="class_noun", default=None, metavar="NOUN")
+    p.add_argument("--trigger", default=None, metavar="WORD")
+    p.add_argument("--seed", type=int, default=None, metavar="N")
+    p.add_argument("--force", action="store_true",
+                   help="proceed although the seed image's face is small or not found")
+    p.add_argument("--regenerate", action="store_true",
+                   help="rebuild an existing, untrained character's dataset from its character.json")
+    t = sub.add_parser("train", help="train the video LoRA and/or the stills LoRA")
+    t.add_argument("name", metavar="NAME")
+    t.add_argument("--video", action="store_true")
+    t.add_argument("--stills", action="store_true")
+    t.add_argument("--force", action="store_true", help="retrain a LoRA that already exists")
+    sub.add_parser("list", help="list every character")
+    s = sub.add_parser("show", help="print one character's record and file status")
+    s.add_argument("name", metavar="NAME")
+    return parser
+
+
+def cmd_list():
+    print("\n".join(character_lib.character_table_lines()))
+    return 0
+
+
+def cmd_show(name):
+    try:
+        data = character_lib.load_character(name)
+    except character_lib.CharacterError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print("files:")
+    paths = []
+    if data["source"]["type"] == "seed_image":
+        paths.append(os.path.join(character_lib.character_dir(name), "seed.png"))
+    if data["dataset"] is not None:
+        paths.append(data["dataset"]["contact_sheet"])
+    for kind in ("video", "stills"):
+        entry = data["loras"][kind]
+        if entry is not None:
+            paths.extend(p for p in (entry["path"], entry["sample_path"], entry["control_path"])
+                         if p is not None)
+    for p in paths:
+        print("  %-8s %s" % ("ok" if os.path.isfile(p) else "MISSING", p))
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.command == "list":
+        return cmd_list()
+    if args.command == "show":
+        return cmd_show(args.name)
+    import character_dataset
+    if args.command == "create":
+        return character_dataset.create(args)
+    return character_dataset.train(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

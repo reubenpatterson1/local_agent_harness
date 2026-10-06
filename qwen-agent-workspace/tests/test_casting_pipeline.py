@@ -1407,3 +1407,16 @@ def test_p75_repeatable_lora_action_copies_are_identical():
     sources = [inspect.getsource(module._RepeatableLoraAction)
                for module in (ltx_movie, render, story_images)]
     assert sources[0] == sources[1] == sources[2]
+
+
+# --- P55: bin/ltx-movie --list-characters == bin/character list (spec 5.6(i)) -------------
+def test_p55_list_characters_matches_bin_character_list(lib_dir):
+    _c45_library(lib_dir)
+    env = dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir)
+    movie = subprocess.run([sys.executable, "bin/ltx-movie", "--list-characters"], cwd=WS,
+                           env=env, capture_output=True)
+    tool = subprocess.run([sys.executable, "bin/character", "list"], cwd=WS, env=env,
+                          capture_output=True)
+    assert movie.returncode == 0 and tool.returncode == 0
+    assert movie.stdout == tool.stdout
+    assert movie.stderr == b"" and tool.stderr == b""
