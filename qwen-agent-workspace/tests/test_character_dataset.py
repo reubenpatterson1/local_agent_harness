@@ -419,3 +419,296 @@ def test_d39_image_data_url_applies_exif_orientation(tmp_path):
     url = character_dataset.image_data_url(path)
     data = base64.b64decode(url.split(",", 1)[1])
     assert Image.open(io.BytesIO(data)).size == (100, 200)
+
+
+# --- D7, D8, D20-D28: video LoRA training and train() (spec 4.8, 4.11) -------------------
+def test_d7_video_train_config():
+    text = character_dataset.video_train_config("/d/pre", "p, q.", "/d/out")
+    assert text == character_dataset.VIDEO_TRAIN_CONFIG_TEMPLATE.format(
+        model_path=json.dumps(character_dataset.TRAIN_MODEL_DIR),
+        gemma=json.dumps(character_dataset.SKILL.GEMMA_MODEL_ID),
+        data_root='"/d/pre"', validation_prompt='"p, q."', output_dir='"/d/out"')
+    lines = text.splitlines()
+    for line in ('  model_path: "%s"' % character_dataset.TRAIN_MODEL_DIR,
+                 '  preprocessed_data_root: "/d/pre"', '    - "p, q."', 'output_dir: "/d/out"',
+                 "  rank: 32", "  alpha: 32", "  steps: 1000", "  interval: 250",
+                 "  keep_last_n: 10"):
+        assert line in lines, line
+    assert "{" not in text
+
+
+def test_d8_preprocess_and_train_argv():
+    cd = character_dataset
+    assert cd.preprocess_argv("/v", "/c", "/o") == [
+        cd.SKILL.LTX2_MLX_BIN, "preprocess", "--videos", "/v", "--captions", "/c", "-o", "/o",
+        "-m", cd.TRAIN_MODEL_DIR, "-H", "320", "-W", "512", "--max-frames", "1"]
+    assert cd.train_argv("/t.yaml") == [cd.SKILL.LTX2_MLX_BIN, "train", "--config", "/t.yaml",
+                                        "--low-ram"]
+
+
+def _untrained(lib, name="kyra", kept=24):
+    """An untrained character with a real dataset layout: 25 tiny stills, and captions,
+    1-frame "videos" and manifest items for the kept ones (n 5 is the dropped still)."""
+    data = make_character(lib, name=name, status="untrained")
+    data["dataset"]["kept"] = kept
+    cdir = os.path.join(lib, name)
+    kept_ns = [n for n in range(25) if n != 5][:kept]
+    for sub in ("stills", "captions", "videos"):
+        os.makedirs(os.path.join(cdir, "dataset", sub), exist_ok=True)
+    items = []
+    for n in range(25):
+        Image.new("RGB", (8, 8), (n, n, n)).save(os.path.join(cdir, "dataset", "stills",
+                                                              "char_%02d.png" % n))
+        if n in kept_ns:
+            with open(os.path.join(cdir, "dataset", "captions", "char_%02d.txt" % n), "w") as f:
+                f.write("kyrawmn woman, close-up, n %d" % n)
+            with open(os.path.join(cdir, "dataset", "videos", "char_%02d.mp4" % n), "wb") as f:
+                f.write(b"mp4")
+        items.append({"n": n, "kept": n in kept_ns})
+    with open(os.path.join(cdir, "dataset", "manifest.json"), "w") as f:
+        json.dump({"items": items}, f)
+    character_lib.write_character(data)
+    return data
+
+
+def _fake_video_tools(monkeypatch, preprocess_rc=0, latents=None, train_rc=0,
+                      write_checkpoint=True, fail_test=None):
+    """run_logged and SKILL.generate_video fakes; returns the dict of recorded calls."""
+    record = {"run": [], "generate": []}
+
+    def _run(cmd, log_path, cwd, env, timeout_s):
+        record["run"].append({"cmd": cmd, "log": log_path, "cwd": cwd, "env": env})
+        if cmd[1] == "preprocess":
+            out_dir = cmd[cmd.index("-o") + 1]
+            videos = cmd[cmd.index("--videos") + 1]
+            latent_dir = os.path.join(out_dir, ".precomputed", "latents")
+            os.makedirs(latent_dir)
+            count = len(os.listdir(videos)) if latents is None else latents
+            for i in range(count):
+                open(os.path.join(latent_dir, "l%02d.safetensors" % i), "wb").close()
+            return preprocess_rc
+        vdir = os.path.dirname(cmd[cmd.index("--config") + 1])
+        if write_checkpoint:
+            ckpt_dir = os.path.join(vdir, "out", "checkpoints")
+            os.makedirs(ckpt_dir)
+            with open(os.path.join(ckpt_dir, character_dataset.VIDEO_FINAL_CKPT), "wb") as f:
+                f.write(b"lora")
+        return train_rc
+
+    def _generate(prompt, output_path, **kwargs):
+        record["generate"].append(dict(kwargs, prompt=prompt, output_path=output_path))
+        if fail_test is not None and len(record["generate"]) == fail_test:
+            raise character_dataset.SKILL.Ltx2MlxError("stub render failure")
+        with open(output_path, "wb") as f:
+            f.write(b"mp4")
+        return output_path
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run)
+    monkeypatch.setattr(character_dataset.SKILL, "generate_video", _generate)
+    return record
+
+
+_Memory = collections.namedtuple("_Memory", "available")
+
+
+def _train_ready(monkeypatch, tmp_path):
+    """Every train() preflight passes: no busy process, server STOPPED, 64 GiB available,
+    100 GiB free, a valid dev-model dir, a test-model dir, and executable stub binaries."""
+    dev = tmp_path / "dev-model"
+    dev.mkdir(parents=True)
+    (dev / "transformer-dev.safetensors").write_bytes(b"dev")
+    test_model = tmp_path / "test-model"
+    test_model.mkdir(parents=True)
+    stub = tmp_path / "stub-bin"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(character_dataset, "busy_process", lambda: None)
+    monkeypatch.setattr(character_dataset, "story_server_state", lambda: "STOPPED")
+    monkeypatch.setattr(character_dataset.psutil, "virtual_memory",
+                        lambda: _Memory(64.0 * 2 ** 30))
+    monkeypatch.setattr(character_dataset, "free_gib", lambda path: 100.0)
+    monkeypatch.setattr(character_dataset, "TRAIN_MODEL_DIR", str(dev))
+    monkeypatch.setattr(character_dataset, "TEST_MODEL_DIR", str(test_model))
+    monkeypatch.setattr(character_dataset.SKILL, "LTX2_MLX_BIN", str(stub))
+    monkeypatch.setattr(character_dataset, "MFLUX_TRAIN", str(stub))
+    return dev
+
+
+def _train_args(name="kyra", video=False, stills=False, force=False):
+    return argparse.Namespace(command="train", name=name, video=video, stills=stills, force=force)
+
+
+def _load(name="kyra"):
+    return character_lib.load_character(name)
+
+
+def test_d20_train_video_happy_path(lib_dir, monkeypatch):
+    data = _untrained(lib_dir)
+    record = _fake_video_tools(monkeypatch)
+    assert character_dataset.train_video(data) == "ok"
+    lora = os.path.join(lib_dir, "kyra", "lora", "video.safetensors")
+    with open(lora, "rb") as f:
+        assert f.read() == b"lora"
+    saved = _load()
+    entry = saved["loras"]["video"]
+    assert saved["status"] == "trained"
+    assert entry["sha256"] == hashlib.sha256(b"lora").hexdigest()
+    assert (entry["rank"], entry["alpha"], entry["steps"]) == (32, 32, 1000)
+    assert entry["sample_path"] == os.path.join(lib_dir, "kyra", "tests", "video_lora.mp4")
+    assert entry["control_path"] == os.path.join(lib_dir, "kyra", "tests", "video_control.mp4")
+    first, second = record["generate"]
+    assert first["loras"] == [(lora, 1.0)]
+    assert (first["width"], first["height"], first["num_frames"], first["seed"]) == (512, 320, 25, 42)
+    assert first["model"] == character_dataset.TEST_MODEL_DIR
+    assert first["image_path"] is None
+    assert "loras" not in second
+    assert [r["cmd"][1] for r in record["run"]] == ["preprocess", "train"]
+    assert all(r["env"]["HF_HOME"] == character_dataset.SKILL.LTX2_MLX_HF_HOME
+               and r["cwd"] == character_dataset.SKILL.LTX2_MLX_DIR for r in record["run"])
+
+
+def test_d21_preprocess_failure(lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_video_tools(monkeypatch, preprocess_rc=1)
+    assert character_dataset.train_video(data) == "failed"
+    err = capsys.readouterr().err
+    assert "failed at preprocess (exit 1)" in err
+    assert "log: %s" % os.path.join(lib_dir, "kyra", "logs") in err
+    assert "-preprocess.log" in err
+    assert _load()["status"] == "untrained"
+    assert not os.path.exists(os.path.join(lib_dir, "kyra", "lora", "video.safetensors"))
+
+
+def test_d22_latent_count_mismatch(lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_video_tools(monkeypatch, latents=23)
+    assert character_dataset.train_video(data) == "failed"
+    assert "preprocess wrote 23 latents for 24 videos" in capsys.readouterr().err
+
+
+def test_d23_missing_final_checkpoint(lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_video_tools(monkeypatch, write_checkpoint=False)
+    assert character_dataset.train_video(data) == "failed"
+    assert "failed at train" in capsys.readouterr().err
+
+
+def test_d24_test_render_failure_keeps_the_lora(tmp_path, lib_dir, monkeypatch, capsys):
+    data = _untrained(lib_dir)
+    _fake_video_tools(monkeypatch, fail_test=1)
+    assert character_dataset.train_video(data) == "test_failed"
+    saved = _load()
+    assert saved["status"] == "trained"
+    assert saved["loras"]["video"]["sample_path"] is None
+    assert saved["loras"]["video"]["control_path"] is not None
+    assert "Error: video test render failed: stub render failure" in capsys.readouterr().err
+
+    _untrained(lib_dir, name="ronin")
+    _fake_video_tools(monkeypatch, fail_test=1)
+    _train_ready(monkeypatch, tmp_path)
+    stills_calls = []
+    monkeypatch.setattr(character_dataset, "train_stills",
+                        lambda d: stills_calls.append(d["name"]) or "ok", raising=False)
+    assert character_dataset.train(_train_args("ronin")) == 1
+    assert stills_calls == ["ronin"]
+
+
+def test_d25_stale_training_dir_is_removed(lib_dir, monkeypatch):
+    data = _untrained(lib_dir)
+    stale = os.path.join(lib_dir, "kyra", "train", "video", "stale.txt")
+    os.makedirs(os.path.dirname(stale))
+    with open(stale, "w") as f:
+        f.write("old")
+    _fake_video_tools(monkeypatch)
+    assert character_dataset.train_video(data) == "ok"
+    assert not os.path.exists(stale)
+
+
+def test_d26_preflight_order(tmp_path, lib_dir, monkeypatch, capsys):
+    _untrained(lib_dir)
+    char_dir = os.path.join(lib_dir, "kyra")
+
+    def _never(data):
+        raise AssertionError("train_video ran")
+
+    def _case(name, override, message):
+        with monkeypatch.context() as m:
+            dev = _train_ready(m, tmp_path / name)
+            m.setattr(character_dataset, "train_video", _never)
+            override(m, dev)
+            assert character_dataset.train(_train_args()) == 2, name
+        assert capsys.readouterr().err == message + "\n", name
+
+    lock = os.path.join(lib_dir, ".lock")
+
+    def _hold_lock(m, dev):
+        with open(lock, "w") as f:
+            f.write(str(os.getppid()))
+
+    _case("lock", _hold_lock, "Error: another bin/character create/train is running (pid %d); "
+          "run one at a time" % os.getppid())
+    os.remove(lock)
+    _case("busy", lambda m, dev: m.setattr(character_dataset, "busy_process",
+                                           lambda: (4242, "python3 bin/ltx-mlx-render m.json")),
+          "Error: a render or training process is running (pid 4242: python3 bin/ltx-mlx-render "
+          "m.json); bin/character never trains or generates concurrently with a render")
+    _case("server", lambda m, dev: m.setattr(character_dataset, "story_server_state",
+                                             lambda: "SERVING vision"),
+          "Error: the story server is SERVING vision; stop it first with bin/story-server stop "
+          "(training needs its memory)")
+    _case("memory", lambda m, dev: m.setattr(character_dataset.psutil, "virtual_memory",
+                                             lambda: _Memory(29.9 * 2 ** 30)),
+          "Error: only 29.9 GiB of memory is available; training needs 30 GiB (quit "
+          "memory-heavy apps and retry)")
+    _case("disk", lambda m, dev: m.setattr(character_dataset, "free_gib", lambda path: 15.9),
+          "Error: only 15.9 GiB free at %s; training video and stills needs 16 GiB" % char_dir)
+
+    def _distilled(m, dev):
+        (dev / "transformer-distilled.safetensors").write_bytes(b"x")
+
+    _case("dev", _distilled,
+          "Error: %s must contain transformer-dev.safetensors and neither "
+          "transformer.safetensors nor transformer-distilled.safetensors (the trainer would "
+          "pick those first)" % (tmp_path / "dev" / "dev-model"))
+
+    def _server_and_memory(m, dev):
+        m.setattr(character_dataset, "story_server_state", lambda: "SERVING vision")
+        m.setattr(character_dataset.psutil, "virtual_memory", lambda: _Memory(29.9 * 2 ** 30))
+
+    _case("order", _server_and_memory,
+          "Error: the story server is SERVING vision; stop it first with bin/story-server stop "
+          "(training needs its memory)")
+    assert not os.path.exists(lock)
+
+
+def test_d27_existing_lora_needs_force(tmp_path, lib_dir, monkeypatch, capsys):
+    make_character(lib_dir)
+    _train_ready(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(character_dataset, "train_video",
+                        lambda data: calls.append(data["name"]) or "ok")
+    assert character_dataset.train(_train_args(video=True)) == 2
+    assert capsys.readouterr().err == (
+        "Error: character kyra already has a video LoRA (%s); pass --force to retrain it\n"
+        % os.path.join(lib_dir, "kyra", "lora", "video.safetensors"))
+    assert calls == []
+    assert character_dataset.train(_train_args(video=True, force=True)) == 0
+    assert calls == ["kyra"]
+
+
+def test_d28_missing_mflux_skips_stills(tmp_path, lib_dir, monkeypatch, capsys):
+    _untrained(lib_dir)
+    _train_ready(monkeypatch, tmp_path)
+    missing = str(tmp_path / "no-mflux" / "mflux-train")
+    monkeypatch.setattr(character_dataset, "MFLUX_TRAIN", missing)
+    calls = []
+    monkeypatch.setattr(character_dataset, "train_video",
+                        lambda data: calls.append(data["name"]) or "ok")
+    assert character_dataset.train(_train_args()) == 0
+    assert calls == ["kyra"]
+    assert _load()["stills_skip_reason"] == "mflux-train not found at %s" % missing
+    assert ("stills LoRA skipped: mflux-train not found at %s; install mflux as described in "
+            "docs/superpowers/specs/2026-10-05-character-library-design.md section 4.10"
+            % missing) in capsys.readouterr().out
+    assert character_dataset.train(_train_args(stills=True)) == 1
+    assert calls == ["kyra"]

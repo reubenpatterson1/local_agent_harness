@@ -942,6 +942,247 @@ def _regenerate(data):
     return build_dataset(data, prev_fh)
 
 
+# ---------------------------------------------------------------------------
+# Video LoRA training (spec 4.8, 4.11)
+# ---------------------------------------------------------------------------
+
+VIDEO_TRAIN_CONFIG_TEMPLATE = """model:
+  model_path: {model_path}
+  text_encoder_path: {gemma}
+  training_mode: lora
+
+lora:
+  rank: 32
+  alpha: 32
+  dropout: 0.0
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+optimization:
+  learning_rate: 2.0e-4
+  steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  scheduler_type: linear
+  scheduler_params:
+    start_factor: 1.0
+    end_factor: 0.1
+
+data:
+  preprocessed_data_root: {data_root}
+
+training_strategy:
+  name: text_to_video
+  generate_audio: false
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+
+validation:
+  prompts:
+    - {validation_prompt}
+  video_dims: [512, 320, 25]
+  frame_rate: 24.0
+  inference_steps: 8
+  interval: 1000
+  guidance_scale: 4.0
+  stg_scale: 0.0
+  seed: 42
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 250
+  keep_last_n: 10
+
+seed: 42
+output_dir: {output_dir}
+"""
+
+
+def video_train_config(data_root, validation_prompt, output_dir):
+    return VIDEO_TRAIN_CONFIG_TEMPLATE.format(
+        model_path=json.dumps(TRAIN_MODEL_DIR), gemma=json.dumps(SKILL.GEMMA_MODEL_ID),
+        data_root=json.dumps(data_root), validation_prompt=json.dumps(validation_prompt),
+        output_dir=json.dumps(output_dir))
+
+
+def preprocess_argv(videos, captions, out_dir):
+    return [SKILL.LTX2_MLX_BIN, "preprocess", "--videos", videos, "--captions", captions,
+            "-o", out_dir, "-m", TRAIN_MODEL_DIR, "-H", "320", "-W", "512", "--max-frames", "1"]
+
+
+def train_argv(config_path):
+    return [SKILL.LTX2_MLX_BIN, "train", "--config", config_path, "--low-ram"]
+
+
+def _video_failed(data, step, rc, log):
+    print("Error: video LoRA training failed at %s (exit %s); log: %s; character %s stays %s"
+          % (step, rc, log, data["name"], data["status"]), file=sys.stderr)
+    return "failed"
+
+
+def train_video(data):
+    """Preprocess, train, record and A/B-test the video LoRA (spec 4.8). Returns "ok",
+    "failed" (nothing recorded) or "test_failed" (the LoRA is recorded; a test render
+    failed)."""
+    name = data["name"]
+    char_dir = character_lib.character_dir(name)
+    vdir = os.path.join(char_dir, "train", "video")
+    if os.path.exists(vdir):
+        shutil.rmtree(vdir)
+    os.makedirs(vdir)
+    for sub in ("lora", "tests", "logs"):
+        os.makedirs(os.path.join(char_dir, sub), exist_ok=True)
+    prompt = trigger_test_prompt(data["trigger"], data["class_noun"])
+    config_path = os.path.join(vdir, "train.yaml")
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(video_train_config(os.path.join(vdir, "preprocessed"), prompt,
+                                   os.path.join(vdir, "out")))
+    env = dict(os.environ, HF_HOME=SKILL.LTX2_MLX_HF_HOME)
+    videos = os.path.join(char_dir, "dataset", "videos")
+
+    log = step_log_path(char_dir, "preprocess")
+    rc = run_logged(preprocess_argv(videos, os.path.join(char_dir, "dataset", "captions"),
+                                    os.path.join(vdir, "preprocessed")),
+                    log, SKILL.LTX2_MLX_DIR, env, PREPROCESS_TIMEOUT_S)
+    if rc != 0:
+        return _video_failed(data, "preprocess", rc, log)
+    latents = os.path.join(vdir, "preprocessed", ".precomputed", "latents")
+    n_lat = len(os.listdir(latents)) if os.path.isdir(latents) else 0
+    n_vid = len(glob.glob(os.path.join(videos, "*.mp4")))
+    if n_lat != n_vid:
+        print("Error: preprocess wrote %d latents for %d videos; log: %s" % (n_lat, n_vid, log),
+              file=sys.stderr)
+        return "failed"
+
+    log = step_log_path(char_dir, "train")
+    rc = run_logged(train_argv(config_path), log, SKILL.LTX2_MLX_DIR, env, VIDEO_TRAIN_TIMEOUT_S)
+    final = os.path.join(vdir, "out", "checkpoints", VIDEO_FINAL_CKPT)
+    if rc != 0 or not os.path.isfile(final) or os.path.getsize(final) == 0:
+        return _video_failed(data, "train", rc, log)
+
+    lora_path = os.path.join(char_dir, "lora", "video.safetensors")
+    shutil.copy2(final, lora_path + ".tmp")
+    os.replace(lora_path + ".tmp", lora_path)
+    data["loras"]["video"] = {"path": lora_path, "sha256": _sha256(lora_path),
+                              "base_model": TRAIN_MODEL_DIR, "rank": VIDEO_RANK,
+                              "alpha": VIDEO_RANK, "steps": VIDEO_STEPS,
+                              "trained_at": character_lib.utc_now(),
+                              "sample_path": None, "control_path": None}
+    data["status"] = "trained"
+    character_lib.write_character(data)
+
+    test_failed = False
+    for key, filename, step, extra in (
+            ("sample_path", "video_lora.mp4", "test-video-lora", {"loras": [(lora_path, 1.0)]}),
+            ("control_path", "video_control.mp4", "test-video-control", {})):
+        out = os.path.join(char_dir, "tests", filename)
+        try:
+            SKILL.generate_video(prompt, out, image_path=None, width=512, height=320,
+                                 num_frames=25, frame_rate=24, seed=TEST_SEED,
+                                 model=TEST_MODEL_DIR, gemma=SKILL.GEMMA_MODEL_ID, low_ram=True,
+                                 log_path=step_log_path(char_dir, step),
+                                 timeout_s=TEST_RENDER_TIMEOUT_S, force=True, **extra)
+        except (ValueError, SKILL.Ltx2MlxError) as e:
+            print("Error: video test render failed: %s" % e, file=sys.stderr)
+            test_failed = True
+            continue
+        data["loras"]["video"][key] = out
+        character_lib.write_character(data)
+
+    entry = data["loras"]["video"]
+    print("video LoRA: %s (sha256 %s)" % (lora_path, entry["sha256"]))
+    print("trigger-only A/B (compare by eye; the LoRA clip should show the character, the "
+          "control a stranger):")
+    print("  with LoRA: %s" % entry["sample_path"])
+    print("  control:   %s" % entry["control_path"])
+    return "test_failed" if test_failed else "ok"
+
+
+def train(args):
+    """bin/character train (spec 4.11). Returns 0, 1 or 2."""
+    name = args.name
+    try:
+        data = character_lib.load_character(name)
+    except character_lib.CharacterError as e:
+        return _error(e)
+    if data["status"] == "dataset":
+        return _error("character %s has no accepted dataset (status dataset); fix it with "
+                      "bin/character create %s --regenerate" % (name, name))
+    requested = [k for k in ("video", "stills") if getattr(args, k)] or ["video", "stills"]
+    explicit_stills = args.stills
+    for kind in requested:
+        if data["loras"][kind] is not None and not args.force:
+            return _error("character %s already has a %s LoRA (%s); pass --force to retrain it"
+                          % (name, kind, data["loras"][kind]["path"]))
+    char_dir = character_lib.character_dir(name)
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(library_lock())
+        except DatasetError as e:
+            return _error(e)
+        busy = busy_process()
+        if busy is not None:
+            return _error("a render or training process is running (pid %d: %s); bin/character "
+                          "never trains or generates concurrently with a render" % busy)
+        state = story_server_state()
+        if state != "STOPPED":
+            return _error("the story server is %s; stop it first with bin/story-server stop "
+                          "(training needs its memory)" % state)
+        avail = psutil.virtual_memory().available / 2 ** 30
+        if avail < TRAIN_MIN_AVAIL_GIB:
+            return _error("only %.1f GiB of memory is available; training needs 30 GiB (quit "
+                          "memory-heavy apps and retry)" % avail)
+        need = TRAIN_MIN_FREE_GIB_PER_KIND * len(requested)
+        free = free_gib(char_dir)
+        if free < need:
+            return _error("only %.1f GiB free at %s; training %s needs %d GiB"
+                          % (free, char_dir, " and ".join(requested), need))
+        if "video" in requested:
+            if (not os.path.isfile(os.path.join(TRAIN_MODEL_DIR, "transformer-dev.safetensors"))
+                    or os.path.exists(os.path.join(TRAIN_MODEL_DIR, "transformer.safetensors"))
+                    or os.path.exists(os.path.join(TRAIN_MODEL_DIR,
+                                                   "transformer-distilled.safetensors"))):
+                return _error("%s must contain transformer-dev.safetensors and neither "
+                              "transformer.safetensors nor transformer-distilled.safetensors "
+                              "(the trainer would pick those first)" % TRAIN_MODEL_DIR)
+            if not os.path.isdir(TEST_MODEL_DIR):
+                return _error("test-render model not found: %s" % TEST_MODEL_DIR)
+            if not (os.path.isfile(SKILL.LTX2_MLX_BIN) and os.access(SKILL.LTX2_MLX_BIN, os.X_OK)):
+                return _error("ltx-2-mlx binary not found or not executable: %s"
+                              % SKILL.LTX2_MLX_BIN)
+
+        stills_outcome = "ok"
+        if "stills" in requested and not (os.path.isfile(MFLUX_TRAIN)
+                                          and os.access(MFLUX_TRAIN, os.X_OK)):
+            data["stills_skip_reason"] = "mflux-train not found at %s" % MFLUX_TRAIN
+            character_lib.write_character(data)
+            print("stills LoRA skipped: %s; install mflux as described in "
+                  "docs/superpowers/specs/2026-10-05-character-library-design.md section 4.10"
+                  % data["stills_skip_reason"])
+            requested.remove("stills")
+            stills_outcome = "skipped"
+
+        video_outcome = "ok"
+        if "video" in requested:
+            video_outcome = train_video(data)
+            if video_outcome == "failed":
+                return 1
+        if "stills" in requested:
+            stills_outcome = train_stills(data)
+        if (video_outcome == "test_failed" or stills_outcome == "failed"
+                or (stills_outcome == "skipped" and explicit_stills)):
+            return 1
+        return 0
+
+
 # --- Z-Image child process (spec 4.9) ---
 
 def run_zimage_child(spec, char_dir, step):
