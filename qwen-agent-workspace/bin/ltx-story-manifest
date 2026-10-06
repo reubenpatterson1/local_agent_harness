@@ -60,6 +60,17 @@ and a chain panel's panel_text is its Motion: text too. --glob, --image without
 --chain, and --no-images keep writing schema_version 2 exactly as before, with no
 "conditioning" key.
 
+--cast PHRASE=NAME (repeatable, --chain only) casts a trained character from the
+character library (generated/characters/NAME, see
+docs/superpowers/specs/2026-10-05-character-library-design.md). The character's trigger
+token is inserted into every Motion: text (motion_prompt) that names PHRASE; panel_text
+is left as authored. Every panel then carries an optional "characters" list (possibly
+empty) of {"name", "phrase", "trigger", "video_lora", "strength"} entries, sorted by
+name: strength is 1.0 when the panel names exactly one cast character, else the
+character's own character.json strength or --character-strength (default 0.8).
+schema_version stays 3, because the key is optional. character_lib.py is loaded by path
+only when --cast is given.
+
 Dependencies: stdlib + Pillow only (for an image-openable sanity check on
 each selected file). No torch, no diffusers -- this tool must stay fast
 and lightweight.
@@ -68,6 +79,7 @@ and lightweight.
 import argparse
 import datetime
 import glob as glob_module
+import importlib.machinery
 import json
 import os
 import re
@@ -123,7 +135,23 @@ def build_parser():
     parser.add_argument("--frames", dest="frames", type=int, action="append", default=None,
                          help="explicit per-panel num_frames override, repeatable; "
                               "count must equal panel count; mutually exclusive with --pace")
+    parser.add_argument("--cast", dest="cast", action="append", default=None,
+                         metavar="PHRASE=NAME",
+                         help="cast a trained character (generated/characters/NAME) under PHRASE "
+                              "(repeatable; --chain only): its trigger is inserted into every "
+                              "Motion: text that names PHRASE, and the panel's 'characters' list "
+                              "carries its video LoRA and strength")
+    parser.add_argument("--character-strength", dest="character_strength", type=float,
+                         default=None,
+                         help="LoRA strength for each cast character in a panel that names two "
+                              "or more of them (default 0.8, provisional); one character always "
+                              "uses 1.0")
     return parser
+
+
+def _character_lib():
+    return importlib.machinery.SourceFileLoader(
+        "character_lib", os.path.join(WS, "character_lib.py")).load_module()
 
 
 def _select_images_glob(images_dir, pattern):
@@ -327,6 +355,10 @@ def main(argv=None):
             parser.error("--chain requires --prompts-md")
         if len(args.image or []) != 1:
             parser.error("--chain requires exactly one --image (panel 1's still)")
+    if args.cast and not args.chain:
+        parser.error("--cast requires --chain")
+    if args.character_strength is not None and not args.cast:
+        parser.error("--character-strength requires --cast")
 
     if args.no_images:
         if args.glob or args.image:
@@ -415,6 +447,20 @@ def main(argv=None):
     else:
         print("WARNING: no --prompts-md; panel_text is a placeholder "
               "— edit manifest.json before running")
+
+    members, strength = [], None
+    if args.cast:
+        lib = _character_lib()
+        strength = (args.character_strength if args.character_strength is not None
+                    else lib.DEFAULT_CHARACTER_STRENGTH)
+        if not 0 < strength <= 1.0:
+            print("Error: --character-strength must be in (0, 1], got %r" % strength, file=sys.stderr)
+            return 2
+        try:
+            members = lib.resolve_cast([lib.parse_cast_arg(v) for v in args.cast])
+        except lib.CharacterError as e:
+            print("Error: %s" % e, file=sys.stderr)
+            return 2
 
     n_panels = len(prompt_texts) if (args.no_images or args.chain) else len(matched)
 
@@ -527,6 +573,21 @@ def main(argv=None):
             panel["conditioning"] = conditioning
         panels.append(panel)
 
+    if members:
+        by_name = {m.name: m for m in members}
+        used = set()
+        for p in panels:
+            p["motion_prompt"], names = lib.cast_text(p["motion_prompt"], members)
+            strengths = lib.panel_strengths(names, members, strength)
+            p["characters"] = [{"name": n, "phrase": by_name[n].phrase, "trigger": by_name[n].trigger,
+                                "video_lora": by_name[n].video_lora, "strength": strengths[n]}
+                               for n in names]
+            used.update(names)
+        for m in members:
+            if m.name not in used:
+                print("WARNING: cast phrase %r (character %s) occurs in no panel's Motion: text; "
+                      "that character gets no LoRA" % (m.phrase, m.name))
+
     for p in panels:
         # Chain mode: the video model receives the Motion: text, so that is what is measured.
         _prompt_length_warning(p["index"], p["motion_prompt"] if args.chain else p["panel_text"])
@@ -566,6 +627,11 @@ def main(argv=None):
         print("%-6d %-30s %-8d %-8.2f %s"
               % (p["index"], basename, p["num_frames"], p["duration_s"], p["title"]))
     print("TOTAL %d frames = %.2f s @ %d fps" % (total_num_frames, total_num_frames / args.fps, args.fps))
+    if members:
+        for p in panels:
+            if p["characters"]:
+                print("cast: panel %d: %s" % (p["index"], ", ".join(
+                    "%s@%s" % (c["name"], repr(c["strength"])) for c in p["characters"])))
 
     return 0
 

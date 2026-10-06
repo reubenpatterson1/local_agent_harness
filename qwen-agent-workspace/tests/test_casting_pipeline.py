@@ -652,3 +652,152 @@ def test_p67_dry_run_lists_globals_first(tmp_path, monkeypatch, capsys):
     assert lines[p2 + 1:p2 + 4] == [glob_line, "            lora: %s @ 0.8 (kyra)" % k,
                                     "            lora: %s @ 0.8 (ronin)" % r]
     assert lines[p3 + 1] == glob_line
+
+
+# --- P20-P25: bin/ltx-story-manifest --cast (spec 5.4) -----------------------------------
+CAST_STORY = """# Cast test
+
+Two travellers on a forest trail.
+
+## Panel 1 — One
+Image: A medium shot of the woman in grey standing on a forest trail. Photorealistic live-action film still.
+Motion: {motion1}
+Narration: She listens to the trees.
+
+## Panel 2 — Two
+Motion: The ronin nods to the woman in grey.
+Narration: They agree without a word.
+
+## Panel 3 — Three
+Motion: Leaves drift across the empty trail.
+Narration: The forest is quiet again.
+"""
+MOTION_1 = "The woman in grey turns her head; the camera stays static."
+
+
+def _manifest_env(tmp_path, monkeypatch, motion1=MOTION_1):
+    """A workspace root under tmp_path for bin/ltx-story-manifest (its module WS is patched),
+    with character_lib.py symlinked in so _character_lib() loads the real module, plus the
+    story.md and panel 1's still. Returns (story_md, image, ws)."""
+    from PIL import Image
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    os.symlink(os.path.join(WS, "character_lib.py"), str(ws / "character_lib.py"))
+    monkeypatch.setattr(story_manifest, "WS", str(ws))
+    story_md = tmp_path / "story.md"
+    story_md.write_text(CAST_STORY.format(motion1=motion1), encoding="utf-8")
+    image = str(tmp_path / "panel_01.png")
+    Image.new("RGB", (64, 64), (90, 90, 90)).save(image)
+    return str(story_md), image, str(ws)
+
+
+def _manifest_argv(story_id, story_md, image, *extra):
+    return ["--story-id", story_id, "--prompts-md", story_md, "--chain", "--image", image,
+            "--fps", "24", "--target-seconds", "18.125", "--min-frames", "145",
+            "--max-frames", "145", "--force"] + list(extra)
+
+
+def _read_manifest(ws, story_id):
+    with open(os.path.join(ws, "generated", "stories", story_id, "manifest.json")) as f:
+        return json.load(f)
+
+
+def _short(characters):
+    return [(c["name"], c["strength"]) for c in characters]
+
+
+def test_p20_cast_inserts_triggers_and_lists_characters(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir)
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_manifest_argv("uncast", story_md, image)) == 0
+    capsys.readouterr()
+    assert story_manifest.main(_manifest_argv(
+        "cast", story_md, image, "--cast", "the woman in grey=kyra",
+        "--cast", "the ronin=ronin")) == 0
+    out = capsys.readouterr().out
+    uncast, cast = _read_manifest(ws, "uncast"), _read_manifest(ws, "cast")
+    assert cast["schema_version"] == 3
+    assert [p["motion_prompt"] for p in cast["panels"]] == [
+        "The kyrawmn woman in grey turns her head; the camera stays static.",
+        "The roninmn ronin nods to the kyrawmn woman in grey.",
+        "Leaves drift across the empty trail."]
+    assert [p["panel_text"] for p in cast["panels"]] == [p["panel_text"] for p in uncast["panels"]]
+    assert [_short(p["characters"]) for p in cast["panels"]] == [
+        [("kyra", 1.0)], [("kyra", 0.8), ("ronin", 0.8)], []]
+    kyra = cast["panels"][0]["characters"][0]
+    assert kyra == {"name": "kyra", "phrase": "the woman in grey", "trigger": "kyrawmn",
+                    "video_lora": os.path.join(lib_dir, "kyra", "lora", "video.safetensors"),
+                    "strength": 1.0}
+    assert all(set(c) == {"name", "phrase", "trigger", "video_lora", "strength"}
+               for p in cast["panels"] for c in p["characters"])
+    assert "cast: panel 1: kyra@1.0" in out.splitlines()
+    assert "cast: panel 2: kyra@0.8, ronin@0.8" in out.splitlines()
+    assert not any(line.startswith("cast: panel 3") for line in out.splitlines())
+
+
+def test_p21_character_strength_and_override(tmp_path, monkeypatch, lib_dir):
+    make_character(lib_dir)
+    _ronin(lib_dir, strength=0.5)
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_manifest_argv(
+        "cast", story_md, image, "--cast", "the woman in grey=kyra",
+        "--cast", "the ronin=ronin", "--character-strength", "0.6")) == 0
+    panels = _read_manifest(ws, "cast")["panels"]
+    assert _short(panels[0]["characters"]) == [("kyra", 1.0)]
+    assert _short(panels[1]["characters"]) == [("kyra", 0.6), ("ronin", 0.5)]
+
+
+def test_p22_unused_cast_phrase_warns(tmp_path, monkeypatch, capsys, lib_dir):
+    _ronin(lib_dir)
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_manifest_argv(
+        "cast", story_md, image, "--cast", "the stranger=ronin")) == 0
+    assert ("WARNING: cast phrase 'the stranger' (character ronin) occurs in no panel's "
+            "Motion: text; that character gets no LoRA") in capsys.readouterr().out
+    assert [p["characters"] for p in _read_manifest(ws, "cast")["panels"]] == [[], [], []]
+
+
+def test_p23_cast_argument_errors(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    manifest = os.path.join(ws, "generated", "stories", "bad", "manifest.json")
+    with pytest.raises(SystemExit) as info:
+        story_manifest.main(["--story-id", "bad", "--prompts-md", story_md, "--image", image,
+                             "--cast", "the woman in grey=kyra"])
+    assert info.value.code == 2
+    assert "--cast requires --chain" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as info:
+        story_manifest.main(_manifest_argv("bad", story_md, image, "--character-strength", "0.5"))
+    assert info.value.code == 2
+    assert "--character-strength requires --cast" in capsys.readouterr().err
+    assert story_manifest.main(_manifest_argv("bad", story_md, image,
+                                              "--cast", "the ghost=ghost")) == 2
+    assert capsys.readouterr().err == "Error: unknown character: ghost (no %s)\n" % os.path.join(
+        lib_dir, "ghost", "character.json")
+    assert story_manifest.main(_manifest_argv("bad", story_md, image,
+                                              "--cast", "the woman in grey=kyra",
+                                              "--character-strength", "0")) == 2
+    assert capsys.readouterr().err == "Error: --character-strength must be in (0, 1], got 0.0\n"
+    assert not os.path.exists(manifest)
+
+
+def test_p24_uncast_manifest_has_no_characters_key(tmp_path, monkeypatch, lib_dir):
+    story_md, image, ws = _manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_manifest_argv("uncast", story_md, image)) == 0
+    assert all("characters" not in p for p in _read_manifest(ws, "uncast")["panels"])
+
+
+def test_p25_length_warning_measures_the_cast_prompt(tmp_path, monkeypatch, capsys, lib_dir):
+    make_character(lib_dir)
+    for filler, warned in ((145, False), (146, True)):
+        sub = tmp_path / ("w%d" % filler)
+        sub.mkdir()
+        motion = "The woman in grey " + " ".join(["walks"] * filler)
+        story_md, image, ws = _manifest_env(sub, monkeypatch, motion1=motion)
+        capsys.readouterr()
+        assert story_manifest.main(_manifest_argv(
+            "long", story_md, image, "--cast", "the woman in grey=kyra")) == 0
+        out = capsys.readouterr().out
+        assert ("WARNING: unit 1 prompt is 151 words" in out) is warned
+        assert "WARNING: unit 1 prompt is 150 words" not in out
