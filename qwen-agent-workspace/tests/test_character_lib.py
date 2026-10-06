@@ -131,7 +131,7 @@ def test_c4_normalize_phrase_rejects():
 
 
 def test_c5_normalize_phrase_keeps_apostrophes_and_hyphens():
-    for ok in ("the ronin's ally", "o'brien", "half-elf"):
+    for ok in ("the ronin’s ally", "o'brien", "half-elf"):
         assert character_lib.normalize_phrase(ok) == ok
 
 
@@ -328,8 +328,8 @@ def test_c24_every_occurrence():
 def test_c25_possessives():
     assert character_lib.cast_text("the ronin's blade", [RONIN]) == (
         "the roninmn ronin's blade", ["ronin"])
-    assert character_lib.cast_text("the ronin's blade", [RONIN]) == (
-        "the roninmn ronin's blade", ["ronin"])
+    assert character_lib.cast_text("the ronin’s blade", [RONIN]) == (
+        "the roninmn ronin’s blade", ["ronin"])
 
 
 def test_c26_word_boundaries():
@@ -356,7 +356,7 @@ def test_c29_idempotent():
     named = member("kyra", "Kyra", "kyrawmn")
     cases = [("The woman in grey rides.", [KYRA]),
              ("He bows to the woman in grey; the woman in grey nods.", [KYRA]),
-             ("the ronin's blade", [RONIN]), ("the ronin's blade", [RONIN]),
+             ("the ronin's blade", [RONIN]), ("the ronin’s blade", [RONIN]),
              ("the ronins", [RONIN]), ("the ronin-like", [RONIN]), ("bathe ronin", [RONIN]),
              ("the woman in grey-blue robe", [KYRA]), ("theronin", [RONIN]),
              ("the woman in grey and the woman", [x, KYRA]),
