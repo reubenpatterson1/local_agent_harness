@@ -380,3 +380,42 @@ def test_d37_no_heavy_top_level_imports():
         elif isinstance(node, ast.ImportFrom):
             roots.add((node.module or "").split(".")[0])
     assert roots and not roots & {"torch", "z_image_skill", "content_safety", "diffusers"}
+
+
+def test_d38_run_logged_kills_child_on_interrupt(tmp_path, monkeypatch):
+    procs = []
+    real_popen = subprocess.Popen
+
+    def _popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(character_dataset.subprocess, "Popen", _popen)
+
+    class _Out(object):
+        def write(self, text):
+            if procs:
+                raise KeyboardInterrupt()
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(character_dataset.sys, "stdout", _Out())
+    with pytest.raises(KeyboardInterrupt):
+        character_dataset.run_logged(["sh", "-c", "echo start; sleep 30"],
+                                     str(tmp_path / "c.log"), "/", os.environ, 60)
+    assert len(procs) == 1
+    assert procs[0].poll() is not None
+    assert procs[0].returncode == -9
+
+
+def test_d39_image_data_url_applies_exif_orientation(tmp_path):
+    path = str(tmp_path / "rot.jpg")
+    img = Image.new("RGB", (200, 100), (10, 20, 30))
+    exif = img.getexif()
+    exif[0x0112] = 6
+    img.save(path, format="JPEG", exif=exif.tobytes())
+    url = character_dataset.image_data_url(path)
+    data = base64.b64decode(url.split(",", 1)[1])
+    assert Image.open(io.BytesIO(data)).size == (100, 200)

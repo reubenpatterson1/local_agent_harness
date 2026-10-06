@@ -276,7 +276,7 @@ def caption(trigger, class_noun, check):
 
 def image_data_url(path, max_side=768):
     """Return a data URL for the image at path, scaled so max side <= max_side."""
-    img = Image.open(path).convert("RGB")
+    img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
     img.thumbnail((max_side, max_side), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=90)
@@ -523,6 +523,12 @@ def run_logged(cmd, log_path, cwd, env, timeout_s):
             proc.wait()
         finally:
             timer.cancel()
+            if proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
     return -9 if timed_out[0] else proc.returncode
 
 
