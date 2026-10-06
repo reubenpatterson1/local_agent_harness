@@ -306,7 +306,7 @@ class TestPrimitives(DeployTestCase):
 
 
 PIPELINE = ("z_image_skill.py", "ltx2_mlx_video_skill.py", "ltx_image_fit.py", "content_safety.py", "pipeline_log.py",
-            "bin/ltx-movie", "bin/ltx-story-images", "bin/ltx-story-manifest", "bin/ltx-mlx-render",
+            "character_lib.py", "bin/ltx-movie", "bin/ltx-story-images", "bin/ltx-story-manifest", "bin/ltx-mlx-render",
             "bin/story-server", "bin/qwen-agent")
 TESTS7 = ("tests/test_ltx_movie_offline.py", "tests/test_ltx_mlx_render.py", "tests/test_ltx_story_images.py",
           "tests/test_ltx2_mlx_video_skill.py", "tests/test_ltx_image_fit.py",
@@ -838,7 +838,7 @@ class TestComponentCollection(DeployTestCase):
     def test_stats(self):
         ctx = self.fx.ctx()
         self.assertEqual(list(ctx.comp_stats), list(ORDER))
-        self.assertEqual((ctx.comp_stats["A1"]["files"], ctx.comp_stats["A1"]["dirs"]), (18, 3))
+        self.assertEqual((ctx.comp_stats["A1"]["files"], ctx.comp_stats["A1"]["dirs"]), (19, 3))
         self.assertEqual(ctx.comp_stats["F2"], {"slug": "framework-symlinks", "files": 0, "symlinks": 17, "dirs": 3, "bytes": 0})
         totals = bp.stats_totals(ctx.comp_stats)
         self.assertEqual(totals["bytes"], sum(e["b"] for e in ctx.entries if e["k"] == "f"))
@@ -1725,7 +1725,7 @@ class TestBuildCli(BuildE2ECase):
         self.assertEqual(lines[-1], "build_pkg: DRY RUN OK")
         comp = [line for line in lines if re.match(r"^[A-H][0-9] ", line)]
         self.assertEqual([line.split()[0] for line in comp], list(ORDER))
-        self.assertTrue(re.match(r"^A1 workspace-code files=18 symlinks=0 dirs=3 bytes=\d+ \(\d+\.\d\d GiB\)$", comp[0]), comp[0])
+        self.assertTrue(re.match(r"^A1 workspace-code files=19 symlinks=0 dirs=3 bytes=\d+ \(\d+\.\d\d GiB\)$", comp[0]), comp[0])
         self.assertEqual(comp[9], "F2 framework-symlinks files=0 symlinks=17 dirs=3 bytes=0 (0.00 GiB)")
         totals = [line for line in lines if line.startswith("TOTAL ")]
         self.assertEqual(len(totals), 1)
@@ -2219,7 +2219,7 @@ class TestResume(BuildE2ECase):
             fh.write(b"L")
         rc, out, err = build_apply(self.fx, "--resume")
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("PASS B07 resume prefix: 26 of ", out)
+        self.assertIn("PASS B07 resume prefix: 27 of ", out)
         self.assert_identical(self.reference())
 
     def test_T44_resume_with_manifest_present_fails_b07(self):
@@ -2245,7 +2245,7 @@ class TestResume(BuildE2ECase):
         bp.HOOKS["after_chunk"] = lambda src, nbytes: None
         rc, out, err = build_apply(self.fx, "--resume")
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("PASS B07 resume prefix: 26 of ", out)
+        self.assertIn("PASS B07 resume prefix: 27 of ", out)
         rc, out, err = build_verify(self.fx)
         self.assertEqual(rc, 0, out + err)
         with open(self.fx.pkg + "/payload/B1-ltx2mlx-repo/README.md", "rb") as fh:
