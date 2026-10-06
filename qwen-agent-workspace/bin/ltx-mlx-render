@@ -82,6 +82,19 @@ class ConcatPreflightError(RuntimeError):
     concatenate, naming the offending clip and the exact differing field."""
 
 
+class _RepeatableLoraAction(argparse.Action):
+    """Repeatable --lora: the dest (lora_path / stills_lora_path) keeps the FIRST value as a
+    string, exactly like the old single-valued flag; <dest>_specs collects every value in
+    command-line order (spec 5.7.1)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        specs = list(getattr(namespace, self.dest + "_specs", None) or [])
+        specs.append(values)
+        setattr(namespace, self.dest + "_specs", specs)
+        if getattr(namespace, self.dest, None) is None:
+            setattr(namespace, self.dest, values)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="ltx-mlx-render",
@@ -102,9 +115,11 @@ def build_parser():
                         help="base seed; panel i uses seed S+i")
     parser.add_argument("--model", default=SKILL.MODEL_ID)
     parser.add_argument("--gemma", default=SKILL.GEMMA_MODEL_ID)
-    parser.add_argument("--lora", dest="lora_path", default=None,
-                        help="LoRA .safetensors file or HF repo ID, prep for future "
-                             "fine-tuning; always applied at strength 1.0")
+    parser.add_argument("--lora", dest="lora_path", action=_RepeatableLoraAction, default=None,
+                        help="global LoRA for the video DiT (ltx-2-mlx): repeatable; PATH or "
+                             "PATH:STRENGTH (0 < STRENGTH <= 2, default 1.0). Every global LoRA "
+                             "applies to every panel, ahead of that panel's cast-character LoRAs, "
+                             "at its own strength (never reduced automatically).")
     parser.add_argument("--no-low-ram", dest="no_low_ram", action="store_true",
                         default=False)
     parser.add_argument("--tile-frames", dest="tile_frames", type=int, default=1)
@@ -217,6 +232,29 @@ def load_manifest(path):
         else:
             panel["conditioning"] = "still" if panel["image_path"] else "t2v"
 
+        if "characters" in panel:
+            characters = panel["characters"]
+            if not isinstance(characters, list):
+                raise ValueError("panel %d: characters must be a list" % index)
+            seen = set()
+            for entry in characters:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not name:
+                    raise ValueError("panel %d: every characters entry needs a non-empty name" % index)
+                if name in seen:
+                    raise ValueError("panel %d: character %s is listed more than once" % (index, name))
+                seen.add(name)
+                lora = entry.get("video_lora")
+                if (not isinstance(lora, str) or not os.path.isabs(lora) or not os.path.isfile(lora)
+                        or not os.access(lora, os.R_OK)):
+                    raise ValueError("panel %d: character %s's video_lora is not a readable file: %r"
+                                     % (index, name, lora))
+                strength = entry.get("strength")
+                if (isinstance(strength, bool) or not isinstance(strength, (int, float))
+                        or not 0 < strength <= 1.0):
+                    raise ValueError("panel %d: character %s's strength must be a number in (0, 1], "
+                                     "got %r" % (index, name, strength))
+
         panel_text = panel.get("panel_text")
         if not isinstance(panel_text, str) or not panel_text.strip():
             raise ValueError("panel %d: panel_text is required and must be a "
@@ -230,7 +268,7 @@ def resolve_prompt(panel):
     return panel.get("motion_prompt") or panel["panel_text"]
 
 
-def build_units(panels, seed, clips_dir, run_root=None):
+def build_units(panels, seed, clips_dir, run_root=None, global_loras=()):
     """Return the ordered per-panel unit list.
 
     Each unit: {"index", "label", "seed", "prompt", "image_path", "clip_path",
@@ -251,7 +289,7 @@ def build_units(panels, seed, clips_dir, run_root=None):
     for i, panel in enumerate(panels, start=1):
         conditioning = panel["conditioning"]
         chained = conditioning == "chain"
-        units.append({
+        unit = {
             "index": i,
             "label": "panel-%d" % i,
             "seed": seed + i,
@@ -264,7 +302,14 @@ def build_units(panels, seed, clips_dir, run_root=None):
             "conditioning": conditioning,
             "chain_source": (os.path.join(clips_dir, "panel_%02d.mp4" % (i - 1)) if chained
                              else None),
-        })
+        }
+        loras = [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
+                 for g in global_loras]
+        loras += [{"kind": "character", "name": c["name"], "path": c["video_lora"],
+                   "strength": float(c["strength"])} for c in (panel.get("characters") or [])]
+        if loras:
+            unit["loras"] = loras
+        units.append(unit)
     return units
 
 
@@ -355,6 +400,19 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+_LORA_SHA256_CACHE = {}
+
+
+def lora_sha256(path):
+    """file_sha256, memoized on (realpath, size, mtime_ns): a 642 MB LoRA is hashed once per
+    process, not three times per panel; a rewritten file changes the key and is re-hashed."""
+    info = os.stat(path)
+    key = (os.path.realpath(path), info.st_size, info.st_mtime_ns)
+    if key not in _LORA_SHA256_CACHE:
+        _LORA_SHA256_CACHE[key] = file_sha256(path)
+    return _LORA_SHA256_CACHE[key]
+
+
 def build_clip_provenance(unit, args, *, strict=False):
     """The exact generation identity a reusable clip must match. schema_version 2: every
     pre-redesign clip is deliberately non-reusable (it was conditioned on the old,
@@ -362,7 +420,7 @@ def build_clip_provenance(unit, args, *, strict=False):
     the frame index taken from it, not on the extracted PNG, so an ffmpeg PNG-encoder
     change cannot cascade a spurious re-render while any real change to clip k-1 does."""
     conditioning = unit["conditioning"]
-    return {
+    provenance = {
         "schema_version": 2,
         "backend": "ltx-2-mlx",
         "model": args.model,
@@ -379,6 +437,11 @@ def build_clip_provenance(unit, args, *, strict=False):
         "frames": args.frames, "fps": args.frame_rate, "low_ram": not args.no_low_ram,
         "tile_frames": args.tile_frames, "tile_spatial": args.tile_spatial,
     }
+    if unit.get("loras"):
+        provenance["loras"] = [{"kind": l["kind"], "path": l["path"],
+                                "sha256": lora_sha256(l["path"]), "strength": l["strength"]}
+                               for l in unit["loras"]]
+    return provenance
 
 
 def write_clip_provenance(clip_path, provenance):
@@ -694,6 +757,8 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
             print("  panel %2d: I2V %s" % (unit["index"], unit["image_path"]))
         else:
             print("  panel %2d: T2V (no conditioning image)" % unit["index"])
+        for l in unit.get("loras", []):
+            print("            lora: %s @ %s (%s)" % (l["path"], repr(l["strength"]), l["name"] or "global"))
     print("clips dir: %s" % clips_dir)
     print("output: %s" % os.path.abspath(args.output_path))
     print("geometry: %dx%d, %d frames @ %d fps = %.2f s per panel"
@@ -721,13 +786,15 @@ def print_dry_run(args, manifest, units, story_id, clips_dir):
 
     if would_render:
         first = would_render[0]
+        extra = ({"loras": [(l["path"], l["strength"]) for l in first["loras"]]}
+                 if first.get("loras") else {})
         cmd = SKILL.build_command(
             prompt=first["prompt"], output_path=first["clip_path"],
             image_path=first["image_path"], width=args.width, height=args.height,
             num_frames=args.frames, frame_rate=args.frame_rate, seed=first["seed"],
             model=args.model, gemma=args.gemma, lora_path=args.lora_path,
             low_ram=(not args.no_low_ram),
-            tile_frames=args.tile_frames, tile_spatial=args.tile_spatial)
+            tile_frames=args.tile_frames, tile_spatial=args.tile_spatial, **extra)
         print("first render command: %s" % shlex.join(cmd))
     else:
         print("first render command: (none; all panels would be skipped)")
@@ -803,6 +870,8 @@ def render_panel(unit, args):
                      "seconds": round(time.monotonic() - started, 1)})
         return base
     try:
+        extra = ({"loras": [(l["path"], l["strength"]) for l in unit["loras"]]}
+                 if unit.get("loras") else {})
         clip = SKILL.generate_video(
             unit["prompt"], unit["clip_path"], image_path=unit["image_path"],
             width=args.width, height=args.height, num_frames=args.frames,
@@ -810,7 +879,7 @@ def render_panel(unit, args):
             gemma=args.gemma, lora_path=args.lora_path,
             low_ram=(not args.no_low_ram), tile_frames=args.tile_frames,
             tile_spatial=args.tile_spatial, log_path=unit["log_path"],
-            timeout_s=args.panel_timeout, force=True)
+            timeout_s=args.panel_timeout, force=True, **extra)
     except ValueError as e:
         print("panel %d FAILED (invalid): %s" % (unit["index"], e), file=sys.stderr)
         base.update({"status": "invalid", "clip": None, "error": str(e),
@@ -1001,6 +1070,36 @@ def main(argv=None):
               file=sys.stderr)
         return 2
 
+    specs = getattr(args, "lora_path_specs", None) or []
+    try:
+        parsed = [SKILL.parse_lora_spec(v) for v in specs]
+    except ValueError as e:
+        print("Error: --lora: %s" % e, file=sys.stderr)
+        return 2
+    cast_entries = [(p["index"], c) for p in panels for c in (p.get("characters") or [])]
+    args.global_loras = []
+    if len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries:
+        args.lora_path = parsed[0][0]                       # legacy route (5.7.2)
+    elif parsed:
+        args.lora_path = None
+        seen = {}
+        for path, strength, _explicit in parsed:
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                print("Error: --lora %s: not a readable file" % path, file=sys.stderr)
+                return 2
+            real = os.path.realpath(path)
+            if real in seen:
+                print("Error: --lora %s is given more than once" % path, file=sys.stderr)
+                return 2
+            seen[real] = path
+            args.global_loras.append({"path": os.path.abspath(path), "strength": strength})
+        for index, c in cast_entries:
+            real = os.path.realpath(c["video_lora"])
+            if real in seen:
+                print("Error: --lora %s is also character %s's video LoRA (panel %d); pass it "
+                      "once" % (seen[real], c["name"], index), file=sys.stderr)
+                return 2
+
     story_id = manifest.get("story_id") or "story"
     story_dir = story_dir_for(story_id)
     clips_dir = args.clips_dir or os.path.join(story_dir, "clips")
@@ -1026,7 +1125,7 @@ def main(argv=None):
         return 2
 
     if args.dry_run:
-        units = build_units(panels, args.seed, clips_dir)
+        units = build_units(panels, args.seed, clips_dir, global_loras=args.global_loras)
         return print_dry_run(args, manifest, units, story_id, clips_dir)
 
     for tool in ("ffmpeg", "ffprobe"):
@@ -1088,7 +1187,7 @@ def main(argv=None):
     print("run root: %s" % run_root)
     print("clips dir: %s" % clips_dir)
 
-    units = build_units(panels, args.seed, clips_dir, run_root)
+    units = build_units(panels, args.seed, clips_dir, run_root, global_loras=args.global_loras)
 
     # ORDER-SAFE: keyed on unit index, never appended in loop order, because
     # the retry pass fills these in out of order (only failed panels, in
