@@ -81,6 +81,17 @@ member plus --character-strength, so every panel whose prompt names a cast phras
 with that character's LoRAs (1.0 for one character, --character-strength, default 0.8, for
 two or more). Every casting problem exits 2 before any phase runs. character_lib.py is
 loaded by path only when casting is used, so an uncast run never reads it.
+
+Shots mode (docs/superpowers/specs/2026-10-06-shots-mode-design.md): --shots makes every
+panel its own shot. Phase 1 uses STORY_PROMPT_TEMPLATE_SHOTS (a Characters list, an Image:
+field on every panel, one action per Motion:) and enforces the shot rules in
+character_lib.shots_violations, asking the story model for one rewrite of a draft it wrote
+in this run; Phase 2 renders a still for every panel, one bin/ltx-story-images run per
+stills-LoRA group (z_image_skill holds one LoRA set per process); Phase 3 builds a --shots
+manifest in which every panel is conditioned on its own still; Phase 4 renders independent
+clips (--on-panel-failure skip). Every cast character LoRA defaults to 0.8, alone or
+paired. --redo N[,M] moves those panels' stills and clips, and movie.mp4, into
+<story>/redo/<stamp>-<pid>/ so that only they re-render.
 """
 
 import argparse
@@ -153,6 +164,37 @@ Write the Prompt: field in the present tense and describe only what is physicall
 
 Do not emit an Image: or Motion: field. Do not verify the file with run_python or any other tool. Emit no other text."""
 
+STORY_PROMPT_TEMPLATE_SHOTS = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
+
+Narrative to adapt:
+{narrative}
+
+How this movie is made: it is a sequence of separate shots joined by cuts, {seconds} seconds each. Every panel is one shot. Its Image: field is rendered as a single still picture, that picture becomes the shot's first frame, and a {seconds}-second clip is animated from it. Nothing carries over from one shot to the next except what you write, so every Image: field must describe its whole shot. Cuts between panels are expected. Make the cuts read as one scene by stating the continuity in every Image: field: the same setting, the same time of day, lighting and colour palette, and consistent screen direction -- who is on the left and who is on the right, and which way each character faces or moves.
+
+Write the complete story to generated/stories/{story_id}/story.md using the write_file tool. The file starts with a title line, a one-sentence summary and a Characters section, and then has EXACTLY {panels} panel sections, numbered 1 through {panels} in order:
+
+# <title>
+
+<one sentence summarising the story>
+
+## Characters
+- "<referring phrase>": <full visual description>
+
+The Characters section has one line per character who appears anywhere in the file, in exactly that format, with the phrase in double quotes. A full visual description covers apparent age group, build, skin tone, hair colour, length and style, and clothing and accessories. Give each character a referring phrase of at most four words built only from details in their description or stated by the narrative, and use that exact phrase for them everywhere else in the file. Never add a colour, garment or trait just to make the phrase.
+
+Every panel has exactly three fields, in this order:
+
+## Panel N — <short title>
+Image: <80-170 words describing this shot's first frame as one still picture: every character who is on screen, each named by their referring phrase and then given their full description from the Characters section, word for word; where each one stands and which way they face; the setting and background; the lighting and colour palette; the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up); the camera viewpoint; and the rendering style.>
+Motion: <10-25 words: one sentence naming ONE character by their referring phrase and the ONE physical action they perform during these {seconds} seconds, then a separate short sentence about the camera, for example "The camera stays static.">
+Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
+
+One action per shot. {seconds} seconds is enough for one gesture, a few steps, one swing or one turn of the head -- not for a sequence. The Motion: action sentence gives one character one action: never chain actions with "then", "while", "meanwhile", "simultaneously", "afterwards", "followed by" or ", and", never use a semicolon, and never write a second action sentence. When the story needs a sequence -- for example a charge, a draw and a strike -- give each beat its own panel, so a fight or a chase takes several panels. Do not describe appearance, clothing, setting or lighting in Motion: -- that belongs in Image:.
+
+Give the story a narrative arc -- an introduction, a middle, a climax and a conclusion -- carried by what the characters do from shot to shot and by the narration. Each panel should move the action forward instead of repeating the previous panel's action.
+
+Write the file in a single write_file call. Trust your first draft: do NOT read the file back, do NOT run run_python or any other tool to check it, and do NOT count or recount words. Once the write_file call returns, stop immediately and emit no further text or tool calls."""
+
 SEED_IMAGE_PREFACE = """An image is attached to this message. It IS the first frame of this movie: the pipeline uses the attached image itself as Panel 1's picture, so nothing you write is rendered into Panel 1's picture.
 
 Before you write anything, look closely at the attached image. Panel 1's Image: field must be a faithful, literal description of what the attached image actually shows -- each person's apparent age group, build and body shape, skin tone, eye shape and colour, hair colour, length, style and texture, clothing and accessories, their pose and where they are in the frame, the setting, the lighting, the colour palette and the visual style. It is not a generative prompt, not an embellishment and not an invention: do not add people, objects or scenery that are not visible in the attached image, do not leave out the ones that are, and do not change anyone's age, gender or physical attributes unless the narrative directs it. Choose each person's short referring phrase from what is actually visible.
@@ -165,8 +207,9 @@ Do not verify the file with run_python or any other tool. Emit no other text."""
 
 
 def build_story_prompt(narrative, story_id, panels, no_stills=False, seed_image=False, *,
-                       seconds, cast_block=None):
-    template = STORY_PROMPT_TEMPLATE_NO_STILLS if no_stills else STORY_PROMPT_TEMPLATE
+                       seconds, cast_block=None, shots=False):
+    template = (STORY_PROMPT_TEMPLATE_NO_STILLS if no_stills
+                else STORY_PROMPT_TEMPLATE_SHOTS if shots else STORY_PROMPT_TEMPLATE)
     rendered = template.format(narrative=narrative, story_id=story_id, panels=panels,
                                seconds=seconds)
     if cast_block:
@@ -276,6 +319,19 @@ def build_parser():
                          default=False,
                          help="print the character library table (the same as bin/character "
                               "list) and exit; must be the only argument")
+    parser.add_argument("--shots", dest="shots", action="store_true", default=False,
+                         help="shots mode: every panel is its own shot with its own Image: still "
+                              "and is rendered from that still (no chaining; cuts between "
+                              "panels). Phase 1 uses the shots story template and enforces the "
+                              "shot rules (one action per Motion:, at most two cast characters "
+                              "per shot), Phase 2 renders a still for every panel, and every "
+                              "cast character LoRA defaults to 0.8. See docs/superpowers/specs/"
+                              "2026-10-06-shots-mode-design.md.")
+    parser.add_argument("--redo", dest="redo", default=None, metavar="N[,M...]",
+                         help="with --shots and an existing story.md: move panels N,M...'s "
+                              "stills and clips (and movie.mp4) aside into "
+                              "<story>/redo/<stamp>/ and re-render only those panels; every "
+                              "other panel is reused")
     parser.add_argument("--story-model", dest="story_model", default=None,
                          help="model name to declare to bin/qwen-agent's --model for "
                               "Phase 1 story generation; must match whatever the "
@@ -669,7 +725,8 @@ def _resolve_casting(args):
         return 2
     lib = _character_lib()
     strength = (args.character_strength if args.character_strength is not None
-                else lib.DEFAULT_CHARACTER_STRENGTH)
+                else (lib.SHOTS_CHARACTER_STRENGTH if getattr(args, "shots", False)
+                      else lib.DEFAULT_CHARACTER_STRENGTH))
     if not 0 < strength <= 1.0:
         print("Error: --character-strength must be in (0, 1], got %r" % strength, file=sys.stderr)
         return 2
@@ -695,7 +752,7 @@ def _resolve_casting(args):
                   "runs: the override is used verbatim, so the Cast block cannot be added",
                   file=sys.stderr)
             return 2
-        args.cast_block = lib.build_cast_block(members)
+        args.cast_block = lib.build_cast_block(members, shots=getattr(args, "shots", False))
     else:
         with open(story_md, encoding="utf-8") as f:
             text = f.read()
@@ -754,6 +811,55 @@ def _resolve_global_loras(args):
             seen[real] = path
             resolved.append((os.path.abspath(path), strength))
         setattr(args, out_attr, resolved)
+    return 0
+
+
+def _resolve_shots(args):
+    """Validate --shots/--redo (shots spec 5.1). Sets args.redo_panels to the sorted, de-duplicated
+    panel numbers ([] without --redo). Returns 0, or 2 after one Error: line. Touches nothing."""
+    args.redo_panels = []
+    if not args.shots:
+        if args.redo is not None:
+            print("Error: --redo requires --shots", file=sys.stderr)
+            return 2
+        return 0
+    if args.no_stills:
+        print("Error: --shots needs Phase 2's per-panel stills; it cannot be combined with "
+              "--no-stills", file=sys.stderr)
+        return 2
+    if getattr(args, "seed_image", None):
+        print("Error: --shots is not supported with --seed-image: the seed image can be only "
+              "panel 1's still, and the seed-image story preface describes the chained flow",
+              file=sys.stderr)
+        return 2
+    if args.redo is None:
+        return 0
+    if args.force_story:
+        print("Error: --redo cannot be combined with --force-story: --force-story writes a new "
+              "story.md, so every panel changes", file=sys.stderr)
+        return 2
+    if args.story_only:
+        print("Error: --redo cannot be combined with --story-only: --story-only stops before the "
+              "stills and clips that --redo re-renders", file=sys.stderr)
+        return 2
+    try:
+        panels = sorted({int(x) for x in args.redo.split(",") if x.strip()})
+    except ValueError:
+        panels = []
+    if not panels:
+        print("Error: --redo must be a comma-separated list of panel numbers, e.g. 3 or 3,7; "
+              "got %r" % args.redo, file=sys.stderr)
+        return 2
+    for n in panels:
+        if not 1 <= n <= args.panels:
+            print("Error: --redo panel %d is out of range (1..%d)" % (n, args.panels),
+                  file=sys.stderr)
+            return 2
+    story_md = _story_paths(args.story_id)["story_md"]
+    if not os.path.isfile(story_md):
+        print("Error: --redo needs an existing story.md: %s" % story_md, file=sys.stderr)
+        return 2
+    args.redo_panels = panels
     return 0
 
 
@@ -875,7 +981,8 @@ def phase1_story(args):
             prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
                                          bool(getattr(args, "seed_image", None)),
                                          seconds=_clip_seconds(args),
-                                         cast_block=getattr(args, "cast_block", None))
+                                         cast_block=getattr(args, "cast_block", None),
+                                         shots=getattr(args, "shots", False))
         with open(os.path.join(_story_dir(args.story_id), "story_prompt.txt"), "w",
                   encoding="utf-8") as f:
             f.write(prompt)
@@ -1223,7 +1330,8 @@ def _print_dry_run_plan(args):
     prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
                                  bool(getattr(args, "seed_image", None)),
                                  seconds=_clip_seconds(args),
-                                 cast_block=getattr(args, "cast_block", None))
+                                 cast_block=getattr(args, "cast_block", None),
+                                 shots=getattr(args, "shots", False))
 
     print("=== DRY RUN: ltx-movie phase plan (story-id=%s) ===" % args.story_id)
     print()
@@ -1386,6 +1494,9 @@ def main(argv=None):
               file=sys.stderr)
         return 2
 
+    rc = _resolve_shots(args)
+    if rc:
+        return rc
     rc = _resolve_casting(args)
     if rc:
         return rc

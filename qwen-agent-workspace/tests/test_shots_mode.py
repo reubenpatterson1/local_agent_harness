@@ -816,3 +816,147 @@ def test_s66_render_accepts_the_shots_manifest(tmp_path, monkeypatch, lib_dir):
     assert summary["skipped_panels"] == [2]
     assert [os.path.basename(c) for c in summary["clips"]] == [
         "panel_01.mp4", "panel_03.mp4", "panel_04.mp4"]
+
+
+# --- S30-S34: bin/ltx-movie arguments, _resolve_shots, the template (spec 5.1-5.3) -------
+ANCHOR = "\n\nHow this movie is made:"
+
+
+@pytest.fixture
+def movie_ws(tmp_path, monkeypatch):
+    """ltx_movie.WS -> tmp_path/ws (spec 10.1). bin/ and character_lib.py are symlinked to the
+    real workspace, so every by-path loader in bin/ltx-movie still reads the real files while
+    every story dir lands under tmp_path/ws/generated/stories."""
+    ws = tmp_path / "ws"
+    (ws / "generated" / "stories").mkdir(parents=True)
+    os.symlink(os.path.join(WS, "bin"), str(ws / "bin"))
+    os.symlink(os.path.join(WS, "character_lib.py"), str(ws / "character_lib.py"))
+    monkeypatch.setattr(ltx_movie, "WS", str(ws))
+    return ws
+
+
+def _story_dir_with(movie_ws, story_id, text=None):
+    """<ws>/generated/stories/<story_id>, created, with story.md = text when given."""
+    directory = movie_ws / "generated" / "stories" / story_id
+    directory.mkdir(parents=True, exist_ok=True)
+    if text is not None:
+        (directory / "story.md").write_text(text, encoding="utf-8")
+    return directory
+
+
+def _movie_args(*argv):
+    args = ltx_movie.build_parser().parse_args(list(argv))
+    args.video_width, args.video_height = 704, 448
+    return args
+
+
+def _shots_args(*argv):
+    """parse_args, then _resolve_shots and _resolve_casting exactly as main() runs them (both
+    must return 0), with main()'s default 704x448 geometry."""
+    args = _movie_args(*argv)
+    assert ltx_movie._resolve_shots(args) == 0
+    assert ltx_movie._resolve_casting(args) == 0
+    return args
+
+
+def _all_files(root):
+    return sorted(os.path.join(d, f) for d, _dirs, files in os.walk(str(root)) for f in files)
+
+
+def test_s30_parser_flags():
+    args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x"])
+    assert args.shots is False
+    assert args.redo is None
+    args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x", "--shots", "--redo", "3,1"])
+    assert args.shots is True
+    assert args.redo == "3,1"
+    helptext = " ".join(ltx_movie.build_parser().format_help().split())
+    assert "--shots" in helptext and "--redo" in helptext
+    for fragment in ("145 frames @ 24 fps = 6.04s per clip.", "6.04s per panel at the defaults",
+                     "number of chained clips; panel 1 also gets the movie's one still image; "
+                     "mutually exclusive with --length",
+                     "every clip after the first continues from the previous clip's last frame"):
+        assert fragment in helptext, fragment
+
+
+def test_s31_shots_story_prompt():
+    template = ltx_movie.STORY_PROMPT_TEMPLATE_SHOTS
+    plain = ltx_movie.build_story_prompt("N", "sid", 14, seconds="6", shots=True)
+    assert plain == template.format(narrative="N", story_id="sid", panels=14, seconds="6")
+    cast = ltx_movie.build_story_prompt("N", "sid", 14, seconds="6", cast_block="CAST", shots=True)
+    assert cast == plain.replace(ANCHOR, "\n\nCAST" + ANCHOR)
+    assert "\n\nCAST" + ANCHOR in cast
+    fields = {f for _text, f, _spec, _conv in string.Formatter().parse(template) if f is not None}
+    assert fields == {"story_id", "narrative", "seconds", "panels"}
+    assert template.count(ANCHOR) == 1
+    for fragment in ("sequence of separate shots joined by cuts", "## Characters", "10-25 words",
+                     "ONE physical action", "never use a semicolon",
+                     "EXACTLY {panels} panel sections"):
+        assert fragment in template, fragment
+
+
+def test_s32_non_shots_prompts_are_unchanged():
+    build = ltx_movie.build_story_prompt
+    for no_stills in (False, True):
+        for seed_image in (False, True):
+            assert build("N", "sid", 14, no_stills, seed_image, seconds="6", shots=False) == build(
+                "N", "sid", 14, no_stills, seed_image, seconds="6")
+    assert build("N", "sid", 14, seconds="6") == ltx_movie.STORY_PROMPT_TEMPLATE.format(
+        narrative="N", story_id="sid", panels=14, seconds="6")
+
+
+def test_s33_resolve_shots_errors(tmp_path, movie_ws, capsys):
+    seed = tmp_path / "seed.png"
+    seed.write_bytes(b"png")
+    _story_dir_with(movie_ws, "has-story", SHOTS_OK)
+    missing = os.path.join(str(movie_ws), "generated", "stories", "no-story", "story.md")
+    base = ["n", "--story-id", "has-story", "--panels", "14"]
+    malformed = "Error: --redo must be a comma-separated list of panel numbers, e.g. 3 or 3,7; got %r"
+    cases = [
+        (base + ["--redo", "3"], "Error: --redo requires --shots"),
+        (base + ["--shots", "--no-stills"],
+         "Error: --shots needs Phase 2's per-panel stills; it cannot be combined with --no-stills"),
+        (base + ["--shots", "--seed-image", str(seed)],
+         "Error: --shots is not supported with --seed-image: the seed image can be only panel 1's "
+         "still, and the seed-image story preface describes the chained flow"),
+        (base + ["--shots", "--redo", "x"], malformed % "x"),
+        (base + ["--shots", "--redo", "3.0"], malformed % "3.0"),
+        (base + ["--shots", "--redo", ""], malformed % ""),
+        (base + ["--shots", "--redo", ","], malformed % ","),
+        (base + ["--shots", "--redo", "0"], "Error: --redo panel 0 is out of range (1..14)"),
+        (base + ["--shots", "--redo", "15"], "Error: --redo panel 15 is out of range (1..14)"),
+        (base + ["--shots", "--redo", "-1"], "Error: --redo panel -1 is out of range (1..14)"),
+        (base + ["--shots", "--redo", "2", "--force-story"],
+         "Error: --redo cannot be combined with --force-story: --force-story writes a new "
+         "story.md, so every panel changes"),
+        (base + ["--shots", "--redo", "2", "--story-only"],
+         "Error: --redo cannot be combined with --story-only: --story-only stops before the "
+         "stills and clips that --redo re-renders"),
+        (["n", "--story-id", "no-story", "--panels", "14", "--shots", "--redo", "2"],
+         "Error: --redo needs an existing story.md: %s" % missing),
+    ]
+    before = _all_files(tmp_path)
+    for argv, message in cases:
+        args = _movie_args(*argv)
+        assert ltx_movie._resolve_shots(args) == 2, argv
+        assert capsys.readouterr().err == message + "\n", argv
+        assert args.redo_panels == []
+    args = _movie_args(*(base + ["--shots", "--redo", "3, 1,3"]))
+    assert ltx_movie._resolve_shots(args) == 0
+    assert args.redo_panels == [1, 3]
+    args = _movie_args(*(base + ["--shots"]))
+    assert ltx_movie._resolve_shots(args) == 0
+    assert args.redo_panels == []
+    assert capsys.readouterr().err == ""
+    assert _all_files(tmp_path) == before
+
+
+def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir):
+    _kyra(lib_dir)
+    members = _members("kyra")
+    args = _shots_args("n", "--story-id", "new", "--shots", "--character", "kyra")
+    assert args.character_strength == 0.8
+    assert args.cast_block == character_lib.build_cast_block(members, shots=True)
+    assert args.cast_block.endswith("\n" + character_lib.SHOTS_CAST_BLOCK_RULES)
+    args = _shots_args("n", "--story-id", "new", "--character", "kyra")
+    assert args.cast_block == character_lib.build_cast_block(members)
