@@ -1503,7 +1503,7 @@ def _redo_pairs(directory, archive, panel, clip=True):
     return pairs + [(j(directory, "movie.mp4"), j(archive, "movie.mp4"))]
 
 
-def test_s49_redo_moves_only_the_named_panels(movie_ws, capsys):
+def test_s49_redo_moves_only_the_named_panels(movie_ws, capsys, monkeypatch):
     directory = _redo_tree(movie_ws, "s49")
     before = _snapshot(directory)
     args = _shots_args("n", "--story-id", "s49", "--shots", "--redo", "2", "--panels", "3")
@@ -1532,6 +1532,39 @@ def test_s49_redo_moves_only_the_named_panels(movie_ws, capsys):
     assert [l for l in capsys.readouterr().out.splitlines() if l.startswith("redo: moved ")] == [
         "redo: moved %s -> %s" % pair for pair in _redo_pairs(directory, archives[0], 3,
                                                                clip=False)]
+    # E-S13: a failed move returns 1 with one Error: line on stderr; the earlier move stays in
+    # the archive (printed), and the failed and later files stay where they were.
+    directory = _redo_tree(movie_ws, "s49c")
+    before = _snapshot(directory)
+    real_replace = os.replace
+
+    def replace(src, dst):
+        if src.endswith(os.path.join("clips", "panel_02.mp4")):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(ltx_movie.os, "replace", replace)
+    try:
+        args = _shots_args("n", "--story-id", "s49c", "--shots", "--redo", "2", "--panels", "3")
+        assert ltx_movie.phase_redo_shots(args) == 1
+    finally:
+        monkeypatch.setattr(ltx_movie.os, "replace", real_replace)
+    archives = glob.glob(os.path.join(directory, "redo", "*"))
+    assert len(archives) == 1
+    (still, still_dst), (clip, clip_dst) = _redo_pairs(directory, archives[0], 2)[:2]
+    captured = capsys.readouterr()
+    assert [l for l in captured.out.splitlines() if l.startswith("redo: moved ")] == [
+        "redo: moved %s -> %s" % (still, still_dst)]
+    assert captured.err.splitlines() == [
+        "Error: --redo could not move %s to %s: [Errno 28] No space left on device"
+        % (clip, clip_dst)]
+    with open(still_dst, "rb") as f:
+        assert f.read() == before[still][0]
+    after = _snapshot(directory)
+    assert len(after) == len(before)
+    for path, value in before.items():
+        if path != still:
+            assert after[path] == value, path
 
 
 def test_s50_dry_run_new_shots_story(lib_dir):
@@ -1584,6 +1617,14 @@ def test_s51_dry_run_existing_story_with_redo(movie_ws, lib_dir, capsys):
         assert " --only %s " % only in lines[i + 1] and lines[i + 1].endswith(" --shots")
     assert _snapshot(directory) == before
     assert not os.path.exists(os.path.join(directory, "redo"))
+    # --force-story: story.md is about to be rewritten, so the groups are not read from it.
+    assert ltx_movie.main(["n", "--story-id", "s51", "--shots", "--force-story", "--panels", "3",
+                           "--dry-run", "--no-review", "--character", "kyra",
+                           "--character", "ronin"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert any(l.startswith("Stills groups: computed from story.md after Phase 1") for l in lines)
+    assert not [l for l in lines if l.startswith("stills group ")]
+    assert _snapshot(directory) == before
 
 
 def test_s52_non_shots_outputs_are_byte_identical(tmp_path, movie_ws, capsys):
