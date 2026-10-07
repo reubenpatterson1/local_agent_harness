@@ -47,8 +47,9 @@ schema_version 1 manifests written by earlier versions of this tool):
   ]
 }
 
-Schema version 3 is written ONLY by --chain (the bin/ltx-movie chained flow). It is
-schema version 2 plus one required per-panel key, "conditioning":
+Schema version 3 is written ONLY by --chain (the bin/ltx-movie chained flow) and by
+--shots (see below). It is schema version 2 plus one required per-panel key,
+"conditioning":
   "still" -- image_path is an existing, readable file (panel 1's still);
   "chain" -- index >= 2 and image_path is null: at render time bin/ltx-mlx-render
              conditions the panel on the exact last frame of the previous panel's clip;
@@ -57,11 +58,11 @@ schema version 2 plus one required per-panel key, "conditioning":
 has Image:/Motion:/Narration: and whose later panels have Motion:/Narration:. Panel
 1's panel_text is its Image: text; every panel's motion_prompt is its Motion: text,
 and a chain panel's panel_text is its Motion: text too. --glob, --image without
---chain, and --no-images keep writing schema_version 2 exactly as before, with no
-"conditioning" key.
+--chain or --shots, and --no-images keep writing schema_version 2 exactly as before,
+with no "conditioning" key.
 
---cast PHRASE=NAME (repeatable, --chain only) casts a trained character from the
-character library (generated/characters/NAME, see
+--cast PHRASE=NAME (repeatable, --chain or --shots only) casts a trained character from
+the character library (generated/characters/NAME, see
 docs/superpowers/specs/2026-10-05-character-library-design.md). The character's trigger
 token is inserted into every Motion: text (motion_prompt) that names PHRASE; panel_text
 is left as authored. Every panel then carries an optional "characters" list (possibly
@@ -152,14 +153,15 @@ def build_parser():
     parser.add_argument("--cast", dest="cast", action="append", default=None,
                          metavar="PHRASE=NAME",
                          help="cast a trained character (generated/characters/NAME) under PHRASE "
-                              "(repeatable; --chain only): its trigger is inserted into every "
-                              "Motion: text that names PHRASE, and the panel's 'characters' list "
-                              "carries its video LoRA and strength")
+                              "(repeatable; --chain or --shots only): its trigger is inserted "
+                              "into every Motion: text that names PHRASE, and the panel's "
+                              "'characters' list carries its video LoRA and strength")
     parser.add_argument("--character-strength", dest="character_strength", type=float,
                          default=None,
                          help="LoRA strength for each cast character in a panel that names two "
-                              "or more of them (default 0.8, provisional); one character always "
-                              "uses 1.0")
+                              "or more of them (default 0.8, provisional); one character uses "
+                              "1.0, except with --shots, where every cast character uses this "
+                              "strength")
     return parser
 
 

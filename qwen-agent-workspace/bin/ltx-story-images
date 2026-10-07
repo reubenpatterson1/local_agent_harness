@@ -127,7 +127,8 @@ def build_parser():
                         default=None,
                         help="stills LoRA strength for each cast character in a panel that names "
                              "two or more of them (default 0.8, provisional); one character "
-                             "always uses 1.0")
+                             "uses 1.0, except with --shots, where every cast character uses "
+                             "this strength")
     parser.add_argument("--shots", dest="shots", action="store_true", default=False,
                         help="shots mode (bin/ltx-movie --shots): every generated panel uses --seed "
                              "exactly (pinned, as in grounded mode), and every cast character's "

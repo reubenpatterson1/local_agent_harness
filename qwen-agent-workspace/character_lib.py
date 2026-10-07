@@ -4,8 +4,9 @@ Stdlib only. This module is the single owner of the character.json schema
 (schema_version 1), of name/trigger/phrase validation, and of the casting rules:
 phrase matching, trigger insertion, per-panel LoRA strengths and the Phase 1 Cast
 block. bin/character imports it at top level; bin/ltx-movie, bin/ltx-story-manifest
-and bin/ltx-story-images load it by path, and only inside their casting branch, so
-an uncast run never reads this file. It also owns the shots-mode story rules (shot-rule
+and bin/ltx-story-images load it by path, and only inside their casting branch (and
+bin/ltx-movie also on its --shots path), so an uncast run without --shots never reads
+this file. It also owns the shots-mode story rules (shot-rule
 validation, advisories and the rewrite block;
 docs/superpowers/specs/2026-10-06-shots-mode-design.md).
 

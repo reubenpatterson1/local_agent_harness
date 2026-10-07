@@ -80,7 +80,8 @@ under a phrase the story already uses. Phases 2 and 3 receive --cast PHRASE=NAME
 member plus --character-strength, so every panel whose prompt names a cast phrase renders
 with that character's LoRAs (1.0 for one character, --character-strength, default 0.8, for
 two or more). Every casting problem exits 2 before any phase runs. character_lib.py is
-loaded by path only when casting is used, so an uncast run never reads it.
+loaded by path only when casting or --shots is used, so an uncast run without --shots
+never reads it.
 
 Shots mode (docs/superpowers/specs/2026-10-06-shots-mode-design.md): --shots makes every
 panel its own shot. Phase 1 uses STORY_PROMPT_TEMPLATE_SHOTS (a Characters list, an Image:
@@ -314,7 +315,8 @@ def build_parser():
                          default=None,
                          help="LoRA strength for each cast character in a panel that names two "
                               "or more of them (default 0.8, provisional); a panel that names "
-                              "one cast character always uses 1.0")
+                              "one cast character uses 1.0, except with --shots, where every "
+                              "cast character uses this strength")
     parser.add_argument("--list-characters", dest="list_characters", action="store_true",
                          default=False,
                          help="print the character library table (the same as bin/character "
@@ -330,8 +332,8 @@ def build_parser():
     parser.add_argument("--redo", dest="redo", default=None, metavar="N[,M...]",
                          help="with --shots and an existing story.md: move panels N,M...'s "
                               "stills and clips (and movie.mp4) aside into "
-                              "<story>/redo/<stamp>/ and re-render only those panels; every "
-                              "other panel is reused")
+                              "<story>/redo/<stamp>-<pid>/ and re-render only those panels; "
+                              "every other panel is reused")
     parser.add_argument("--story-model", dest="story_model", default=None,
                          help="model name to declare to bin/qwen-agent's --model for "
                               "Phase 1 story generation; must match whatever the "
@@ -702,8 +704,8 @@ def _image_fit():
 
 
 def _character_lib():
-    """character_lib.py, loaded by path and only when casting is used, so an uncast run never
-    reads it (spec 1.2)."""
+    """character_lib.py, loaded by path and only when casting or --shots is used, so an uncast
+    run without --shots never reads it (spec 1.2; shots spec 8)."""
     return importlib.machinery.SourceFileLoader(
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
 
@@ -1457,7 +1459,8 @@ def _wait_for_avail(min_avail_gib, avail_timeout):
 def _stream_and_tee(cmd, log_path):
     with open(log_path, "w") as logf:
         proc = subprocess.Popen(cmd, cwd=WS, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                 env=dict(os.environ, PYTHONUNBUFFERED="1"))
         for line in proc.stdout:
             sys.stdout.write(line)
             logf.write(line)

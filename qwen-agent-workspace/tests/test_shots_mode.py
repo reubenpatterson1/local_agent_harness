@@ -1422,7 +1422,7 @@ def test_s46_phase3_passes_shots_and_every_still(monkeypatch, movie_ws, capsys):
     assert "Command: %s" % ltx_movie.shlex.join(manifest_cmd) in capsys.readouterr().out.splitlines()
 
 
-def test_s47_phase4_failure_policy():
+def test_s47_phase4_failure_policy(tmp_path, monkeypatch, capsys):
     def policy(*extra):
         flags = ltx_movie._phase4_flags(_movie_args("n", "--story-id", "x", *extra))
         return flags[flags.index("--on-panel-failure") + 1]
@@ -1430,6 +1430,15 @@ def test_s47_phase4_failure_policy():
     assert policy("--shots") == "skip"
     assert policy() == "stop"
     assert policy("--no-stills") == "skip"
+    # The Phase 2 stills groups and the Phase 4 render run through _stream_and_tee with
+    # PYTHONUNBUFFERED=1, so their logs are written live and survive a hard crash.
+    monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+    log = tmp_path / "tee.log"
+    assert ltx_movie._stream_and_tee(
+        [sys.executable, "-c", "import os; print(os.environ.get('PYTHONUNBUFFERED'))"],
+        str(log)) == 0
+    assert log.read_text() == "1\n"
+    assert capsys.readouterr().out == "1\n"
 
 
 def test_s48_phase_sequence_with_redo():
