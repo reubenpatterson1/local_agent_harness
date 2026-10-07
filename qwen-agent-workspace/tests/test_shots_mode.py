@@ -1,0 +1,462 @@
+"""Tests for shots mode (spec docs/superpowers/specs/2026-10-06-shots-mode-design.md
+Section 10, S1-S72).
+
+Run from the workspace root: python3 -m pytest tests/test_shots_mode.py
+Plain pytest asserts only (no check() helper). No network, GPU, VLM, Z-Image or LTX: the
+story model is a fake subprocess.Popen, the stills runner a fake _stream_and_tee, Z-Image
+runs against fake torch/z_image_skill/content_safety modules, the render goes through a
+stubbed generate_video, and every character library lives under tmp_path through
+$CHARACTER_LIBRARY_DIR.
+"""
+
+import ast
+import contextlib
+import glob
+import hashlib
+import importlib.machinery
+import io
+import json
+import os
+import re
+import string
+import subprocess
+import sys
+import types
+
+import pytest
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import character_lib  # noqa: E402
+import ltx2_mlx_video_skill as SKILL  # noqa: E402
+
+
+def _load(name, rel):
+    return importlib.machinery.SourceFileLoader(name, os.path.join(WS, rel)).load_module()
+
+
+ltx_movie = _load("ltx_movie_shots", "bin/ltx-movie")
+story_manifest = _load("ltx_story_manifest_shots", "bin/ltx-story-manifest")
+story_images = _load("ltx_story_images_shots", "bin/ltx-story-images")
+render = _load("ltx_mlx_render_shots", "bin/ltx-mlx-render")
+
+# The character_lib exception classes are looked up on the module at call time, never bound
+# with "from character_lib import ...": the pipeline tools load character_lib.py by path into
+# the same sys.modules entry, which re-creates its classes.
+
+# --- shared fixtures (spec 10.1, 10.2) -------------------------------------------------
+DESC_K = "a young woman with long black hair pinned up with jade hairpins wearing a grey kimono"
+DESC_R = "a lean man in his late thirties with a topknot and a scarred brow wearing an indigo haori"
+DESC_M = "an old bald man with a white beard wearing a saffron robe and wooden prayer beads"
+VIDEO_BYTES = b"fake-video-lora!"
+STILLS_BYTES = b"fake-stills-lora"
+
+
+@pytest.fixture
+def lib_dir(tmp_path, monkeypatch):
+    lib = tmp_path / "lib"
+    monkeypatch.setenv("CHARACTER_LIBRARY_DIR", str(lib))
+    return str(lib)
+
+
+def make_character(lib, name, trigger, phrase, class_noun, descriptor, stills=True, strength=None):
+    """Write a valid trained character.json (casting spec 2.2 shape) under lib/name and return
+    the dict: a 16-byte lora/video.safetensors, plus a 16-byte lora/stills.safetensors when
+    stills is true; each entry carries the real sha256."""
+    cdir = os.path.join(lib, name)
+    os.makedirs(os.path.join(cdir, "lora"), exist_ok=True)
+    dataset = {"reference": "char_00", "kept": 24, "total": 25, "min_score": 7,
+               "face_height": 0.38,
+               "contact_sheet": os.path.join(cdir, "dataset", "contact_sheet.jpg")}
+    video_path = os.path.join(cdir, "lora", "video.safetensors")
+    with open(video_path, "wb") as f:
+        f.write(VIDEO_BYTES)
+    video = {"path": video_path, "sha256": hashlib.sha256(VIDEO_BYTES).hexdigest(),
+             "base_model": "/models/ltx-2.3-mlx-q8-dev", "rank": 32, "alpha": 32,
+             "steps": 1000, "trained_at": "2026-10-06T02:00:00Z",
+             "sample_path": None, "control_path": None}
+    stills_entry = None
+    if stills:
+        stills_path = os.path.join(cdir, "lora", "stills.safetensors")
+        with open(stills_path, "wb") as f:
+            f.write(STILLS_BYTES)
+        stills_entry = {"path": stills_path,
+                        "sha256": hashlib.sha256(STILLS_BYTES).hexdigest(),
+                        "base_model": "Tongyi-MAI/Z-Image-Turbo", "rank": 16, "alpha": 16,
+                        "steps": 2400, "trained_at": "2026-10-06T03:00:00Z",
+                        "sample_path": None, "control_path": None}
+    data = {"schema_version": 1, "name": name, "trigger": trigger, "class_noun": class_noun,
+            "referring_phrase": phrase, "descriptor": descriptor, "seed": 0,
+            "source": {"type": "seed_image", "path": "/fixtures/seed.png"},
+            "strength": strength, "status": "trained", "created_at": "2026-10-06T01:02:03Z",
+            "dataset": dataset, "loras": {"video": video, "stills": stills_entry},
+            "stills_skip_reason": None}
+    with open(os.path.join(cdir, "character.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return data
+
+
+def _kyra(lib, **kw):
+    return make_character(lib, "kyra", "kyrawmn", "the woman in grey", "woman", DESC_K, **kw)
+
+
+def _ronin(lib, **kw):
+    return make_character(lib, "ronin", "roninmn", "the ronin", "man", DESC_R, **kw)
+
+
+def _monk(lib, **kw):
+    return make_character(lib, "monk", "monkmn", "the monk", "man", DESC_M, **kw)
+
+
+def _members(*names):
+    return character_lib.resolve_cast([(None, n) for n in names])
+
+
+SHOTS_OK = """# Forest Rescue
+
+A ronin saves a woman from a robber on a forest trail.
+
+## Characters
+- "the woman in grey": a young woman with long black hair pinned up with jade hairpins wearing a grey kimono
+- "the ronin": a lean man in his late thirties with a topknot and a scarred brow wearing an indigo haori
+- "the bearded robber": a stocky man with a black beard in a ragged brown jacket
+
+## Panel 1 — The Trail
+Image: A medium shot of the woman in grey, a young woman with long black hair pinned up with jade hairpins wearing a grey kimono, standing in the centre of a mossy cedar trail and facing right. Far behind her on the left, small in the frame, the bearded robber watches from the ferns. Soft overcast light, muted green palette, eye-level camera, photorealistic film still.
+Motion: The woman in grey turns her head slowly toward the ferns on her right. The camera stays static.
+Narration: She senses she is not alone.
+
+## Panel 2 — The Robber
+Image: A medium close-up of the bearded robber, a stocky man with a black beard in a ragged brown jacket, crouching among ferns on a mossy cedar trail and facing left. Soft overcast light, muted green palette, eye-level camera, photorealistic film still.
+Motion: The bearded robber lunges forward out of the ferns with his short knife raised. The camera stays static.
+Narration: A robber springs from cover.
+
+## Panel 3 — The Ronin
+Image: A medium shot of the ronin, a lean man in his late thirties with a topknot and a scarred brow wearing an indigo haori, and the woman in grey, a young woman with long black hair pinned up with jade hairpins wearing a grey kimono, standing an arm's length apart on the mossy cedar trail, the ronin on the left facing right. Soft overcast light, muted green palette, eye-level camera, photorealistic film still.
+Motion: The ronin offers his open hand to the woman in grey. The camera stays static.
+Narration: Help arrives.
+"""
+ROSTER_BLOCK = SHOTS_OK[SHOTS_OK.index("## Characters\n"):SHOTS_OK.index("## Panel 1")]
+
+
+def _variant(old, new, text=None):
+    """SHOTS_OK (or text) with the unique string old replaced by new."""
+    text = SHOTS_OK if text is None else text
+    assert text.count(old) == 1, old
+    return text.replace(old, new)
+
+
+def _panels(tmp_path, text):
+    """bin/ltx-story-manifest _parse_prompts_md panels for text."""
+    path = tmp_path / "parse-me.md"
+    path.write_text(text, encoding="utf-8")
+    return story_manifest._parse_prompts_md(str(path))[1]
+
+
+# --- S1-S20: character_lib (spec 3, 4) --------------------------------------------------
+def test_s1_constants():
+    assert character_lib.SHOTS_CHARACTER_STRENGTH == 0.8
+    assert character_lib.SHOTS_MOTION_MIN_WORDS == 10
+    assert character_lib.SHOTS_MOTION_MAX_WORDS == 25
+    assert character_lib.SHOTS_MAX_CAST_PER_PANEL == 2
+    assert character_lib.SHOTS_REWRITE_MAX_LISTED == 40
+    assert character_lib.SHOTS_CLOSE_SHOT_TYPES == (
+        "medium shot", "medium close-up", "close-up", "extreme close-up")
+
+
+def test_s2_panel_strengths_in_shots_mode(lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir, strength=0.6)
+    m = _members("kyra", "ronin")
+    strengths = character_lib.panel_strengths
+    assert strengths(["kyra"], m, 0.8, shots=True) == {"kyra": 0.8}
+    assert strengths(["kyra"], m, 0.7, shots=True) == {"kyra": 0.7}
+    assert strengths(["ronin"], m, 0.8, shots=True) == {"ronin": 0.6}
+    assert strengths(["kyra", "ronin"], m, 0.8, shots=True) == {"kyra": 0.8, "ronin": 0.6}
+    assert strengths(["kyra"], m, 0.8) == {"kyra": 1.0}
+    assert strengths([], m, 0.8, shots=True) == {}
+
+
+def test_s3_shots_cast_block(lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    m = _members("kyra", "ronin")
+    lib = character_lib
+    assert lib.build_cast_block(m, shots=True) == (
+        lib.CAST_BLOCK_HEADER + "\n" + '- "the woman in grey": ' + DESC_K + "." + "\n"
+        + '- "the ronin": ' + DESC_R + "." + "\n" + lib.SHOTS_CAST_BLOCK_RULES)
+    continuous = (lib.CAST_BLOCK_HEADER + "\n" + '- "the woman in grey": ' + DESC_K + "." + "\n"
+                  + '- "the ronin": ' + DESC_R + "." + "\n" + lib.CAST_BLOCK_RULES)
+    assert lib.build_cast_block(m) == continuous
+    assert lib.build_cast_block(m, shots=False) == continuous
+    rules = lib.SHOTS_CAST_BLOCK_RULES
+    assert "{" not in rules and "}" not in rules and "%" not in rules
+    assert rules.count("word for word") == 2
+    for fragment in ("at most two of these characters", "a medium shot or closer",
+                     "never within arm's reach", "show it by cutting",
+                     "an offered hand or a hand on an arm", "has none of these extra rules"):
+        assert fragment in rules, fragment
+
+
+def test_s4_find_phrases():
+    find = character_lib.find_phrases
+    assert find("The woman in grey nods to the woman.", ["the woman", "the woman in grey"]) == [
+        "the woman in grey", "the woman"]
+    assert find("THE RONIN bows.", ["the ronin"]) == ["the ronin"]
+    assert find("the ronin's blade", ["the ronin"]) == ["the ronin"]
+    assert find("the ronin-like man", ["the ronin"]) == []
+    assert find("the bearded robber grabs the ronin; the ronin",
+                ["the ronin", "the bearded robber"]) == ["the bearded robber", "the ronin"]
+    assert find("", ["the ronin"]) == []
+
+
+def _roster(*lines):
+    """A minimal story whose Characters section holds lines, then one panel."""
+    return ("# T\n\nA summary.\n\n## Characters\n" + "".join(l + "\n" for l in lines)
+            + "\n## Panel 1 — A\nImage: x\n")
+
+
+def test_s5_parse_character_roster():
+    parse = character_lib.parse_character_roster
+    entries = [("the woman in grey", DESC_K), ("the ronin", DESC_R),
+               ("the bearded robber", "a stocky man with a black beard in a ragged brown jacket")]
+    assert parse(SHOTS_OK) == (entries, [])
+    assert parse(_roster("- “the ronin”: a man")) == ([("the ronin", "a man")], [])
+    assert parse(_roster('* "the ronin": a man')) == ([("the ronin", "a man")], [])
+    assert parse("# T\n\nA summary.\n\n## Panel 1 — A\nImage: x\n") == (
+        [], ['no "## Characters" section'])
+    assert parse(_roster('- "the monk": a man', "- the ronin: a man")) == (
+        [("the monk", "a man")],
+        ['line \'- the ronin: a man\' is not - "<referring phrase>": <description>'])
+    with pytest.raises(character_lib.CharacterError) as info:
+        character_lib.normalize_phrase("a b c d e f g")
+    assert parse(_roster('- "the ronin": a man', '- "a b c d e f g": x')) == (
+        [("the ronin", "a man")], [str(info.value)])
+    assert parse(_roster('- "the ronin": a man', '- "The Ronin": a tall man')) == (
+        [("the ronin", "a man")], ["phrase 'The Ronin' is listed more than once"])
+    assert parse(_roster('- "the ronin": a man', "", '- "the monk": an old man')) == (
+        [("the ronin", "a man"), ("the monk", "an old man")], [])
+    assert parse(_roster('- "the ronin": a man') + '\n- "x y": z\n') == (
+        [("the ronin", "a man")], [])
+    assert parse("# T\n\nA summary.\n\n## Characters\n\n## Panel 1 — A\nImage: x\n") == (
+        [], ['the "## Characters" section lists no characters'])
+    late = _variant("A ronin saves a woman from a robber on a forest trail.",
+                    "Three characters meet on a forest trail.",
+                    SHOTS_OK.replace(ROSTER_BLOCK, "")) + "\n" + ROSTER_BLOCK
+    assert late.index("## Characters") > late.index("## Panel 3")
+    assert parse(late) == (entries, [])
+
+
+TEN_WORDS = "The ronin slowly lowers his katana toward the mossy ground."
+TWENTY_FIVE_WORDS = ("The ronin slowly lowers his curved katana toward the soft mossy ground beside "
+                     "the old stone lantern near the quiet shrine at the trail's end.")
+
+
+def test_s6_motion_problems_pass(tmp_path):
+    assert len(TEN_WORDS.split()) == 10 and len(TWENTY_FIVE_WORDS.split()) == 25
+    texts = [p["motion"] for p in _panels(tmp_path, SHOTS_OK)] + [
+        "The ronin draws his katana from its scabbard in one smooth motion. The camera stays "
+        "static.",
+        "The woman in grey swings the cedar branch at the robber's knife hand.",
+        TEN_WORDS,
+        TWENTY_FIVE_WORDS,
+        "Camera holds. The ronin kneels beside the fallen branch on the trail."]
+    assert len(texts) == 8
+    for text in texts:
+        assert character_lib.motion_problems(text) == [], text
+
+
+def test_s7_motion_problems_fail():
+    problems = character_lib.motion_problems
+    nine = "The ronin slowly lowers his katana toward the ground."
+    twenty_six = TWENTY_FIVE_WORDS.replace("his curved", "his long curved")
+    assert len(nine.split()) == 9 and len(twenty_six.split()) == 26
+    assert problems(nine) == [("S4 motion length", "Motion: is 9 words; it must be 10-25")]
+    assert problems(twenty_six) == [("S4 motion length", "Motion: is 26 words; it must be 10-25")]
+    assert problems("The ronin draws his sword. The ronin strikes the bearded robber hard.") == [
+        ("S5 one action", "Motion: has 2 action sentences; it must have exactly one, optionally "
+                          "followed by a camera sentence")]
+    assert problems("The ronin draws his sword; he strikes the bearded robber across the arm.") == [
+        ("S5 one action", "Motion: contains a semicolon")]
+    for word, shown in (("then", "then"), ("While", "while"), ("meanwhile", "meanwhile"),
+                        ("simultaneously", "simultaneously"), ("afterwards", "afterwards"),
+                        ("followed  by", "followed by"), ("as soon as", "as soon as")):
+        if word == "While":
+            text = ("While the ronin raises his katana the bearded robber stumbles back across "
+                    "the mossy trail.")
+        else:
+            text = ("The ronin raises his katana %s the bearded robber stumbles back across the "
+                    "mossy trail." % word)
+        assert len(text.split()) == 14 + len(word.split()), text
+        assert problems(text) == [("S5 one action", "Motion: chains actions with '%s'" % shown)], text
+    assert problems("The ronin sprints in, and he draws his katana toward the robber.") == [
+        ("S5 one action", "Motion: chains actions with ', and'")]
+    assert problems("The camera pans slowly across the empty clearing toward the cedar trees.") == [
+        ("S5 one action", "Motion: has 0 action sentences; it must have exactly one, optionally "
+                          "followed by a camera sentence")]
+
+
+def test_s8_motion_negative_controls():
+    for text in ("The ronin crosses the strengthened rope bridge above the river gorge slowly.",
+                 "The woman in grey kneels before the shrine and lowers her head."):
+        assert character_lib.motion_problems(text) == [], text
+
+
+def _cast_kyra_ronin(lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    return _members("kyra", "ronin")
+
+
+def _violations(tmp_path, text, members, expected_panels=3):
+    return character_lib.shots_violations(text, _panels(tmp_path, text), expected_panels, members)
+
+
+def test_s9_shots_ok_is_valid(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    assert _violations(tmp_path, SHOTS_OK, members) == []
+    assert _violations(tmp_path, SHOTS_OK, []) == []
+
+
+def test_s10_s1_panel_count(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    assert _violations(tmp_path, SHOTS_OK, members, expected_panels=4) == [
+        "story: S1 panel count: expected exactly 4 panels, found 3"]
+
+
+def test_s11_s2_roster_presence(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    text = SHOTS_OK.replace(ROSTER_BLOCK, "")
+    assert "## Characters" not in text
+    assert _violations(tmp_path, text, members) == [
+        'story: S2 characters list: no "## Characters" section',
+        "story: S2 characters list: cast phrase 'the woman in grey' (character kyra) is not listed",
+        "story: S2 characters list: cast phrase 'the ronin' (character ronin) is not listed"]
+    assert _violations(tmp_path, text, []) == []
+
+
+def test_s12_s2_cast_phrase_missing(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    text = _variant('- "the ronin": ' + DESC_R + "\n", "")
+    assert _violations(tmp_path, text, members) == [
+        "story: S2 characters list: cast phrase 'the ronin' (character ronin) is not listed"]
+
+
+PANEL_2_IMAGE = ("Image: A medium close-up of the bearded robber, a stocky man with a black beard in "
+                 "a ragged brown jacket, crouching among ferns on a mossy cedar trail and facing "
+                 "left. Soft overcast light, muted green palette, eye-level camera, photorealistic "
+                 "film still.\n")
+
+
+def test_s13_s3_fields(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    assert _violations(tmp_path, _variant(PANEL_2_IMAGE, ""), members) == [
+        "panel 2: S3 fields: missing/empty Image: field"]
+    text = _variant("Narration: Help arrives.\n", "Narration: Help arrives.\nPrompt: x\n")
+    assert _violations(tmp_path, text, members) == [
+        "panel 3: S3 fields: has a Prompt: field; shots mode expects Image:, Motion: and "
+        "Narration:"]
+
+
+PANEL_3_MOTION = "Motion: The ronin offers his open hand to the woman in grey. The camera stays static."
+
+
+def test_s14_violations_name_panel_and_rule(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    text = _variant(PANEL_3_MOTION, "Motion: The ronin offers his hand then pulls the woman in "
+                                    "grey to her feet on the trail.")
+    assert _violations(tmp_path, text, members) == [
+        "panel 3: S5 one action: Motion: chains actions with 'then'"]
+
+
+def test_s15_s6_cast_count(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    _monk(lib_dir)
+    three = _members("kyra", "ronin", "monk")
+    roster = _variant('- "the bearded robber":',
+                      '- "the monk": ' + DESC_M + '\n- "the bearded robber":')
+    in_image = _variant("eye-level camera, photorealistic film still.\nMotion: The ronin offers",
+                        "eye-level camera, photorealistic film still. The monk, an old bald man "
+                        "with a white beard wearing a saffron robe and wooden prayer beads, stands "
+                        "behind them.\nMotion: The ronin offers", roster)
+    s6 = ["panel 3: S6 cast count: the shot names 3 cast characters (kyra, monk, ronin); at most 2"]
+    assert _violations(tmp_path, in_image, three) == s6
+    in_motion = _variant(PANEL_3_MOTION, "Motion: The monk raises his hand toward the ronin and "
+                                         "the woman in grey.", roster)
+    assert _violations(tmp_path, in_motion, three) == s6
+    assert _violations(tmp_path, SHOTS_OK, members) == []
+
+
+PANEL_1_MOTION = ("Motion: The woman in grey turns her head slowly toward the ferns on her right. "
+                  "The camera stays static.")
+
+
+def test_s16_s7_cast_and_extra(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    text = _variant(PANEL_1_MOTION, "Motion: The woman in grey pushes the bearded robber away from "
+                                    "her with both hands.")
+    assert _violations(tmp_path, text, members) == [
+        "panel 1: S7 cast and extra: Motion: names 'the woman in grey' together with 'the bearded "
+        "robber'; show the other character's action in its own shot, then cut to the cast "
+        "character's reaction"]
+    assert _violations(tmp_path, SHOTS_OK, members) == []
+
+
+def test_s17_s7_longest_phrase_claims_the_span(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+    text = _variant('- "the bearded robber": a stocky man with a black beard in a ragged brown '
+                    'jacket\n',
+                    '- "the bearded robber": a stocky man with a black beard in a ragged brown '
+                    'jacket\n- "the woman": an old woman in a straw hat\n')
+    text = _variant(PANEL_1_MOTION, "Motion: The woman in grey bows her head to the trail shrine "
+                                    "slowly. The camera stays static.", text)
+    assert character_lib.parse_character_roster(text)[0][-1] == (
+        "the woman", "an old woman in a straw hat")
+    assert _violations(tmp_path, text, members) == []
+
+
+def test_s18_shots_advisories(tmp_path, lib_dir):
+    members = _cast_kyra_ronin(lib_dir)
+
+    def advise(text, cast=members):
+        return character_lib.shots_advisories(_panels(tmp_path, text), cast)
+
+    assert advise(SHOTS_OK) == []
+    assert advise(_variant("grey kimono, standing in the centre", "grey robe, standing in the centre")) == [
+        "panel 1: Image: names 'the woman in grey' but does not repeat character kyra's Cast "
+        "description word for word; that still relies on the phrase and the stills LoRA alone"]
+    assert advise(_variant("hairpins wearing a grey kimono, standing in the centre",
+                           "hairpins   WEARING a grey kimono, standing in the centre")) == []
+    assert advise(_variant("A medium shot of the woman in grey", "A wide shot of the woman in grey")) == [
+        "panel 1: shows cast character(s) kyra but its Image: shot type is wide shot; a shot with "
+        "a cast character should be a medium shot or closer"]
+    assert advise(_variant("A medium shot of the woman in grey", "The woman in grey")) == [
+        "panel 1: shows cast character(s) kyra but its Image: shot type is not stated; a shot "
+        "with a cast character should be a medium shot or closer"]
+    assert advise(_variant("A medium close-up of the bearded robber",
+                           "A wide shot of the bearded robber")) == []
+    assert advise(SHOTS_OK, cast=[]) == []
+
+
+def test_s19_shots_rewrite_block():
+    lib = character_lib
+    block = lib.shots_rewrite_block(["a", "b", "c"], 14)
+    assert block == lib.SHOTS_REWRITE_TEMPLATE % ("- a\n- b\n- c", 14)
+    assert "Keep EXACTLY 14 panel sections." in block
+    many = ["v%d" % i for i in range(1, 46)]
+    listed = "\n".join(["- v%d" % i for i in range(1, 41)] + ["- ... and 5 more"])
+    assert lib.shots_rewrite_block(many, 3) == lib.SHOTS_REWRITE_TEMPLATE % (listed, 3)
+    assert lib.SHOTS_REWRITE_TEMPLATE.count("%") == 2
+
+
+def test_s20_character_lib_imports():
+    with open(os.path.join(WS, "character_lib.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(node.module)
+    assert names == {"collections", "datetime", "json", "os", "re", "uuid"}
