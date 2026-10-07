@@ -1270,11 +1270,13 @@ def _shots_missing_stills(args, panels):
 def _phase2_shots(args, cmd):
     """Phase 2 in shots mode (shots spec 5.5): one bin/ltx-story-images run per stills-LoRA group,
     each the Phase 2 cmd with --only <the group's panels> and --shots appended, teed to
-    images/stills-group-KK.log. A group with no missing still is skipped. Stops at the first
-    failing group; stills already written are kept."""
+    images/stills-group-KK.log. A group with no missing still is skipped. A failing group does
+    not stop the rest: every group runs, then one error lists each failed group and Phase 2
+    returns 1. Stills already written are kept."""
     paths = _story_paths(args.story_id)
     groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [])
     os.makedirs(paths["images_dir"], exist_ok=True)
+    failed = []
     for k, (names, panels) in enumerate(groups, start=1):
         label = "%s; panels %s" % (", ".join(names) or "no character LoRAs", _panel_list(panels))
         if not _shots_missing_stills(args, panels):
@@ -1288,11 +1290,18 @@ def _phase2_shots(args, cmd):
         print("Running: %s" % shlex.join(group_cmd))
         rc = _stream_and_tee(group_cmd, log_path)
         if rc != 0:
-            print("Error: ltx-story-images exited %d for stills group %d/%d (%s); log: %s. "
-                  "Stills already written are kept; rerun the same command to continue -- every "
-                  "existing panel_NN.png is reused." % (rc, k, len(groups), label, log_path),
-                  file=sys.stderr)
-            return 1
+            failed.append("  - stills group %d/%d (%s) exited %d -- see %s"
+                          % (k, len(groups), label, rc, log_path))
+    if failed:
+        print("Error: ltx-story-images exited nonzero for %d of %d stills groups:"
+              % (len(failed), len(groups)), file=sys.stderr)
+        for line in failed:
+            print(line, file=sys.stderr)
+        print("Stills already written are kept. If a log shows \"panel N BLOCKED\", edit that "
+              "panel's Image: line in story.md first -- the stills seed is pinned, so a rerun alone "
+              "reproduces the block. Then rerun the same command to continue -- groups whose stills "
+              "all exist are skipped.", file=sys.stderr)
+        return 1
     return 0
 
 

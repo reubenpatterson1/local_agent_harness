@@ -926,11 +926,13 @@ So the existing command construction, which carries the `["--lora", args.stills_
 def _phase2_shots(args, cmd):
     """Phase 2 in shots mode (shots spec 5.5): one bin/ltx-story-images run per stills-LoRA group,
     each the Phase 2 cmd with --only <the group's panels> and --shots appended, teed to
-    images/stills-group-KK.log. A group with no missing still is skipped. Stops at the first
-    failing group; stills already written are kept."""
+    images/stills-group-KK.log. A group with no missing still is skipped. A failing group does
+    not stop the rest: every group runs, then one error lists each failed group and Phase 2
+    returns 1. Stills already written are kept."""
     paths = _story_paths(args.story_id)
     groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [])
     os.makedirs(paths["images_dir"], exist_ok=True)
+    failed = []
     for k, (names, panels) in enumerate(groups, start=1):
         label = "%s; panels %s" % (", ".join(names) or "no character LoRAs", _panel_list(panels))
         if not _shots_missing_stills(args, panels):
@@ -944,16 +946,24 @@ def _phase2_shots(args, cmd):
         print("Running: %s" % shlex.join(group_cmd))
         rc = _stream_and_tee(group_cmd, log_path)
         if rc != 0:
-            print("Error: ltx-story-images exited %d for stills group %d/%d (%s); log: %s. "
-                  "Stills already written are kept; rerun the same command to continue -- every "
-                  "existing panel_NN.png is reused." % (rc, k, len(groups), label, log_path),
-                  file=sys.stderr)
-            return 1
+            failed.append("  - stills group %d/%d (%s) exited %d -- see %s"
+                          % (k, len(groups), label, rc, log_path))
+    if failed:
+        print("Error: ltx-story-images exited nonzero for %d of %d stills groups:"
+              % (len(failed), len(groups)), file=sys.stderr)
+        for line in failed:
+            print(line, file=sys.stderr)
+        print("Stills already written are kept. If a log shows \"panel N BLOCKED\", edit that "
+              "panel's Image: line in story.md first -- the stills seed is pinned, so a rerun alone "
+              "reproduces the block. Then rerun the same command to continue -- groups whose stills "
+              "all exist are skipped.", file=sys.stderr)
+        return 1
     return 0
 ```
 
 - `--only` lists the whole group, not only its missing panels **[spec choice]**. bin/ltx-story-images skips existing stills itself, and the log shows the full group.
 - **Skipping a fully rendered group [spec choice]** avoids a process start plus the torch import, and leaves `images.json` as it was.
+- **Every group runs; Phase 2 fails at the end [user decision, 2026-10-07].** The stills seed is pinned (S71), so a content-safety BLOCK on one panel recurs on every rerun. Stopping at the first failing group would keep every later, independent group (often the cast characters) from ever rendering. So Phase 2 runs every group with a missing still, then prints one E-S12 error that lists each failed group and returns 1, never a group's rc. Phase 4's `skip` policy (5.7) follows the same reasoning.
 - Seeds come from bin/ltx-story-images `--shots` (5.7): every still uses `--image-seed` exactly.
 - Group order is by size, then by names: `()`, then single characters alphabetically, then pairs. For the rescue cast that is at most 4 groups: `()`, `(kyra,)`, `(ronin,)`, `(kyra, ronin)`.
 
@@ -1229,7 +1239,7 @@ Checks run in the order of the 5.1 `_resolve_shots` code: E-S3, E-S1, E-S2, E-S6
 | E-S9 | ltx-movie | `--shots`, story.md pre-existed, S-violations | 2. `Error: story.md breaks the shot rules:` plus one `  - <violation>` line each, plus the hand-edit hint (5.4). No file changes |
 | E-S10 | ltx-movie | first draft (this run) violates | `Warning:` plus the list (stdout); the draft moves to `story.rejected-<stamp>-<pid>.md`; one rewrite. If the rewrite also violates: 2, with `Error: story.md still breaks the shot rules after one rewrite:`, the list, and the kept-draft hint |
 | E-S11 | ltx-movie | qwen-agent fails during the rewrite (rc 1 path: timeout, or nonzero with no story.md) | 1. The existing qwen-agent error, then `Error: the shots rewrite failed; the rejected first draft is kept at <path>` |
-| E-S12 | ltx-movie | a stills group exits nonzero | 1. `Error: ltx-story-images exited <rc> for stills group <k>/<n> (<names or "no character LoRAs">; panels <list>); log: <story>/images/stills-group-<KK>.log. Stills already written are kept; rerun the same command to continue -- every existing panel_NN.png is reused.` Later groups are not run |
+| E-S12 | ltx-movie | one or more stills groups exit nonzero | 1, after every group has run (whatever the groups' rc values). `Error: ltx-story-images exited nonzero for <f> of <n> stills groups:`, then one line per failed group, in group order: `  - stills group <k>/<n> (<names or "no character LoRAs">; panels <list>) exited <rc> -- see <story>/images/stills-group-<KK>.log`, then `Stills already written are kept. If a log shows "panel N BLOCKED", edit that panel's Image: line in story.md first -- the stills seed is pinned, so a rerun alone reproduces the block. Then rerun the same command to continue -- groups whose stills all exist are skipped.` |
 | E-S13 | ltx-movie | `--redo` move fails (OSError) | 1. `Error: --redo could not move <src> to <dst>: <e>`. Earlier moves stay in the archive (printed) |
 | E-S14 | ltx-movie | W1/W2 advisories | `Warning: <text>` (stdout), continues |
 | E-S15 | ltx-story-manifest | `--shots` with `--chain`/`--glob`/`--no-images`; or without `--prompts-md` | 2 (`parser.error`, 5.9 messages) |
@@ -1384,7 +1394,7 @@ The Motion: word counts are 18, 18 and 15. `shots_violations(SHOTS_OK, panels, 3
 | S41 | continuous mode unaffected | no `--shots`, story.md = a 2-panel chained story (panel 1 with Image:/Motion:/Narration:, panel 2 with Motion:/Narration:) whose panel 2 Motion: is `"She draws then strikes; then he falls."` → `phase1_story` rc 0 (only `_validate_story_md` applies) |
 | S42 | `_shots_stills_groups` | a 5-panel story whose Image: fields name {kyra}, {ronin}, {kyra, ronin}, {}, {kyra}, with both members having stills → `[((), [4]), (("kyra",), [1, 5]), (("ronin",), [2]), (("kyra", "ronin"), [3])]`. Uncast → `[((), [1, 2, 3, 4, 5])]`. Ronin without a stills LoRA → ronin names drop: `[((), [2, 4]), (("kyra",), [1, 3, 5])]`. A nested phrase (cast `"the woman"` without stills, and kyra `"the woman in grey"` with stills, Image: `"the woman in grey"`) → `(("kyra",), …)` (the I3 rule). Motion:-only mentions do not affect groups |
 | S43 | `phase2_stills` shots | the S42 story (all stills absent), fake stills runner (rc 0 each) → rc 0. Exactly 4 runs, in S42 group order. Each `cmd` equals the non-shots Phase 2 `cmd` (built by the same args) with the `--only` value replaced by `"4"`, `"1,5"`, `"2"`, `"3"` (the S42 group lists, in that order) and `"--shots"` as the last element, after the `--cast …` and `--character-strength 0.8` flags. `log_path`s are `images/stills-group-01.log` … `-04.log`. Rerun with every still present → 0 runs, and 4 `"every still exists; skipped"` lines. With only panel 2's still absent → exactly 1 run (group `ronin`) |
-| S44 | stills group failure | runner rc queue `[0, 1]` → rc 1. Exactly 2 runs (the third group not run). stderr has `"for stills group 2/4"`, `"stills-group-02.log"` and `"rerun the same command to continue"`. Group 1's PNGs still exist |
+| S44 | stills group failure | runner rc queue `[0, 1, 0, 2]` → rc 1. Exactly 4 runs, `--only` `"4"`, `"1,5"`, `"2"`, `"3"` (a failing group does not stop the rest). stderr equals the E-S12 text exactly: 2 of 4 groups, group 2/4 exited 1 (`stills-group-02.log`), group 4/4 exited 2 (`stills-group-04.log`). Exactly `panel_02.png` and `panel_04.png` exist. Rerun with queue `[2]` → rc 1 (not 2). 2 runs (`"1,5"`, `"3"`), 2 `"every still exists; skipped"` lines, and stderr lists only group 2/4, exited 2. A third run (rc 0) → rc 0, 1 run (`"1,5"`), empty stderr |
 | S45 | one LoRA set per process, end to end | for each S43-recorded group `cmd` (S42 story; members with stills), call `story_images.main(cmd[2:])` under the fake Z-Image modules → each rc 0 (E-P16 never fires). Every `generate_image` call in a group has `loras == [(stills_path(n), 0.8) for n in group names]` (sorted by name), or no `loras` key for the `()` group |
 | S46 | `phase3_manifest` shots | `subprocess.run` patched to record → the manifest `cmd` has `"--shots"` directly followed by `--image <images>/panel_01.png … --image <images>/panel_14.png` (`--panels 14`) and no `"--chain"`. The `_print_dry_run_plan` Phase 3 line is the same command |
 | S47 | `_phase4_flags` | `--shots` → `--on-panel-failure skip`. Default → `stop`. `--no-stills` → `skip` (L51 unchanged) |
@@ -1473,7 +1483,7 @@ All use `WS` patched to `tmp_path` and 64x64 PNGs made at runtime.
 | `--only` not replaced | S43 |
 | `--shots` not appended to group commands | S43, S45 (strength 1.0) |
 | a fully rendered group is still run | S43 |
-| a failing group does not stop Phase 2 | S44 |
+| a failing group stops Phase 2 (`return 1` inside the loop) | S44 |
 | Phase 3 shots passes `--chain` | S46 |
 | manifest shots panels 2+ `chain` | S60, S66 |
 | manifest shots names from Motion: only | S61 (panel 3) |
