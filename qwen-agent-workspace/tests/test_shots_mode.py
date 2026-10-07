@@ -1201,3 +1201,176 @@ def test_s41_continuous_mode_unaffected(monkeypatch, movie_ws):
     args = _shots_args("n", "--story-id", "chained", "--panels", "2", "--no-review")
     assert ltx_movie.phase1_story(args) == 0
     assert agent.calls == []
+
+
+# --- S42-S45: shots-mode Phase 2 stills groups (spec 5.5) ---------------------------------
+GROUP_STORY = """# Groups
+
+Five shots on a forest trail.
+
+## Characters
+- "the woman in grey": %s
+- "the ronin": %s
+
+## Panel 1 — One
+Image: A medium shot of the woman in grey standing on the mossy trail.
+Motion: The woman in grey turns her head slowly toward the ferns on her right.
+Narration: One.
+
+## Panel 2 — Two
+Image: A medium shot of the ronin standing under a tall cedar.
+Motion: The ronin turns his head slowly toward the ferns on his left side.
+Narration: Two.
+
+## Panel 3 — Three
+Image: A medium shot of the woman in grey and the ronin standing apart on the trail.
+Motion: The ronin offers his open hand to the woman in grey on the trail.
+Narration: Three.
+
+## Panel 4 — Four
+Image: A wide shot of the empty mossy trail under grey clouds.
+Motion: The ronin walks slowly along the empty trail toward the distant shrine.
+Narration: Four.
+
+## Panel 5 — Five
+Image: A close-up of the woman in grey under the cedars.
+Motion: The woman in grey closes her eyes slowly and lowers her chin a little.
+Narration: Five.
+""" % (DESC_K, DESC_R)
+GROUPS = [((), [4]), (("kyra",), [1, 5]), (("ronin",), [2]), (("kyra", "ronin"), [3])]
+
+
+class _StillsRunner(object):
+    """ltx_movie._stream_and_tee stand-in (spec 10.1): records (cmd, log_path), writes a 1x1
+    PNG for every --only panel when the queued rc is 0 and write_pngs is true, and returns
+    the next queued rc (default 0). It also makes any real subprocess call from bin/ltx-movie
+    fail the test, so no Z-Image process can ever start."""
+
+    def __init__(self, monkeypatch, returncodes=(), write_pngs=True):
+        self.returncodes = list(returncodes)
+        self.write_pngs = write_pngs
+        self.runs = []
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("Phase 2 made a real subprocess call")
+
+        monkeypatch.setattr(ltx_movie.subprocess, "run", _forbidden)
+        monkeypatch.setattr(ltx_movie.subprocess, "Popen", _forbidden)
+        monkeypatch.setattr(ltx_movie, "_stream_and_tee", self)
+
+    def __call__(self, cmd, log_path):
+        from PIL import Image
+        self.runs.append((list(cmd), log_path))
+        rc = self.returncodes.pop(0) if self.returncodes else 0
+        if rc == 0 and self.write_pngs:
+            out_dir = cmd[cmd.index("--out-dir") + 1]
+            os.makedirs(out_dir, exist_ok=True)
+            for i in cmd[cmd.index("--only") + 1].split(","):
+                Image.new("RGB", (1, 1), (0, 0, 0)).save(
+                    os.path.join(out_dir, "panel_%02d.png" % int(i)))
+        return rc
+
+
+def _group_args(movie_ws, lib_dir, story_id="groups"):
+    """kyra and ronin (both with stills LoRAs), the GROUP_STORY story dir, and resolved args for
+    --shots --character kyra --character ronin --panels 5."""
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    _story_dir_with(movie_ws, story_id, GROUP_STORY)
+    return _shots_args("n", "--story-id", story_id, "--shots", "--character", "kyra",
+                       "--character", "ronin", "--panels", "5", "--no-review")
+
+
+def _plain_phase2_cmd(monkeypatch, args):
+    """The non-shots Phase 2 command for the same args (spec S43), recorded from
+    phase2_stills with args.shots False and subprocess.run stubbed."""
+    runs = []
+    monkeypatch.setattr(ltx_movie.subprocess, "run",
+                        lambda cmd, **kw: runs.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0))
+    args.shots = False
+    try:
+        assert ltx_movie.phase2_stills(args) == 0
+    finally:
+        args.shots = True
+    assert len(runs) == 1
+    return runs[0]
+
+
+def _stills_path(lib_dir, name):
+    return os.path.join(lib_dir, name, "lora", "stills.safetensors")
+
+
+def test_s42_stills_groups(tmp_path, movie_ws, lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    story = _story_dir_with(movie_ws, "groups", GROUP_STORY) / "story.md"
+    assert ltx_movie._shots_stills_groups(str(story), _members("kyra", "ronin")) == GROUPS
+    assert ltx_movie._shots_stills_groups(str(story), []) == [((), [1, 2, 3, 4, 5])]
+    _ronin(lib_dir, stills=False)
+    assert ltx_movie._shots_stills_groups(str(story), _members("kyra", "ronin")) == [
+        ((), [2, 4]), (("kyra",), [1, 3, 5])]
+    make_character(lib_dir, "mira", "miragrl", "the woman", "girl",
+                   "an old woman with grey hair in a straw hat and a brown travelling cloak",
+                   stills=False)
+    nested = _story_dir_with(movie_ws, "nested", (
+        "# Nested\n\nTwo shots.\n\n## Panel 1 — One\nImage: A medium shot of the woman in grey.\n"
+        "Motion: The woman in grey turns her head slowly toward the ferns on her right.\n"
+        "Narration: One.\n\n## Panel 2 — Two\nImage: A medium shot of the woman.\n"
+        "Motion: The woman turns her head slowly toward the ferns on her right side.\n"
+        "Narration: Two.\n")) / "story.md"
+    assert ltx_movie._shots_stills_groups(str(nested), _members("kyra", "mira")) == [
+        ((), [2]), (("kyra",), [1])]
+
+
+def test_s43_phase2_runs_one_process_per_group(monkeypatch, movie_ws, lib_dir, capsys):
+    args = _group_args(movie_ws, lib_dir)
+    base = _plain_phase2_cmd(monkeypatch, args)
+    assert base[-4:] == ["--cast", "the ronin=ronin", "--character-strength", "0.8"]
+    runner = _StillsRunner(monkeypatch)
+    assert ltx_movie.phase2_stills(args) == 0
+    at = base.index("--only") + 1
+    images_dir = os.path.join(str(movie_ws), "generated", "stories", "groups", "images")
+    assert [cmd for cmd, _log in runner.runs] == [
+        base[:at] + [only] + base[at + 1:] + ["--shots"] for only in ("4", "1,5", "2", "3")]
+    assert [log for _cmd, log in runner.runs] == [
+        os.path.join(images_dir, "stills-group-%02d.log" % k) for k in (1, 2, 3, 4)]
+    capsys.readouterr()
+    del runner.runs[:]
+    assert ltx_movie.phase2_stills(args) == 0
+    assert runner.runs == []
+    assert capsys.readouterr().out.count("every still exists; skipped") == 4
+    os.remove(os.path.join(images_dir, "panel_02.png"))
+    assert ltx_movie.phase2_stills(args) == 0
+    assert len(runner.runs) == 1
+    cmd = runner.runs[0][0]
+    assert cmd[cmd.index("--only") + 1] == "2"
+
+
+def test_s44_failing_group_stops_phase2(monkeypatch, movie_ws, lib_dir, capsys):
+    args = _group_args(movie_ws, lib_dir)
+    runner = _StillsRunner(monkeypatch, returncodes=[0, 1])
+    assert ltx_movie.phase2_stills(args) == 1
+    err = capsys.readouterr().err
+    assert len(runner.runs) == 2
+    assert "for stills group 2/4" in err
+    assert "stills-group-02.log" in err
+    assert "rerun the same command to continue" in err
+    assert os.path.isfile(os.path.join(str(movie_ws), "generated", "stories", "groups", "images",
+                                       "panel_04.png"))
+
+
+def test_s45_each_group_is_one_lora_set_end_to_end(monkeypatch, movie_ws, lib_dir):
+    args = _group_args(movie_ws, lib_dir)
+    runner = _StillsRunner(monkeypatch, write_pngs=False)
+    assert ltx_movie.phase2_stills(args) == 0
+    assert len(runner.runs) == 4
+    calls, _seeds = _fake_zimage_shots(monkeypatch)
+    for (cmd, _log), (names, panels) in zip(runner.runs, GROUPS):
+        del calls[:]
+        assert story_images.main(cmd[2:]) == 0, names
+        assert len(calls) == len(panels)
+        for _prompt, kwargs in calls:
+            if names:
+                assert kwargs["loras"] == [(_stills_path(lib_dir, n), 0.8) for n in names]
+            else:
+                assert "loras" not in kwargs

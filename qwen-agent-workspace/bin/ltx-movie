@@ -1211,6 +1211,8 @@ def phase2_stills(args):
     elif args.stills_lora_path:
         cmd += ["--lora", args.stills_lora_path]
     cmd += _cast_flags(args)
+    if getattr(args, "shots", False):
+        return _phase2_shots(args, cmd)
     panel_01 = os.path.join(paths["images_dir"], "panel_01.png")
     if (getattr(args, "cast_members", None) and not getattr(args, "seed_image", None)
             and os.path.exists(panel_01)):
@@ -1223,6 +1225,71 @@ def phase2_stills(args):
         print("Error: ltx-story-images exited %d; see %s for which panels failed/were blocked"
               % (proc.returncode, images_json), file=sys.stderr)
         return 1
+    return 0
+
+
+def _panel_list(panels):
+    return ",".join(str(i) for i in panels)
+
+
+def _shots_stills_groups(story_md_path, members):
+    """[(names, [panel numbers])]: shots-mode panels grouped by the cast characters whose stills
+    LoRAs bin/ltx-story-images will load for them -- the same _compose_prompt(Image:, Style:) +
+    cast_text(insert=members with a stills LoRA) match it performs, so every group is one LoRA
+    set (shots spec 5.5). Sorted by (len(names), names); panels ascending, 1-based by position.
+    Uncast: one group of every panel."""
+    panels = _load_story_panels(story_md_path)
+    by_panel = {i: () for i in range(1, len(panels) + 1)}
+    if members:
+        lib = _character_lib()
+        images = importlib.machinery.SourceFileLoader(
+            "ltx_story_images_for_movie", os.path.join(WS, "bin", "ltx-story-images")).load_module()
+        style = images._style_text(panels)
+        insert = {m.name for m in members if m.stills_lora}
+        for i, p in enumerate(panels, start=1):
+            by_panel[i] = tuple(lib.cast_text(images._compose_prompt(p["image"], style), members,
+                                              insert=insert)[1])
+    groups = {}
+    for i, names in sorted(by_panel.items()):
+        groups.setdefault(names, []).append(i)
+    return sorted(groups.items(), key=lambda g: (len(g[0]), g[0]))
+
+
+def _shots_missing_stills(args, panels):
+    """The panels of one group whose still must be generated: those being redone, and those
+    with no images/panel_NN.png."""
+    images_dir = _story_paths(args.story_id)["images_dir"]
+    redo = set(getattr(args, "redo_panels", None) or [])
+    return [i for i in panels if i in redo
+            or not os.path.exists(os.path.join(images_dir, "panel_%02d.png" % i))]
+
+
+def _phase2_shots(args, cmd):
+    """Phase 2 in shots mode (shots spec 5.5): one bin/ltx-story-images run per stills-LoRA group,
+    each the Phase 2 cmd with --only <the group's panels> and --shots appended, teed to
+    images/stills-group-KK.log. A group with no missing still is skipped. Stops at the first
+    failing group; stills already written are kept."""
+    paths = _story_paths(args.story_id)
+    groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [])
+    os.makedirs(paths["images_dir"], exist_ok=True)
+    for k, (names, panels) in enumerate(groups, start=1):
+        label = "%s; panels %s" % (", ".join(names) or "no character LoRAs", _panel_list(panels))
+        if not _shots_missing_stills(args, panels):
+            print("stills group %d/%d (%s): every still exists; skipped" % (k, len(groups), label))
+            continue
+        group_cmd = list(cmd)
+        group_cmd[group_cmd.index("--only") + 1] = _panel_list(panels)
+        group_cmd.append("--shots")
+        log_path = os.path.join(paths["images_dir"], "stills-group-%02d.log" % k)
+        print("stills group %d/%d (%s); log: %s" % (k, len(groups), label, log_path))
+        print("Running: %s" % shlex.join(group_cmd))
+        rc = _stream_and_tee(group_cmd, log_path)
+        if rc != 0:
+            print("Error: ltx-story-images exited %d for stills group %d/%d (%s); log: %s. "
+                  "Stills already written are kept; rerun the same command to continue -- every "
+                  "existing panel_NN.png is reused." % (rc, k, len(groups), label, log_path),
+                  file=sys.stderr)
+            return 1
     return 0
 
 
