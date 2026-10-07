@@ -732,3 +732,87 @@ def test_s72_shots_without_cast(tmp_path, monkeypatch):
     assert all("loras" not in kwargs for _prompt, kwargs in calls)
     assert all("loras" not in p for p in _images_json(out_dir)["panels"])
     assert seeds == [7, 7]
+
+
+# --- S66: bin/ltx-mlx-render renders a shots manifest unchanged (spec 1.2) ---------------
+class _ShotsRenderHarness(object):
+    """render.main() in-process with generate_video, probe_streams, assert_clips_uniform,
+    build_concat_command and clip_frame_count stubbed and the story dir under tmp_path (a
+    fresh copy of the tests/test_casting_pipeline.py P9 harness). generate_video raises
+    Ltx2MlxError for every panel in fail; every other stub render writes 128 bytes unique to
+    that call."""
+
+    def __init__(self, monkeypatch, directory, manifest, fail=()):
+        self.dir = str(directory)
+        os.makedirs(self.dir, exist_ok=True)
+        self.manifest = manifest
+        self.received = []
+        self.renders = [0]
+        self.model = os.path.join(self.dir, "model-fixture")
+        os.makedirs(self.model, exist_ok=True)
+        with open(os.path.join(self.model, "split_model.json"), "w") as f:
+            json.dump({"recipe": "ltx-2.5"}, f)
+        self.clips = os.path.join(self.dir, "clips")
+        os.makedirs(self.clips, exist_ok=True)
+        self.out = os.path.join(self.dir, "movie.mp4")
+        fake_bin = os.path.join(self.dir, "fake-ltx")
+        with open(fake_bin, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_bin, 0o755)
+        harness = self
+
+        def _gen(prompt, output_path, image_path=None, **kw):
+            harness.renders[0] += 1
+            index = int(os.path.basename(output_path)[len("panel_"):-len(".mp4")])
+            harness.received.append((index, image_path, kw))
+            if index in fail:
+                raise SKILL.Ltx2MlxError("stub failure for panel %d" % index, returncode=1)
+            with open(output_path, "wb") as f:
+                f.write(("render %d" % harness.renders[0]).encode().ljust(128, b"\0"))
+            return os.path.abspath(output_path)
+
+        monkeypatch.setattr(render.SKILL, "generate_video", _gen)
+        monkeypatch.setattr(render.SKILL, "LTX2_MLX_BIN", fake_bin)
+        monkeypatch.setattr(render, "probe_streams", lambda p: {"streams": []})
+        monkeypatch.setattr(render, "assert_clips_uniform", lambda pairs, w, h, fr: None)
+        monkeypatch.setattr(render, "build_concat_command", lambda lp, out: [
+            sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'MOVIE')", out])
+        monkeypatch.setattr(render, "clip_frame_count", lambda p: 241)
+        monkeypatch.setattr(render, "story_dir_for",
+                            lambda sid: os.path.join(harness.dir, "stories", sid))
+
+    def run(self, *extra):
+        return render.main([self.manifest, self.out, "--clips-dir", self.clips,
+                            "--skip-input-screen", "--model", self.model, "--width", "512",
+                            "--height", "512"] + list(extra))
+
+    def newest_summary(self, story_id):
+        paths = glob.glob(os.path.join(self.dir, "stories", story_id, "runs", "*",
+                                       "story_summary.json"))
+        with open(max(paths, key=os.path.getmtime)) as f:
+            return json.load(f)
+
+
+def test_s66_render_accepts_the_shots_manifest(tmp_path, monkeypatch, lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch, text=S61_STORY)
+    assert story_manifest.main(_shots_manifest_argv(
+        "cast", story_md, images, "--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin",
+        "--character-strength", "0.8")) == 0
+    path = os.path.join(ws, "generated", "stories", "cast", "manifest.json")
+    manifest = render.load_manifest(path)
+    units = render.build_units(manifest["panels"], 0, str(tmp_path / "clips"))
+    assert [u["conditioning"] for u in units] == ["still"] * 4
+    assert [u["chain_source"] for u in units] == [None] * 4
+    assert [u["image_path"] for u in units] == [os.path.abspath(i) for i in images]
+    h = _ShotsRenderHarness(monkeypatch, tmp_path / "run", path, fail=(2,))
+    assert h.run("--on-panel-failure", "skip", "--retry-failed", "0") == 1
+    assert [index for index, _image, _kw in h.received] == [1, 2, 3, 4]
+    assert [image for _index, image, _kw in h.received] == [os.path.abspath(i) for i in images]
+    summary = h.newest_summary("cast")
+    assert [u["status"] for u in summary["units"]] == ["ok", "error", "ok", "ok"]
+    assert summary["stopped_reason"] is None
+    assert summary["skipped_panels"] == [2]
+    assert [os.path.basename(c) for c in summary["clips"]] == [
+        "panel_01.mp4", "panel_03.mp4", "panel_04.mp4"]
