@@ -965,9 +965,61 @@ def phase0_seed(args):
 # phase 1: story
 # ---------------------------------------------------------------------------
 
+def _run_story_agent(cmd, timeout, story_md):
+    """Run one bin/qwen-agent story-authoring call: print the command, wait up to timeout
+    seconds, and apply Phase 1's exit-code rules. Returns 0 when story.md may be validated
+    (including qwen-agent exiting nonzero after writing it), else 1. Moved verbatim out of
+    phase1_story so the shots rewrite reuses it (shots spec 5.4)."""
+    print("Running (timeout %ds): %s" % (
+        timeout, shlex.join(cmd[:-1] + ["--user-prompt", "<%d chars>" % len(cmd[-1])])
+    ))
+
+    proc = subprocess.Popen(cmd, cwd=WS, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        tail = "\n".join((out or "").splitlines()[-40:])
+        print("Error: qwen-agent timed out after %ds writing story.md (known hang mode: "
+              "attempting to self-verify, which the prompt forbids); log tail:\n%s"
+              % (timeout, tail), file=sys.stderr)
+        return 1
+    if "--danger-auto-approve" in cmd:
+        # Every tool call qwen-agent ran unconfirmed under this flag traces as
+        # [danger-auto]; print the full output (not just the failure-path tail
+        # below) regardless of exit code, so that trail actually reaches whatever
+        # captures this process's stdout -- a human's terminal, or bin/iterate-story's
+        # own per-round log (tiered-approval spec SS1.4.1). Silently discarding it on
+        # success would make the audit-trail property that flag's acceptance depends
+        # on false exactly when nothing went wrong.
+        print(out or "")
+    if proc.returncode != 0:
+        tail = "\n".join((out or "").splitlines()[-40:])
+        if os.path.isfile(story_md):
+            # qwen-agent can finish writing story.md and STILL exit
+            # nonzero (e.g. it hits its round/tool limit after the
+            # write -- observed 2026-08-27, story sisters_sorrow: 30
+            # valid panels on disk, rc != 0, and this branch killed the
+            # run). The file on disk, validated below, is the evidence
+            # that matters; the exit code is not. Same lesson as
+            # qwen-serve-guard's restart rc: never trust an exit code
+            # over a direct check of the outcome.
+            print("Warning: qwen-agent exited %d but story.md exists -- "
+                  "validating the file instead of failing. Log tail:\n%s"
+                  % (proc.returncode, tail))
+        else:
+            print("Error: qwen-agent exited %d while authoring story.md\n%s"
+                  % (proc.returncode, tail), file=sys.stderr)
+            return 1
+    return 0
+
+
 def phase1_story(args):
     paths = _story_paths(args.story_id)
     story_md = paths["story_md"]
+    authored = None
 
     if os.path.exists(story_md) and not args.force_story:
         print("note: %s already exists; skipping Phase 1 (pass --force-story to regenerate)"
@@ -1001,49 +1053,10 @@ def phase1_story(args):
         if args.force_story and args.no_review:
             cmd += ["--danger-auto-approve"]
         cmd += ["--user-prompt", prompt]
-        print("Running (timeout %ds): %s" % (
-            timeout, shlex.join(cmd[:-1] + ["--user-prompt", "<%d chars>" % len(prompt)])
-        ))
-
-        proc = subprocess.Popen(cmd, cwd=WS, stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, text=True)
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, _ = proc.communicate()
-            tail = "\n".join((out or "").splitlines()[-40:])
-            print("Error: qwen-agent timed out after %ds writing story.md (known hang mode: "
-                  "attempting to self-verify, which the prompt forbids); log tail:\n%s"
-                  % (timeout, tail), file=sys.stderr)
-            return 1
-        if "--danger-auto-approve" in cmd:
-            # Every tool call qwen-agent ran unconfirmed under this flag traces as
-            # [danger-auto]; print the full output (not just the failure-path tail
-            # below) regardless of exit code, so that trail actually reaches whatever
-            # captures this process's stdout -- a human's terminal, or bin/iterate-story's
-            # own per-round log (tiered-approval spec SS1.4.1). Silently discarding it on
-            # success would make the audit-trail property that flag's acceptance depends
-            # on false exactly when nothing went wrong.
-            print(out or "")
-        if proc.returncode != 0:
-            tail = "\n".join((out or "").splitlines()[-40:])
-            if os.path.isfile(story_md):
-                # qwen-agent can finish writing story.md and STILL exit
-                # nonzero (e.g. it hits its round/tool limit after the
-                # write -- observed 2026-08-27, story sisters_sorrow: 30
-                # valid panels on disk, rc != 0, and this branch killed the
-                # run). The file on disk, validated below, is the evidence
-                # that matters; the exit code is not. Same lesson as
-                # qwen-serve-guard's restart rc: never trust an exit code
-                # over a direct check of the outcome.
-                print("Warning: qwen-agent exited %d but story.md exists -- "
-                      "validating the file instead of failing. Log tail:\n%s"
-                      % (proc.returncode, tail))
-            else:
-                print("Error: qwen-agent exited %d while authoring story.md\n%s"
-                      % (proc.returncode, tail), file=sys.stderr)
-                return 1
+        rc = _run_story_agent(cmd, timeout, story_md)
+        if rc:
+            return rc
+        authored = {"cmd": cmd, "timeout": timeout, "prompt": prompt}
 
     violations = _validate_story_md(story_md, args.panels, args.no_stills)
     if violations:
