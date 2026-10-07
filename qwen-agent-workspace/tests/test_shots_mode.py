@@ -1391,3 +1391,233 @@ def test_s45_each_group_is_one_lora_set_end_to_end(monkeypatch, movie_ws, lib_di
                 assert kwargs["loras"] == [(_stills_path(lib_dir, n), 0.8) for n in names]
             else:
                 assert "loras" not in kwargs
+
+
+# --- S46-S53: --redo, Phase 3, Phase 4 and the dry run (spec 5.6-5.8) --------------------
+def _record_runs(monkeypatch):
+    runs = []
+    monkeypatch.setattr(ltx_movie.subprocess, "run",
+                        lambda cmd, **kw: runs.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0))
+    return runs
+
+
+def test_s46_phase3_passes_shots_and_every_still(monkeypatch, movie_ws, capsys):
+    _story_dir_with(movie_ws, "s46")
+    args = _shots_args("n", "--story-id", "s46", "--shots", "--panels", "14", "--no-review")
+    runs = _record_runs(monkeypatch)
+    assert ltx_movie.phase3_manifest(args) == 0
+    manifest_cmd = runs[0]
+    assert "ltx-story-manifest" in manifest_cmd[1]
+    images = os.path.join(str(movie_ws), "generated", "stories", "s46", "images")
+    expected = []
+    for i in range(1, 15):
+        expected += ["--image", os.path.join(images, "panel_%02d.png" % i)]
+    at = manifest_cmd.index("--shots")
+    assert manifest_cmd[at + 1:at + 29] == expected
+    assert manifest_cmd.count("--image") == 14
+    assert "--chain" not in manifest_cmd
+    capsys.readouterr()
+    assert ltx_movie.main(["n", "--story-id", "s46", "--shots", "--panels", "14", "--dry-run",
+                           "--no-review"]) == 0
+    assert "Command: %s" % ltx_movie.shlex.join(manifest_cmd) in capsys.readouterr().out.splitlines()
+
+
+def test_s47_phase4_failure_policy():
+    def policy(*extra):
+        flags = ltx_movie._phase4_flags(_movie_args("n", "--story-id", "x", *extra))
+        return flags[flags.index("--on-panel-failure") + 1]
+
+    assert policy("--shots") == "skip"
+    assert policy() == "stop"
+    assert policy("--no-stills") == "skip"
+
+
+def test_s48_phase_sequence_with_redo():
+    def names(**kwargs):
+        return tuple(f.__name__ for f in ltx_movie._phase_sequence(types.SimpleNamespace(**kwargs)))
+
+    assert names(no_stills=False, story_server_stop_after_story=True, redo_panels=[3]) == (
+        "phase1_story", "phase_release_story_server", "phase_redo_shots", "phase2_stills",
+        "phase3_manifest", "phase4_render")
+    assert names(no_stills=False, story_server_stop_after_story=True, redo_panels=[]) == (
+        "phase1_story", "phase_release_story_server", "phase2_stills", "phase3_manifest",
+        "phase4_render")
+    l41 = [
+        (dict(no_stills=False, story_server_stop_after_story=False, seed_image=None),
+         ("phase1_story", "phase2_stills", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=True, seed_image=None),
+         ("phase1_story", "phase_release_story_server", "phase2_stills", "phase3_manifest",
+          "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=False, seed_image=None),
+         ("phase1_story", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=True, seed_image=None),
+         ("phase1_story", "phase_release_story_server", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=False, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase2_stills", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=False, story_server_stop_after_story=True, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase_release_story_server", "phase2_stills",
+          "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=False, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase3_manifest", "phase4_render")),
+        (dict(no_stills=True, story_server_stop_after_story=True, seed_image="x.png"),
+         ("phase0_seed", "phase1_story", "phase_release_story_server", "phase3_manifest",
+          "phase4_render")),
+    ]
+    for kwargs, expected in l41:
+        assert names(**kwargs) == expected, kwargs
+
+
+def _redo_tree(movie_ws, story_id, clip_panels=(1, 2, 3)):
+    """A shots story dir: SHOTS_OK as story.md, images/panel_0{1,2,3}.png, clips/panel_0N.mp4
+    (+ .provenance.json) for clip_panels, and movie.mp4, each with distinct bytes."""
+    directory = _story_dir_with(movie_ws, story_id, SHOTS_OK)
+    (directory / "images").mkdir()
+    (directory / "clips").mkdir()
+    for i in (1, 2, 3):
+        (directory / "images" / ("panel_%02d.png" % i)).write_bytes(b"still %d" % i)
+        if i in clip_panels:
+            (directory / "clips" / ("panel_%02d.mp4" % i)).write_bytes(b"clip %d" % i)
+            (directory / "clips" / ("panel_%02d.mp4.provenance.json" % i)).write_bytes(
+                b"provenance %d" % i)
+    (directory / "movie.mp4").write_bytes(b"movie")
+    return str(directory)
+
+
+def _snapshot(directory):
+    out = {}
+    for path in _all_files(directory):
+        with open(path, "rb") as f:
+            out[path] = (f.read(), os.stat(path).st_mtime_ns)
+    return out
+
+
+def _redo_pairs(directory, archive, panel, clip=True):
+    j = os.path.join
+    pairs = [(j(directory, "images", "panel_%02d.png" % panel),
+              j(archive, "images", "panel_%02d.png" % panel))]
+    if clip:
+        pairs += [(j(directory, "clips", "panel_%02d.mp4" % panel),
+                   j(archive, "clips", "panel_%02d.mp4" % panel)),
+                  (j(directory, "clips", "panel_%02d.mp4.provenance.json" % panel),
+                   j(archive, "clips", "panel_%02d.mp4.provenance.json" % panel))]
+    return pairs + [(j(directory, "movie.mp4"), j(archive, "movie.mp4"))]
+
+
+def test_s49_redo_moves_only_the_named_panels(movie_ws, capsys):
+    directory = _redo_tree(movie_ws, "s49")
+    before = _snapshot(directory)
+    args = _shots_args("n", "--story-id", "s49", "--shots", "--redo", "2", "--panels", "3")
+    assert ltx_movie.phase_redo_shots(args) == 0
+    archives = glob.glob(os.path.join(directory, "redo", "*"))
+    assert len(archives) == 1
+    assert re.fullmatch(r"\d{8}T\d{6}Z-%d" % os.getpid(), os.path.basename(archives[0]))
+    pairs = _redo_pairs(directory, archives[0], 2)
+    for src, dst in pairs:
+        assert not os.path.lexists(src)
+        with open(dst, "rb") as f:
+            assert f.read() == before[src][0]
+    after = _snapshot(directory)
+    moved = {src for src, _dst in pairs}
+    for path, value in before.items():
+        if path not in moved:
+            assert after[path] == value, path
+    assert len(after) == len(before)
+    assert [l for l in capsys.readouterr().out.splitlines() if l.startswith("redo: moved ")] == [
+        "redo: moved %s -> %s" % pair for pair in pairs]
+    directory = _redo_tree(movie_ws, "s49b", clip_panels=(1, 2))
+    args = _shots_args("n", "--story-id", "s49b", "--shots", "--redo", "3", "--panels", "3")
+    assert ltx_movie.phase_redo_shots(args) == 0
+    archives = glob.glob(os.path.join(directory, "redo", "*"))
+    assert len(archives) == 1
+    assert [l for l in capsys.readouterr().out.splitlines() if l.startswith("redo: moved ")] == [
+        "redo: moved %s -> %s" % pair for pair in _redo_pairs(directory, archives[0], 3,
+                                                               clip=False)]
+
+
+def test_s50_dry_run_new_shots_story(lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    story_id = "shots-s50-%d" % os.getpid()
+    story_dir = os.path.join(WS, "generated", "stories", story_id)
+    assert not os.path.exists(story_dir)
+    proc = subprocess.run(
+        [sys.executable, "bin/ltx-movie", "n", "--story-id", story_id, "--shots", "--panels", "4",
+         "--dry-run", "--no-review", "--character", "kyra", "--character", "ronin"],
+        cwd=WS, env=dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir, STORY_PIPELINE_LOGGED="1"),
+        capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    lines = out.splitlines()
+    assert "sequence of separate shots joined by cuts" in out
+    assert "at most two of these characters" in out
+    assert any(l.startswith("Stills groups: computed from story.md after Phase 1") for l in lines)
+    phase2 = [l for l in lines if l.startswith("Command: ") and "ltx-story-images" in l]
+    assert len(phase2) == 1
+    assert "--only '<PANELS>'" in phase2[0] and phase2[0].endswith(" --shots")
+    manifest = [l for l in lines if l.startswith("Command: ") and "ltx-story-manifest" in l]
+    assert len(manifest) == 1
+    assert "--shots" in manifest[0].split() and manifest[0].split().count("--image") == 4
+    assert "--on-panel-failure skip" in out
+    assert not os.path.exists(story_dir)
+
+
+def test_s51_dry_run_existing_story_with_redo(movie_ws, lib_dir, capsys):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    directory = _redo_tree(movie_ws, "s51")
+    before = _snapshot(directory)
+    assert ltx_movie.main(["n", "--story-id", "s51", "--shots", "--redo", "2", "--panels", "3",
+                           "--dry-run", "--no-review", "--character", "kyra",
+                           "--character", "ronin"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "--- Redo: panels 2 ---" in lines
+    archive = os.path.join(directory, "redo", "<UTC stamp>-<pid>")
+    assert [l for l in lines if l.startswith("Would move ")] == [
+        "Would move %s -> %s" % pair for pair in _redo_pairs(directory, archive, 2)]
+    groups = [i for i, l in enumerate(lines) if l.startswith("stills group ")]
+    assert [lines[i] for i in groups] == [
+        "stills group 1/3 (no character LoRAs; panels 2)",
+        "stills group 2/3 (kyra; panels 1) -- would be skipped: every still exists",
+        "stills group 3/3 (kyra, ronin; panels 3) -- would be skipped: every still exists"]
+    for i, only in zip(groups, ("2", "1", "3")):
+        assert lines[i + 1].startswith("Command: ") and "ltx-story-images" in lines[i + 1]
+        assert " --only %s " % only in lines[i + 1] and lines[i + 1].endswith(" --shots")
+    assert _snapshot(directory) == before
+    assert not os.path.exists(os.path.join(directory, "redo"))
+
+
+def test_s52_non_shots_outputs_are_byte_identical(tmp_path, movie_ws, capsys):
+    regression = _load("casting_regression_for_s52", "tests/test_casting_regression.py")
+    for text, golden in ((regression.b1_text(), regression.GOLDEN_B1),
+                         (regression.b2_text(str(tmp_path)), regression.GOLDEN_B2),
+                         (regression.b3_text(), regression.GOLDEN_B3)):
+        with open(golden, encoding="utf-8") as f:
+            assert text == f.read(), golden
+    args = _movie_args("n", "--story-id", "x")
+    flags = ltx_movie._phase4_flags(args)
+    assert "--shots" not in flags
+    assert "--shots" not in ltx_movie._render_flags(args)
+    assert flags[flags.index("--on-panel-failure") + 1] == "stop"
+    assert ltx_movie.main(["n", "--story-id", "x", "--dry-run", "--no-review"]) == 0
+    out = capsys.readouterr().out
+    assert "--shots" not in out.split()
+    manifest = next(l for l in out.splitlines()
+                    if l.startswith("Command: ") and "ltx-story-manifest" in l)
+    assert "--chain" in manifest.split()
+
+
+def test_s53_uncast_shots_dry_run_never_loads_character_lib():
+    script = (
+        "import contextlib, io, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import importlib.machinery\n"
+        "m = importlib.machinery.SourceFileLoader('ltx_movie', %r).load_module()\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "    rc = m.main(['n', '--story-id', 'x', '--dry-run', '--no-review', '--shots'])\n"
+        "print('RC=%%d' %% rc)\n"
+        "print('CHARACTER_LIB_LOADED=%%s' %% ('character_lib' in sys.modules))\n"
+    ) % (WS, os.path.join(WS, "bin", "ltx-movie"))
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    lines = proc.stdout.splitlines()
+    assert "RC=0" in lines, proc.stderr
+    assert "CHARACTER_LIB_LOADED=False" in lines

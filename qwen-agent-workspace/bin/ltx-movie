@@ -490,10 +490,11 @@ def _phase4_flags(args):
     from -- so it passes --on-panel-failure stop and relies on bin/ltx-mlx-render's
     inline retry; --no-stills renders independent clips and keeps skip. Both keep one
     retry, a 120 s idle before it and the 3-consecutive circuit breaker (which the
-    render tool does not consult for a chained manifest)."""
+    render tool does not consult for a chained manifest). --shots renders independent clips
+    too and passes skip."""
     flags = _render_flags(args) + [
         "--panel-timeout", str(args.panel_timeout),
-        "--on-panel-failure", "skip" if args.no_stills else "stop",
+        "--on-panel-failure", "skip" if (args.no_stills or getattr(args, "shots", False)) else "stop",
         "--retry-failed", "1",
         "--retry-idle", "120",
         "--max-consecutive-failures", "3"]
@@ -1314,9 +1315,60 @@ def phase_release_story_server(args):
     return 0
 
 
+def _redo_moves(args, archive):
+    """[(src, dst)] for every existing file --redo moves aside (shots spec 5.6), in order: per redo
+    panel its still, clip and clip provenance; then movie.mp4. Reads only os.path state."""
+    paths = _story_paths(args.story_id)
+    clips_dir = os.path.join(paths["story_dir"], "clips")
+    moves = []
+    for n in args.redo_panels:
+        for src, sub in ((os.path.join(paths["images_dir"], "panel_%02d.png" % n), "images"),
+                         (os.path.join(clips_dir, "panel_%02d.mp4" % n), "clips"),
+                         (os.path.join(clips_dir, "panel_%02d.mp4.provenance.json" % n), "clips")):
+            if os.path.lexists(src):
+                moves.append((src, os.path.join(archive, sub, os.path.basename(src))))
+    if os.path.lexists(paths["movie_path"]):
+        moves.append((paths["movie_path"], os.path.join(archive, "movie.mp4")))
+    return moves
+
+
+def phase_redo_shots(args):
+    """--redo (shots spec 5.6): move the named panels' still, clip and clip provenance, and
+    movie.mp4, into <story>/redo/<UTC stamp>-<pid>/, so Phase 2 regenerates only those stills
+    and Phase 4 (--resume) re-renders only those clips. Never deletes anything."""
+    paths = _story_paths(args.story_id)
+    panels = _panel_list(args.redo_panels)
+    print("=== Redo: panels %s ===" % panels)
+    archive = os.path.join(paths["story_dir"], "redo", "%s-%d"
+                           % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()))
+    moves = _redo_moves(args, archive)
+    for src, dst in moves:
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(src, dst)
+        except OSError as e:
+            print("Error: --redo could not move %s to %s: %s" % (src, dst, e), file=sys.stderr)
+            return 1
+        print("redo: moved %s -> %s" % (src, dst))
+    if not moves:
+        print("redo: nothing to move (no still, clip or movie exists yet for panels %s)" % panels)
+    print("redo: panels %s re-render; every other panel's still and clip is reused (stills by "
+          "existence, clips by --resume provenance)" % panels)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # phase 3: manifest + dry-run
 # ---------------------------------------------------------------------------
+
+def _shots_image_flags(args):
+    """--image <images>/panel_NN.png for every panel 1..--panels, in order (shots spec 5.7)."""
+    images_dir = _story_paths(args.story_id)["images_dir"]
+    flags = []
+    for i in range(1, args.panels + 1):
+        flags += ["--image", os.path.join(images_dir, "panel_%02d.png" % i)]
+    return flags
+
 
 def phase3_manifest(args):
     paths = _story_paths(args.story_id)
@@ -1326,6 +1378,8 @@ def phase3_manifest(args):
                      "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
     if args.no_stills:
         cmd_manifest += ["--no-images"]
+    elif getattr(args, "shots", False):
+        cmd_manifest += ["--shots"] + _shots_image_flags(args)
     else:
         cmd_manifest += ["--chain", "--image", os.path.join(paths["images_dir"], "panel_01.png")]
     cmd_manifest += ["--fps", str(args.fps),
@@ -1470,6 +1524,28 @@ def phase4_render(args):
 # dry-run plan
 # ---------------------------------------------------------------------------
 
+def _print_shots_stills_plan(args, cmd):
+    """Phase 2's dry-run lines in shots mode (shots spec 5.8). Touches nothing."""
+    story_md = _story_paths(args.story_id)["story_md"]
+    if args.force_story or not os.path.exists(story_md):
+        group_cmd = list(cmd)
+        group_cmd[group_cmd.index("--only") + 1] = "<PANELS>"
+        group_cmd.append("--shots")
+        print("Stills groups: computed from story.md after Phase 1 -- one run per distinct set of "
+              "cast stills LoRAs, each with --only <PANELS> (that group's panels):")
+        print("Command: %s" % shlex.join(group_cmd))
+        return
+    groups = _shots_stills_groups(story_md, getattr(args, "cast_members", None) or [])
+    for k, (names, panels) in enumerate(groups, start=1):
+        group_cmd = list(cmd)
+        group_cmd[group_cmd.index("--only") + 1] = _panel_list(panels)
+        group_cmd.append("--shots")
+        skip = "" if _shots_missing_stills(args, panels) else " -- would be skipped: every still exists"
+        print("stills group %d/%d (%s; panels %s)%s"
+              % (k, len(groups), ", ".join(names) or "no character LoRAs", _panel_list(panels), skip))
+        print("Command: %s" % shlex.join(group_cmd))
+
+
 def _print_dry_run_plan(args):
     paths = _story_paths(args.story_id)
     geometry_line = None
@@ -1545,6 +1621,14 @@ def _print_dry_run_plan(args):
               "(timeout %ds) before Phase 2." % (args.min_avail_gib, args.avail_timeout))
         print()
 
+    if getattr(args, "redo_panels", None):
+        print("--- Redo: panels %s ---" % _panel_list(args.redo_panels))
+        for src, dst in _redo_moves(args, os.path.join(paths["story_dir"], "redo",
+                                                       "<UTC stamp>-<pid>")):
+            print("Would move %s -> %s" % (src, dst))
+        print("Then only those panels' stills and clips re-render; every other panel is reused.")
+        print()
+
     if args.no_stills:
         print("--- Phase 2: stills --- SKIPPED (--no-stills: no anchor stills are generated)")
         print()
@@ -1563,7 +1647,10 @@ def _print_dry_run_plan(args):
         elif args.stills_lora_path:
             phase2_cmd += ["--lora", args.stills_lora_path]
         phase2_cmd += _cast_flags(args)
-        print("Command: %s" % shlex.join(phase2_cmd))
+        if getattr(args, "shots", False):
+            _print_shots_stills_plan(args, phase2_cmd)
+        else:
+            print("Command: %s" % shlex.join(phase2_cmd))
         print()
 
     print("--- Phase 3: manifest + dry-run ---")
@@ -1571,6 +1658,8 @@ def _print_dry_run_plan(args):
                             "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
     if args.no_stills:
         phase3_manifest_cmd += ["--no-images"]
+    elif getattr(args, "shots", False):
+        phase3_manifest_cmd += ["--shots"] + _shots_image_flags(args)
     else:
         phase3_manifest_cmd += ["--chain", "--image",
                                 os.path.join(paths["images_dir"], "panel_01.png")]
@@ -1612,6 +1701,9 @@ def _phase_sequence(args):
     if getattr(args, "story_server_stop_after_story", False):
         cut = 1
         phases = phases[:cut] + (phase_release_story_server,) + phases[cut:]
+    if getattr(args, "redo_panels", None):
+        cut = phases.index(phase2_stills)
+        phases = phases[:cut] + (phase_redo_shots,) + phases[cut:]
     if getattr(args, "seed_image", None):
         phases = (phase0_seed,) + phases
     return phases
