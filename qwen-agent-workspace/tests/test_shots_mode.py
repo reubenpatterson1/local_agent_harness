@@ -647,3 +647,88 @@ def test_s65_unused_cast_phrase_warning_names_image_and_motion(tmp_path, monkeyp
     assert story_manifest.main(chain) == 0
     assert ("WARNING: cast phrase 'the stranger' (character ronin) occurs in no panel's Motion: "
             "text; that character gets no LoRA") in capsys.readouterr().out
+
+
+# --- S70-S72: bin/ltx-story-images --shots (spec 5.10) ----------------------------------
+class _FakeContentSafetyError(Exception):
+    pass
+
+
+def _fake_zimage_shots(monkeypatch):
+    """Fake torch, z_image_skill and content_safety modules in sys.modules (a fresh copy of
+    the tests/test_casting_pipeline.py P30 harness). Returns (calls, seeds): the
+    (prompt, kwargs) of every generate_image call and every manual_seed(n) value."""
+    calls, seeds = [], []
+
+    class _Generator(object):
+        def __init__(self, device):
+            self.device = device
+
+        def manual_seed(self, seed):
+            seeds.append(seed)
+            return self
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.Generator = _Generator
+    fake_zimage = types.ModuleType("z_image_skill")
+    fake_zimage.generate_image = lambda prompt, **kwargs: calls.append((prompt, kwargs))
+    fake_safety = types.ModuleType("content_safety")
+    fake_safety.ContentSafetyError = _FakeContentSafetyError
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "z_image_skill", fake_zimage)
+    monkeypatch.setitem(sys.modules, "content_safety", fake_safety)
+    return calls, seeds
+
+
+def _images_story(tmp_path):
+    story_md = tmp_path / "story.md"
+    story_md.write_text(SHOTS_OK, encoding="utf-8")
+    return str(story_md)
+
+
+def _images_json(out_dir):
+    with open(os.path.join(out_dir, "images.json")) as f:
+        return json.load(f)
+
+
+def test_s70_lone_stills_lora_is_0_8_in_shots_mode(tmp_path, monkeypatch, lib_dir):
+    _kyra(lib_dir)
+    calls, _seeds = _fake_zimage_shots(monkeypatch)
+    story_md = _images_story(tmp_path)
+    stills = os.path.join(lib_dir, "kyra", "lora", "stills.safetensors")
+    out_dir = str(tmp_path / "shots")
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the woman in grey=kyra", "--shots"]) == 0
+    assert len(calls) == 1
+    assert calls[0][1]["loras"] == [(stills, 0.8)]
+    assert _images_json(out_dir)["panels"][0]["loras"][0]["strength"] == 0.8
+    out_dir = str(tmp_path / "chained")
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1",
+                              "--cast", "the woman in grey=kyra"]) == 0
+    assert calls[1][1]["loras"] == [(stills, 1.0)]
+    assert _images_json(out_dir)["panels"][0]["loras"][0]["strength"] == 1.0
+
+
+def test_s71_shots_pins_the_seed(tmp_path, monkeypatch):
+    _calls, seeds = _fake_zimage_shots(monkeypatch)
+    story_md = _images_story(tmp_path)
+    assert _panels(tmp_path, SHOTS_OK)[0]["style"] == ""
+    assert story_images.main(["--story-md", story_md, "--out-dir", str(tmp_path / "a"),
+                              "--only", "2,3", "--seed", "0", "--shots"]) == 0
+    assert seeds == [0, 0]
+    del seeds[:]
+    assert story_images.main(["--story-md", story_md, "--out-dir", str(tmp_path / "b"),
+                              "--only", "2,3", "--seed", "0"]) == 0
+    assert seeds == [2, 3]
+
+
+def test_s72_shots_without_cast(tmp_path, monkeypatch):
+    calls, seeds = _fake_zimage_shots(monkeypatch)
+    story_md = _images_story(tmp_path)
+    out_dir = str(tmp_path / "images")
+    assert story_images.main(["--story-md", story_md, "--out-dir", out_dir, "--only", "1,2",
+                              "--seed", "7", "--shots"]) == 0
+    assert len(calls) == 2
+    assert all("loras" not in kwargs for _prompt, kwargs in calls)
+    assert all("loras" not in p for p in _images_json(out_dir)["panels"])
+    assert seeds == [7, 7]
