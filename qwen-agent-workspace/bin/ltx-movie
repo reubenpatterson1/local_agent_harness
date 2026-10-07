@@ -1058,6 +1058,9 @@ def phase1_story(args):
             return rc
         authored = {"cmd": cmd, "timeout": timeout, "prompt": prompt}
 
+    if getattr(args, "shots", False):
+        return _phase1_shots_finish(args, story_md, authored)
+
     violations = _validate_story_md(story_md, args.panels, args.no_stills)
     if violations:
         print("Error: story.md failed validation:", file=sys.stderr)
@@ -1095,6 +1098,80 @@ def phase1_story(args):
     if not args.no_review:
         input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
 
+    return 0
+
+
+def _shots_check(lib, story_md, expected_panels, members):
+    """(violations, advisories) for a shots-mode story.md (shots spec 4)."""
+    try:
+        with open(story_md, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        return ["story: cannot read story.md: %s" % e], []
+    panels = _load_story_panels(story_md)
+    return (lib.shots_violations(text, panels, expected_panels, members),
+            lib.shots_advisories(panels, members))
+
+
+def _phase1_shots_finish(args, story_md, authored):
+    """Shots-mode Phase 1 after story.md exists (shots spec 5.4): validate; a draft the story
+    model wrote in this run gets exactly one rewrite; then the story dump, the advisories, the
+    cast-phrase warnings and the review gate. authored is None when Phase 1 was skipped."""
+    lib = _character_lib()
+    members = getattr(args, "cast_members", None) or []
+    violations, advisories = _shots_check(lib, story_md, args.panels, members)
+    if violations and authored is None:
+        print("Error: story.md breaks the shot rules:", file=sys.stderr)
+        for v in violations:
+            print("  - %s" % v, file=sys.stderr)
+        print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to have "
+              "the story model write a new one." % story_md, file=sys.stderr)
+        return 2
+    if violations:
+        story_dir = os.path.dirname(story_md)
+        rejected = os.path.join(story_dir, "story.rejected-%s-%d.md"
+                                % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()))
+        print("Warning: the story model's draft broke the shot rules; moving it to %s and asking "
+              "for one rewrite:" % rejected)
+        for v in violations:
+            print("  - %s" % v)
+        os.replace(story_md, rejected)
+        rewrite = authored["prompt"] + "\n\n" + lib.shots_rewrite_block(violations, args.panels)
+        with open(os.path.join(story_dir, "story_prompt.rewrite.txt"), "w", encoding="utf-8") as f:
+            f.write(rewrite)
+        cmd = list(authored["cmd"])
+        cmd[-1] = rewrite
+        print("=== Phase 1: story (rewrite) ===")
+        rc = _run_story_agent(cmd, authored["timeout"], story_md)
+        if rc:
+            print("Error: the shots rewrite failed; the rejected first draft is kept at %s"
+                  % rejected, file=sys.stderr)
+            return rc
+        violations, advisories = _shots_check(lib, story_md, args.panels, members)
+        if violations:
+            print("Error: story.md still breaks the shot rules after one rewrite:", file=sys.stderr)
+            for v in violations:
+                print("  - %s" % v, file=sys.stderr)
+            print("The rejected first draft is kept at %s. Hand-edit %s to fix the violations "
+                  "above and rerun (Phase 1 is skipped while story.md exists), or rerun with "
+                  "--force-story." % (rejected, story_md), file=sys.stderr)
+            return 2
+    if not args.no_review:
+        with open(story_md) as f:
+            content = f.read()
+        print("=== story.md ===")
+        print(content)
+    for a in advisories:
+        print("Warning: %s" % a)
+    if members:
+        with open(story_md, encoding="utf-8") as f:
+            text = f.read()
+    for m in members:
+        if not lib.phrase_occurs(text, m.phrase):
+            print("Warning: story.md does not use cast phrase %r; character %s gets no LoRA in "
+                  "this story" % (m.phrase, m.name))
+    if not args.no_review:
+        input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
     return 0
 
 

@@ -1010,3 +1010,159 @@ def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir, monkeypatch, capsy
     with pytest.raises(Stop):
         ltx_movie.phase1_story(_shots_args("n", "--story-id", "w3"))
     assert seen == [True, False]
+
+
+# --- S35-S41: shots-mode Phase 1 and the one rewrite (spec 5.4) --------------------------
+BAD = _variant("Motion: The bearded robber lunges forward out of the ferns with his short knife "
+               "raised. The camera stays static.", "Motion: The bearded robber lunges then slashes.")
+BAD_VIOLATIONS = ["panel 2: S4 motion length: Motion: is 6 words; it must be 10-25",
+                  "panel 2: S5 one action: Motion: chains actions with 'then'"]
+PARAPHRASED = _variant("grey kimono, standing in the centre", "grey robe, standing in the centre")
+SHOTS_ARGV = ["n", "--story-id", "shots", "--shots", "--character", "kyra", "--character",
+              "ronin", "--panels", "3", "--no-review"]
+
+
+class _FakeStoryAgent(object):
+    """subprocess.Popen stand-in for bin/qwen-agent (spec 10.1): records each cmd and whether
+    story.md existed at call time, writes the next queued story text to story.md (None writes
+    nothing), and exits with the next queued return code (default 0). An unexpected extra
+    call pops an empty queue and raises IndexError."""
+
+    def __init__(self, monkeypatch, story_md, stories, returncodes=()):
+        self.story_md = story_md
+        self.stories = list(stories)
+        self.returncodes = list(returncodes)
+        self.calls = []
+        monkeypatch.setattr(ltx_movie.subprocess, "Popen", self)
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append({"cmd": list(cmd), "existed": os.path.exists(self.story_md)})
+        text = self.stories.pop(0)
+        if text is not None:
+            with open(self.story_md, "w", encoding="utf-8") as f:
+                f.write(text)
+        proc = types.SimpleNamespace(
+            returncode=self.returncodes.pop(0) if self.returncodes else 0,
+            communicate=lambda timeout=None: ("", None))
+        return proc
+
+
+def _phase1_env(movie_ws, lib_dir, story=None):
+    """kyra and ronin in the library and the story dir "shots" (with story.md = story when
+    given). Returns (story dir, story.md path)."""
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    directory = _story_dir_with(movie_ws, "shots", story)
+    return directory, str(directory / "story.md")
+
+
+def _rejected(directory):
+    return sorted(glob.glob(os.path.join(str(directory), "story.rejected-*.md")))
+
+
+def test_s35_valid_first_draft(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [SHOTS_OK])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 0
+    assert len(agent.calls) == 1
+    assert _rejected(directory) == []
+    assert "has an Image: field, which is ignored" not in capsys.readouterr().out
+
+
+def test_s36_one_rewrite(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [BAD, SHOTS_OK])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 0
+    out = capsys.readouterr().out
+    assert len(agent.calls) == 2
+    first, second = agent.calls[0]["cmd"], agent.calls[1]["cmd"]
+    assert agent.calls[1]["existed"] is False
+    assert second[-1] == first[-1] + "\n\n" + character_lib.shots_rewrite_block(BAD_VIOLATIONS, 3)
+    assert second[:-1] == first[:-1]
+    rejected = _rejected(directory)
+    assert len(rejected) == 1
+    assert re.fullmatch(r"story\.rejected-\d{8}T\d{6}Z-%d\.md" % os.getpid(),
+                        os.path.basename(rejected[0]))
+    with open(rejected[0], encoding="utf-8") as f:
+        assert f.read() == BAD
+    assert (directory / "story_prompt.rewrite.txt").read_text(encoding="utf-8") == second[-1]
+    assert (directory / "story_prompt.txt").read_text(encoding="utf-8") == first[-1]
+    lines = out.splitlines()
+    warning = next(i for i, line in enumerate(lines)
+                   if line.startswith("Warning: the story model's draft broke the shot rules; "
+                                      "moving it to %s and asking for one rewrite:" % rejected[0]))
+    assert lines[warning + 1:warning + 3] == ["  - " + v for v in BAD_VIOLATIONS]
+
+
+def test_s37_second_failure_exits_2(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [BAD, BAD])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 2
+    err = capsys.readouterr().err
+    assert len(agent.calls) == 2
+    assert "Error: story.md still breaks the shot rules after one rewrite:" in err
+    for v in BAD_VIOLATIONS:
+        assert "  - " + v in err.splitlines()
+    rejected = _rejected(directory)
+    assert len(rejected) == 1
+    assert rejected[0] in err
+    with open(story_md, encoding="utf-8") as f:
+        assert f.read() == BAD
+
+
+def test_s38_existing_story_is_never_rewritten(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir, story=BAD)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 2
+    err = capsys.readouterr().err
+    assert agent.calls == []
+    with open(story_md, encoding="utf-8") as f:
+        assert f.read() == BAD
+    assert _rejected(directory) == []
+    assert err.startswith("Error: story.md breaks the shot rules:\n")
+    assert "pass --force-story" in err
+
+
+def test_s39_rewrite_agent_failure(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [BAD, None], returncodes=[0, 1])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 1
+    err = capsys.readouterr().err
+    assert len(agent.calls) == 2
+    assert "Error: qwen-agent exited 1 while authoring story.md" in err
+    assert "Error: the shots rewrite failed; the rejected first draft is kept at " in err
+    rejected = _rejected(directory)
+    assert len(rejected) == 1
+    assert os.path.isfile(rejected[0])
+
+
+def test_s40_advisories_are_not_fatal(monkeypatch, movie_ws, lib_dir, capsys):
+    directory, story_md = _phase1_env(movie_ws, lib_dir)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [PARAPHRASED])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 0
+    assert len(agent.calls) == 1
+    assert ("Warning: panel 1: Image: names 'the woman in grey' but does not repeat"
+            in capsys.readouterr().out)
+
+
+CHAINED_STORY = """# Chained
+
+A continuous take.
+
+## Panel 1 — One
+Image: A medium shot of a woman standing on a forest trail and facing right.
+Motion: She turns her head slowly toward the trees.
+Narration: She listens.
+
+## Panel 2 — Two
+Motion: She draws then strikes; then he falls.
+Narration: It is over.
+"""
+
+
+def test_s41_continuous_mode_unaffected(monkeypatch, movie_ws):
+    directory = _story_dir_with(movie_ws, "chained", CHAINED_STORY)
+    agent = _FakeStoryAgent(monkeypatch, str(directory / "story.md"), [])
+    args = _shots_args("n", "--story-id", "chained", "--panels", "2", "--no-review")
+    assert ltx_movie.phase1_story(args) == 0
+    assert agent.calls == []
