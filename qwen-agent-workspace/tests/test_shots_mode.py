@@ -825,8 +825,9 @@ ANCHOR = "\n\nHow this movie is made:"
 @pytest.fixture
 def movie_ws(tmp_path, monkeypatch):
     """ltx_movie.WS -> tmp_path/ws (spec 10.1). bin/ and character_lib.py are symlinked to the
-    real workspace, so every by-path loader in bin/ltx-movie still reads the real files while
-    every story dir lands under tmp_path/ws/generated/stories."""
+    real workspace, so the sub-tool commands and the character_lib loader in bin/ltx-movie still
+    read the real files while every story dir lands under tmp_path/ws/generated/stories.
+    ltx_image_fit.py and ltx2_mlx_video_skill.py are not linked: --seed-image and --lora fail here."""
     ws = tmp_path / "ws"
     (ws / "generated" / "stories").mkdir(parents=True)
     os.symlink(os.path.join(WS, "bin"), str(ws / "bin"))
@@ -932,6 +933,12 @@ def test_s33_resolve_shots_errors(tmp_path, movie_ws, capsys):
         (base + ["--shots", "--redo", "2", "--story-only"],
          "Error: --redo cannot be combined with --story-only: --story-only stops before the "
          "stills and clips that --redo re-renders"),
+        (base + ["--shots", "--redo", "x", "--force-story"],
+         "Error: --redo cannot be combined with --force-story: --force-story writes a new "
+         "story.md, so every panel changes"),
+        (base + ["--shots", "--redo", "99", "--story-only"],
+         "Error: --redo cannot be combined with --story-only: --story-only stops before the "
+         "stills and clips that --redo re-renders"),
         (["n", "--story-id", "no-story", "--panels", "14", "--shots", "--redo", "2"],
          "Error: --redo needs an existing story.md: %s" % missing),
     ]
@@ -951,7 +958,7 @@ def test_s33_resolve_shots_errors(tmp_path, movie_ws, capsys):
     assert _all_files(tmp_path) == before
 
 
-def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir):
+def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir, monkeypatch, capsys):
     _kyra(lib_dir)
     members = _members("kyra")
     args = _shots_args("n", "--story-id", "new", "--shots", "--character", "kyra")
@@ -960,3 +967,46 @@ def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir):
     assert args.cast_block.endswith("\n" + character_lib.SHOTS_CAST_BLOCK_RULES)
     args = _shots_args("n", "--story-id", "new", "--character", "kyra")
     assert args.cast_block == character_lib.build_cast_block(members)
+    # main() runs _resolve_shots before _resolve_casting (spec 5.1), and both
+    # build_story_prompt call sites pass shots= (spec 5.2).
+    assert ltx_movie.main(["n", "--story-id", "w1", "--shots", "--no-stills", "--character",
+                           "kyra", "--dry-run", "--no-review"]) == 2
+    assert capsys.readouterr().err == ("Error: --shots needs Phase 2's per-panel stills; it "
+                                       "cannot be combined with --no-stills\n")
+    assert ltx_movie.main(["n", "--story-id", "w2", "--shots", "--panels", "4", "--dry-run",
+                           "--no-review"]) == 0
+    assert "sequence of separate shots joined by cuts" in capsys.readouterr().out
+    assert ltx_movie.main(["n", "--story-id", "w2", "--panels", "4", "--dry-run",
+                           "--no-review"]) == 0
+    assert "sequence of separate shots joined by cuts" not in capsys.readouterr().out
+    # The shots branch of the default strength, made visible while
+    # SHOTS_CHARACTER_STRENGTH == DEFAULT_CHARACTER_STRENGTH.
+    real_lib = ltx_movie._character_lib
+
+    def lib_with_distinct_shots_strength():
+        lib = real_lib()
+        monkeypatch.setattr(lib, "SHOTS_CHARACTER_STRENGTH", 0.6)
+        return lib
+
+    monkeypatch.setattr(ltx_movie, "_character_lib", lib_with_distinct_shots_strength)
+    assert _shots_args("n", "--story-id", "w4", "--shots", "--character",
+                       "kyra").character_strength == 0.6
+    assert _shots_args("n", "--story-id", "w4", "--character", "kyra").character_strength == 0.8
+    monkeypatch.setattr(ltx_movie, "_character_lib", real_lib)
+
+    class Stop(Exception):
+        pass
+
+    seen = []
+
+    def record(*_args, **kwargs):
+        seen.append(kwargs.get("shots"))
+        raise Stop
+
+    _story_dir_with(movie_ws, "w3")
+    monkeypatch.setattr(ltx_movie, "build_story_prompt", record)
+    with pytest.raises(Stop):
+        ltx_movie.phase1_story(_shots_args("n", "--story-id", "w3", "--shots"))
+    with pytest.raises(Stop):
+        ltx_movie.phase1_story(_shots_args("n", "--story-id", "w3"))
+    assert seen == [True, False]
