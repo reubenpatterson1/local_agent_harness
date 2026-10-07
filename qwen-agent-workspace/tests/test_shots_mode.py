@@ -1243,7 +1243,8 @@ GROUPS = [((), [4]), (("kyra",), [1, 5]), (("ronin",), [2]), (("kyra", "ronin"),
 class _StillsRunner(object):
     """ltx_movie._stream_and_tee stand-in (spec 10.1): records (cmd, log_path), writes a 1x1
     PNG for every --only panel when the queued rc is 0 and write_pngs is true, and returns
-    the next queued rc (default 0). It also makes any real subprocess call from bin/ltx-movie
+    the next queued rc (default 0). It asserts the log's directory already exists, as the real
+    _stream_and_tee needs. It also makes any real subprocess call from bin/ltx-movie
     fail the test, so no Z-Image process can ever start."""
 
     def __init__(self, monkeypatch, returncodes=(), write_pngs=True):
@@ -1260,6 +1261,7 @@ class _StillsRunner(object):
 
     def __call__(self, cmd, log_path):
         from PIL import Image
+        assert os.path.isdir(os.path.dirname(log_path)), log_path
         self.runs.append((list(cmd), log_path))
         rc = self.returncodes.pop(0) if self.returncodes else 0
         if rc == 0 and self.write_pngs:
@@ -1338,12 +1340,19 @@ def test_s43_phase2_runs_one_process_per_group(monkeypatch, movie_ws, lib_dir, c
     del runner.runs[:]
     assert ltx_movie.phase2_stills(args) == 0
     assert runner.runs == []
-    assert capsys.readouterr().out.count("every still exists; skipped") == 4
+    out = capsys.readouterr().out
+    assert out.count("every still exists; skipped") == 4
+    assert "stills group 1/4 (no character LoRAs; panels 4): every still exists; skipped\n" in out
+    assert "will be reused as-is" not in out
     os.remove(os.path.join(images_dir, "panel_02.png"))
     assert ltx_movie.phase2_stills(args) == 0
     assert len(runner.runs) == 1
     cmd = runner.runs[0][0]
     assert cmd[cmd.index("--only") + 1] == "2"
+    del runner.runs[:]
+    os.remove(os.path.join(images_dir, "panel_05.png"))
+    assert ltx_movie.phase2_stills(args) == 0
+    assert [c[c.index("--only") + 1] for c, _log in runner.runs] == ["1,5"]
 
 
 def test_s44_failing_group_stops_phase2(monkeypatch, movie_ws, lib_dir, capsys):
@@ -1355,8 +1364,16 @@ def test_s44_failing_group_stops_phase2(monkeypatch, movie_ws, lib_dir, capsys):
     assert "for stills group 2/4" in err
     assert "stills-group-02.log" in err
     assert "rerun the same command to continue" in err
-    assert os.path.isfile(os.path.join(str(movie_ws), "generated", "stories", "groups", "images",
-                                       "panel_04.png"))
+    images_dir = os.path.join(str(movie_ws), "generated", "stories", "groups", "images")
+    assert os.path.isfile(os.path.join(images_dir, "panel_04.png"))
+    runner.returncodes = [2]
+    del runner.runs[:]
+    assert ltx_movie.phase2_stills(args) == 1
+    assert [cmd[cmd.index("--only") + 1] for cmd, _log in runner.runs] == ["1,5"]
+    assert capsys.readouterr().err == (
+        "Error: ltx-story-images exited 2 for stills group 2/4 (kyra; panels 1,5); log: %s. "
+        "Stills already written are kept; rerun the same command to continue -- every existing "
+        "panel_NN.png is reused.\n" % os.path.join(images_dir, "stills-group-02.log"))
 
 
 def test_s45_each_group_is_one_lora_set_end_to_end(monkeypatch, movie_ws, lib_dir):
