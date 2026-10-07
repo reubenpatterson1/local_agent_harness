@@ -71,6 +71,12 @@ character's own character.json strength or --character-strength (default 0.8).
 schema_version stays 3, because the key is optional. character_lib.py is loaded by path
 only when --cast is given.
 
+--shots (bin/ltx-movie --shots) writes schema_version 3 with every panel conditioning
+"still": one --image per panel, in order; panel_text is the Image: text and
+motion_prompt the Motion: text. With --cast, a panel's characters are the cast phrases
+its Image: or Motion: names, each at its character.json strength or --character-strength
+(default 0.8), alone or not.
+
 Dependencies: stdlib + Pillow only (for an image-openable sanity check on
 each selected file). No torch, no diffusers -- this tool must stay fast
 and lightweight.
@@ -121,6 +127,14 @@ def build_parser():
                               "still; every later panel is conditioned at render time on the "
                               "previous clip's last frame. Requires --prompts-md; mutually "
                               "exclusive with --glob and --no-images.")
+    parser.add_argument("--shots", action="store_true", default=False,
+                         help="shots flow (bin/ltx-movie --shots): every panel is its own shot "
+                              "conditioned on its own still; give one --image per panel, in "
+                              "panel order. Requires --prompts-md; mutually exclusive with "
+                              "--chain, --glob and --no-images. With --cast, a panel's "
+                              "characters are those its Image: or Motion: names, each at its "
+                              "character.json strength or --character-strength (default 0.8), "
+                              "alone or not.")
     parser.add_argument("--images-dir", dest="images_dir", default=None,
                          help="default: <workspace>/generated")
     parser.add_argument("--title", dest="title", default="")
@@ -348,6 +362,11 @@ def main(argv=None):
     if args.frames is not None and args.pace is not None:
         parser.error("--frames and --pace are mutually exclusive")
 
+    if args.shots:
+        if args.chain or args.no_images or args.glob:
+            parser.error("--shots is mutually exclusive with --chain, --glob and --no-images")
+        if not args.prompts_md:
+            parser.error("--shots requires --prompts-md")
     if args.chain:
         if args.no_images or args.glob:
             parser.error("--chain is mutually exclusive with --glob and --no-images")
@@ -355,8 +374,8 @@ def main(argv=None):
             parser.error("--chain requires --prompts-md")
         if len(args.image or []) != 1:
             parser.error("--chain requires exactly one --image (panel 1's still)")
-    if args.cast and not args.chain:
-        parser.error("--cast requires --chain")
+    if args.cast and not (args.chain or args.shots):
+        parser.error("--cast requires --chain or --shots")
     if args.character_strength is not None and not args.cast:
         parser.error("--character-strength requires --cast")
 
@@ -424,6 +443,20 @@ def main(argv=None):
             print("Error: prompts.md has %d panels but %d images were selected"
                   % (len(parsed_panels), len(matched)), file=sys.stderr)
             return 2
+        if args.shots:
+            for i, pt in enumerate(parsed_panels, start=1):
+                if not pt["image"].strip():
+                    print("Error: --shots requires every panel to have a non-empty Image: field; "
+                          "panel %d has none" % i, file=sys.stderr)
+                    return 2
+                if not pt["motion"].strip():
+                    print("Error: --shots requires every panel to have a non-empty Motion: field; "
+                          "panel %d has none" % i, file=sys.stderr)
+                    return 2
+                if pt["prompt"].strip():
+                    print("Error: --shots does not accept Prompt: fields; panel %d has one" % i,
+                          file=sys.stderr)
+                    return 2
         # A panel must use one form or the other: the assembly below silently
         # prefers Prompt: over Image:/Motion:, and a silent drop is worse than
         # a refusal. Checked in both modes (spec Section 8).
@@ -452,7 +485,8 @@ def main(argv=None):
     if args.cast:
         lib = _character_lib()
         strength = (args.character_strength if args.character_strength is not None
-                    else lib.DEFAULT_CHARACTER_STRENGTH)
+                    else (lib.SHOTS_CHARACTER_STRENGTH if args.shots
+                          else lib.DEFAULT_CHARACTER_STRENGTH))
         if not 0 < strength <= 1.0:
             print("Error: --character-strength must be in (0, 1], got %r" % strength, file=sys.stderr)
             return 2
@@ -529,6 +563,13 @@ def main(argv=None):
                 image_path = None
                 conditioning = "chain"
                 panel_text = pt["motion"]
+        elif args.shots:
+            title = pt["title"]
+            narration = pt["narration"]
+            motion_prompt = pt["motion"]
+            image_path = matched[i - 1]
+            conditioning = "still"
+            panel_text = pt["image"]
         else:
             image_path = matched[i - 1] if matched else None
             has_prompt = pt is not None and bool(pt["prompt"].strip())
@@ -578,19 +619,22 @@ def main(argv=None):
         used = set()
         for p in panels:
             p["motion_prompt"], names = lib.cast_text(p["motion_prompt"], members)
-            strengths = lib.panel_strengths(names, members, strength)
+            if args.shots:
+                names = sorted(set(names) | set(lib.cast_text(p["panel_text"], members)[1]))
+            strengths = lib.panel_strengths(names, members, strength, shots=args.shots)
             p["characters"] = [{"name": n, "phrase": by_name[n].phrase, "trigger": by_name[n].trigger,
                                 "video_lora": by_name[n].video_lora, "strength": strengths[n]}
                                for n in names]
             used.update(names)
         for m in members:
             if m.name not in used:
-                print("WARNING: cast phrase %r (character %s) occurs in no panel's Motion: text; "
-                      "that character gets no LoRA" % (m.phrase, m.name))
+                print("WARNING: cast phrase %r (character %s) occurs in no panel's %s text; "
+                      "that character gets no LoRA"
+                      % (m.phrase, m.name, "Image: or Motion:" if args.shots else "Motion:"))
 
     for p in panels:
         # Chain mode: the video model receives the Motion: text, so that is what is measured.
-        _prompt_length_warning(p["index"], p["motion_prompt"] if args.chain else p["panel_text"])
+        _prompt_length_warning(p["index"], p["motion_prompt"] if (args.chain or args.shots) else p["panel_text"])
 
     story_dir = os.path.join(WS, "generated", "stories", args.story_id)
     manifest_path = os.path.join(story_dir, "manifest.json")
@@ -603,7 +647,7 @@ def main(argv=None):
 
     total_num_frames = sum(p["num_frames"] for p in panels)
     manifest = {
-        "schema_version": 3 if args.chain else 2,
+        "schema_version": 3 if (args.chain or args.shots) else 2,
         "story_id": args.story_id,
         "title": args.title or "",
         "narrative": narrative,

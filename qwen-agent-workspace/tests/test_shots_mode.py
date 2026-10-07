@@ -460,3 +460,190 @@ def test_s20_character_lib_imports():
         elif isinstance(node, ast.ImportFrom):
             names.add(node.module)
     assert names == {"collections", "datetime", "json", "os", "re", "uuid"}
+
+
+# --- S60-S65: bin/ltx-story-manifest --shots (spec 5.9) ---------------------------------
+S61_STORY = """# Shots cast test
+
+The woman in grey meets the ronin on a forest trail.
+
+## Characters
+- "the woman in grey": %s
+- "the ronin": %s
+
+## Panel 1 — One
+Image: A medium shot of the woman in grey standing on a mossy cedar trail and facing right.
+Motion: The woman in grey turns her head slowly toward the ferns on her right.
+Narration: She listens.
+
+## Panel 2 — Two
+Image: A medium shot of the woman in grey and the ronin standing apart on the mossy trail.
+Motion: The ronin bows his head slowly to her across the mossy trail.
+Narration: He greets her.
+
+## Panel 3 — Three
+Image: A medium close-up of the woman in grey kneeling beside a small trail shrine.
+Motion: She bows her head low to the shrine on the trail.
+Narration: She prays.
+
+## Panel 4 — Four
+Image: A wide shot of the empty mossy cedar trail under grey clouds.
+Motion: Leaves drift slowly across the empty trail in the cold wind.
+Narration: The forest is quiet.
+""" % (DESC_K, DESC_R)
+
+
+def _shots_manifest_env(tmp_path, monkeypatch, text=SHOTS_OK, images=None):
+    """A workspace root under tmp_path for bin/ltx-story-manifest (its module WS is patched),
+    with character_lib.py symlinked in so _character_lib() loads the real module, the
+    story.md, and one 64x64 PNG per panel (or images PNGs). Returns (story_md, [image], ws)."""
+    from PIL import Image
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    os.symlink(os.path.join(WS, "character_lib.py"), str(ws / "character_lib.py"))
+    monkeypatch.setattr(story_manifest, "WS", str(ws))
+    story_md = tmp_path / "story.md"
+    story_md.write_text(text, encoding="utf-8")
+    count = images if images is not None else len(_panels(tmp_path, text))
+    paths = []
+    for i in range(1, count + 1):
+        path = str(tmp_path / ("panel_%02d.png" % i))
+        Image.new("RGB", (64, 64), (20 * i, 90, 90)).save(path)
+        paths.append(path)
+    return str(story_md), paths, str(ws)
+
+
+def _shots_manifest_argv(story_id, story_md, images, *extra):
+    argv = ["--story-id", story_id, "--prompts-md", story_md, "--shots"]
+    for image in images:
+        argv += ["--image", image]
+    return argv + ["--fps", "24", "--target-seconds", repr(145 * len(images) / 24.0),
+                   "--min-frames", "145", "--max-frames", "145", "--force"] + list(extra)
+
+
+def _shots_manifest(ws, story_id):
+    path = os.path.join(ws, "generated", "stories", story_id, "manifest.json")
+    with open(path) as f:
+        return json.load(f)
+
+
+def _names_strengths(panel):
+    return [(c["name"], c["strength"]) for c in panel["characters"]]
+
+
+def test_s60_shots_manifest_uncast(tmp_path, monkeypatch, capsys):
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_shots_manifest_argv("s60", story_md, images)) == 0
+    out = capsys.readouterr().out
+    manifest = _shots_manifest(ws, "s60")
+    parsed = _panels(tmp_path, SHOTS_OK)
+    assert manifest["schema_version"] == 3
+    assert len(manifest["panels"]) == 3
+    for panel, image, pt in zip(manifest["panels"], images, parsed):
+        assert panel["conditioning"] == "still"
+        assert panel["image_path"] == os.path.abspath(image)
+        assert panel["panel_text"] == pt["image"]
+        assert panel["motion_prompt"] == pt["motion"]
+        assert "characters" not in panel
+    assert "(chained)" not in out
+
+
+def test_s61_shots_cast_names_come_from_image_and_motion(tmp_path, monkeypatch, capsys, lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir)
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch, text=S61_STORY)
+    assert story_manifest.main(_shots_manifest_argv("uncast", story_md, images)) == 0
+    capsys.readouterr()
+    assert story_manifest.main(_shots_manifest_argv(
+        "cast", story_md, images, "--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin",
+        "--character-strength", "0.8")) == 0
+    out = capsys.readouterr().out
+    cast, uncast = _shots_manifest(ws, "cast")["panels"], _shots_manifest(ws, "uncast")["panels"]
+    assert [_names_strengths(p) for p in cast] == [
+        [("kyra", 0.8)], [("kyra", 0.8), ("ronin", 0.8)], [("kyra", 0.8)], []]
+    assert "the kyrawmn woman in grey" in cast[0]["motion_prompt"].lower()
+    assert "the roninmn ronin" in cast[1]["motion_prompt"].lower()
+    assert "kyrawmn" not in cast[1]["motion_prompt"]
+    assert cast[2]["motion_prompt"] == "She bows her head low to the shrine on the trail."
+    assert [p["panel_text"] for p in cast] == [p["panel_text"] for p in uncast]
+    assert "cast: panel 1: kyra@0.8" in out.splitlines()
+
+
+def test_s62_shots_strength_overrides(tmp_path, monkeypatch, lib_dir):
+    _kyra(lib_dir)
+    _ronin(lib_dir, strength=0.5)
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch, text=S61_STORY)
+    cast = ["--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin"]
+    assert story_manifest.main(_shots_manifest_argv(
+        "s06", story_md, images, *(cast + ["--character-strength", "0.6"]))) == 0
+    panels = _shots_manifest(ws, "s06")["panels"]
+    assert _names_strengths(panels[0]) == [("kyra", 0.6)]
+    assert _names_strengths(panels[1]) == [("kyra", 0.6), ("ronin", 0.5)]
+    assert story_manifest.main(_shots_manifest_argv("default", story_md, images, *cast)) == 0
+    assert _names_strengths(_shots_manifest(ws, "default")["panels"][0]) == [("kyra", 0.8)]
+    chain = ["--story-id", "chain", "--prompts-md", story_md, "--chain", "--image", images[0],
+             "--fps", "24", "--target-seconds", repr(145 * 4 / 24.0), "--min-frames", "145",
+             "--max-frames", "145", "--force"] + cast
+    assert story_manifest.main(chain) == 0
+    assert _names_strengths(_shots_manifest(ws, "chain")["panels"][0]) == [("kyra", 1.0)]
+
+
+def test_s63_shots_manifest_errors(tmp_path, monkeypatch, capsys):
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch)
+    manifest = os.path.join(ws, "generated", "stories", "bad", "manifest.json")
+    exclusive = "--shots is mutually exclusive with --chain, --glob and --no-images"
+    for extra in (["--chain"], ["--no-images"], ["--glob", "panel_*.png"]):
+        with pytest.raises(SystemExit) as info:
+            story_manifest.main(_shots_manifest_argv("bad", story_md, images, *extra))
+        assert info.value.code == 2
+        assert exclusive in capsys.readouterr().err
+    with pytest.raises(SystemExit) as info:
+        story_manifest.main(["--story-id", "bad", "--shots", "--image", images[0]])
+    assert info.value.code == 2
+    assert "--shots requires --prompts-md" in capsys.readouterr().err
+    assert story_manifest.main(_shots_manifest_argv("bad", story_md, images[:2])) == 2
+    assert capsys.readouterr().err == (
+        "Error: prompts.md has 3 panels but 2 images were selected\n")
+    cases = [
+        (_variant(PANEL_2_IMAGE, ""),
+         "Error: --shots requires every panel to have a non-empty Image: field; panel 2 has none\n"),
+        (_variant(PANEL_3_MOTION + "\n", ""),
+         "Error: --shots requires every panel to have a non-empty Motion: field; panel 3 has none\n"),
+        (_variant("Narration: She senses she is not alone.\n",
+                  "Narration: She senses she is not alone.\nPrompt: x\n"),
+         "Error: --shots does not accept Prompt: fields; panel 1 has one\n"),
+    ]
+    for text, message in cases:
+        with open(story_md, "w", encoding="utf-8") as f:
+            f.write(text)
+        assert story_manifest.main(_shots_manifest_argv("bad", story_md, images)) == 2
+        assert capsys.readouterr().err == message
+    assert not os.path.exists(manifest)
+
+
+def test_s64_cast_requires_chain_or_shots(tmp_path, monkeypatch, capsys, lib_dir):
+    _kyra(lib_dir)
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit) as info:
+        story_manifest.main(["--story-id", "bad", "--prompts-md", story_md, "--image", images[0],
+                             "--cast", "the woman in grey=kyra"])
+    assert info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--cast requires --chain or --shots" in err
+    assert "--cast requires --chain" in err
+
+
+def test_s65_unused_cast_phrase_warning_names_image_and_motion(tmp_path, monkeypatch, capsys,
+                                                               lib_dir):
+    _ronin(lib_dir)
+    story_md, images, ws = _shots_manifest_env(tmp_path, monkeypatch)
+    assert story_manifest.main(_shots_manifest_argv(
+        "s65", story_md, images, "--cast", "the stranger=ronin")) == 0
+    assert ("WARNING: cast phrase 'the stranger' (character ronin) occurs in no panel's Image: or "
+            "Motion: text; that character gets no LoRA") in capsys.readouterr().out
+    chain = ["--story-id", "s65c", "--prompts-md", story_md, "--chain", "--image", images[0],
+             "--fps", "24", "--target-seconds", "18.125", "--min-frames", "145",
+             "--max-frames", "145", "--force", "--cast", "the stranger=ronin"]
+    assert story_manifest.main(chain) == 0
+    assert ("WARNING: cast phrase 'the stranger' (character ronin) occurs in no panel's Motion: "
+            "text; that character gets no LoRA") in capsys.readouterr().out
