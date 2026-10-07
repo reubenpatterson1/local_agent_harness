@@ -1127,6 +1127,10 @@ def _phase1_shots_finish(args, story_md, authored):
         print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to have "
               "the story model write a new one." % story_md, file=sys.stderr)
         return 2
+    if violations and not os.path.isfile(story_md):
+        print("Error: qwen-agent exited 0 without writing %s; nothing to rewrite. Rerun the same "
+              "command to try again." % story_md, file=sys.stderr)
+        return 1
     if violations:
         story_dir = os.path.dirname(story_md)
         rejected = os.path.join(story_dir, "story.rejected-%s-%d.md"
@@ -1143,6 +1147,9 @@ def _phase1_shots_finish(args, story_md, authored):
         cmd[-1] = rewrite
         print("=== Phase 1: story (rewrite) ===")
         rc = _run_story_agent(cmd, authored["timeout"], story_md)
+        if not rc and not os.path.isfile(story_md):
+            print("Error: qwen-agent exited 0 without writing %s" % story_md, file=sys.stderr)
+            rc = 1
         if rc:
             print("Error: the shots rewrite failed; the rejected first draft is kept at %s"
                   % rejected, file=sys.stderr)

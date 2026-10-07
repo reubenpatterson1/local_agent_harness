@@ -1018,6 +1018,9 @@ BAD = _variant("Motion: The bearded robber lunges forward out of the ferns with 
 BAD_VIOLATIONS = ["panel 2: S4 motion length: Motion: is 6 words; it must be 10-25",
                   "panel 2: S5 one action: Motion: chains actions with 'then'"]
 PARAPHRASED = _variant("grey kimono, standing in the centre", "grey robe, standing in the centre")
+S7_BAD = _variant("Motion: The bearded robber lunges forward out of the ferns with his short knife "
+                  "raised.", "Motion: The ronin lunges forward out of the ferns toward the bearded "
+                  "robber with his katana raised.")
 SHOTS_ARGV = ["n", "--story-id", "shots", "--shots", "--character", "kyra", "--character",
               "ronin", "--panels", "3", "--no-review"]
 
@@ -1088,6 +1091,8 @@ def test_s36_one_rewrite(monkeypatch, movie_ws, lib_dir, capsys):
     assert (directory / "story_prompt.rewrite.txt").read_text(encoding="utf-8") == second[-1]
     assert (directory / "story_prompt.txt").read_text(encoding="utf-8") == first[-1]
     lines = out.splitlines()
+    runs = [line.split(":")[0] for line in lines if line.startswith("Running (timeout ")]
+    assert len(runs) == 2 and runs[0] == runs[1]
     warning = next(i for i, line in enumerate(lines)
                    if line.startswith("Warning: the story model's draft broke the shot rules; "
                                       "moving it to %s and asking for one rewrite:" % rejected[0]))
@@ -1121,6 +1126,16 @@ def test_s38_existing_story_is_never_rewritten(monkeypatch, movie_ws, lib_dir, c
     assert _rejected(directory) == []
     assert err.startswith("Error: story.md breaks the shot rules:\n")
     assert "pass --force-story" in err
+    assert err.splitlines()[1:3] == ["  - " + v for v in BAD_VIOLATIONS]
+    (directory / "story.md").write_text(S7_BAD, encoding="utf-8")
+    assert ltx_movie.phase1_story(_shots_args(*(SHOTS_ARGV[:-2] + ["4", "--no-review"]))) == 2
+    err = capsys.readouterr().err
+    assert err.splitlines()[1:3] == [
+        "  - story: S1 panel count: expected exactly 4 panels, found 3",
+        "  - panel 2: S7 cast and extra: Motion: names 'the ronin' together with 'the bearded "
+        "robber'; show the other character's action in its own shot, then cut to the cast "
+        "character's reaction"]
+    assert agent.calls == []
 
 
 def test_s39_rewrite_agent_failure(monkeypatch, movie_ws, lib_dir, capsys):
@@ -1134,6 +1149,16 @@ def test_s39_rewrite_agent_failure(monkeypatch, movie_ws, lib_dir, capsys):
     rejected = _rejected(directory)
     assert len(rejected) == 1
     assert os.path.isfile(rejected[0])
+    agent = _FakeStoryAgent(monkeypatch, story_md, [None])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 1
+    assert "Error: qwen-agent exited 0 without writing %s" % story_md in capsys.readouterr().err
+    assert _rejected(directory) == rejected
+    agent = _FakeStoryAgent(monkeypatch, story_md, [BAD, None])
+    assert ltx_movie.phase1_story(_shots_args(*SHOTS_ARGV)) == 1
+    err = capsys.readouterr().err
+    assert len(agent.calls) == 2
+    assert "Error: qwen-agent exited 0 without writing %s" % story_md in err
+    assert "Error: the shots rewrite failed; the rejected first draft is kept at " in err
 
 
 def test_s40_advisories_are_not_fatal(monkeypatch, movie_ws, lib_dir, capsys):
@@ -1143,6 +1168,16 @@ def test_s40_advisories_are_not_fatal(monkeypatch, movie_ws, lib_dir, capsys):
     assert len(agent.calls) == 1
     assert ("Warning: panel 1: Image: names 'the woman in grey' but does not repeat"
             in capsys.readouterr().out)
+    agent = _FakeStoryAgent(monkeypatch, story_md, [BAD, PARAPHRASED])
+    gate = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": gate.append(prompt) or "")
+    argv = [a for a in SHOTS_ARGV if a != "--no-review"] + ["--force-story"]
+    assert ltx_movie.phase1_story(_shots_args(*argv)) == 0
+    out = capsys.readouterr().out
+    assert len(agent.calls) == 2
+    assert gate == ["Review story.md above. Enter to continue, Ctrl-C to abort: "]
+    dump = out.index("=== story.md ===\n" + PARAPHRASED)
+    assert out.index("Warning: panel 1: Image: names 'the woman in grey' but does not repeat") > dump
 
 
 CHAINED_STORY = """# Chained
