@@ -8,7 +8,8 @@ and bin/ltx-story-images load it by path, and only inside their casting branch (
 bin/ltx-movie also on its --shots path), so an uncast run without --shots never reads
 this file. It also owns the shots-mode story rules (shot-rule
 validation, advisories and the rewrite block;
-docs/superpowers/specs/2026-10-06-shots-mode-design.md).
+docs/superpowers/specs/2026-10-06-shots-mode-design.md and
+docs/superpowers/specs/2026-10-09-shots-rules-v2-design.md).
 
 The library root is $CHARACTER_LIBRARY_DIR when set (test infrastructure only, like
 LTX2_MLX_BIN), else <workspace>/generated/characters.
@@ -44,6 +45,80 @@ SHOTS_MOTION_MAX_WORDS = 25
 SHOTS_MAX_CAST_PER_PANEL = 2
 SHOTS_REWRITE_MAX_LISTED = 40
 SHOTS_CLOSE_SHOT_TYPES = ("medium shot", "medium close-up", "close-up", "extreme close-up")
+SHOTS_MAX_REWRITES = 2
+SHOTS_SETTING_MIN_WORDS = 12
+SHOTS_CONTACT_VERBS = frozenset("""
+    strike strikes struck striking hit hits hitting slash slashes slashed slashing cut cuts
+    cutting stab stabs stabbed stabbing thrust thrusts thrusting punch punches punched punching
+    kick kicks kicked kicking slap slaps slapped slapping smash smashes smashed smashing slam
+    slams slammed slamming knock knocks knocked knocking shove shoves shoved shoving push pushes
+    pushed pushing pull pulls pulled pulling drag drags dragged dragging grab grabs grabbed
+    grabbing seize seizes seized seizing catch catches caught catching tackle tackles tackled
+    tackling trip trips tripped tripping choke chokes choked choking strangle strangles
+    strangled strangling disarm disarms disarmed disarming block blocks blocked blocking parry
+    parries parried parrying deflect deflects deflected deflecting wrestle wrestles wrestled
+    wrestling grapple grapples grappled grappling fight fights fought fighting attack attacks
+    attacked attacking drive drives drove driven driving swing swings swung swinging help helps
+    helped helping touch touches touched touching hug hugs hugged hugging embrace embraces
+    embraced embracing kiss kisses kissed kissing restrain restrains restrained restraining
+    shoulder-charge shoulder-charges shoulder-charged shoulder-charging""".split())
+SHOTS_HANDOFF_VERBS = frozenset("""
+    hands handed handing give gives gave given giving return returns returned returning""".split())
+SHOTS_TAKE_VERBS = frozenset("""
+    take takes took taken taking accept accepts accepted accepting receive receives received
+    receiving snatch snatches snatched snatching""".split())
+SHOTS_PERSON_NOUNS = frozenset("""
+    man men woman women boy boys girl girls child children person people figure figures someone
+    somebody stranger strangers robber robbers bandit bandits thief thieves attacker attackers
+    assailant assailants enemy enemies foe foes opponent opponents soldier soldiers warrior
+    warriors samurai ronin ninja swordsman swordsmen spearman spearmen archer archers rider riders
+    villager villagers elder elders monk monks priest priests merchant merchants servant servants
+    maid lord lady master messenger messengers shogun daughter son father mother brother sister
+    husband wife friend rival victim leader captain king queen prince princess emperor assassin
+    killer""".split())
+SHOTS_ANIMAL_NOUNS = frozenset("""
+    horse horses mare mares stallion stallions pony ponies colt colts foal steed steeds mount
+    mounts dog dogs hound hounds puppy wolf wolves fox foxes ox oxen bull bulls cow cows mule
+    mules donkey donkeys goat goats sheep pig pigs boar boars deer stag doe bear bears tiger
+    tigers monkey monkeys cat cats kitten rabbit rabbits hare rat rats mouse mice snake snakes
+    serpent viper cobra hawk hawks falcon falcons eagle eagles crow crows raven ravens owl owls
+    heron crane cranes bird birds sparrow dove doves pigeon rooster chicken chickens duck ducks
+    fish koi carp frog toad turtle tortoise dragon dragons butterfly moth bee bees spider beetle
+    firefly dragonfly camel elephant lion leopard panther""".split())
+SHOTS_RULE_GUIDANCE = (
+    ("S1 panel count", "S1 panel count -- write exactly the requested number of panel sections, "
+                       "numbered from 1:"),
+    ("S2 characters list", 'S2 characters list -- the "## Characters" section lists every '
+                           'character as - "<referring phrase>": <full visual description>, '
+                           "including every Cast phrase:"),
+    ("S3 fields", "S3 fields -- every panel has an Image:, a Motion: and a Narration: field and "
+                  "no Prompt: field:"),
+    ("S4 motion length", "S4 motion length -- every Motion: is 10-25 words in total:"),
+    ("S5 one action", "S5 one action -- every Motion: is one action sentence, optionally "
+                      "followed by one camera sentence, with no chaining word, no semicolon and "
+                      "no ', and':"),
+    ("S6 cast count", "S6 cast count -- at most two Cast characters in any one shot:"),
+    ("S7 cast and extra", "S7 cast and extra -- a Motion: never names a Cast character together "
+                          "with another person; give the other person's action its own shot, then "
+                          "cut to the Cast character's reaction:"),
+    ("S8 contact", "S8 contact -- two people never touch on screen; replace each of these shots "
+                   "with a wind-up shot that shows only the person acting and a reaction shot "
+                   "that shows only the person acted on, each with a Motion: that names only "
+                   "that person:"),
+    ("S9 cast description", "S9 cast description -- every Image: that names a Cast character "
+                            "contains that character's identity sentence, copied word for word; "
+                            "an Image: that does not show them does not name them:"),
+    ("S10 extra in cast shot", "S10 extra in cast shot -- in a shot that shows a Cast character, "
+                               "leave every other person out of the Image:, or place them far in "
+                               "the background, small in the frame, and write \"far in the "
+                               "background\" in the sentence that mentions them:"),
+    ("S11 off-screen wording", "S11 off-screen wording -- never mention anything outside the "
+                               "frame; show who faces whom with left and right screen direction "
+                               "instead:"),
+    ("S12 setting sentence", "S12 setting sentence -- every Image: contains its location's setting "
+                             "sentence, at least 12 words long and starting \"The setting is\", "
+                             "copied word for word in every shot at that location:"),
+)
 
 _ROSTER_HEADER_RE = re.compile(r"##\s*Characters", re.IGNORECASE)
 _ROSTER_ENTRY_RE = re.compile(r'[-*]\s*["“]([^"“”]+)["”]\s*:\s*(\S.*)')
@@ -54,6 +129,42 @@ _CHAIN_WORD_RE = re.compile(r"\b(?:then|while|meanwhile|simultaneously|afterward
 _COMMA_AND_RE = re.compile(r",\s+and\b", re.IGNORECASE)
 _SHOT_TYPE_RE = re.compile(r"(?<![\w-])(extreme wide shot|extreme close-up|medium close-up|"
                            r"medium shot|wide shot|close-up)(?![\w-])", re.IGNORECASE)
+_CAMERA_SHORT_MAX_WORDS = 4
+_CAMERA_TERM_RE = re.compile(r"\b(?:camera|shot|push-in|pull-back|pans?|tilts?|zooms?|dolly|"
+                             r"tracking|static|locked-off|handheld)\b", re.IGNORECASE)
+_POSSESSIVE_DETERMINERS = frozenset(("his", "her", "their", "its"))
+_NOUN_MARKERS = frozenset("""
+    a an the his her their its my your our this that these those one each every no another both
+    two""".split())
+_HER_OBJECT_FOLLOWERS = frozenset("""
+    away aside down up off forward forwards backward backwards over to toward towards into onto
+    against from across out by with""".split())
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’-]*")
+_POSSESSIVE_RE = re.compile(r"['’]s?$")
+_CLAUSE_BREAK_RE = re.compile(r"[,;:]")
+_CAMERA_WORD_RE = re.compile(r"\bcamera\b", re.IGNORECASE)
+_PRONOUN_KEYS = frozenset(("him", "them", "her", "each other"))
+_EACH_OTHER_RE = re.compile(r"\b(?:each\s+other|one\s+another)\b", re.IGNORECASE)
+_TO_RE = re.compile(r"\bto\b", re.IGNORECASE)
+_FROM_RE = re.compile(r"\bfrom\b", re.IGNORECASE)
+_SPATIAL_RE = re.compile(r"\b(?:toward|towards|beside|behind|before|around|past|near|"
+                         r"in\s+front\s+of|sight\s+of|up\s+with|back\s+from)\b", re.IGNORECASE)
+_HAND_AFTER_RE = re.compile(r"""["”]?(?:['’]s)?\s+hands?\b""", re.IGNORECASE)
+_OWN_HAND_RE = re.compile(r"\s+(?:his|her|their)\s+hands?\b", re.IGNORECASE)
+_OFFSCREEN_RE = re.compile(r"\b(?:outside\s+(?:of\s+)?the\s+(?:frame|shot)|"
+                           r"out\s+of\s+(?:the\s+)?(?:frame|shot)|out\s+of\s+(?:view|sight)|"
+                           r"off(?:\s+|-)?screen|off(?:\s+|-)camera|"
+                           r"beyond\s+the\s+(?:edge\s+of\s+the\s+)?frame|unseen)\b",
+                           re.IGNORECASE)
+_DISTANCE_CUE_RE = re.compile(r"\b(?:far\s+(?:in\s+the\s+)?(?:background|distance)|far\s+(?:behind|"
+                              r"back|away|off)|far-off|in\s+the\s+(?:far\s+)?distance|in\s+the\s+"
+                              r"far\s+background|distant|(?:small|tiny)\s+in\s+the\s+frame)\b",
+                              re.IGNORECASE)
+_SETTING_SENTENCE_RE = re.compile(r"""["“]?the\s+setting\s+is\b""", re.IGNORECASE)
+_VIOLATION_RE = re.compile(r"(?:story|panel (\d+)): (S\d+ [^:]+): (.*)", re.DOTALL)
+_STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
+_STORY_FIELD_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
+_SENTENCE_END_RE = re.compile(r"""[.!?]["”’']?(?=\s|$)""")
 
 TRIGGER_REGISTRY = ".triggers"
 LOCK_NAME = ".lock"
@@ -71,22 +182,28 @@ CAST_BLOCK_RULES = (
 SHOTS_CAST_BLOCK_RULES = (
     "Use each quoted phrase above, word for word, as that character's referring phrase "
     "everywhere in the file, even when it is longer than four words, and list each of them in "
-    "the Characters section with exactly the description given above. In every panel's Image: "
-    "field where one of these characters is on screen, name them by that phrase and then give "
-    "exactly the description given above, word for word. Shots that show these characters "
-    "follow four extra rules. One: at most two of these characters appear in any one shot. "
-    "Two: a shot that shows one of them is composed around them -- a medium shot or closer, "
-    "with them in the centre or the foreground of the frame. Three: any other character may "
-    "appear in such a shot only far in the background, small in the frame, never touching them "
-    "and never within arm's reach of them, and that shot's Motion: names none of the other "
-    "characters; when one of these characters and another character act on each other at close "
-    "range -- a grab, a blow, a shove -- show it by cutting: first a shot of the other character "
-    "performing the action, then a separate shot of this character's reaction. Four: when two "
-    "of these characters share a shot they stay apart or touch only lightly, such as an offered "
-    "hand or a hand on an arm; they never grapple, embrace or overlap. A shot that shows none of "
-    "these characters has none of these extra rules. Bring a cast member on screen only where "
-    "the narrative calls for them. Every other character still gets a referring phrase of your "
-    "own, under the rules below.")
+    "the Characters section with exactly the description given above. Every Image: field that "
+    "shows one of these characters contains that character's identity sentence from the list "
+    "above, copied word for word -- never shortened, reordered or paraphrased -- and an Image: "
+    "field that does not show them never names them. Shots that show these characters follow "
+    "four extra rules. One: at most two of these characters appear in any one shot. Two: a shot "
+    "that shows one of them is composed around them -- a medium shot or closer, with them in the "
+    "centre or the foreground of the frame. Three: any other "
+    "person may appear in such a shot only far in the background, small in the frame, never "
+    "touching them and never within arm's reach of them; the sentence that mentions that person "
+    'says "far in the background", the Image: names no other person anywhere else -- not as '
+    "someone a character looks at, and not even in a possessive -- and the shot's Motion: names "
+    "none of the other characters; when one of these characters and another person act on each "
+    "other at close range -- a grab, a blow, a shove -- show it by cutting: first a shot of the "
+    "other person performing the action, then a separate shot of this character's reaction. "
+    "Four: when two of these characters share a shot they never touch -- no taken hand, no "
+    "hand-off, no grappling, embrace or overlap; show a hand-off or a taken hand as two shots, "
+    "one of each character. A shot that shows none of these characters has none of these extra "
+    "rules. An animal, such as a horse that a character rides, is not a person, so none of these "
+    "rules limit it. Bring a cast member on screen only where the narrative calls for them. Every "
+    "other character still gets a referring phrase of your own, under the rules below.")
+SHOTS_IDENTITY_HEADER = ("Identity sentences -- copy the one for each of these characters, word "
+                         "for word, into every Image: field that shows them:")
 SHOTS_REWRITE_TEMPLATE = (
     "REWRITE REQUIRED. Your previous draft of this file was rejected because it broke these "
     "rules:\n"
@@ -94,7 +211,10 @@ SHOTS_REWRITE_TEMPLATE = (
     "Write the complete file again from the beginning, following every instruction above and "
     "fixing every listed problem. Keep EXACTLY %d panel sections. Where a Motion: held more than "
     "one action, keep only its single most important action and give the other beats their own "
-    "panels instead, merging or dropping minor beats so that the panel count stays the same.")
+    "panels instead. Where a shot showed two people touching, replace it with a wind-up shot of "
+    "the one acting and a reaction shot of the one acted on. Merge or drop minor beats so that "
+    "the panel count stays the same. Copy every identity sentence and every setting sentence "
+    "exactly as written, without shortening or rewording it.")
 
 _TOP_LEVEL_KEYS = frozenset([
     "schema_version", "name", "trigger", "class_noun", "referring_phrase", "descriptor",
@@ -522,12 +642,35 @@ def panel_strengths(names, members, character_strength, shots=False):
             for n in names}
 
 
+def identity_sentence(member):
+    """The sentence a shots-mode Image: copies for a cast member who is on screen (shots rules v2
+    spec 3.3): the phrase with its first letter capitalised, " is ", the descriptor, "."."""
+    return "%s%s is %s." % (member.phrase[:1].upper(), member.phrase[1:], member.descriptor)
+
+
 def build_cast_block(members, shots=False):
     lines = [CAST_BLOCK_HEADER]
     for m in members:
         lines.append('- "%s": %s.' % (m.phrase, m.descriptor))
+    if shots:
+        lines.append(SHOTS_IDENTITY_HEADER)
+        lines += ["- " + identity_sentence(m) for m in members]
     lines.append(SHOTS_CAST_BLOCK_RULES if shots else CAST_BLOCK_RULES)
     return "\n".join(lines)
+
+
+def _phrase_spans(text, phrases):
+    """[(start, end, phrase)] for every claimed occurrence of the given phrases in text, sorted:
+    matched like cast_text, longest phrase first, a match overlapping an already-claimed span
+    ignored (shots spec 3.4; shots rules v2 spec 3.4)."""
+    claimed = []
+    for phrase in sorted(set(phrases), key=lambda p: (-len(p), p.lower(), p)):
+        for match in _phrase_regex(normalize_phrase(phrase)).finditer(text):
+            start, end = match.span()
+            if any(start < e and s < end for s, e, _ in claimed):
+                continue
+            claimed.append((start, end, phrase))
+    return sorted(claimed)
 
 
 def find_phrases(text, phrases):
@@ -536,15 +679,8 @@ def find_phrases(text, phrases):
     overlapping an already-claimed span ignored. Each phrase is returned once, as given, in the
     order of its first claimed occurrence (shots spec 3.4). Phrases must already be valid
     (normalize_phrase)."""
-    claimed = []
-    for phrase in sorted(set(phrases), key=lambda p: (-len(p), p.lower(), p)):
-        for match in _phrase_regex(normalize_phrase(phrase)).finditer(text):
-            start, end = match.span()
-            if any(start < e and s < end for s, e, _ in claimed):
-                continue
-            claimed.append((start, end, phrase))
     ordered = []
-    for _start, _end, phrase in sorted(claimed):
+    for _start, _end, phrase in _phrase_spans(text, phrases):
         if phrase not in ordered:
             ordered.append(phrase)
     return ordered
@@ -590,16 +726,142 @@ def parse_character_roster(text):
     return entries, problems
 
 
+def is_animal_phrase(phrase):
+    """True when a word of phrase, lowercased and with a trailing 's or ' removed, is in
+    SHOTS_ANIMAL_NOUNS: that roster character is an animal, exempt from S7, S8 and S10 (shots
+    rules v2 spec 3.5)."""
+    return any(_POSSESSIVE_RE.sub("", w.lower()) in SHOTS_ANIMAL_NOUNS for w in phrase.split())
+
+
+def _is_camera_sentence(sentence):
+    """A camera sentence (shots spec 4.3 S5; shots rules v2 spec 3.6): it starts with "camera"
+    or "the camera", or it has at most _CAMERA_SHORT_MAX_WORDS words and contains a camera term
+    ("Static camera.", "Slow push-in.")."""
+    return bool(_CAMERA_SENTENCE_RE.match(sentence)
+                or (len(sentence.split()) <= _CAMERA_SHORT_MAX_WORDS
+                    and _CAMERA_TERM_RE.search(sentence)))
+
+
+def _blank(text, spans):
+    """text with every character inside the (start, end) spans replaced by a space."""
+    chars = list(text)
+    for start, end in spans:
+        chars[start:end] = " " * (end - start)
+    return "".join(chars)
+
+
+def _passage_spans(text, passages):
+    """[(start, end)] of every case- and whitespace-insensitive occurrence in text of each
+    passage, ignoring a trailing "." on the passage."""
+    spans = []
+    for passage in passages:
+        words = passage.rstrip(".").split()
+        if words:
+            pattern = re.compile(r"\s+".join(re.escape(w) for w in words), re.IGNORECASE)
+            spans += [m.span() for m in pattern.finditer(text)]
+    return spans
+
+
+def _person_refs(sentence, humans, animals, descriptions):
+    """[(start, end, key)] of the people one sentence refers to, sorted by start (shots rules v2
+    spec 3.7): each human roster or cast phrase (key: the phrase, lowercased); then, outside every
+    roster phrase (human or animal) and every description, each SHOTS_PERSON_NOUNS word (key: the
+    noun, lowercased, a trailing 's or ' removed), "him", "them", "each other", "one another"
+    (key "each other"), and "her" used as an object: followed by no word, by punctuation, or by a
+    _HER_OBJECT_FOLLOWERS word. A person noun right after his/her/their/its is skipped ("her
+    figure")."""
+    spans = _phrase_spans(sentence, list(humans) + list(animals))
+    human_keys = {h.lower() for h in humans}
+    refs = [(s, e, p.lower()) for s, e, p in spans if p.lower() in human_keys]
+    blanked = _blank(sentence, [(s, e) for s, e, _ in spans]
+                     + _passage_spans(sentence, descriptions))
+    words = list(_WORD_RE.finditer(blanked))
+    for j, word in enumerate(words):
+        token = word.group(0).lower()
+        noun = _POSSESSIVE_RE.sub("", token)
+        if noun in SHOTS_PERSON_NOUNS:
+            if j == 0 or words[j - 1].group(0).lower() not in _POSSESSIVE_DETERMINERS:
+                refs.append((word.start(), word.end(), noun))
+        elif token in ("him", "them"):
+            refs.append((word.start(), word.end(), token))
+        elif token == "her":
+            nxt = words[j + 1] if j + 1 < len(words) else None
+            if (nxt is None or any(c in ",;:.!?)" for c in blanked[word.end():nxt.start()])
+                    or nxt.group(0).lower() in _HER_OBJECT_FOLLOWERS):
+                refs.append((word.start(), word.end(), "her"))
+    refs += [(m.start(), m.end(), "each other") for m in _EACH_OTHER_RE.finditer(blanked)]
+    return sorted(refs)
+
+
+def find_contact(sentence, humans, animals, descriptions):
+    """(verb, target) for the first contact in one sentence, or None (shots rules v2 spec 3.7).
+    A word in SHOTS_CONTACT_VERBS, SHOTS_HANDOFF_VERBS or SHOTS_TAKE_VERBS is a verb unless the
+    word before it is in _NOUN_MARKERS or ends in 's. Its clause runs between the nearest , ; or
+    : on either side; a clause containing "camera" is skipped. Its subject is the first person
+    reference in the sentence before it; a target is a person reference after it, inside its
+    clause, with a key other than the subject's and no _SPATIAL_RE word ("toward", "behind", "in
+    front of", ...) between the verb and it. A contact verb needs any target; a handoff verb a
+    target after "to"; a take verb either "his/her/their hand(s)" right after it, or a target
+    after "from" or followed by 's hand(s)."""
+    refs = _person_refs(sentence, humans, animals, descriptions)
+    breaks = [m.start() for m in _CLAUSE_BREAK_RE.finditer(sentence)]
+    words = list(_WORD_RE.finditer(sentence))
+    for i, word in enumerate(words):
+        form = word.group(0).lower()
+        if (form not in SHOTS_CONTACT_VERBS and form not in SHOTS_HANDOFF_VERBS
+                and form not in SHOTS_TAKE_VERBS):
+            continue
+        previous = words[i - 1].group(0).lower() if i else ""
+        if previous in _NOUN_MARKERS or previous.endswith(("'s", "’s")):
+            continue
+        clause_start = max([b for b in breaks if b < word.start()], default=0)
+        clause_end = min([b for b in breaks if b >= word.end()], default=len(sentence))
+        if _CAMERA_WORD_RE.search(sentence[clause_start:clause_end]):
+            continue
+        before = [r for r in refs if r[1] <= word.start()]
+        subject = before[0][2] if before else None
+        targets = [r for r in refs
+                   if r[0] >= word.end() and r[1] <= clause_end and r[2] != subject
+                   and not _SPATIAL_RE.search(sentence, word.end(), r[0])]
+        if form in SHOTS_HANDOFF_VERBS:
+            targets = [r for r in targets if _TO_RE.search(sentence, word.end(), r[0])]
+        elif form in SHOTS_TAKE_VERBS:
+            own = _OWN_HAND_RE.match(sentence, word.end())
+            if own:
+                return form, own.group(0).strip()
+            targets = [r for r in targets if _FROM_RE.search(sentence, word.end(), r[0])
+                       or _HAND_AFTER_RE.match(sentence, r[1])]
+        if targets:
+            return form, sentence[targets[0][0]:targets[0][1]]
+    return None
+
+
+def _appositive_nouns(sentence, members):
+    """{(start, end)} of each cast member's class noun standing in an appositive right after that
+    member's phrase -- <phrase>, optional closing quote, "," or ":", "a" or "an", at most six
+    words, <class noun> -- as in "the woman in grey, a young woman with ..." (shots rules v2 spec
+    3.8 S10)."""
+    spans = set()
+    for m in members:
+        tail = re.compile(r"""["”]?\s*[,:]\s*an?\s+(?:[\w'’-]+,?\s+){0,6}?(%s)\b"""
+                          % re.escape(m.class_noun), re.IGNORECASE)
+        for match in _phrase_regex(m.phrase).finditer(sentence):
+            noun = tail.match(sentence, match.end())
+            if noun:
+                spans.add(noun.span(1))
+    return spans
+
+
 def motion_problems(motion):
-    """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S4, S5). A sentence that starts
-    with "camera" or "the camera" is a camera sentence and is not an action sentence."""
+    """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S4, S5). A camera sentence
+    (_is_camera_sentence) is not an action sentence."""
     problems = []
     words = len(motion.split())
     if not SHOTS_MOTION_MIN_WORDS <= words <= SHOTS_MOTION_MAX_WORDS:
         problems.append(("S4 motion length", "Motion: is %d words; it must be %d-%d"
                          % (words, SHOTS_MOTION_MIN_WORDS, SHOTS_MOTION_MAX_WORDS)))
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(motion.strip()) if s.strip()]
-    actions = [s for s in sentences if not _CAMERA_SENTENCE_RE.match(s)]
+    actions = [s for s in sentences if not _is_camera_sentence(s)]
     if len(actions) != 1:
         problems.append(("S5 one action", "Motion: has %d action sentences; it must have exactly "
                          "one, optionally followed by a camera sentence" % len(actions)))
@@ -615,16 +877,18 @@ def motion_problems(motion):
 
 
 def shots_violations(text, panels, expected_panels, members):
-    """Every shot-rule violation of a shots-mode story.md (spec 4.3), in this order: S1, S2, then
-    per panel S3, S4, S5, S6, S7. text is the whole file; panels are bin/ltx-story-manifest
-    _parse_prompts_md dicts; members are CastMember (may be empty: then S2, S6, S7 are skipped)."""
+    """Every shot-rule violation of a shots-mode story.md (shots spec 4.3; shots rules v2 spec 4),
+    in this order: S1, S2, then per panel S3, S4, S5, S6, S7, S8 (Motion:, then Image:), S9, S10,
+    S11 (Image:, then Motion:), S12. text is the whole file; panels are bin/ltx-story-manifest
+    _parse_prompts_md dicts; members are CastMember (may be empty: then S2, S6, S7, S9 and S10
+    are skipped). The roster is read even without members, so S8 knows an uncast story's
+    extras and animals."""
     out = []
     if len(panels) != expected_panels:
         out.append("story: S1 panel count: expected exactly %d panels, found %d"
                    % (expected_panels, len(panels)))
-    roster = []
+    roster, problems = parse_character_roster(text)
     if members:
-        roster, problems = parse_character_roster(text)
         out += ["story: S2 characters list: %s" % p for p in problems]
         listed = [p.lower() for p, _ in roster]
         for m in members:
@@ -632,7 +896,11 @@ def shots_violations(text, panels, expected_panels, members):
                 out.append("story: S2 characters list: cast phrase %r (character %s) is not listed"
                            % (m.phrase, m.name))
     cast_phrases = {m.phrase.lower() for m in members}
-    extras = [p for p, _ in roster if p.lower() not in cast_phrases]
+    others = [p for p, _ in roster if p.lower() not in cast_phrases]
+    animals = [p for p in others if is_animal_phrase(p)]
+    extras = [p for p in others if not is_animal_phrase(p)]
+    humans = [m.phrase for m in members] + extras
+    descriptions = [d for _, d in roster] + [m.descriptor for m in members]
     for p in panels:
         num = p["number"]
         for label, key in (("Image", "image"), ("Motion", "motion"), ("Narration", "narration")):
@@ -644,42 +912,78 @@ def shots_violations(text, panels, expected_panels, members):
         if p["motion"].strip():
             out += ["panel %d: %s: %s" % (num, rule, detail)
                     for rule, detail in motion_problems(p["motion"])]
-        if not members:
-            continue
-        names = sorted(set(cast_text(p["image"], members)[1])
-                       | set(cast_text(p["motion"], members)[1]))
-        if len(names) > SHOTS_MAX_CAST_PER_PANEL:
-            out.append("panel %d: S6 cast count: the shot names %d cast characters (%s); at most %d"
-                       % (num, len(names), ", ".join(names), SHOTS_MAX_CAST_PER_PANEL))
-        found = find_phrases(p["motion"], [m.phrase for m in members] + extras)
-        cast_found = [f for f in found if f.lower() in cast_phrases]
-        extra_found = [f for f in found if f.lower() not in cast_phrases]
-        if cast_found and extra_found:
-            out.append("panel %d: S7 cast and extra: Motion: names %s together with %s; show the "
-                       "other character's action in its own shot, then cut to the cast "
-                       "character's reaction"
-                       % (num, ", ".join(repr(f) for f in cast_found),
-                          ", ".join(repr(f) for f in extra_found)))
+        names = []
+        if members:
+            names = sorted(set(cast_text(p["image"], members)[1])
+                           | set(cast_text(p["motion"], members)[1]))
+            if len(names) > SHOTS_MAX_CAST_PER_PANEL:
+                out.append("panel %d: S6 cast count: the shot names %d cast characters (%s); "
+                           "at most %d" % (num, len(names), ", ".join(names),
+                                           SHOTS_MAX_CAST_PER_PANEL))
+            found = find_phrases(p["motion"], [m.phrase for m in members] + others)
+            cast_found = [f for f in found if f.lower() in cast_phrases]
+            extra_found = [f for f in found if f in extras]
+            if cast_found and extra_found:
+                out.append("panel %d: S7 cast and extra: Motion: names %s together with %s; show "
+                           "the other character's action in its own shot, then cut to the cast "
+                           "character's reaction"
+                           % (num, ", ".join(repr(f) for f in cast_found),
+                              ", ".join(repr(f) for f in extra_found)))
+        for label, key in (("Motion", "motion"), ("Image", "image")):
+            sentences = [s for s in _SENTENCE_SPLIT_RE.split(p[key].strip()) if s.strip()]
+            if key == "motion":
+                sentences = [s for s in sentences if not _is_camera_sentence(s)]
+            for sentence in sentences:
+                contact = find_contact(sentence, humans, animals, descriptions)
+                if contact:
+                    out.append("panel %d: S8 contact: %s: %r acts on %r; two people touching on "
+                               "screen" % (num, label, contact[0], contact[1]))
+                    break
+        image_norm = " ".join(p["image"].split()).lower()
+        for m in members:
+            if (phrase_occurs(p["image"], m.phrase)
+                    and " ".join(m.descriptor.split()).lower() not in image_norm):
+                out.append("panel %d: S9 cast description: Image: names %r without character %s's "
+                           "description word for word; copy in this sentence: %s"
+                           % (num, m.phrase, m.name, identity_sentence(m)))
+        if names:
+            flagged = {}
+            for sentence in _SENTENCE_SPLIT_RE.split(p["image"].strip()):
+                if _DISTANCE_CUE_RE.search(sentence):
+                    continue
+                own = _appositive_nouns(sentence, members)
+                named = [d for phrase, d in roster if phrase_occurs(sentence, phrase)]
+                for start, end, key in _person_refs(sentence, humans, animals,
+                                                    [m.descriptor for m in members] + named):
+                    if (key not in cast_phrases and key not in _PRONOUN_KEYS
+                            and (start, end) not in own):
+                        flagged.setdefault(key, sentence[start:end])
+            out += ["panel %d: S10 extra in cast shot: Image: names %r in a shot that shows %s, "
+                    "without \"far in the background\" or another distance cue in that sentence"
+                    % (num, shown, ", ".join(names)) for shown in flagged.values()]
+        for label, key in (("Image", "image"), ("Motion", "motion")):
+            offscreen = _OFFSCREEN_RE.search(p[key])
+            if offscreen:
+                out.append("panel %d: S11 off-screen wording: %s: says %r; use left and right "
+                           "screen direction instead"
+                           % (num, label, " ".join(offscreen.group(0).lower().split())))
+        if p["image"].strip() and not any(
+                _SETTING_SENTENCE_RE.match(s) and len(s.split()) >= SHOTS_SETTING_MIN_WORDS
+                for s in _SENTENCE_SPLIT_RE.split(p["image"].strip())):
+            out.append('panel %d: S12 setting sentence: Image: has no setting sentence of at least '
+                       '%d words starting "The setting is"' % (num, SHOTS_SETTING_MIN_WORDS))
     return out
 
 
 def shots_advisories(panels, members):
-    """Non-fatal shots-mode warnings (spec 4.4), per panel in order: W1 for each cast member
-    named in Image: whose descriptor is not repeated there (whitespace- and case-insensitive),
-    then W2 when the shot names a cast character but its Image: states no shot type, or a wide
-    one. [] when members is empty."""
+    """Non-fatal shots-mode warnings (shots spec 4.4; its W1 is the fatal S9 since shots rules v2),
+    per panel in order: W2 when the shot names a cast character but its Image: states no shot
+    type, or a wide one. [] when members is empty."""
     out = []
     if not members:
         return out
     for p in panels:
         num = p["number"]
-        image_norm = " ".join(p["image"].split()).lower()
-        for m in members:
-            if (phrase_occurs(p["image"], m.phrase)
-                    and " ".join(m.descriptor.split()).lower() not in image_norm):
-                out.append("panel %d: Image: names %r but does not repeat character %s's Cast "
-                           "description word for word; that still relies on the phrase and the "
-                           "stills LoRA alone" % (num, m.phrase, m.name))
         names = sorted(set(cast_text(p["image"], members)[1])
                        | set(cast_text(p["motion"], members)[1]))
         if names:
@@ -692,13 +996,107 @@ def shots_advisories(panels, members):
 
 
 def shots_rewrite_block(violations, panels):
-    """The text appended to the Phase 1 prompt for the one rewrite (spec 5.4): at most
-    SHOTS_REWRITE_MAX_LISTED violations as "- <violation>" lines, then "- ... and N more"."""
-    listed = violations[:SHOTS_REWRITE_MAX_LISTED]
-    lines = ["- " + v for v in listed]
-    if len(violations) > len(listed):
-        lines.append("- ... and %d more" % (len(violations) - len(listed)))
+    """The text appended to the Phase 1 prompt for each rewrite (shots spec 5.4; shots rules v2
+    spec 3.10, 6). Violations of a SHOTS_RULE_GUIDANCE rule are grouped by rule, in that order,
+    under the rule's guidance line; within a rule, violations with the same detail merge into one
+    "- panel N: <detail>" / "- panels N, M: <detail>" / "- story: <detail>" line. Any other
+    violation follows as its own "- <violation>" line. At most SHOTS_REWRITE_MAX_LISTED "- "
+    lines are listed, then "- ... and N more", N counting the violations not listed."""
+    guidance = dict(SHOTS_RULE_GUIDANCE)
+    merged, other = {}, []
+    for v in violations:
+        match = _VIOLATION_RE.fullmatch(v)
+        if match and match.group(2) in guidance:
+            merged.setdefault((match.group(2), match.group(3)), []).append(match.group(1))
+        else:
+            other.append(v)
+    items = []
+    for rule, _line in SHOTS_RULE_GUIDANCE:
+        for (r, detail), numbers in merged.items():
+            if r != rule:
+                continue
+            if numbers[0] is None:
+                where = "story"
+            elif len(numbers) == 1:
+                where = "panel " + numbers[0]
+            else:
+                where = "panels " + ", ".join(numbers)
+            items.append((rule, "- %s: %s" % (where, detail), len(numbers)))
+    items += [(None, "- " + v, 1) for v in other]
+    lines, current, shown = [], None, 0
+    for rule, line, count in items[:SHOTS_REWRITE_MAX_LISTED]:
+        if rule is not None and rule != current:
+            lines.append(guidance[rule])
+        current = rule
+        lines.append(line)
+        shown += count
+    if shown < len(violations):
+        lines.append("- ... and %d more" % (len(violations) - shown))
     return SHOTS_REWRITE_TEMPLATE % ("\n".join(lines), panels)
+
+
+def repair_cast_descriptions(text, members):
+    """(text, [(panel number, member name)]): S9 repaired in a shots story.md (shots rules v2 spec
+    3.11). Panels and their Image: fields are found as bin/ltx-story-manifest parses them. For
+    each panel in file order and each member in members order whose phrase occurs in the Image:
+    field but whose descriptor (case- and whitespace-insensitive) does not, " " +
+    identity_sentence(member) is inserted after the end of the sentence that holds the phrase's
+    first match on one line of that field: the first ., ! or ?, optionally followed by a closing
+    quote, that is followed by whitespace or the end of the line. When that line has no such end
+    after the match, the sentence goes at the end of the line, after a "." if the line does not
+    already end in ., ! or ? (a trailing carriage return stays last). A phrase that occurs only
+    across a line break is not repaired (S9 still reports it). Every other byte of text is
+    unchanged."""
+    lines = text.split("\n")
+    sections = []
+    current, field = None, None
+    for i, line in enumerate(lines):
+        header = _STORY_PANEL_RE.match(line)
+        if header:
+            current, field = (int(header.group(1)), []), None
+            sections.append(current)
+            continue
+        if line.startswith("##"):
+            current, field = None, None
+            continue
+        if current is None:
+            continue
+        label = _STORY_FIELD_RE.match(line)
+        if label:
+            field = label.group(1)
+            if field == "Image":
+                current[1].append(i)
+        elif field == "Image" and line.strip():
+            current[1].append(i)
+    repaired = []
+    for number, indexes in sections:
+        for m in members:
+            values = []
+            for i in indexes:
+                label = _STORY_FIELD_RE.match(lines[i])
+                value = (label.group(2) if label else lines[i]).strip()
+                if value:
+                    values.append(value)
+            image = " ".join(values)
+            if (not phrase_occurs(image, m.phrase)
+                    or " ".join(m.descriptor.split()).lower() in " ".join(image.split()).lower()):
+                continue
+            for i in indexes:
+                match = _phrase_regex(m.phrase).search(lines[i])
+                if not match:
+                    continue
+                end = _SENTENCE_END_RE.search(lines[i], match.end())
+                if end:
+                    lines[i] = (lines[i][:end.end()] + " " + identity_sentence(m)
+                                + lines[i][end.end():])
+                else:
+                    cr = "\r" if lines[i].endswith("\r") else ""
+                    line = lines[i].rstrip()
+                    lines[i] = (line + ("" if line.endswith((".", "!", "?")) else ".") + " "
+                                + identity_sentence(m) + cr)
+                repaired.append((number, m.name))
+                break
+    return "\n".join(lines), repaired
 
 
 def usable_characters():
