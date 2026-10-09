@@ -186,11 +186,17 @@ The Characters section has one line per character who appears anywhere in the fi
 Every panel has exactly three fields, in this order:
 
 ## Panel N — <short title>
-Image: <80-170 words describing this shot's first frame as one still picture: every character who is on screen, each named by their referring phrase and then given their full description from the Characters section, word for word; where each one stands and which way they face; the setting and background; the lighting and colour palette; the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up); the camera viewpoint; and the rendering style.>
+Image: <80-170 words describing this shot's first frame as one still picture: the setting sentence of this shot's location, copied word for word; for every character who is on screen, one sentence made of their referring phrase, the word "is" and their full description from the Characters section, copied word for word; where each one stands and which way they face; the background; the lighting and colour palette; the shot type (exactly one of: extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme close-up); the camera viewpoint; and the rendering style.>
 Motion: <10-25 words: one sentence naming ONE character by their referring phrase and the ONE physical action they perform during these {seconds} seconds, then a separate short sentence about the camera, for example "The camera stays static.">
 Narration: <one sentence of voice-over narration; vary the sentence length across panels rather than repeating a similar length every time>
 
 One action per shot. {seconds} seconds is enough for one gesture, a few steps, one swing or one turn of the head -- not for a sequence. The Motion: action sentence gives one character one action: never chain actions with "then", "while", "meanwhile", "simultaneously", "afterwards", "followed by" or ", and", never use a semicolon, and never write a second action sentence. When the story needs a sequence -- for example a charge, a draw and a strike -- give each beat its own panel, so a fight or a chase takes several panels. Do not describe appearance, clothing, setting or lighting in Motion: -- that belongs in Image:.
+
+Setting sentences. For each location in the story, write one setting sentence that starts with "The setting is" and names the period, the place, the ground and the light, for example: "The setting is a dense cedar forest in feudal Japan, tall trunks and ferns behind, the ground covered in leaf litter, under flat overcast grey light." Copy that exact sentence, word for word, into the Image: field of every shot at that location.
+
+Fights and touch. Two people never touch on screen. Split every strike, grab, push, thrust or block into two consecutive panels: first a wind-up shot that shows only the attacker (raising the blade, drawing back the arm, lunging forward), then a hard cut to a reaction shot that shows only the person who is hit (recoiling, staggering, clutching the wound, falling). The contact itself is never on screen; the cut implies it. Show a hand-off, a taken hand or a helping hand the same way: one shot of the person who gives or reaches, then one shot of the person who receives. Each of these shots shows one person, and its Motion: names no one else.
+
+Screen direction. Never write "outside the frame", "off-screen", "out of frame" or anything like them, and never name a person who is not in the shot, not even as someone a character looks at. Show who faces whom with fixed screen direction instead: keep each attacker on the left of the frame facing right and each defender on the right facing left (or the reverse), the same way for each pair of characters for the whole fight.
 
 Give the story a narrative arc -- an introduction, a middle, a climax and a conclusion -- carried by what the characters do from shot to shot and by the narration. Each panel should move the action forward instead of repeating the previous panel's action.
 
@@ -1056,10 +1062,11 @@ def phase1_story(args):
         if args.force_story and args.no_review:
             cmd += ["--danger-auto-approve"]
         cmd += ["--user-prompt", prompt]
+        before = os.stat(story_md) if os.path.exists(story_md) else None
         rc = _run_story_agent(cmd, timeout, story_md)
         if rc:
             return rc
-        authored = {"cmd": cmd, "timeout": timeout, "prompt": prompt}
+        authored = {"cmd": cmd, "timeout": timeout, "prompt": prompt, "before": before}
 
     if getattr(args, "shots", False):
         return _phase1_shots_finish(args, story_md, authored)
@@ -1104,8 +1111,56 @@ def phase1_story(args):
     return 0
 
 
-def _shots_check(lib, story_md, expected_panels, members):
-    """(violations, advisories) for a shots-mode story.md (shots spec 4)."""
+def _unused_path(path):
+    """path if nothing exists there, else path with -2, -3, ... inserted before its extension:
+    the first that does not exist, so a moved-aside or copied draft never replaces an earlier one
+    (shots rules v2 spec 5.3)."""
+    root, ext = os.path.splitext(path)
+    candidate, k = path, 2
+    while os.path.lexists(candidate):
+        candidate = "%s-%d%s" % (root, k, ext)
+        k += 1
+    return candidate
+
+
+def _shots_repair_s9(lib, story_md, members):
+    """Insert every missing cast identity sentence into story.md in place (shots rules v2 spec
+    5.3; character_lib.repair_cast_descriptions). When anything changes, the unrepaired bytes
+    are first copied to story.pre-repair-<UTC stamp>-<pid>.md and one "Repaired S9 on panels
+    ..." line is printed. Returns the sorted repaired panel numbers, [] when nothing changed or
+    story.md cannot be read or decoded (validation then reports it)."""
+    if not members:
+        return []
+    try:
+        with open(story_md, "rb") as f:
+            raw = f.read()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    repaired_text, repaired = lib.repair_cast_descriptions(text, members)
+    if not repaired:
+        return []
+    keep = _unused_path(os.path.join(
+        os.path.dirname(story_md), "story.pre-repair-%s-%d.md"
+        % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid())))
+    with open(keep, "xb") as f:
+        f.write(raw)
+    temporary = story_md + ".repair.tmp"
+    with open(temporary, "wb") as f:
+        f.write(repaired_text.encode("utf-8"))
+    os.replace(temporary, story_md)
+    panels = sorted({number for number, _name in repaired})
+    print("Repaired S9 on panels %s: inserted %d missing cast identity sentence(s); the "
+          "unrepaired draft is kept at %s"
+          % (",".join(str(n) for n in panels), len(repaired), keep))
+    return panels
+
+
+def _shots_check(lib, story_md, expected_panels, members, repair=False):
+    """(violations, advisories) for a shots-mode story.md (shots spec 4). With repair, S9 is
+    first repaired in place (shots rules v2 spec 5.3)."""
+    if repair:
+        _shots_repair_s9(lib, story_md, members)
     try:
         with open(story_md, encoding="utf-8") as f:
             text = f.read()
@@ -1117,12 +1172,26 @@ def _shots_check(lib, story_md, expected_panels, members):
 
 
 def _phase1_shots_finish(args, story_md, authored):
-    """Shots-mode Phase 1 after story.md exists (shots spec 5.4): validate; a draft the story
-    model wrote in this run gets exactly one rewrite; then the story dump, the advisories, the
-    cast-phrase warnings and the review gate. authored is None when Phase 1 was skipped."""
+    """Shots-mode Phase 1 after story.md exists (shots spec 5.4; shots rules v2 spec 5.3):
+    validate; a draft the story model wrote in this run first gets its missing cast identity
+    sentences inserted (S9 repair) and then up to SHOTS_MAX_REWRITES rewrites, each listing only
+    the violations still present; then the story dump, the advisories, the cast-phrase warnings
+    and the review gate. authored is None when Phase 1 was skipped: no repair, no rewrite. A
+    story.md that Phase 1's call left unchanged (authored["before"], an os.stat taken before the
+    call) is never repaired or validated: exit 1."""
     lib = _character_lib()
     members = getattr(args, "cast_members", None) or []
-    violations, advisories = _shots_check(lib, story_md, args.panels, members)
+    before = (authored or {}).get("before")
+    if before is not None and os.path.isfile(story_md):
+        now = os.stat(story_md)
+        if ((now.st_ino, now.st_mtime_ns, now.st_size)
+                == (before.st_ino, before.st_mtime_ns, before.st_size)):
+            print("Error: qwen-agent did not write %s; the existing file is unchanged since before "
+                  "Phase 1 and was neither validated nor repaired. Rerun the same command to try "
+                  "again." % story_md, file=sys.stderr)
+            return 1
+    violations, advisories = _shots_check(lib, story_md, args.panels, members,
+                                          repair=authored is not None)
     if violations and authored is None:
         print("Error: story.md breaks the shot rules:", file=sys.stderr)
         for v in violations:
@@ -1134,38 +1203,56 @@ def _phase1_shots_finish(args, story_md, authored):
         print("Error: qwen-agent exited 0 without writing %s; nothing to rewrite. Rerun the same "
               "command to try again." % story_md, file=sys.stderr)
         return 1
-    if violations:
-        story_dir = os.path.dirname(story_md)
-        rejected = os.path.join(story_dir, "story.rejected-%s-%d.md"
-                                % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()))
-        print("Warning: the story model's draft broke the shot rules; moving it to %s and asking "
-              "for one rewrite:" % rejected)
+    story_dir = os.path.dirname(story_md)
+    rejected = []
+    attempt = 0
+    while violations:
+        if attempt == lib.SHOTS_MAX_REWRITES:
+            print("Error: story.md still breaks the shot rules after %d rewrites:" % attempt,
+                  file=sys.stderr)
+            for v in violations:
+                print("  - %s" % v, file=sys.stderr)
+            print("The rejected drafts are kept at %s. Hand-edit %s to fix the violations above "
+                  "and rerun (Phase 1 is skipped while story.md exists), or rerun with "
+                  "--force-story." % (", ".join(rejected), story_md), file=sys.stderr)
+            return 2
+        attempt += 1
+        moved = _unused_path(os.path.join(story_dir, "story.rejected-%s-%d.md"
+                                          % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                                             os.getpid())))
+        if attempt == 1:
+            print("Warning: the story model's draft broke the shot rules; moving it to %s and "
+                  "asking for rewrite 1 of %d:" % (moved, lib.SHOTS_MAX_REWRITES))
+        else:
+            print("Warning: rewrite %d still breaks the shot rules; moving it to %s and asking for "
+                  "rewrite %d of %d:" % (attempt - 1, moved, attempt, lib.SHOTS_MAX_REWRITES))
         for v in violations:
             print("  - %s" % v)
-        os.replace(story_md, rejected)
+        os.replace(story_md, moved)
+        rejected.append(moved)
         rewrite = authored["prompt"] + "\n\n" + lib.shots_rewrite_block(violations, args.panels)
-        with open(os.path.join(story_dir, "story_prompt.rewrite.txt"), "w", encoding="utf-8") as f:
+        name = ("story_prompt.rewrite.txt" if attempt == 1
+                else "story_prompt.rewrite-%d.txt" % attempt)
+        with open(os.path.join(story_dir, name), "w", encoding="utf-8") as f:
             f.write(rewrite)
         cmd = list(authored["cmd"])
         cmd[-1] = rewrite
-        print("=== Phase 1: story (rewrite) ===")
+        print("=== Phase 1: story (rewrite %d of %d) ===" % (attempt, lib.SHOTS_MAX_REWRITES))
         rc = _run_story_agent(cmd, authored["timeout"], story_md)
         if not rc and not os.path.isfile(story_md):
             print("Error: qwen-agent exited 0 without writing %s" % story_md, file=sys.stderr)
             rc = 1
         if rc:
-            print("Error: the shots rewrite failed; the rejected first draft is kept at %s"
-                  % rejected, file=sys.stderr)
+            if os.path.isfile(story_md):
+                moved = _unused_path(os.path.join(story_dir, "story.rejected-%s-%d.md"
+                                                  % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                                                     os.getpid())))
+                os.replace(story_md, moved)
+                rejected.append(moved)
+            print("Error: shots rewrite %d of %d failed; the rejected draft(s) are kept at %s"
+                  % (attempt, lib.SHOTS_MAX_REWRITES, ", ".join(rejected)), file=sys.stderr)
             return rc
-        violations, advisories = _shots_check(lib, story_md, args.panels, members)
-        if violations:
-            print("Error: story.md still breaks the shot rules after one rewrite:", file=sys.stderr)
-            for v in violations:
-                print("  - %s" % v, file=sys.stderr)
-            print("The rejected first draft is kept at %s. Hand-edit %s to fix the violations "
-                  "above and rerun (Phase 1 is skipped while story.md exists), or rerun with "
-                  "--force-story." % (rejected, story_md), file=sys.stderr)
-            return 2
+        violations, advisories = _shots_check(lib, story_md, args.panels, members, repair=True)
     if not args.no_review:
         with open(story_md) as f:
             content = f.read()
