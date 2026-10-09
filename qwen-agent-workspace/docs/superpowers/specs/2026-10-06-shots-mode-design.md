@@ -3,6 +3,8 @@
 Date: 2026-10-06
 Status: The user approved the design in three sections (story structure and prompt rules; pipeline; errors and tests) and pre-authorized implementation ("write the spec and implement"). This document transcribes those decisions without reopening them. Every choice made while writing it to remove ambiguity is marked **[spec choice]**, and every reading of an ambiguous approved phrase is marked **[interpretation]**. The facts checked against real files this session are in 0.2. Anything that could not be verified offline is in Section 12 (Known gaps). There are no open questions (Section 14).
 
+Amended 2026-10-09 by docs/superpowers/specs/2026-10-09-shots-rules-v2-design.md (shots rules v2): rules S8-S12 are added, W1 became the fatal S9 (repaired automatically in drafts the story model writes), S7 exempts animals, Phase 1 allows up to two rewrites, and the Cast block, rewrite block, story template and Phase 1 code in 3.3, 3.7-3.9, 5.2 and 5.4 are replaced. Where the two differ, the v2 spec wins.
+
 Workspace root (`WS`): `/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/`. Branch `qwen-agent-redteam`, HEAD `1567e35`. This feature builds on `docs/superpowers/specs/2026-10-05-character-library-design.md` (called "the casting spec" below) and uses its terms: **character**, **cast**, **casting**, **uncast**, **trigger**, **referring phrase**, **global LoRA**.
 
 Two new terms:
