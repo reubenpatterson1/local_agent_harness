@@ -98,6 +98,11 @@ SKILL_MODEL_OVERRIDES = {
     ) if v
 }
 
+# Skills served by an Ollama endpoint. Ollama's /v1 ignores
+# chat_template_kwargs.enable_thinking; only reasoning_effort "none" turns
+# thinking off there. Never sent to vLLM skills, which may reject "none".
+OLLAMA_SKILLS = ("researcher",)
+
 # Search grounding (see docs/specs/2026-08-21-qwen-agent-search-grounding-design.md).
 # SEARXNG_BASE_URL must match the published port in
 # /Volumes/Ollama/vllm-metal/searxng/docker-compose.yml. No trailing slash.
@@ -1450,6 +1455,8 @@ def chat_completion(base_url, messages, args_ns, include_tools=True):
         "top_p": 0.95 if args_ns.think else 0.8,
         "stream": False,
     }
+    if args_ns.skill in OLLAMA_SKILLS and not args_ns.think:
+        body["reasoning_effort"] = "none"
     if not include_tools:
         del body["tools"]
         del body["tool_choice"]
@@ -2211,7 +2218,7 @@ def parse_args(argv):
     parser.add_argument("--user-prompt", type=str, default=None)
     parser.add_argument("--system-prompt", type=str, default=None)
     parser.add_argument("--skill", type=str, default=None,
-                        choices=("investigator", "analyst", "planner"))
+                        choices=("investigator", "analyst", "planner", "researcher"))
     parser.add_argument("--temperature", type=float, default=None)
     return parser.parse_args(argv)
 
