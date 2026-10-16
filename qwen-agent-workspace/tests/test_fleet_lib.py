@@ -1073,3 +1073,56 @@ def test_t29a_state_io_prune_and_version(tmp_path):
 def test_tag_re_rejects_non_ascii_digits():
     assert fleet_lib.TAG_RE.fullmatch("v2026.10.17")
     assert fleet_lib.TAG_RE.fullmatch("v٢٠٢٦.10.17") is None
+
+
+# --- T26, T29b: bin/qwen-agentd-launch (F89, F83) ------------------------------------
+
+def _load_launcher():
+    path = os.path.join(WS, "bin", "qwen-agentd-launch")
+    loader = importlib.machinery.SourceFileLoader("qwen_agentd_launch", path)
+    spec = importlib.util.spec_from_loader("qwen_agentd_launch", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_t26_launcher_step():
+    launch = _load_launcher()
+    assert launch.MAX_START_ATTEMPTS == fleet_lib.MAX_START_ATTEMPTS == 3
+    for status in ("ok", "rolled_back"):
+        state = {"from": "v1", "to": "v2026.01.02", "status": status, "attempts": 0, "bad_tags": []}
+        assert launch.launcher_step(state, True) == (state, "exec")
+    pending = {"from": "v2026.01.01", "to": "v2026.01.02", "status": "pending", "attempts": 0,
+               "bad_tags": ["v2025.12.31"]}
+    assert launch.launcher_step(pending, True) == (dict(pending, attempts=1), "exec")
+    assert launch.launcher_step(dict(pending, attempts=1), True) == (dict(pending, attempts=2), "exec")
+    new, action = launch.launcher_step(dict(pending, attempts=2), True)
+    assert action == "rollback"
+    assert new == {"from": "v2026.01.01", "to": "v2026.01.02", "status": "rolled_back", "attempts": 3,
+                   "bad_tags": ["v2025.12.31", "v2026.01.02"]}
+    again, _ = launch.launcher_step(dict(pending, attempts=2, bad_tags=["v2026.01.02"]), True)
+    assert again["bad_tags"] == ["v2026.01.02"]
+    assert launch.launcher_step(dict(pending, attempts=2), False) == (dict(pending, attempts=3), "exec")
+    with open(os.path.join(WS, "bin", "qwen-agentd-launch"), encoding="utf-8") as f:
+        source = f.read()
+    assert "import fleet_lib" not in source and "from fleet_lib" not in source
+
+
+def test_t29b_launcher_and_fleet_lib_state_files_agree(tmp_path):
+    launch = _load_launcher()
+    state = {"from": "v2026.01.01", "to": "v2026.01.02", "status": "pending", "attempts": 1,
+             "bad_tags": ["v2026.01.03"]}
+    a = str(tmp_path / "a.json")
+    b = str(tmp_path / "b.json")
+    fleet_lib.write_state(a, state)
+    launch.write_state(b, state)
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        assert fa.read() == fb.read()
+    assert launch.read_state(a) == fleet_lib.read_state(b) == state
+    assert stat.S_IMODE(os.stat(b).st_mode) == 0o600
+    for text in ("garbage", '{"from": null}'):
+        with open(a, "w") as f:
+            f.write(text)
+        assert launch.read_state(a) == fleet_lib.read_state(a) == {
+            "from": None, "to": None, "status": "ok", "attempts": 0, "bad_tags": []}
+    assert launch.read_state(str(tmp_path / "missing.json")) == fleet_lib.read_state(str(tmp_path / "missing.json"))
