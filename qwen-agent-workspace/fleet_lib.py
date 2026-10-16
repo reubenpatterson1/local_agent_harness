@@ -660,3 +660,166 @@ class LivenessTable(object):
             now = self._clock()
             return any(r["heard_via"] == "beacon" and now - r["last_heard"] <= window
                        for r in self._records.values())
+
+
+# ---------------------------------------------------------------------------
+# Sections 6.1 and 7: HTTP routing table, fleet routing, and the bin/qwen-agent
+# clients (F42, F57-F64, F68)
+# ---------------------------------------------------------------------------
+
+_ROUTES = {
+    ("GET", "/health"): ("signed", "health"),
+    ("GET", "/skills"): ("signed", "skills"),
+    ("POST", "/run"): ("signed", "run"),
+    ("GET", "/peers"): ("loopback", "peers"),
+    ("POST", "/delegate"): ("loopback", "delegate"),
+}
+
+
+def is_loopback_client(ip):
+    """Exact string match on the client address (F42); ::ffff:127.0.0.1 is NOT loopback."""
+    return ip in LOOPBACK_CLIENTS
+
+
+def http_route(method, path):
+    """(kind, name) for a request; ("unknown", None) for every other pair (F42)."""
+    return _ROUTES.get((method, path), ("unknown", None))
+
+
+def serves_skill(skills, skill):
+    """True iff a skills list (/skills or fleet-view shape) has `skill` with verified True (F57)."""
+    return any(isinstance(item, dict) and item.get("skill") == skill and item.get("verified") is True
+               for item in skills)
+
+
+def route_candidates(skill, view):
+    """[LOCAL] when this host serves skill verified, else eligible peer host_ids in view order (F59)."""
+    if serves_skill(view["self"]["skills"], skill):
+        return [LOCAL]
+    return [peer["host_id"] for peer in view["peers"]
+            if peer.get("compatible") is True and serves_skill(peer["skills"], skill)]
+
+
+def delegate_enum(targets, view):
+    """The delegate_to_skill enum filtered to targets something live serves (F60)."""
+    return [t for t in targets if route_candidates(t, view)]
+
+
+def _valid_skill_list(skills):
+    return isinstance(skills, list) and all(
+        isinstance(i, dict) and isinstance(i.get("skill"), str) and isinstance(i.get("verified"), bool)
+        for i in skills)
+
+
+def valid_view(obj):
+    """True iff obj has the F61 shape of a qwen-agentd.peers.v1 fleet view. Never raises."""
+    try:
+        if not (isinstance(obj, dict) and obj.get("schema") == PEERS_SCHEMA):
+            return False
+        me = obj.get("self")
+        if not (isinstance(me, dict) and isinstance(me.get("host_id"), str) and _valid_skill_list(me.get("skills"))):
+            return False
+        peers = obj.get("peers")
+        if not isinstance(peers, list):
+            return False
+        for peer in peers:
+            if not (isinstance(peer, dict) and isinstance(peer.get("host_id"), str)
+                    and isinstance(peer.get("compatible"), bool) and _valid_skill_list(peer.get("skills"))):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def failover(candidates, attempt):
+    """Try candidates in order until one returns "ok" (F68). attempt(host_id) -> (outcome, envelope)."""
+    tried = []
+    for host_id in candidates:
+        try:
+            outcome, envelope = attempt(host_id)
+        except Exception:
+            outcome, envelope = "error", None
+        if outcome == "ok":
+            return {"outcome": "ok", "host_id": host_id, "envelope": envelope, "tried": tried}
+        tried.append((host_id, outcome))
+    return {"outcome": "exhausted", "host_id": None, "envelope": None, "tried": tried}
+
+
+def daemon_url_from_env(environ):
+    """(url, warning) from QWEN_AGENT_DAEMON_URL; only http://127.0.0.1:<port> is accepted (F63)."""
+    value = environ.get("QWEN_AGENT_DAEMON_URL", "")
+    if value == "":
+        return DEFAULT_DAEMON_URL, None
+    match = DAEMON_URL_RE.fullmatch(value)
+    if match and 1 <= int(match.group(1)) <= 65535:
+        return value, None
+    return None, ("qwen-agent: warning: ignoring QWEN_AGENT_DAEMON_URL=%s: it must be "
+                  "http://127.0.0.1:<port>; fleet routing disabled" % value)
+
+
+def _loopback_port(daemon_url):
+    return int(DAEMON_URL_RE.fullmatch(daemon_url).group(1))
+
+
+def fetch_view(daemon_url):
+    """(view, warning) from GET /peers on the local daemon (F64).
+
+    http.client, never urllib, so no proxy setting can intercept it (F44). A
+    missing daemon is the normal case and returns (None, None) silently.
+    """
+    if daemon_url is None:
+        return None, None
+    conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url), timeout=VIEW_TIMEOUT)
+    try:
+        conn.request("GET", "/peers")
+        resp = conn.getresponse()
+        status = resp.status
+        body = resp.read(MAX_BODY + 1)
+    except (OSError, http.client.HTTPException):
+        return None, None
+    finally:
+        conn.close()
+    warning = ("qwen-agent: warning: qwen-agentd at %s returned an unrecognized fleet view; "
+               "fleet routing disabled" % daemon_url)
+    if status != 200:
+        return None, warning
+    try:
+        view = json.loads(body)
+    except (ValueError, RecursionError):
+        return None, warning
+    if not valid_view(view):
+        return None, warning
+    return view, None
+
+
+def delegate_once(daemon_url, skill, task, host_id):
+    """POST /delegate for one named peer -> (outcome, envelope, detail). Never raises (F68)."""
+    if daemon_url is None:
+        return "daemon_error", None, "no daemon"
+    try:
+        body = canonical_json({"skill": skill, "task": task, "host_id": host_id})
+        conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url),
+                                          timeout=DELEGATE_CLIENT_TIMEOUT)
+        try:
+            conn.request("POST", "/delegate", body=body,
+                         headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+            resp = conn.getresponse()
+            status = resp.status
+            raw = resp.read(MAX_BODY + 1)
+        finally:
+            conn.close()
+    except Exception as e:
+        return "daemon_error", None, type(e).__name__
+    if status != 200:
+        return "daemon_error", None, "http %d" % status
+    try:
+        obj = json.loads(raw)
+    except (ValueError, RecursionError):
+        return "daemon_error", None, "bad response"
+    if not (isinstance(obj, dict) and isinstance(obj.get("outcome"), str)
+            and isinstance(obj.get("detail"), str) and "envelope" in obj):
+        return "daemon_error", None, "bad response"
+    if obj["outcome"] == "ok" and not (isinstance(obj["envelope"], dict)
+                                       and obj["envelope"].get("schema") == ONESHOT_SCHEMA):
+        return "daemon_error", None, "bad response"
+    return obj["outcome"], obj["envelope"], obj["detail"]

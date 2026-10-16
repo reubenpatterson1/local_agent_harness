@@ -627,3 +627,238 @@ def test_beacon_alone_cannot_keep_a_record_live():
     clock.t = 1210.0
     assert table.heard("192.168.1.168", 8190, "beacon") is None
     assert table.live_peers() == []
+
+
+# --- T21-T24, Review Focus 3 and 4: routing and the harness clients (F42, F57-F68) ----
+
+def _skill(name, verified=True, busy=False, model="m"):
+    return {"skill": name, "model": model, "verified": verified, "busy": busy}
+
+
+def _peer(host_id, skills, compatible=True, age=1.0):
+    return {"host_id": host_id, "address": "192.168.1.5", "port": 8190, "role": "agent",
+            "version": "v2026.10.17", "proto": 1, "compatible": compatible,
+            "skills": skills, "heard_via": "beacon", "age": age}
+
+
+def _view(self_skills, peers):
+    return {"schema": fleet_lib.PEERS_SCHEMA,
+            "self": {"host_id": "mac-local", "role": "agent", "version": "dev", "proto": 1,
+                     "discovery": "beacon", "skills": self_skills},
+            "peers": peers}
+
+
+def test_t21_route_candidates():
+    peers = [_peer("p1", [_skill("researcher")]), _peer("p2", [_skill("researcher")])]
+    view = _view([_skill("researcher")], peers)
+    snapshot = copy.deepcopy(view)
+    assert fleet_lib.route_candidates("researcher", view) == [fleet_lib.LOCAL]
+    assert view == snapshot
+    view = _view([_skill("researcher", verified=False)], peers)
+    assert fleet_lib.route_candidates("researcher", view) == ["p1", "p2"]
+    view = _view([], [_peer("p1", [_skill("researcher", verified=False)]),
+                      _peer("p2", [_skill("researcher")], compatible=False),
+                      _peer("p3", [_skill("analyst")]),
+                      _peer("p4", [_skill("researcher", busy=True)]),
+                      _peer("p0", [_skill("researcher")])])
+    assert fleet_lib.route_candidates("researcher", view) == ["p4", "p0"]
+    assert fleet_lib.route_candidates("planner", view) == []
+    assert not fleet_lib.HOST_ID_RE.fullmatch(fleet_lib.LOCAL)
+
+
+def test_t22_failover():
+    outcomes = {"a": "busy", "b": "timeout", "c": "bad_signature", "d": "ok"}
+    calls = []
+
+    def attempt(host_id):
+        calls.append(host_id)
+        return outcomes[host_id], ({"answer": host_id} if outcomes[host_id] == "ok" else None)
+
+    result = fleet_lib.failover(["a", "b", "c", "d"], attempt)
+    assert result == {"outcome": "ok", "host_id": "d", "envelope": {"answer": "d"},
+                      "tried": [("a", "busy"), ("b", "timeout"), ("c", "bad_signature")]}
+    assert calls == ["a", "b", "c", "d"]
+    result = fleet_lib.failover(["a", "b"], attempt)
+    assert result == {"outcome": "exhausted", "host_id": None, "envelope": None,
+                      "tried": [("a", "busy"), ("b", "timeout")]}
+
+    def raising(host_id):
+        if host_id == "x":
+            raise ValueError("boom")
+        return "ok", {"answer": "y"}
+
+    result = fleet_lib.failover(["x", "y"], raising)
+    assert result["outcome"] == "ok" and result["tried"] == [("x", "error")]
+    assert fleet_lib.failover([], attempt) == {"outcome": "exhausted", "host_id": None,
+                                               "envelope": None, "tried": []}
+
+    def interrupted(host_id):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        fleet_lib.failover(["a"], interrupted)
+
+
+def test_t23_delegate_enum_and_valid_view():
+    view = _view([_skill("analyst")], [_peer("p1", [_skill("researcher")]),
+                                       _peer("p2", [_skill("planner", verified=False)])])
+    targets = ("investigator", "analyst", "planner", "researcher")
+    assert fleet_lib.delegate_enum(targets, view) == ["analyst", "researcher"]
+    assert fleet_lib.delegate_enum(("researcher", "analyst"), view) == ["researcher", "analyst"]
+    assert fleet_lib.valid_view(view) is True
+    assert fleet_lib.valid_view(dict(view, schema="qwen-agentd.peers.v2")) is False
+    assert fleet_lib.valid_view(dict((k, v) for k, v in view.items() if k != "self")) is False
+    bad = copy.deepcopy(view)
+    bad["peers"][0]["skills"][0]["verified"] = "true"
+    assert fleet_lib.valid_view(bad) is False
+    bad = copy.deepcopy(view)
+    bad["peers"][0]["compatible"] = 1
+    assert fleet_lib.valid_view(bad) is False
+    bad = copy.deepcopy(view)
+    bad["self"]["skills"] = None
+    assert fleet_lib.valid_view(bad) is False
+    for obj in (None, [], "x", 5, {"schema": fleet_lib.PEERS_SCHEMA}):
+        assert fleet_lib.valid_view(obj) is False
+
+
+def test_t24_routes_loopback_and_daemon_url():
+    assert fleet_lib.http_route("GET", "/health") == ("signed", "health")
+    assert fleet_lib.http_route("GET", "/skills") == ("signed", "skills")
+    assert fleet_lib.http_route("POST", "/run") == ("signed", "run")
+    assert fleet_lib.http_route("GET", "/peers") == ("loopback", "peers")
+    assert fleet_lib.http_route("POST", "/delegate") == ("loopback", "delegate")
+    for method, path in (("GET", "/run"), ("POST", "/health"), ("GET", "/peers/"),
+                         ("PUT", "/peers"), ("GET", "/health?x=1"), ("GET", "/nowhere")):
+        assert fleet_lib.http_route(method, path) == ("unknown", None)
+    assert fleet_lib.is_loopback_client("127.0.0.1") is True
+    assert fleet_lib.is_loopback_client("::1") is True
+    for ip in ("127.0.0.2", "192.168.1.5", "::ffff:127.0.0.1"):
+        assert fleet_lib.is_loopback_client(ip) is False
+    assert fleet_lib.daemon_url_from_env({}) == ("http://127.0.0.1:8190", None)
+    assert fleet_lib.daemon_url_from_env({"QWEN_AGENT_DAEMON_URL": ""}) == ("http://127.0.0.1:8190", None)
+    assert fleet_lib.daemon_url_from_env({"QWEN_AGENT_DAEMON_URL": "http://127.0.0.1:18190"}) == \
+        ("http://127.0.0.1:18190", None)
+    for bad in ("http://192.168.1.5:8190", "http://localhost:8190", "https://127.0.0.1:8190",
+                "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://127.0.0.1:8190/"):
+        url, warning = fleet_lib.daemon_url_from_env({"QWEN_AGENT_DAEMON_URL": bad})
+        assert url is None
+        assert warning == ("qwen-agent: warning: ignoring QWEN_AGENT_DAEMON_URL=%s: it must be "
+                           "http://127.0.0.1:<port>; fleet routing disabled" % bad)
+
+
+def test_review_focus_3_daemon_url_with_trailing_newline_is_rejected():
+    """Review Focus 3: QWEN_AGENT_DAEMON_URL set from a file or a heredoc often ends in
+    a newline. It is rejected with the F63 warning, never half-accepted."""
+    for value in ("http://127.0.0.1:8190\n", " http://127.0.0.1:8190", "http://127.0.0.1:8190 "):
+        url, warning = fleet_lib.daemon_url_from_env({"QWEN_AGENT_DAEMON_URL": value})
+        assert url is None and warning.startswith("qwen-agent: warning: ignoring QWEN_AGENT_DAEMON_URL=")
+
+
+class _Scripted(object):
+    """An in-process loopback HTTP server: routes[(method, path)] = (status, body bytes)."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _serve(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                outer.requests.append((self.command, self.path, body))
+                status, raw = outer.routes.get((self.command, self.path), (404, b""))
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = _serve
+            do_POST = _serve
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _closed_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+_ENVELOPE = {"schema": "qwen-agent.oneshot.v1", "status": "ok", "answer": "A", "error": None,
+             "rounds": 1, "tool_calls": []}
+
+
+def test_fetch_view_mapping():
+    view = _view([_skill("analyst")], [])
+    srv = _Scripted({("GET", "/peers"): (200, json.dumps(view).encode())})
+    try:
+        assert fleet_lib.fetch_view(srv.url) == (view, None)
+        warning = ("qwen-agent: warning: qwen-agentd at %s returned an unrecognized fleet view; "
+                   "fleet routing disabled" % srv.url)
+        for status, body in ((403, b""), (200, b"not json"), (200, b'{"schema": "x"}'), (500, b"{}")):
+            srv.routes[("GET", "/peers")] = (status, body)
+            assert fleet_lib.fetch_view(srv.url) == (None, warning)
+    finally:
+        srv.close()
+    assert fleet_lib.fetch_view("http://127.0.0.1:%d" % _closed_port()) == (None, None)
+    assert fleet_lib.fetch_view(None) == (None, None)
+
+
+def test_delegate_once_mapping():
+    srv = _Scripted({})
+    try:
+        def answer(status, obj):
+            srv.routes[("POST", "/delegate")] = (status, obj if isinstance(obj, bytes) else json.dumps(obj).encode())
+            return fleet_lib.delegate_once(srv.url, "researcher", "té", "ollama-168")
+
+        assert answer(200, {"outcome": "ok", "envelope": _ENVELOPE, "detail": ""}) == ("ok", _ENVELOPE, "")
+        method, path, body = srv.requests[-1]
+        assert (method, path) == ("POST", "/delegate")
+        assert json.loads(body) == {"skill": "researcher", "task": "té", "host_id": "ollama-168"}
+        assert answer(200, {"outcome": "busy", "envelope": None, "detail": ""}) == ("busy", None, "")
+        assert answer(500, b"") == ("daemon_error", None, "http 500")
+        assert answer(200, b"[]") == ("daemon_error", None, "bad response")
+        assert answer(200, {"outcome": "ok", "detail": ""}) == ("daemon_error", None, "bad response")
+        assert answer(200, {"outcome": "ok", "envelope": {"schema": "x"}, "detail": ""}) == \
+            ("daemon_error", None, "bad response")
+        assert answer(200, b"garbage") == ("daemon_error", None, "bad response")
+    finally:
+        srv.close()
+    outcome, envelope, detail = fleet_lib.delegate_once("http://127.0.0.1:%d" % _closed_port(), "a", "t", "h")
+    assert (outcome, envelope) == ("daemon_error", None) and detail == "ConnectionRefusedError"
+    assert fleet_lib.delegate_once(None, "a", "t", "h") == ("daemon_error", None, "no daemon")
+
+
+def test_review_focus_4_proxy_environment_is_ignored(monkeypatch):
+    """Review Focus 4: the Mac runs Netskope, and shells often export proxy variables.
+    Fleet traffic goes through http.client, so a dead proxy in the environment changes
+    nothing."""
+    dead = "http://127.0.0.1:%d" % _closed_port()
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(name, dead)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    view = _view([], [])
+    srv = _Scripted({("GET", "/peers"): (200, json.dumps(view).encode()),
+                     ("POST", "/delegate"): (200, json.dumps({"outcome": "ok", "envelope": _ENVELOPE,
+                                                              "detail": ""}).encode())})
+    try:
+        assert fleet_lib.fetch_view(srv.url) == (view, None)
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h")[0] == "ok"
+    finally:
+        srv.close()
+    with open(fleet_lib.__file__, encoding="utf-8") as f:
+        source = f.read()
+    assert "import urllib" not in source and "urlopen" not in source
