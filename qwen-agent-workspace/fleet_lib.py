@@ -228,3 +228,75 @@ def self_entry(registry, host_id):
         raise RegistryError("host_id '%s' is not in the fleet registry; valid IDs: %s"
                             % (host_id, ", ".join(sorted(registry["hosts"]))))
     return registry["hosts"][host_id]
+
+
+# ---------------------------------------------------------------------------
+# Section 3: trust -- fleet.env and join strings (F19-F28)
+# ---------------------------------------------------------------------------
+
+def fleet_env_path():
+    """~/.config/qwen-agent/fleet.env, the only place the token is stored (F19)."""
+    return os.path.expanduser("~/.config/qwen-agent/fleet.env")
+
+
+def write_fleet_env(path, fleet_id, token):
+    """Create fleet.env (dir 0700, file 0600). An existing file raises FileExistsError (F20)."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write("%s=%s\n%s=%s\n" % (FLEET_ENV_KEYS[0], fleet_id, FLEET_ENV_KEYS[1], token))
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def load_fleet_env(path):
+    """(fleet_id, token) from fleet.env. A missing file raises FileNotFoundError (F21)."""
+    st = os.stat(path)
+    if st.st_mode & 0o077:
+        raise FleetEnvError("%s must be mode 0600 (chmod 600 %s)" % (path, path))
+    malformed = FleetEnvError("%s is malformed" % path)
+    try:
+        with open(path, "r", encoding="ascii", newline="") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        raise malformed
+    lines = content.split("\n")
+    if len(lines) != 3 or lines[2] != "":
+        raise malformed
+    values = []
+    for line, key, value_re in zip(lines[:2], FLEET_ENV_KEYS, (FLEET_ID_RE, TOKEN_RE)):
+        name, sep, value = line.partition("=")
+        if name != key or sep != "=" or not value_re.fullmatch(value):
+            raise malformed
+        values.append(value)
+    return values[0], values[1]
+
+
+def _join_check(fleet_id, token):
+    return hashlib.sha256((fleet_id + ":" + token).encode("ascii")).hexdigest()[:8]
+
+
+def make_join_string(fleet_id, token):
+    """qaf1.<fleet_id>.<token>.<8-hex check>; shown once by init-fleet, never stored (F24)."""
+    return JOIN_PREFIX + "." + fleet_id + "." + token + "." + _join_check(fleet_id, token)
+
+
+def parse_join_string(s):
+    """(fleet_id, token) from a join string. Surrounding whitespace is ignored (F25).
+
+    Every failure raises FleetEnvError("invalid join string"), which carries no part
+    of the input.
+    """
+    parts = s.strip().split(".") if isinstance(s, str) else []
+    if (len(parts) != 4 or parts[0] != JOIN_PREFIX
+            or not FLEET_ID_RE.fullmatch(parts[1]) or not TOKEN_RE.fullmatch(parts[2])
+            or parts[3] != _join_check(parts[1], parts[2])):
+        raise FleetEnvError("invalid join string")
+    return parts[1], parts[2]
+
+
+def token_key(token):
+    """The 32-byte HMAC key; the daemon keeps only this after startup (F27)."""
+    return bytes.fromhex(token)

@@ -176,3 +176,113 @@ def test_t4_self_entry():
         fleet_lib.self_entry(reg, "laptop")
     assert str(e.value) == ("host_id 'laptop' is not in the fleet registry; "
                             "valid IDs: mac-local, ollama-168, orchestrator")
+
+
+# --- T5, T6, T25, Review Focus 3: fleet.env and join strings (F19-F28) --------------
+
+def _write_raw(path, text, mode=0o600):
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="ascii", newline="") as f:
+        f.write(text)
+    os.chmod(str(path), mode)
+    return str(path)
+
+
+def test_t5_fleet_env_write_load_and_modes(tmp_path):
+    path = str(tmp_path / "cfg" / "qwen-agent" / "fleet.env")
+    fleet_lib.write_fleet_env(path, TEST_FLEET_ID, TEST_TOKEN)
+    assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    with open(path, encoding="ascii", newline="") as f:
+        assert f.read() == ("QWEN_AGENT_FLEET_ID=%s\nQWEN_AGENT_FLEET_TOKEN=%s\n"
+                            % (TEST_FLEET_ID, TEST_TOKEN))
+    with pytest.raises(FileExistsError):
+        fleet_lib.write_fleet_env(path, TEST_FLEET_ID, TEST_TOKEN)
+    assert fleet_lib.load_fleet_env(path) == (TEST_FLEET_ID, TEST_TOKEN)
+
+    os.chmod(path, 0o644)
+    with pytest.raises(fleet_lib.FleetEnvError) as e:
+        fleet_lib.load_fleet_env(path)
+    assert str(e.value) == "%s must be mode 0600 (chmod 600 %s)" % (path, path)
+
+    good = "QWEN_AGENT_FLEET_ID=%s\nQWEN_AGENT_FLEET_TOKEN=%s\n" % (TEST_FLEET_ID, TEST_TOKEN)
+    variants = [
+        good[:-1],                                     # no final newline
+        good + "\n",                                   # extra empty line
+        good + "EXTRA=1\n",                            # extra line
+        good.replace("\n", "\r\n"),                    # CRLF
+        "QWEN_AGENT_FLEET_TOKEN=%s\nQWEN_AGENT_FLEET_ID=%s\n" % (TEST_TOKEN, TEST_FLEET_ID),
+        good.replace(TEST_FLEET_ID, TEST_FLEET_ID.upper()),
+        good.replace(TEST_TOKEN, TEST_TOKEN[:-2]),
+        good.replace("QWEN_AGENT_FLEET_ID=", "QWEN_AGENT_FLEET_ID = "),
+        "",
+    ]
+    for i, text in enumerate(variants):
+        bad = _write_raw(tmp_path / ("bad%d.env" % i), text)
+        with pytest.raises(fleet_lib.FleetEnvError) as e:
+            fleet_lib.load_fleet_env(bad)
+        assert str(e.value) == "%s is malformed" % bad, i
+    with pytest.raises(FileNotFoundError):
+        fleet_lib.load_fleet_env(str(tmp_path / "absent.env"))
+
+
+def test_t6_join_string_round_trip_and_tamper():
+    s = fleet_lib.make_join_string(TEST_FLEET_ID, TEST_TOKEN)
+    check = hashlib.sha256((TEST_FLEET_ID + ":" + TEST_TOKEN).encode("ascii")).hexdigest()[:8]
+    assert s == "qaf1.%s.%s.%s" % (TEST_FLEET_ID, TEST_TOKEN, check)
+    assert fleet_lib.parse_join_string(s) == (TEST_FLEET_ID, TEST_TOKEN)
+    other_id = "1" + TEST_FLEET_ID[1:]
+    other_token = "6" + TEST_TOKEN[1:]
+    tampered = [
+        s[:-1] + ("0" if s[-1] != "0" else "1"),                      # checksum
+        "qaf2" + s[4:],                                                # prefix
+        s + ".extra",                                                  # part count
+        s.replace(".", "", 1),                                         # part count
+        "qaf1.%s.%s.%s" % (other_id, TEST_TOKEN, check),               # fleet_id
+        "qaf1.%s.%s.%s" % (TEST_FLEET_ID, other_token, check),         # token
+        "qaf1.%s.%s.%s" % (TEST_FLEET_ID.upper(), TEST_TOKEN, check),  # case
+        "",
+    ]
+    for bad in tampered:
+        with pytest.raises(fleet_lib.FleetEnvError) as e:
+            fleet_lib.parse_join_string(bad)
+        message = str(e.value)
+        assert message == "invalid join string"
+        for i in range(len(bad) - 5):
+            assert bad[i:i + 6] not in message
+
+
+def test_review_focus_3_pasted_join_string_whitespace():
+    """Review Focus 3: a join string pasted with spaces, a tab, or a trailing newline
+    still parses; one with whitespace inside it does not."""
+    s = fleet_lib.make_join_string(TEST_FLEET_ID, TEST_TOKEN)
+    for pasted in ("  " + s, s + "\n", "\t" + s + " \r\n"):
+        assert fleet_lib.parse_join_string(pasted) == (TEST_FLEET_ID, TEST_TOKEN)
+    with pytest.raises(fleet_lib.FleetEnvError):
+        fleet_lib.parse_join_string(s[:20] + " " + s[20:])
+    assert fleet_lib.token_key(TEST_TOKEN) == bytes.fromhex(TEST_TOKEN)
+    assert len(fleet_lib.token_key(TEST_TOKEN)) == 32
+
+
+def test_t25_token_not_in_git_tree():
+    path = fleet_lib.fleet_env_path()
+    if not os.path.exists(path):
+        pytest.skip("no fleet.env on this host")
+    inside = subprocess.run(["git", "-C", WS, "rev-parse", "--is-inside-work-tree"],
+                            capture_output=True, text=True)
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        pytest.skip("WS is not in a git worktree")
+    _fleet_id, token = fleet_lib.load_fleet_env(path)
+    needles = (token.encode("ascii"), fleet_lib.token_key(token))
+    listing = subprocess.run(["git", "-C", WS, "ls-files", "-z"], capture_output=True)
+    assert listing.returncode == 0
+    leaked = []
+    for rel in listing.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        full = os.path.join(WS, rel)
+        if not rel or not os.path.isfile(full) or os.path.islink(full):
+            continue
+        with open(full, "rb") as f:
+            data = f.read()
+        if any(n in data for n in needles):
+            leaked.append(rel)
+    assert leaked == [], "fleet token or key bytes found in tracked files: %s" % leaked
