@@ -300,3 +300,179 @@ def parse_join_string(s):
 def token_key(token):
     """The 32-byte HMAC key; the daemon keeps only this after startup (F27)."""
     return bytes.fromhex(token)
+
+
+# ---------------------------------------------------------------------------
+# Section 4: signing primitives (F29b-F29j)
+# ---------------------------------------------------------------------------
+
+_BEACON_KEYS = frozenset(("proto", "fleet_tag", "port", "ts", "nonce", "sig"))
+_HDR_TS_RE = re.compile(r"[0-9]{1,15}")
+_HDR_NONCE_RE = re.compile(r"[0-9a-f]{32}")
+_HDR_SIG_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def fleet_tag(key):
+    """The 16-hex fleet marker carried by every beacon (F29b)."""
+    return hmac.new(key, b"fleet-tag", hashlib.sha256).hexdigest()[:FLEET_TAG_CHARS]
+
+
+def canonical_json(obj):
+    """The one JSON encoding signed and sent everywhere in the fleet (F29c)."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _hmac_hex(key, data):
+    return hmac.new(key, data, hashlib.sha256).hexdigest()
+
+
+def _safe_equal(a, b):
+    """Constant-time compare of two str values that never raises.
+
+    hmac.compare_digest raises TypeError on non-ASCII str; attacker-chosen text
+    (a beacon field, a header) must simply fail to match instead.
+    """
+    try:
+        return hmac.compare_digest(a.encode("ascii"), b.encode("ascii"))
+    except UnicodeEncodeError:
+        return False
+
+
+class NonceCache(object):
+    """Nonces seen within the last `retention` seconds of `clock()` (F29d)."""
+
+    def __init__(self, retention=NONCE_RETENTION, clock=time.time):
+        self.retention = retention
+        self.clock = clock
+        self._seen = {}
+        self._lock = threading.Lock()
+
+    def check_and_add(self, nonce):
+        """False if nonce was added less than `retention` seconds ago; else record it, True."""
+        with self._lock:
+            now = self.clock()
+            added = self._seen.get(nonce)
+            if added is not None and now - added < self.retention:
+                return False
+            self._seen[nonce] = now
+            return True
+
+    def prune(self):
+        with self._lock:
+            now = self.clock()
+            for nonce in [n for n, added in self._seen.items() if now - added >= self.retention]:
+                del self._seen[nonce]
+
+    def __len__(self):
+        with self._lock:
+            return len(self._seen)
+
+
+def make_beacon(key, port, now, nonce):
+    """A signed beacon: no host_id, skills or version ever cross in one (F29f)."""
+    beacon = {"proto": PROTOCOL, "fleet_tag": fleet_tag(key), "port": port, "ts": now, "nonce": nonce}
+    beacon["sig"] = _hmac_hex(key, canonical_json(beacon))
+    return canonical_json(beacon)
+
+
+def verify_beacon(key, data, now, cache):
+    """(status, beacon or None) with status in ok/malformed/foreign/bad_sig/skew/replay (F29g)."""
+    try:
+        beacon = json.loads(data)
+    except (ValueError, RecursionError):
+        return "malformed", None
+    if not isinstance(beacon, dict) or set(beacon) != _BEACON_KEYS:
+        return "malformed", None
+    if not all(_is_int(beacon[k]) for k in ("proto", "port", "ts")):
+        return "malformed", None
+    if not all(isinstance(beacon[k], str) for k in ("fleet_tag", "nonce", "sig")):
+        return "malformed", None
+    if beacon["proto"] != PROTOCOL:
+        return "malformed", None
+    if not _safe_equal(beacon["fleet_tag"], fleet_tag(key)):
+        return "foreign", None
+    unsigned = dict((k, v) for k, v in beacon.items() if k != "sig")
+    if not _safe_equal(beacon["sig"], _hmac_hex(key, canonical_json(unsigned))):
+        return "bad_sig", None
+    if abs(now - beacon["ts"]) > SKEW_WINDOW:
+        return "skew", beacon
+    if not cache.check_and_add(beacon["nonce"]):
+        return "replay", None
+    return "ok", beacon
+
+
+def _sha256_hex(body):
+    return hashlib.sha256(body).hexdigest()
+
+
+def _request_input(method, path, ts_text, nonce, body):
+    return ("qwen-agentd-req-v1\n" + method + "\n" + path + "\n" + ts_text + "\n" + nonce
+            + "\n" + _sha256_hex(body)).encode("ascii")
+
+
+def _response_input(status_code, method, path, request_nonce, ts_text, nonce, body):
+    return ("qwen-agentd-resp-v1\n" + str(status_code) + "\n" + method + "\n" + path + "\n"
+            + request_nonce + "\n" + ts_text + "\n" + nonce + "\n" + _sha256_hex(body)).encode("ascii")
+
+
+def _signature_headers(headers):
+    """(ts_text, nonce, sig) from X-Fleet-* headers, or None when any is missing or malformed."""
+    try:
+        values = tuple(headers.get(name) for name in ("X-Fleet-Ts", "X-Fleet-Nonce", "X-Fleet-Sig"))
+    except Exception:
+        return None
+    if not all(isinstance(v, str) for v in values):
+        return None
+    ts_text, nonce, sig = values
+    if not (_HDR_TS_RE.fullmatch(ts_text) and _HDR_NONCE_RE.fullmatch(nonce)
+            and _HDR_SIG_RE.fullmatch(sig)):
+        return None
+    return values
+
+
+def _verify_signed(key, build_input, headers, now, cache):
+    parsed = _signature_headers(headers)
+    if parsed is None:
+        return "bad"
+    ts_text, nonce, sig = parsed
+    try:
+        expected = _hmac_hex(key, build_input(ts_text, nonce))
+    except UnicodeEncodeError:
+        return "bad"
+    if not hmac.compare_digest(sig, expected):
+        return "bad"
+    if abs(now - int(ts_text)) > SKEW_WINDOW:
+        return "skew"
+    if not cache.check_and_add(nonce):
+        return "replay"
+    return "ok"
+
+
+def sign_request(key, method, path, body, now, nonce):
+    """The three X-Fleet-* request headers (F29h)."""
+    ts_text = str(now)
+    return {"X-Fleet-Ts": ts_text, "X-Fleet-Nonce": nonce,
+            "X-Fleet-Sig": _hmac_hex(key, _request_input(method, path, ts_text, nonce, body))}
+
+
+def verify_request(key, method, path, headers, body, now, cache):
+    """"ok", "bad", "skew" or "replay": headers, then signature, then skew, then replay (F29h)."""
+    return _verify_signed(
+        key, lambda ts_text, nonce: _request_input(method, path, ts_text, nonce, body),
+        headers, now, cache)
+
+
+def sign_response(key, status_code, method, path, request_nonce, body, now, nonce):
+    """The three X-Fleet-* response headers, bound to the request's nonce (F29i)."""
+    ts_text = str(now)
+    return {"X-Fleet-Ts": ts_text, "X-Fleet-Nonce": nonce,
+            "X-Fleet-Sig": _hmac_hex(key, _response_input(status_code, method, path, request_nonce,
+                                                          ts_text, nonce, body))}
+
+
+def verify_response(key, status_code, method, path, request_nonce, headers, body, now, cache):
+    """Same statuses and order as verify_request (F29i)."""
+    return _verify_signed(
+        key, lambda ts_text, nonce: _response_input(status_code, method, path, request_nonce,
+                                                    ts_text, nonce, body),
+        headers, now, cache)

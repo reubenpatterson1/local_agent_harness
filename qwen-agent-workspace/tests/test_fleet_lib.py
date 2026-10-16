@@ -286,3 +286,181 @@ def test_t25_token_not_in_git_tree():
         if any(n in data for n in needles):
             leaked.append(rel)
     assert leaked == [], "fleet token or key bytes found in tracked files: %s" % leaked
+
+
+# --- T10-T11, T13-T18: signing primitives (F29b-F29j) ---------------------------------
+
+KEY = bytes.fromhex(TEST_TOKEN)
+OTHER_KEY = bytes.fromhex(OTHER_TOKEN)
+NOW = 1760000000
+NONCE_A = "a" * 32
+NONCE_B = "b" * 32
+NONCE_C = "c" * 32
+
+
+class _Clock(object):
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _beacon_dict(raw):
+    return json.loads(raw)
+
+
+def _resign(key, beacon):
+    unsigned = dict((k, v) for k, v in beacon.items() if k != "sig")
+    beacon = dict(unsigned)
+    beacon["sig"] = hmac.new(key, fleet_lib.canonical_json(unsigned), hashlib.sha256).hexdigest()
+    return fleet_lib.canonical_json(beacon)
+
+
+def test_t10_request_sign_verify():
+    body = b'{"skill":"researcher"}'
+    headers = fleet_lib.sign_request(KEY, "POST", "/run", body, NOW, NONCE_A)
+    assert set(headers) == {"X-Fleet-Ts", "X-Fleet-Nonce", "X-Fleet-Sig"}
+    assert fleet_lib.verify_request(KEY, "POST", "/run", headers, body, NOW,
+                                    fleet_lib.NonceCache()) == "ok"
+    changed = [
+        ("GET", "/run", headers, body),
+        ("POST", "/runx", headers, body),
+        ("POST", "/run", dict(headers, **{"X-Fleet-Ts": str(NOW + 1)}), body),
+        ("POST", "/run", dict(headers, **{"X-Fleet-Nonce": NONCE_B}), body),
+        ("POST", "/run", headers, body + b" "),
+        ("POST", "/run", dict(headers, **{"X-Fleet-Sig": "0" * 64}), body),
+    ]
+    for method, path, hdrs, b in changed:
+        assert fleet_lib.verify_request(KEY, method, path, hdrs, b, NOW,
+                                        fleet_lib.NonceCache()) == "bad"
+    for name in headers:
+        missing = dict(headers)
+        del missing[name]
+        assert fleet_lib.verify_request(KEY, "POST", "/run", missing, body, NOW,
+                                        fleet_lib.NonceCache()) == "bad"
+    for name, value in (("X-Fleet-Sig", "z" * 64), ("X-Fleet-Nonce", "Z" * 32), ("X-Fleet-Ts", "12a")):
+        assert fleet_lib.verify_request(KEY, "POST", "/run", dict(headers, **{name: value}), body,
+                                        NOW, fleet_lib.NonceCache()) == "bad"
+    assert fleet_lib.verify_request(OTHER_KEY, "POST", "/run", headers, body, NOW,
+                                    fleet_lib.NonceCache()) == "bad"
+
+
+def test_t11_response_sign_verify():
+    body = b'{"schema":"qwen-agent.oneshot.v1"}'
+    headers = fleet_lib.sign_response(KEY, 200, "POST", "/run", NONCE_A, body, NOW, NONCE_B)
+    assert fleet_lib.verify_response(KEY, 200, "POST", "/run", NONCE_A, headers, body, NOW,
+                                     fleet_lib.NonceCache()) == "ok"
+    for args in ((KEY, 200, "POST", "/run", NONCE_C, headers, body),
+                 (KEY, 409, "POST", "/run", NONCE_A, headers, body),
+                 (KEY, 200, "GET", "/run", NONCE_A, headers, body),
+                 (KEY, 200, "POST", "/health", NONCE_A, headers, body),
+                 (KEY, 200, "POST", "/run", NONCE_A, headers, body + b"x")):
+        assert fleet_lib.verify_response(*(args + (NOW, fleet_lib.NonceCache()))) == "bad"
+
+
+def test_t13_beacon_statuses():
+    raw = fleet_lib.make_beacon(KEY, 8190, NOW, NONCE_A)
+    status, beacon = fleet_lib.verify_beacon(KEY, raw, NOW, fleet_lib.NonceCache())
+    assert status == "ok" and beacon["port"] == 8190 and beacon["nonce"] == NONCE_A
+    good = _beacon_dict(raw)
+    malformed = [
+        b"not json",
+        b"[1, 2]",
+        fleet_lib.canonical_json(dict((k, v) for k, v in good.items() if k != "port")),
+        fleet_lib.canonical_json(dict(good, extra=1)),
+        fleet_lib.canonical_json(dict(good, port="8190")),
+        fleet_lib.canonical_json(dict(good, ts=True)),
+        fleet_lib.canonical_json(dict(good, nonce=5)),
+        _resign(KEY, dict(good, proto=2)),
+    ]
+    for data in malformed:
+        assert fleet_lib.verify_beacon(KEY, data, NOW, fleet_lib.NonceCache()) == ("malformed", None)
+    for field, value in (("port", 8191), ("ts", NOW - 1), ("nonce", NONCE_B)):
+        tampered = fleet_lib.canonical_json(dict(good, **{field: value}))
+        assert fleet_lib.verify_beacon(KEY, tampered, NOW, fleet_lib.NonceCache()) == ("bad_sig", None)
+
+
+def test_t14_replays_are_rejected():
+    cache = fleet_lib.NonceCache()
+    raw = fleet_lib.make_beacon(KEY, 8190, NOW, NONCE_A)
+    assert fleet_lib.verify_beacon(KEY, raw, NOW, cache)[0] == "ok"
+    assert fleet_lib.verify_beacon(KEY, raw, NOW, cache) == ("replay", None)
+
+    cache = fleet_lib.NonceCache()
+    headers = fleet_lib.sign_request(KEY, "GET", "/health", b"", NOW, NONCE_B)
+    assert fleet_lib.verify_request(KEY, "GET", "/health", headers, b"", NOW, cache) == "ok"
+    assert fleet_lib.verify_request(KEY, "GET", "/health", headers, b"", NOW, cache) == "replay"
+
+    cache = fleet_lib.NonceCache()
+    headers = fleet_lib.sign_response(KEY, 200, "GET", "/health", NONCE_B, b"{}", NOW, NONCE_C)
+    args = (KEY, 200, "GET", "/health", NONCE_B, headers, b"{}", NOW, cache)
+    assert fleet_lib.verify_response(*args) == "ok"
+    assert fleet_lib.verify_response(*args) == "replay"
+
+
+def test_t15_skew_window_is_60_seconds():
+    for ts, expected in ((NOW - 60, "ok"), (NOW + 60, "ok"), (NOW - 61, "skew"), (NOW + 61, "skew")):
+        raw = fleet_lib.make_beacon(KEY, 8190, ts, NONCE_A)
+        status, beacon = fleet_lib.verify_beacon(KEY, raw, NOW, fleet_lib.NonceCache())
+        assert status == expected, ("beacon", ts)
+        if expected == "skew":
+            assert beacon["ts"] == ts
+        headers = fleet_lib.sign_request(KEY, "GET", "/health", b"", ts, NONCE_A)
+        assert fleet_lib.verify_request(KEY, "GET", "/health", headers, b"", NOW,
+                                        fleet_lib.NonceCache()) == expected, ("request", ts)
+        headers = fleet_lib.sign_response(KEY, 200, "GET", "/health", NONCE_B, b"", ts, NONCE_A)
+        assert fleet_lib.verify_response(KEY, 200, "GET", "/health", NONCE_B, headers, b"", NOW,
+                                         fleet_lib.NonceCache()) == expected, ("response", ts)
+
+
+def test_t16_foreign_beacon_checked_before_signature():
+    raw = fleet_lib.make_beacon(OTHER_KEY, 8190, NOW, NONCE_A)
+    assert fleet_lib.verify_beacon(KEY, raw, NOW, fleet_lib.NonceCache()) == ("foreign", None)
+    # A foreign tag with a garbage signature is still "foreign", not "bad_sig".
+    garbage = fleet_lib.canonical_json(dict(_beacon_dict(raw), sig="x"))
+    assert fleet_lib.verify_beacon(KEY, garbage, NOW, fleet_lib.NonceCache()) == ("foreign", None)
+    assert fleet_lib.fleet_tag(KEY) != fleet_lib.fleet_tag(OTHER_KEY)
+    assert len(fleet_lib.fleet_tag(KEY)) == 16
+
+
+def test_t17_nonce_cache_retention():
+    clock = _Clock(1000.0)
+    cache = fleet_lib.NonceCache(retention=120, clock=clock)
+    assert cache.check_and_add("n1") is True
+    clock.t = 1119.9
+    assert cache.check_and_add("n1") is False
+    clock.t = 1120.1
+    assert cache.check_and_add("n1") is True        # re-recorded at 1120.1
+    assert cache.check_and_add("n2") is True
+    clock.t = 1300.0
+    cache.prune()
+    assert len(cache) == 0
+
+
+def test_t18_beacon_carries_no_secret():
+    raw = fleet_lib.make_beacon(KEY, 8190, NOW, NONCE_A)
+    assert TEST_TOKEN.encode("ascii") not in raw
+    assert KEY not in raw
+    assert KEY.hex().encode("ascii") not in raw
+    assert len(raw) < 2048
+    assert set(_beacon_dict(raw)) == {"proto", "fleet_tag", "port", "ts", "nonce", "sig"}
+
+
+def test_signing_never_raises_on_hostile_input():
+    """LAN noise or a hostile sender: non-ASCII text, deep nesting and odd header
+    containers must come back as a plain status, never as an exception (an exception
+    would reach the daemon's thread guard and write a log line, breaking F29a)."""
+    good = _beacon_dict(fleet_lib.make_beacon(KEY, 8190, NOW, NONCE_A))
+    cache = fleet_lib.NonceCache()
+    assert fleet_lib.verify_beacon(KEY, fleet_lib.canonical_json(dict(good, fleet_tag="é" * 16)),
+                                   NOW, cache) == ("foreign", None)
+    assert fleet_lib.verify_beacon(KEY, fleet_lib.canonical_json(dict(good, sig="é" * 64)),
+                                   NOW, cache) == ("bad_sig", None)
+    assert fleet_lib.verify_beacon(KEY, b"[" * 3000, NOW, cache) == ("malformed", None)
+    assert fleet_lib.verify_beacon(KEY, b"\xff\xfe\x00", NOW, cache) == ("malformed", None)
+    headers = fleet_lib.sign_request(KEY, "GET", "/health", b"", NOW, NONCE_A)
+    assert fleet_lib.verify_request(KEY, "GET", "/héalth", headers, b"", NOW, cache) == "bad"
+    assert fleet_lib.verify_request(KEY, "GET", "/health", dict(headers, **{"X-Fleet-Nonce": "é" * 32}),
+                                    b"", NOW, cache) == "bad"
+    assert fleet_lib.verify_request(KEY, "GET", "/health", None, b"", NOW, cache) == "bad"
