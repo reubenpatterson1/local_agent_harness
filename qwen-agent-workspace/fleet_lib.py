@@ -823,3 +823,164 @@ def delegate_once(daemon_url, skill, task, host_id):
                                        and obj["envelope"].get("schema") == ONESHOT_SCHEMA):
         return "daemon_error", None, "bad response"
     return obj["outcome"], obj["envelope"], obj["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Sections 9 and 10.5: deploy root, releases, update state, the update cycle,
+# and the log directory (F80-F85a, F88a, F107)
+# ---------------------------------------------------------------------------
+
+_STATUSES = ("ok", "pending", "rolled_back")
+
+
+def deploy_root():
+    """D = ~/.local/share/qwen-agent, the same on every host (F80)."""
+    return os.path.expanduser(DEPLOY_ROOT)
+
+
+def log_dir():
+    """The daemon's log directory (F107)."""
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Logs/qwen-agentd")
+    return os.path.expanduser("~/.local/state/qwen-agentd")
+
+
+def tag_key(tag):
+    """(year, month, day, n) for a release tag, else None. Tags compare only by this (F81)."""
+    if not isinstance(tag, str):
+        return None
+    match = TAG_RE.fullmatch(tag)
+    if match is None:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4) or 0))
+
+
+def select_candidate(tags, current, bad_tags, is_ancestor):
+    """The highest tag newer than current that descends from it and is not bad (F85a)."""
+    ck = tag_key(current)
+    if ck is None:
+        return None
+    newer = [t for t in set(tags)
+             if tag_key(t) is not None and tag_key(t) > ck and t not in bad_tags]
+    for t in sorted(newer, key=tag_key, reverse=True):
+        if is_ancestor(current, t):
+            return t
+    return None
+
+
+def _default_state():
+    return {"from": None, "to": None, "status": "ok", "attempts": 0, "bad_tags": []}
+
+
+def _valid_state(state):
+    return (isinstance(state, dict)
+            and set(state) == {"from", "to", "status", "attempts", "bad_tags"}
+            and (state["from"] is None or isinstance(state["from"], str))
+            and (state["to"] is None or isinstance(state["to"], str))
+            and isinstance(state["status"], str) and state["status"] in _STATUSES
+            and _is_int(state["attempts"]) and state["attempts"] >= 0
+            and isinstance(state["bad_tags"], list)
+            and all(isinstance(t, str) for t in state["bad_tags"]))
+
+
+def read_state(path):
+    """The update state, or the default state when missing or invalid. Never raises (F83)."""
+    try:
+        with open(path, "rb") as f:
+            state = json.loads(f.read())
+    except Exception:
+        return _default_state()
+    return state if _valid_state(state) else _default_state()
+
+
+def write_state(path, state):
+    """Atomically replace the state file with canonical JSON plus a newline, mode 0600 (F83)."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(canonical_json(state) + b"\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def releases_to_prune(present, current, state):
+    """Release names to unstage: never current, state["from"], or the 3 newest (F88a)."""
+    cands = [n for n in present if tag_key(n) is not None]
+    keep = {current}
+    if state.get("from") is not None:
+        keep.add(state["from"])
+    keep.update(sorted(cands, key=tag_key, reverse=True)[:KEEP_RELEASES])
+    return sorted([n for n in cands if n not in keep], key=tag_key)
+
+
+def release_version(repo_root, deploy_root):
+    """The tag when repo_root is D/releases/<tag>/qwen-agent-workspace, else "dev" (F82)."""
+    rr = os.path.realpath(repo_root)
+    parent = os.path.dirname(rr)
+    if (os.path.basename(rr) == WS_SUBDIR
+            and os.path.dirname(parent) == os.path.realpath(os.path.join(deploy_root, "releases"))
+            and tag_key(os.path.basename(parent)) is not None):
+        return os.path.basename(parent)
+    return "dev"
+
+
+def run_update_cycle(ctx):
+    """One self-update cycle over the F85 ctx interface; returns the outcome string (F84, F85)."""
+    ok, detail = ctx.fetch()
+    if not ok:
+        ctx.log("WARNING", "update: git fetch failed (%s); retrying next cycle" % detail)
+        return "fetch_failed"
+    state = ctx.read_state()
+    cur = ctx.current_tag()
+    cand = select_candidate(ctx.list_tags(), cur, state["bad_tags"], ctx.is_ancestor)
+    if cand is None:
+        return "up_to_date"
+    if ctx.is_dirty():
+        ctx.log("WARNING", "update: %s available but the current release has modified tracked "
+                           "files; not updating" % cand)
+        return "dirty"
+    if not ctx.try_lock():
+        ctx.log("INFO", "update: %s deferred: a run is in flight" % cand)
+        return "busy"
+    held = [True]
+
+    def release():
+        if held[0]:
+            held[0] = False
+            ctx.unlock()
+
+    try:
+        ok, detail = ctx.stage(cand)
+        if not ok:
+            release()
+            ctx.log("WARNING", "update: staging %s failed (%s)" % (cand, detail))
+            return "stage_failed"
+        ok, detail = ctx.gate(cand)
+        if not ok:
+            state = ctx.read_state()
+            if cand not in state["bad_tags"]:
+                state["bad_tags"].append(cand)
+            ctx.write_state(state)
+            ctx.unstage(cand)
+            release()
+            ctx.log("WARNING", "update: %s failed its gate (%s); marked bad" % (cand, detail))
+            return "gate_failed"
+        prev = ctx.read_state()
+        ctx.write_state({"from": cur, "to": cand, "status": "pending", "attempts": 0,
+                         "bad_tags": prev["bad_tags"]})
+        ctx.log("INFO", "update: switching %s -> %s" % (cur, cand))
+        try:
+            ctx.swap(cand)
+        except Exception as e:
+            ctx.write_state(prev)
+            release()
+            ctx.log("ERROR", "update: swap to %s failed (%s: %s)" % (cand, type(e).__name__, e))
+            return "error"
+    except Exception as e:
+        release()
+        ctx.log("ERROR", "update: %s: %s" % (type(e).__name__, e))
+        return "error"
+    ctx.restart()
+    return "switched"

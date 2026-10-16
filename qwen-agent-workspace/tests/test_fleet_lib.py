@@ -862,3 +862,209 @@ def test_review_focus_4_proxy_environment_is_ignored(monkeypatch):
     with open(fleet_lib.__file__, encoding="utf-8") as f:
         source = f.read()
     assert "import urllib" not in source and "urlopen" not in source
+
+
+# --- T27, T28, T29a: tags, the update cycle, state, pruning, version (F80-F88a) -----
+
+def test_t27_tag_key_and_select_candidate():
+    ordered = ["v2026.10.17", "v2026.10.17.1", "v2026.10.17.2", "v2026.10.17.10", "v2026.10.18"]
+    assert sorted(reversed(ordered), key=fleet_lib.tag_key) == ordered
+    assert fleet_lib.tag_key("v2026.10.17.10") == (2026, 10, 17, 10)
+    for bad in ("v2026.10.17.0", "2026.10.17", "v2026.1.17", "vX", "v2026.10.17\n", "", None, "dev"):
+        assert fleet_lib.tag_key(bad) is None, bad
+
+    def ancestor_of(pairs):
+        return lambda a, b: (a, b) in pairs
+
+    tags = ["v2026.10.17", "v2026.10.18", "v2026.10.19", "v2026.10.20", "v2026.10.16", "junk", "v2026.10.18"]
+    every = ancestor_of({("v2026.10.17", t) for t in tags})
+    assert fleet_lib.select_candidate(tags, "v2026.10.17", [], every) == "v2026.10.20"
+    # A higher tag that does not descend from current is skipped.
+    some = ancestor_of({("v2026.10.17", "v2026.10.18"), ("v2026.10.17", "v2026.10.19")})
+    assert fleet_lib.select_candidate(tags, "v2026.10.17", [], some) == "v2026.10.19"
+    assert fleet_lib.select_candidate(tags, "v2026.10.17", ["v2026.10.20", "v2026.10.19"], every) == "v2026.10.18"
+    assert fleet_lib.select_candidate(["v2026.10.16", "v2026.10.17", "x"], "v2026.10.17", [], every) is None
+    assert fleet_lib.select_candidate(tags, "dev", [], every) is None
+    asked = []
+
+    def lazy(a, b):
+        asked.append(b)
+        return True
+
+    assert fleet_lib.select_candidate(tags, "v2026.10.17", [], lazy) == "v2026.10.20"
+    assert asked == ["v2026.10.20"]
+
+
+class _FakeCtx(object):
+    """A scripted F85 ctx that records every call in order."""
+
+    def __init__(self, tags=("v2026.01.01", "v2026.01.02"), fetch_ok=True, dirty=False,
+                 lock_free=True, stage_ok=True, gate_ok=True, stage_raises=False, swap_raises=False):
+        self.tags = list(tags)
+        self.fetch_ok, self.dirty, self.lock_free = fetch_ok, dirty, lock_free
+        self.stage_ok, self.gate_ok = stage_ok, gate_ok
+        self.stage_raises, self.swap_raises = stage_raises, swap_raises
+        self.state = {"from": None, "to": "v2026.01.01", "status": "ok", "attempts": 0,
+                      "bad_tags": ["v2025.12.31"]}
+        self.locked = False
+        self.calls = []
+        self.logs = []
+
+    def fetch(self):
+        self.calls.append("fetch")
+        return (True, "") if self.fetch_ok else (False, "exit 128: fatal: unable to access")
+
+    def list_tags(self):
+        return list(self.tags)
+
+    def is_ancestor(self, a, b):
+        return True
+
+    def current_tag(self):
+        return "v2026.01.01"
+
+    def is_dirty(self):
+        return self.dirty
+
+    def try_lock(self):
+        if not self.lock_free:
+            return False
+        self.locked = True
+        self.calls.append("lock")
+        return True
+
+    def unlock(self):
+        assert self.locked
+        self.locked = False
+        self.calls.append("unlock")
+
+    def read_state(self):
+        return copy.deepcopy(self.state)
+
+    def write_state(self, state):
+        self.calls.append(("write_state", copy.deepcopy(state)))
+        self.state = copy.deepcopy(state)
+
+    def stage(self, tag):
+        self.calls.append(("stage", tag))
+        if self.stage_raises:
+            raise RuntimeError("disk full")
+        return (True, "") if self.stage_ok else (False, "exit 128: fatal: invalid reference")
+
+    def gate(self, tag):
+        self.calls.append(("gate", tag))
+        return (True, "") if self.gate_ok else (False, "selftest exit 1")
+
+    def unstage(self, tag):
+        self.calls.append(("unstage", tag))
+
+    def swap(self, tag):
+        self.calls.append(("swap", tag))
+        if self.swap_raises:
+            raise OSError("read-only file system")
+
+    def restart(self):
+        self.calls.append("restart")
+
+    def log(self, level, msg):
+        self.logs.append((level, msg))
+
+
+def test_t28_run_update_cycle_outcomes():
+    ctx = _FakeCtx(fetch_ok=False)
+    assert fleet_lib.run_update_cycle(ctx) == "fetch_failed"
+    assert ctx.logs == [("WARNING", "update: git fetch failed (exit 128: fatal: unable to access); "
+                                    "retrying next cycle")]
+
+    ctx = _FakeCtx(tags=("v2026.01.01",))
+    assert fleet_lib.run_update_cycle(ctx) == "up_to_date" and ctx.logs == []
+
+    ctx = _FakeCtx(dirty=True)
+    assert fleet_lib.run_update_cycle(ctx) == "dirty"
+    assert ctx.logs[0][0] == "WARNING" and "not updating" in ctx.logs[0][1]
+
+    ctx = _FakeCtx(lock_free=False)
+    assert fleet_lib.run_update_cycle(ctx) == "busy"
+    assert ctx.logs == [("INFO", "update: v2026.01.02 deferred: a run is in flight")]
+
+    ctx = _FakeCtx(stage_ok=False)
+    assert fleet_lib.run_update_cycle(ctx) == "stage_failed"
+    assert not ctx.locked and "unlock" in ctx.calls
+    assert ctx.state["bad_tags"] == ["v2025.12.31"]
+
+    ctx = _FakeCtx(gate_ok=False)
+    assert fleet_lib.run_update_cycle(ctx) == "gate_failed"
+    assert not ctx.locked
+    assert ctx.state["bad_tags"] == ["v2025.12.31", "v2026.01.02"]
+    assert ("unstage", "v2026.01.02") in ctx.calls
+    assert ctx.logs[-1] == ("WARNING", "update: v2026.01.02 failed its gate (selftest exit 1); marked bad")
+
+    ctx = _FakeCtx(stage_raises=True)
+    assert fleet_lib.run_update_cycle(ctx) == "error"
+    assert not ctx.locked and ctx.logs[-1] == ("ERROR", "update: RuntimeError: disk full")
+
+    ctx = _FakeCtx(swap_raises=True)
+    before = copy.deepcopy(ctx.state)
+    assert fleet_lib.run_update_cycle(ctx) == "error"
+    assert not ctx.locked and ctx.state == before and "restart" not in ctx.calls
+
+    ctx = _FakeCtx()
+    assert fleet_lib.run_update_cycle(ctx) == "switched"
+    pending = {"from": "v2026.01.01", "to": "v2026.01.02", "status": "pending", "attempts": 0,
+               "bad_tags": ["v2025.12.31"]}
+    i_write = ctx.calls.index(("write_state", pending))
+    i_swap = ctx.calls.index(("swap", "v2026.01.02"))
+    assert i_write < i_swap < ctx.calls.index("restart")
+    assert ctx.locked is True          # held through the restart (F85 step 4)
+    assert ("INFO", "update: switching v2026.01.01 -> v2026.01.02") in ctx.logs
+
+
+def test_t29a_state_io_prune_and_version(tmp_path):
+    default = {"from": None, "to": None, "status": "ok", "attempts": 0, "bad_tags": []}
+    path = str(tmp_path / "update-state.json")
+    assert fleet_lib.read_state(path) == default
+    for text in ("not json", "[]", '{"from": null}',
+                 '{"from": null, "to": null, "status": "weird", "attempts": 0, "bad_tags": []}',
+                 '{"from": null, "to": null, "status": "ok", "attempts": true, "bad_tags": []}',
+                 '{"from": null, "to": null, "status": "ok", "attempts": -1, "bad_tags": []}',
+                 '{"from": 1, "to": null, "status": "ok", "attempts": 0, "bad_tags": []}',
+                 '{"from": null, "to": null, "status": "ok", "attempts": 0, "bad_tags": [1]}'):
+        with open(path, "w") as f:
+            f.write(text)
+        assert fleet_lib.read_state(path) == default, text
+    state = {"from": "v2026.01.01", "to": "v2026.01.02", "status": "pending", "attempts": 2,
+             "bad_tags": ["v2026.01.03"]}
+    fleet_lib.write_state(path, state)
+    assert fleet_lib.read_state(path) == state
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert not os.path.exists(path + ".tmp")
+    with open(path, "rb") as f:
+        assert f.read() == fleet_lib.canonical_json(state) + b"\n"
+
+    present = ["v2026.01.01", "v2026.01.02", "v2026.01.03", "v2026.01.04", "v2026.01.05",
+               "v2026.01.06", "notes", ".DS_Store"]
+    st = {"from": "v2026.01.02", "to": "v2026.01.03", "status": "ok", "attempts": 0, "bad_tags": []}
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st) == ["v2026.01.01"]
+    st["from"] = None
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st) == ["v2026.01.01", "v2026.01.02"]
+
+    d = tmp_path / "D"
+    ws = d / "releases" / "v2026.10.17" / "qwen-agent-workspace"
+    ws.mkdir(parents=True)
+    assert fleet_lib.release_version(str(ws), str(d)) == "v2026.10.17"
+    (d / "current").symlink_to("releases/v2026.10.17")
+    assert fleet_lib.release_version(str(d / "current" / "qwen-agent-workspace"), str(d)) == "v2026.10.17"
+    link = tmp_path / "linked-D"
+    link.symlink_to(d)
+    assert fleet_lib.release_version(str(ws), str(link)) == "v2026.10.17"
+    assert fleet_lib.release_version(WS, str(d)) == "dev"
+    other = d / "releases" / "notatag" / "qwen-agent-workspace"
+    other.mkdir(parents=True)
+    assert fleet_lib.release_version(str(other), str(d)) == "dev"
+    wrong = d / "releases" / "v2026.10.18" / "workspace"
+    wrong.mkdir(parents=True)
+    assert fleet_lib.release_version(str(wrong), str(d)) == "dev"
+    assert fleet_lib.deploy_root() == os.path.expanduser("~/.local/share/qwen-agent")
+    expected_logs = ("~/Library/Logs/qwen-agentd" if sys.platform == "darwin"
+                     else "~/.local/state/qwen-agentd")
+    assert fleet_lib.log_dir() == os.path.expanduser(expected_logs)
