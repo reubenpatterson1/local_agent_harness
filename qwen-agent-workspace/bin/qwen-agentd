@@ -477,6 +477,11 @@ class Daemon(object):
         housekeeping = self.scaled(fleet_lib.HOUSEKEEPING_INTERVAL)
         self._periodic("housekeeping", housekeeping, self.housekeeping_once, housekeeping)
         self._thread("http", self.httpd.serve_forever)
+        if self.version != "dev":
+            self._thread("updater", self.updater_loop)
+        state = fleet_lib.read_state(state_path(fleet_lib.deploy_root()))
+        if state["status"] == "pending" and state["to"] == self.version:
+            self._thread("confirm", lambda: self.confirm_loop(state))
 
     # --- model probe and housekeeping (F16, F17, F38) ----------------------------
 
@@ -831,6 +836,51 @@ class Daemon(object):
             return "bad_response", None, ""
         return "peer_error", None, "http %d" % status
 
+    # --- self-update threads (F84, F88) ------------------------------------------------
+
+    def updater_loop(self):
+        """Sleep UPDATE_INTERVAL + jitter (scaled), then run one cycle; repeat (F84)."""
+        ctx = UpdateCtx(self)
+        while True:
+            delay = (self.scaled(fleet_lib.UPDATE_INTERVAL)
+                     + random.uniform(0, self.scaled(fleet_lib.UPDATE_JITTER)))
+            if self.stop.wait(delay):
+                return
+            try:
+                fleet_lib.run_update_cycle(ctx)
+            except Exception as e:
+                LOG.error("updater error: %s: %s" % (type(e).__name__, e))
+
+    def confirm_loop(self, state):
+        """F88: signed GET /health to ourselves every 1 s; on success mark the switch ok and
+        prune old releases; at STARTUP_HEALTH_DEADLINE (never scaled) exit 1 for rollback."""
+        deadline = self.t0 + fleet_lib.STARTUP_HEALTH_DEADLINE
+        while True:
+            try:
+                result = self.signed_call("127.0.0.1", self.port, "GET", "/health")
+                health = _json_or_none(result[1]) if result is not None and result[0] == 200 else None
+                if isinstance(health, dict) and health.get("host_id") == self.host_id:
+                    self._confirm_switch()
+                    return
+            except Exception as e:
+                LOG.error("confirm error: %s: %s" % (type(e).__name__, e))
+            if time.monotonic() >= deadline:
+                LOG.error("update: %s did not answer its own /health within %ds; exiting for rollback"
+                          % (state["to"], fleet_lib.STARTUP_HEALTH_DEADLINE))
+                close_logging()
+                os._exit(1)
+            if self.stop.wait(1.0):
+                return
+
+    def _confirm_switch(self):
+        d = fleet_lib.deploy_root()
+        st = fleet_lib.read_state(state_path(d))
+        new = {"from": st["from"], "to": st["to"], "status": "ok", "attempts": 0, "bad_tags": st["bad_tags"]}
+        fleet_lib.write_state(state_path(d), new)
+        LOG.info("update: now running %s (from %s)" % (new["to"], new["from"]))
+        for tag in fleet_lib.releases_to_prune(os.listdir(os.path.join(d, "releases")), self.version, new):
+            unstage_release(d, tag, log_to_daemon)
+
     def wait(self):
         """F95 step 12: block until SIGTERM/SIGINT, then stop the listener."""
         while not self.stop.wait(1.0):
@@ -1173,6 +1223,84 @@ def cmd_install(args):
         print("next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join (or init-fleet); "
               "the service retries every 10 s" % d)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# self-update: the real ctx, the in-place restart (F84, F85, F87)
+# ---------------------------------------------------------------------------
+
+def restart_daemon(d):
+    """F87: close the log, then exec D/current's qwen-agentd with the same arguments.
+
+    The PID stays the same. An exec failure cannot be left to the updater thread's
+    guard (that would keep a half-switched daemon running), so it ends the process
+    and the supervisor restarts it through the launcher, which counts the start.
+    """
+    close_logging()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    target = os.path.join(d, "current", fleet_lib.WS_SUBDIR, "bin", "qwen-agentd")
+    try:
+        os.execv(sys.executable, [sys.executable, target] + sys.argv[1:])
+    except OSError as e:
+        _err("qwen-agentd: cannot exec %s: %s: %s" % (target, type(e).__name__, e))
+        os._exit(1)
+
+
+class UpdateCtx(object):
+    """The real F85 interface: D's bare repo and releases, this release's tree, run_lock."""
+
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self.d = fleet_lib.deploy_root()
+        self.repo = os.path.join(self.d, "repo")
+
+    def fetch(self):
+        ok, detail, _out = git(["-C", self.repo, "fetch", "origin", "--tags"])
+        return ok, detail
+
+    def list_tags(self):
+        return list_tags(self.d)
+
+    def is_ancestor(self, a, b):
+        return git(["-C", self.repo, "merge-base", "--is-ancestor", "refs/tags/" + a, "refs/tags/" + b])[0]
+
+    def current_tag(self):
+        return self.daemon.version
+
+    def is_dirty(self):
+        ok, _detail, out = git(["-C", REPO_ROOT, "status", "--porcelain", "--untracked-files=no"])
+        return (not ok) or out.strip() != ""
+
+    def try_lock(self):
+        return self.daemon.run_lock.acquire(False)
+
+    def unlock(self):
+        self.daemon.run_lock.release()
+
+    def read_state(self):
+        return fleet_lib.read_state(state_path(self.d))
+
+    def write_state(self, state):
+        fleet_lib.write_state(state_path(self.d), state)
+
+    def stage(self, tag):
+        return stage_release(self.d, tag, log_to_daemon)
+
+    def gate(self, tag):
+        return gate_release(self.d, tag)
+
+    def unstage(self, tag):
+        unstage_release(self.d, tag, log_to_daemon)
+
+    def swap(self, tag):
+        swap_current(self.d, tag)
+
+    def restart(self):
+        restart_daemon(self.d)
+
+    def log(self, level, msg):
+        log_to_daemon(level, msg)
 
 
 # ---------------------------------------------------------------------------

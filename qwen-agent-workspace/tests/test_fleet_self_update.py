@@ -232,3 +232,148 @@ def test_stage_recovers_from_interrupted_worktree_add(tmp_path, monkeypatch):
     assert agentd.stage_release(d, "v2026.01.02", log) == (True, "")
     assert os.path.isfile(os.path.join(path, fleet_lib.WS_SUBDIR, "bin", "qwen-agentd"))
     assert lines == []
+
+
+# --- T60, T62, T63: switch, gate failure, crash rollback, dirty tree, busy host (F84-F89, F102) ---
+
+UPDATE_PERIOD = (fleet_lib.UPDATE_INTERVAL + fleet_lib.UPDATE_JITTER) * float(ftu.SELF_UPDATE_SCALE)
+
+
+class Supervisor(object):
+    """Emulates launchd/systemd: run D/qwen-agentd-launch, restart it 0.2 s after each exit."""
+
+    def __init__(self, home, extra_args=()):
+        self.home = str(home)
+        self.d = _deploy(home)
+        self.beacon_port = ftu.free_port()
+        self.extra_args = list(extra_args)
+        self.pids = []
+        self.proc = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        env = ftu.clean_env(self.home, QWEN_AGENT_HOST_ID="h1")
+        while not self._stop.is_set():
+            argv = [sys.executable, os.path.join(self.d, "qwen-agentd-launch"), "--beacon-targets", "none",
+                    "--beacon-port", str(self.beacon_port), "--timing-scale", ftu.SELF_UPDATE_SCALE] + self.extra_args
+            self.proc = ftu.spawn(argv, env, self.home)
+            self.pids.append(self.proc.pid)
+            self.proc.wait()
+            if self._stop.wait(0.2):
+                return
+
+    def close(self):
+        self._stop.set()
+        if self.proc is not None:
+            ftu._kill(self.proc)
+        self._thread.join(5)
+
+
+def _setup(tmp_path, skills=(), server_url=None):
+    """Origin with v2026.01.01, installed, fleet.env with a random token -> (origin, home, key, port)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    port = ftu.free_port()
+    origin = Origin(tmp_path / "o", _registry(port, skills, server_url))
+    origin.release("v2026.01.01")
+    proc = _install(home, origin)
+    assert proc.returncode == 0, proc.stderr
+    token = secrets.token_hex(32)
+    ftu.make_fleet(home, ftu.TEST_FLEET_ID, token)
+    return origin, home, bytes.fromhex(token), port
+
+
+def _version(key, port):
+    status, _headers, body, _nonce = ftu.signed(key, "GET", port, "/health", timeout=5)
+    return json.loads(body)["version"] if status == 200 else None
+
+
+def _state(home):
+    return fleet_lib.read_state(os.path.join(_deploy(home), "update-state.json"))
+
+
+def test_t60_switch_gate_failure_and_crash_rollback(tmp_path):
+    origin, home, key, port = _setup(tmp_path)
+    sup = Supervisor(home)
+    try:
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.01", 20)
+        # (1) a good release: exec in place, then the self-check marks it ok.
+        origin.release("v2026.01.02")
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.02" and _state(home)["status"] == "ok", 60)
+        state = _state(home)
+        assert (state["from"], state["to"]) == ("v2026.01.01", "v2026.01.02")
+        assert len(sup.pids) == 1
+        status = subprocess.run([sys.executable, ftu.AGENTD, "status", "--port", str(port)],
+                                env=ftu.clean_env(home), capture_output=True, text=True, timeout=30)
+        assert status.stdout.splitlines()[0].startswith("daemon: http://127.0.0.1:%d (version v2026.01.02, "
+                                                        "host_id h1, discovery poll)" % port)
+        assert status.stdout.splitlines()[-1] == ("update: status=ok from=v2026.01.01 to=v2026.01.02 "
+                                                  "attempts=0 bad_tags=-")
+        # (2) a release whose own unit tests fail: marked bad, unstaged, never switched to.
+        origin.release("v2026.01.03", parent="v2026.01.02", change=lambda o: o.append(
+            "tests/test_fleet_lib.py", "\n\ndef test_gate_must_fail():\n    assert False\n"))
+        ftu.wait_until(lambda: "v2026.01.03" in _state(home)["bad_tags"], 60)
+        assert _version(key, port) == "v2026.01.02"
+        assert not os.path.exists(os.path.join(_deploy(home), "releases", "v2026.01.03"))
+        # (3) a release that passes the gate but cannot start (registry {}): rolled back.
+        origin.release("v2026.01.04", parent="v2026.01.02",
+                       change=lambda o: o.write(o.registry_rel, "{}"))
+        ftu.wait_until(lambda: _state(home)["status"] == "rolled_back", 90)
+        state = _state(home)
+        assert state["to"] == "v2026.01.04"
+        assert set(state["bad_tags"]) >= {"v2026.01.03", "v2026.01.04"}
+        assert os.readlink(os.path.join(_deploy(home), "current")) == "releases/v2026.01.02"
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 20)
+        log = ftu.read_log(home)
+        assert "update: switching v2026.01.01 -> v2026.01.02" in log
+        assert "update: now running v2026.01.02 (from v2026.01.01)" in log
+        assert "update: v2026.01.03 failed its gate (selftest exit 1); marked bad" in log
+    finally:
+        sup.close()
+
+
+def test_t62_dirty_tree_blocks_the_update(tmp_path):
+    origin, home, key, port = _setup(tmp_path)
+    sup = Supervisor(home)
+    try:
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.01", 20)
+        doc = os.path.join(_deploy(home), "current", "qwen-agent-workspace", "docs", "RELEASE.md")
+        with open(doc, "a") as f:
+            f.write("local edit\n")
+        origin.release("v2026.01.02")
+        time.sleep(3 * UPDATE_PERIOD)
+        assert _version(key, port) == "v2026.01.01"
+        assert ("WARNING updater update: v2026.01.02 available but the current release has modified "
+                "tracked files; not updating") in ftu.read_log(home)
+        subprocess.run(["git", "-C", os.path.join(_deploy(home), "current"), "checkout", "--", "."],
+                       check=True, capture_output=True, env=ftu.clean_env(home))
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 2 * UPDATE_PERIOD + 10)
+    finally:
+        sup.close()
+
+
+def test_t63_update_waits_for_an_in_flight_run(tmp_path):
+    stub = ftu.StubModelServer("vllm", "h1-model", "unused")
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-slow"), "slow")
+    origin, home, key, port = _setup(tmp_path, skills=("planner",), server_url=stub.url)
+    sup = Supervisor(home, extra_args=["--qwen-agent-bin", hook])
+    try:
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.01", 20)
+        body = json.dumps({"skill": "planner", "task": "hold", "request_id": "r1"}).encode()
+        result = {}
+        held = threading.Thread(target=lambda: result.update(
+            run=ftu.signed(key, "POST", port, "/run", body, timeout=300)[0]))
+        held.start()
+        ftu.wait_until(lambda: json.loads(ftu.signed(key, "GET", port, "/skills")[2])["skills"][0]["busy"], 10)
+        origin.release("v2026.01.02")
+        time.sleep(3 * UPDATE_PERIOD)
+        assert _version(key, port) == "v2026.01.01"
+        assert "INFO updater update: v2026.01.02 deferred: a run is in flight" in ftu.read_log(home)
+        ftu.release_hook(hook, "hold")
+        held.join(30)
+        assert result["run"] == 200
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 2 * UPDATE_PERIOD + 10)
+    finally:
+        sup.close()
