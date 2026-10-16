@@ -464,3 +464,66 @@ def test_signing_never_raises_on_hostile_input():
     assert fleet_lib.verify_request(KEY, "GET", "/health", dict(headers, **{"X-Fleet-Nonce": "é" * 32}),
                                     b"", NOW, cache) == "bad"
     assert fleet_lib.verify_request(KEY, "GET", "/health", None, b"", NOW, cache) == "bad"
+
+
+# --- T7-T9, T12: skill verification and the child environment (F13-F15, F54a) -------
+
+def test_t7_probe_url():
+    assert fleet_lib.probe_url({"type": "vllm", "url": "http://127.0.0.1:8177/v1"}) == \
+        "http://127.0.0.1:8177/v1/models"
+    assert fleet_lib.probe_url({"type": "ollama", "url": "http://127.0.0.1:11434/v1"}) == \
+        "http://127.0.0.1:11434/api/tags"
+    assert fleet_lib.probe_url({"type": "vllm", "url": "http://127.0.0.1:8177/v1/"}) == \
+        "http://127.0.0.1:8177/v1/models"
+
+
+def test_t8_parse_loaded_models():
+    ollama = b'{"models": [{"name": "qwen3.5:9b", "model": "qwen3.5:9b", "size": 1, "details": {}}]}'
+    assert fleet_lib.parse_loaded_models("ollama", ollama) == {"qwen3.5:9b"}
+    vllm = b'{"object": "list", "data": [{"id": "qwen38-6bit", "object": "model", "max_model_len": 16384}]}'
+    assert fleet_lib.parse_loaded_models("vllm", vllm) == {"qwen38-6bit"}
+    both = b'{"models": [{"name": "a:latest", "model": "a"}]}'
+    assert fleet_lib.parse_loaded_models("ollama", both) == {"a:latest", "a"}
+    for kind, body in (("vllm", b"not json"), ("ollama", b"<html>"),
+                       ("vllm", b'{"data": "x"}'), ("vllm", b'{"data": [1]}'),
+                       ("vllm", b'{"models": []}'), ("ollama", b'{"data": []}'),
+                       ("ollama", b'{"models": [5]}'), ("vllm", b'{"data": [{"id": 5}]}'),
+                       ("ollama", b'{"models": [{"name": 5, "model": null}]}'),
+                       ("vllm", b"[]"), ("lmstudio", vllm)):
+        assert fleet_lib.parse_loaded_models(kind, body) == set(), (kind, body)
+
+
+def test_t9_verify_skills():
+    entry = {"model": "qwen38-6bit", "skills": ["investigator", "analyst", "planner"]}
+    assert fleet_lib.verify_skills(entry, {"qwen38-6bit", "other"}) == [
+        {"skill": "investigator", "model": "qwen38-6bit", "verified": True},
+        {"skill": "analyst", "model": "qwen38-6bit", "verified": True},
+        {"skill": "planner", "model": "qwen38-6bit", "verified": True},
+    ]
+    assert [s["verified"] for s in fleet_lib.verify_skills(entry, {"qwen3.5:9b"})] == [False] * 3
+    assert fleet_lib.verify_skills({"model": "m", "skills": []}, {"m"}) == []
+
+
+def test_t12_build_child_env():
+    environ = {
+        "QWEN_AGENT_FLEET_ID": TEST_FLEET_ID,
+        "QWEN_AGENT_FLEET_TOKEN": TEST_TOKEN,
+        "QWEN_AGENT_FLEET_EXTRA": "x",
+        "SKILL_ENDPOINT_RESEARCHER": "http://192.168.1.168:11434/v1",
+        "SKILL_MODEL_RESEARCHER": "qwen3.5:9b",
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/test",
+        "QWEN_AGENT_HOST_ID": "mac-local",
+        "QWEN_AGENT_SEARXNG_URL": "http://10.0.0.5:8888",
+        "QWEN_AGENT_DAEMON_URL": "http://127.0.0.1:1",
+    }
+    before = dict(environ)
+    env = fleet_lib.build_child_env(environ, "http://127.0.0.1:8190")
+    assert environ == before
+    for gone in ("QWEN_AGENT_FLEET_ID", "QWEN_AGENT_FLEET_TOKEN", "QWEN_AGENT_FLEET_EXTRA",
+                 "SKILL_ENDPOINT_RESEARCHER", "SKILL_MODEL_RESEARCHER"):
+        assert gone not in env
+    for kept in ("PATH", "HOME", "QWEN_AGENT_HOST_ID", "QWEN_AGENT_SEARXNG_URL"):
+        assert env[kept] == environ[kept]
+    assert env["QWEN_AGENT_DAEMON_URL"] == "http://127.0.0.1:8190"
+    assert not any(TEST_TOKEN in v for v in env.values())

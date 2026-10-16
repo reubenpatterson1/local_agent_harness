@@ -476,3 +476,56 @@ def verify_response(key, status_code, method, path, request_nonce, headers, body
         key, lambda ts_text, nonce: _response_input(status_code, method, path, request_nonce,
                                                     ts_text, nonce, body),
         headers, now, cache)
+
+
+# ---------------------------------------------------------------------------
+# Section 2.3 and 6.5: skill verification and the /run child environment
+# (F13-F15, F54a)
+# ---------------------------------------------------------------------------
+
+def probe_url(model_server):
+    """The model-listing URL of a registry model_server entry (F13)."""
+    url = model_server["url"].rstrip("/")
+    if model_server["type"] == "ollama":
+        if url.endswith("/v1"):
+            url = url[:-len("/v1")]
+        return url + "/api/tags"
+    return url + "/models"
+
+
+def parse_loaded_models(server_type, body_bytes):
+    """Model names from a probe_url response body; any parse error or shape gives set() (F14)."""
+    try:
+        data = json.loads(body_bytes)
+        if server_type == "vllm":
+            return {item["id"] for item in data["data"] if isinstance(item.get("id"), str)}
+        if server_type == "ollama":
+            names = set()
+            for item in data["models"]:
+                for field in ("name", "model"):
+                    value = item.get(field)
+                    if isinstance(value, str):
+                        names.add(value)
+            return names
+    except Exception:
+        return set()
+    return set()
+
+
+def verify_skills(entry, loaded):
+    """[{skill, model, verified}] in registry order (F15)."""
+    return [{"skill": s, "model": entry["model"], "verified": entry["model"] in loaded}
+            for s in entry["skills"]]
+
+
+def build_child_env(environ, daemon_url):
+    """A new env for a /run child: no fleet secrets, no SKILL_* overrides (F54a)."""
+    env = {}
+    for key, value in environ.items():
+        if key.startswith(FLEET_ENV_PREFIX):
+            continue
+        if key.startswith("SKILL_ENDPOINT_") or key.startswith("SKILL_MODEL_"):
+            continue
+        env[key] = value
+    env["QWEN_AGENT_DAEMON_URL"] = daemon_url
+    return env
