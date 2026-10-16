@@ -202,3 +202,33 @@ def test_linger_check(monkeypatch):
         raise FileNotFoundError("loginctl")
     monkeypatch.setattr(agentd.subprocess, "run", missing)
     assert agentd.linger_enabled("u") is False
+
+
+def test_stage_recovers_from_interrupted_worktree_add(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    origin = Origin(tmp_path / "o", _registry(ftu.free_port()))
+    origin.release("v2026.01.01")
+    assert _install(home, origin).returncode == 0
+    origin.release("v2026.01.02")
+    d = _deploy(home)
+    repo = os.path.join(d, "repo")
+    _git(repo, "fetch", "-q", "origin", "--tags")
+    agentd = ftu.load_script("qwen_agentd_stage", ftu.AGENTD)
+    lines = []
+    log = lambda level, msg: lines.append((level, msg))
+    path = os.path.join(d, "releases", "v2026.01.02")
+    # (a) locked registration, directory present (a killed `worktree add`)
+    _git(repo, "worktree", "add", "-q", "--detach", "--lock", path, "refs/tags/v2026.01.02")
+    assert agentd.stage_release(d, "v2026.01.02", log) == (True, "")
+    # (b) unlocked registration whose directory is gone
+    shutil.rmtree(path)
+    assert agentd.stage_release(d, "v2026.01.02", log) == (True, "")
+    # (c) locked registration whose directory is gone
+    _git(repo, "worktree", "lock", path)
+    shutil.rmtree(path)
+    assert agentd.stage_release(d, "v2026.01.02", log) == (True, "")
+    assert os.path.isfile(os.path.join(path, fleet_lib.WS_SUBDIR, "bin", "qwen-agentd"))
+    assert lines == []

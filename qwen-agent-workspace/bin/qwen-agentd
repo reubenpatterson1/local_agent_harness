@@ -942,11 +942,16 @@ def list_tags(d):
 
 
 def unstage_release(d, tag, log):
-    """Remove D/releases/<tag> and its worktree registration; failures are logged and ignored."""
+    """Remove D/releases/<tag> and its worktree registration; failures are logged and ignored.
+
+    A killed `worktree add` leaves a locked registration, and a crash can leave one whose
+    directory is gone; unlock + a double-forced remove + prune clears both (F86).
+    """
     repo = os.path.join(d, "repo")
     path = os.path.join(d, "releases", tag)
-    ok, detail, _out = git(["-C", repo, "worktree", "remove", "--force", path])
-    if not ok:
+    git(["-C", repo, "worktree", "unlock", path])
+    ok, detail, _out = git(["-C", repo, "worktree", "remove", "-f", "-f", path])
+    if not ok and os.path.lexists(path):
         log("WARNING", "update: git worktree remove %s failed (%s)" % (tag, detail))
     shutil.rmtree(path, ignore_errors=True)
     ok, detail, _out = git(["-C", repo, "worktree", "prune"])
@@ -957,8 +962,7 @@ def unstage_release(d, tag, log):
 def stage_release(d, tag, log):
     """git worktree add --detach D/releases/<tag> refs/tags/<tag> -> (ok, detail) (F86)."""
     path = os.path.join(d, "releases", tag)
-    if os.path.lexists(path):
-        unstage_release(d, tag, log)
+    unstage_release(d, tag, log)
     os.makedirs(os.path.join(d, "releases"), exist_ok=True)
     ok, detail, _out = git(["-C", os.path.join(d, "repo"), "worktree", "add", "--detach", path,
                             "refs/tags/" + tag])
