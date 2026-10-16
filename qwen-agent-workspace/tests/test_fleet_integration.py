@@ -639,3 +639,83 @@ def test_review_focus_5_delegate_while_run_lock_held(tmp_path):
     assert time.monotonic() - started < 30
     ftu.release_hook(hook, "hold")
     held.join(30)
+
+
+# --- cross-host round trip through the real harness (K3, K5; F50-F54a, F65-F69, F76, F109) ---
+
+def _harness(fleet, home):
+    """Run the real bin/qwen-agent one-shot on alpha's stub, routed through alpha's daemon."""
+    env = ftu.clean_env(home, QWEN_AGENT_DAEMON_URL=fleet.daemons["alpha"].url)
+    assert not any(k.startswith("SKILL_") for k in env)
+    return subprocess.run([sys.executable, ftu.QWEN_AGENT, "--user-prompt=go",
+                           "--base-url=%s" % fleet.stubs["alpha"].url, "--model=alpha-model"],
+                          env=env, capture_output=True, text=True, timeout=120)
+
+
+def test_t43_researcher_runs_on_the_peer(tmp_path):
+    fleet = ftu.Fleet(tmp_path, stub_kwargs={"alpha": {"delegate_skill": "researcher"}}).start()
+    ftu.wait_until(lambda: "bravo" in fleet.peer_ids("alpha"), 4.5)
+    home = tmp_path / "caller"
+    home.mkdir()
+    proc = _harness(fleet, home)
+    assert proc.returncode == 0, proc.stderr
+    envelope = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert envelope["status"] == "ok" and "BRAVO-ANSWER" in envelope["answer"]
+    assert "[delegating to researcher on bravo, up to 900s...]" in proc.stderr
+    assert any(r.get("reasoning_effort") == "none" for r in fleet.stubs["bravo"].requests)
+    assert not any("reasoning_effort" in r for r in fleet.stubs["alpha"].requests)
+    bravo_log = fleet.daemons["bravo"].log()
+    assert "run start skill=researcher request_id=" in bravo_log
+    assert "http=200 status=ok seconds=" in bravo_log
+    assert "delegate skill=researcher host=bravo request_id=" in fleet.daemons["alpha"].log()
+    assert "outcome=ok seconds=" in fleet.daemons["alpha"].log()
+
+
+def test_t46_no_secret_leaves_the_daemon(tmp_path):
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-envdump"), "envdump")
+    sniffer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sniff_port = ftu.free_port()
+    sniffer.bind(("127.0.0.1", sniff_port))
+    sniffer.settimeout(0.2)
+    try:
+        fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), extra_targets=[sniff_port],
+                          stub_kwargs={"alpha": {"delegate_skill": "researcher"}},
+                          extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+        ftu.wait_until(lambda: "bravo" in fleet.peer_ids("alpha"), 4.5)
+        home = tmp_path / "caller"
+        home.mkdir()
+        proc = _harness(fleet, home)
+        assert proc.returncode == 0, proc.stderr
+        assert "[delegating to researcher on bravo, up to 900s...]" in proc.stderr
+        status, delegated = ftu.delegate(fleet.ports["alpha"], "researcher", "again", "bravo")
+        assert status == 200 and delegated["outcome"] == "ok", delegated
+        bodies = [json.dumps(fleet.view("alpha")).encode(), json.dumps(delegated).encode()]
+        datagrams = []
+        while True:
+            try:
+                datagrams.append(sniffer.recvfrom(4096)[0])
+            except socket.timeout:
+                break
+    finally:
+        sniffer.close()
+    assert datagrams, "the sniffer heard no beacons"
+    with open(hook + ".json", encoding="utf-8") as f:
+        dumped = json.load(f)
+    env = dumped["env"]
+    assert not any(k.startswith("QWEN_AGENT_FLEET_") for k in env)
+    assert not any(ftu.TEST_TOKEN in v for v in env.values())
+    assert env["QWEN_AGENT_DAEMON_URL"] == fleet.daemons["bravo"].url
+    bravo_url = "http://127.0.0.1:%d/v1" % fleet.server_ports["bravo"]
+    assert dumped["argv"][1:] == ["--skill=researcher", "--user-prompt=again", "--base-url=%s" % bravo_url,
+                                  "--model=bravo-model", "--model-server-type=ollama"]
+    needles = (ftu.TEST_TOKEN.encode("ascii"), ftu.TEST_KEY,
+               fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN).encode("ascii"))
+    blobs = list(datagrams) + bodies
+    for name in fleet.names:
+        log_dir = ftu.daemon_log_dir(fleet.homes[name])
+        for entry in os.listdir(log_dir):
+            with open(os.path.join(log_dir, entry), "rb") as f:
+                blobs.append(f.read())
+    for blob in blobs:
+        for needle in needles:
+            assert needle not in blob

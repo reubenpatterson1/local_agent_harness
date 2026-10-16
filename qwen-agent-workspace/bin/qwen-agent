@@ -610,7 +610,7 @@ _MEMORY_TOOLS = [
 ]
 
 
-def build_tools_for_context(skill):
+def build_tools_for_context(skill, delegate_targets=None):
     """Return the TOOLS list active for this process.
 
     skill=None is the unrestricted top level (all seven base tools plus
@@ -625,7 +625,9 @@ def build_tools_for_context(skill):
         names = SKILL_TOOL_NAMES[skill]
     tools = [_BASE_TOOL_BY_NAME[n] for n in names if n not in ("delegate_to_skill", "calculate")]
     if "delegate_to_skill" in names:
-        tools.append(_build_delegate_tool(DELEGATE_TARGETS[skill]))
+        targets = DELEGATE_TARGETS[skill] if delegate_targets is None else tuple(delegate_targets)
+        if targets:
+            tools.append(_build_delegate_tool(targets))
     if "calculate" in names:
         tools.append(_CALCULATE_TOOL)
     return tools
@@ -633,6 +635,28 @@ def build_tools_for_context(skill):
 
 TOOLS = None
 TOOL_BY_NAME = None
+FLEET = None
+FLEET_DAEMON_URL = None
+
+
+def _load_fleet_lib():
+    """fleet_lib.py beside bin/, or None. Absent (deploy package) means no fleet routing."""
+    path = os.path.join(REPO_ROOT, "fleet_lib.py")
+    if not os.path.isfile(path):
+        return None
+    try:
+        # __import__ rather than an import statement: the AST "no new imports" guards in
+        # tests/test_qwen_agent_context_budget.py (C8) and test_qwen_agent_session_memory.py
+        # (M14) count every import statement in this file, including ones inside functions.
+        importlib_util = __import__("importlib.util", fromlist=["spec_from_file_location"])
+        spec = importlib_util.spec_from_file_location("fleet_lib", path)
+        module = importlib_util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as e:
+        sys.stderr.write("qwen-agent: warning: cannot load %s (%s: %s); fleet routing disabled\n"
+                         % (path, type(e).__name__, e))
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1248,21 @@ def exec_calculate(args):
     return "OK: %s" % result
 
 
+def _envelope_to_result(skill, envelope):
+    """Map a qwen-agent.oneshot.v1 envelope to delegate_to_skill's result string.
+
+    Shared by the local subprocess path and the remote fleet path (fleet spec F78(e)).
+    """
+    status = envelope.get("status")
+    answer = envelope.get("answer")
+    if status == "ok":
+        return answer or "(the %s skill produced no answer)" % skill
+
+    detail = envelope.get("error") or "no error detail"
+    partial = ("\n\n[partial answer before the failure]\n%s" % answer) if answer else ""
+    return "ERROR: the %s skill ended with status '%s': %s%s" % (skill, status, detail, partial)
+
+
 def exec_delegate_to_skill(args, args_ns):
     """Spawn a --skill subprocess and return its final answer (or an ERROR: string).
 
@@ -1241,6 +1280,15 @@ def exec_delegate_to_skill(args, args_ns):
     if skill not in allowed:
         return "ERROR: '%s' is not a valid delegation target here. Allowed: %s." % (skill, ", ".join(allowed))
 
+    if FLEET is not None and FLEET_DAEMON_URL is not None:
+        view, warning = FLEET.fetch_view(FLEET_DAEMON_URL)
+        if warning:
+            sys.stderr.write(warning + "\n")
+        if view is not None:
+            candidates = FLEET.route_candidates(skill, view)
+            if candidates != [FLEET.LOCAL]:
+                return _delegate_remote(skill, task, candidates)
+
     print("[delegating to %s, up to %ds...]" % (skill, SKILL_SUBPROCESS_TIMEOUT), file=_ui())
 
     argv = [
@@ -1256,6 +1304,8 @@ def exec_delegate_to_skill(args, args_ns):
         "--tool-timeout", str(args_ns.tool_timeout),
         "--context-window", str(CONTEXT_WINDOW),
     ]
+    if args_ns.model_server_type != "vllm":
+        argv.append("--model-server-type=%s" % args_ns.model_server_type)
     if args_ns.api_key:
         argv.extend(["--api-key=%s" % args_ns.api_key])
 
@@ -1308,14 +1358,37 @@ def exec_delegate_to_skill(args, args_ns):
     except (ValueError, IndexError):
         return "ERROR: the %s skill produced no parseable output (exit code %d)." % (skill, proc.returncode)
 
-    status = envelope.get("status")
-    answer = envelope.get("answer")
-    if status == "ok":
-        return answer or "(the %s skill produced no answer)" % skill
+    return _envelope_to_result(skill, envelope)
 
-    detail = envelope.get("error") or "no error detail"
-    partial = ("\n\n[partial answer before the failure]\n%s" % answer) if answer else ""
-    return "ERROR: the %s skill ended with status '%s': %s%s" % (skill, status, detail, partial)
+
+def _delegate_remote(skill, task, candidates):
+    """Run a delegation on live peers through the local qwen-agentd (fleet spec F69 steps 4-5).
+
+    Never raises. Every result that is not an answer starts with ERROR:, so the
+    duplicate guard and the circuit breaker treat it like any other tool failure.
+    """
+    current = [None]
+
+    def attempt(host_id):
+        current[0] = host_id
+        print("[delegating to %s on %s, up to %ds...]" % (skill, host_id, SKILL_SUBPROCESS_TIMEOUT),
+              file=_ui())
+        outcome, envelope, _detail = FLEET.delegate_once(FLEET_DAEMON_URL, skill, task, host_id)
+        if outcome != "ok":
+            print("[%s on %s failed: %s]" % (skill, host_id, outcome), file=_ui())
+        return outcome, envelope
+
+    try:
+        result = FLEET.failover(candidates, attempt)
+    except KeyboardInterrupt:
+        return ("ERROR: execution was interrupted by the user before the %s skill finished on %s. "
+                "The remote run may still be in progress there." % (skill, current[0]))
+    if result["outcome"] == "ok":
+        return _envelope_to_result(skill, result["envelope"])
+    if not result["tried"]:
+        return "ERROR: no live host serves '%s'" % skill
+    return "ERROR: no live host serves '%s' (tried: %s)" % (
+        skill, "; ".join("%s: %s" % (host_id, outcome) for host_id, outcome in result["tried"]))
 
 
 def exec_read_file(resolved):
@@ -3728,9 +3801,25 @@ def parse_args(argv):
 def main():
     args_ns = parse_args(sys.argv[1:])
 
-    global TOOLS, TOOL_BY_NAME, SKILL_CONTEXT
-    TOOLS = build_tools_for_context(args_ns.skill)
+    global TOOLS, TOOL_BY_NAME, SKILL_CONTEXT, FLEET, FLEET_DAEMON_URL
+    FLEET = _load_fleet_lib()
+    view = None
+    if FLEET is not None:
+        FLEET_DAEMON_URL, warning = FLEET.daemon_url_from_env(os.environ)
+        if warning:
+            sys.stderr.write(warning + "\n")
+        view, warning = FLEET.fetch_view(FLEET_DAEMON_URL)
+        if warning:
+            sys.stderr.write(warning + "\n")
+    delegate_targets = None
+    if view is not None and args_ns.skill in DELEGATE_TARGETS:
+        delegate_targets = FLEET.delegate_enum(DELEGATE_TARGETS[args_ns.skill], view)
+    TOOLS = build_tools_for_context(args_ns.skill, delegate_targets)
     TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+    if view is not None and args_ns.user_prompt is None:
+        sys.stderr.write("[fleet: qwen-agentd at %s; %d live peer(s); delegate targets: %s]\n"
+                         % (FLEET_DAEMON_URL, len(view["peers"]),
+                            ", ".join(delegate_targets) if delegate_targets else "none"))
     SKILL_CONTEXT = args_ns.skill
 
     if args_ns.system_prompt is not None and args_ns.user_prompt is None:
