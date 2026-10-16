@@ -84,3 +84,254 @@ def make_fleet(home, fleet_id=TEST_FLEET_ID, token=TEST_TOKEN):
     path = os.path.join(str(home), ".config", "qwen-agent", "fleet.env")
     fleet_lib.write_fleet_env(path, fleet_id, token)
     return path
+
+
+# --- registry, stub model servers, daemons, HTTP helpers (Task 12) -------------------
+
+_STARTED = []   # every Popen a helper started; kill_all() SIGKILLs their process groups
+_STUBS = []     # every StubModelServer; kill_all() stops them
+
+
+def write_registry(path, fleet_id, hosts):
+    """Write a registry with every host at 127.0.0.1 and an explicit port.
+
+    hosts: {host_id: {"port": int, "model_server": {"type", "url"}, "model": str,
+                      "skills": [...], optional "role"}}
+    """
+    obj = {"protocol": 1, "fleet_id": fleet_id, "hosts": {}}
+    for host_id, h in hosts.items():
+        obj["hosts"][host_id] = {"role": h.get("role", "agent"), "address": "127.0.0.1",
+                                 "port": h["port"], "model_server": h["model_server"],
+                                 "model": h["model"], "skills": list(h["skills"])}
+    with open(str(path), "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
+    return str(path)
+
+
+class StubModelServer(object):
+    """An OpenAI-shaped model server on 127.0.0.1 (spec 11.2).
+
+    GET /v1/models lists `model` for both kinds; kind "ollama" also serves
+    GET /api/tags. POST /v1/chat/completions records the parsed body in .requests
+    and answers either one delegate_to_skill tool call (when delegate_skill is set
+    and no message has role "tool") or `answer` plus " | <last tool result>".
+    port=0 picks a free port; a fixed port lets a test start the stub late.
+    """
+
+    def __init__(self, kind, model, answer, delegate_skill=None, port=0):
+        self.kind, self.model, self.answer, self.delegate_skill = kind, model, answer, delegate_skill
+        self.requests = []
+        self._lock = threading.Lock()
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, obj, status=200):
+                raw = json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/v1/models":
+                    self._json({"object": "list", "data": [{"id": stub.model, "object": "model"}]})
+                elif self.path == "/api/tags" and stub.kind == "ollama":
+                    self._json({"models": [{"name": stub.model, "model": stub.model}]})
+                else:
+                    self._json({"error": "not found"}, 404)
+
+            def do_POST(self):
+                if self.path != "/v1/chat/completions":
+                    return self._json({"error": "not found"}, 404)
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                with stub._lock:
+                    stub.requests.append(body)
+                tool_msgs = [m for m in body.get("messages") or [] if m.get("role") == "tool"]
+                if stub.delegate_skill and not tool_msgs:
+                    message = {"role": "assistant", "content": "", "tool_calls": [{
+                        "id": "call_stub_1", "type": "function",
+                        "function": {"name": "delegate_to_skill",
+                                     "arguments": json.dumps({"skill": stub.delegate_skill,
+                                                              "task": "stub task"})}}]}
+                    finish = "tool_calls"
+                else:
+                    content = stub.answer
+                    if tool_msgs:
+                        content += " | " + str(tool_msgs[-1].get("content"))
+                    message = {"role": "assistant", "content": content}
+                    finish = "stop"
+                self._json({"id": "stub", "object": "chat.completion", "model": stub.model,
+                            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.port = self.httpd.server_address[1]
+        self.url = "http://127.0.0.1:%d/v1" % self.port
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        _STUBS.append(self)
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def daemon_log_dir(home):
+    """fleet_lib.log_dir() as it resolves under HOME=home."""
+    if sys.platform == "darwin":
+        return os.path.join(str(home), "Library", "Logs", "qwen-agentd")
+    return os.path.join(str(home), ".local", "state", "qwen-agentd")
+
+
+def read_log(home):
+    path = os.path.join(daemon_log_dir(home), "qwen-agentd.log")
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+class DaemonProc(object):
+    def __init__(self, proc, home, host_id, port, beacon_port):
+        self.proc, self.home, self.host_id, self.port, self.beacon_port = proc, home, host_id, port, beacon_port
+        self.url = "http://127.0.0.1:%d" % port
+
+    def log(self):
+        return read_log(self.home)
+
+    def kill(self):
+        _kill(self.proc)
+
+
+def _kill(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    proc.wait()
+
+
+def kill_all():
+    while _STARTED:
+        _kill(_STARTED.pop())
+    while _STUBS:
+        _STUBS.pop().stop()
+
+
+def targets(*ports):
+    """A --beacon-targets value for loopback beacon ports ("none" when empty)."""
+    return ",".join("127.0.0.1:%d" % p for p in ports) or "none"
+
+
+def spawn(argv, env, home):
+    """Start argv in a new session with stdout+stderr in <home>/<name>.out; tracked for kill_all."""
+    out_path = os.path.join(str(home), "%s.out" % os.path.basename(argv[1]))
+    out = open(out_path, "ab")
+    try:
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                                start_new_session=True)
+    finally:
+        out.close()
+    _STARTED.append(proc)
+    return proc
+
+
+def start_daemon(home, host_id, registry, beacon_port, beacon_targets, extra_args=(),
+                 scale=INTEGRATION_SCALE, env_extra=None, wait=True):
+    """Spawn `qwen-agentd run` for host_id; return once GET /peers answers 200 (10 s max)."""
+    with open(str(registry), encoding="utf-8") as f:
+        port = json.load(f)["hosts"][host_id].get("port", fleet_lib.DEFAULT_PORT)
+    argv = [sys.executable, AGENTD, "run", "--registry", str(registry), "--beacon-port", str(beacon_port),
+            "--beacon-targets", beacon_targets, "--timing-scale", scale] + list(extra_args)
+    env = clean_env(home, QWEN_AGENT_HOST_ID=host_id, **(env_extra or {}))
+    proc = spawn(argv, env, home)
+    daemon = DaemonProc(proc, home, host_id, port, beacon_port)
+    if not wait:
+        return daemon
+    deadline = time.monotonic() + 10
+    while True:
+        if proc.poll() is not None:
+            raise AssertionError("qwen-agentd %s exited %s at startup" % (host_id, proc.returncode))
+        try:
+            if peers(port)[0] == 200:
+                return daemon
+        except (OSError, http.client.HTTPException):
+            pass
+        if time.monotonic() > deadline:
+            raise AssertionError("qwen-agentd %s did not answer /peers within 10 s" % host_id)
+        time.sleep(0.05)
+
+
+def _request(port, method, path, body=None, headers=None, timeout=30, source=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout, source_address=source)
+    try:
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.headers, resp.read()
+    finally:
+        conn.close()
+
+
+def peers(port):
+    """(status, parsed body or None) of loopback GET /peers."""
+    status, _headers, raw = _request(port, "GET", "/peers", timeout=5)
+    return status, (json.loads(raw) if raw else None)
+
+
+def delegate(port, skill, task, host_id, timeout=120):
+    """(status, parsed body or None) of loopback POST /delegate."""
+    body = json.dumps({"skill": skill, "task": task, "host_id": host_id}).encode("utf-8")
+    status, _headers, raw = _request(port, "POST", "/delegate", body,
+                                     {"Content-Type": "application/json"}, timeout=timeout)
+    return status, (json.loads(raw) if raw else None)
+
+
+def signed(key, method, port, path, body=b"", timeout=30, nonce=None):
+    """A request signed with fleet_lib.sign_request -> (status, headers, body, request_nonce)."""
+    nonce = nonce or os.urandom(16).hex()
+    headers = fleet_lib.sign_request(key, method, path, body, int(time.time()), nonce)
+    if method == "POST":
+        headers["Content-Type"] = "application/json"
+    status, resp_headers, raw = _request(port, method, path, body if method == "POST" else None,
+                                         headers, timeout=timeout)
+    return status, resp_headers, raw, nonce
+
+
+def response_ok(key, status, method, path, nonce, headers, body):
+    """True iff the response carries a valid fleet signature for that request."""
+    return fleet_lib.verify_response(key, status, method, path, nonce, headers, body,
+                                     int(time.time()), fleet_lib.NonceCache()) == "ok"
+
+
+def raw_request(port, method, path, headers, body=b"", source=None):
+    """Send exactly these headers (no automatic Content-Length) -> (status, body)."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10, source_address=source)
+    try:
+        conn.putrequest(method, path)
+        for name, value in headers.items():
+            conn.putheader(name, value)
+        conn.endheaders()
+        if body:
+            conn.send(body)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
+
+
+def wait_until(predicate, timeout, interval=0.1):
+    """Poll predicate() until truthy; return the elapsed seconds, or fail the test."""
+    start = time.monotonic()
+    while True:
+        try:
+            if predicate():
+                return time.monotonic() - start
+        except (OSError, http.client.HTTPException, ValueError):
+            pass
+        if time.monotonic() - start > timeout:
+            raise AssertionError("condition not met within %.1f s" % timeout)
+        time.sleep(interval)

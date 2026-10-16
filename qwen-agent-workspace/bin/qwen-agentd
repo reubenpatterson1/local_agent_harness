@@ -113,6 +113,520 @@ def cmd_selftest(args):
 
 
 # ---------------------------------------------------------------------------
+# run: logging, startup, the HTTP listener and the local endpoints
+# (F41-F46, F55, F56, F95-F101, F107, F108)
+# ---------------------------------------------------------------------------
+
+class StartupError(Exception):
+    """A run startup failure (F100). str(e) is the complete stderr message; exit 2."""
+
+
+class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler whose file is chmod 0600 every time it is opened (F108)."""
+
+    def _open(self):
+        stream = logging.handlers.RotatingFileHandler._open(self)
+        os.chmod(self.baseFilename, 0o600)
+        return stream
+
+
+def setup_logging():
+    """<log_dir>/qwen-agentd.log, 5 MB x 3, INFO (F107, F108). Only `run` logs."""
+    directory = fleet_lib.log_dir()
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o700)
+    handler = _PrivateRotatingFileHandler(os.path.join(directory, "qwen-agentd.log"),
+                                          maxBytes=fleet_lib.LOG_MAX_BYTES,
+                                          backupCount=fleet_lib.LOG_BACKUPS)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(message)s"))
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
+
+
+def close_logging():
+    for handler in list(LOG.handlers):
+        handler.flush()
+        handler.close()
+        LOG.removeHandler(handler)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+_PORT_RE = re.compile(r"[0-9]{1,5}")
+_LENGTH_RE = re.compile(r"[0-9]{1,12}")
+
+
+def _parse_port(text):
+    """An int in 1..65535 from decimal text, else None."""
+    if not isinstance(text, str) or not _PORT_RE.fullmatch(text):
+        return None
+    port = int(text)
+    return port if 1 <= port <= 65535 else None
+
+
+def _parse_beacon_targets(value):
+    """F92 --beacon-targets as [(ipv4, port), ...]; "none" is []. None means invalid."""
+    if value == "none":
+        return []
+    targets = []
+    for item in value.split(","):
+        host, sep, port_text = item.rpartition(":")
+        port = _parse_port(port_text)
+        if sep != ":" or port is None:
+            return None
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            return None
+        targets.append((host, port))
+    return targets
+
+
+def _validate_run_flags(args):
+    """(beacon_targets, beacon_port, scale) or StartupError with the F92 message."""
+    targets = _parse_beacon_targets(args.beacon_targets)
+    if targets is None:
+        raise StartupError("qwen-agentd: invalid --beacon-targets")
+    beacon_port = _parse_port(args.beacon_port)
+    if beacon_port is None:
+        raise StartupError("qwen-agentd: invalid --beacon-port")
+    if not os.path.isfile(args.qwen_agent_bin):
+        raise StartupError("qwen-agentd: --qwen-agent-bin not found: %s" % args.qwen_agent_bin)
+    try:
+        scale = float(args.timing_scale)
+    except ValueError:
+        scale = None
+    if scale is None or not 0 < scale <= 1:
+        raise StartupError("qwen-agentd: invalid --timing-scale")
+    return targets, beacon_port, scale
+
+
+def _bind_message(proto, port, e):
+    """F96 bind-error text."""
+    if e.errno == errno.EADDRINUSE:
+        if proto == "TCP":
+            return "qwen-agentd: TCP port %d is already in use (is another qwen-agentd running?)" % port
+        return "qwen-agentd: UDP port %d is already in use" % port
+    return "qwen-agentd: cannot bind %s 0.0.0.0:%d: %s: %s" % (proto, port, type(e).__name__, e)
+
+
+def _valid_health(obj):
+    """F32 step 2: a JSON object with str host_id, role, version, discovery and int proto."""
+    return (isinstance(obj, dict)
+            and all(isinstance(obj.get(k), str) for k in ("host_id", "role", "version", "discovery"))
+            and _is_int(obj.get("proto")))
+
+
+def _valid_skills_body(obj, host_id):
+    """F32 step 5: {"host_id": <the /health host_id>, "skills": [{skill, model, verified, busy}]}."""
+    if not (isinstance(obj, dict) and obj.get("host_id") == host_id and isinstance(obj.get("skills"), list)):
+        return False
+    return all(isinstance(i, dict) and isinstance(i.get("skill"), str) and isinstance(i.get("model"), str)
+               and isinstance(i.get("verified"), bool) and isinstance(i.get("busy"), bool)
+               for i in obj["skills"])
+
+
+def _json_or_none(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+
+
+class _FleetHTTPServer(http.server.ThreadingHTTPServer):
+    """The daemon's single listener (F41)."""
+
+    daemon_threads = True
+
+    def __init__(self, address, fleet):
+        self.fleet = fleet
+        http.server.ThreadingHTTPServer.__init__(self, address, _FleetHandler)
+
+    def handle_error(self, request, client_address):
+        LOG.error("http handler error: %s" % sys.exc_info()[0].__name__)
+
+
+class _FleetHandler(http.server.BaseHTTPRequestHandler):
+    """One handler for every method; the F44 order lives in _handle."""
+
+    protocol_version = "HTTP/1.0"
+    timeout = 30
+    server_version = "qwen-agentd"
+    sys_version = ""
+
+    def log_message(self, format, *args):
+        """F43: http.server's own per-request logging is off."""
+
+    def send_error(self, code, message=None, explain=None):
+        """F29a: http.server's own errors (bad request line, unknown method) carry no body."""
+        self.close_connection = True
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+    def do_PUT(self):
+        self._handle()
+
+    def do_DELETE(self):
+        self._handle()
+
+    def do_PATCH(self):
+        self._handle()
+
+    def do_OPTIONS(self):
+        self._handle()
+
+    def _loopback_request_ok(self, method):
+        """Loopback routes refuse browser-originated requests (CSRF, DNS rebinding)."""
+        port = self.server.fleet.port
+        host = (self.headers.get("Host") or "").strip()
+        if host not in ("127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port):
+            return False
+        if self.headers.get("Origin") is not None:
+            return False
+        if method == "POST":
+            content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if content_type != "application/json":
+                return False
+        return True
+
+    def _send(self, status, body, sign=None):
+        """Send status + body; sign=(method, path, request_nonce) adds X-Fleet-* headers (F29j)."""
+        self.send_response(status)
+        if body:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if sign is not None:
+            method, path, request_nonce = sign
+            headers = fleet_lib.sign_response(self.server.fleet.key, status, method, path, request_nonce,
+                                              body, int(time.time()), secrets.token_hex(16))
+            for name, value in headers.items():
+                self.send_header(name, value)
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _handle(self):
+        fleet = self.server.fleet
+        method, path = self.command, self.path
+        kind, name = fleet_lib.http_route(method, path)
+        client_ip = self.client_address[0]
+        if kind == "loopback" and not fleet_lib.is_loopback_client(client_ip):
+            return self._send(403, b"")
+        length_text = self.headers.get("Content-Length")
+        if method == "POST" and length_text is None:
+            return self._send(411, b"")
+        length = 0
+        if length_text is not None:
+            if not _LENGTH_RE.fullmatch(length_text.strip()):
+                return self._send(400, b"")
+            length = int(length_text.strip())
+        if length > fleet_lib.MAX_BODY:
+            return self._send(413, b"")
+        body = self.rfile.read(length) if length else b""
+        if len(body) != length:
+            return
+        if kind == "loopback":
+            if not self._loopback_request_ok(method):
+                return self._send(403, b"")
+            status, obj = fleet.loopback_endpoint(name, body)
+            return self._send(status, fleet_lib.canonical_json(obj))
+        now = int(time.time())
+        verdict = fleet_lib.verify_request(fleet.key, method, path, self.headers, body, now,
+                                           fleet.request_nonces)
+        if verdict == "skew":
+            fleet.warn_skew_once(client_ip, int(self.headers.get("X-Fleet-Ts")) - now)
+        if verdict != "ok":
+            return self._send(401, b"")
+        if kind == "unknown":
+            status, raw = 404, fleet_lib.canonical_json({"error": "not found"})
+        else:
+            status, raw = fleet.signed_endpoint(name, body)
+        self._send(status, raw, (method, path, self.headers.get("X-Fleet-Nonce")))
+
+
+class Daemon(object):
+    """One `qwen-agentd run`: state, sockets, threads and endpoint logic (F95)."""
+
+    def __init__(self, args, beacon_targets, beacon_port, scale, t0):
+        self.args = args
+        self.beacon_targets = beacon_targets
+        self.beacon_port = beacon_port
+        self.scale = scale
+        self.t0 = t0
+        self.qwen_agent_bin = args.qwen_agent_bin
+        self.stop = threading.Event()
+        self.run_lock = threading.Lock()
+        self.beacon_nonces = fleet_lib.NonceCache()
+        self.request_nonces = fleet_lib.NonceCache()
+        self.response_nonces = fleet_lib.NonceCache()
+        self._warn_lock = threading.Lock()
+        self._skew_warned = set()
+        self._unregistered_warned = set()
+        self._inflight = set()
+        self.skills_state = []
+        self._prev_verified = {}
+        self.beacon_ok = True
+        self.key = None
+        self.httpd = None
+        self.udp = None
+
+    def scaled(self, seconds):
+        return seconds * self.scale
+
+    # --- startup (F95 steps 4-11) -------------------------------------------------
+
+    def start(self):
+        path = fleet_lib.fleet_env_path()
+        try:
+            fleet_id, token = fleet_lib.load_fleet_env(path)
+        except FileNotFoundError:
+            raise StartupError("qwen-agentd: %s not found; run qwen-agentd init-fleet or "
+                               "qwen-agentd join" % path)
+        except fleet_lib.FleetEnvError as e:
+            raise StartupError("qwen-agentd: %s" % e)
+        self.key = fleet_lib.token_key(token)
+        del token
+        registry_path = self.args.registry or os.path.join(REPO_ROOT, "fleets", fleet_id + ".json")
+        try:
+            self.registry = fleet_lib.load_registry(registry_path, fleet_id)
+        except fleet_lib.RegistryError as e:
+            raise StartupError("qwen-agentd: %s" % e)
+        self.host_id = os.environ.get("QWEN_AGENT_HOST_ID", "")
+        if self.host_id == "":
+            raise StartupError("qwen-agentd: QWEN_AGENT_HOST_ID is not set; valid IDs: %s"
+                               % ", ".join(sorted(self.registry["hosts"])))
+        try:
+            self.entry = fleet_lib.self_entry(self.registry, self.host_id)
+        except fleet_lib.RegistryError as e:
+            raise StartupError("qwen-agentd: %s" % e)
+        self.port = self.entry["port"]
+        self.loopback_url = "http://127.0.0.1:%d" % self.port
+        self.version = fleet_lib.release_version(REPO_ROOT, fleet_lib.deploy_root())
+        self.table = fleet_lib.LivenessTable(self.registry, self.host_id,
+                                             self.scaled(fleet_lib.LIVE_WINDOW))
+        self._bind_sockets()
+        self.probe()
+        self._start_threads()
+        LOG.info("qwen-agentd %s started host_id=%s port=%d beacon_port=%d beacon_targets=%d skills=%s"
+                 % (self.version, self.host_id, self.port, self.beacon_port, len(self.beacon_targets),
+                    ",".join("%s:%s" % (i["skill"], "verified" if i["verified"] else "unverified")
+                             for i in self.skills_state)))
+
+    def _bind_sockets(self):
+        """F95 step 8: the TCP listener, then the UDP beacon socket."""
+        try:
+            self.httpd = _FleetHTTPServer(("0.0.0.0", self.port), self)
+        except OSError as e:
+            raise StartupError(_bind_message("TCP", self.port, e))
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp.bind(("0.0.0.0", self.beacon_port))
+        except OSError as e:
+            udp.close()
+            self.httpd.server_close()
+            raise StartupError(_bind_message("UDP", self.beacon_port, e))
+        udp.settimeout(1.0)
+        self.udp = udp
+
+    def _thread(self, name, target):
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        thread.start()
+        return thread
+
+    def _periodic(self, name, interval, work, first_delay):
+        """Run work() every `interval` s after `first_delay` s, until stop (F97 guard)."""
+        def loop():
+            if self.stop.wait(first_delay):
+                return
+            while True:
+                try:
+                    work()
+                except Exception as e:
+                    LOG.error("%s error: %s: %s" % (name, type(e).__name__, e))
+                if self.stop.wait(interval):
+                    return
+        return self._thread(name, loop)
+
+    def _start_threads(self):
+        """F95 step 10, in Section 1.2 order."""
+        reprobe = self.scaled(fleet_lib.REPROBE_INTERVAL)
+        self._periodic("prober", reprobe, self.probe, reprobe)
+        housekeeping = self.scaled(fleet_lib.HOUSEKEEPING_INTERVAL)
+        self._periodic("housekeeping", housekeeping, self.housekeeping_once, housekeeping)
+        self._thread("http", self.httpd.serve_forever)
+
+    # --- model probe and housekeeping (F16, F17, F38) ----------------------------
+
+    def probe(self):
+        """GET probe_url, recompute verified skills, log only changes (F16, F17)."""
+        url = fleet_lib.probe_url(self.entry["model_server"])
+        loaded = set()
+        try:
+            parts = urllib.parse.urlsplit(url)
+            conn = http.client.HTTPConnection(parts.hostname, parts.port or 80,
+                                              timeout=fleet_lib.MODEL_PROBE_TIMEOUT)
+            try:
+                conn.request("GET", parts.path or "/")
+                resp = conn.getresponse()
+                body = resp.read()
+                if resp.status == 200:
+                    loaded = fleet_lib.parse_loaded_models(self.entry["model_server"]["type"], body)
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException, ValueError):
+            loaded = set()
+        result = fleet_lib.verify_skills(self.entry, loaded)
+        for item in result:
+            if item["verified"] != self._prev_verified.get(item["skill"], True):
+                if item["verified"]:
+                    LOG.info("skill '%s' offered: model '%s' present" % (item["skill"], item["model"]))
+                else:
+                    LOG.warning("skill '%s' not offered: model '%s' not present at %s"
+                                % (item["skill"], item["model"], url))
+            self._prev_verified[item["skill"]] = item["verified"]
+        self.skills_state = result
+
+    def housekeeping_once(self):
+        for cache in (self.beacon_nonces, self.request_nonces, self.response_nonces):
+            cache.prune()
+        for host_id, state in self.table.transitions():
+            record = self.table.record(host_id)
+            if state == "live" and record is not None:
+                LOG.info("peer %s live at %s:%d (version %s, via %s)"
+                         % (host_id, record["address"], record["port"], record["version"],
+                            record["heard_via"]))
+            else:
+                LOG.info("peer %s down" % host_id)
+
+    def warn_skew_once(self, ip, delta):
+        """F33: one WARNING per source IP per process, for beacons and signed requests alike."""
+        with self._warn_lock:
+            if ip in self._skew_warned:
+                return
+            self._skew_warned.add(ip)
+        LOG.warning("clock skew of %+ds from %s exceeds %ds; check NTP on both hosts"
+                    % (delta, ip, fleet_lib.SKEW_WINDOW))
+
+    # --- endpoints (F45, F46, F55) -------------------------------------------------
+
+    def skills_view(self):
+        busy = self.run_lock.locked()
+        return [dict(item, busy=busy) for item in self.skills_state]
+
+    def discovery(self):
+        """F39: "beacon" when the last send succeeded and a beacon was heard recently."""
+        if self.beacon_ok and self.table.heard_beacon_within(self.scaled(fleet_lib.LIVE_WINDOW)):
+            return "beacon"
+        return "poll"
+
+    def health_body(self):
+        return {"host_id": self.host_id, "role": self.entry["role"], "version": self.version,
+                "proto": fleet_lib.PROTOCOL, "discovery": self.discovery()}
+
+    def peers_view(self):
+        me = self.health_body()
+        me["skills"] = self.skills_view()
+        return {"schema": fleet_lib.PEERS_SCHEMA, "self": me, "peers": self.table.live_peers()}
+
+    def signed_endpoint(self, name, body):
+        """(status, body bytes) for a verified request to a signed endpoint."""
+        if name == "health":
+            return 200, fleet_lib.canonical_json(self.health_body())
+        if name == "skills":
+            return 200, fleet_lib.canonical_json({"host_id": self.host_id, "skills": self.skills_view()})
+        return 404, fleet_lib.canonical_json({"error": "not found"})
+
+    def loopback_endpoint(self, name, body):
+        """(status, JSON-able object) for a loopback-only endpoint; sent unsigned."""
+        if name == "peers":
+            return 200, self.peers_view()
+        return 404, {"error": "not found"}
+
+    def wait(self):
+        """F95 step 12: block until SIGTERM/SIGINT, then stop the listener."""
+        while not self.stop.wait(1.0):
+            pass
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        return 0
+
+
+def cmd_run(args):
+    t0 = time.monotonic()
+    try:
+        targets, beacon_port, scale = _validate_run_flags(args)
+    except StartupError as e:
+        _err(str(e))
+        return 2
+    setup_logging()
+    daemon = Daemon(args, targets, beacon_port, scale, t0)
+    signal.signal(signal.SIGTERM, lambda signum, frame: daemon.stop.set())
+    signal.signal(signal.SIGINT, lambda signum, frame: daemon.stop.set())
+    try:
+        daemon.start()
+    except StartupError as e:
+        _err(str(e))
+        LOG.error(str(e))
+        close_logging()
+        return 2
+    return daemon.wait()
+
+
+# ---------------------------------------------------------------------------
+# status (F94)
+# ---------------------------------------------------------------------------
+
+def _format_skills(skills):
+    return ", ".join("%s=%s%s" % (i.get("skill"), "verified" if i.get("verified") is True else "unverified",
+                                  "+busy" if i.get("busy") is True else "")
+                     for i in skills)
+
+
+def cmd_status(args):
+    url = "http://127.0.0.1:%d" % args.port
+    view, _warning = fleet_lib.fetch_view(url)
+    lines = []
+    if view is None:
+        lines.append("daemon: not reachable at %s" % url)
+        rc = 1
+    else:
+        me = view["self"]
+        lines.append("daemon: %s (version %s, host_id %s, discovery %s)"
+                     % (url, me.get("version"), me["host_id"], me.get("discovery")))
+        lines.append("skills: %s" % (_format_skills(me["skills"]) or "none"))
+        for p in view["peers"]:
+            lines.append("peer %s %s:%s version %s via %s age %ss%s skills %s"
+                         % (p["host_id"], p.get("address"), p.get("port"), p.get("version"),
+                            p.get("heard_via"), p.get("age"), "" if p["compatible"] else " INCOMPATIBLE",
+                            _format_skills(p["skills"]) or "none"))
+        if not view["peers"]:
+            lines.append("peers: none")
+        rc = 0
+    state_file = os.path.join(fleet_lib.deploy_root(), "update-state.json")
+    if not os.path.exists(state_file):
+        lines.append("update: not installed")
+    else:
+        st = fleet_lib.read_state(state_file)
+        lines.append("update: status=%s from=%s to=%s attempts=%d bad_tags=%s"
+                     % (st["status"], st["from"] or "-", st["to"] or "-", st["attempts"],
+                        ",".join(st["bad_tags"]) or "-"))
+    sys.stdout.write("\n".join(lines) + "\n")
+    return rc
+
+
+# ---------------------------------------------------------------------------
 # CLI (F92, F99). Keep this section last.
 # ---------------------------------------------------------------------------
 
@@ -127,6 +641,16 @@ def _build_parser():
     p.set_defaults(func=cmd_join)
     p = sub.add_parser("selftest", help="run this release's fleet unit tests (the update gate)")
     p.set_defaults(func=cmd_selftest)
+    p = sub.add_parser("run", help="run the fleet daemon (the default subcommand)")
+    p.add_argument("--registry", default=None, metavar="PATH")
+    p.add_argument("--beacon-targets", default="255.255.255.255:%d" % fleet_lib.DEFAULT_PORT, metavar="LIST")
+    p.add_argument("--beacon-port", default=str(fleet_lib.DEFAULT_PORT), metavar="N")
+    p.add_argument("--qwen-agent-bin", default=os.path.join(REPO_ROOT, "bin", "qwen-agent"), metavar="PATH")
+    p.add_argument("--timing-scale", default="1.0", metavar="X")
+    p.set_defaults(func=cmd_run)
+    p = sub.add_parser("status", help="print this host's fleet view and update state")
+    p.add_argument("--port", type=int, default=fleet_lib.DEFAULT_PORT)
+    p.set_defaults(func=cmd_status)
     return parser
 
 
