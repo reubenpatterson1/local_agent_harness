@@ -529,3 +529,131 @@ def build_child_env(environ, daemon_url):
         env[key] = value
     env["QWEN_AGENT_DAEMON_URL"] = daemon_url
     return env
+
+
+# ---------------------------------------------------------------------------
+# Section 5.3: liveness table (F34, F35)
+# ---------------------------------------------------------------------------
+
+PEER_FIELDS = ("host_id", "address", "port", "role", "version", "proto", "compatible",
+               "skills", "heard_via", "age")
+
+
+class LivenessTable(object):
+    """Registered, bound, recently heard peers, keyed by host_id (F35)."""
+
+    def __init__(self, registry, self_host_id, live_window, clock=time.time):
+        self._registered = sorted(registry["hosts"])
+        self._self = self_host_id
+        self._window = live_window
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._records = {}
+        self._reported = {}
+
+    def _live(self, record, now):
+        return now - record["last_heard"] <= self._window
+
+    def bind(self, host_id, address, port, health, skills, via):
+        """Create or replace host_id's record after a successful signed /health + /skills.
+
+        A record of another host_id at the same (address, port) is dropped: that
+        daemon has been replaced, and heard() matches records by address (F34).
+        """
+        with self._lock:
+            now = self._clock()
+            for other in [h for h, r in self._records.items()
+                          if h != host_id and r["address"] == address and r["port"] == port]:
+                del self._records[other]
+            self._records[host_id] = {
+                "address": address, "port": port,
+                "role": health["role"], "version": health["version"], "proto": health["proto"],
+                "compatible": health["proto"] == PROTOCOL,
+                "skills": copy.deepcopy(skills),
+                "last_heard": now, "heard_via": via, "last_refresh": now,
+            }
+
+    def heard(self, address, port, via):
+        """Refresh last_heard of the LIVE record at (address, port); its host_id, else None.
+
+        A record that has aged out is not revived here: the caller then schedules a
+        bind attempt, so a restarted peer is re-checked by signed /health (decision 5).
+        """
+        with self._lock:
+            now = self._clock()
+            for host_id, record in self._records.items():
+                if record["address"] == address and record["port"] == port and self._live(record, now):
+                    record["last_heard"] = now
+                    record["heard_via"] = via
+                    return host_id
+            return None
+
+    def refresh(self, host_id, health, skills, via):
+        with self._lock:
+            record = self._records.get(host_id)
+            if record is None:
+                return
+            now = self._clock()
+            record.update(role=health["role"], version=health["version"], proto=health["proto"],
+                          compatible=health["proto"] == PROTOCOL, skills=copy.deepcopy(skills),
+                          last_heard=now, last_refresh=now, heard_via=via)
+
+    def record(self, host_id):
+        """A copy of host_id's record (live or not), or None."""
+        with self._lock:
+            record = self._records.get(host_id)
+            return copy.deepcopy(record) if record is not None else None
+
+    def is_live(self, host_id):
+        with self._lock:
+            record = self._records.get(host_id)
+            return record is not None and self._live(record, self._clock())
+
+    def live_peers(self):
+        """Live records as F55 peer dicts, last_heard descending, then host_id ascending."""
+        with self._lock:
+            now = self._clock()
+            rows = []
+            for host_id, r in self._records.items():
+                if not self._live(r, now):
+                    continue
+                rows.append((-r["last_heard"], host_id, {
+                    "host_id": host_id, "address": r["address"], "port": r["port"],
+                    "role": r["role"], "version": r["version"], "proto": r["proto"],
+                    "compatible": r["compatible"], "skills": copy.deepcopy(r["skills"]),
+                    "heard_via": r["heard_via"], "age": round(now - r["last_heard"], 1),
+                }))
+            rows.sort(key=lambda row: (row[0], row[1]))
+            return [row[2] for row in rows]
+
+    def unheard_registered(self):
+        with self._lock:
+            now = self._clock()
+            return [h for h in self._registered
+                    if h != self._self
+                    and not (h in self._records and self._live(self._records[h], now))]
+
+    def due_for_refresh(self, interval):
+        with self._lock:
+            now = self._clock()
+            return sorted(h for h, r in self._records.items()
+                          if self._live(r, now) and now - r["last_refresh"] >= interval)
+
+    def transitions(self):
+        """[(host_id, "live" | "down")] changed since the previous call, each reported once."""
+        with self._lock:
+            now = self._clock()
+            changes = []
+            for host_id in sorted(set(self._records) | set(self._reported)):
+                record = self._records.get(host_id)
+                state = "live" if record is not None and self._live(record, now) else "down"
+                if state != self._reported.get(host_id, "down"):
+                    self._reported[host_id] = state
+                    changes.append((host_id, state))
+            return changes
+
+    def heard_beacon_within(self, window):
+        with self._lock:
+            now = self._clock()
+            return any(r["heard_via"] == "beacon" and now - r["last_heard"] <= window
+                       for r in self._records.values())

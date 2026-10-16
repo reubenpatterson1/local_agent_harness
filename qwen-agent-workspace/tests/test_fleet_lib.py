@@ -527,3 +527,89 @@ def test_t12_build_child_env():
         assert env[kept] == environ[kept]
     assert env["QWEN_AGENT_DAEMON_URL"] == "http://127.0.0.1:8190"
     assert not any(TEST_TOKEN in v for v in env.values())
+
+
+# --- T19, T20, Review Focus 2: the liveness table (F34, F35) ------------------------
+
+def _health(version="v2026.10.17", proto=1, role="agent"):
+    return {"host_id": "x", "role": role, "version": version, "proto": proto, "discovery": "beacon"}
+
+
+_SKILLS = [{"skill": "researcher", "model": "qwen3.5:9b", "verified": True, "busy": False}]
+
+
+def _table(clock):
+    return fleet_lib.LivenessTable(_f18_registry(), "mac-local", 90, clock=clock)
+
+
+def test_t19_live_window_and_transitions():
+    clock = _Clock(1000.0)
+    table = _table(clock)
+    assert table.unheard_registered() == ["ollama-168", "orchestrator"]
+    table.bind("ollama-168", "192.168.1.168", 8190, _health(), _SKILLS, "beacon")
+    assert table.is_live("ollama-168")
+    assert table.unheard_registered() == ["orchestrator"]
+    assert table.transitions() == [("ollama-168", "live")]
+    assert table.transitions() == []
+    clock.t = 1090.0
+    assert table.is_live("ollama-168")
+    clock.t = 1090.001
+    assert not table.is_live("ollama-168")
+    assert table.live_peers() == []
+    assert table.unheard_registered() == ["ollama-168", "orchestrator"]
+    assert table.transitions() == [("ollama-168", "down")]
+    assert table.transitions() == []
+    assert not table.is_live("orchestrator")
+    assert "mac-local" not in table.unheard_registered()
+
+
+def test_t20_order_fields_rebind_refresh():
+    clock = _Clock(1000.0)
+    table = _table(clock)
+    table.bind("orchestrator", "192.168.1.170", 8190, _health(role="orchestrator"), [], "poll")
+    table.bind("ollama-168", "192.168.1.168", 8190, _health(), _SKILLS, "beacon")
+    assert [p["host_id"] for p in table.live_peers()] == ["ollama-168", "orchestrator"]
+    clock.t = 1001.0
+    assert table.heard("192.168.1.170", 8190, "beacon") == "orchestrator"
+    assert [p["host_id"] for p in table.live_peers()] == ["orchestrator", "ollama-168"]
+    clock.t = 1002.0
+    assert table.heard("192.168.1.168", 8190, "beacon") == "ollama-168"
+    assert table.heard("192.168.1.170", 8190, "beacon") == "orchestrator"
+    peers = table.live_peers()
+    assert [p["host_id"] for p in peers] == ["ollama-168", "orchestrator"]  # tie -> host_id
+    for p in peers:
+        assert set(p) == set(fleet_lib.PEER_FIELDS) and len(p) == 10
+    assert peers[0]["age"] == 0.0 and peers[0]["compatible"] is True
+    assert table.heard("192.168.1.99", 8190, "beacon") is None
+    assert table.heard("192.168.1.168", 8191, "beacon") is None
+
+    # A bind attempt from a new address moves the record (F34).
+    table.bind("ollama-168", "192.168.1.201", 8190, _health(), _SKILLS, "beacon")
+    assert table.record("ollama-168")["address"] == "192.168.1.201"
+    assert table.heard("192.168.1.168", 8190, "beacon") is None
+
+    # due_for_refresh and heard_beacon_within.
+    clock.t = 1062.5
+    assert table.due_for_refresh(60) == ["ollama-168", "orchestrator"]
+    table.refresh("orchestrator", _health(version="v2", proto=2, role="orchestrator"), [], "poll")
+    assert table.due_for_refresh(60) == ["ollama-168"]
+    rec = table.record("orchestrator")
+    assert rec["version"] == "v2" and rec["compatible"] is False and rec["heard_via"] == "poll"
+    assert table.heard_beacon_within(90) is True
+    assert table.heard_beacon_within(10) is False
+    clock.t = 1300.0
+    assert table.heard_beacon_within(90) is False
+
+
+def test_review_focus_2_restarted_peer_is_rebound_not_revived():
+    """Review Focus 2: a peer that aged out (rebooted, or restarted on a new release)
+    and beacons again from the same address must not be revived by heard(); the
+    daemon re-binds it through signed /health, which picks up the new version."""
+    clock = _Clock(1000.0)
+    table = _table(clock)
+    table.bind("ollama-168", "192.168.1.168", 8190, _health(version="v2026.10.17"), _SKILLS, "beacon")
+    clock.t = 1200.0
+    assert table.heard("192.168.1.168", 8190, "beacon") is None
+    assert not table.is_live("ollama-168")
+    table.bind("ollama-168", "192.168.1.168", 8190, _health(version="v2026.10.18"), _SKILLS, "beacon")
+    assert table.live_peers()[0]["version"] == "v2026.10.18"
