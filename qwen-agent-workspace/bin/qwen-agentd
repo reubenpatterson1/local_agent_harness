@@ -904,6 +904,274 @@ def cmd_status(args):
 
 
 # ---------------------------------------------------------------------------
+# releases: git, staging, the gate, the current symlink (F80, F81, F85, F86)
+# ---------------------------------------------------------------------------
+
+def log_to_daemon(level, msg):
+    LOG.log(getattr(logging, level), msg)
+
+
+def log_to_stderr(level, msg):
+    _err("qwen-agentd: %s: %s" % (level.lower(), msg))
+
+
+def git(args):
+    """Run one git command -> (ok, detail, stdout). detail is "" on success (F85)."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(["git"] + list(args), capture_output=True, text=True, env=env,
+                              stdin=subprocess.DEVNULL, timeout=fleet_lib.GIT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, "timeout", ""
+    except OSError as e:
+        return False, "%s: %s" % (type(e).__name__, e), ""
+    if proc.returncode == 0:
+        return True, "", proc.stdout
+    lines = [line.strip() for line in proc.stderr.splitlines() if line.strip()]
+    return False, "exit %d: %s" % (proc.returncode, lines[-1] if lines else "-"), proc.stdout
+
+
+def state_path(d):
+    return os.path.join(d, "update-state.json")
+
+
+def list_tags(d):
+    ok, _detail, out = git(["-C", os.path.join(d, "repo"), "tag", "--list"])
+    return [line.strip() for line in out.splitlines() if line.strip()] if ok else []
+
+
+def unstage_release(d, tag, log):
+    """Remove D/releases/<tag> and its worktree registration; failures are logged and ignored."""
+    repo = os.path.join(d, "repo")
+    path = os.path.join(d, "releases", tag)
+    ok, detail, _out = git(["-C", repo, "worktree", "remove", "--force", path])
+    if not ok:
+        log("WARNING", "update: git worktree remove %s failed (%s)" % (tag, detail))
+    shutil.rmtree(path, ignore_errors=True)
+    ok, detail, _out = git(["-C", repo, "worktree", "prune"])
+    if not ok:
+        log("WARNING", "update: git worktree prune failed (%s)" % detail)
+
+
+def stage_release(d, tag, log):
+    """git worktree add --detach D/releases/<tag> refs/tags/<tag> -> (ok, detail) (F86)."""
+    path = os.path.join(d, "releases", tag)
+    if os.path.lexists(path):
+        unstage_release(d, tag, log)
+    os.makedirs(os.path.join(d, "releases"), exist_ok=True)
+    ok, detail, _out = git(["-C", os.path.join(d, "repo"), "worktree", "add", "--detach", path,
+                            "refs/tags/" + tag])
+    return ok, detail
+
+
+def gate_release(d, tag):
+    """py_compile, then the staged release's own `qwen-agentd selftest` -> (ok, detail) (F86)."""
+    ws = os.path.join(d, "releases", tag, fleet_lib.WS_SUBDIR)
+    try:
+        proc = subprocess.run([sys.executable, "-m", "py_compile", ws + "/bin/qwen-agent", ws + "/bin/qwen-agentd"],
+                              cwd=ws, capture_output=True, timeout=fleet_lib.GATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return False, "py_compile timeout"
+    except OSError as e:
+        return False, "py_compile %s" % type(e).__name__
+    if proc.returncode != 0:
+        return False, "py_compile exit %d" % proc.returncode
+    logs = fleet_lib.log_dir()
+    os.makedirs(logs, exist_ok=True)
+    fd = os.open(os.path.join(logs, "gate-%s.log" % tag), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w") as out:
+        try:
+            child = subprocess.Popen([sys.executable, ws + "/bin/qwen-agentd", "selftest"], cwd=ws,
+                                     env=_strip_fleet_env(os.environ), stdin=subprocess.DEVNULL,
+                                     stdout=out, stderr=out, start_new_session=True)
+        except OSError as e:
+            return False, "selftest %s" % type(e).__name__
+        try:
+            rc = child.wait(timeout=fleet_lib.GATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            return False, "selftest timeout"
+    if rc != 0:
+        return False, "selftest exit %d" % rc
+    return True, ""
+
+
+def swap_current(d, tag):
+    """Point D/current at the RELATIVE target releases/<tag>, atomically (F80)."""
+    tmp = os.path.join(d, ".current.tmp")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(os.path.join("releases", tag), tmp)
+    os.replace(tmp, os.path.join(d, "current"))
+
+
+# ---------------------------------------------------------------------------
+# install and the supervisor services (F90, F91)
+# ---------------------------------------------------------------------------
+
+LAUNCHD_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def launchd_plist_dict(py, d, host_id, logs):
+    return {"Label": fleet_lib.LAUNCHD_LABEL,
+            "ProgramArguments": [py, d + "/qwen-agentd-launch"],
+            "EnvironmentVariables": {"QWEN_AGENT_HOST_ID": host_id, "PATH": LAUNCHD_PATH},
+            "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": fleet_lib.SUPERVISOR_RESTART_DELAY,
+            "StandardOutPath": logs + "/launchd.out", "StandardErrorPath": logs + "/launchd.err"}
+
+
+def systemd_unit_text(py, d, host_id):
+    return ("[Unit]\n"
+            "Description=qwen-agent fleet daemon\n"
+            "StartLimitIntervalSec=0\n"
+            "\n"
+            "[Service]\n"
+            "ExecStart=%s %s/qwen-agentd-launch\n"
+            "Environment=QWEN_AGENT_HOST_ID=%s\n"
+            "Restart=always\n"
+            "RestartSec=%d\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=default.target\n" % (py, d, host_id, fleet_lib.SUPERVISOR_RESTART_DELAY))
+
+
+def linger_enabled(user):
+    """True iff `loginctl show-user <user> -p Linger` prints exactly Linger=yes (F90)."""
+    try:
+        proc = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True,
+                              text=True, timeout=fleet_lib.GIT_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.stdout.strip() == "Linger=yes"
+
+
+def _write_file_atomic(path, data, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def install_service(py, d, host_id):
+    """Write and load the platform's service -> (ok, service path or error message) (F90)."""
+    if sys.platform == "darwin":
+        path = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % fleet_lib.LAUNCHD_LABEL)
+        _write_file_atomic(path, plistlib.dumps(launchd_plist_dict(py, d, host_id, fleet_lib.log_dir())))
+        domain = "gui/%d" % os.getuid()
+        subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, fleet_lib.LAUNCHD_LABEL)],
+                       capture_output=True)
+        rc = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True).returncode
+        if rc != 0:
+            return False, "qwen-agentd: launchctl bootstrap failed (exit %d)" % rc
+        return True, path
+    if sys.platform.startswith("linux"):
+        path = os.path.expanduser("~/.config/systemd/user/%s" % fleet_lib.SYSTEMD_UNIT)
+        _write_file_atomic(path, systemd_unit_text(py, d, host_id).encode("utf-8"))
+        for cmd in (["systemctl", "--user", "daemon-reload"],
+                    ["systemctl", "--user", "enable", fleet_lib.SYSTEMD_UNIT],
+                    ["systemctl", "--user", "restart", fleet_lib.SYSTEMD_UNIT]):
+            rc = subprocess.run(cmd, capture_output=True).returncode
+            if rc != 0:
+                return False, "qwen-agentd: %s failed (exit %d)" % (" ".join(cmd), rc)
+        return True, path
+    return False, "qwen-agentd: unsupported platform %s" % sys.platform
+
+
+def cmd_install(args):
+    """F91, steps 1-11. Idempotent: never re-clones and never changes an existing D/current."""
+    d = fleet_lib.deploy_root()
+    if not fleet_lib.HOST_ID_RE.fullmatch(args.host_id):
+        _err("qwen-agentd: invalid --host-id '%s'" % args.host_id)
+        return 2
+    if not git(["--version"])[0]:
+        _err("qwen-agentd: git is required")
+        return 2
+    try:
+        has_pytest = subprocess.run([sys.executable, "-c", "import pytest"], capture_output=True,
+                                    timeout=fleet_lib.GIT_TIMEOUT).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        has_pytest = False
+    if not has_pytest:
+        _err("qwen-agentd: pytest is required for the self-update gate (install python3-pytest, "
+             "or pip install pytest, for %s)" % sys.executable)
+        return 2
+    if sys.platform.startswith("linux") and not args.no_service:
+        user = getpass.getuser()
+        if not linger_enabled(user):
+            _err("qwen-agentd: user lingering is off, so the daemon would stop at logout; run: "
+                 "sudo loginctl enable-linger %s" % user)
+            return 2
+    for directory in (d, fleet_lib.log_dir()):
+        os.makedirs(directory, exist_ok=True)
+        os.chmod(directory, 0o700)
+    repo = os.path.join(d, "repo")
+    if not os.path.isdir(repo):
+        ok, detail, _out = git(["clone", "--bare", args.origin, repo])
+        if not ok:
+            _err("qwen-agentd: git clone failed (%s)" % detail)
+            return 2
+    else:
+        ok, detail, _out = git(["-C", repo, "fetch", "origin", "--tags"])
+        if not ok:
+            _err("qwen-agentd: git fetch failed (%s)" % detail)
+            return 2
+    tags = [t for t in list_tags(d) if fleet_lib.tag_key(t) is not None]
+    if not tags:
+        _err("qwen-agentd: no release tags (vYYYY.MM.DD[.N]) at %s; tag a release first" % args.origin)
+        return 2
+    current = os.path.join(d, "current")
+    if not os.path.exists(current):
+        tag = max(tags, key=fleet_lib.tag_key)
+        ok, detail = stage_release(d, tag, log_to_stderr)
+        if ok:
+            ok, detail = gate_release(d, tag)
+        if not ok:
+            _err("qwen-agentd: first release %s failed its gate (%s); see %s"
+                 % (tag, detail, os.path.join(fleet_lib.log_dir(), "gate-%s.log" % tag)))
+            return 2
+        swap_current(d, tag)
+        fleet_lib.write_state(state_path(d), {"from": None, "to": tag, "status": "ok", "attempts": 0,
+                                              "bad_tags": []})
+    launcher_tmp = os.path.join(d, ".qwen-agentd-launch.tmp")
+    shutil.copyfile(os.path.join(current, fleet_lib.WS_SUBDIR, "bin", "qwen-agentd-launch"), launcher_tmp)
+    os.chmod(launcher_tmp, 0o755)
+    os.replace(launcher_tmp, os.path.join(d, "qwen-agentd-launch"))
+    bindir = os.path.expanduser("~/.local/bin")
+    os.makedirs(bindir, exist_ok=True)
+    link = os.path.join(bindir, "qwen-agent")
+    if os.path.lexists(link) and not os.path.islink(link):
+        _err("qwen-agentd: warning: not replacing %s: not a symlink" % link)
+    else:
+        link_tmp = link + ".tmp"
+        if os.path.lexists(link_tmp):
+            os.unlink(link_tmp)
+        os.symlink(os.path.join(current, fleet_lib.WS_SUBDIR, "bin", "qwen-agent"), link_tmp)
+        os.replace(link_tmp, link)
+    service_path = None
+    if not args.no_service:
+        ok, result = install_service(sys.executable, d, args.host_id)
+        if not ok:
+            _err(result)
+            return 2
+        service_path = result
+    print("installed %s at %s" % (os.path.basename(os.path.realpath(current)), d))
+    if service_path is not None:
+        print("service: %s" % service_path)
+    if not os.path.exists(fleet_lib.fleet_env_path()):
+        print("next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join (or init-fleet); "
+              "the service retries every 10 s" % d)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI (F92, F99). Keep this section last.
 # ---------------------------------------------------------------------------
 
@@ -928,6 +1196,11 @@ def _build_parser():
     p = sub.add_parser("status", help="print this host's fleet view and update state")
     p.add_argument("--port", type=int, default=fleet_lib.DEFAULT_PORT)
     p.set_defaults(func=cmd_status)
+    p = sub.add_parser("install", help="install this host into ~/.local/share/qwen-agent and its service")
+    p.add_argument("--host-id", required=True, metavar="ID")
+    p.add_argument("--origin", default=fleet_lib.ORIGIN_URL, metavar="URL")
+    p.add_argument("--no-service", action="store_true", default=False)
+    p.set_defaults(func=cmd_install)
     return parser
 
 
