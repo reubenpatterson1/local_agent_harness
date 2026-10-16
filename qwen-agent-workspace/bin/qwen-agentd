@@ -246,6 +246,10 @@ class _FleetHTTPServer(http.server.ThreadingHTTPServer):
         http.server.ThreadingHTTPServer.__init__(self, address, _FleetHandler)
 
     def handle_error(self, request, client_address):
+        # A peer dropping the connection is not a daemon error, and anyone on the LAN
+        # can cause one, so it is not logged (F29a). socket.timeout is listed for 3.9.
+        if issubclass(sys.exc_info()[0], (ConnectionError, TimeoutError, socket.timeout)):
+            return
         LOG.error("http handler error: %s" % sys.exc_info()[0].__name__)
 
 

@@ -17,6 +17,7 @@ import re
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -312,3 +313,16 @@ def test_http_server_errors_have_no_body(tmp_path):
     head, _sep, rest = data.partition(b"\r\n\r\n")
     assert head.startswith(b"HTTP/1.0 501") and b"Content-Length: 0" in head
     assert rest == b"" and b"<" not in data
+
+
+def test_connection_reset_mid_request_is_not_logged(tmp_path):
+    daemon, _stub, _registry = _single(tmp_path)
+    for _ in range(5):
+        sock = socket.create_connection(("127.0.0.1", daemon.port), timeout=10)
+        sock.sendall(b"POST /run HTTP/1.0\r\nContent-Length: 1000\r\n\r\nabc")
+        time.sleep(0.05)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        sock.close()
+    time.sleep(1.0)
+    assert "http handler error" not in daemon.log()
+    assert ftu.peers(daemon.port)[0] == 200
