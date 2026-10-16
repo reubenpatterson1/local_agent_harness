@@ -552,7 +552,10 @@ class LivenessTable(object):
         self._reported = {}
 
     def _live(self, record, now):
-        return now - record["last_heard"] <= self._window
+        # A beacon alone cannot keep a record live: it also needs a signed refresh
+        # within two windows, or it ages out and the next beacon triggers a re-bind.
+        return (now - record["last_heard"] <= self._window
+                and now - record["last_refresh"] <= 2 * self._window)
 
     def bind(self, host_id, address, port, health, skills, via):
         """Create or replace host_id's record after a successful signed /health + /skills.
