@@ -261,7 +261,7 @@ def load_fleet_env(path):
         with open(path, "r", encoding="ascii", newline="") as f:
             content = f.read()
     except UnicodeDecodeError:
-        raise malformed
+        raise malformed from None
     lines = content.split("\n")
     if len(lines) != 3 or lines[2] != "":
         raise malformed
