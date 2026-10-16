@@ -28,7 +28,7 @@ services:
 
   llm-proxy:
     image: alpine/socat
-    command: "TCP-LISTEN:8177,fork,reuseaddr TCP:host.docker.internal:8177"
+    command: "TCP-LISTEN:8177,fork,reuseaddr TCP:host.docker.internal:11434"
     networks:
       - redteam-net
       - llm-bridge-net
