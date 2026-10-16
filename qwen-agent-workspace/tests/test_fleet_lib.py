@@ -1068,3 +1068,8 @@ def test_t29a_state_io_prune_and_version(tmp_path):
     expected_logs = ("~/Library/Logs/qwen-agentd" if sys.platform == "darwin"
                      else "~/.local/state/qwen-agentd")
     assert fleet_lib.log_dir() == os.path.expanduser(expected_logs)
+
+
+def test_tag_re_rejects_non_ascii_digits():
+    assert fleet_lib.TAG_RE.fullmatch("v2026.10.17")
+    assert fleet_lib.TAG_RE.fullmatch("v٢٠٢٦.10.17") is None
