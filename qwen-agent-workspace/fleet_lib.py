@@ -1,0 +1,230 @@
+"""fleet_lib -- pure, importable logic for the qwen-agent fleet.
+
+Registry, trust (fleet.env and join strings), signing, liveness, routing and the
+self-update decisions all live here so that they can be unit tested without a
+daemon. bin/qwen-agentd holds the CLI, threads, sockets and subprocesses;
+bin/qwen-agent loads this file lazily and only for routing.
+See docs/superpowers/specs/2026-10-16-fleet-discovery-self-update-design.md.
+
+Standard library only. Nothing here opens a socket or starts a process at import
+time; fetch_view and delegate_once open a connection only when called. Valid on
+Python 3.9 and 3.13: no `X | Y` annotations, no `match`, no 3.10+ APIs.
+"""
+
+import copy
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import os
+import re
+import sys
+import threading
+import time
+
+PROTOCOL = 1
+DEFAULT_PORT = 8190
+BEACON_INTERVAL = 30          # s, scaled by --timing-scale
+POLL_INTERVAL = 60            # s, scaled
+LIVE_WINDOW = 90              # s, scaled
+REPROBE_INTERVAL = 60         # s, scaled
+PEER_REFRESH_INTERVAL = 60    # s, scaled
+HOUSEKEEPING_INTERVAL = 5     # s, scaled
+UPDATE_INTERVAL = 900         # s, scaled
+UPDATE_JITTER = 120           # s, scaled; uniform in [0, UPDATE_JITTER]
+SKEW_WINDOW = 60              # s, never scaled
+NONCE_RETENTION = 120         # s, never scaled
+STARTUP_HEALTH_DEADLINE = 120 # s, never scaled
+PEER_HTTP_TIMEOUT = 5         # s, /health and /skills calls to peers
+MODEL_PROBE_TIMEOUT = 5       # s
+RUN_TIMEOUT = 900             # s, equals bin/qwen-agent SKILL_SUBPROCESS_TIMEOUT
+FORWARD_TIMEOUT = 930         # s, RUN_TIMEOUT + 30: /delegate -> peer /run
+GATE_TIMEOUT = 300            # s, the staged release's selftest
+GIT_TIMEOUT = 120             # s, any single git subprocess
+MAX_BODY = 1048576            # bytes, request body cap
+MAX_START_ATTEMPTS = 3
+KEEP_RELEASES = 3
+FLEET_TAG_CHARS = 16
+KNOWN_SKILLS = ("investigator", "analyst", "planner", "researcher")
+FLEET_ENV_KEYS = ("QWEN_AGENT_FLEET_ID", "QWEN_AGENT_FLEET_TOKEN")
+FLEET_ENV_PREFIX = "QWEN_AGENT_FLEET_"   # every env key with this prefix is stripped (F54a, F86)
+TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})\.(\d{2})(?:\.([1-9]\d*))?$")
+HOST_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+FLEET_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+JOIN_PREFIX = "qaf1"
+LOOPBACK_CLIENTS = ("127.0.0.1", "::1")   # client addresses allowed on loopback-only endpoints (F42)
+LOCAL = "@local"              # route_candidates' marker for "run on this host" (F59); cannot match HOST_ID_RE
+PEERS_SCHEMA = "qwen-agentd.peers.v1"
+ONESHOT_SCHEMA = "qwen-agent.oneshot.v1"   # equals bin/qwen-agent ONESHOT_SCHEMA
+DEFAULT_DAEMON_URL = "http://127.0.0.1:8190"
+DAEMON_URL_RE = re.compile(r"^http://127\.0\.0\.1:([0-9]{1,5})$")
+VIEW_TIMEOUT = 2              # s, bin/qwen-agent GET /peers; never scaled
+DELEGATE_CLIENT_TIMEOUT = 960 # s, bin/qwen-agent POST /delegate = FORWARD_TIMEOUT + 30; never scaled
+ORIGIN_URL = "https://github.com/reubenpatterson1/local_agent_harness.git"
+DEPLOY_ROOT = "~/.local/share/qwen-agent"   # passed through os.path.expanduser at every use
+WS_SUBDIR = "qwen-agent-workspace"          # the workspace directory inside a release worktree
+LAUNCHD_LABEL = "com.qwen-agent.qwen-agentd"
+SYSTEMD_UNIT = "qwen-agentd.service"
+SUPERVISOR_RESTART_DELAY = 10 # s, launchd ThrottleInterval and systemd RestartSec
+LOG_MAX_BYTES = 5242880       # 5 MB
+LOG_BACKUPS = 3
+
+# Every regex above is applied with .fullmatch(), never .match(): "$" alone also
+# matches just before a trailing newline, so "mac-local\n" would otherwise pass.
+
+
+class RegistryError(ValueError):
+    """The registry cannot be read, fails the F7 schema, or lacks this host (F8, F9)."""
+
+
+class FleetEnvError(ValueError):
+    """fleet.env or a join string is malformed (F21, F25). Never carries secret text."""
+
+
+def _is_int(value):
+    """True for a real int. bool is an int subclass and is rejected (F7 rules 2 and 8)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+# ---------------------------------------------------------------------------
+# Section 2: registry and self-identity (F5-F11, F18)
+# ---------------------------------------------------------------------------
+
+_REGISTRY_KEYS = frozenset(("protocol", "fleet_id", "hosts"))
+_HOST_KEYS = frozenset(("role", "address", "port", "model_server", "model", "skills"))
+_HOST_REQUIRED = _HOST_KEYS - frozenset(("port",))
+_ROLES = ("orchestrator", "agent")
+_SERVER_TYPES = ("ollama", "vllm")
+
+
+def validate_registry(obj, expected_fleet_id):
+    """Every F7 violation in obj, as "location: message" strings. [] means valid.
+
+    Collects all failures instead of stopping at the first. Each independent
+    violation produces exactly one string.
+    """
+    if not isinstance(obj, dict):
+        return ["registry: must be a JSON object"]
+    errors = []
+    keys = set(obj)
+    for key in sorted(_REGISTRY_KEYS - keys):
+        errors.append("registry: missing key '%s'" % key)
+    for key in sorted(keys - _REGISTRY_KEYS):
+        errors.append("registry: unexpected key '%s'" % key)
+    if "protocol" in obj and not (_is_int(obj["protocol"]) and obj["protocol"] == PROTOCOL):
+        errors.append("protocol: must be the integer %d" % PROTOCOL)
+    if "fleet_id" in obj:
+        fleet_id = obj["fleet_id"]
+        if not (isinstance(fleet_id, str) and FLEET_ID_RE.fullmatch(fleet_id)):
+            errors.append("fleet_id: must be 16 lowercase hex characters")
+        elif fleet_id != expected_fleet_id:
+            errors.append("fleet_id: '%s' does not match this host's fleet_id '%s'"
+                          % (fleet_id, expected_fleet_id))
+    if "hosts" in obj:
+        errors.extend(_validate_hosts(obj["hosts"]))
+    return errors
+
+
+def _validate_hosts(hosts):
+    if not isinstance(hosts, dict) or not hosts:
+        return ["hosts: must be a non-empty object"]
+    errors = []
+    used = {}
+    for host_id in sorted(hosts):
+        loc = "hosts.%s" % host_id
+        if not HOST_ID_RE.fullmatch(host_id):
+            errors.append("%s: host_id must match %s" % (loc, HOST_ID_RE.pattern))
+        host = hosts[host_id]
+        if not isinstance(host, dict):
+            errors.append("%s: must be an object" % loc)
+            continue
+        keys = set(host)
+        for key in sorted(_HOST_REQUIRED - keys):
+            errors.append("%s: missing key '%s'" % (loc, key))
+        for key in sorted(keys - _HOST_KEYS):
+            errors.append("%s: unexpected key '%s'" % (loc, key))
+        if "role" in host and host["role"] not in _ROLES:
+            errors.append("%s.role: must be 'orchestrator' or 'agent'" % loc)
+        address_ok = False
+        if "address" in host:
+            try:
+                if not isinstance(host["address"], str):
+                    raise ValueError("not a string")
+                ipaddress.IPv4Address(host["address"])
+                address_ok = True
+            except ValueError:
+                errors.append("%s.address: must be an IPv4 dotted quad" % loc)
+        port = host.get("port", DEFAULT_PORT)
+        port_ok = _is_int(port) and 1 <= port <= 65535
+        if not port_ok:
+            errors.append("%s.port: must be an integer in 1..65535" % loc)
+        if "model_server" in host:
+            errors.extend(_validate_model_server(loc + ".model_server", host["model_server"]))
+        if "model" in host and not (isinstance(host["model"], str) and host["model"] != ""):
+            errors.append("%s.model: must be a non-empty string" % loc)
+        if "skills" in host:
+            errors.extend(_validate_skills(loc + ".skills", host["skills"]))
+        if address_ok and port_ok:
+            pair = (host["address"], port)
+            if pair in used:
+                errors.append("%s: address %s:%d is already used by hosts.%s"
+                              % (loc, pair[0], pair[1], used[pair]))
+            else:
+                used[pair] = host_id
+    return errors
+
+
+def _validate_model_server(loc, server):
+    if not isinstance(server, dict) or set(server) != {"type", "url"}:
+        return ["%s: must be an object with exactly the keys 'type' and 'url'" % loc]
+    errors = []
+    if server["type"] not in _SERVER_TYPES:
+        errors.append("%s.type: must be 'ollama' or 'vllm'" % loc)
+    url = server["url"]
+    if not (isinstance(url, str) and url.startswith("http://")):
+        errors.append("%s.url: must be a string starting with http://" % loc)
+    elif server["type"] == "ollama" and not url.endswith("/v1"):
+        errors.append("%s.url: an ollama url must end with /v1" % loc)
+    return errors
+
+
+def _validate_skills(loc, skills):
+    if not isinstance(skills, list):
+        return ["%s: must be a list" % loc]
+    errors = []
+    seen = []
+    for index, skill in enumerate(skills):
+        if not isinstance(skill, str) or skill not in KNOWN_SKILLS:
+            errors.append("%s[%d]: must be one of %s" % (loc, index, ", ".join(KNOWN_SKILLS)))
+        elif skill in seen:
+            errors.append("%s[%d]: duplicate skill '%s'" % (loc, index, skill))
+        else:
+            seen.append(skill)
+    return errors
+
+
+def load_registry(path, expected_fleet_id):
+    """Read, validate and return the registry with `port` filled in on every host (F8)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.loads(f.read())
+    except (OSError, ValueError, RecursionError) as e:
+        raise RegistryError("cannot read registry %s: %s: %s" % (path, type(e).__name__, e))
+    errors = validate_registry(obj, expected_fleet_id)
+    if errors:
+        raise RegistryError("invalid registry %s:\n  " % path + "\n  ".join(errors))
+    registry = copy.deepcopy(obj)
+    for host in registry["hosts"].values():
+        host.setdefault("port", DEFAULT_PORT)
+    return registry
+
+
+def self_entry(registry, host_id):
+    """This host's registry entry; host identity comes only from QWEN_AGENT_HOST_ID (F9, F10)."""
+    if host_id not in registry["hosts"]:
+        raise RegistryError("host_id '%s' is not in the fleet registry; valid IDs: %s"
+                            % (host_id, ", ".join(sorted(registry["hosts"]))))
+    return registry["hosts"][host_id]
