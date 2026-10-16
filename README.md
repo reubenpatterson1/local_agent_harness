@@ -76,14 +76,33 @@ persistence. The only thing standing between an injected instruction and real
 harm is (a) the model declining to obey, and (b) the harness's own guardrails
 (human approval, path confinement, scheme checks).
 
-This range removes the harness guardrails on purpose so you can measure
-(a) — how much the model itself resists — and observe exactly what a
-successful injection would have done. It is a laboratory for the question
-"if the human-in-the-loop and the confinement were gone, what would this model
-let a hostile web page do with these tools?"
+The range runs two complementary experiments. Each removes one of those two
+defenses on purpose and measures the one that is left.
 
-The safe/production harness this is derived from lives elsewhere; this range is
-the offensive test rig for it, not the harness itself.
+**Remove the harness, measure the model.** With the guardrails off — the
+range's `agent/qwen-agent-unsafe`, or the real harness run with
+`--danger-auto-approve`, which drops the confirmation prompt for every tool
+call except `promote` (bash, run_python, and generate_image included, none of
+them sandboxed) — the only defense left is (a), the model declining to obey.
+This measures how much the model itself resists and shows exactly what a
+successful injection would have done. It is a laboratory for the question "if
+the human-in-the-loop and the confinement were gone, what would this model let
+a hostile web page do with these tools?"
+
+**Remove the model's refusals, measure the harness.** The harness can also
+host *abliterated* models — models whose refusal behavior has been deliberately
+removed, such as the default `qwen38-6bit` (Huihui-Qwen3.8-27B-abliterated). A
+model that never refuses acts on every injected instruction it reads, so (b),
+the harness's own guardrails (human approval, path confinement, scheme checks),
+is the only thing left between the injection and real harm. Running the same
+injection payloads against an abliterated model with the guardrails **on**
+measures how effective the harness alone is at stopping a model that does not
+resist from doing something harmful.
+
+The safe/production harness this range is derived from lives in this same
+repository at `qwen-agent-workspace/bin/qwen-agent`. The range itself
+(`agent/`, `testsite/`, `collector/`) is the offensive test rig for it, not the
+harness.
 
 ---
 
