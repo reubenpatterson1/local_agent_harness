@@ -616,15 +616,15 @@ def test_review_focus_2_restarted_peer_is_rebound_not_revived():
 
 
 def test_beacon_alone_cannot_keep_a_record_live():
-    # bind at t=1000, then heard() every 30 s with no refresh; live through t=1180, not at t=1181+
+    # bind at t=1000, then heard() every 30 s with no refresh; live through t=1360, not at t=1361+
     clock = _Clock(1000.0)
     table = _table(clock)
     table.bind("ollama-168", "192.168.1.168", 8190, _health(), _SKILLS, "beacon")
-    for t in (1030.0, 1060.0, 1090.0, 1120.0, 1150.0, 1180.0):
+    for t in (1030.0 + 30.0 * i for i in range(12)):
         clock.t = t
         assert table.heard("192.168.1.168", 8190, "beacon") == "ollama-168"
     assert [p["host_id"] for p in table.live_peers()] == ["ollama-168"]
-    clock.t = 1210.0
+    clock.t = 1390.0
     assert table.heard("192.168.1.168", 8190, "beacon") is None
     assert table.live_peers() == []
 

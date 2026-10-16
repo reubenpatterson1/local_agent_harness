@@ -406,8 +406,8 @@ def test_t49_model_server_comes_back(tmp_path):
     assert status == 200
     ftu.wait_until(lambda: fleet.peer_ids("alpha") == ["bravo"], 4.5)
     ftu.StubModelServer("ollama", "bravo-model", "B", port=fleet.server_ports["bravo"])
-    elapsed = ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", bravo.port, "/skills")[2])
-                             ["skills"][0]["verified"] is True, 6.0 + 2.0)
+    ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", bravo.port, "/skills")[2])
+                   ["skills"][0]["verified"] is True, 6.0 + 2.0)
     ftu.wait_until(lambda: "INFO prober skill 'researcher' offered: model 'bravo-model' present" in bravo.log(), 1.0)
 
 
