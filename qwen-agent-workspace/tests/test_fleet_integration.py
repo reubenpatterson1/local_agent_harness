@@ -445,3 +445,65 @@ def test_unregistered_same_fleet_host_warns_once(tmp_path):
     time.sleep(4.0)
     assert alpha.log().count("ignoring unregistered host_id 'zulu'") == 1
     assert fleet.peer_ids("alpha") == []
+
+
+# --- POST /run (F47-F54c) ----------------------------------------------------------------
+
+def _run_body(skill, task, request_id="req-1"):
+    return json.dumps({"skill": skill, "task": task, "request_id": request_id}).encode("utf-8")
+
+
+def _signed_run(port, body):
+    status, headers, raw, nonce = ftu.signed(ftu.TEST_KEY, "POST", port, "/run", body, timeout=60)
+    assert ftu.response_ok(ftu.TEST_KEY, status, "POST", "/run", nonce, headers, raw), status
+    return status, raw
+
+
+def _bravo_with_hook(tmp_path, kind):
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-%s" % kind), kind)
+    fleet = ftu.Fleet(tmp_path, names=("bravo",), extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+    return fleet, hook
+
+
+def test_t48_run_endpoint(tmp_path):
+    fleet, hook = _bravo_with_hook(tmp_path, "slow")
+    port = fleet.ports["bravo"]
+    for body in (b"not json", b"[]", json.dumps({"skill": "researcher", "task": "x"}).encode(),
+                 _run_body("researcher", "   "), _run_body("researcher", "x", "bad id!"),
+                 json.dumps({"skill": "researcher", "task": 5, "request_id": "r"}).encode(),
+                 json.dumps({"skill": "researcher", "task": "x", "request_id": "r", "more": 1}).encode()):
+        assert _signed_run(port, body) == (400, b'{"error":"bad request"}'), body
+    assert _signed_run(port, _run_body("analyst", "x")) == (400, b'{"error":"skill not served: analyst"}')
+
+    nonce = os.urandom(16).hex()
+    headers = fleet_lib.sign_request(ftu.TEST_KEY, "POST", "/run", b"", int(time.time()), nonce)
+    assert ftu.raw_request(port, "POST", "/run", headers) == (411, b"")
+    headers = dict(headers, **{"Content-Length": str(fleet_lib.MAX_BODY + 1)})
+    assert ftu.raw_request(port, "POST", "/run", headers) == (413, b"")
+    assert ftu._request(port, "POST", "/run", _run_body("researcher", "x"),
+                        {"Content-Type": "application/json"})[0::2] == (401, b"")
+    body = _run_body("researcher", "replayed")
+    nonce = os.urandom(16).hex()
+    headers = fleet_lib.sign_request(ftu.TEST_KEY, "POST", "/run", body, int(time.time()), nonce)
+    ftu.release_hook(hook, "replayed")
+    assert ftu._request(port, "POST", "/run", body, dict(headers))[0] == 200
+    assert ftu._request(port, "POST", "/run", body, dict(headers))[0::2] == (401, b"")
+
+    result = {}
+    first = threading.Thread(target=lambda: result.update(first=_signed_run(port, _run_body("researcher", "one"))))
+    first.start()
+    ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", port, "/skills")[2])
+                   ["skills"][0]["busy"] is True, 10)
+    assert _signed_run(port, _run_body("researcher", "two", "req-2")) == (409, b'{"error":"busy"}')
+    ftu.release_hook(hook, "one")
+    first.join(30)
+    assert result["first"] == (200, ftu.CANNED_LINE.encode("utf-8"))
+    assert _signed_run(port, _run_body("researcher", "garbage")) == \
+        (502, b'{"error":"skill produced no parseable output (exit code 1)"}')
+    log = fleet.daemons["bravo"].log()
+    assert "run start skill=researcher request_id=req-1 task_chars=3" in log
+    assert "run end skill=researcher request_id=req-1 http=200 status=ok seconds=" in log
+    assert "run end skill=researcher request_id=req-1 http=502 status=- seconds=" in log
+    assert "one" not in [w for line in log.splitlines() for w in line.split()]
+    stderr_path = os.path.join(ftu.daemon_log_dir(fleet.homes["bravo"]), "last-run.stderr")
+    assert stat.S_IMODE(os.stat(stderr_path).st_mode) == 0o600

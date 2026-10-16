@@ -557,7 +557,7 @@ class Daemon(object):
             return 200, fleet_lib.canonical_json(self.health_body())
         if name == "skills":
             return 200, fleet_lib.canonical_json({"host_id": self.host_id, "skills": self.skills_view()})
-        return 404, fleet_lib.canonical_json({"error": "not found"})
+        return self.handle_run(body)
 
     def loopback_endpoint(self, name, body):
         """(status, JSON-able object) for a loopback-only endpoint; sent unsigned."""
@@ -708,6 +708,69 @@ class Daemon(object):
             self.bind_attempt(host["address"], host["port"], "poll")
         for host_id in self.table.due_for_refresh(self.scaled(fleet_lib.PEER_REFRESH_INTERVAL)):
             self.refresh_peer(host_id)
+
+    # --- POST /run (F47-F54c) ----------------------------------------------------------
+
+    def handle_run(self, body):
+        """(status, body bytes) for a verified POST /run. One run at a time per host."""
+        req = _json_or_none(body)
+        if not (isinstance(req, dict) and set(req) == {"skill", "task", "request_id"}
+                and all(isinstance(v, str) for v in req.values())
+                and req["task"].strip() != ""
+                and fleet_lib.REQUEST_ID_RE.fullmatch(req["request_id"])):
+            return 400, fleet_lib.canonical_json({"error": "bad request"})
+        if not self.run_lock.acquire(False):
+            return 409, fleet_lib.canonical_json({"error": "busy"})
+        skill, task, request_id = req["skill"], req["task"], req["request_id"]
+        started = None
+        code, status, raw = 500, "-", b""
+        try:
+            if not fleet_lib.serves_skill(self.skills_state, skill):
+                code, raw = 400, fleet_lib.canonical_json({"error": "skill not served: %s" % skill})
+                return code, raw
+            started = time.monotonic()
+            LOG.info("run start skill=%s request_id=%s task_chars=%d" % (skill, request_id, len(task)))
+            code, status, raw = self.spawn_run(skill, task)
+            return code, raw
+        finally:
+            self.run_lock.release()
+            if started is not None:
+                LOG.info("run end skill=%s request_id=%s http=%d status=%s seconds=%.1f"
+                         % (skill, request_id, code, status, time.monotonic() - started))
+
+    def spawn_run(self, skill, task):
+        """Run this release's bin/qwen-agent --skill child -> (http code, envelope status, body)."""
+        argv = [sys.executable, self.qwen_agent_bin, "--skill=" + skill, "--user-prompt=" + task,
+                "--base-url=" + self.entry["model_server"]["url"], "--model=" + self.entry["model"],
+                "--model-server-type=" + self.entry["model_server"]["type"]]
+        err_path = os.path.join(fleet_lib.log_dir(), "last-run.stderr")
+        fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as err:
+            try:
+                proc = subprocess.Popen(argv, cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.PIPE, stderr=err,
+                                        env=fleet_lib.build_child_env(os.environ, self.loopback_url),
+                                        start_new_session=True, text=True, errors="replace")
+            except (OSError, ValueError) as e:
+                return 500, "-", fleet_lib.canonical_json({"error": "cannot start skill: %s" % type(e).__name__})
+            try:
+                stdout, _unused = proc.communicate(timeout=fleet_lib.RUN_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+                return 504, "-", fleet_lib.canonical_json({"error": "timeout"})
+        lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+        if lines:
+            envelope = _json_or_none(lines[-1])
+            if isinstance(envelope, dict) and envelope.get("schema") == fleet_lib.ONESHOT_SCHEMA:
+                status = envelope.get("status")
+                return 200, (status if isinstance(status, str) else "-"), lines[-1].encode("utf-8")
+        return 502, "-", fleet_lib.canonical_json(
+            {"error": "skill produced no parseable output (exit code %d)" % proc.returncode})
 
     def wait(self):
         """F95 step 12: block until SIGTERM/SIGINT, then stop the listener."""

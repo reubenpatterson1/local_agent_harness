@@ -422,3 +422,51 @@ def send_beacon(key, port_field, beacon_port):
         sock.sendto(data, ("127.0.0.1", beacon_port))
     finally:
         sock.close()
+
+
+# --- --qwen-agent-bin hook scripts (spec 11.2; Task 14) --------------------------------
+
+CANNED_LINE = ('{"schema": "qwen-agent.oneshot.v1", "status": "ok", "answer": "CANNED", '
+               '"error": null, "rounds": 1, "tool_calls": []}')
+
+_HOOK_SOURCES = {
+    "canned": (
+        "import sys\n"
+        "print(%r)\n"
+        "sys.exit(0)\n" % CANNED_LINE
+    ),
+    "slow": (
+        "import os, sys, time\n"
+        "task = ''\n"
+        "for arg in sys.argv[1:]:\n"
+        "    if arg.startswith('--user-prompt='):\n"
+        "        task = arg[len('--user-prompt='):]\n"
+        "if task == 'garbage':\n"
+        "    print('not json')\n"
+        "    sys.exit(1)\n"
+        "release = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'release-' + task)\n"
+        "while not os.path.exists(release):\n"
+        "    time.sleep(0.05)\n"
+        "print(%r)\n"
+        "sys.exit(0)\n" % CANNED_LINE
+    ),
+    "envdump": (
+        "import json, os, sys\n"
+        "with open(os.path.abspath(__file__) + '.json', 'w') as f:\n"
+        "    json.dump({'argv': sys.argv, 'env': dict(os.environ)}, f)\n"
+        "os.execv(sys.executable, [sys.executable, %r] + sys.argv[1:])\n" % QWEN_AGENT
+    ),
+}
+
+
+def write_hook(path, kind):
+    """Write an executable --qwen-agent-bin stand-in: "slow", "envdump" or "canned"."""
+    with open(str(path), "w", encoding="utf-8") as f:
+        f.write(_HOOK_SOURCES[kind])
+    os.chmod(str(path), 0o755)
+    return str(path)
+
+
+def release_hook(hook_path, task):
+    """Let the "slow" hook's run for `task` finish."""
+    open(os.path.join(os.path.dirname(str(hook_path)), "release-" + task), "w").close()
