@@ -507,3 +507,135 @@ def test_t48_run_endpoint(tmp_path):
     assert "one" not in [w for line in log.splitlines() for w in line.split()]
     stderr_path = os.path.join(ftu.daemon_log_dir(fleet.homes["bravo"]), "last-run.stderr")
     assert stat.S_IMODE(os.stat(stderr_path).st_mode) == 0o600
+
+
+# --- POST /delegate (F65-F68, F29j, F106) --------------------------------------------
+
+class _FakePeer(object):
+    """An in-process registered peer 'delta' that signs its responses with the fleet key.
+
+    mode "busy": /run answers a signed 409. mode "badsig": /run answers 200 signed with
+    a different key.
+    """
+
+    def __init__(self, port):
+        self.mode = "busy"
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, status, obj, key=ftu.TEST_KEY):
+                raw = fleet_lib.canonical_json(obj)
+                headers = fleet_lib.sign_response(key, status, self.command, self.path,
+                                                  self.headers.get("X-Fleet-Nonce"), raw,
+                                                  int(time.time()), os.urandom(16).hex())
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._reply(200, {"host_id": "delta", "role": "agent", "version": "dev",
+                                      "proto": 1, "discovery": "beacon"})
+                else:
+                    self._reply(200, {"host_id": "delta", "skills": [
+                        {"skill": "researcher", "model": "delta-model", "verified": True, "busy": False}]})
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if outer.mode == "busy":
+                    self._reply(409, {"error": "busy"})
+                else:
+                    self._reply(200, {"schema": "qwen-agent.oneshot.v1", "status": "ok", "answer": "FORGED",
+                                      "error": None, "rounds": 1, "tool_calls": []},
+                                key=bytes.fromhex(ftu.OTHER_TOKEN))
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_t44_delegate_outcomes_and_failover(tmp_path):
+    delta_port = ftu.free_port()
+    fleet = ftu.Fleet(tmp_path, extra_hosts={"delta": {
+        "port": delta_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+        "model": "delta-model", "skills": ["researcher"]}})
+    delta = _FakePeer(delta_port)
+    try:
+        fleet.start()
+        alpha_port = fleet.ports["alpha"]
+        ftu.wait_until(lambda: "bravo" in fleet.peer_ids("alpha"), 4.5)
+
+        def bind_delta():
+            ftu.send_beacon(ftu.TEST_KEY, delta_port, fleet.beacon_ports["alpha"])
+            ftu.wait_until(lambda: "delta" in fleet.peer_ids("alpha"), 3.0)
+
+        bind_delta()
+        delta.mode = "busy"
+        assert ftu.delegate(alpha_port, "researcher", "t", "delta") == \
+            (200, {"outcome": "busy", "envelope": None, "detail": ""})
+        delta.mode = "badsig"
+        bind_delta()
+        assert ftu.delegate(alpha_port, "researcher", "t", "delta") == \
+            (200, {"outcome": "bad_signature", "envelope": None, "detail": ""})
+
+        alpha_url = fleet.daemons["alpha"].url
+
+        def attempt(host_id):
+            return fleet_lib.delegate_once(alpha_url, "researcher", "t", host_id)[:2]
+
+        for mode, outcome in (("busy", "busy"), ("badsig", "bad_signature")):
+            delta.mode = mode
+            bind_delta()
+            result = fleet_lib.failover(["delta", "bravo"], attempt)
+            assert result["outcome"] == "ok" and result["host_id"] == "bravo"
+            assert result["tried"] == [("delta", outcome)]
+            assert result["envelope"]["answer"] == "BRAVO-ANSWER"
+
+        assert ftu.delegate(alpha_port, "researcher", "t", "charlie") == \
+            (200, {"outcome": "not_live", "envelope": None, "detail": ""})
+        assert ftu.delegate(alpha_port, "researcher", "t", "alpha")[1]["outcome"] == "not_live"
+        assert ftu.delegate(alpha_port, "researcher", "t", "nobody")[1]["outcome"] == "not_live"
+        for body in (b"[]", b'{"skill": "researcher", "task": "t"}',
+                     b'{"skill": "coder", "task": "t", "host_id": "bravo"}',
+                     b'{"skill": "researcher", "task": " ", "host_id": "bravo"}',
+                     b'{"skill": "researcher", "task": "t", "host_id": "Bravo"}'):
+            status, _h, raw = ftu._request(alpha_port, "POST", "/delegate", body,
+                                           {"Content-Type": "application/json"})
+            assert (status, json.loads(raw)) == (400, {"error": "bad request"}), body
+        log = fleet.daemons["alpha"].log()
+        assert "delegate skill=researcher host=charlie request_id=- outcome=not_live seconds=" in log
+        assert "outcome=bad_signature" in log and "outcome=ok" in log and "FORGED" not in log
+    finally:
+        delta.close()
+
+
+def test_review_focus_5_delegate_while_run_lock_held(tmp_path):
+    """Review Focus 5: a /run child that delegates goes through its own daemon while that
+    daemon holds run_lock. /delegate must not wait on, or answer 409 because of, it."""
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-slow"), "slow")
+    fleet = ftu.Fleet(tmp_path, names=("bravo", "charlie"),
+                      extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+    ftu.wait_until(lambda: fleet.peer_ids("bravo") == ["charlie"], 4.5)
+    held = threading.Thread(target=lambda: ftu.signed(ftu.TEST_KEY, "POST", fleet.ports["bravo"], "/run",
+                                                       _run_body("researcher", "hold"), timeout=60))
+    held.start()
+    ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", fleet.ports["bravo"], "/skills")[2])
+                   ["skills"][0]["busy"] is True, 10)
+    started = time.monotonic()
+    status, result = ftu.delegate(fleet.ports["bravo"], "analyst", "check this", "charlie", timeout=60)
+    assert status == 200 and result["outcome"] == "ok"
+    assert result["envelope"]["answer"] == "CHARLIE-ANSWER"
+    assert time.monotonic() - started < 30
+    ftu.release_hook(hook, "hold")
+    held.join(30)

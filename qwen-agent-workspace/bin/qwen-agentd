@@ -563,7 +563,7 @@ class Daemon(object):
         """(status, JSON-able object) for a loopback-only endpoint; sent unsigned."""
         if name == "peers":
             return 200, self.peers_view()
-        return 404, {"error": "not found"}
+        return self.handle_delegate(body)
 
     # --- discovery: beacons, bind attempts, poll fallback (F11, F30-F39) -------------
 
@@ -771,6 +771,65 @@ class Daemon(object):
                 return 200, (status if isinstance(status, str) else "-"), lines[-1].encode("utf-8")
         return 502, "-", fleet_lib.canonical_json(
             {"error": "skill produced no parseable output (exit code %d)" % proc.returncode})
+
+    # --- POST /delegate (F65-F67) -------------------------------------------------------
+
+    def handle_delegate(self, body):
+        """(status, object) for loopback POST /delegate. Never touches run_lock (F65)."""
+        req = _json_or_none(body)
+        if not (isinstance(req, dict) and set(req) == {"skill", "task", "host_id"}
+                and all(isinstance(v, str) for v in req.values())
+                and req["task"].strip() != "" and req["skill"] in fleet_lib.KNOWN_SKILLS
+                and fleet_lib.HOST_ID_RE.fullmatch(req["host_id"])):
+            return 400, {"error": "bad request"}
+        skill, task, host_id = req["skill"], req["task"], req["host_id"]
+        started = time.monotonic()
+        record = self.table.record(host_id)
+        if (host_id == self.host_id or not self.table.is_live(host_id) or record is None
+                or record["compatible"] is not True or not fleet_lib.serves_skill(record["skills"], skill)):
+            LOG.info("delegate skill=%s host=%s request_id=- outcome=not_live seconds=%.1f"
+                     % (skill, host_id, time.monotonic() - started))
+            return 200, {"outcome": "not_live", "envelope": None, "detail": ""}
+        request_id = secrets.token_hex(8)
+        outcome, envelope, detail = self.forward_run(record, skill, task, request_id)
+        LOG.info("delegate skill=%s host=%s request_id=%s outcome=%s seconds=%.1f"
+                 % (skill, host_id, request_id, outcome, time.monotonic() - started))
+        return 200, {"outcome": outcome, "envelope": envelope, "detail": detail}
+
+    def forward_run(self, record, skill, task, request_id):
+        """Signed POST /run to the peer's current address -> (outcome, envelope, detail) (F66)."""
+        body = fleet_lib.canonical_json({"skill": skill, "task": task, "request_id": request_id})
+        nonce = secrets.token_hex(16)
+        headers = fleet_lib.sign_request(self.key, "POST", "/run", body, int(time.time()), nonce)
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
+        conn = http.client.HTTPConnection(record["address"], record["port"], timeout=fleet_lib.FORWARD_TIMEOUT)
+        try:
+            conn.request("POST", "/run", body=body, headers=headers)
+            resp = conn.getresponse()
+            status, resp_headers = resp.status, resp.headers
+            raw = resp.read(fleet_lib.MAX_BODY + 1)
+        except (socket.timeout, TimeoutError):
+            return "timeout", None, ""
+        except (OSError, http.client.HTTPException) as e:
+            return "unreachable", None, type(e).__name__
+        finally:
+            conn.close()
+        if len(raw) > fleet_lib.MAX_BODY:
+            return "bad_response", None, ""
+        if fleet_lib.verify_response(self.key, status, "POST", "/run", nonce, resp_headers, raw,
+                                     int(time.time()), self.response_nonces) != "ok":
+            return "bad_signature", None, ""
+        if status == 409:
+            return "busy", None, ""
+        if status == 504:
+            return "timeout", None, ""
+        if status == 200:
+            envelope = _json_or_none(raw)
+            if isinstance(envelope, dict) and envelope.get("schema") == fleet_lib.ONESHOT_SCHEMA:
+                return "ok", envelope, ""
+            return "bad_response", None, ""
+        return "peer_error", None, "http %d" % status
 
     def wait(self):
         """F95 step 12: block until SIGTERM/SIGINT, then stop the listener."""
