@@ -326,3 +326,122 @@ def test_connection_reset_mid_request_is_not_logged(tmp_path):
     time.sleep(1.0)
     assert "http handler error" not in daemon.log()
     assert ftu.peers(daemon.port)[0] == 200
+
+
+# --- discovery and liveness (F11, F30-F40, F104, F105; K1, K2, K4) -----------------------
+
+def _log_lines(daemon):
+    return [line for line in daemon.log().splitlines() if line.strip()]
+
+
+def test_t40_beacon_discovery_within_45s_scaled(tmp_path):
+    fleet = ftu.Fleet(tmp_path).start()
+    ftu.wait_until(fleet.all_see_each_other, 4.5)
+    for name in fleet.names:
+        assert fleet.view(name)["self"]["discovery"] == "beacon"
+    proc = _run_agentd(fleet.homes["alpha"], ["status", "--port", str(fleet.ports["alpha"])])
+    lines = proc.stdout.splitlines()
+    assert proc.returncode == 0
+    assert lines[0] == "daemon: %s (version dev, host_id alpha, discovery beacon)" % fleet.daemons["alpha"].url
+    assert lines[1] == "skills: none"
+    peer_lines = sorted(line for line in lines if line.startswith("peer "))
+    assert len(peer_lines) == 2
+    assert peer_lines[0].startswith("peer bravo 127.0.0.1:%d version dev via beacon age " % fleet.ports["bravo"])
+    assert peer_lines[0].endswith("s skills researcher=verified")
+    assert peer_lines[1].endswith("s skills analyst=verified")
+    assert lines[-1] == "update: not installed"
+
+
+def test_t41_poll_discovery_within_75s_scaled(tmp_path):
+    fleet = ftu.Fleet(tmp_path, beacons=False).start()
+    ftu.wait_until(lambda: fleet.all_see_each_other(via="poll"), 7.5)
+    for name in fleet.names:
+        assert fleet.view(name)["self"]["discovery"] == "poll"
+
+
+def test_t42_killed_host_leaves_within_90s_scaled(tmp_path):
+    fleet = ftu.Fleet(tmp_path).start()
+    ftu.wait_until(fleet.all_see_each_other, 4.5)
+    fleet.daemons["charlie"].kill()
+    ftu.wait_until(lambda: "charlie" not in fleet.peer_ids("alpha") + fleet.peer_ids("bravo"), 9.0)
+    ftu.wait_until(lambda: "INFO housekeeping peer charlie down" in fleet.daemons["alpha"].log(), 1.0)
+    log = fleet.daemons["alpha"].log()
+    assert "INFO housekeeping peer bravo live at 127.0.0.1:%d (version dev, via beacon)" % fleet.ports["bravo"] in log
+
+
+def test_t45_foreign_fleet_is_invisible_and_silent(tmp_path):
+    fleet = ftu.Fleet(tmp_path).start()
+    ftu.wait_until(fleet.all_see_each_other, 4.5)
+    time.sleep(1.0)  # let housekeeping log the live transitions before counting lines
+    alpha = fleet.daemons["alpha"]
+    before = _log_lines(alpha)
+    echo_home = os.path.join(str(tmp_path), "echo")
+    os.makedirs(echo_home)
+    ftu.make_fleet(echo_home, ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
+    echo_port = ftu.free_port()
+    echo_registry = ftu.write_registry(os.path.join(str(tmp_path), "echo-registry.json"), ftu.OTHER_FLEET_ID, {
+        "echo": {"port": echo_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                 "model": "m", "skills": ["researcher"]},
+        "alpha": {"port": fleet.ports["alpha"], "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                  "model": "m", "skills": []}})
+    echo = ftu.start_daemon(echo_home, "echo", echo_registry, ftu.free_port(),
+                            ftu.targets(fleet.beacon_ports["alpha"], fleet.beacon_ports["bravo"]))
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        for name in ("alpha", "bravo"):
+            assert all(p["port"] != echo_port for p in fleet.view(name)["peers"])
+        time.sleep(0.5)
+    assert ftu.peers(echo.port)[1]["peers"] == []
+    echo.kill()
+    assert _log_lines(alpha) == before
+
+
+def test_t49_model_server_comes_back(tmp_path):
+    fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), start_stubs=False)
+    fleet.start()
+    bravo = fleet.daemons["bravo"]
+    status, _h, body, _n = ftu.signed(ftu.TEST_KEY, "GET", bravo.port, "/skills")
+    assert status == 200 and json.loads(body)["skills"][0]["verified"] is False
+    status, _h, body, _n = ftu.signed(ftu.TEST_KEY, "GET", bravo.port, "/health")
+    assert status == 200
+    ftu.wait_until(lambda: fleet.peer_ids("alpha") == ["bravo"], 4.5)
+    ftu.StubModelServer("ollama", "bravo-model", "B", port=fleet.server_ports["bravo"])
+    elapsed = ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", bravo.port, "/skills")[2])
+                             ["skills"][0]["verified"] is True, 6.0 + 2.0)
+    ftu.wait_until(lambda: "INFO prober skill 'researcher' offered: model 'bravo-model' present" in bravo.log(), 1.0)
+
+
+def test_review_focus_1_own_beacon_echo_is_silent(tmp_path):
+    """Review Focus 1: with the production 255.255.255.255 target, every host hears its
+    own beacon. It must be dropped silently (it is a replay), never bound as a peer."""
+    home = tmp_path / "solo"
+    home.mkdir()
+    ftu.make_fleet(home)
+    beacon_port = ftu.free_port()
+    registry = ftu.write_registry(tmp_path / "registry.json", ftu.TEST_FLEET_ID, {
+        "solo": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                 "model": "m", "skills": []}})
+    solo = ftu.start_daemon(home, "solo", registry, beacon_port, ftu.targets(beacon_port))
+    time.sleep(7.0)  # two scaled beacon intervals plus one poll cycle
+    view = ftu.peers(solo.port)[1]
+    assert view["peers"] == [] and view["self"]["discovery"] == "poll"
+    assert len(_log_lines(solo)) == 1 and " started host_id=solo " in solo.log()
+
+
+def test_unregistered_same_fleet_host_warns_once(tmp_path):
+    """F11: a same-fleet daemon whose host_id is not in this registry is ignored, with
+    exactly one WARNING however often it beacons."""
+    fleet = ftu.Fleet(tmp_path, names=("alpha",))
+    fleet.start()
+    zulu_home = os.path.join(str(tmp_path), "zulu")
+    os.makedirs(zulu_home)
+    ftu.make_fleet(zulu_home)
+    zulu_registry = ftu.write_registry(os.path.join(str(tmp_path), "zulu-registry.json"), ftu.TEST_FLEET_ID, {
+        "zulu": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                 "model": "m", "skills": []}})
+    ftu.start_daemon(zulu_home, "zulu", zulu_registry, ftu.free_port(), ftu.targets(fleet.beacon_ports["alpha"]))
+    alpha = fleet.daemons["alpha"]
+    ftu.wait_until(lambda: "ignoring unregistered host_id 'zulu' at 127.0.0.1" in alpha.log(), 4.5)
+    time.sleep(4.0)
+    assert alpha.log().count("ignoring unregistered host_id 'zulu'") == 1
+    assert fleet.peer_ids("alpha") == []

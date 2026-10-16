@@ -465,6 +465,13 @@ class Daemon(object):
 
     def _start_threads(self):
         """F95 step 10, in Section 1.2 order."""
+        send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self._periodic("beacon-send", self.scaled(fleet_lib.BEACON_INTERVAL),
+                       lambda: self.send_beacons(send_sock), 0)
+        self._thread("beacon-recv", self.beacon_recv_loop)
+        poll = self.scaled(fleet_lib.POLL_INTERVAL)
+        self._periodic("poll", poll, self.poll_once, poll)
         reprobe = self.scaled(fleet_lib.REPROBE_INTERVAL)
         self._periodic("prober", reprobe, self.probe, reprobe)
         housekeeping = self.scaled(fleet_lib.HOUSEKEEPING_INTERVAL)
@@ -557,6 +564,150 @@ class Daemon(object):
         if name == "peers":
             return 200, self.peers_view()
         return 404, {"error": "not found"}
+
+    # --- discovery: beacons, bind attempts, poll fallback (F11, F30-F39) -------------
+
+    def signed_call(self, address, port, method, path, body=b"", timeout=fleet_lib.PEER_HTTP_TIMEOUT):
+        """(status, body) of a response whose signature verifies, else None. Never raises."""
+        nonce = secrets.token_hex(16)
+        headers = fleet_lib.sign_request(self.key, method, path, body, int(time.time()), nonce)
+        if method == "POST":
+            headers["Content-Type"] = "application/json"
+            headers["Content-Length"] = str(len(body))
+        try:
+            conn = http.client.HTTPConnection(address, port, timeout=timeout)
+            try:
+                conn.request(method, path, body=body if method == "POST" else None, headers=headers)
+                resp = conn.getresponse()
+                status, resp_headers = resp.status, resp.headers
+                raw = resp.read(fleet_lib.MAX_BODY + 1)
+            finally:
+                conn.close()
+        except Exception:
+            return None
+        if len(raw) > fleet_lib.MAX_BODY:
+            return None
+        if fleet_lib.verify_response(self.key, status, method, path, nonce, resp_headers, raw,
+                                     int(time.time()), self.response_nonces) != "ok":
+            return None
+        return status, raw
+
+    def _fetch_health_and_skills(self, address, port):
+        """(health, skills list) from signed /health then /skills, or None (F32 steps 1-2, 5)."""
+        result = self.signed_call(address, port, "GET", "/health")
+        if result is None or result[0] != 200:
+            return None
+        health = _json_or_none(result[1])
+        if not _valid_health(health):
+            return None
+        if health["host_id"] == self.host_id:
+            return None
+        if health["host_id"] not in self.registry["hosts"]:
+            self.warn_unregistered_once(health["host_id"], address)
+            return None
+        result = self.signed_call(address, port, "GET", "/skills")
+        if result is None or result[0] != 200:
+            return None
+        skills = _json_or_none(result[1])
+        if not _valid_skills_body(skills, health["host_id"]):
+            return None
+        return health, skills["skills"]
+
+    def bind_attempt(self, address, port, via):
+        """F32 steps 1-6. Every failure is silent. True when the peer was bound."""
+        try:
+            fetched = self._fetch_health_and_skills(address, port)
+            if fetched is None:
+                return False
+            health, skills = fetched
+            self.table.bind(health["host_id"], address, port, health, skills, via)
+            return True
+        except Exception:
+            return False
+
+    def schedule_bind(self, address, port):
+        """At most one in-flight bind attempt per (address, port), each on its own thread."""
+        with self._warn_lock:
+            if (address, port) in self._inflight:
+                return
+            self._inflight.add((address, port))
+
+        def work():
+            try:
+                self.bind_attempt(address, port, "beacon")
+            finally:
+                with self._warn_lock:
+                    self._inflight.discard((address, port))
+
+        self._thread("bind-attempt", work)
+
+    def warn_unregistered_once(self, host_id, address):
+        """F11: one WARNING the first time each unregistered same-fleet host_id answers."""
+        with self._warn_lock:
+            if host_id in self._unregistered_warned:
+                return
+            self._unregistered_warned.add(host_id)
+        LOG.warning("ignoring unregistered host_id '%s' at %s" % (host_id, address))
+
+    def send_beacons(self, sock):
+        """F30: one fresh beacon to every target; the nonce is cached BEFORE sending."""
+        nonce = secrets.token_hex(16)
+        data = fleet_lib.make_beacon(self.key, self.port, int(time.time()), nonce)
+        self.beacon_nonces.check_and_add(nonce)
+        error = None
+        for target in self.beacon_targets:
+            try:
+                sock.sendto(data, target)
+            except OSError as e:
+                if error is None:
+                    error = e
+        ok = error is None
+        if ok != self.beacon_ok:
+            if ok:
+                LOG.info("beacon send recovered")
+            else:
+                LOG.warning("beacon send failed (%s: %s); relying on poll fallback"
+                            % (type(error).__name__, error))
+        self.beacon_ok = ok
+
+    def beacon_recv_loop(self):
+        """F31-F34: verify every datagram; refresh a bound peer or schedule a bind attempt."""
+        while not self.stop.is_set():
+            try:
+                try:
+                    data, source = self.udp.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                now = int(time.time())
+                status, beacon = fleet_lib.verify_beacon(self.key, data, now, self.beacon_nonces)
+                if status == "skew":
+                    self.warn_skew_once(source[0], beacon["ts"] - now)
+                elif status == "ok":
+                    if self.table.heard(source[0], beacon["port"], "beacon") is None:
+                        self.schedule_bind(source[0], beacon["port"])
+            except Exception as e:
+                LOG.error("beacon-recv error: %s: %s" % (type(e).__name__, e))
+
+    def refresh_peer(self, host_id):
+        """F37: re-read /health and /skills of a live peer at its current address. Silent."""
+        record = self.table.record(host_id)
+        if record is None:
+            return
+        try:
+            fetched = self._fetch_health_and_skills(record["address"], record["port"])
+        except Exception:
+            return
+        if fetched is None or fetched[0]["host_id"] != host_id:
+            return
+        self.table.refresh(host_id, fetched[0], fetched[1], record["heard_via"])
+
+    def poll_once(self):
+        """F36, F37: bind unheard registered hosts at their registry address; refresh live ones."""
+        for host_id in self.table.unheard_registered():
+            host = self.registry["hosts"][host_id]
+            self.bind_attempt(host["address"], host["port"], "poll")
+        for host_id in self.table.due_for_refresh(self.scaled(fleet_lib.PEER_REFRESH_INTERVAL)):
+            self.refresh_peer(host_id)
 
     def wait(self):
         """F95 step 12: block until SIGTERM/SIGINT, then stop the listener."""

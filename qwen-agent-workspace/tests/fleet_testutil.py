@@ -335,3 +335,90 @@ def wait_until(predicate, timeout, interval=0.1):
         if time.monotonic() - start > timeout:
             raise AssertionError("condition not met within %.1f s" % timeout)
         time.sleep(interval)
+
+
+# --- the standard three-daemon fleet (spec 11.5; Task 13) -----------------------------
+
+STANDARD_HOSTS = (
+    # name, model-server kind, skills, model, stub answer
+    ("alpha", "vllm", [], "alpha-model", "ALPHA-ANSWER"),
+    ("bravo", "ollama", ["researcher"], "bravo-model", "BRAVO-ANSWER"),
+    ("charlie", "vllm", ["analyst"], "charlie-model", "CHARLIE-ANSWER"),
+)
+
+
+class Fleet(object):
+    """alpha/bravo/charlie on 127.0.0.1, one shared test fleet, one registry listing all.
+
+    Each daemon has its own HOME, stub model server, HTTP port and beacon port, and
+    beacons to the other two (plus `extra_targets`). `beacons=False` gives every
+    daemon --beacon-targets none. `extra_args` / `stub_kwargs` / `env_extra` are
+    keyed by name. `extra_hosts` adds registry entries for hosts no daemon runs
+    (for example an in-process fake peer). Nothing starts until start().
+    """
+
+    def __init__(self, root, names=("alpha", "bravo", "charlie"), beacons=True, extra_targets=(),
+                 extra_args=None, stub_kwargs=None, extra_hosts=None, start_stubs=True, env_extra=None):
+        self.root = str(root)
+        self.names = list(names)
+        self.beacons = beacons
+        self.extra_targets = list(extra_targets)
+        self.extra_args = extra_args or {}
+        self.env_extra = env_extra or {}
+        self.homes, self.ports, self.beacon_ports, self.stubs, self.daemons = {}, {}, {}, {}, {}
+        self.server_ports = {}
+        hosts = {}
+        spec = dict((h[0], h) for h in STANDARD_HOSTS)
+        for name in self.names:
+            _n, kind, skills, model, answer = spec[name]
+            home = os.path.join(self.root, name)
+            os.makedirs(home)
+            make_fleet(home)
+            self.homes[name] = home
+            self.ports[name] = free_port()
+            self.beacon_ports[name] = free_port()
+            if start_stubs:
+                self.stubs[name] = StubModelServer(kind, model, answer, **(stub_kwargs or {}).get(name, {}))
+                self.server_ports[name] = self.stubs[name].port
+            else:
+                self.server_ports[name] = free_port()
+            url = "http://127.0.0.1:%d/v1" % self.server_ports[name]
+            hosts[name] = {"port": self.ports[name], "model_server": {"type": kind, "url": url},
+                           "model": model, "skills": skills}
+        hosts.update(extra_hosts or {})
+        self.registry = write_registry(os.path.join(self.root, "registry.json"), TEST_FLEET_ID, hosts)
+
+    def start(self):
+        for name in self.names:
+            others = [self.beacon_ports[o] for o in self.names if o != name] if self.beacons else []
+            self.daemons[name] = start_daemon(
+                self.homes[name], name, self.registry, self.beacon_ports[name],
+                targets(*(others + self.extra_targets)) if (self.beacons or self.extra_targets) else "none",
+                self.extra_args.get(name, ()), env_extra=self.env_extra.get(name))
+        return self
+
+    def view(self, name):
+        return peers(self.ports[name])[1]
+
+    def peer_ids(self, name):
+        return sorted(p["host_id"] for p in self.view(name)["peers"])
+
+    def all_see_each_other(self, via=None):
+        for name in self.names:
+            view = self.view(name)
+            expected = sorted(n for n in self.names if n != name)
+            if sorted(p["host_id"] for p in view["peers"]) != expected:
+                return False
+            if via is not None and any(p["heard_via"] != via for p in view["peers"]):
+                return False
+        return True
+
+
+def send_beacon(key, port_field, beacon_port):
+    """Send one valid beacon advertising HTTP port `port_field` to a daemon's beacon port."""
+    data = fleet_lib.make_beacon(key, port_field, int(time.time()), os.urandom(16).hex())
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(data, ("127.0.0.1", beacon_port))
+    finally:
+        sock.close()
