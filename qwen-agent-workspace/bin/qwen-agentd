@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""qwen-agentd -- the qwen-agent fleet daemon and its subcommands.
+
+  qwen-agentd [run] [--registry PATH] [--beacon-targets LIST] [--beacon-port N]
+                    [--qwen-agent-bin PATH] [--timing-scale X]
+  qwen-agentd init-fleet
+  qwen-agentd join [STRING]
+  qwen-agentd install --host-id ID [--origin URL] [--no-service]
+  qwen-agentd selftest
+  qwen-agentd status [--port N]
+
+Every host in the fleet runs `run`. The daemon advertises the skills its host
+serves and runs them locally, against its own model server, when a peer sends a
+signed POST /run; only the task text and the final answer cross the network.
+Peers are found by signed UDP beacons, with signed HTTP polling as the fallback.
+Installed daemons update themselves from release tags, with a gated staging step
+and automatic rollback through bin/qwen-agentd-launch.
+See docs/superpowers/specs/2026-10-16-fleet-discovery-self-update-design.md.
+
+Standard library only. All pure fleet logic lives in fleet_lib.py beside bin/.
+Valid on Python 3.9 and 3.13.
+"""
+
+import argparse
+import errno
+import getpass
+import http.client
+import http.server
+import ipaddress
+import json
+import logging
+import logging.handlers
+import os
+import plistlib
+import random
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, REPO_ROOT)
+import fleet_lib  # noqa: E402  (spec F2: the fleet_lib.py of this same release)
+
+LOG = logging.getLogger("qwen-agentd")
+
+
+def _err(msg):
+    """One line to stderr; every user-facing failure goes through here."""
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def _strip_fleet_env(environ):
+    """environ minus every QWEN_AGENT_FLEET_* key (F86, F93)."""
+    return dict((k, v) for k, v in environ.items() if not k.startswith(fleet_lib.FLEET_ENV_PREFIX))
+
+
+# ---------------------------------------------------------------------------
+# init-fleet, join, selftest (F23, F26, F93)
+# ---------------------------------------------------------------------------
+
+def cmd_init_fleet(args):
+    path = fleet_lib.fleet_env_path()
+    if os.path.lexists(path):
+        _err("qwen-agentd: %s already exists; remove it first to create a new fleet" % path)
+        return 2
+    fleet_id = secrets.token_hex(8)
+    token = secrets.token_hex(32)
+    fleet_lib.write_fleet_env(path, fleet_id, token)
+    sys.stdout.write("fleet_id: %s\n" % fleet_id)
+    sys.stdout.write("join string (shown once; copy it to each other host over ssh):\n")
+    sys.stdout.write(fleet_lib.make_join_string(fleet_id, token) + "\n")
+    sys.stdout.write("next: create fleets/%s.json (see the fleet spec, Section 2.4), commit, "
+                     "tag a release\n" % fleet_id)
+    sys.stdout.flush()
+    return 0
+
+
+def cmd_join(args):
+    raw = args.string if args.string is not None else getpass.getpass("join string: ")
+    try:
+        fleet_id, token = fleet_lib.parse_join_string(raw)
+    except fleet_lib.FleetEnvError:
+        _err("qwen-agentd: invalid join string")
+        return 2
+    path = fleet_lib.fleet_env_path()
+    if os.path.lexists(path):
+        try:
+            existing = fleet_lib.load_fleet_env(path)
+        except (fleet_lib.FleetEnvError, OSError):
+            existing = None
+        if existing == (fleet_id, token):
+            print("qwen-agentd: already joined fleet %s" % fleet_id)
+            return 0
+        _err("qwen-agentd: %s exists for a different fleet; remove it first" % path)
+        return 2
+    fleet_lib.write_fleet_env(path, fleet_id, token)
+    print("qwen-agentd: joined fleet %s" % fleet_id)
+    return 0
+
+
+def cmd_selftest(args):
+    test_file = os.path.join(REPO_ROOT, "tests", "test_fleet_lib.py")
+    return subprocess.call([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", test_file],
+                           cwd=REPO_ROOT, env=_strip_fleet_env(os.environ))
+
+
+# ---------------------------------------------------------------------------
+# CLI (F92, F99). Keep this section last.
+# ---------------------------------------------------------------------------
+
+def _build_parser():
+    parser = argparse.ArgumentParser(prog="qwen-agentd", description="qwen-agent fleet daemon")
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
+    p = sub.add_parser("init-fleet", help="create a new fleet and print its join string once")
+    p.set_defaults(func=cmd_init_fleet)
+    p = sub.add_parser("join", help="join an existing fleet (prompts when STRING is omitted)")
+    p.add_argument("string", nargs="?", default=None, metavar="STRING")
+    p.set_defaults(func=cmd_join)
+    p = sub.add_parser("selftest", help="run this release's fleet unit tests (the update gate)")
+    p.set_defaults(func=cmd_selftest)
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv or argv[0].startswith("-"):
+        argv.insert(0, "run")
+    args = _build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        _err("qwen-agentd: interrupted")
+        return 130
+    except Exception as e:
+        msg = "qwen-agentd: internal error: %s: %s" % (type(e).__name__, e)
+        _err(msg)
+        if LOG.handlers:
+            LOG.error(msg)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
