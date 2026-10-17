@@ -464,3 +464,105 @@ def test_trt28_model_span_status_for_every_transport_failure(qa, monkeypatch, tm
         assert turn["status"] == json.loads(traced[1])["status"]
         if http == 500:
             assert "[server error 500] model exploded\n" in traced[2]
+
+
+# --- TRT26 and the /help line: /trace in the REPL (TR47) ----------------------------------
+
+_HELP_LINE = "  /trace      Show a turn's trace: /trace (last turn), /trace N (N turns back), /trace <id>"
+
+
+def _canned():
+    """A valid GET /trace?id= result with one turn record; the fake daemon sets its trace_id."""
+    turn = fleet_lib.make_record(T, "1000000000000001", None, "mac-local", "turn", "repl", 1760000000.0, 0.0,
+                                 "ok", {"rounds": 1, "tool_calls": 0}, now=1.5)
+    return {"schema": fleet_lib.TRACE_SCHEMA, "trace_id": T, "records": [turn], "missing": [], "truncated": []}
+
+
+def _repl(qa, monkeypatch, lines, run_turn=None):
+    """qa.repl() over scripted input lines; run_turn is faked unless given. Returns stdout."""
+    feed = list(lines)
+
+    def fake_input(prompt=""):
+        if not feed:
+            raise EOFError
+        return feed.pop(0)
+
+    monkeypatch.setattr(builtins, "input", fake_input)
+    monkeypatch.setattr(qa, "print_banner", lambda *a, **k: None)
+    monkeypatch.setattr(qa, "memory_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(qa, "TRACE_RING", [])
+    if run_turn is None:
+        monkeypatch.setattr(qa, "run_turn", lambda messages, args_ns, snapshot: {
+            "status": "ok", "answer": "hi %d" % len(messages), "rounds": 1, "tool_calls": [], "error": None})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        with pytest.raises(SystemExit):
+            qa.repl(qa.parse_args([]))
+    return out.getvalue()
+
+
+def test_trt20_help_lists_trace(qa):
+    lines = qa.HELP_TEXT.splitlines()
+    i = [n for n, line in enumerate(lines) if line.startswith("  /remember")][0]
+    assert lines[i + 1] == _HELP_LINE
+
+
+def test_trt26_slash_trace(qa, monkeypatch, tmp_path):
+    sink = _TraceDaemon(trace_result=_canned())
+    other = "5" * 32
+    try:
+        _state(qa, monkeypatch, tmp_path, sink.url)
+        out = _repl(qa, monkeypatch, ["/trace", "hello", "/trace", "/trace 1", "/trace 2", "/trace 21",
+                                      "/trace 0", "/trace xyz", "/trace   %s  " % other])
+        [turn] = sink.posts("/spans")
+        ring_id = turn["trace_id"]
+        tree = "\n".join(qa.FLEET.render_trace(dict(_canned(), trace_id=ring_id))) + "\n"
+        tree_other = "\n".join(qa.FLEET.render_trace(dict(_canned(), trace_id=other))) + "\n"
+        usage = qa.TRACE_USAGE + "\n"
+        assert out == ("no turns in this session yet\n" + "hi 2\n" + tree + tree +
+                       "only 1 turn in this session\n" + usage * 3 + tree_other + "\n")
+        gets = [p for m, p, _b in sink.requests if m == "GET" and p.startswith("/trace")]
+        assert gets == ["/trace?id=" + ring_id] * 2 + ["/trace?id=" + other]
+        sink.trace_result = None
+        out = _repl(qa, monkeypatch, ["hello", "/trace"])
+        assert out == "hi 2\nthe daemon at %s has no trace support (http 404)\n\n" % sink.url
+        sink.trace_result = _canned()
+        out = _repl(qa, monkeypatch, ["hello"] * 25)
+        turn_ids = [s["trace_id"] for s in sink.posts("/spans")[-25:]]
+        assert len(set(turn_ids)) == 25 and qa.TRACE_RING == turn_ids[-20:]
+        traced_turns = out
+    finally:
+        sink.close()
+    closed = _closed_url()
+    _state(qa, monkeypatch, tmp_path, closed)
+    assert _repl(qa, monkeypatch, ["hello", "/trace"]) == "hi 2\ndaemon not reachable at %s\n\n" % closed
+    monkeypatch.setattr(qa, "FLEET_DAEMON_URL", None)
+    assert _repl(qa, monkeypatch, ["/trace"]) == "tracing is off: QWEN_AGENT_DAEMON_URL is not usable\n\n"
+    _state(qa, monkeypatch, tmp_path, None, fleet=False)
+    assert _repl(qa, monkeypatch, ["hello", "/trace"]) == "hi 2\ntracing is off: fleet_lib.py is not available\n\n"
+    assert _repl(qa, monkeypatch, ["hello"] * 25) == traced_turns
+    assert qa.TRACE_RING == []
+
+
+def test_tracing_focus_3_an_interrupted_repl_turn_is_still_traced(qa, monkeypatch, tmp_path):
+    """Review Focus 3: Ctrl-C while the model is answering a REPL turn. Expected: the turn
+    still gets a trace (its model span and turn span say "interrupted"), the next turn gets a
+    new trace, and /trace 2 reaches the interrupted one."""
+    sink = _TraceDaemon(trace_result=_canned())
+    try:
+        _state(qa, monkeypatch, tmp_path, sink.url)
+        replies = [KeyboardInterrupt(), _reply("second answer")]
+        monkeypatch.setattr(qa.urllib.request, "urlopen",
+                            lambda req, timeout=None: (_ for _ in ()).throw(replies.pop(0))
+                            if isinstance(replies[0], BaseException) else _FakeResp(json.dumps(replies.pop(0)).encode()))
+        out = _repl(qa, monkeypatch, ["first", "second", "/trace 2"], run_turn=qa.run_turn)
+        spans = sink.posts("/spans")
+        assert [(s["kind"], s["status"]) for s in spans] == [("model", "interrupted"), ("turn", "interrupted"),
+                                                             ("model", "ok"), ("turn", "ok")]
+        first, second = spans[1]["trace_id"], spans[3]["trace_id"]
+        assert first != second and qa.TRACE_RING == [first, second]
+        assert spans[0]["trace_id"] == first and spans[0]["parent_span_id"] == spans[1]["span_id"]
+        assert out.startswith("second answer\n")
+        assert [p for m, p, _b in sink.requests if m == "GET" and p.startswith("/trace")] == ["/trace?id=" + first]
+    finally:
+        sink.close()

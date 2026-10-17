@@ -2427,6 +2427,7 @@ Commands:
   /tools      List the available tools.
   /memory     Show both memory stores: paths, sizes, entry counts, contents.
   /remember   Add one line to long-term memory: /remember <text>
+  /trace      Show a turn's trace: /trace (last turn), /trace N (N turns back), /trace <id>
 
   (approval)  bash, run_python, generate_image, promote and overwriting an existing
               file ask first, unless --danger-auto-approve was passed -- then only
@@ -2529,6 +2530,35 @@ def slash_resume(messages, system_message, args_ns):
     ]
     print("[resumed from %d checkpoint(s) in %s; ~%d tokens reloaded]"
           % (count, source, estimate_tokens(messages[1:], include_tools=False)))
+
+
+def slash_trace(raw):
+    """/trace, /trace N, /trace <id> -- one turn's trace tree from the local qwen-agentd. Returns lines."""
+    if FLEET is None:
+        return ["tracing is off: fleet_lib.py is not available"]
+    if FLEET_DAEMON_URL is None:
+        return ["tracing is off: QWEN_AGENT_DAEMON_URL is not usable"]
+    arg = raw.strip()
+    if arg == "" or re.fullmatch(r"[0-9]{1,2}", arg):
+        n = int(arg) if arg else 1
+        if not 1 <= n <= TRACE_RING_SIZE:
+            return [TRACE_USAGE]
+        if not TRACE_RING:
+            return ["no turns in this session yet"]
+        if n > len(TRACE_RING):
+            return ["only %d turn%s in this session" % (len(TRACE_RING), "" if len(TRACE_RING) == 1 else "s")]
+        trace_id = TRACE_RING[-n]
+    elif FLEET.valid_trace_id(arg):
+        trace_id = arg
+    else:
+        return [TRACE_USAGE]
+    result, error = FLEET.fetch_trace(FLEET_DAEMON_URL, trace_id)
+    if error is not None:
+        return [error]
+    lines = FLEET.render_trace(result)
+    if not result["records"]:
+        lines.append("no records for trace %s" % trace_id)
+    return lines
 
 
 def stop_local_model(base_url):
@@ -2642,6 +2672,9 @@ def handle_slash_command(line, messages, system_message, args_ns):
             print(slash_remember(cmd[len("/remember"):]))
         else:
             print("memory is disabled for this session.")
+    elif cmd == "/trace" or cmd.startswith("/trace "):
+        for out_line in slash_trace(cmd[len("/trace"):]):
+            print(out_line)
     else:
         print("unknown command: %s (try /help)" % cmd)
 
