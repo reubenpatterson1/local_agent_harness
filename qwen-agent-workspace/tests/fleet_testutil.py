@@ -516,3 +516,25 @@ def write_hook(path, kind):
 def release_hook(hook_path, task):
     """Let the "slow" hook's run for `task` finish."""
     open(os.path.join(os.path.dirname(str(hook_path)), "release-" + task), "w").close()
+
+
+# --- tracing (docs/superpowers/specs/2026-10-17-fleet-tracing-design.md, Section 6.2) ---------
+
+def trace_files(home, host_id):
+    """Sorted paths of trace.jsonl* in the agent's log directory under HOME=home."""
+    d = daemon_log_dir(home, host_id)
+    if not os.path.isdir(d):
+        return []
+    return sorted(os.path.join(d, n) for n in os.listdir(d) if n.startswith(fleet_lib.TRACE_FILE_NAME))
+
+
+def read_records(home, host_id):
+    """Every line of the agent's trace files, oldest file first, json.loads'd."""
+    paths = trace_files(home, host_id)
+    current = [p for p in paths if p.endswith(fleet_lib.TRACE_FILE_NAME)]
+    backups = sorted((p for p in paths if p not in current), key=lambda p: -int(p.rsplit(".", 1)[1]))
+    records = []
+    for path in backups + current:
+        with open(path, encoding="utf-8") as f:
+            records.extend(json.loads(line) for line in f if line.strip())
+    return records

@@ -399,7 +399,7 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
             if len(body) != length:
                 return
             if kind == "loopback":
-                status, obj = fleet.loopback_endpoint(name, body)
+                status, obj = fleet.loopback_endpoint(name, body, path)
                 return self._send(status, fleet_lib.canonical_json(obj))
             now = int(time.time())
             verdict = fleet_lib.verify_request(fleet.key, method, path, self.headers, body, now,
@@ -411,7 +411,7 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
             if kind == "unknown":
                 status, raw = 404, fleet_lib.canonical_json({"error": "not found"})
             else:
-                status, raw = fleet.signed_endpoint(name, body)
+                status, raw = fleet.signed_endpoint(name, body, path)
             self._send(status, raw, (method, path, self.headers.get("X-Fleet-Nonce")))
         finally:
             if slot:
@@ -439,6 +439,8 @@ class Daemon(object):
         self.response_nonces = fleet_lib.NonceCache()
         self._warn_lock = threading.Lock()
         self._skew_warned = set()
+        self.trace_store = fleet_lib.TraceStore(fleet_lib.log_dir(host_id))
+        self._trace_warned = False
         self._unregistered_warned = set()
         self._inflight = set()
         self.skills_state = []
@@ -626,7 +628,7 @@ class Daemon(object):
         me["skills"] = self.skills_view()
         return {"schema": fleet_lib.PEERS_SCHEMA, "self": me, "peers": self.table.live_peers()}
 
-    def signed_endpoint(self, name, body):
+    def signed_endpoint(self, name, body, path):
         """(status, body bytes) for a verified request to a signed endpoint."""
         if name == "health":
             return 200, fleet_lib.canonical_json(self.health_body())
@@ -634,11 +636,43 @@ class Daemon(object):
             return 200, fleet_lib.canonical_json({"host_id": self.host_id, "skills": self.skills_view()})
         return self.handle_run(body)
 
-    def loopback_endpoint(self, name, body):
+    def loopback_endpoint(self, name, body, path):
         """(status, JSON-able object) for a loopback-only endpoint; sent unsigned."""
         if name == "peers":
             return 200, self.peers_view()
+        if name == "spans":
+            return self.handle_spans(body)
         return self.handle_delegate(body)
+
+    # --- tracing: the store, POST /spans and the query endpoints (tracing spec TR21-TR28) ---
+
+    def record_span(self, trace_id, span_id, parent_span_id, kind, name, start, t0, status, attrs):
+        """Store one finished daemon span; a failure never fails the request (tracing spec TR21)."""
+        try:
+            self.trace_store.append(fleet_lib.make_record(trace_id, span_id, parent_span_id, self.host_id,
+                                                          kind, name, start, t0, status, attrs))
+        except Exception as e:
+            self._trace_write_failed(e)
+
+    def _trace_write_failed(self, e):
+        """One WARNING per process when the store cannot be written."""
+        with self._warn_lock:
+            if self._trace_warned:
+                return
+            self._trace_warned = True
+        LOG.warning("trace: cannot write %s: %s" % (self.trace_store.path, type(e).__name__))
+
+    def handle_spans(self, body):
+        """(status, object) for loopback POST /spans: one finished span from a local qwen-agent (tracing spec TR22)."""
+        obj = _json_or_none(body)
+        reason = fleet_lib.trace_record_error(obj, posted=True)
+        if reason is not None:
+            return 400, {"error": "bad span: %s" % reason}
+        try:
+            self.trace_store.append(dict(obj, agent=self.host_id))
+        except Exception as e:
+            self._trace_write_failed(e)
+        return 200, {"ok": True}
 
     # --- discovery: beacons, bind attempts, poll fallback (F11, F30-F39) -------------
 

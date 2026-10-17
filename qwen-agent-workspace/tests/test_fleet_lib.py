@@ -2241,3 +2241,25 @@ def test_trt14_render_recent_table():
     ]
     assert fleet_lib.render_recent([], localtime=time.gmtime) == [
         "time                 trace id                               dur  status        spans  delegated"]
+
+
+# --- fleet tracing: routes and the /spans body cap (tracing spec TR9) ---
+
+def test_trt6_trace_routes_and_spans_cap():
+    assert fleet_lib.http_route("POST", "/spans") == ("loopback", "spans")
+    for path in ("/trace/" + TR_TRACE, "/trace/x"):
+        assert fleet_lib.http_route("GET", path) == ("signed", "trace")
+    for path in ("/trace?id=x", "/trace"):
+        assert fleet_lib.http_route("GET", path) == ("loopback", "trace_query")
+    for path in ("/traces/recent", "/traces/recent?n=3"):
+        assert fleet_lib.http_route("GET", path) == ("loopback", "recent")
+    for method, path in (("POST", "/trace/x"), ("GET", "/traces"), ("GET", "/spans"),
+                         ("GET", "/run"), ("POST", "/health"), ("GET", "/peers/"),
+                         ("PUT", "/peers"), ("GET", "/health?x=1"), ("GET", "/nowhere")):
+        assert fleet_lib.http_route(method, path) == ("unknown", None), (method, path)
+    assert fleet_lib.body_cap("loopback", "spans") == 8192
+    assert fleet_lib.body_cap("signed", "run") == fleet_lib.MAX_IMAGE_BODY
+    assert fleet_lib.body_cap("loopback", "delegate") == fleet_lib.MAX_IMAGE_BODY
+    for kind, name in (("signed", "health"), ("signed", "skills"), ("loopback", "peers"), ("unknown", None),
+                       ("signed", "trace"), ("loopback", "trace_query"), ("loopback", "recent")):
+        assert fleet_lib.body_cap(kind, name) == fleet_lib.MAX_BODY, (kind, name)

@@ -685,6 +685,8 @@ _IMAGE_ROUTES = (("signed", "run"), ("loopback", "delegate"))
 
 def body_cap(kind, name):
     """Largest request body accepted on a route: MAX_IMAGE_BODY for /run and /delegate, else MAX_BODY."""
+    if (kind, name) == ("loopback", "spans"):
+        return TRACE_SPAN_MAX_BYTES
     return MAX_IMAGE_BODY if (kind, name) in _IMAGE_ROUTES else MAX_BODY
 
 
@@ -830,6 +832,7 @@ _ROUTES = {
     ("POST", "/run"): ("signed", "run"),
     ("GET", "/peers"): ("loopback", "peers"),
     ("POST", "/delegate"): ("loopback", "delegate"),
+    ("POST", "/spans"): ("loopback", "spans"),
 }
 
 
@@ -839,8 +842,18 @@ def is_loopback_client(ip):
 
 
 def http_route(method, path):
-    """(kind, name) for a request; ("unknown", None) for every other pair (F42)."""
-    return _ROUTES.get((method, path), ("unknown", None))
+    """(kind, name) for a request; ("unknown", None) for every other pair (F42, tracing spec TR9)."""
+    route = _ROUTES.get((method, path))
+    if route is not None:
+        return route
+    if method == "GET":
+        if path.startswith("/trace/"):
+            return "signed", "trace"
+        if path == "/trace" or path.startswith("/trace?"):
+            return "loopback", "trace_query"
+        if path == "/traces/recent" or path.startswith("/traces/recent?"):
+            return "loopback", "recent"
+    return "unknown", None
 
 
 def serves_skill(skills, skill):
