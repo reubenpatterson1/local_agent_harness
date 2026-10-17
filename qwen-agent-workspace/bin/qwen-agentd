@@ -224,13 +224,20 @@ def _parse_beacon_targets(value):
 
 
 def _validate_run_flags(args):
-    """(beacon_targets, beacon_port, scale) or StartupError with the F92 message."""
-    targets = _parse_beacon_targets(args.beacon_targets)
-    if targets is None:
-        raise StartupError("qwen-agentd: invalid --beacon-targets")
-    beacon_port = _parse_port(args.beacon_port)
-    if beacon_port is None:
-        raise StartupError("qwen-agentd: invalid --beacon-port")
+    """(beacon_targets, beacon_port, scale) or StartupError with the F92 message.
+
+    An omitted beacon flag stays None; Daemon.start applies its default (multi-agent spec M15, M16).
+    """
+    targets = None
+    if args.beacon_targets is not None:
+        targets = _parse_beacon_targets(args.beacon_targets)
+        if targets is None:
+            raise StartupError("qwen-agentd: invalid --beacon-targets")
+    beacon_port = None
+    if args.beacon_port is not None:
+        beacon_port = _parse_port(args.beacon_port)
+        if beacon_port is None:
+            raise StartupError("qwen-agentd: invalid --beacon-port")
     if not os.path.isfile(args.qwen_agent_bin):
         raise StartupError("qwen-agentd: --qwen-agent-bin not found: %s" % args.qwen_agent_bin)
     try:
@@ -443,6 +450,10 @@ class Daemon(object):
         self.port = self.entry["port"]
         self.loopback_url = "http://127.0.0.1:%d" % self.port
         self.version = fleet_lib.release_version(REPO_ROOT, fleet_lib.deploy_root(self.host_id))
+        if self.beacon_port is None:
+            self.beacon_port = self.port
+        if self.beacon_targets is None:
+            self.beacon_targets = fleet_lib.default_beacon_targets(self.registry)
         self.table = fleet_lib.LivenessTable(self.registry, self.host_id,
                                              self.scaled(fleet_lib.LIVE_WINDOW))
         self._bind_sockets()
@@ -1456,8 +1467,8 @@ def _build_parser():
     p.set_defaults(func=cmd_selftest)
     p = sub.add_parser("run", help="run the fleet daemon (the default subcommand)")
     p.add_argument("--registry", default=None, metavar="PATH")
-    p.add_argument("--beacon-targets", default="255.255.255.255:%d" % fleet_lib.DEFAULT_PORT, metavar="LIST")
-    p.add_argument("--beacon-port", default=str(fleet_lib.DEFAULT_PORT), metavar="N")
+    p.add_argument("--beacon-targets", default=None, metavar="LIST")
+    p.add_argument("--beacon-port", default=None, metavar="N")
     p.add_argument("--qwen-agent-bin", default=os.path.join(REPO_ROOT, "bin", "qwen-agent"), metavar="PATH")
     p.add_argument("--timing-scale", default="1.0", metavar="X")
     p.set_defaults(func=cmd_run)

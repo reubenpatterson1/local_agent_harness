@@ -913,3 +913,48 @@ def test_mt12_status_resolves_the_agent_port(tmp_path):
     proc = _run_agentd(home, ["status", "--agent-id", "zulu"])
     assert (proc.returncode, proc.stdout, proc.stderr) == (
         2, "", "qwen-agentd: agent 'zulu' is not in any registry in %s; pass --port N\n" % os.path.join(WS, "fleets"))
+
+
+# --- multi-agent hosts: two agents in one HOME with the default beacon flags (M15-M17, M31, MK4) ---
+
+def test_mt10_two_agents_one_home_default_beacons(tmp_path):
+    """The one test whose daemons run without beacon flags (multi-agent spec 5.1): they send
+    limited broadcasts to 255.255.255.255 on their two ephemeral registry ports."""
+    home = tmp_path / "m"
+    home.mkdir()
+    ftu.make_fleet(home, "alpha")
+    ftu.make_fleet(home, "bravo")
+    pa, pb = ftu.free_port(), ftu.free_port()
+    assert fleet_lib.DEFAULT_PORT not in (pa, pb)
+    stub_a = ftu.StubModelServer("vllm", "alpha-model", "ALPHA-ANSWER")
+    stub_b = ftu.StubModelServer("ollama", "bravo-model", "BRAVO-ANSWER")
+    registry = ftu.write_registry(tmp_path / "registry.json", ftu.TEST_FLEET_ID, {
+        "alpha": {"port": pa, "model_server": {"type": "vllm", "url": stub_a.url},
+                  "model": "alpha-model", "skills": []},
+        "bravo": {"port": pb, "model_server": {"type": "ollama", "url": stub_b.url},
+                  "model": "bravo-model", "skills": ["researcher"]}})
+    alpha = ftu.start_daemon(home, "alpha", registry, None, None)
+    bravo = ftu.start_daemon(home, "bravo", registry, None, None)
+    for daemon in (alpha, bravo):
+        assert "--beacon-port" not in daemon.proc.args and "--beacon-targets" not in daemon.proc.args
+        assert daemon.beacon_port == daemon.port
+    # (a) each agent logs to its own A/logs, receives on its own port, and beacons to both ports
+    for daemon, other in ((alpha, "bravo"), (bravo, "alpha")):
+        log = ftu.read_log(home, daemon.host_id)
+        assert ("qwen-agentd dev started host_id=%s port=%d beacon_port=%d beacon_targets=2 skills="
+                % (daemon.host_id, daemon.port, daemon.port)) in log
+        assert "started host_id=%s " % other not in log
+    # (b) both UDP ports are really bound
+    for port in (pa, pb):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with pytest.raises(OSError) as e:
+                sock.bind(("0.0.0.0", port))
+            assert e.value.errno == errno.EADDRINUSE
+        finally:
+            sock.close()
+
+    # (c) the two agents at one address find each other within the scaled poll bound
+    def lists(daemon, other, port):
+        return [(p["host_id"], p["port"]) for p in ftu.peers(daemon.port)[1]["peers"]] == [(other, port)]
+    ftu.wait_until(lambda: lists(alpha, "bravo", pb) and lists(bravo, "alpha", pa), 7.5)

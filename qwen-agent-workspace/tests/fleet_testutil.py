@@ -1,7 +1,8 @@
 """Shared helpers for the fleet test suites (fleet spec Section 11.2, D10).
 
 Not a test module (pytest does not collect it). Loopback only: every server a
-helper starts binds 127.0.0.1, and every daemon gets explicit beacon targets.
+helper starts binds 127.0.0.1, and every daemon gets explicit beacon targets
+except MT10's (multi-agent spec 5.1).
 Every spawned process gets HOME=<tmp dir> and a QWEN_AGENT_SEARXNG_URL that points
 at a closed port, so no test touches real user state or needs a running SearXNG.
 """
@@ -240,14 +241,22 @@ def spawn(argv, env, home):
 
 def start_daemon(home, host_id, registry, beacon_port, beacon_targets, extra_args=(),
                  scale=INTEGRATION_SCALE, env_extra=None, wait=True):
-    """Spawn `qwen-agentd run` for host_id; return once GET /peers answers 200 (10 s max)."""
+    """Spawn `qwen-agentd run` for host_id; return once GET /peers answers 200 (10 s max).
+
+    beacon_port=None omits --beacon-port (the daemon then receives on its registry port) and
+    beacon_targets=None omits --beacon-targets (multi-agent spec M15, M16; only MT10 does this).
+    """
     with open(str(registry), encoding="utf-8") as f:
         port = json.load(f)["hosts"][host_id].get("port", fleet_lib.DEFAULT_PORT)
-    argv = [sys.executable, AGENTD, "run", "--registry", str(registry), "--beacon-port", str(beacon_port),
-            "--beacon-targets", beacon_targets, "--timing-scale", scale] + list(extra_args)
+    argv = [sys.executable, AGENTD, "run", "--registry", str(registry)]
+    if beacon_port is not None:
+        argv += ["--beacon-port", str(beacon_port)]
+    if beacon_targets is not None:
+        argv += ["--beacon-targets", beacon_targets]
+    argv += ["--timing-scale", scale] + list(extra_args)
     env = clean_env(home, QWEN_AGENT_HOST_ID=host_id, **(env_extra or {}))
     proc = spawn(argv, env, home)
-    daemon = DaemonProc(proc, home, host_id, port, beacon_port)
+    daemon = DaemonProc(proc, home, host_id, port, port if beacon_port is None else beacon_port)
     if not wait:
         return daemon
     deadline = time.monotonic() + 10
