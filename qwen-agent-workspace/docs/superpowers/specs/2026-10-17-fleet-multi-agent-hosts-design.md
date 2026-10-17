@@ -532,7 +532,7 @@ Helpers changed with no test-body edit: `_single` (`make_fleet(home, "alpha")`),
   Pass:
   - Within 75 s, `qwen-agentd status --agent-id vision-185` lists `gemma-185 192.168.1.185:8191`, and `status --agent-id gemma-185` lists `vision-185 192.168.1.185:8190`.
   - The Mac's `status --agent-id mac-local` lists both.
-  - `systemctl --user status qwen-agentd-vision-185 qwen-agentd-gemma-185` shows both active.
+  - .185 is macOS: `launchctl print gui/$(id -u)/com.qwen-agent.qwen-agentd.vision-185` and `launchctl print gui/$(id -u)/com.qwen-agent.qwen-agentd.gemma-185` both show `state = running`.
   - `grep QWEN_AGENT_DAEMON_URL ~/.local/bin/qwen-agent-gemma-185` shows port 8191.
   - The older checkout on .185 is unchanged (`git -C <it> status` as before).
 
