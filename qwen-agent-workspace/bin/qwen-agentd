@@ -1236,15 +1236,18 @@ def restart_daemon(d):
     guard (that would keep a half-switched daemon running), so it ends the process
     and the supervisor restarts it through the launcher, which counts the start.
     """
-    close_logging()
-    sys.stdout.flush()
-    sys.stderr.flush()
     target = os.path.join(d, "current", fleet_lib.WS_SUBDIR, "bin", "qwen-agentd")
     try:
+        close_logging()
+        sys.stdout.flush()
+        sys.stderr.flush()
         os.execv(sys.executable, [sys.executable, target] + sys.argv[1:])
-    except OSError as e:
-        _err("qwen-agentd: cannot exec %s: %s: %s" % (target, type(e).__name__, e))
-        os._exit(1)
+    except BaseException as e:
+        try:
+            _err("qwen-agentd: cannot exec %s: %s: %s" % (target, type(e).__name__, e))
+        except BaseException:
+            pass
+    os._exit(1)
 
 
 class UpdateCtx(object):
