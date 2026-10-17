@@ -341,3 +341,175 @@ def test_tracing_focus_2_fresh_agent_with_no_trace_file(tmp_path):
     assert proc.returncode == 1 and proc.stderr == "qwen-agentd: no records for trace %s\n" % T
     assert ftu.trace_files(home, "alpha") == []
     assert "trace" not in fleet.daemons["alpha"].log()
+
+
+# --- POST /run and POST /delegate spans, propagation, the old-peer retry (TR23-TR25) ------------
+
+def _signed_run(port, body, timeout=60):
+    status, headers, raw, nonce = ftu.signed(ftu.TEST_KEY, "POST", port, "/run", body, timeout=timeout)
+    assert ftu.response_ok(ftu.TEST_KEY, status, "POST", "/run", nonce, headers, raw), status
+    return status, raw
+
+
+def _of_kind(records, kind, trace_id=T):
+    return [r for r in records if r["kind"] == kind and r["trace_id"] == trace_id]
+
+
+def test_trt48_run_child_gets_the_agent_span_as_its_parent(tmp_path):
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-envdump"), "envdump")
+    fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+    ftu.wait_until(lambda: "bravo" in fleet.peer_ids("alpha"), 4.5)
+    status, body = ftu.delegate(fleet.ports["alpha"], "researcher", "again", "bravo",
+                                trace={"trace_id": T, "parent_span_id": P})
+    assert status == 200 and body["outcome"] == "ok", body
+    with open(hook + ".json", encoding="utf-8") as f:
+        dumped = json.load(f)
+    bravo = ftu.read_records(fleet.homes["bravo"], "bravo")
+    alpha = ftu.read_records(fleet.homes["alpha"], "alpha")
+    [delegate] = _of_kind(alpha, "delegate")
+    [run] = _of_kind(bravo, "run")
+    [agent] = _of_kind(bravo, "agent")
+    assert dumped["env"]["QWEN_AGENT_TRACE_ID"] == T
+    assert dumped["env"]["QWEN_AGENT_PARENT_SPAN"] == agent["span_id"]
+    assert agent["parent_span_id"] == run["span_id"]
+    assert run["parent_span_id"] == delegate["span_id"] and delegate["parent_span_id"] == P
+    assert _of_kind(bravo, "turn") == []
+    assert (delegate["status"], delegate["attrs"]) == ("ok", {"skill": "researcher", "target": "bravo",
+                                                             "request_id": run["attrs"]["request_id"],
+                                                             "http": 200, "images": 0})
+    assert (run["status"], run["name"], run["attrs"]["http"]) == ("ok", "researcher", 200)
+    assert (agent["status"], agent["attrs"]["envelope_status"]) == ("ok", "ok")
+    bravo_url = "http://127.0.0.1:%d/v1" % fleet.server_ports["bravo"]
+    assert dumped["argv"][1:] == ["--skill=researcher", "--user-prompt=again", "--base-url=%s" % bravo_url,
+                                  "--model=bravo-model", "--model-server-type=ollama"]
+    assert "run start skill=researcher request_id=%s task_chars=5 images=0 image_bytes=0" % (
+        run["attrs"]["request_id"]) in fleet.daemons["bravo"].log()
+
+
+class _OldPeer(object):
+    """An in-process registered peer 'delta' from before tracing: its /run answers a body with
+    a "trace" key with a signed 400 {"error": "bad request"} and any other body with the canned
+    envelope; GET /trace/<id> is an unknown route (signed 404 {"error": "not found"})."""
+
+    def __init__(self, port):
+        self.run_bodies = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, status, raw):
+                headers = fleet_lib.sign_response(ftu.TEST_KEY, status, self.command, self.path,
+                                                  self.headers.get("X-Fleet-Nonce"), raw,
+                                                  int(time.time()), os.urandom(16).hex())
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._reply(200, fleet_lib.canonical_json({"host_id": "delta", "role": "agent",
+                                                               "version": "dev", "proto": 1,
+                                                               "discovery": "beacon"}))
+                elif self.path == "/skills":
+                    self._reply(200, fleet_lib.canonical_json({"host_id": "delta", "skills": [
+                        {"skill": "researcher", "model": "delta-model", "verified": True, "busy": False}]}))
+                else:
+                    self._reply(404, fleet_lib.canonical_json({"error": "not found"}))
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                outer.run_bodies.append(body)
+                if "trace" in body:
+                    self._reply(400, fleet_lib.canonical_json({"error": "bad request"}))
+                else:
+                    self._reply(200, ftu.CANNED_LINE.encode("utf-8"))
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_trt43_old_peer_gets_one_untraced_retry_and_shows_as_no_trace_support(tmp_path):
+    delta_port = ftu.free_port()
+    fleet = ftu.Fleet(tmp_path, names=("alpha",), extra_hosts={"delta": {
+        "port": delta_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+        "model": "delta-model", "skills": ["researcher"]}})
+    delta = _OldPeer(delta_port)
+    try:
+        fleet.start()
+        alpha = fleet.ports["alpha"]
+        ftu.send_beacon(ftu.TEST_KEY, delta_port, fleet.beacon_ports["alpha"])
+        ftu.wait_until(lambda: "delta" in fleet.peer_ids("alpha"), 3.0)
+        status, body = ftu.delegate(alpha, "researcher", "t", "delta", trace={"trace_id": T, "parent_span_id": P})
+        assert status == 200 and body["outcome"] == "ok" and body["envelope"]["answer"] == "CANNED", body
+        [delegate] = _of_kind(ftu.read_records(fleet.homes["alpha"], "alpha"), "delegate")
+        assert [sorted(b) for b in delta.run_bodies] == [["request_id", "skill", "task", "trace"],
+                                                         ["request_id", "skill", "task"]]
+        assert delta.run_bodies[0]["trace"] == {"trace_id": T, "parent_span_id": delegate["span_id"]}
+        assert delta.run_bodies[0]["request_id"] == delta.run_bodies[1]["request_id"]
+        status, result = ftu.trace(alpha, T)
+        assert status == 200 and result["records"] == [delegate]
+        assert (delegate["status"], delegate["attrs"]["http"]) == ("ok", 200)
+        assert result["missing"] == [{"agent": "delta", "reason": "no trace support (http 404)"}]
+        proc = ftu.trace_cli(fleet.homes["alpha"], ["--port", str(alpha), T])
+        assert proc.returncode == 0
+        lines = proc.stdout.splitlines()
+        assert lines[1] == "! delta: no trace support (http 404)"
+        assert lines[2] == "… span %s on alpha (not retrieved)" % P
+        assert lines[3].startswith("  delegate researcher -> delta  req=%s  http=200  " % (
+            delegate["attrs"]["request_id"])) and lines[3].endswith("  ok  @alpha")
+    finally:
+        delta.close()
+
+
+def test_tracing_focus_5_a_crashed_child_still_leaves_run_and_agent_spans(tmp_path):
+    """Review Focus 5: the peer's child crashes before printing an envelope (a model server
+    that went away, a broken release). Expected: the run and agent spans are still recorded
+    with http 502 and status error; a busy refusal is a run span "busy" with no agent span;
+    a malformed trace field is a plain 400 with no span at all."""
+    hook = ftu.write_hook(os.path.join(str(tmp_path), "hook-slow"), "slow")
+    fleet = ftu.Fleet(tmp_path, names=("bravo",), extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+    port, home = fleet.ports["bravo"], fleet.homes["bravo"]
+
+    def run_body(task, request_id, trace=None):
+        req = {"skill": "researcher", "task": task, "request_id": request_id}
+        if trace is not None:
+            req["trace"] = trace
+        return json.dumps(req).encode("utf-8")
+
+    field = {"trace_id": T, "parent_span_id": P}
+    assert _signed_run(port, run_body("garbage", "req-1", field)) == \
+        (502, b'{"error":"skill produced no parseable output (exit code 1)"}')
+    [run] = _of_kind(ftu.read_records(home, "bravo"), "run")
+    [agent] = _of_kind(ftu.read_records(home, "bravo"), "agent")
+    assert (run["parent_span_id"], run["status"], run["attrs"]["http"]) == (P, "error", 502)
+    assert (agent["parent_span_id"], agent["status"]) == (run["span_id"], "error")
+    assert agent["attrs"] == {"skill": "researcher", "request_id": "req-1", "http": 502, "envelope_status": None}
+    result = {}
+    first = threading.Thread(target=lambda: result.update(first=_signed_run(port, run_body("one", "req-2"))))
+    first.start()
+    ftu.wait_until(lambda: json.loads(ftu.signed(ftu.TEST_KEY, "GET", port, "/skills")[2])
+                   ["skills"][0]["busy"] is True, 10)
+    assert _signed_run(port, run_body("two", "req-3", field)) == (409, b'{"error":"busy"}')
+    ftu.release_hook(hook, "one")
+    first.join(30)
+    assert result["first"] == (200, ftu.CANNED_LINE.encode("utf-8"))
+    records = ftu.read_records(home, "bravo")
+    busy = [r for r in records if r["kind"] == "run" and r["attrs"]["request_id"] == "req-3"]
+    assert [(r["status"], r["attrs"]["http"], r["parent_span_id"]) for r in busy] == [("busy", 409, P)]
+    assert [r for r in records if r["kind"] == "agent" and r["attrs"]["request_id"] == "req-3"] == []
+    untraced = [r for r in records if r["kind"] == "run" and r["attrs"]["request_id"] == "req-2"]
+    assert len(untraced) == 1 and untraced[0]["parent_span_id"] is None and untraced[0]["trace_id"] != T
+    count = len(records)
+    assert _signed_run(port, run_body("x", "req-4", {"trace_id": T})) == (400, b'{"error":"bad request"}')
+    assert len(ftu.read_records(home, "bravo")) == count

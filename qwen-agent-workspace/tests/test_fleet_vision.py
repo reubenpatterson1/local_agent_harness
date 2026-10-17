@@ -438,7 +438,7 @@ def test_vt27_unsigned_peer_503_is_busy_and_413_is_peer_error(tmp_path):
         assert ftu.delegate(alpha, "vision", "t", "delta", images=[PNG_WIRE]) == \
             (200, {"outcome": "peer_error", "envelope": None, "detail": "http 413"})
         assert [b["images"] for b in delta.run_bodies] == [[PNG_WIRE], [PNG_WIRE]]
-        assert all(set(b) == {"skill", "task", "request_id", "images"} for b in delta.run_bodies)
+        assert all(set(b) == {"skill", "task", "request_id", "images", "trace"} for b in delta.run_bodies)
     finally:
         delta.close()
 

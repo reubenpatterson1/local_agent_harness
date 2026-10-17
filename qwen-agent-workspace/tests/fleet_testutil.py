@@ -302,11 +302,14 @@ def peers(port):
     return status, (json.loads(raw) if raw else None)
 
 
-def delegate(port, skill, task, host_id, timeout=120, images=None):
-    """(status, parsed body or None) of loopback POST /delegate; images (wire list) adds the key."""
+def delegate(port, skill, task, host_id, timeout=120, images=None, trace=None):
+    """(status, parsed body or None) of loopback POST /delegate; images (wire list) and trace
+    ({"trace_id", "parent_span_id"}) each add their key when not None."""
     request = {"skill": skill, "task": task, "host_id": host_id}
     if images is not None:
         request["images"] = images
+    if trace is not None:
+        request["trace"] = trace
     body = json.dumps(request).encode("utf-8")
     status, _headers, raw = _request(port, "POST", "/delegate", body,
                                      {"Content-Type": "application/json"}, timeout=timeout)

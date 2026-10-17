@@ -200,6 +200,7 @@ _PORT_RE = re.compile(r"[0-9]{1,5}")
 _LENGTH_RE = re.compile(r"[0-9]{1,12}")
 _RUN_KEYS = frozenset(("skill", "task", "request_id"))
 _DELEGATE_KEYS = frozenset(("skill", "task", "host_id"))
+_OPTIONAL_KEYS = frozenset(("images", "trace"))   # body keys /run and /delegate accept beyond their base set
 _TRACE_QUERY_RE = re.compile(r"/trace\?id=([0-9a-f]{32})")
 _RECENT_QUERY_RE = re.compile(r"/traces/recent\?n=([0-9]{1,3})")
 
@@ -948,17 +949,43 @@ class Daemon(object):
     # --- POST /run (F47-F54c) ----------------------------------------------------------
 
     def handle_run(self, body):
-        """(status, body bytes) for a verified POST /run. One run at a time per host (vision spec V16)."""
+        """(status, body bytes) for a verified POST /run; one run at a time per host (vision spec V16).
+
+        Every request that passes the shape check is recorded as one run span (tracing spec TR23).
+        """
         req = _json_or_none(body)
-        if not (isinstance(req, dict) and set(req) in (_RUN_KEYS, _RUN_KEYS | {"images"})
+        if not (isinstance(req, dict) and set(req) - _OPTIONAL_KEYS == _RUN_KEYS
                 and all(isinstance(req[k], str) for k in _RUN_KEYS)
                 and req["task"].strip() != ""
-                and fleet_lib.REQUEST_ID_RE.fullmatch(req["request_id"])):
+                and fleet_lib.REQUEST_ID_RE.fullmatch(req["request_id"])
+                and ("trace" not in req or fleet_lib.valid_trace_field(req["trace"]))):
             return 400, fleet_lib.canonical_json({"error": "bad request"})
+        trace_id, parent = fleet_lib.trace_context(req.get("trace"))
+        span_id = fleet_lib.new_span_id()
+        start, t0 = round(time.time(), 3), time.monotonic()
+        facts = {"http": 500, "images": 0, "image_bytes": 0, "envelope_status": None}
+        try:
+            code, raw = self._run_request(req, (trace_id, span_id), facts)
+            facts["http"] = code
+            return code, raw
+        finally:
+            skill = fleet_lib.trace_skill(req["skill"])
+            self.record_span(trace_id, span_id, parent, "run", skill, start, t0,
+                             fleet_lib.run_status(facts["http"], facts["envelope_status"]),
+                             {"skill": skill, "request_id": req["request_id"], "http": facts["http"],
+                              "images": facts["images"], "image_bytes": facts["image_bytes"]})
+
+    def _run_request(self, req, trace, facts):
+        """Vision spec V16 steps 2-5 -> (http code, body bytes); fills facts for the run span.
+
+        trace is (trace_id, run span_id); the child gets (trace_id, agent span_id) (tracing spec TR23).
+        """
         try:
             images = fleet_lib.request_images(req)
         except fleet_lib.ImageError as e:
             return e.status, fleet_lib.canonical_json({"error": e.reason})
+        facts["images"] = len(images or [])
+        facts["image_bytes"] = sum(len(data) for _media_type, data in images or [])
         if not self.run_lock.acquire(False):
             return 409, fleet_lib.canonical_json({"error": "busy"})
         skill, task, request_id = req["skill"], req["task"], req["request_id"]
@@ -970,9 +997,14 @@ class Daemon(object):
                 return code, raw
             started = time.monotonic()
             LOG.info("run start skill=%s request_id=%s task_chars=%d images=%d image_bytes=%d"
-                     % (skill, request_id, len(task), len(images or []),
-                        sum(len(data) for _media_type, data in images or [])))
-            code, status, raw = self.spawn_run(skill, task, images)
+                     % (skill, request_id, len(task), facts["images"], facts["image_bytes"]))
+            agent_span, agent_start = fleet_lib.new_span_id(), round(time.time(), 3)
+            code, status, raw = self.spawn_run(skill, task, images, (trace[0], agent_span))
+            facts["envelope_status"] = fleet_lib.trace_token(status)
+            self.record_span(trace[0], agent_span, trace[1], "agent", fleet_lib.trace_skill(skill),
+                             agent_start, started, "ok" if code == 200 and status == "ok" else "error",
+                             {"skill": fleet_lib.trace_skill(skill), "request_id": request_id, "http": code,
+                              "envelope_status": fleet_lib.trace_token(status)})
             return code, raw
         finally:
             self.run_lock.release()
@@ -980,17 +1012,19 @@ class Daemon(object):
                 LOG.info("run end skill=%s request_id=%s http=%d status=%s seconds=%.1f"
                          % (skill, request_id, code, status, time.monotonic() - started))
 
-    def spawn_run(self, skill, task, images=None):
+    def spawn_run(self, skill, task, images=None, trace=None):
         """Run this release's bin/qwen-agent --skill child -> (http code, envelope status, body).
 
         images, decoded [(media_type, bytes)], are written to a private directory under
         A(<id>)/tmp, passed as --image paths, and removed on every exit (vision spec V17, V18).
+        trace, (trace_id, agent span_id), becomes the child's QWEN_AGENT_TRACE_ID and
+        QWEN_AGENT_PARENT_SPAN (tracing spec TR23).
         """
         argv = [sys.executable, self.qwen_agent_bin, "--skill=" + skill, "--user-prompt=" + task,
                 "--base-url=" + self.entry["model_server"]["url"], "--model=" + self.entry["model"],
                 "--model-server-type=" + self.entry["model_server"]["type"]]
         if not images:
-            return self._run_child(argv)
+            return self._run_child(argv, trace)
         image_dir = None
         try:
             try:
@@ -1007,12 +1041,12 @@ class Daemon(object):
                     argv.extend(["--image", path])
             except OSError as e:
                 return 500, "-", fleet_lib.canonical_json({"error": "cannot stage images: %s" % type(e).__name__})
-            return self._run_child(argv)
+            return self._run_child(argv, trace)
         finally:
             if image_dir is not None:
                 shutil.rmtree(image_dir, ignore_errors=True)
 
-    def _run_child(self, argv):
+    def _run_child(self, argv, trace=None):
         """Start argv as the /run child and map its result (F50-F54c, multi-agent spec M32)."""
         err_path = os.path.join(fleet_lib.log_dir(self.host_id), "last-run.stderr")
         fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1021,7 +1055,7 @@ class Daemon(object):
             try:
                 proc = subprocess.Popen(argv, cwd=os.path.expanduser("~"), stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=err,
-                                        env=fleet_lib.build_child_env(os.environ, self.loopback_url),
+                                        env=fleet_lib.build_child_env(os.environ, self.loopback_url, trace),
                                         start_new_session=True, text=True, errors="replace")
             except (OSError, ValueError) as e:
                 return 500, "-", fleet_lib.canonical_json({"error": "cannot start skill: %s" % type(e).__name__})
@@ -1046,39 +1080,65 @@ class Daemon(object):
     # --- POST /delegate (F65-F67) -------------------------------------------------------
 
     def handle_delegate(self, body):
-        """(status, object) for loopback POST /delegate. Never touches run_lock (F65, vision spec V14)."""
+        """(status, object) for loopback POST /delegate, recorded as one delegate span.
+
+        Never touches run_lock (F65, vision spec V14, tracing spec TR24).
+        """
         req = _json_or_none(body)
-        if not (isinstance(req, dict) and set(req) in (_DELEGATE_KEYS, _DELEGATE_KEYS | {"images"})
+        if not (isinstance(req, dict) and set(req) - _OPTIONAL_KEYS == _DELEGATE_KEYS
                 and all(isinstance(req[k], str) for k in _DELEGATE_KEYS)
                 and req["task"].strip() != "" and req["skill"] in fleet_lib.KNOWN_SKILLS
-                and fleet_lib.HOST_ID_RE.fullmatch(req["host_id"])):
+                and fleet_lib.HOST_ID_RE.fullmatch(req["host_id"])
+                and ("trace" not in req or fleet_lib.valid_trace_field(req["trace"]))):
             return 400, {"error": "bad request"}
         try:
             fleet_lib.request_images(req)
         except fleet_lib.ImageError as e:
             return e.status, {"error": e.reason}
         skill, task, host_id = req["skill"], req["task"], req["host_id"]
+        trace_id, parent = fleet_lib.trace_context(req.get("trace"))
+        span_id = fleet_lib.new_span_id()
+        start = round(time.time(), 3)
         started = time.monotonic()
+        images = len(req.get("images") or [])
         record = self.table.record(host_id)
         if (host_id == self.host_id or not self.table.is_live(host_id) or record is None
                 or record["compatible"] is not True or not fleet_lib.serves_skill(record["skills"], skill)):
             LOG.info("delegate skill=%s host=%s request_id=- outcome=not_live seconds=%.1f"
                      % (skill, host_id, time.monotonic() - started))
+            self.record_span(trace_id, span_id, parent, "delegate", skill, start, started, "not_live",
+                             {"skill": skill, "target": host_id, "request_id": None, "http": None,
+                              "images": images})
             return 200, {"outcome": "not_live", "envelope": None, "detail": ""}
         request_id = secrets.token_hex(8)
-        outcome, envelope, detail = self.forward_run(record, skill, task, request_id, req.get("images"))
+        outcome, envelope, detail, http_status = self.forward_run(record, skill, task, request_id,
+                                                                  req.get("images"), (trace_id, span_id))
         LOG.info("delegate skill=%s host=%s request_id=%s outcome=%s seconds=%.1f"
                  % (skill, host_id, request_id, outcome, time.monotonic() - started))
+        self.record_span(trace_id, span_id, parent, "delegate", skill, start, started, outcome,
+                         {"skill": skill, "target": host_id, "request_id": request_id, "http": http_status,
+                          "images": images})
         return 200, {"outcome": outcome, "envelope": envelope, "detail": detail}
 
-    def forward_run(self, record, skill, task, request_id, images=None):
-        """Signed POST /run to the peer's current address -> (outcome, envelope, detail) (F66).
+    def forward_run(self, record, skill, task, request_id, images=None, trace=None):
+        """Signed POST /run to the peer -> (outcome, envelope, detail, http status or None) (F66, V15).
 
-        images is the wire list exactly as /delegate received it (vision spec V15, V20).
+        trace=(trace_id, parent_span_id) adds the body's "trace" field (tracing spec TR25). A peer
+        that answers it with a signed 400 {"error": "bad request"} predates tracing: the request
+        is sent once more, with a new nonce, without the field.
         """
+        result = self._forward_once(record, skill, task, request_id, images, trace)
+        if trace is not None and result[3] == 400 and result[4] == {"error": "bad request"}:
+            result = self._forward_once(record, skill, task, request_id, images, None)
+        return result[:4]
+
+    def _forward_once(self, record, skill, task, request_id, images, trace):
+        """One signed POST /run -> (outcome, envelope, detail, http, parsed body of a peer_error)."""
         request = {"skill": skill, "task": task, "request_id": request_id}
         if images is not None:
             request["images"] = images
+        if trace is not None:
+            request["trace"] = {"trace_id": trace[0], "parent_span_id": trace[1]}
         body = fleet_lib.canonical_json(request)
         nonce = secrets.token_hex(16)
         headers = fleet_lib.sign_request(self.key, "POST", "/run", body, int(time.time()), nonce)
@@ -1091,28 +1151,28 @@ class Daemon(object):
             status, resp_headers = resp.status, resp.headers
             raw = resp.read(fleet_lib.MAX_BODY + 1)
         except (socket.timeout, TimeoutError):
-            return "timeout", None, ""
+            return "timeout", None, "", None, None
         except (OSError, http.client.HTTPException) as e:
-            return "unreachable", None, type(e).__name__
+            return "unreachable", None, type(e).__name__, None, None
         finally:
             conn.close()
         if len(raw) > fleet_lib.MAX_BODY:
-            return "bad_response", None, ""
+            return "bad_response", None, "", status, None
         if resp_headers.get("X-Fleet-Sig") is None and status in (413, 503):
-            return ("busy", None, "") if status == 503 else ("peer_error", None, "http 413")
+            return ("busy", None, "", 503, None) if status == 503 else ("peer_error", None, "http 413", 413, None)
         if fleet_lib.verify_response(self.key, status, "POST", "/run", nonce, resp_headers, raw,
                                      int(time.time()), self.response_nonces) != "ok":
-            return "bad_signature", None, ""
+            return "bad_signature", None, "", status, None
         if status == 409:
-            return "busy", None, ""
+            return "busy", None, "", 409, None
         if status == 504:
-            return "timeout", None, ""
+            return "timeout", None, "", 504, None
         if status == 200:
             envelope = _json_or_none(raw)
             if isinstance(envelope, dict) and envelope.get("schema") == fleet_lib.ONESHOT_SCHEMA:
-                return "ok", envelope, ""
-            return "bad_response", None, ""
-        return "peer_error", None, "http %d" % status
+                return "ok", envelope, "", 200, None
+            return "bad_response", None, "", 200, None
+        return "peer_error", None, "http %d" % status, status, _json_or_none(raw)
 
     # --- self-update threads (F84, F88) ------------------------------------------------
 
