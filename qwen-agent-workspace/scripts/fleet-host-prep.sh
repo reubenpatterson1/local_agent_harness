@@ -457,6 +457,189 @@ fix_clock_mac() {
 }
 
 # ---------------------------------------------------------------------------
+# model (P14)
+# ---------------------------------------------------------------------------
+
+MD_KIND=''
+MD_PROBE=''
+
+# t_model sets MD_KIND after a failure: lib (fleet_lib cannot be used), down
+# (the server does not answer 200) or missing (the model is not served).
+t_model() {
+    local out rc code body names
+    MD_KIND='lib'
+    CK_RESULT=fail
+    CK_DETAIL="python3 cannot load fleet_lib from $WS"
+    if ! command -v python3 >/dev/null 2>&1; then
+        return
+    fi
+    MD_PROBE=$(python3 -I -B -c "$PY_PROBE_URL" "$WS" "$TYPE" "$MODEL_URL" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$MD_PROBE" ]; then
+        return
+    fi
+    out=$(curl -sS --noproxy '*' --max-time 5 -w '\n%{http_code}' "$MD_PROBE" 2>/dev/null)
+    rc=$?
+    MD_KIND='down'
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="$TYPE not reachable at $MD_PROBE (curl exit $rc)"
+        return
+    fi
+    code="${out##*"$NL"}"
+    body="${out%"$NL"*}"
+    if [ "$code" != 200 ]; then
+        CK_DETAIL="$TYPE not reachable at $MD_PROBE (HTTP $code)"
+        return
+    fi
+    names=$(python3 -I -B -c "$PY_HAS_MODEL" "$WS" "$TYPE" "$MODEL" <<<"$body" 2>/dev/null)
+    rc=$?
+    case "$rc" in
+        0)
+            MD_KIND=''
+            CK_RESULT=pass
+            CK_DETAIL="'$MODEL' served by $TYPE at $MD_PROBE"
+            ;;
+        3)
+            MD_KIND='missing'
+            CK_DETAIL="'$MODEL' not served by $TYPE at $MD_PROBE (serving: ${names:-none})"
+            ;;
+        *)
+            MD_KIND='lib'
+            ;;
+    esac
+}
+
+ck_model() {
+    t_model
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    case "$MD_KIND" in
+        lib)
+            CK_FIXLINE="needs python3 >= 3.9 (see packages) and $WS/fleet_lib.py from a complete checkout"
+            ;;
+        down)
+            CK_FIXLINE="start the $TYPE model server at $MODEL_URL; this script never starts model servers"
+            ;;
+        missing)
+            if [ "$TYPE" = vllm ]; then
+                CK_FIXLINE="start vllm-metal serving '$MODEL' at $MODEL_URL by hand; this script never starts, restarts or pulls for vLLM"
+            elif [ "$MODEL_URL" != "$OLLAMA_URL_DEFAULT" ]; then
+                CK_FIXLINE="pull '$MODEL' into the Ollama server at $MODEL_URL by hand"
+            elif ! command -v ollama >/dev/null 2>&1; then
+                CK_FIXLINE="the ollama CLI is not on PATH; pull '$MODEL' by hand (this script never installs Ollama)"
+            else
+                set_fix fix_model
+            fi
+            ;;
+    esac
+}
+
+fix_model() {
+    step ollama pull "$MODEL"
+}
+
+# ---------------------------------------------------------------------------
+# searxng (P14)
+# ---------------------------------------------------------------------------
+
+DOCKER_SUDO=0
+SX_START=0
+
+t_searxng() {
+    local code rc
+    code=$(curl -sS --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' "$SEARXNG_URL" 2>/dev/null)
+    rc=$?
+    CK_RESULT=fail
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="no answer at $SEARXNG_URL (curl exit $rc)"
+    elif [ "$code" = 200 ]; then
+        CK_RESULT=pass
+        CK_DETAIL="HTTP 200 at $SEARXNG_URL"
+    else
+        CK_DETAIL="HTTP $code at $SEARXNG_URL"
+    fi
+}
+
+# docker_words FN ARG...: call FN with the docker command words (docker, or
+# sudo docker for a Linux user outside the docker group), then ARG...
+docker_words() {
+    local fn="$1"
+    shift
+    if [ "$DOCKER_SUDO" = 1 ]; then
+        "$fn" sudo docker "$@"
+    else
+        "$fn" docker "$@"
+    fi
+}
+
+ck_searxng() {
+    local names rc line
+    if [ "$NO_SEARXNG" = 1 ]; then
+        CK_RESULT=skip
+        CK_DETAIL='disabled by --no-searxng'
+        return
+    fi
+    t_searxng
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    if [ "$SEARXNG_URL" != "$SEARXNG_URL_DEFAULT" ]; then
+        CK_FIXLINE="check that $SEARXNG_URL is up and that no_proxy covers its host; if this host cannot run SearXNG, set QWEN_AGENT_SEARXNG_URL with the systemd drop-in described in R0 of the fleet spec"
+        return
+    fi
+    DOCKER_SUDO=0
+    if [ "$OS" = linux ]; then
+        case " $(id -nG 2>/dev/null) " in
+            *' docker '*) ;;
+            *) DOCKER_SUDO=1 ;;
+        esac
+    fi
+    if [ "$APPLY" != 1 ]; then
+        CK_FIXLINE="$(docker_words render start "$SEARXNG_CONTAINER") if that container exists, else: $(render mkdir -p "$SX") && $(render cp "$WS/searxng/docker-compose.yml" "$WS/searxng/settings.yml" "$SX/") && $(docker_words render compose -p "$SEARXNG_CONTAINER" -f "$SX/docker-compose.yml" up -d) (or re-run with --apply)"
+        return
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        CK_DETAIL="$CK_DETAIL; Docker not installed (this script never installs Docker)"
+        CK_FIXLINE='install Docker, or use another SearXNG instance through QWEN_AGENT_SEARXNG_URL (fleet spec R0), then re-run'
+        return
+    fi
+    if [ "$DOCKER_SUDO" = 1 ]; then
+        names=$(sudo -n docker ps -a --format '{{.Names}}' 2>/dev/null)
+        rc=$?
+    else
+        names=$(docker ps -a --format '{{.Names}}' 2>/dev/null)
+        rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="$CK_DETAIL; 'docker ps -a' failed (exit $rc): is the Docker daemon running?"
+        CK_FIXLINE='start Docker, then re-run'
+        return
+    fi
+    SX_START=0
+    while IFS= read -r line; do
+        if [ "$line" = "$SEARXNG_CONTAINER" ]; then
+            SX_START=1
+        fi
+    done <<<"$names"
+    set_fix fix_searxng
+    CK_POLLS=30
+    CK_SLEEP=1
+}
+
+# The stable directory SX keeps the bind-mounted settings.yml alive across
+# reboots (spec P14): never a temporary clone or a release directory.
+fix_searxng() {
+    if [ "$SX_START" = 1 ]; then
+        docker_words step start "$SEARXNG_CONTAINER"
+        return
+    fi
+    step mkdir -p "$SX" || return
+    step cp "$WS/searxng/docker-compose.yml" "$WS/searxng/settings.yml" "$SX/" || return
+    docker_words step compose -p "$SEARXNG_CONTAINER" -f "$SX/docker-compose.yml" up -d
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing (P5)
 # ---------------------------------------------------------------------------
 
@@ -588,6 +771,8 @@ if [ -z "$OS" ]; then
 fi
 run_check packages
 run_check clock
+run_check model
+run_check searxng
 
 # ---------------------------------------------------------------------------
 # Summary (P10) and exit status (P11)

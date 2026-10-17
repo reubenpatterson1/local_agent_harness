@@ -823,3 +823,267 @@ def test_h20c_linux_without_timedatectl():
     assert r.fix_after("clock") == "  fix: enable NTP time synchronization on this host by hand, then re-run"
     assert r.named("sudo", "timedatectl") == []
     assert r.rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 5: model and searxng (H9, H10, H13, H15, H26 lines, Review Focus 1, 2, 4, 5)
+# ---------------------------------------------------------------------------
+
+OLLAMA_PROBE = "http://127.0.0.1:11434/api/tags"
+VLLM_PROBE = "http://127.0.0.1:8177/v1/models"
+SEARXNG_DEFAULT = "http://127.0.0.1:8888/"
+
+
+def shown(word):
+    """A path as the script prints it in + and fix: lines (P10)."""
+    return "'%s'" % word if " " in word else word
+
+
+def model_curls(r):
+    return [c for c in r.named("curl") if "-w" in c["argv"] and "-o" not in c["argv"]]
+
+
+def searxng_curls(r):
+    return [c for c in r.named("curl") if "-o" in c["argv"]]
+
+
+def compose_plus_lines(r, docker="docker"):
+    sx = r.sx
+    return ["+ mkdir -p %s" % shown(sx),
+            "+ cp %s %s %s" % (shown(WS + "/searxng/docker-compose.yml"), shown(WS + "/searxng/settings.yml"),
+                               shown(sx + "/")),
+            "+ %s compose -p qwen-agent-searxng -f %s up -d" % (docker, shown(sx + "/docker-compose.yml"))]
+
+
+def assert_searxng_copied(r):
+    for name in ("docker-compose.yml", "settings.yml"):
+        with open(os.path.join(WS, "searxng", name), "rb") as f:
+            want = f.read()
+        with open(os.path.join(r.sx, name), "rb") as f:
+            assert f.read() == want, name
+
+
+def test_h15a_model_probe_urls_come_from_fleet_lib():
+    r = run(LINUX_ARGS)
+    assert [c["argv"][-1] for c in model_curls(r)] == [OLLAMA_PROBE]
+    assert r.status("model") == "PASS model: 'qwen3.5:9b' served by ollama at " + OLLAMA_PROBE
+    r = run(MAC_ARGS, mac_state(), MAC_ABSENT)
+    assert [c["argv"][-1] for c in model_curls(r)] == [VLLM_PROBE]
+    assert r.status("model") == "PASS model: 'qwen38-6bit' served by vllm at " + VLLM_PROBE
+    r = run(LINUX_ARGS + ["--model-url", "http://127.0.0.1:11434"])
+    assert [c["argv"][-1] for c in model_curls(r)] == [OLLAMA_PROBE]
+    assert r.rc == 0
+
+
+def test_model_missing_check_mode():
+    r = run(LINUX_ARGS, linux_state(model="missing"))
+    assert r.status("model") == ("FAIL model: 'qwen3.5:9b' not served by ollama at %s "
+                                 "(serving: other-model:1b)" % OLLAMA_PROBE)
+    assert r.fix_after("model") == "  fix: ollama pull qwen3.5:9b"
+    assert r.named("ollama") == []
+    assert r.rc == 1
+
+
+def test_model_pull_streams_and_rechecks():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(model="missing"))
+    fixed = "FIXED model: 'qwen3.5:9b' served by ollama at " + OLLAMA_PROBE
+    assert plus_lines(r.out) == ["+ ollama pull qwen3.5:9b"]
+    assert r.lines.index("+ ollama pull qwen3.5:9b") < r.lines.index("pulling manifest") < r.lines.index(fixed)
+    assert len(model_curls(r)) == 2
+    assert r.rc == 0
+
+
+def test_h15c_model_server_down_is_never_pulled():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(model="down"))
+    assert r.status("model") == "FAIL model: ollama not reachable at %s (curl exit 7)" % OLLAMA_PROBE
+    assert r.fix_after("model") == ("  fix: start the ollama model server at http://127.0.0.1:11434/v1; "
+                                    "this script never starts model servers")
+    assert r.named("ollama") == []
+    assert r.rc == 1
+
+
+def test_h15d_ollama_cli_absent():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(model="missing"), LINUX_ABSENT | {"ollama"})
+    assert r.status("model").startswith("FAIL model: 'qwen3.5:9b' not served by ollama")
+    assert r.fix_after("model") == ("  fix: the ollama CLI is not on PATH; pull 'qwen3.5:9b' by hand "
+                                    "(this script never installs Ollama)")
+    assert r.rc == 1
+
+
+def test_h15e_custom_ollama_url_is_never_pulled():
+    r = run(LINUX_ARGS + ["--apply", "--model-url", "http://127.0.0.1:11500/v1"],
+            linux_state(model="missing"))
+    assert r.status("model") == ("FAIL model: 'qwen3.5:9b' not served by ollama at "
+                                 "http://127.0.0.1:11500/api/tags (serving: other-model:1b)")
+    assert r.fix_after("model") == "  fix: pull 'qwen3.5:9b' into the Ollama server at http://127.0.0.1:11500/v1 by hand"
+    assert r.named("ollama") == []
+    assert r.rc == 1
+
+
+def test_h15f_pull_failure():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(model="missing", fix={"model": "exit:1"}))
+    assert r.status("model") == ("FAIL model: 'qwen3.5:9b' not served by ollama at %s "
+                                 "(serving: other-model:1b) (fix exited 1)" % OLLAMA_PROBE)
+    assert r.fix_after("model") == "  fix: ollama pull qwen3.5:9b"
+    assert r.rc == 1
+
+
+def test_h15g_python3_absent():
+    r = run(LINUX_ARGS, linux_state(), LINUX_ABSENT | {"python3"})
+    assert r.status("model") == "FAIL model: python3 cannot load fleet_lib from " + WS
+    assert r.fix_after("model") == ("  fix: needs python3 >= 3.9 (see packages) and %s/fleet_lib.py "
+                                    "from a complete checkout" % WS)
+    assert model_curls(r) == []
+    assert r.rc == 1
+
+
+def test_h10_vllm_missing_model_is_never_fixed():
+    r = run(MAC_ARGS + ["--apply"], mac_state(model="missing"), MAC_ABSENT)
+    assert r.status("model") == ("FAIL model: 'qwen38-6bit' not served by vllm at %s "
+                                 "(serving: other-model:1b)" % VLLM_PROBE)
+    assert r.fix_after("model") == ("  fix: start vllm-metal serving 'qwen38-6bit' at http://127.0.0.1:8177/v1 "
+                                    "by hand; this script never starts, restarts or pulls for vLLM")
+    assert r.named("ollama") == [] and r.named("docker") == []
+    assert r.rc == 1
+
+
+def test_searxng_check_mode_fix_line_runs_no_docker():
+    for groups, d in (("tester docker", "docker"), ("tester", "sudo docker")):
+        r = run(LINUX_ARGS, linux_state(searxng="down", groups=groups))
+        assert r.status("searxng") == "FAIL searxng: no answer at %s (curl exit 7)" % SEARXNG_DEFAULT
+        sx = r.sx
+        assert r.fix_after("searxng") == (
+            "  fix: %s start qwen-agent-searxng if that container exists, else: mkdir -p %s && cp %s %s %s && "
+            "%s compose -p qwen-agent-searxng -f %s up -d (or re-run with --apply)"
+            % (d, shown(sx), shown(WS + "/searxng/docker-compose.yml"), shown(WS + "/searxng/settings.yml"),
+               shown(sx + "/"), d, shown(sx + "/docker-compose.yml")))
+        assert r.named("docker") == [] and mutating(r.calls()) == []
+        assert not os.path.exists(r.sx)
+        assert r.rc == 1
+
+
+def test_h9a_compose_in_docker_group():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down"))
+    assert plus_lines(r.out) == compose_plus_lines(r)
+    assert r.named("docker", "ps") != [] and r.named("sudo", "-n", "docker") == []
+    assert [c["rc"] for c in r.named("docker", "compose")] == [0]
+    assert r.status("searxng") == "FIXED searxng: HTTP 200 at " + SEARXNG_DEFAULT
+    assert_searxng_copied(r)
+    assert r.rc == 0
+
+
+def test_h9b_compose_outside_docker_group_uses_sudo():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down", groups="tester"))
+    assert ["-n", "docker", "ps", "-a", "--format", "{{.Names}}"] in [c["argv"] for c in r.named("sudo")]
+    assert plus_lines(r.out) == compose_plus_lines(r, "sudo docker")
+    assert r.status("searxng") == "FIXED searxng: HTTP 200 at " + SEARXNG_DEFAULT
+    assert r.rc == 0
+
+
+def test_h9c_existing_container_is_started():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down", containers=["qwen-agent-searxng"]))
+    assert plus_lines(r.out) == ["+ docker start qwen-agent-searxng"]
+    assert r.named("docker", "compose") == []
+    assert not os.path.exists(r.sx)
+    assert r.status("searxng") == "FIXED searxng: HTTP 200 at " + SEARXNG_DEFAULT
+    assert r.rc == 0
+
+
+def test_h9d_docker_absent():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down"), LINUX_ABSENT | {"docker"})
+    assert r.status("searxng") == ("FAIL searxng: no answer at %s (curl exit 7); Docker not installed "
+                                   "(this script never installs Docker)" % SEARXNG_DEFAULT)
+    assert r.fix_after("searxng") == ("  fix: install Docker, or use another SearXNG instance through "
+                                      "QWEN_AGENT_SEARXNG_URL (fleet spec R0), then re-run")
+    assert r.named("docker") == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h9e_searxng_poll_waits_for_the_container():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down", lag={"searxng": 5}))
+    assert r.status("searxng") == "FIXED searxng: HTTP 200 at " + SEARXNG_DEFAULT
+    assert len(r.named("sleep", "1")) == 5
+    assert r.rc == 0
+
+
+def test_h9f_searxng_poll_gives_up_after_30_probes():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down", fix={"searxng": "noop"}))
+    assert r.status("searxng") == ("FAIL searxng: no answer at %s (curl exit 7) (fix did not take)"
+                                   % SEARXNG_DEFAULT)
+    assert r.fix_after("searxng") == "  fix: " + " && ".join(l[2:] for l in compose_plus_lines(r))
+    assert len(searxng_curls(r)) == 31
+    assert len(r.named("sleep", "1")) == 29
+    assert r.rc == 1
+
+
+def test_h9g_docker_ps_failure():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down", docker_ps_exit=1))
+    assert r.status("searxng") == ("FAIL searxng: no answer at %s (curl exit 7); 'docker ps -a' failed "
+                                   "(exit 1): is the Docker daemon running?" % SEARXNG_DEFAULT)
+    assert r.fix_after("searxng") == "  fix: start Docker, then re-run"
+    assert r.named("docker", "compose") == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h13_custom_searxng_url_runs_no_docker():
+    r = run(LINUX_ARGS + ["--apply", "--searxng-url", "http://127.0.0.1:9999/"],
+            linux_state(searxng="down"))
+    assert r.status("searxng") == "FAIL searxng: no answer at http://127.0.0.1:9999/ (curl exit 7)"
+    fix = r.fix_after("searxng")
+    assert "QWEN_AGENT_SEARXNG_URL" in fix and "no_proxy" in fix
+    assert fix == ("  fix: check that http://127.0.0.1:9999/ is up and that no_proxy covers its host; if this "
+                   "host cannot run SearXNG, set QWEN_AGENT_SEARXNG_URL with the systemd drop-in described "
+                   "in R0 of the fleet spec")
+    assert r.named("docker") == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h26_no_searxng_skips_the_check():
+    for extra in ([], ["--apply"]):
+        r = run(LINUX_ARGS + ["--no-searxng"] + extra, linux_state(searxng="down"))
+        assert r.status("searxng") == "SKIP searxng: disabled by --no-searxng"
+        assert searxng_curls(r) == [] and len(model_curls(r)) == 1
+        assert r.named("docker") == [] and plus_lines(r.out) == []
+        assert not os.path.exists(r.sx)
+        assert r.rc == 0
+
+
+def test_review_focus_2_relative_invocation_from_another_directory():
+    # R0 on .168: cd into the clone and run the script by a relative path.
+    rel = os.path.join(os.path.basename(WS), "scripts", "fleet-host-prep.sh")
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down"),
+            cwd=os.path.dirname(WS), script=rel)
+    assert r.status("model") == "PASS model: 'qwen3.5:9b' served by ollama at " + OLLAMA_PROBE
+    assert plus_lines(r.out) == compose_plus_lines(r)
+    assert_searxng_copied(r)
+    assert r.rc == 0
+
+
+def test_review_focus_5_home_with_a_space():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(searxng="down"), home_name="home dir")
+    assert " " in r.sx
+    assert plus_lines(r.out) == compose_plus_lines(r)
+    assert plus_lines(r.out)[0] == "+ mkdir -p '%s'" % r.sx
+    assert r.status("searxng") == "FIXED searxng: HTTP 200 at " + SEARXNG_DEFAULT
+    assert_searxng_copied(r)
+    assert r.rc == 0
+
+
+def test_review_focus_1_hugging_face_model_id():
+    name = "DreamFast/Qwen3-VL-4b-Heretic"
+    r = run(["--model-server-type", "vllm", "--model", name, "--no-searxng"],
+            mac_state(model_name=name), MAC_ABSENT)
+    assert r.status("model") == "PASS model: '%s' served by vllm at %s" % (name, VLLM_PROBE)
+    assert r.status("searxng") == "SKIP searxng: disabled by --no-searxng"
+    assert r.rc == 0
+
+
+def test_review_focus_4_model_url_answering_404():
+    # A vLLM --model-url without /v1 probes /models, which vLLM answers with 404.
+    r = run(MAC_ARGS + ["--apply", "--model-url", "http://127.0.0.1:8177"],
+            mac_state(model_code=404), MAC_ABSENT)
+    assert r.status("model") == "FAIL model: vllm not reachable at http://127.0.0.1:8177/models (HTTP 404)"
+    assert r.fix_after("model") == ("  fix: start the vllm model server at http://127.0.0.1:8177; "
+                                    "this script never starts model servers")
+    assert plus_lines(r.out) == []
+    assert r.rc == 1
