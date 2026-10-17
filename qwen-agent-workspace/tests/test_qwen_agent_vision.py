@@ -580,3 +580,23 @@ def test_vision_focus_3_symlink_out_of_the_workspace_is_never_read(qa, monkeypat
         assert reads == [] and daemon.requests == [] and _FakeProc.calls == []
     finally:
         daemon.close()
+
+
+def test_vk5_vision_child_stderr_omits_server_error_body(qa, monkeypatch, capsys):
+    sentinel = "SENTINEL_TASK_TEXT data:image/png;base64,QUJD"
+
+    def fake_urlopen(req, timeout=None):
+        raise qa.urllib.error.HTTPError("http://x/v1", 500, "boom", {}, io.BytesIO(sentinel.encode("utf-8")))
+
+    monkeypatch.setattr(qa.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(qa, "CONTEXT_WINDOW", 16384)
+    for skill, leaks in (("vision", False), ("analyst", True)):
+        args_ns = types.SimpleNamespace(base_url="http://x/v1", model="m", think=False, max_tokens=10,
+                                        temperature=None, request_timeout=5, api_key=None,
+                                        max_rounds=3, skill=skill, model_server_type="vllm")
+        messages = [{"role": "user", "content": "hi"}]
+        result = qa.run_turn(messages, args_ns, 0)
+        err = capsys.readouterr().err
+        assert result["status"] == "http_error", result
+        assert "[server error" in err
+        assert (sentinel in err) is leaks, (skill, err)

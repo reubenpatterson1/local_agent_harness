@@ -3501,7 +3501,7 @@ def _forced_summary(messages, args_ns, round_num, records, status, error, args_t
             return _turn_result("context_length", None, round_num, records,
                                 "context full: the conversation exceeds the server's "
                                 "context window")
-        sys.stderr.write("[server error %s] %s\n" % (code, err_body[:1000]))
+        sys.stderr.write("[server error %s] %s\n" % (code, "" if _skill_has_no_tools(args_ns) else err_body[:1000]))
         return _turn_result("http_error", None, round_num, records,
                             "server error %s: %s" % (code, err_body[:1000]))
     except (urllib.error.URLError, OSError) as e:
@@ -3627,7 +3627,7 @@ def run_turn(messages, args_ns, snapshot):
                 # user is about to /reset away, and writing nothing loses it for good.
                 discarded = messages[snapshot:]
             else:
-                sys.stderr.write("[server error %s] %s\n" % (code, err_body[:1000]))
+                sys.stderr.write("[server error %s] %s\n" % (code, "" if _skill_has_no_tools(args_ns) else err_body[:1000]))
                 status = "http_error"
                 error = "server error %s: %s" % (code, err_body[:1000])
             del messages[snapshot:]

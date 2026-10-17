@@ -447,7 +447,7 @@ def test_vt27_unsigned_peer_503_is_busy_and_413_is_peer_error(tmp_path):
 
 def _vision_round_trip(tmp_path):
     """alpha (no skills) and bravo (vision, the real bin/qwen-agent child); the real
-    harness on alpha's stub delegates a.png and b.jpg to vision -> (fleet, proc, caller home)."""
+    harness on alpha's stub delegates a.png and b.jpg to vision -> (fleet, proc)."""
     fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), skills={"bravo": ["vision"]},
                       stub_kwargs={"alpha": {"delegate_skill": "vision",
                                              "delegate_images": ["a.png", "b.jpg"]}}).start()
@@ -515,4 +515,6 @@ def test_vt26_no_image_bytes_task_text_or_secret_reaches_any_log(tmp_path):
     for blob in blobs:
         for needle in needles:
             assert needle not in blob, needle[:40]
+    image_bytes = len(ftu.PNG_BYTES) + len(ftu.JPEG_BYTES)
+    assert any(b"images=2 image_bytes=%d" % image_bytes in blob for blob in blobs)
     assert os.listdir(_agent_tmp(fleet.homes["bravo"], "bravo")) == []
