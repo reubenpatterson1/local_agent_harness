@@ -1,7 +1,7 @@
 # ltx-movie -- Design Spec (robust story generation and the LoRA catalog, piece E)
 
 Date: 2026-10-17
-Status: The user approved every design decision of piece E on 2026-10-17: Section 1 (the principle "the model writes small scoped pieces, code does structure"; the six stages PLAN, PANELS, CHECKS, CRITIC, GATE, REVIEW; `--story-legacy`), Section 2 (the check table, the critic JSON, the patch rules, the round controller and its budgets, and the hard-fail answer: stop for hand-editing, exit 2), Section 3 (the versioned LoRA catalog, `bin/lora-catalog`, per-panel selection), Section 4 (the test plan, the live protocol, the rollout), and the scheduling (piece D first, then E). This document writes those decisions down precisely enough to implement without reopening any. Every value they left open is marked **[spec choice]** with a one-line reason; Section 9 collects them. Section 11 lists the questions only the user can answer; none blocks implementation.
+Status: The user approved every design decision of piece E on 2026-10-17: Section 1 (the principle "the model writes small scoped pieces, code does structure"; the six stages PLAN, PANELS, CHECKS, CRITIC, GATE, REVIEW; `--story-legacy`), Section 2 (the check table, the critic JSON, the patch rules, the round controller and its budgets, and the hard-fail answer: stop for hand-editing, exit 2), Section 3 (the versioned LoRA catalog, `bin/lora-catalog`, per-panel selection), Section 4 (the test plan, the live protocol, the rollout), and the scheduling (piece D first, then E). This document writes those decisions down precisely enough to implement without reopening any. Every value they left open is marked **[spec choice]** with a one-line reason; Section 9 collects them. The user answered the three open questions of the first draft on 2026-10-17 (fallback sisters_sorrow premise, preference bar of at least 5 of 8, declared-only casting); Section 11 records the answers.
 
 Repository: `/Users/reubenpatterson/local_agent_harness`, branch `qwen-agent-redteam`. `WS` is `qwen-agent-workspace/`; every relative path is relative to `WS`. Line numbers cite the tree at commit `1b651da`. `bin/qwen-agent` is being edited by piece D while this spec is written, so its citations name functions and give approximate lines (`~`).
 
@@ -70,7 +70,7 @@ Phase 1 of `bin/ltx-movie` today sends one large prompt per mode and asks a 27B 
 | G9 | `bin/iterate-story` | deprecated wrapper |
 | G10 | `scripts/deploy/build_pkg.py` | `PIPELINE_FILES` gains `story_engine.py`, `lora_catalog.py` |
 | G11 | `tests/story_engine_testutil.py` (new) | fake agent / fake judge executables, temp workspace builder, fake fleet |
-| G12 | `tests/test_story_engine.py` (new) | RST1-RST54, RST60-RST63 |
+| G12 | `tests/test_story_engine.py` (new) | RST1-RST58, RST60-RST63 |
 | G13 | `tests/test_lora_catalog.py` (new) | LCT1-LCT30 |
 | G14 | existing tests | the edits of Section 5.5 only |
 
@@ -80,7 +80,7 @@ Phase 1 of `bin/ltx-movie` today sends one large prompt per mode and asks a 27B 
 
 - Changing S1-S12, `character_lib.py`, the legacy templates, or the legacy Phase 1 code path (it stays byte-identical under `--story-legacy`).
 - Calling a model server directly (every model call is a `bin/qwen-agent` subprocess).
-- Auto-casting library characters (characters are cast only by `--character`; Section 10, RSC4).
+- Auto-casting library characters: forbidden, not merely out of scope (RS37).
 - Per-panel style LoRAs, per-panel stills LoRAs, more than one catalog stills LoRA.
 - Training LoRAs; downloading LoRAs; editing the character `.triggers` registry from `bin/lora-catalog`.
 - Images for the critic; tracing propagation from `bin/ltx-movie`.
@@ -95,11 +95,11 @@ Phase 1 of `bin/ltx-movie` today sends one large prompt per mode and asks a 27B 
 | RSK3 | Standard library only in `story_engine.py`, `lora_catalog.py`, `bin/lora-catalog`. Every touched file keeps its existing import constraints: `bin/ltx-movie` adds no top-level import; `bin/ltx-story-manifest` keeps stdlib + Pillow; `bin/ltx-mlx-render` adds no import; `bin/judge-story` adds no import; `bin/ltx-story-images` adds no top-level import. | RST62 |
 | RSK4 | Tests never use the real `HOME`, never read or write the real `generated/loras/catalog.json` or `generated/characters/`, never render video, never contact a real model server, daemon or the Anthropic API. | review of RST/LCT; RST63 |
 | RSK5 | `--story-legacy` reproduces today's Phase 1 prompt and `bin/qwen-agent` argv byte for byte, and today's default dry-run output byte for byte (the existing golden `tests/fixtures/casting_baseline/ltx_movie_dry_run.txt`). | RST40, RST41 |
-| RSK6 | Live: the Section 7.3 pass bar on the eight premises, and the Section 7.4 LoRA A/B. | RSR1-RSR3 |
+| RSK6 | Live: the Section 7.3 pass bar on the eight premises (RSR1, RSR2, RSR4), and the Section 7.4 LoRA A/B (RSR3). | RSR1-RSR4 |
 
 ### 0.6 Must-have vs nice-to-have
 
-Every requirement RS1-RS36 and LC1-LC20 is a must-have. Nothing else is built.
+Every requirement RS1-RS37 and LC1-LC20 is a must-have. Nothing else is built.
 
 ---
 
@@ -436,7 +436,7 @@ Fragments:
   - no_stills: `every panel is a separate @@SECONDS@@-second shot rendered from text alone, joined to the next panel by a hard cut. Nothing carries over between panels except what the text states.`
   - shots: `it is a sequence of separate shots joined by cuts, @@SECONDS@@ seconds each. Every panel is one shot that starts from its own still picture. One beat is one action: a fight or a chase takes several beats.`
 - `@@SEED_PARAGRAPH@@`: `""` unless `ctx.seed_agent_image`; then `An image is attached to this message. It IS the first frame of this movie. Describe every person it shows faithfully in cast -- each one's apparent age group, build, skin tone, hair, clothing and accessories as actually visible -- invent no person who is not visible, and make beat 1 start from the exact scene it shows.` followed by `"\n\n"`.
-- `@@CAST_FIXED@@`: `""` when `ctx.members` is empty; else ` The following characters are already cast; list them first in cast with exactly these ids, phrases and descriptors, and give your own characters the next ids:` followed, per member in `ctx.members` order (i from 1), by `\n- id c<i>, phrase "<phrase>", descriptor "<descriptor>"`.
+- `@@CAST_FIXED@@`: the RS37 reserved sentence (possibly empty) followed by: `""` when `ctx.members` is empty; else ` The following characters are already cast; list them first in cast with exactly these ids, phrases and descriptors, and give your own characters the next ids:` followed, per member in `ctx.members` order (i from 1), by `\n- id c<i>, phrase "<phrase>", descriptor "<descriptor>"`.
 - `@@ARC_RULE@@`: N >= 3: `the first beat is introduction, the last is resolution, and at least one beat is climax.`; N == 2: `the first beat is introduction and the last is resolution.`; N == 1: `use climax.`
 - `@@SHOT_LIST@@`: `", ".join(SHOT_TYPES)`; `@@CAMERA_LIST@@`: `", ".join(key for key, _ in CAMERA_SENTENCES)`.
 - `@@LORA_PARAGRAPH@@`: when `not ctx.auto_lora` or `compatible` is empty: `an object with the keys global, per_beat and stills, each empty: global and stills are empty lists and per_beat is an empty object.` Otherwise:
@@ -485,6 +485,7 @@ On a parsed object `raw`, `normalize_plan(ctx, raw)` builds the plan dict of Sec
 | P10 | word budget | hard | for every pasted field of the beat (RS14), `hi - pasted_words >= MIN_WRITER_WORDS[field kind]` | `beat K: P10 word budget: Image: the pasted sentences take W of its LO-HI words, leaving fewer than M for the writer` |
 | P11 | location change | advisory, chained | beat K's location differs from beat K-1's | `beat K: P11 location change: moves from l1 to l2 with no cut; the action must carry the characters there` |
 | P12 | new character | advisory, chained, K >= 2 | a cast id of beat K is not in beat 1's cast | `beat K: P12 new character: c3 is not in the opening frame; their look is left to the video model` |
+| P13 | undeclared character | hard | RS37: no plan text references an undeclared library character | `plan: P13 undeclared character: <where> names library character <name> by its <kind> '<text>'; library characters appear only when declared with --character <name>` |
 
 P3-P12 run only on entries that passed P2 for the fields they read.
 
@@ -619,6 +620,7 @@ Sections are separated by one blank line. The dash is U+2014. A field whose asse
 | N12 | one action | advisory | chained Motion writer text | no `_CHAIN_WORD_RE`, `;` or `_COMMA_AND_RE` match | `panel K: N12 one action: Motion: chains actions with 'then'` |
 | N13 | repeat | advisory | consecutive panels' action writer text (chained/shots `motion`, no_stills `prompt`) | Jaccard similarity of their word sets (lowercased `_WORD_RE` words of length >= 3, minus every word of every plan phrase) is below `REPEAT_JACCARD` | `panel K: N13 repeat: Motion: repeats panel K-1's action (similarity 0.71)` (two decimals) |
 | N14 | narration form | advisory | Narration | exactly one sentence (`_SENTENCE_SPLIT_RE`) and `NARRATION_WORDS` words | `panel K: N14 narration form: Narration: is 2 sentences / is W words; it should be one sentence of 3-30 words` |
+| N15 | undeclared character | hard | panel title and every assembled field (Image/Motion/Prompt/Narration) | RS37: no reference to an undeclared library character | `panel K: N15 undeclared character: <Label>: names library character <name> by its <kind> '<text>'; library characters appear only when declared with --character <name>` (`<Label>` is `Title`, `Image`, `Motion`, `Prompt` or `Narration`) |
 
 Each check reports at most one violation per panel per field (the first match).
 
@@ -806,9 +808,9 @@ story.md, plan.json and story_checks.json are saved in <story_dir>. Hand-edit st
 
 When the robust engine is selected and `story.md` exists without `--force-story`, `_phase1_robust` prints `note: %s already exists; re-checking it instead of regenerating it (pass --force-story to regenerate)` and calls `story_engine.recheck(ctx)`:
 
-- With `<story_dir>/plan.json` present and valid JSON with `schema == PLAN_SCHEMA`, `mode == ctx.mode` and `panels == N`: hard = `bin/ltx-movie`'s legacy structural violations for the mode (`_validate_story_md(story_md, N, no_stills)` for chained/no_stills; nothing extra for shots), plus N1, N2, N3, N4 (applied to the whole field text, since writer parts are unknown), N7, N8, N9, N10 (`PLACEHOLDER_RE` and `COPIED_EXAMPLES` on field text), N11, plus (shots) S1-S12; plus L1-L7 when `ctx.auto_lora`; advisory = N12, N13 (whole Motion/Prompt text), N14, (shots) W2, L4 advisory. P1-P12, N5 and N6 are not re-run **[spec choice: they validate generation; a hand-edited story.md is not re-derived from the plan, and requiring plan.json edits for a setting-sentence fix would be hostile]**. `_validate_story_md` is passed in by the caller as a function argument (`recheck(ctx, legacy_validate)`).
+- With `<story_dir>/plan.json` present and valid JSON with `schema == PLAN_SCHEMA`, `mode == ctx.mode` and `panels == N`: hard = `bin/ltx-movie`'s legacy structural violations for the mode (`_validate_story_md(story_md, N, no_stills)` for chained/no_stills; nothing extra for shots), plus N1, N2, N3, N4 (applied to the whole field text, since writer parts are unknown), N7, N8, N9, N10 (`PLACEHOLDER_RE` and `COPIED_EXAMPLES` on field text), N11, N15, plus (shots) S1-S12; plus L1-L7 when `ctx.auto_lora`; advisory = N12, N13 (whole Motion/Prompt text), N14, (shots) W2, L4 advisory. P1-P12, N5 and N6 are not re-run **[spec choice: they validate generation; a hand-edited story.md is not re-derived from the plan, and requiring plan.json edits for a setting-sentence fix would be hostile]**. `_validate_story_md` is passed in by the caller as a function argument (`recheck(ctx, legacy_validate)`).
 - With `plan.json` absent, unreadable, or for another mode/panel count: exactly today's validators -- chained/no_stills `_validate_story_md` (any violation -> the legacy message of `:1076-1082` and **exit 1**, as today), shots `character_lib.shots_violations`/`shots_advisories` (any -> the legacy message of `:1196-1201`, exit 2) **[spec choice: a story.md written before this feature must not start failing on new rules]**.
-- `plan_free_report(story_md, mode, panels, members, legacy_validate)` (public; used by 7.2 and RST45) returns the hard list a re-check computes **without** a plan: `legacy_validate(story_md, panels, mode == "no_stills")` for chained/no_stills, N1 (field text), N7, N8 (not shots), N9, N10 (field text), N11, and (shots) `character_lib.shots_violations`. It prints nothing and writes nothing. N2, N3 and N4 are left out because they need the plan's referring phrases (a phrase such as "the woman in grey" would otherwise trip N3).
+- `plan_free_report(story_md, mode, panels, members, legacy_validate)` (public; used by 7.2 and RST45) returns the hard list a re-check computes **without** a plan: `legacy_validate(story_md, panels, mode == "no_stills")` for chained/no_stills, N1 (field text), N7, N8 (not shots), N9, N10 (field text), N11, N15 (with `members`), and (shots) `character_lib.shots_violations`. It prints nothing and writes nothing. N2, N3 and N4 are left out because they need the plan's referring phrases (a phrase such as "the woman in grey" would otherwise trip N3).
 - With plan.json: any hard violation -> `Error: story.md fails the story checks:` + `  - <message>` lines + `Hand-edit <story.md> to fix the violations above and rerun, or pass --force-story to regenerate it.` -> exit 2. `story_checks.json` is written with `source: "recheck"` in both outcomes.
 
 ### RS29. Review gate
@@ -876,6 +878,14 @@ New code in `bin/ltx-movie` adds **no** occurrence of: `["--model", args.story_m
 
 `bin/ltx-movie`'s module docstring gains one paragraph after the "Shots mode" paragraph: `Story engine (docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md): by default Phase 1 asks the story model for a JSON plan and then one panel at a time, assembles story.md itself, runs deterministic checks and up to three local critic rounds (the fleet analyst skill), and exits 2 with story.md, plan.json and story_checks.json saved when hard violations remain; a rerun re-checks the existing story.md. --judge adds bin/judge-story --patches as a final gate; --story-legacy restores the single-prompt path. The plan may pick catalog LoRAs (bin/lora-catalog), which Phases 2 and 3 apply per panel; --no-auto-lora turns that off.` The sentence "character_lib.py is loaded by path only when casting or --shots is used, so an uncast run without --shots never reads it" (`:83-84`) gains: `-- on the --story-legacy path and in every dry run; the default story engine loads it for its checks.`
 
+### RS37. Library characters are declared only (never auto-cast)
+
+- Using a library character is a declared action: a character from `character_lib.library_dir()` appears in a story only when the user passes `--character NAME` (or `--cast PHRASE=NAME` on an existing story). No stage -- planner, panel writer, critic, judge patch, LoRA selection -- may introduce one. The catalog never offers characters to the planner (LC5), no patch field can add one (RS20), and P13/N15 reject any that slips in.
+- `library_identities(ws)` (in `story_engine.py`, stdlib, **without** loading `character_lib.py`, so dry runs stay character_lib-free): the library root is `$CHARACTER_LIBRARY_DIR` else `<ws>/generated/characters`; for every subdirectory whose `character.json` parses as an object with string `name`, `trigger` and `referring_phrase`, one `(name, trigger, referring_phrase)` tuple, sorted by name, regardless of status. Unreadable files are skipped silently. **Undeclared** = every tuple whose name is not the name of a member of `ctx.members`.
+- Reference kinds, tested in this order per character and per text, first hit reported: `referring phrase` (`character_lib.phrase_occurs(text, phrase)`, or exact case-insensitive equality for a cast entry's phrase), `trigger`, `name` (each `re.compile(r"(?<![\w-])" + re.escape(x) + r"(?![\w-])", re.IGNORECASE)`). `<text>` is the matched substring as it appears.
+- **P13** (plan) scans, in this order, with these `<where>` labels: each cast entry without `cast_name` -- `cN's phrase`, `cN's descriptor`; `the title`; `the logline`; each location -- `lN's setting`; each prop -- `pN's name`; each beat -- `beat K's action`. **N15** (panels) scans each panel's title and assembled fields; identity sentences of declared members are never flagged because declared members are excluded. Both are hard; P13 triggers the plan repair call (RS8) and both are listed to the critic like every other hard violation.
+- Plan prompt fragment (prepended inside `@@CAST_FIXED@@`): when the undeclared list is non-empty, ` Never use these names or referring phrases, which belong to characters who are not in this movie: ` + `", ".join('%s ("%s")' % (name, phrase) for each undeclared tuple)` + `.`; else `""`. Panel prompts carry the same sentence on its own line after `@@CAST_PHRASES@@`'s line, prefixed `Characters who are not in this movie, never to be named: ` and listing the same items, when non-empty. The sentences contain no braces.
+
 ---
 
 ## 4. LoRA catalog requirements (normative)
@@ -918,7 +928,7 @@ Section 2.7. `bin/lora-catalog` creates the directory (`os.makedirs(..., exist_o
 
 ### LC5. Folded characters
 
-`fold_characters(ws)` -> list of read-only pseudo-entries, one per `character_lib.list_names()` character whose `load_character` succeeds and whose `loras.video` is set: `{"id": "char:<name>", "kind": "character", "path": video.path, "sha256": video.sha256, "bytes": None, "base_models": [video.base_model], "target": "video", "triggers": [trigger], "rank": video.rank, "alpha": video.alpha, "default_strength": strength or 0.8, "strength_range": None, "description": descriptor, "use_when": "cast with bin/ltx-movie --character <name>", "avoid_when": ""}`. Never written to `catalog.json`. Never offered to the planner (RS7 shows catalog entries only): characters are cast only with `--character`.
+`fold_characters(ws)` -> list of read-only pseudo-entries, one per `character_lib.list_names()` character whose `load_character` succeeds and whose `loras.video` is set: `{"id": "char:<name>", "kind": "character", "path": video.path, "sha256": video.sha256, "bytes": None, "base_models": [video.base_model], "target": "video", "triggers": [trigger], "rank": video.rank, "alpha": video.alpha, "default_strength": strength or 0.8, "strength_range": None, "description": descriptor, "use_when": "cast with bin/ltx-movie --character <name>", "avoid_when": ""}`. Never written to `catalog.json`. Never offered to the planner or the critic (RS7/RS17 show catalog entries only): characters are cast only with `--character` (RS37).
 
 ### LC6. Compatibility
 
@@ -1069,6 +1079,10 @@ Repeatable (`action="append"`, `dest="lora_trigger"`, default None). After the `
 | RST51 | e2e chained | fake agent, `--panels 3`, uncast, `--story-only --no-review --force-story` via `ltx_movie.main`: exit 0; story.md passes `_validate_story_md`; plan.json and story_checks.json written; agent log shows 1 plan, 3 panel, 1 critic call with `--skill=analyst` |
 | RST52 | e2e no_stills | same for `--no-stills --panels 2`: Prompt fields 150-220 words; the critic returns a `location.setting` patch that is applied |
 | RST53 | e2e shots | `--shots --panels 4 --character kyra --character ronin`: S1-S12 clean; plan cast c1/c2 fixed; one malformed panel reply retried; critic first reply malformed then valid |
+| RST55 | RS37 P13 | a temp library with trained `ronin` (phrase "the ronin", trigger `roninmn`) and an uncast run: a plan whose c2 phrase is "the ronin" -> the exact P13 message with `c2's phrase`/`referring phrase`; a beat action naming `roninmn` -> `beat 3's action`/`trigger`; a logline naming `Ronin` -> `the logline`/`name`; P13 forces plan call 2; with `--character ronin` none of these fire |
+| RST56 | RS37 N15 | assembled panels referring to the undeclared `ronin` in Motion (phrase), Narration (name) and Title (trigger) give the three exact N15 messages; a declared member's identity sentence gives none; re-check with plan.json reports N15 and exits 2; `plan_free_report` reports it |
+| RST57 | RS37 prompts | plan and panel prompts list the undeclared characters in the reserved sentence (brace-free) and omit declared ones; an uncast in-process dry run with a non-empty library still has no `character_lib` in `sys.modules`; `library_identities` skips an unreadable `character.json` |
+| RST58 | RS37 patches | a critic `panel motion` patch whose replacement names the undeclared phrase is applied, then the next state's checks report N15 (hard), and the best-round selection prefers the state without it |
 | RST54 | e2e hard fail + resume | a scripted run ending with one N7 violation -> exit 2; hand-edit story.md (test rewrites the line); rerun same argv without `--force-story` -> re-check passes, exit 0, no agent call |
 | RST60 | RSK1 | baseline recorded before the change (`python3 -m pytest tests/ -q -rA`, `python3 tests/test_ltx_movie_offline.py`); after: no lost pass, new tests pass |
 | RST61 | RSK2 | `/usr/bin/python3 -m py_compile` and `python3 -m py_compile` exit 0 on every G1-G13 file and every edited test |
@@ -1169,6 +1183,7 @@ RST60-RST63 above. Additionally `git diff --stat <base>` lists only G1-G14 (and 
 | RS34 | RST50 | |
 | RS35 | RST44, RST51-RST54 | |
 | RS36 | review | docstring text, checked in code review |
+| RS37 | RST55, RST56, RST57, RST58 | |
 | LC1 | LCT1 | |
 | LC2 | LCT2 | |
 | LC3 | LCT3 | |
@@ -1201,7 +1216,7 @@ RST60-RST63 above. Additionally `git diff --stat <base>` lists only G1-G14 (and 
 | # | Story id (legacy / new) | Flags | Narrative |
 |---|---|---|---|
 | 1 | `drift_red_test-L` / `-R` | `--seed-image ~/Downloads/red.jpg --panels 6` | `a short story about a red object crossing a city` (the [panel-drift-fix] A4 run) |
-| 2 | `sisters_sorrow-L` / `-R` | `--panels 30` | the 2026-08-27 `sisters_sorrow` narrative (not in the repo; Section 11 Q1); fallback if unavailable: `Two estranged sisters meet at their mother's empty seaside house after the funeral, sort through her belongings in silence, argue over a music box, find their childhood letters inside it, and walk together to scatter her ashes from the pier at dusk.` |
+| 2 | `sisters_sorrow-L` / `-R` | `--panels 30` no original 2026-08-27 narrative exists (user, 2026-10-17), so the protocol uses this premise: `Two estranged sisters meet at their mother's empty seaside house after the funeral, sort through her belongings in silence, argue over a music box, find their childhood letters inside it, and walk together to scatter her ashes from the pier at dusk.` |
 | 3 | `ronin-rescue-L` / `-R` | `--shots --panels 14 --character kyra --character ronin --model /Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8` | the fight scene, verbatim from [SHOTS] `:1516` ("Deep in a cedar forest, three robbers corner the Shogun's daughter, ... focus on realistic, physically grounded action.") |
 | 4 | `lighthouse-L` / `-R` | `--no-stills --panels 8` | `A lighthouse keeper climbs the spiral stairs during a storm, relights the dead lamp, and watches a fishing boat turn safely toward the harbour.` |
 | 5 | `subway-dancer-L` / `-R` | `--panels 10` | `A street dancer practises alone in an empty subway station at dawn, slips on a puddle, gets up, and finishes the routine as the first train arrives.` |
@@ -1217,7 +1232,7 @@ For each premise: `python3 bin/ltx-movie "<narrative>" --story-id <id>-L <flags>
 
 - **RSR1:** the new engine has 0 hard violations on at least 7 of 8 premises.
 - **RSR2:** no panel drift: every new story.md has exactly the requested panel count (8 of 8), and judge-story's minimum score for the new story is >= the legacy minimum on at least 6 of 8 premises.
-- **User preference** is recorded for all 8 and reported with the results; the user decides whether the result ships as the default (Section 11 Q2).
+- **RSR4:** user preference favors the new engine on more than 50% of premises, i.e. at least 5 of 8 (a premise rated "same" does not count toward the 5).
 
 ### 7.4 LoRA A/B (RSR3)
 
@@ -1261,7 +1276,7 @@ For each premise: `python3 bin/ltx-movie "<narrative>" --story-id <id>-L <flags>
 21. RS28: re-check skips P*, N5, N6; stories without plan.json keep today's validators and exit codes.
 22. RS31: legacy Phase 1 moves a stale `plan.json` aside.
 23. RS33: iterate-story's notice placement; `--threshold`/`--max-rounds` ignored on the wrapper path.
-24. LC5: library characters are listed and counted but never auto-picked.
+24. (user decision, not a spec choice) RS37: library characters are declared only; P13/N15 enforce it.
 25. LC7: `--default-strength 1.0`, `--strength-range 0.5,1.0`.
 26. LC10: `verify` exits 1 on problems.
 27. LC12: pins stay on the global `--lora` route; pins skip the range check.
@@ -1279,7 +1294,7 @@ For each premise: `python3 bin/ltx-movie "<narrative>" --story-id <id>-L <flags>
 - **RSC1. "Spec to pin: chained mode may only support global picks if the renderer can't switch per panel."** It can (1.4): each panel is its own `ltx-2-mlx` process with its own LoRA list, and chained character LoRAs already switch per panel. Chained mode therefore gets per-panel motion/physics picks; style is global-only in every mode (L2), which was the approved per-panel order's only continuity-sensitive kind. Residual risk: a motion LoRA that starts at panel K changes the weights between two continuous clips; the A/B (7.4) and the "use_when" text are the controls.
 - **RSC2. "Replaces per-mode validators."** On the robust engine, the shared checks replace `_validate_story_md` and the shots rewrite loop. Stories without `plan.json` (written before this feature or by `--story-legacy`) keep today's validators and exit codes on re-check (RS28), so no existing story.md starts failing. The legacy chained validator exits 1 where the robust engine exits 2; both are kept as they are.
 - **RSC3. "cast per shot limit (hard, <=2 shots)"** is read as "at most 2 characters per beat in shots mode"; chained/no-stills get 4 (a spec choice for word budgets).
-- **RSC4. "Characters folded in automatically; planner/critic see the catalog and pick per panel."** Library characters are folded into `lora-catalog list`, `verify` and the per-panel limits, but the planner never picks them: casting a character LoRA forces an identity and stays explicit (`--character`). The planner chooses which beats a cast character appears in, which decides that character's LoRA per panel. Flagged for the user (Section 11 Q3).
+- **RSC4. "Characters folded in automatically; planner/critic see the catalog and pick per panel."** Library characters are folded into `lora-catalog list`, `verify` and the per-panel limits, but the planner never picks them: casting a character LoRA forces an identity and stays explicit (`--character`). The planner chooses which beats a declared character appears in, which decides that character's LoRA per panel. User decision 2026-10-17: never auto-cast; enforced by RS37 (P13, N15).
 - **RSC5. "Critic: delegate via local daemon, else local one-shot."** The daemon's `POST /delegate` refuses its own host (`handle_delegate:1105-1111`), so the Mac's analyst is always the local one-shot; the daemon is used only to discover and reach peers. This matches `bin/qwen-agent`'s own routing.
 - **RSC6. Concurrent piece D (tracing).** E edits none of `fleet_lib.py`, `bin/qwen-agentd`, `bin/qwen-agent` or fleet tests. E depends read-only on `fleet_lib`'s F59/F63/F64/F68 functions and `LOCAL`; D already added `trace=None` as a trailing parameter of `delegate_once`, and E passes four positional arguments only. RST25 fails loudly if D changes those signatures. With D in place, each robust `bin/qwen-agent` call posts its own trace (a `oneshot` or `analyst` turn) to the local daemon; [TRACE] TRK6 bounds that at 2 s per call, so a slow daemon can add up to ~2 s x (N + 8) to Phase 1. `bin/qwen-agent` line numbers cited here will drift while D lands; this spec names functions.
 - **RSC7. Deploy gate X2** counts brace lines in the default dry run; the robust dry run is brace-free by construction (RS7) and RST47 checks it.
@@ -1297,8 +1312,10 @@ For each premise: `python3 bin/ltx-movie "<narrative>" --story-id <id>-L <flags>
 
 ---
 
-## 11. Open questions (for the user; none blocks implementation)
+## 11. Answered questions (user, 2026-10-17)
 
-- **Q1.** The 2026-08-27 `sisters_sorrow` narrative is not in this repository (only its story id survives in a code comment, `bin/ltx-movie:1012`). Supply the original text for premise 2, or accept the fallback narrative in 7.1.
-- **Q2.** The design lists "user preference" in the live pass bar without a number. As specified, preference is recorded and the user decides; say if a threshold (e.g. new preferred or same on at least 5 of 8) should be binding.
-- **Q3.** RSC4: should the planner ever be allowed to bring a library character into a story that did not `--character` it? As specified: no.
+- **A1.** No original `sisters_sorrow` narrative exists; premise 2 uses the narrative in 7.1.
+- **A2.** User preference must favor the new engine on at least 5 of 8 premises (RSR4).
+- **A3.** The planner must never auto-cast library characters; casting is declared only with `--character` (RS37, P13, N15).
+
+No open questions remain.
