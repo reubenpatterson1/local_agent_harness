@@ -127,6 +127,178 @@ valid_port() {
 }
 
 # ---------------------------------------------------------------------------
+# Output and the check protocol (P10-P12)
+# ---------------------------------------------------------------------------
+
+N_PASS=0
+N_FIXED=0
+N_FAIL=0
+N_UNKNOWN=0
+N_SKIP=0
+
+# render WORD...: print the words as one copy-pasteable command (P10). A word
+# with a space is quoted: --name='value' for a --name=value word, else 'word'.
+render() {
+    local out='' w
+    for w in "$@"; do
+        case "$w" in
+            *' '*)
+                case "$w" in
+                    --*=*) w="${w%%=*}='${w#*=}'" ;;
+                    *) w="'$w'" ;;
+                esac
+                ;;
+        esac
+        if [ -z "$out" ]; then
+            out="$w"
+        else
+            out="$out $w"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# emit STATUS CHECK DETAIL [FIXLINE]: print a status line, count it, and
+# print the fix line after a FAIL or UNKNOWN.
+emit() {
+    printf '%s %s: %s\n' "$1" "$2" "$3"
+    case "$1" in
+        PASS) N_PASS=$((N_PASS + 1)) ;;
+        FIXED) N_FIXED=$((N_FIXED + 1)) ;;
+        FAIL) N_FAIL=$((N_FAIL + 1)); printf '  fix: %s\n' "$4" ;;
+        UNKNOWN) N_UNKNOWN=$((N_UNKNOWN + 1)); printf '  fix: %s\n' "$4" ;;
+        SKIP) N_SKIP=$((N_SKIP + 1)) ;;
+    esac
+}
+
+print_summary() {
+    printf 'summary: %s pass, %s fixed, %s fail, %s unknown, %s skip\n' \
+        "$N_PASS" "$N_FIXED" "$N_FAIL" "$N_UNKNOWN" "$N_SKIP"
+}
+
+# run_fix WORD...: print the + line, then run the command with inherited
+# stdout and stderr. FIX_RC is its exit status.
+run_fix() {
+    printf '+ %s\n' "$(render "$@")"
+    "$@"
+    FIX_RC=$?
+    return "$FIX_RC"
+}
+
+# step WORD...: one command of a fix function. With FIX_MODE=line it appends
+# the rendered command to CK_FIXLINE (joined by ' && '); with FIX_MODE=run it
+# runs it through run_fix. A fix function is written as a list of steps, each
+# but the last followed by '|| return', so its fix line and the commands it
+# runs can never disagree.
+step() {
+    if [ "$FIX_MODE" = line ]; then
+        CK_FIXLINE="${CK_FIXLINE:+$CK_FIXLINE && }$(render "$@")"
+        return 0
+    fi
+    run_fix "$@"
+}
+
+# set_fix FN: FN is the automatic fix for this failure; its steps become the
+# fix line.
+set_fix() {
+    CK_FIX="$1"
+    CK_FIXLINE=''
+    FIX_MODE=line
+    "$1"
+}
+
+# run_check NAME (P12). ck_NAME runs the read-only test and sets CK_RESULT
+# (pass, fail, unknown or skip) and CK_DETAIL; after a fail or unknown it
+# also sets CK_FIXLINE and, when an automatic fix exists, CK_FIX (through
+# set_fix), and it may set CK_POLLS and CK_SLEEP for the re-check. The
+# re-check calls t_NAME, which repeats the test and sets only CK_RESULT and
+# CK_DETAIL.
+run_check() {
+    local name="$1" pre fixline i
+    CK_RESULT=''
+    CK_DETAIL=''
+    CK_FIXLINE=''
+    CK_FIX=''
+    CK_POLLS=1
+    CK_SLEEP=0
+    "ck_$name"
+    case "$CK_RESULT" in
+        pass) emit PASS "$name" "$CK_DETAIL"; return ;;
+        skip) emit SKIP "$name" "$CK_DETAIL"; return ;;
+        unknown) emit UNKNOWN "$name" "$CK_DETAIL" "$CK_FIXLINE"; return ;;
+    esac
+    if [ "$APPLY" != 1 ] || [ -z "$CK_FIX" ]; then
+        emit FAIL "$name" "$CK_DETAIL" "$CK_FIXLINE"
+        return
+    fi
+    pre="$CK_DETAIL"
+    fixline="$CK_FIXLINE"
+    FIX_RC=0
+    FIX_MODE=run
+    "$CK_FIX"
+    if [ "$FIX_RC" -ne 0 ]; then
+        emit FAIL "$name" "$pre (fix exited $FIX_RC)" "$fixline"
+        return
+    fi
+    i=1
+    while :; do
+        "t_$name"
+        if [ "$CK_RESULT" = pass ] || [ "$i" -ge "$CK_POLLS" ]; then
+            break
+        fi
+        sleep "$CK_SLEEP"
+        i=$((i + 1))
+    done
+    if [ "$CK_RESULT" = pass ]; then
+        emit FIXED "$name" "$CK_DETAIL"
+    else
+        emit FAIL "$name" "$CK_DETAIL (fix did not take)" "$fixline"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# platform (P13)
+# ---------------------------------------------------------------------------
+
+OS=''
+PKG='none'
+
+ck_platform() {
+    local os v rc
+    os=$(uname -s 2>/dev/null)
+    case "$os" in
+        Darwin)
+            v=$(sw_vers -productVersion 2>/dev/null)
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                v='unknown'
+            fi
+            OS='mac'
+            CK_RESULT=pass
+            CK_DETAIL="macOS $v"
+            ;;
+        Linux)
+            OS='linux'
+            CK_RESULT=pass
+            if command -v apt-get >/dev/null 2>&1; then
+                PKG='apt'
+                CK_DETAIL='linux/apt'
+            elif command -v dnf >/dev/null 2>&1; then
+                PKG='dnf'
+                CK_DETAIL='linux/dnf'
+            else
+                CK_DETAIL='linux (no apt-get/dnf: packages must be installed by hand)'
+            fi
+            ;;
+        *)
+            CK_RESULT=fail
+            CK_DETAIL="unsupported OS '$os'"
+            CK_FIXLINE='this script supports macOS (Darwin) and Linux only'
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing (P5)
 # ---------------------------------------------------------------------------
 
@@ -231,3 +403,38 @@ if [ "$MY_UID" = 0 ]; then
     printf '%s\n' 'fleet-host-prep.sh: refusing to run as root; run as the user who will run the fleet daemon (fixes use sudo)' >&2
     exit 2
 fi
+
+# ---------------------------------------------------------------------------
+# sudo (P9)
+# ---------------------------------------------------------------------------
+
+if [ "$APPLY" = 1 ]; then
+    sudo -v
+    SUDO_RC=$?
+    if [ "$SUDO_RC" -ne 0 ]; then
+        emit FAIL sudo "'sudo -v' failed (exit $SUDO_RC); nothing was changed" \
+            're-run from an interactive terminal and enter your password, or run without --apply'
+        print_summary
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# The checks, in order (P12-P16)
+# ---------------------------------------------------------------------------
+
+run_check platform
+if [ -z "$OS" ]; then
+    print_summary
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Summary (P10) and exit status (P11)
+# ---------------------------------------------------------------------------
+
+print_summary
+if [ $((N_FAIL + N_UNKNOWN)) -gt 0 ]; then
+    exit 1
+fi
+exit 0

@@ -618,3 +618,55 @@ def test_h23_no_secret_strings():
     text = script_text()
     for s in ("fleet.env", "QWEN_AGENT_FLEET", ".config/qwen-agent"):
         assert s not in text
+
+
+# ---------------------------------------------------------------------------
+# Task 3: output protocol, sudo, platform (H21, H22, P9, P13)
+# ---------------------------------------------------------------------------
+
+def test_h21_unsupported_platform_stops_at_once():
+    r = run(LINUX_ARGS, linux_state(os="FreeBSD"))
+    assert r.rc == 1
+    assert r.out == ("FAIL platform: unsupported OS 'FreeBSD'\n"
+                     "  fix: this script supports macOS (Darwin) and Linux only\n"
+                     "summary: 0 pass, 0 fixed, 1 fail, 0 unknown, 0 skip\n")
+    assert [(c["name"], c["argv"]) for c in r.calls()] == [("id", ["-u"]), ("uname", ["-s"])]
+
+
+def test_h22_sudo_v_failure_changes_nothing():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(sudo_v_exit=1))
+    assert r.rc == 1
+    assert r.out == ("FAIL sudo: 'sudo -v' failed (exit 1); nothing was changed\n"
+                     "  fix: re-run from an interactive terminal and enter your password, or run without --apply\n"
+                     "summary: 0 pass, 0 fixed, 1 fail, 0 unknown, 0 skip\n")
+    assert [(c["name"], c["argv"]) for c in r.calls()] == [("id", ["-u"]), ("sudo", ["-v"])]
+
+
+@pytest.mark.parametrize("state,absent,line", [
+    (linux_state(), LINUX_ABSENT, "PASS platform: linux/apt"),
+    (linux_state(), {"apt-get", "sntp"}, "PASS platform: linux/dnf"),
+    (linux_state(), {"apt-get", "dnf", "sntp"},
+     "PASS platform: linux (no apt-get/dnf: packages must be installed by hand)"),
+    (mac_state(), MAC_ABSENT, "PASS platform: macOS 26.5.2"),
+], ids=["apt", "dnf", "no-package-manager", "macos"])
+def test_platform_lines(state, absent, line):
+    args = MAC_ARGS if state["os"] == "Darwin" else LINUX_ARGS
+    r = run(args, state, absent)
+    assert r.lines[0] == line
+    assert r.status("platform") == line
+
+
+def test_sudo_v_runs_once_with_apply_before_any_check():
+    r = run(LINUX_ARGS + ["--apply"])
+    names = [(c["name"], c["argv"]) for c in r.calls()]
+    assert names.count(("sudo", ["-v"])) == 1
+    assert names.index(("id", ["-u"])) < names.index(("sudo", ["-v"])) < names.index(("uname", ["-s"]))
+    assert r.lines[-1].startswith("summary: ")
+    assert r.rc == 0
+
+
+def test_check_mode_never_runs_sudo_v():
+    r = run(LINUX_ARGS)
+    assert r.named("sudo", "-v") == []
+    assert r.lines[-1].startswith("summary: ")
+    assert r.rc == 0
