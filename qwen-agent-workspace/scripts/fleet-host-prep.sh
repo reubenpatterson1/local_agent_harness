@@ -640,6 +640,265 @@ fix_searxng() {
 }
 
 # ---------------------------------------------------------------------------
+# firewall (P15)
+# ---------------------------------------------------------------------------
+
+# t_firewall sets FW_KIND after a fail or unknown: settings, blockall, exe or
+# app (macOS); unknown, ufw_weird, both, ufw or firewalld (Linux).
+FW_KIND=''
+FW_READ=''
+FW_EXE=''
+FW_LISTED=0
+FW_MISS_TCP=0
+FW_MISS_UDP=0
+FW_RULE_TCP=''
+FW_RULE_UDP=''
+
+t_firewall() {
+    if [ "$OS" = mac ]; then
+        t_firewall_mac
+    else
+        t_firewall_linux
+    fi
+}
+
+t_firewall_mac() {
+    local out rc line next allowed blockall
+    FW_KIND='settings'
+    CK_RESULT=fail
+    if [ ! -x "$SOCKETFILTERFW" ]; then
+        CK_DETAIL="$SOCKETFILTERFW not found"
+        return
+    fi
+    out=$("$SOCKETFILTERFW" --getglobalstate 2>/dev/null)
+    blockall=0
+    case "$out" in
+        *'State = 0'*)
+            CK_RESULT=pass
+            CK_DETAIL='application firewall off'
+            return
+            ;;
+        *'State = 1'*) ;;
+        *'State = 2'*) blockall=1 ;;
+        *)
+            CK_DETAIL="unrecognized socketfilterfw output '${out%%"$NL"*}'"
+            return
+            ;;
+    esac
+    if [ "$blockall" = 0 ]; then
+        out=$("$SOCKETFILTERFW" --getblockall 2>/dev/null)
+        case "$out" in
+            *enabled*|*ENABLED*) blockall=1 ;;
+        esac
+    fi
+    if [ "$blockall" = 1 ]; then
+        FW_KIND='blockall'
+        CK_DETAIL='block all incoming connections is on'
+        return
+    fi
+    FW_KIND='exe'
+    CK_DETAIL='cannot resolve the python3 binary'
+    if ! command -v python3 >/dev/null 2>&1; then
+        return
+    fi
+    FW_EXE=$(python3 -I -B -c "$PY_EXE" 2>/dev/null)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$FW_EXE" ]; then
+        return
+    fi
+    out=$("$SOCKETFILTERFW" --listapps 2>/dev/null)
+    FW_LISTED=0
+    allowed=0
+    next=0
+    while IFS= read -r line; do
+        if [ "$next" = 1 ]; then
+            case "$line" in
+                *'(Allow incoming connections)'*) allowed=1 ;;
+            esac
+        fi
+        next=0
+        if [[ $line =~ $RE_APP ]] && [ "${BASH_REMATCH[1]}" = "$FW_EXE" ]; then
+            FW_LISTED=1
+            next=1
+        fi
+    done <<<"$out"
+    if [ "$allowed" = 1 ]; then
+        CK_RESULT=pass
+        CK_DETAIL="application firewall on; $FW_EXE allowed"
+        return
+    fi
+    FW_KIND='app'
+    CK_DETAIL="application firewall on; $FW_EXE not allowed"
+}
+
+# fw_missing TCP_OK UDP_OK: print the missing protocols (tcp, udp).
+fw_missing() {
+    if [ "$1" = 0 ] && [ "$2" = 0 ]; then
+        printf '%s' 'tcp, udp'
+    elif [ "$1" = 0 ]; then
+        printf '%s' 'tcp'
+    else
+        printf '%s' 'udp'
+    fi
+}
+
+t_firewall_linux() {
+    local ufw=0 fwd=0 active=0 out rc first f1 f2 f3 rest line tcp=0 udp=0
+    FW_RULE_TCP="rule family=\"ipv4\" source address=\"$LAN_CIDR\" port port=\"$PORT\" protocol=\"tcp\" accept"
+    FW_RULE_UDP="rule family=\"ipv4\" source address=\"$LAN_CIDR\" port port=\"$PORT\" protocol=\"udp\" accept"
+    if command -v ufw >/dev/null 2>&1; then
+        ufw=1
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        out=$(firewall-cmd --state 2>/dev/null)
+        if [ "$out" = running ]; then
+            fwd=1
+        fi
+    fi
+    CK_RESULT=fail
+    if [ "$ufw" = 1 ]; then
+        out=$(sudo -n ufw status 2>/dev/null)
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            CK_RESULT=unknown
+            CK_DETAIL='cannot read ufw rules without sudo'
+            FW_KIND='unknown'
+            FW_READ='sudo ufw status'
+            return
+        fi
+        first="${out%%"$NL"*}"
+        case "$first" in
+            'Status: inactive') ;;
+            'Status: active') active=1 ;;
+            *)
+                CK_DETAIL="unrecognized 'ufw status' output '$first'"
+                FW_KIND='ufw_weird'
+                return
+                ;;
+        esac
+    fi
+    if [ "$active" = 1 ] && [ "$fwd" = 1 ]; then
+        CK_DETAIL='ufw and firewalld are both active'
+        FW_KIND='both'
+    elif [ "$active" = 1 ]; then
+        while read -r f1 f2 f3 rest; do
+            if [ "$f2" != ALLOW ]; then
+                continue
+            fi
+            if [ "$f3" != "$LAN_CIDR" ] && [ "$f3" != Anywhere ]; then
+                continue
+            fi
+            case "$f1" in
+                "$PORT") tcp=1; udp=1 ;;
+                "$PORT/tcp") tcp=1 ;;
+                "$PORT/udp") udp=1 ;;
+            esac
+        done <<<"$out"
+        if [ "$tcp" = 1 ] && [ "$udp" = 1 ]; then
+            CK_RESULT=pass
+            CK_DETAIL="ufw allows $PORT tcp+udp from $LAN_CIDR"
+        else
+            CK_DETAIL="ufw active; no rule allows $PORT $(fw_missing "$tcp" "$udp") from $LAN_CIDR"
+            FW_KIND='ufw'
+        fi
+    elif [ "$fwd" = 1 ]; then
+        out=$(sudo -n firewall-cmd --permanent --list-rich-rules 2>/dev/null)
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            CK_RESULT=unknown
+            CK_DETAIL='cannot read firewalld rules without sudo'
+            FW_KIND='unknown'
+            FW_READ='sudo firewall-cmd --permanent --list-rich-rules'
+            return
+        fi
+        while IFS= read -r line; do
+            if [ "$line" = "$FW_RULE_TCP" ]; then
+                tcp=1
+            fi
+            if [ "$line" = "$FW_RULE_UDP" ]; then
+                udp=1
+            fi
+        done <<<"$out"
+        FW_MISS_TCP=$((1 - tcp))
+        FW_MISS_UDP=$((1 - udp))
+        if [ "$tcp" = 1 ] && [ "$udp" = 1 ]; then
+            CK_RESULT=pass
+            CK_DETAIL="firewalld allows $PORT tcp+udp from $LAN_CIDR"
+        else
+            CK_DETAIL="firewalld running; missing rich rules for $PORT $(fw_missing "$tcp" "$udp") from $LAN_CIDR"
+            FW_KIND='firewalld'
+        fi
+    elif [ "$ufw" = 1 ]; then
+        CK_RESULT=pass
+        CK_DETAIL='ufw inactive'
+    else
+        CK_RESULT=pass
+        CK_DETAIL='no host firewall active'
+    fi
+}
+
+ck_firewall() {
+    t_firewall
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    case "$FW_KIND" in
+        settings)
+            CK_FIXLINE='check System Settings > Network > Firewall by hand'
+            ;;
+        blockall)
+            CK_FIXLINE='turn off System Settings > Network > Firewall > Options > Block all incoming connections; this script never changes it'
+            ;;
+        exe)
+            CK_FIXLINE='fix the packages check first, then re-run'
+            ;;
+        app)
+            set_fix fix_firewall_mac
+            ;;
+        unknown)
+            if [ "$APPLY" = 1 ]; then
+                CK_FIXLINE="'sudo -n' failed even after 'sudo -v'; run '$FW_READ' by hand"
+            else
+                CK_FIXLINE="run 'sudo -v' first, or use --apply"
+            fi
+            ;;
+        ufw_weird)
+            CK_FIXLINE="check 'sudo ufw status' by hand"
+            ;;
+        both)
+            CK_FIXLINE="allow TCP and UDP $PORT from $LAN_CIDR in both firewalls by hand: sudo ufw allow from $LAN_CIDR to any port $PORT; and the two firewalld rich rules and reload shown in the fleet-host-prep spec P15"
+            ;;
+        ufw)
+            set_fix fix_firewall_ufw
+            ;;
+        firewalld)
+            set_fix fix_firewall_firewalld
+            ;;
+    esac
+}
+
+fix_firewall_mac() {
+    if [ "$FW_LISTED" != 1 ]; then
+        step sudo "$SOCKETFILTERFW" --add "$FW_EXE" || return
+    fi
+    step sudo "$SOCKETFILTERFW" --unblockapp "$FW_EXE"
+}
+
+fix_firewall_ufw() {
+    step sudo ufw allow from "$LAN_CIDR" to any port "$PORT"
+}
+
+fix_firewall_firewalld() {
+    if [ "$FW_MISS_TCP" = 1 ]; then
+        step sudo firewall-cmd --permanent "--add-rich-rule=$FW_RULE_TCP" || return
+    fi
+    if [ "$FW_MISS_UDP" = 1 ]; then
+        step sudo firewall-cmd --permanent "--add-rich-rule=$FW_RULE_UDP" || return
+    fi
+    step sudo firewall-cmd --reload
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing (P5)
 # ---------------------------------------------------------------------------
 
@@ -773,6 +1032,7 @@ run_check packages
 run_check clock
 run_check model
 run_check searxng
+run_check firewall
 
 # ---------------------------------------------------------------------------
 # Summary (P10) and exit status (P11)

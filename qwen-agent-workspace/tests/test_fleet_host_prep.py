@@ -1087,3 +1087,221 @@ def test_review_focus_4_model_url_answering_404():
                                     "this script never starts model servers")
     assert plus_lines(r.out) == []
     assert r.rc == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 6: firewall (H6 accepted values, H8, H16-H19)
+# ---------------------------------------------------------------------------
+
+LAN = "192.168.1.0/24"
+SFW_ON = "Firewall is enabled. (State = 1)"
+
+
+def rich(port, proto, cidr=LAN):
+    return 'rule family="ipv4" source address="%s" port port="%s" protocol="%s" accept' % (cidr, port, proto)
+
+
+def rich_plus(port, proto):
+    return "+ sudo firewall-cmd --permanent --add-rich-rule='%s'" % rich(port, proto)
+
+
+FWD_ABSENT = LINUX_ABSENT | {"ufw"}
+
+
+def rich_rule_adds(r):
+    return [c for c in r.named("firewall-cmd") if any(a.startswith("--add-rich-rule=") for a in c["argv"])]
+
+
+def test_h8_ufw_unreadable_without_sudo_is_unknown():
+    r = run(LINUX_ARGS, linux_state(sudo_n_ok=False))
+    assert r.status("firewall") == "UNKNOWN firewall: cannot read ufw rules without sudo"
+    assert r.fix_after("firewall") == "  fix: run 'sudo -v' first, or use --apply"
+    assert r.rc == 1
+    r = run(LINUX_ARGS + ["--apply"], linux_state(sudo_n_ok=False))
+    assert r.status("firewall") == "UNKNOWN firewall: cannot read ufw rules without sudo"
+    assert r.fix_after("firewall") == "  fix: 'sudo -n' failed even after 'sudo -v'; run 'sudo ufw status' by hand"
+    assert r.named("ufw", "allow") == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+@pytest.mark.parametrize("rows", [
+    [ufw_row("8190", "ALLOW", LAN)],
+    [ufw_row("8190/tcp", "ALLOW", LAN), ufw_row("8190/udp", "ALLOW", LAN)],
+    [ufw_row("8190", "ALLOW", "Anywhere")],
+    [ufw_row("8190", "ALLOW", LAN, " # fleet")],
+], ids=["port", "tcp-and-udp", "anywhere", "comment"])
+def test_h16_ufw_rules_that_admit_the_lan(rows):
+    r = run(LINUX_ARGS, linux_state(ufw_out=UFW_HEAD + "".join(rows)))
+    assert r.status("firewall") == "PASS firewall: ufw allows 8190 tcp+udp from " + LAN
+    assert r.rc == 0
+
+
+@pytest.mark.parametrize("rows,missing", [
+    ([ufw_row("8190/tcp", "ALLOW", LAN)], "udp"),
+    ([ufw_row("8190 (v6)", "ALLOW", "Anywhere (v6)")], "tcp, udp"),
+    ([ufw_row("8190", "DENY", LAN)], "tcp, udp"),
+    ([ufw_row("8190", "ALLOW OUT", LAN)], "tcp, udp"),
+    ([ufw_row("8190", "ALLOW", "10.0.0.0/8")], "tcp, udp"),
+    ([ufw_row("8190 on eth0", "ALLOW", LAN)], "tcp, udp"),
+], ids=["tcp-only", "v6-only", "deny", "allow-out", "other-network", "interface"])
+def test_h16_ufw_rules_that_do_not(rows, missing):
+    r = run(LINUX_ARGS, linux_state(ufw_out=UFW_HEAD + "".join(rows)))
+    assert r.status("firewall") == "FAIL firewall: ufw active; no rule allows 8190 %s from %s" % (missing, LAN)
+    assert r.fix_after("firewall") == "  fix: sudo ufw allow from 192.168.1.0/24 to any port 8190"
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+def test_h16_ufw_status_variants():
+    r = run(LINUX_ARGS, linux_state(ufw_out="Status: inactive\n"))
+    assert r.status("firewall") == "PASS firewall: ufw inactive"
+    r = run(LINUX_ARGS, linux_state(), LINUX_ABSENT | {"ufw"})
+    assert r.status("firewall") == "PASS firewall: no host firewall active"
+    assert r.rc == 0
+    r = run(LINUX_ARGS, linux_state(ufw_out="weird"))
+    assert r.status("firewall") == "FAIL firewall: unrecognized 'ufw status' output 'weird'"
+    assert r.fix_after("firewall") == "  fix: check 'sudo ufw status' by hand"
+    assert r.rc == 1
+
+
+def test_h16_non_default_port():
+    args = LINUX_ARGS + ["--port", "8191"]
+    r = run(args, linux_state())
+    assert r.status("firewall") == "FAIL firewall: ufw active; no rule allows 8191 tcp, udp from " + LAN
+    assert r.fix_after("firewall") == "  fix: sudo ufw allow from 192.168.1.0/24 to any port 8191"
+    r = run(args, linux_state(ufw_out=UFW_HEAD + ufw_row("8191", "ALLOW", LAN)))
+    assert r.status("firewall") == "PASS firewall: ufw allows 8191 tcp+udp from " + LAN
+    r = run(args, linux_state(ufw_out=UFW_HEAD + ufw_row("8191/tcp", "ALLOW", LAN) + ufw_row("8190/udp", "ALLOW", LAN)))
+    assert r.status("firewall") == "FAIL firewall: ufw active; no rule allows 8191 udp from " + LAN
+    r = run(args + ["--apply"], linux_state())
+    assert plus_lines(r.out) == ["+ sudo ufw allow from 192.168.1.0/24 to any port 8191"]
+    assert r.status("firewall") == "FIXED firewall: ufw allows 8191 tcp+udp from " + LAN
+    assert r.rc == 0
+
+
+def test_h17a_firewalld_adds_both_rules_then_reloads():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(firewalld="running"), FWD_ABSENT)
+    assert plus_lines(r.out) == [rich_plus("8190", "tcp"), rich_plus("8190", "udp"), "+ sudo firewall-cmd --reload"]
+    assert plus_lines(r.out)[0] == ("+ sudo firewall-cmd --permanent --add-rich-rule='rule family=\"ipv4\" "
+                                    "source address=\"192.168.1.0/24\" port port=\"8190\" protocol=\"tcp\" accept'")
+    assert r.status("firewall") == "FIXED firewall: firewalld allows 8190 tcp+udp from " + LAN
+    assert r.rc == 0
+
+
+def test_h17b_firewalld_adds_only_the_missing_rule():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(firewalld="running", firewalld_rules=[rich("8190", "tcp")]),
+            FWD_ABSENT)
+    assert plus_lines(r.out) == [rich_plus("8190", "udp"), "+ sudo firewall-cmd --reload"]
+    assert r.status("firewall") == "FIXED firewall: firewalld allows 8190 tcp+udp from " + LAN
+
+
+def test_h17_firewalld_check_mode():
+    r = run(LINUX_ARGS, linux_state(firewalld="running"), FWD_ABSENT)
+    assert r.status("firewall") == "FAIL firewall: firewalld running; missing rich rules for 8190 tcp, udp from " + LAN
+    assert r.fix_after("firewall") == "  fix: " + " && ".join(
+        l[2:] for l in (rich_plus("8190", "tcp"), rich_plus("8190", "udp"), "+ sudo firewall-cmd --reload"))
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+def test_h17c_firewalld_unreadable_without_sudo():
+    r = run(LINUX_ARGS, linux_state(firewalld="running", sudo_n_ok=False), FWD_ABSENT)
+    assert r.status("firewall") == "UNKNOWN firewall: cannot read firewalld rules without sudo"
+    assert r.fix_after("firewall") == "  fix: run 'sudo -v' first, or use --apply"
+    r = run(LINUX_ARGS + ["--apply"], linux_state(firewalld="running", sudo_n_ok=False), FWD_ABSENT)
+    assert r.fix_after("firewall") == ("  fix: 'sudo -n' failed even after 'sudo -v'; run "
+                                       "'sudo firewall-cmd --permanent --list-rich-rules' by hand")
+    assert rich_rule_adds(r) == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h17d_firewalld_non_default_port_leaves_8190_alone():
+    rules = [rich("8190", "tcp"), rich("8190", "udp")]
+    r = run(LINUX_ARGS + ["--port", "8191", "--apply"], linux_state(firewalld="running", firewalld_rules=rules),
+            FWD_ABSENT)
+    assert plus_lines(r.out) == [rich_plus("8191", "tcp"), rich_plus("8191", "udp"), "+ sudo firewall-cmd --reload"]
+    assert r.status("firewall") == "FIXED firewall: firewalld allows 8191 tcp+udp from " + LAN
+    assert r.state["firewalld_rules"] == rules + [rich("8191", "tcp"), rich("8191", "udp")]
+
+
+def test_h18_ufw_and_firewalld_both_active():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(firewalld="running"))
+    assert r.status("firewall") == "FAIL firewall: ufw and firewalld are both active"
+    assert r.fix_after("firewall") == (
+        "  fix: allow TCP and UDP 8190 from 192.168.1.0/24 in both firewalls by hand: sudo ufw allow from "
+        "192.168.1.0/24 to any port 8190; and the two firewalld rich rules and reload shown in the "
+        "fleet-host-prep spec P15")
+    assert r.named("ufw", "allow") == [] and rich_rule_adds(r) == []
+    assert r.rc == 1
+    r = run(LINUX_ARGS + ["--apply", "--port", "8191"], linux_state(firewalld="running"))
+    fix = r.fix_after("firewall")
+    assert "to any port 8191" in fix and "8190" not in fix
+
+
+@pytest.mark.parametrize("extra", [[], ["--port", "8191"]], ids=["default-port", "port-8191"])
+def test_h19_macos_application_firewall(extra):
+    exe = PYTHON_EXE
+    r = run(MAC_ARGS + extra, mac_state(sfw_global=SFW_ON, sfw_apps=[[exe, "allow"]]), MAC_ABSENT)
+    assert r.status("firewall") == "PASS firewall: application firewall on; %s allowed" % exe
+    assert [c["argv"] for c in r.named("socketfilterfw")] == [["--getglobalstate"], ["--getblockall"], ["--listapps"]]
+    assert r.rc == 0
+    r = run(MAC_ARGS + extra + ["--apply"], mac_state(sfw_global=SFW_ON), MAC_ABSENT)
+    assert plus_lines(r.out) == ["+ sudo %s --add %s" % (r.sfw, exe), "+ sudo %s --unblockapp %s" % (r.sfw, exe)]
+    assert r.status("firewall") == "FIXED firewall: application firewall on; %s allowed" % exe
+    assert r.rc == 0
+
+
+def test_h19c_listed_but_blocked_is_only_unblocked():
+    r = run(MAC_ARGS + ["--apply"], mac_state(sfw_global=SFW_ON, sfw_apps=[[PYTHON_EXE, "block"]]), MAC_ABSENT)
+    assert plus_lines(r.out) == ["+ sudo %s --unblockapp %s" % (r.sfw, PYTHON_EXE)]
+    assert r.status("firewall") == "FIXED firewall: application firewall on; %s allowed" % PYTHON_EXE
+
+
+def test_h19d_another_python_does_not_count():
+    r = run(MAC_ARGS, mac_state(sfw_global=SFW_ON, sfw_apps=[["/usr/bin/python3", "allow"]]), MAC_ABSENT)
+    assert r.status("firewall") == "FAIL firewall: application firewall on; %s not allowed" % PYTHON_EXE
+    assert r.fix_after("firewall") == "  fix: sudo %s --add %s && sudo %s --unblockapp %s" % (
+        r.sfw, PYTHON_EXE, r.sfw, PYTHON_EXE)
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+@pytest.mark.parametrize("state", [
+    mac_state(sfw_global=SFW_ON, sfw_blockall="Firewall has block all state set to enabled."),
+    mac_state(sfw_global="Firewall is blocking all non-essential incoming connections. (State = 2)"),
+], ids=["blockall-enabled", "state-2"])
+def test_h19e_block_all_is_never_changed(state):
+    r = run(MAC_ARGS + ["--apply"], state, MAC_ABSENT)
+    assert r.status("firewall") == "FAIL firewall: block all incoming connections is on"
+    assert r.fix_after("firewall") == ("  fix: turn off System Settings > Network > Firewall > Options > Block all "
+                                       "incoming connections; this script never changes it")
+    assert r.named("socketfilterfw", "--add") == [] and plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h19f_unrecognized_or_missing_socketfilterfw():
+    r = run(MAC_ARGS, mac_state(sfw_global="gibberish"), MAC_ABSENT)
+    assert r.status("firewall") == "FAIL firewall: unrecognized socketfilterfw output 'gibberish'"
+    assert r.fix_after("firewall") == "  fix: check System Settings > Network > Firewall by hand"
+    r = run(MAC_ARGS, mac_state(), MAC_ABSENT | {"socketfilterfw"})
+    assert r.status("firewall") == "FAIL firewall: %s not found" % r.sfw
+    assert r.fix_after("firewall") == "  fix: check System Settings > Network > Firewall by hand"
+    assert r.rc == 1
+
+
+def test_macos_firewall_on_without_python3():
+    r = run(MAC_ARGS, mac_state(sfw_global=SFW_ON), MAC_ABSENT | {"python3"})
+    assert r.status("firewall") == "FAIL firewall: cannot resolve the python3 binary"
+    assert r.fix_after("firewall") == "  fix: fix the packages check first, then re-run"
+    assert r.rc == 1
+
+
+@pytest.mark.parametrize("extra,row", [
+    (["--lan-cidr", "10.0.0.0/8"], ufw_row("8190", "ALLOW", "10.0.0.0/8")),
+    (["--port", "1024"], ufw_row("1024", "ALLOW", LAN)),
+    (["--port", "65535"], ufw_row("65535", "ALLOW", LAN)),
+], ids=["cidr-10/8", "port-1024", "port-65535"])
+def test_h6_accepted_values(extra, row):
+    r = run(LINUX_ARGS + extra, linux_state(ufw_out=UFW_HEAD + row))
+    assert r.status("firewall").startswith("PASS firewall: ufw allows ")
+    assert r.rc == 0
