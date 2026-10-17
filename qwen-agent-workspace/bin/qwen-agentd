@@ -634,6 +634,8 @@ class Daemon(object):
             return 200, fleet_lib.canonical_json(self.health_body())
         if name == "skills":
             return 200, fleet_lib.canonical_json({"host_id": self.host_id, "skills": self.skills_view()})
+        if name == "trace":
+            return self.handle_peer_trace(path)
         return self.handle_run(body)
 
     def loopback_endpoint(self, name, body, path):
@@ -673,6 +675,18 @@ class Daemon(object):
         except Exception as e:
             self._trace_write_failed(e)
         return 200, {"ok": True}
+
+    def handle_peer_trace(self, path):
+        """(status, body bytes) for a verified GET /trace/<id>: this agent's records only (tracing spec TR26)."""
+        trace_id = path[len("/trace/"):]
+        if not fleet_lib.valid_trace_id(trace_id):
+            return 400, fleet_lib.canonical_json({"error": "bad trace id"})
+        try:
+            records, truncated = self.trace_store.query(trace_id)
+        except OSError as e:
+            return 500, fleet_lib.canonical_json({"error": "trace store unreadable: %s" % type(e).__name__})
+        return 200, fleet_lib.canonical_json({"agent": self.host_id, "trace_id": trace_id,
+                                              "records": records, "truncated": truncated})
 
     # --- discovery: beacons, bind attempts, poll fallback (F11, F30-F39) -------------
 

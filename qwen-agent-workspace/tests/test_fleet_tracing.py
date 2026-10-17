@@ -103,3 +103,39 @@ def test_tracing_focus_1_non_ascii_tool_keys_round_trip(tmp_path):
     lines = fleet_lib.render_trace(result, localtime=time.gmtime)
     assert lines[1] == "… span %s on alpha (not retrieved)" % P
     assert lines[2].startswith("  tool search  %s  " % key) and lines[2].endswith("-> %s  @alpha" % outcome)
+
+
+# --- signed GET /trace/<id> (TR26) ---------------------------------------------------------
+
+def _signed_get(port, path, key=ftu.TEST_KEY, nonce=None):
+    """(status, headers, body, request headers) of a GET signed with key."""
+    nonce = nonce or os.urandom(16).hex()
+    headers = fleet_lib.sign_request(key, "GET", path, b"", int(time.time()), nonce)
+    status, resp_headers, raw = ftu._request(port, "GET", path, None, dict(headers), timeout=10)
+    return status, resp_headers, raw, headers
+
+
+def test_trt44_signed_peer_trace_endpoint(tmp_path):
+    fleet = ftu.Fleet(tmp_path, names=("bravo",)).start()
+    port = fleet.ports["bravo"]
+    mine = [_span("model", name="bravo-model"), _span()]
+    other = _span(trace_id="1" * 32)
+    for rec in mine + [other]:
+        assert _post_span(port, rec)[0] == 200
+    before = fleet.daemons["bravo"].log()
+    path = "/trace/" + T
+    assert ftu._request(port, "GET", path)[0::2] == (401, b"")
+    status, headers, raw, sent = _signed_get(port, path)
+    assert status == 200 and ftu.response_ok(ftu.TEST_KEY, 200, "GET", path, sent["X-Fleet-Nonce"], headers, raw)
+    assert json.loads(raw) == {"agent": "bravo", "trace_id": T, "records": [dict(r, agent="bravo") for r in mine],
+                               "truncated": False}
+    assert ftu._request(port, "GET", path, None, dict(sent))[0::2] == (401, b"")
+    assert _signed_get(port, path, key=bytes.fromhex(ftu.OTHER_TOKEN))[0::2] == (401, b"")
+    for bad in ("/trace/xyz", "/trace/" + T + "?x=1", "/trace/" + T.upper()):
+        status, headers, raw, sent = _signed_get(port, bad)
+        assert (status, raw) == (400, b'{"error":"bad trace id"}'), bad
+        assert ftu.response_ok(ftu.TEST_KEY, 400, "GET", bad, sent["X-Fleet-Nonce"], headers, raw)
+    status, _h, raw, _s = _signed_get(port, "/trace/" + "2" * 32)
+    assert (status, json.loads(raw)) == (200, {"agent": "bravo", "trace_id": "2" * 32, "records": [],
+                                               "truncated": False})
+    assert fleet.daemons["bravo"].log() == before
