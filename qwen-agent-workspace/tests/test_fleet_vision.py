@@ -337,3 +337,107 @@ def test_vt24_two_large_body_slots_then_503(tmp_path):
     assert (status, raw) == (200, CANNED)
     assert ftu.response_ok(ftu.TEST_KEY, status, "POST", "/run", nonce, headers, raw)
     assert "http handler error" not in fleet.daemons["bravo"].log()
+
+
+# --- POST /delegate with images, and a peer's unsigned pre-body answers (V14, V15) ---
+
+def _post_delegate(port, obj):
+    status, _headers, raw = ftu._request(port, "POST", "/delegate", json.dumps(obj).encode("utf-8"),
+                                         {"Content-Type": "application/json"})
+    return status, json.loads(raw)
+
+
+def test_vt22c_delegate_validates_images_then_forwards_them(tmp_path):
+    hook = _hook(tmp_path, "canned")
+    fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), skills={"bravo": ["vision"]},
+                      extra_args={"bravo": ["--qwen-agent-bin", hook]}).start()
+    alpha = fleet.ports["alpha"]
+    ftu.wait_until(lambda: "bravo" in fleet.peer_ids("alpha"), 4.5)
+    assert _post_delegate(alpha, {"skill": "researcher", "task": "t", "host_id": "bravo", "images": []}) == \
+        (400, {"error": "images are only accepted for skill vision"})
+    assert _post_delegate(alpha, {"skill": "vision", "task": "t", "host_id": "bravo"}) == \
+        (400, {"error": "skill vision requires 1 to 4 images"})
+    assert _post_delegate(alpha, {"skill": "vision", "task": "t", "host_id": "bravo",
+                                  "images": [PNG_WIRE], "x": 1}) == (400, {"error": "bad request"})
+    assert _post_delegate(alpha, {"skill": "vision", "task": "t", "host_id": "bravo",
+                                  "images": [{"media_type": "image/png", "data": JPEG_WIRE["data"]}]}) == \
+        (400, {"error": "images[0] does not match its media_type image/png"})
+    assert ftu.delegate(alpha, "vision", "t", "alpha", images=[PNG_WIRE]) == \
+        (200, {"outcome": "not_live", "envelope": None, "detail": ""})
+    assert "run start" not in fleet.daemons["bravo"].log()
+    status, result = ftu.delegate(alpha, "vision", "look", "bravo", images=[PNG_WIRE, JPEG_WIRE])
+    assert status == 200 and result["outcome"] == "ok" and result["envelope"]["answer"] == "CANNED"
+    assert "images=2 image_bytes=%d" % (len(ftu.PNG_BYTES) + len(ftu.JPEG_BYTES)) in fleet.daemons["bravo"].log()
+    assert "delegate skill=vision host=bravo request_id=" in fleet.daemons["alpha"].log()
+
+
+class _FakeVisionPeer(object):
+    """An in-process registered peer 'delta' serving vision. Its signed /health and /skills
+    bind it; its /run answers unsigned with an empty body: 503 in mode "slots", 413 in
+    mode "cap" (what a real daemon sends before reading a body, vision spec V11)."""
+
+    def __init__(self, port):
+        self.mode = "slots"
+        self.run_bodies = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, status, obj):
+                raw = fleet_lib.canonical_json(obj)
+                headers = fleet_lib.sign_response(ftu.TEST_KEY, status, self.command, self.path,
+                                                  self.headers.get("X-Fleet-Nonce"), raw,
+                                                  int(time.time()), os.urandom(16).hex())
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(raw)))
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._reply(200, {"host_id": "delta", "role": "agent", "version": "dev",
+                                      "proto": 1, "discovery": "beacon"})
+                else:
+                    self._reply(200, {"host_id": "delta", "skills": [
+                        {"skill": "vision", "model": "delta-model", "verified": True, "busy": False}]})
+
+            def do_POST(self):
+                outer.run_bodies.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0))))
+                self.send_response(503 if outer.mode == "slots" else 413)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_vt27_unsigned_peer_503_is_busy_and_413_is_peer_error(tmp_path):
+    delta_port = ftu.free_port()
+    fleet = ftu.Fleet(tmp_path, names=("alpha",), extra_hosts={"delta": {
+        "port": delta_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+        "model": "delta-model", "skills": ["vision"]}})
+    delta = _FakeVisionPeer(delta_port)
+    try:
+        fleet.start()
+        alpha = fleet.ports["alpha"]
+        ftu.send_beacon(ftu.TEST_KEY, delta_port, fleet.beacon_ports["alpha"])
+        ftu.wait_until(lambda: "delta" in fleet.peer_ids("alpha"), 3.0)
+        assert ftu.delegate(alpha, "vision", "t", "delta", images=[PNG_WIRE]) == \
+            (200, {"outcome": "busy", "envelope": None, "detail": ""})
+        delta.mode = "cap"
+        assert ftu.delegate(alpha, "vision", "t", "delta", images=[PNG_WIRE]) == \
+            (200, {"outcome": "peer_error", "envelope": None, "detail": "http 413"})
+        assert [b["images"] for b in delta.run_bodies] == [[PNG_WIRE], [PNG_WIRE]]
+        assert all(set(b) == {"skill", "task", "request_id", "images"} for b in delta.run_bodies)
+    finally:
+        delta.close()

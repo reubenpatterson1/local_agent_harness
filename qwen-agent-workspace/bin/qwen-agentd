@@ -197,6 +197,7 @@ def _is_int(value):
 _PORT_RE = re.compile(r"[0-9]{1,5}")
 _LENGTH_RE = re.compile(r"[0-9]{1,12}")
 _RUN_KEYS = frozenset(("skill", "task", "request_id"))
+_DELEGATE_KEYS = frozenset(("skill", "task", "host_id"))
 
 
 def _parse_port(text):
@@ -884,13 +885,17 @@ class Daemon(object):
     # --- POST /delegate (F65-F67) -------------------------------------------------------
 
     def handle_delegate(self, body):
-        """(status, object) for loopback POST /delegate. Never touches run_lock (F65)."""
+        """(status, object) for loopback POST /delegate. Never touches run_lock (F65, vision spec V14)."""
         req = _json_or_none(body)
-        if not (isinstance(req, dict) and set(req) == {"skill", "task", "host_id"}
-                and all(isinstance(v, str) for v in req.values())
+        if not (isinstance(req, dict) and set(req) in (_DELEGATE_KEYS, _DELEGATE_KEYS | {"images"})
+                and all(isinstance(req[k], str) for k in _DELEGATE_KEYS)
                 and req["task"].strip() != "" and req["skill"] in fleet_lib.KNOWN_SKILLS
                 and fleet_lib.HOST_ID_RE.fullmatch(req["host_id"])):
             return 400, {"error": "bad request"}
+        try:
+            fleet_lib.request_images(req)
+        except fleet_lib.ImageError as e:
+            return e.status, {"error": e.reason}
         skill, task, host_id = req["skill"], req["task"], req["host_id"]
         started = time.monotonic()
         record = self.table.record(host_id)
@@ -900,14 +905,20 @@ class Daemon(object):
                      % (skill, host_id, time.monotonic() - started))
             return 200, {"outcome": "not_live", "envelope": None, "detail": ""}
         request_id = secrets.token_hex(8)
-        outcome, envelope, detail = self.forward_run(record, skill, task, request_id)
+        outcome, envelope, detail = self.forward_run(record, skill, task, request_id, req.get("images"))
         LOG.info("delegate skill=%s host=%s request_id=%s outcome=%s seconds=%.1f"
                  % (skill, host_id, request_id, outcome, time.monotonic() - started))
         return 200, {"outcome": outcome, "envelope": envelope, "detail": detail}
 
-    def forward_run(self, record, skill, task, request_id):
-        """Signed POST /run to the peer's current address -> (outcome, envelope, detail) (F66)."""
-        body = fleet_lib.canonical_json({"skill": skill, "task": task, "request_id": request_id})
+    def forward_run(self, record, skill, task, request_id, images=None):
+        """Signed POST /run to the peer's current address -> (outcome, envelope, detail) (F66).
+
+        images is the wire list exactly as /delegate received it (vision spec V15, V20).
+        """
+        request = {"skill": skill, "task": task, "request_id": request_id}
+        if images is not None:
+            request["images"] = images
+        body = fleet_lib.canonical_json(request)
         nonce = secrets.token_hex(16)
         headers = fleet_lib.sign_request(self.key, "POST", "/run", body, int(time.time()), nonce)
         headers["Content-Type"] = "application/json"
@@ -926,6 +937,8 @@ class Daemon(object):
             conn.close()
         if len(raw) > fleet_lib.MAX_BODY:
             return "bad_response", None, ""
+        if resp_headers.get("X-Fleet-Sig") is None and status in (413, 503):
+            return ("busy", None, "") if status == 503 else ("peer_error", None, "http 413")
         if fleet_lib.verify_response(self.key, status, "POST", "/run", nonce, resp_headers, raw,
                                      int(time.time()), self.response_nonces) != "ok":
             return "bad_signature", None, ""
