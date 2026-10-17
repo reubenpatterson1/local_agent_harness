@@ -68,6 +68,12 @@ DEPLOY_ROOT = "~/.local/share/qwen-agent"   # passed through os.path.expanduser 
 WS_SUBDIR = "qwen-agent-workspace"          # the workspace directory inside a release worktree
 LAUNCHD_LABEL = "com.qwen-agent.qwen-agentd"
 SYSTEMD_UNIT = "qwen-agentd.service"
+AGENTS_DIR = "~/agents"                     # A(<id>) = ~/agents/<id>, expanded at every use (multi-agent spec M2)
+LOGS_SUBDIR = "logs"                        # A(<id>)/logs (multi-agent spec M5)
+FLEET_ENV_NAME = "fleet.env"                # A(<id>)/fleet.env (multi-agent spec M4)
+SYSTEMD_UNIT_FMT = "qwen-agentd-%s.service" # systemd_unit(<id>) (multi-agent spec M6)
+BIN_DIR = "~/.local/bin"                    # where the agent commands live (multi-agent spec M8)
+COMMAND_NAME = "qwen-agent"                 # ~/.local/bin/qwen-agent and qwen-agent-<id> (multi-agent spec M8)
 SUPERVISOR_RESTART_DELAY = 10 # s, launchd ThrottleInterval and systemd RestartSec
 LOG_MAX_BYTES = 5242880       # 5 MB
 LOG_BACKUPS = 3
@@ -984,3 +990,69 @@ def run_update_cycle(ctx):
         return "error"
     ctx.restart()
     return "switched"
+
+
+# ---------------------------------------------------------------------------
+# Multi-agent hosts: agent IDs, service names, commands and agent resolution
+# (docs/superpowers/specs/2026-10-17-fleet-multi-agent-hosts-design.md)
+# ---------------------------------------------------------------------------
+
+def _check_agent_id(host_id):
+    """ValueError unless host_id is a valid agent ID; no path is built from a bad one (multi-agent spec M2)."""
+    if not isinstance(host_id, str) or not HOST_ID_RE.fullmatch(host_id):
+        raise ValueError("invalid agent id %r" % (host_id,))
+
+
+def launchd_label(host_id):
+    """com.qwen-agent.qwen-agentd.<id>, this agent's LaunchAgent label (multi-agent spec M6)."""
+    _check_agent_id(host_id)
+    return LAUNCHD_LABEL + "." + host_id
+
+
+def systemd_unit(host_id):
+    """qwen-agentd-<id>.service, this agent's systemd user unit (multi-agent spec M6)."""
+    _check_agent_id(host_id)
+    return SYSTEMD_UNIT_FMT % host_id
+
+
+def command_path(host_id):
+    """~/.local/bin/qwen-agent-<id>, this agent's command (multi-agent spec M8)."""
+    _check_agent_id(host_id)
+    return os.path.join(os.path.expanduser(BIN_DIR), COMMAND_NAME + "-" + host_id)
+
+
+def default_command_path():
+    """~/.local/bin/qwen-agent, the default agent's command (multi-agent spec M8)."""
+    return os.path.join(os.path.expanduser(BIN_DIR), COMMAND_NAME)
+
+
+def agent_ids_on_disk():
+    """Sorted IDs of the directories in ~/agents that hold fleet.env or current (multi-agent spec M21)."""
+    root = os.path.expanduser(AGENTS_DIR)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        path = os.path.join(root, name)
+        if (HOST_ID_RE.fullmatch(name) and os.path.isdir(path)
+                and (os.path.lexists(os.path.join(path, FLEET_ENV_NAME))
+                     or os.path.lexists(os.path.join(path, "current")))):
+            found.append(name)
+    return sorted(found)
+
+
+def resolve_agent(explicit):
+    """(host_id, None) or (None, stderr message) for an optional --agent-id (multi-agent spec M22)."""
+    if explicit is not None:
+        if isinstance(explicit, str) and HOST_ID_RE.fullmatch(explicit):
+            return explicit, None
+        return None, "qwen-agentd: invalid --agent-id '%s'" % (explicit,)
+    root = os.path.expanduser(AGENTS_DIR)
+    ids = agent_ids_on_disk()
+    if len(ids) == 1:
+        return ids[0], None
+    if not ids:
+        return None, "qwen-agentd: no agent found in %s; pass --agent-id ID" % root
+    return None, "qwen-agentd: more than one agent in %s (%s); pass --agent-id ID" % (root, ", ".join(ids))

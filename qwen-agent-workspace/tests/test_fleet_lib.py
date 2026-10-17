@@ -1126,3 +1126,45 @@ def test_t29b_launcher_and_fleet_lib_state_files_agree(tmp_path):
         assert launch.read_state(a) == fleet_lib.read_state(a) == {
             "from": None, "to": None, "status": "ok", "attempts": 0, "bad_tags": []}
     assert launch.read_state(str(tmp_path / "missing.json")) == fleet_lib.read_state(str(tmp_path / "missing.json"))
+
+
+# --- multi-agent hosts: agent IDs, names, resolution (multi-agent spec M2, M6, M8, M21, M22) ---
+
+BAD_AGENT_IDS = ("", "Mac", "../x", "a/b", "mac-local\n", None)
+
+
+def test_mt1a_service_and_command_names(monkeypatch):
+    monkeypatch.setenv("HOME", "/h")
+    assert fleet_lib.launchd_label("mac-local") == "com.qwen-agent.qwen-agentd.mac-local"
+    assert fleet_lib.systemd_unit("ollama-168") == "qwen-agentd-ollama-168.service"
+    assert fleet_lib.command_path("mac-local") == "/h/.local/bin/qwen-agent-mac-local"
+    assert fleet_lib.default_command_path() == "/h/.local/bin/qwen-agent"
+    for bad in BAD_AGENT_IDS:
+        for func in (fleet_lib.launchd_label, fleet_lib.systemd_unit, fleet_lib.command_path):
+            with pytest.raises(ValueError):
+                func(bad)
+
+
+def test_mt6_agent_ids_on_disk_and_resolve_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    agents = tmp_path / "agents"
+    assert fleet_lib.agent_ids_on_disk() == []
+    assert fleet_lib.resolve_agent(None) == (
+        None, "qwen-agentd: no agent found in %s; pass --agent-id ID" % agents)
+    (agents / "alpha").mkdir(parents=True)
+    (agents / "alpha" / "fleet.env").write_text("x")
+    assert fleet_lib.agent_ids_on_disk() == ["alpha"]
+    assert fleet_lib.resolve_agent(None) == ("alpha", None)
+    (agents / "bravo").mkdir()
+    (agents / "bravo" / "current").symlink_to("releases/v2026.01.01")
+    (agents / "Bad_Name").mkdir()
+    (agents / "Bad_Name" / "fleet.env").write_text("x")
+    (agents / "empty").mkdir()
+    (agents / "file").write_text("x")
+    (agents / "notes").mkdir()
+    (agents / "notes" / "readme").write_text("x")
+    assert fleet_lib.agent_ids_on_disk() == ["alpha", "bravo"]
+    assert fleet_lib.resolve_agent(None) == (
+        None, "qwen-agentd: more than one agent in %s (alpha, bravo); pass --agent-id ID" % agents)
+    assert fleet_lib.resolve_agent("zed") == ("zed", None)
+    assert fleet_lib.resolve_agent("Bad") == (None, "qwen-agentd: invalid --agent-id 'Bad'")
