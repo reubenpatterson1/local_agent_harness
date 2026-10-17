@@ -7,6 +7,7 @@ under test is found relative to this file, so a release's selftest always tests
 that release's own fleet_lib.py.
 """
 
+import base64
 import copy
 import hashlib
 import hmac
@@ -1430,3 +1431,142 @@ def test_mt3_write_wrapper_failure_leaves_no_tmp(tmp_path, monkeypatch):
     assert not os.path.lexists(path + ".tmp")
     with open(path, "rb") as f:
         assert f.read() == b"old\n"
+
+
+# --- vision agent: constants, image validation, body caps (vision spec V1-V7, V40) ---
+
+V_PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8
+V_JPEG = b"\xff\xd8\xff\xe0" + bytes(range(255, -1, -1)) * 8
+
+
+def _wire(data, media_type):
+    return {"media_type": media_type, "data": base64.b64encode(data).decode("ascii")}
+
+
+def _sized(magic, size):
+    return magic + b"\x00" * (size - len(magic))
+
+
+def test_vt1_vision_constants_and_skill_validation():
+    assert fleet_lib.KNOWN_SKILLS == ("investigator", "analyst", "planner", "researcher", "vision")
+    assert fleet_lib.VISION_SKILL == "vision"
+    assert fleet_lib.MAX_IMAGE_BODY == 25165824
+    assert fleet_lib.MAX_IMAGES == 4
+    assert fleet_lib.MAX_IMAGE_BYTES == 16777216
+    assert fleet_lib.LARGE_BODY_SLOTS == 2
+    assert fleet_lib.MAX_BODY == 1048576
+    assert fleet_lib.IMAGE_MAGIC == (("image/png", b"\x89PNG\r\n\x1a\n"), ("image/jpeg", b"\xff\xd8\xff"))
+    assert fleet_lib.IMAGE_EXTENSIONS == {"image/png": "png", "image/jpeg": "jpg"}
+    assert fleet_lib.RUN_TMP_SUBDIR == "tmp"
+    assert fleet_lib.RUN_TMP_PREFIX == "images-"
+    reg = _f18_registry()
+    reg["hosts"]["mac-local"]["skills"] = ["vision", "bogus"]
+    assert fleet_lib.validate_registry(reg, TEST_FLEET_ID) == [
+        "hosts.mac-local.skills[1]: must be one of investigator, analyst, planner, researcher, vision"]
+
+
+def test_vt2_validate_images_accepts_valid_lists():
+    png, jpeg = _wire(V_PNG, "image/png"), _wire(V_JPEG, "image/jpeg")
+    assert fleet_lib.validate_images([]) == []
+    assert fleet_lib.validate_images([png]) == [("image/png", V_PNG)]
+    assert fleet_lib.validate_images([png, jpeg, png, jpeg]) == [
+        ("image/png", V_PNG), ("image/jpeg", V_JPEG), ("image/png", V_PNG), ("image/jpeg", V_JPEG)]
+    half = fleet_lib.MAX_IMAGE_BYTES // 2
+    exact = [_wire(_sized(b"\x89PNG\r\n\x1a\n", half), "image/png"),
+             _wire(_sized(b"\xff\xd8\xff", half), "image/jpeg")]
+    decoded = fleet_lib.validate_images(exact)
+    assert [(m, len(d)) for m, d in decoded] == [("image/png", half), ("image/jpeg", half)]
+
+
+def _vt3_cases():
+    """(images, status, reason) for every validate_images failure in vision spec VT3."""
+    png = _wire(V_PNG, "image/png")
+    half = fleet_lib.MAX_IMAGE_BYTES // 2
+    over = [_wire(_sized(b"\x89PNG\r\n\x1a\n", half), "image/png"),
+            _wire(_sized(b"\xff\xd8\xff", half + 1), "image/jpeg")]
+    shape = "images[0] must be an object with exactly the keys media_type and data"
+    return [
+        ("x", 400, "images must be a list"),
+        ([png] * 5, 400, "at most 4 images are allowed (got 5)"),
+        (["x"], 400, shape),
+        ([{"media_type": "image/png", "data": "AA==", "extra": 1}], 400, shape),
+        ([{"media_type": "image/gif", "data": "AA=="}], 400,
+         "images[0].media_type must be image/png or image/jpeg"),
+        ([{"media_type": "image/png", "data": ""}], 400, "images[0].data must be a non-empty base64 string"),
+        ([{"media_type": "image/png", "data": 5}], 400, "images[0].data must be a non-empty base64 string"),
+        ([{"media_type": "image/png", "data": "!!!!"}], 400, "images[0].data is not valid base64"),
+        ([{"media_type": "image/png", "data": "AA=\n="}], 400, "images[0].data is not valid base64"),
+        ([{"media_type": "image/png", "data": "éAAA"}], 400, "images[0].data is not valid base64"),
+        ([_wire(V_JPEG, "image/png")], 400, "images[0] does not match its media_type image/png"),
+        ([png, {"media_type": "image/png"}], 400,
+         "images[1] must be an object with exactly the keys media_type and data"),
+        (over, 413, "images exceed 16777216 bytes in total"),
+        ([{"media_type": "image/gif", "data": "AA=="}] + over, 400,
+         "images[0].media_type must be image/png or image/jpeg"),
+    ]
+
+
+def test_vt3_validate_images_rejects_with_exact_reasons():
+    for images, status, reason in _vt3_cases():
+        with pytest.raises(fleet_lib.ImageError) as e:
+            fleet_lib.validate_images(images)
+        assert (e.value.status, e.value.reason) == (status, reason), reason
+        assert str(e.value) == e.value.reason
+        assert isinstance(e.value, ValueError)
+
+
+def test_vt9_image_error_reasons_never_echo_the_data():
+    for images, _status, _reason in _vt3_cases():
+        with pytest.raises(fleet_lib.ImageError) as e:
+            fleet_lib.validate_images(images)
+        reason = e.value.reason
+        items = images if isinstance(images, list) else [images]
+        for item in items:
+            data = item.get("data") if isinstance(item, dict) else item
+            if not isinstance(data, str) or len(data) < 8:
+                continue
+            assert not any(reason[i:i + 8] in data for i in range(len(reason) - 7)), reason
+
+
+def test_vt4_request_images_skill_rule():
+    png = _wire(V_PNG, "image/png")
+    assert fleet_lib.request_images({"skill": "vision", "task": "t", "images": [png]}) == [("image/png", V_PNG)]
+    assert fleet_lib.request_images({"skill": "researcher", "task": "t"}) is None
+    for req, reason in (({"skill": "researcher", "task": "t", "images": []},
+                         "images are only accepted for skill vision"),
+                        ({"skill": "vision", "task": "t"}, "skill vision requires 1 to 4 images"),
+                        ({"skill": "vision", "task": "t", "images": []}, "skill vision requires 1 to 4 images"),
+                        ({"skill": "vision", "task": "t", "images": "x"}, "images must be a list")):
+        with pytest.raises(fleet_lib.ImageError) as e:
+            fleet_lib.request_images(req)
+        assert (e.value.status, e.value.reason) == (400, reason), req
+
+
+def test_vt5_body_cap():
+    assert fleet_lib.body_cap("signed", "run") == fleet_lib.MAX_IMAGE_BODY
+    assert fleet_lib.body_cap("loopback", "delegate") == fleet_lib.MAX_IMAGE_BODY
+    for kind, name in (("signed", "health"), ("signed", "skills"), ("loopback", "peers"), ("unknown", None)):
+        assert fleet_lib.body_cap(kind, name) == fleet_lib.MAX_BODY, (kind, name)
+
+
+_VISION_185 = {
+    "role": "agent",
+    "address": "192.168.1.185",
+    "port": 8190,
+    "model_server": {"type": "vllm", "url": "http://127.0.0.1:8177/v1"},
+    "model": "DreamFast/Qwen3-VL-4b-Heretic",
+    "skills": ["vision"],
+}
+
+
+def test_vt7_vision_185_registry_entry_and_mlx_vlm_models():
+    reg = _f18_registry()
+    reg["hosts"]["vision-185"] = copy.deepcopy(_VISION_185)
+    assert fleet_lib.validate_registry(reg, TEST_FLEET_ID) == []
+    body = json.dumps({"object": "list", "data": [
+        {"id": "DreamFast/Qwen3-VL-4b-Heretic", "object": "model", "created": 1760000000, "loaded": True},
+        {"id": "mlx-community/other", "object": "model", "created": 1760000000, "loaded": False}]}).encode()
+    loaded = fleet_lib.parse_loaded_models("vllm", body)
+    assert loaded == {"DreamFast/Qwen3-VL-4b-Heretic", "mlx-community/other"}
+    assert fleet_lib.verify_skills(_VISION_185, loaded) == [
+        {"skill": "vision", "model": "DreamFast/Qwen3-VL-4b-Heretic", "verified": True}]

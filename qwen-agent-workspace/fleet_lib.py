@@ -11,6 +11,7 @@ time; fetch_view and delegate_once open a connection only when called. Valid on
 Python 3.9 and 3.13: no `X | Y` annotations, no `match`, no 3.10+ APIs.
 """
 
+import base64
 import copy
 import hashlib
 import hmac
@@ -42,10 +43,17 @@ FORWARD_TIMEOUT = 930         # s, RUN_TIMEOUT + 30: /delegate -> peer /run
 GATE_TIMEOUT = 300            # s, the staged release's selftest
 GIT_TIMEOUT = 120             # s, any single git subprocess
 MAX_BODY = 1048576            # bytes, request body cap
+MAX_IMAGE_BODY = 25165824     # bytes (24 MiB), request body cap for POST /run and POST /delegate only
+MAX_IMAGES = 4                # images per request
+MAX_IMAGE_BYTES = 16777216    # bytes (16 MiB), decoded total of all images in one request
+LARGE_BODY_SLOTS = 2          # concurrent POST /run bodies over MAX_BODY a daemon reads (V13)
 MAX_START_ATTEMPTS = 3
 KEEP_RELEASES = 3
 FLEET_TAG_CHARS = 16
-KNOWN_SKILLS = ("investigator", "analyst", "planner", "researcher")
+KNOWN_SKILLS = ("investigator", "analyst", "planner", "researcher", "vision")
+VISION_SKILL = "vision"
+IMAGE_MAGIC = (("image/png", b"\x89PNG\r\n\x1a\n"), ("image/jpeg", b"\xff\xd8\xff"))
+IMAGE_EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg"}
 FLEET_ENV_KEYS = ("QWEN_AGENT_FLEET_ID", "QWEN_AGENT_FLEET_TOKEN")
 FLEET_ENV_PREFIX = "QWEN_AGENT_FLEET_"   # every env key with this prefix is stripped (F54a, F86)
 TAG_RE = re.compile(r"^v([0-9]{4})\.([0-9]{2})\.([0-9]{2})(?:\.([1-9][0-9]*))?$")
@@ -79,6 +87,8 @@ WRAPPER_MAX_BYTES = 65536                   # a larger file is never a wrapper (
 SUPERVISOR_RESTART_DELAY = 10 # s, launchd ThrottleInterval and systemd RestartSec
 LOG_MAX_BYTES = 5242880       # 5 MB
 LOG_BACKUPS = 3
+RUN_TMP_SUBDIR = "tmp"        # A(<id>)/tmp holds one private directory per image run (V17)
+RUN_TMP_PREFIX = "images-"    # prefix of each run's directory; stale ones are removed at startup (V19)
 
 # Every regex above is applied with .fullmatch(), never .match(): "$" alone also
 # matches just before a trailing newline, so "mac-local\n" would otherwise pass.
@@ -90,6 +100,15 @@ class RegistryError(ValueError):
 
 class FleetEnvError(ValueError):
     """fleet.env or a join string is malformed (F21, F25). Never carries secret text."""
+
+
+class ImageError(ValueError):
+    """An images field fails validate_images or request_images (vision spec V5, V6)."""
+
+    def __init__(self, status, reason):
+        ValueError.__init__(self, reason)
+        self.status = status    # 400 or 413
+        self.reason = reason    # exact text sent as {"error": reason}
 
 
 def _is_int(value):
@@ -547,6 +566,68 @@ def build_child_env(environ, daemon_url):
         env[key] = value
     env["QWEN_AGENT_DAEMON_URL"] = daemon_url
     return env
+
+
+# ---------------------------------------------------------------------------
+# Vision: images on the wire (vision spec V4-V7)
+# ---------------------------------------------------------------------------
+
+def validate_images(images):
+    """Decode a wire `images` list -> [(media_type, bytes)]; raise ImageError at the first failure.
+
+    Checks, per item in order: shape, media_type, data, base64, magic bytes, then the
+    running decoded total (vision spec V5). 0 items is valid here; request_images
+    decides which skills need images.
+    """
+    if not isinstance(images, list):
+        raise ImageError(400, "images must be a list")
+    if len(images) > MAX_IMAGES:
+        raise ImageError(400, "at most %d images are allowed (got %d)" % (MAX_IMAGES, len(images)))
+    magic = dict(IMAGE_MAGIC)
+    decoded = []
+    total = 0
+    for index, item in enumerate(images):
+        loc = "images[%d]" % index
+        if not (isinstance(item, dict) and set(item) == {"media_type", "data"}):
+            raise ImageError(400, "%s must be an object with exactly the keys media_type and data" % loc)
+        media_type, data = item["media_type"], item["data"]
+        if not (isinstance(media_type, str) and media_type in magic):
+            raise ImageError(400, "%s.media_type must be image/png or image/jpeg" % loc)
+        if not (isinstance(data, str) and data != ""):
+            raise ImageError(400, "%s.data must be a non-empty base64 string" % loc)
+        try:
+            raw = base64.b64decode(data, validate=True)
+        except ValueError:
+            raise ImageError(400, "%s.data is not valid base64" % loc)
+        if not raw.startswith(magic[media_type]):
+            raise ImageError(400, "%s does not match its media_type %s" % (loc, media_type))
+        total += len(raw)
+        if total > MAX_IMAGE_BYTES:
+            raise ImageError(413, "images exceed %d bytes in total" % MAX_IMAGE_BYTES)
+        decoded.append((media_type, raw))
+    return decoded
+
+
+def request_images(req):
+    """Decoded images of a /delegate or /run body, or None when it has none (vision spec V6)."""
+    if "images" in req:
+        if req["skill"] != VISION_SKILL:
+            raise ImageError(400, "images are only accepted for skill vision")
+        decoded = validate_images(req["images"])
+        if not decoded:
+            raise ImageError(400, "skill vision requires 1 to %d images" % MAX_IMAGES)
+        return decoded
+    if req["skill"] == VISION_SKILL:
+        raise ImageError(400, "skill vision requires 1 to %d images" % MAX_IMAGES)
+    return None
+
+
+_IMAGE_ROUTES = (("signed", "run"), ("loopback", "delegate"))
+
+
+def body_cap(kind, name):
+    """Largest request body accepted on a route: MAX_IMAGE_BODY for /run and /delegate, else MAX_BODY."""
+    return MAX_IMAGE_BODY if (kind, name) in _IMAGE_ROUTES else MAX_BODY
 
 
 # ---------------------------------------------------------------------------
