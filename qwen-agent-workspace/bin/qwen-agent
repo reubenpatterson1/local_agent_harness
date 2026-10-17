@@ -1290,6 +1290,77 @@ def _envelope_to_result(skill, envelope):
     return "ERROR: the %s skill ended with status '%s': %s%s" % (skill, status, detail, partial)
 
 
+def _read_image(resolved, limit):
+    """(media_type, data, None) or (None, None, "ERROR: ...") for one image file (vision spec V30).
+
+    Reads at most limit + 1 bytes, so an oversized file is never loaded whole.
+    """
+    try:
+        with open(str(resolved), "rb") as f:
+            data = f.read(limit + 1)
+    except FileNotFoundError:
+        return None, None, "ERROR: no such image file: %s" % resolved
+    except IsADirectoryError:
+        return None, None, "ERROR: %s is a directory, not an image file." % resolved
+    except PermissionError:
+        return None, None, "ERROR: permission denied reading %s" % resolved
+    except OSError as e:
+        return None, None, "ERROR: could not read %s: %s" % (resolved, e)
+    if len(data) > limit:
+        return None, None, ("ERROR: the images are larger than %d bytes (16 MiB) in total."
+                            % MAX_IMAGE_BYTES)
+    media_type = _sniff_media_type(data)
+    if media_type is None:
+        return None, None, "ERROR: %s is not a PNG or JPEG file (checked by its first bytes)." % resolved
+    return media_type, data, None
+
+
+def _prepare_vision(images):
+    """Check, route and load one vision delegation (vision spec V30).
+
+    Returns an "ERROR: ..." string, or (candidates, resolved_paths, wire_images).
+    Paths are all resolved before anything is read; routing is decided before any
+    file is read; there is no local fallback when nothing serves vision.
+    """
+    if not images:
+        return ("ERROR: skill 'vision' requires 1 to %d images: workspace paths of PNG or "
+                "JPEG files." % MAX_IMAGES)
+    if len(images) > MAX_IMAGES:
+        return "ERROR: at most %d images are allowed (got %d)." % (MAX_IMAGES, len(images))
+    resolved_paths = []
+    for raw in images:
+        resolved, reason = resolve_in_workspace(raw)
+        if resolved is None:
+            sys.stderr.write("[rejected] delegate_to_skill: image path '%s' is outside the "
+                             "workspace -- not read.\n" % raw)
+            return ("ERROR: rejected image path '%s': %s. Nothing was read. All image paths "
+                    "must stay inside the workspace directory." % (raw, reason))
+        resolved_paths.append(resolved)
+    if FLEET is None or FLEET_DAEMON_URL is None:
+        return "ERROR: no live peer serves vision"
+    view, warning = FLEET.fetch_view(FLEET_DAEMON_URL)
+    if warning:
+        sys.stderr.write(warning + "\n")
+    if view is None:
+        return "ERROR: no live peer serves vision"
+    candidates = FLEET.route_candidates("vision", view)
+    if not candidates:
+        return "ERROR: no live peer serves vision"
+    wire = []
+    total = 0
+    for resolved in resolved_paths:
+        media_type, data, error = _read_image(resolved, MAX_IMAGE_BYTES - total)
+        if error:
+            return error
+        total += len(data)
+        wire.append({"media_type": media_type, "data": base64.b64encode(data).decode("ascii")})
+    try:
+        FLEET.validate_images(wire)
+    except FLEET.ImageError as e:
+        return "ERROR: %s." % e.reason
+    return candidates, resolved_paths, wire
+
+
 def exec_delegate_to_skill(args, args_ns):
     """Spawn a --skill subprocess and return its final answer (or an ERROR: string).
 
@@ -1307,7 +1378,18 @@ def exec_delegate_to_skill(args, args_ns):
     if skill not in allowed:
         return "ERROR: '%s' is not a valid delegation target here. Allowed: %s." % (skill, ", ".join(allowed))
 
-    if FLEET is not None and FLEET_DAEMON_URL is not None:
+    images = args.get("images")
+    if images is not None and skill != "vision":
+        return "ERROR: the images parameter is only accepted with skill 'vision'."
+    image_paths = []
+    if skill == "vision":
+        prepared = _prepare_vision(images)
+        if isinstance(prepared, str):
+            return prepared
+        candidates, image_paths, wire = prepared
+        if candidates != [FLEET.LOCAL]:
+            return _delegate_remote(skill, task, candidates, wire)
+    elif FLEET is not None and FLEET_DAEMON_URL is not None:
         view, warning = FLEET.fetch_view(FLEET_DAEMON_URL)
         if warning:
             sys.stderr.write(warning + "\n")
@@ -1335,6 +1417,8 @@ def exec_delegate_to_skill(args, args_ns):
         argv.append("--model-server-type=%s" % args_ns.model_server_type)
     if args_ns.api_key:
         argv.extend(["--api-key=%s" % args_ns.api_key])
+    for path in image_paths:
+        argv.extend(["--image", str(path)])
 
     # Create a new session ONLY at the top level, so one top-level delegation and every
     # process beneath it share a single process group the top level can always reach.
@@ -1388,7 +1472,7 @@ def exec_delegate_to_skill(args, args_ns):
     return _envelope_to_result(skill, envelope)
 
 
-def _delegate_remote(skill, task, candidates):
+def _delegate_remote(skill, task, candidates, images=None):
     """Run a delegation on live peers through the local qwen-agentd (fleet spec F69 steps 4-5).
 
     Never raises. Every result that is not an answer starts with ERROR:, so the
@@ -1400,7 +1484,7 @@ def _delegate_remote(skill, task, candidates):
         current[0] = host_id
         print("[delegating to %s on %s, up to %ds...]" % (skill, host_id, SKILL_SUBPROCESS_TIMEOUT),
               file=_ui())
-        outcome, envelope, _detail = FLEET.delegate_once(FLEET_DAEMON_URL, skill, task, host_id)
+        outcome, envelope, _detail = FLEET.delegate_once(FLEET_DAEMON_URL, skill, task, host_id, images)
         if outcome != "ok":
             print("[%s on %s failed: %s]" % (skill, host_id, outcome), file=_ui())
         return outcome, envelope

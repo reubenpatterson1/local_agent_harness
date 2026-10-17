@@ -415,3 +415,168 @@ def test_vt19_vision_requests_carry_no_tools_and_skip_the_probes(qa, monkeypatch
         qa.setup(types.SimpleNamespace(workspace=str(tmp_path / "ws"), base_url="http://127.0.0.1:9/v1",
                                        model="m", api_key=None, context_window=None, skill=skill))
         assert calls == expected, skill
+
+
+# --- exec_delegate_to_skill with images: rules, confinement, routing, reading (V29-V31) ---
+
+def _vision_state(qa, monkeypatch, tmp_path, daemon_url, argv=("--user-prompt=x",)):
+    """Module state as main() leaves it when the view serves vision: fleet loaded, every
+    target offered, WORKSPACE a realpath'd Path. Returns (args_ns, workspace str)."""
+    _FakeProc.calls = []
+    monkeypatch.setattr(qa.subprocess, "Popen", _FakeProc)
+    monkeypatch.setattr(qa, "ONESHOT", True)
+    ws = os.path.realpath(str(tmp_path / "ws"))
+    os.makedirs(ws, exist_ok=True)
+    monkeypatch.setattr(qa, "WORKSPACE", qa.Path(ws))
+    monkeypatch.setattr(qa, "FLEET", qa._load_fleet_lib())
+    monkeypatch.setattr(qa, "FLEET_DAEMON_URL", daemon_url)
+    tools = qa.build_tools_for_context(None, qa.DELEGATE_TARGETS[None])
+    monkeypatch.setattr(qa, "TOOLS", tools)
+    monkeypatch.setattr(qa, "TOOL_BY_NAME", {t["function"]["name"]: t for t in tools})
+    return qa.parse_args(list(argv)), ws
+
+
+def _record_reads(qa, monkeypatch):
+    reads = []
+    real = qa._read_image
+
+    def recording(resolved, limit):
+        reads.append(str(resolved))
+        return real(resolved, limit)
+
+    monkeypatch.setattr(qa, "_read_image", recording)
+    return reads
+
+
+def test_vt16_vision_argument_rules_confinement_and_routing(qa, monkeypatch, tmp_path, capsys):
+    daemon = _FakeDaemon(view=_view([], [("v1", [_skill("vision")])]), outcomes={"v1": ("ok", _OK)})
+    try:
+        args_ns, ws = _vision_state(qa, monkeypatch, tmp_path, daemon.url)
+        _write(os.path.join(ws, "a.png"), PNG_BYTES)
+        _write(os.path.join(ws, "notes.txt"), b"just text\n")
+        os.makedirs(os.path.join(ws, "folder.png"))
+        _write(str(tmp_path / "outside.png"), PNG_BYTES)
+        reads = _record_reads(qa, monkeypatch)
+
+        def call(args):
+            return qa.exec_delegate_to_skill(args, args_ns)
+
+        assert call({"skill": "researcher", "task": "t", "images": ["a.png"]}) == \
+            "ERROR: the images parameter is only accepted with skill 'vision'."
+        requires = "ERROR: skill 'vision' requires 1 to 4 images: workspace paths of PNG or JPEG files."
+        assert call({"skill": "vision", "task": "t"}) == requires
+        assert call({"skill": "vision", "task": "t", "images": []}) == requires
+        assert call({"skill": "vision", "task": "t", "images": ["a.png"] * 5}) == \
+            "ERROR: at most 4 images are allowed (got 5)."
+        capsys.readouterr()
+        for paths, raw in ((["a.png", "../outside.png"], "../outside.png"), (["/etc/hosts"], "/etc/hosts")):
+            result = call({"skill": "vision", "task": "t", "images": paths})
+            assert result.startswith("ERROR: rejected image path '%s': it resolves to '" % raw), result
+            assert result.endswith("is outside the workspace '%s'. Nothing was read. All image paths must "
+                                   "stay inside the workspace directory." % ws), result
+        err = capsys.readouterr().err
+        assert "[rejected] delegate_to_skill: image path '../outside.png' is outside the workspace -- not read.\n" in err
+        assert reads == [] and daemon.requests == []
+
+        monkeypatch.setattr(qa, "FLEET", None)
+        assert call({"skill": "vision", "task": "t", "images": ["a.png"]}) == "ERROR: no live peer serves vision"
+        monkeypatch.setattr(qa, "FLEET", qa._load_fleet_lib())
+        daemon.view = _view([_skill("analyst")], [("p1", [_skill("researcher")])])
+        assert call({"skill": "vision", "task": "t", "images": ["a.png"]}) == "ERROR: no live peer serves vision"
+        assert reads == [] and daemon.delegate_bodies() == []
+
+        daemon.view = _view([], [("v1", [_skill("vision")])])
+        assert call({"skill": "vision", "task": "t", "images": ["notes.txt"]}) == \
+            "ERROR: %s is not a PNG or JPEG file (checked by its first bytes)." % os.path.join(ws, "notes.txt")
+        assert call({"skill": "vision", "task": "t", "images": ["missing.png"]}) == \
+            "ERROR: no such image file: %s" % os.path.join(ws, "missing.png")
+        assert call({"skill": "vision", "task": "t", "images": ["folder.png"]}) == \
+            "ERROR: %s is a directory, not an image file." % os.path.join(ws, "folder.png")
+        monkeypatch.setattr(qa, "MAX_IMAGE_BYTES", 100)
+        _write(os.path.join(ws, "big.png"), b"\x89PNG\r\n\x1a\n" + b"\x00" * 93)
+        assert call({"skill": "vision", "task": "t", "images": ["big.png"]}) == \
+            "ERROR: the images are larger than 100 bytes (16 MiB) in total."
+        assert daemon.delegate_bodies() == [] and _FakeProc.calls == []
+    finally:
+        daemon.close()
+
+
+def test_vt17_remote_vision_sends_wire_images_and_fails_over(qa, monkeypatch, tmp_path, capsys):
+    daemon = _FakeDaemon(view=_view([], [("a", [_skill("vision")]), ("b", [_skill("vision")])]),
+                         outcomes={"a": ("busy", None), "b": ("ok", _OK)})
+    try:
+        args_ns, ws = _vision_state(qa, monkeypatch, tmp_path, daemon.url)
+        _write(os.path.join(ws, "a.png"), PNG_BYTES)
+        _write(os.path.join(ws, "b.jpg"), JPEG_BYTES)
+        args = {"skill": "vision", "task": "look", "images": ["a.png", "b.jpg"]}
+        assert qa.exec_delegate_to_skill(args, args_ns) == "REMOTE"
+        images = [_wire(PNG_BYTES, "image/png"), _wire(JPEG_BYTES, "image/jpeg")]
+        assert daemon.delegate_bodies() == [
+            {"skill": "vision", "task": "look", "host_id": "a", "images": images},
+            {"skill": "vision", "task": "look", "host_id": "b", "images": images}]
+        err = capsys.readouterr().err
+        assert "[delegating to vision on a, up to 900s...]" in err
+        assert "[vision on a failed: busy]" in err
+        assert "[delegating to vision on b, up to 900s...]" in err
+        assert _FakeProc.calls == []
+        daemon.outcomes = {"a": ("busy", None), "b": ("timeout", None)}
+        assert qa.exec_delegate_to_skill(args, args_ns) == \
+            "ERROR: no live host serves 'vision' (tried: a: busy; b: timeout)"
+    finally:
+        daemon.close()
+
+
+def test_vt18_local_vision_runs_a_child_with_its_image_paths(qa, monkeypatch, tmp_path):
+    daemon = _FakeDaemon(view=_view([_skill("vision"), _skill("researcher")], [("a", [_skill("vision")])]))
+    try:
+        args_ns, ws = _vision_state(qa, monkeypatch, tmp_path, daemon.url)
+        _write(os.path.join(ws, "a.png"), PNG_BYTES)
+        _write(os.path.join(ws, "b.jpg"), JPEG_BYTES)
+        args = {"skill": "vision", "task": "look", "images": ["a.png", "b.jpg"]}
+        assert qa.exec_delegate_to_skill(args, args_ns) == "LOCAL"
+        assert _FakeProc.calls == [_today_argv(qa, args_ns, "vision", "look", ws) + [
+            "--image", os.path.join(ws, "a.png"), "--image", os.path.join(ws, "b.jpg")]]
+        assert daemon.delegate_bodies() == []
+        _FakeProc.calls = []
+        assert qa.exec_delegate_to_skill({"skill": "researcher", "task": "t"}, args_ns) == "LOCAL"
+        assert _FakeProc.calls == [_today_argv(qa, args_ns, "researcher", "t", ws)]
+    finally:
+        daemon.close()
+
+
+def test_vision_focus_2_paths_with_spaces_and_non_ascii(qa, monkeypatch, tmp_path):
+    """Review Focus 2: images in a folder such as 'my shots/фото 1.png' (a space and
+    non-ASCII letters, as macOS Finder names produce). Expected: the local child gets
+    the resolved path as one --image argument, and a remote delegation sends exactly
+    the file's bytes."""
+    daemon = _FakeDaemon(view=_view([_skill("vision")], []))
+    try:
+        args_ns, ws = _vision_state(qa, monkeypatch, tmp_path, daemon.url)
+        rel = os.path.join("my shots", "фото 1.png")
+        _write(os.path.join(ws, rel), PNG_BYTES)
+        args = {"skill": "vision", "task": "t", "images": [rel]}
+        assert qa.exec_delegate_to_skill(args, args_ns) == "LOCAL"
+        assert _FakeProc.calls[-1][-2:] == ["--image", os.path.join(ws, rel)]
+        daemon.view = _view([], [("a", [_skill("vision")])])
+        daemon.outcomes = {"a": ("ok", _OK)}
+        assert qa.exec_delegate_to_skill(args, args_ns) == "REMOTE"
+        assert daemon.delegate_bodies()[-1]["images"] == [_wire(PNG_BYTES, "image/png")]
+    finally:
+        daemon.close()
+
+
+def test_vision_focus_3_symlink_out_of_the_workspace_is_never_read(qa, monkeypatch, tmp_path):
+    """Review Focus 3: ws/link.png is a symlink to a PNG outside the workspace. Expected:
+    rejected as outside the workspace, the target is never read, and the daemon is
+    never contacted."""
+    daemon = _FakeDaemon(view=_view([], [("a", [_skill("vision")])]), outcomes={"a": ("ok", _OK)})
+    try:
+        args_ns, ws = _vision_state(qa, monkeypatch, tmp_path, daemon.url)
+        outside = os.path.realpath(_write(str(tmp_path / "private" / "x.png"), PNG_BYTES))
+        os.symlink(outside, os.path.join(ws, "link.png"))
+        reads = _record_reads(qa, monkeypatch)
+        result = qa.exec_delegate_to_skill({"skill": "vision", "task": "t", "images": ["link.png"]}, args_ns)
+        assert result.startswith("ERROR: rejected image path 'link.png': it resolves to '%s'" % outside), result
+        assert reads == [] and daemon.requests == [] and _FakeProc.calls == []
+    finally:
+        daemon.close()
