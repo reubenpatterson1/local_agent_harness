@@ -1,7 +1,7 @@
 # fleet-host-prep -- Design Spec (rollout R0 prerequisites check and fix)
 
 Date: 2026-10-17
-Status: The user approved every design decision in the 2026-10-17 brief: check mode by default and `--apply` to fix; the CLI; the seven checks and their order; the sudo policy; the output format; the SearXNG stable directory; reuse of `fleet_lib`; the test harness rules; and live acceptance. This document writes those decisions down precisely enough to implement them without reopening any. Every value the brief left open is marked **[spec choice]** with a one-line reason, and Section 9 collects them all. No design decision is left open.
+Status: The user approved every design decision in the 2026-10-17 brief: check mode by default and `--apply` to fix; the CLI; the seven checks and their order; the sudo policy; the output format; the SearXNG stable directory; reuse of `fleet_lib`; the test harness rules; and live acceptance. This document writes those decisions down precisely enough to implement them without reopening any. Two user-approved amendments (2026-10-17) add `--no-searxng` and `--port N`. Every value the brief left open is marked **[spec choice]** with a one-line reason, and Section 9 collects them all. No design decision is left open.
 
 Repository: `/Users/reubenpatterson/local_agent_harness`, branch `qwen-agent-redteam`, HEAD `55ee4d5` when this was written. `WS` is `qwen-agent-workspace/`, and relative paths are relative to `WS`.
 
@@ -108,7 +108,8 @@ Everything in Sections 1-6 is a must-have. Nice-to-haves, not to be built: distr
 
   ```
   Usage: fleet-host-prep.sh --model-server-type {ollama|vllm} --model NAME
-                            [--model-url URL] [--searxng-url URL] [--lan-cidr CIDR] [--apply]
+                            [--model-url URL] [--searxng-url URL | --no-searxng]
+                            [--lan-cidr CIDR] [--port N] [--apply]
 
   Checks the qwen-agent fleet rollout prerequisites (R0) on this host: platform,
   packages, clock, model, searxng, firewall, linger. Changes nothing unless
@@ -119,7 +120,9 @@ Everything in Sections 1-6 is a must-have. Nice-to-haves, not to be built: distr
     --model-url URL       default: http://127.0.0.1:11434/v1 (ollama),
                           http://127.0.0.1:8177/v1 (vllm)
     --searxng-url URL     default: http://127.0.0.1:8888/
-    --lan-cidr CIDR       fleet LAN that must reach port 8190; default: 192.168.1.0/24
+    --no-searxng          skip the searxng check (a host that serves only no-tools skills)
+    --lan-cidr CIDR       fleet LAN that must reach the fleet port; default: 192.168.1.0/24
+    --port N              the fleet daemon's TCP and UDP port, 1024-65535; default: 8190
     --apply               fix failing checks (asks for your sudo password once)
     -h, --help            show this help
 
@@ -129,6 +132,7 @@ Everything in Sections 1-6 is a must-have. Nice-to-haves, not to be built: distr
 
   Parsing is a `while [ $# -gt 0 ]; case "$1" in ... esac` loop.
   - `-h`/`--help`: print the usage and exit 0 at once. Nothing else runs, not even `id`.
+  - `--apply` and `--no-searxng` take no value. Every other flag except `-h`/`--help` is a value flag.
   - Value flags take the **next** argument. A value flag that is last, or whose next argument starts with `--`, is a usage error `<flag> needs a value`. **[spec choice: catches `--model --apply`.]**
   - Repeating a flag: the last value wins.
   - `--flag=value` is not supported. It is an `unknown argument '<arg>'` error. **[spec choice: one syntax, fewer branches.]**
@@ -137,17 +141,21 @@ Everything in Sections 1-6 is a must-have. Nice-to-haves, not to be built: distr
   1. `--model-server-type` absent: `missing --model-server-type`.
   2. Its value not exactly `ollama` or `vllm`: `--model-server-type must be ollama or vllm, got '<v>'`.
   3. `--model` absent or empty: `missing --model`.
-  4. `--lan-cidr` invalid: `--lan-cidr must be an IPv4 network with zero host bits, e.g. 192.168.1.0/24, got '<v>'`. **[spec choice]** A valid value:
+  4. `--no-searxng` and `--searxng-url` both given (in either order): `--no-searxng and --searxng-url cannot be used together`.
+  5. `--lan-cidr` invalid: `--lan-cidr must be an IPv4 network with zero host bits, e.g. 192.168.1.0/24, got '<v>'`. **[spec choice]** A valid value:
      - matches `^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$`;
      - has each octet `<= 255` (use `10#` in arithmetic) and a prefix length `<= 32`;
      - has zero host bits: with `ip = (o1<<24)|(o2<<16)|(o3<<8)|o4`, `ip & ((1 << (32 - len)) - 1) == 0`, where a prefix length of 0 requires `ip == 0`. bash 3.2 arithmetic is 64-bit, so this is safe.
 
      Reason for zero host bits: ufw and firewalld display the normalized network address, so a check against `192.168.1.5/24` would never match what the fix adds.
+  6. `--port` invalid: `--port must be a decimal integer from 1024 to 65535, got '<v>'`. A valid value matches `^[1-9][0-9]{3,4}$` and satisfies `1024 <= v <= 65535` (compare with `10#$v`). **[spec choice: no leading zeros, so the value is printed and matched in ufw and firewalld output exactly as ufw normalizes it.]**
 
   Defaults are applied after validation:
   - `MODEL_URL`: `http://127.0.0.1:11434/v1` (ollama) or `http://127.0.0.1:8177/v1` (vllm).
   - `SEARXNG_URL`: `http://127.0.0.1:8888/`.
   - `LAN_CIDR`: `192.168.1.0/24`.
+  - `PORT`: `8190`.
+  - `NO_SEARXNG`: `0` (`1` with `--no-searxng`).
   - `APPLY`: `0`.
 
   `--model-url` and `--searxng-url` are not validated.
@@ -298,7 +306,8 @@ The re-check runs once.
 The custom-URL case has no automatic fix. **[spec choice: `ollama pull` targets the CLI's default server, which may not be the one at a custom `--model-url`.]**
 
 **searxng.**
-- The test is `code=$(curl -sS --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' "$SEARXNG_URL" 2>/dev/null); rc=$?`.
+- With `--no-searxng`: `SKIP searxng: disabled by --no-searxng`. No `curl` call for SearXNG, no `docker` call, and no fix, in both modes. A SKIP never fails the run (P11). The model check's own `curl` call is not affected.
+- Otherwise the test is `code=$(curl -sS --noproxy '*' --max-time 5 -o /dev/null -w '%{http_code}' "$SEARXNG_URL" 2>/dev/null); rc=$?`.
   - Pass iff `rc` is 0 and `code` is `200`, with detail `HTTP 200 at <SEARXNG_URL>`.
   - Fail with `no answer at <SEARXNG_URL> (curl exit <rc>)` when `rc` is nonzero, or `HTTP <code> at <SEARXNG_URL>` otherwise.
 - **Custom URL** (`SEARXNG_URL` is not exactly `http://127.0.0.1:8888/`): no automatic fix. Fix line: `check that <SEARXNG_URL> is up and that no_proxy covers its host; if this host cannot run SearXNG, set QWEN_AGENT_SEARXNG_URL with the systemd drop-in described in R0 of the fleet spec`. No `docker` command runs.
@@ -324,7 +333,7 @@ The custom-URL case has no automatic fix. **[spec choice: `ollama pull` targets 
 
 ### P15. `firewall`
 
-The firewall must admit port 8190, TCP and UDP, from `LAN_CIDR`.
+The firewall must admit port `PORT` (`--port`, default 8190), TCP and UDP, from `LAN_CIDR`. Below, `<PORT>` stands for its value. The macOS application firewall allows by binary, not by port, so `PORT` does not affect the macOS branch or its messages. **[spec choice: the macOS messages stay port-free because the rule they describe is port-free.]**
 
 **macOS.** `SFW --getglobalstate`, then:
 
@@ -355,20 +364,20 @@ The daemon must be installed with this same `python3` ([FLEET] F90 records `sys.
    - First line `Status: inactive` gives `UFW_ACTIVE=0`. `Status: active` gives `UFW_ACTIVE=1`.
    - Any other first line gives `FAIL firewall: unrecognized 'ufw status' output '<line>'`, fix `check 'sudo ufw status' by hand`.
 Steps 3-6 form one if/elif chain, evaluated in this order; the first matching branch decides.
-3. `UFW_ACTIVE=1` and `FWD=1`: `FAIL firewall: ufw and firewalld are both active`, fix `allow TCP and UDP 8190 from <CIDR> in both firewalls by hand: sudo ufw allow from <CIDR> to any port 8190; and the two firewalld rich rules and reload shown in the fleet-host-prep spec P15`. No automatic fix. **[spec choice: running both is unusual and they can conflict; the script does not guess which one governs.]**
+3. `UFW_ACTIVE=1` and `FWD=1`: `FAIL firewall: ufw and firewalld are both active`, fix `allow TCP and UDP <PORT> from <CIDR> in both firewalls by hand: sudo ufw allow from <CIDR> to any port <PORT>; and the two firewalld rich rules and reload shown in the fleet-host-prep spec P15`. No automatic fix. **[spec choice: running both is unusual and they can conflict; the script does not guess which one governs.]**
 4. Else if `UFW_ACTIVE=1`: scan the status lines with `while read -r f1 f2 f3 rest` (default IFS).
    - A line **allows** when `f2` is `ALLOW` and `f3` is `<CIDR>` or `Anywhere`. **[spec choice: a broader `Anywhere` allow still admits the LAN.]**
-   - `f1` `8190` covers TCP and UDP, `8190/tcp` covers TCP, `8190/udp` covers UDP.
-   - Every other line is ignored. This excludes `(v6)` rows (where `f2` is `(v6)`), interface rows (`8190 on eth0`, where `f2` is `on`), `DENY`, `LIMIT` and `REJECT` rows, `ALLOW OUT` rows (where `f3` is `OUT`), rows with a destination address, and the header lines.
-   - It passes iff TCP and UDP are both covered, with detail `ufw allows 8190 tcp+udp from <CIDR>`. Otherwise it fails with `ufw active; no rule allows 8190 <missing> from <CIDR>`, where `<missing>` is `tcp, udp`, `tcp` or `udp`.
-   - Fix (one command, which covers both protocols): `sudo ufw allow from <CIDR> to any port 8190`. The re-check runs once.
+   - `f1` equal to `<PORT>` covers TCP and UDP, `<PORT>/tcp` covers TCP, `<PORT>/udp` covers UDP. A row for any other port (for example `8190` when `PORT` is `8191`) covers nothing.
+   - Every other line is ignored. This excludes `(v6)` rows (where `f2` is `(v6)`), interface rows (`<PORT> on eth0`, where `f2` is `on`), `DENY`, `LIMIT` and `REJECT` rows, `ALLOW OUT` rows (where `f3` is `OUT`), rows with a destination address, and the header lines.
+   - It passes iff TCP and UDP are both covered, with detail `ufw allows <PORT> tcp+udp from <CIDR>`. Otherwise it fails with `ufw active; no rule allows <PORT> <missing> from <CIDR>`, where `<missing>` is `tcp, udp`, `tcp` or `udp`.
+   - Fix (one command, which covers both protocols): `sudo ufw allow from <CIDR> to any port <PORT>`. The re-check runs once.
 5. Else if `FWD=1`: read `sudo -n firewall-cmd --permanent --list-rich-rules`. A nonzero exit gives UNKNOWN, `cannot read firewalld rules without sudo`, with the read command shown as `sudo firewall-cmd --permanent --list-rich-rules`.
-   - `RULE_tcp` and `RULE_udp` are exactly `rule family="ipv4" source address="<CIDR>" port port="8190" protocol="<proto>" accept`.
-   - It passes iff each of them equals some output line, with detail `firewalld allows 8190 tcp+udp from <CIDR>`. Otherwise it fails with `firewalld running; missing rich rules for 8190 <missing> from <CIDR>`.
+   - `RULE_tcp` and `RULE_udp` are exactly `rule family="ipv4" source address="<CIDR>" port port="<PORT>" protocol="<proto>" accept`.
+   - It passes iff each of them equals some output line, with detail `firewalld allows <PORT> tcp+udp from <CIDR>`. Otherwise it fails with `firewalld running; missing rich rules for <PORT> <missing> from <CIDR>`.
    - Fix: `sudo firewall-cmd --permanent --add-rich-rule=<RULE_p>` for each **missing** protocol, in the order tcp then udp, then `sudo firewall-cmd --reload`. **[spec choice: adds only what is missing, so the script never depends on `ALREADY_ENABLED` exit codes.]** The re-check runs once.
 6. Else if `UFW=1` (so ufw is inactive and firewalld is not running): `PASS firewall: ufw inactive`. Else (`UFW=0`, `FWD=0`): `PASS firewall: no host firewall active`.
 
-Known limitation: the check reads only the rules shown by `ufw status` and firewalld's default zone. It does not read ufw's default incoming policy, the order of rules (a `DENY` above an `ALLOW`), or firewalld zone bindings by source. A host that admits 8190 some other way gets a redundant rule from `--apply`. That is harmless.
+Known limitation: the check reads only the rules shown by `ufw status` and firewalld's default zone. It does not read ufw's default incoming policy, the order of rules (a `DENY` above an `ALLOW`), or firewalld zone bindings by source. A host that admits `PORT` some other way gets a redundant rule from `--apply`. That is harmless.
 
 ### P16. `linger`
 
@@ -493,7 +502,7 @@ The test file writes a dispatcher `<tmp>/fakebin.py` (its source is a string con
 | `docker` | `start qwen-agent-searxng` | exit 1 if the name is not in `containers`; group `searxng`: `searxng = "ok"` |
 | `docker` | `compose -p qwen-agent-searxng -f F up -d` | exit 14 unless `F` and `dirname(F)/settings.yml` both exist; group `searxng`: append `qwen-agent-searxng` to `containers`, `searxng = "ok"` |
 | `ufw` | `status` | print `ufw_out` |
-| `ufw` | `allow from C to any port 8190` | group `firewall`: append the row `"%-26s %-12s%-26s\n" % ("8190", "ALLOW", C)` to `ufw_out` |
+| `ufw` | `allow from C to any port P` | group `firewall`: append the row `"%-26s %-12s%-26s\n" % (P, "ALLOW", C)` to `ufw_out` |
 | `firewall-cmd` | `--state` | print `firewalld`; exit 0 if it is `running`, else 252 |
 | `firewall-cmd` | `--permanent --list-rich-rules` | print `firewalld_rules`, one per line |
 | `firewall-cmd` | `--permanent --add-rich-rule=R` | group `firewall`: append `R` |
@@ -542,7 +551,7 @@ The test file writes a dispatcher `<tmp>/fakebin.py` (its source is a string con
 | H3 | P9, P12, P13-P16 | `--apply`, Linux all-fail. Exactly one `sudo -v` call. It comes after `id -u` and before the first `uname` call. `plus_lines` equals, in order (with `<H>` the tmp HOME and `SX=<H>/.local/share/qwen-agent/searxng`): `+ sudo apt-get update`; `+ sudo apt-get install -y python3 git python3-pytest`; `+ sudo timedatectl set-ntp true`; `+ ollama pull qwen3.5:9b`; `+ mkdir -p <SX>`; `+ cp <WS>/searxng/docker-compose.yml <WS>/searxng/settings.yml <SX>/`; `+ docker compose -p qwen-agent-searxng -f <SX>/docker-compose.yml up -d`; `+ sudo ufw allow from 192.168.1.0/24 to any port 8190`; `+ sudo loginctl enable-linger tester`. Status lines: platform PASS, the other six FIXED. Exit 0. The copied files are byte-identical to the repo's. `pulling manifest` appears between `+ ollama pull` and `FIXED model`. |
 | H4 | P12 | (a) `fix.linger="noop"`: `FAIL linger: Linger=no for tester (fix did not take)` plus a fix line; exit 1. (b) `fix.packages="exit:100"`: `FAIL packages: missing: python3 >= 3.9, git, pytest (fix exited 100)`, and the later fixes (`timedatectl set-ntp`, ... `loginctl enable-linger`) still run. (c) `fix.apt_update="exit:100"`: `+ sudo apt-get update` is printed, no `apt-get install` call is made, and the line ends `(fix exited 100)`. |
 | H5 | P12 | `--apply` on Linux all-pass and on macOS all-pass: exit 0, `plus_lines == []`, `mutating == []`, exactly one `sudo -v`. |
-| H6 | P5-P7 | Each exits 2 with stderr starting `fleet-host-prep.sh: ` and makes no `sudo` or `uname` call: `uid=0` with valid args (message contains `refusing to run as root`); missing `--model`; missing `--model-server-type`; `--model-server-type llama`; `--bogus`; `--model` as the last arg; `--model --apply`; `--model=qwen3.5:9b`; `--lan-cidr` set to `192.168.1.0/33`, `300.1.1.0/24`, `192.168.1.5/24` or `192.168.1.0`. `-h` and `--help`: exit 0, stdout starts `Usage: fleet-host-prep.sh`, and `calls()` is empty. `--lan-cidr 10.0.0.0/8` is accepted (all-pass with `ufw_out` carrying a `10.0.0.0/8` row, exit 0). |
+| H6 | P5-P7 | Each exits 2 with stderr starting `fleet-host-prep.sh: ` and makes no `sudo` or `uname` call: `uid=0` with valid args (message contains `refusing to run as root`); missing `--model`; missing `--model-server-type`; `--model-server-type llama`; `--bogus`; `--model` as the last arg; `--model --apply`; `--model=qwen3.5:9b`; `--lan-cidr` set to `192.168.1.0/33`, `300.1.1.0/24`, `192.168.1.5/24` or `192.168.1.0`; `--port` set to `1023`, `65536`, `0`, `abc`, `08191` or `8190.0`; `--port` as the last arg; `--no-searxng --searxng-url http://127.0.0.1:8888/` and the reverse order (message contains `cannot be used together`); `--no-searxng=1`. `-h` and `--help`: exit 0, stdout starts `Usage: fleet-host-prep.sh`, and `calls()` is empty. `--lan-cidr 10.0.0.0/8` is accepted (all-pass with `ufw_out` carrying a `10.0.0.0/8` row, exit 0). `--port 1024` and `--port 65535` are accepted (all-pass with `ufw_out` carrying a row for that port, exit 0). |
 | H7 | P13a | `--apply`, Linux, `absent` includes `apt-get` and `dnf`, `git` absent, `linger="no"`: `PASS platform: linux (no apt-get/dnf: ...)`; `FAIL packages: missing: git` with `  fix: install python3 (>= 3.9), git and pytest with this host's package manager, then re-run`; `FIXED linger`; exit 1. |
 | H8 | P9, P15 | Check mode, `sudo_n_ok=false`, ufw present: `UNKNOWN firewall: cannot read ufw rules without sudo` and `  fix: run 'sudo -v' first, or use --apply`; summary `6 pass, 0 fixed, 0 fail, 1 unknown, 0 skip`; exit 1. Same with `--apply`: the fix line is `  fix: 'sudo -n' failed even after 'sudo -v'; run 'sudo ufw status' by hand` and there is no `ufw allow` call. |
 | H9 | P14 | `--apply`, `searxng="down"`. (a) `groups="tester docker"`, no container: the `docker ps` and `docker compose` calls are direct (no sudo); the compose fake's file check passes (proves the copy happened first); FIXED. (b) `groups="tester"`: the calls include `sudo -n docker ps -a --format {{.Names}}`, and the `+` line is `+ sudo docker compose -p ...`; FIXED. (c) `containers=["qwen-agent-searxng"]`: `+ docker start qwen-agent-searxng`, no compose call, stable dir absent; FIXED. (d) `docker` absent: `FAIL searxng: no answer at http://127.0.0.1:8888/ (curl exit 7); Docker not installed (this script never installs Docker)`, no docker call. (e) `lag.searxng=5`: FIXED, and exactly 5 `sleep 1` calls. (f) `fix.searxng="noop"`: FAIL `... (fix did not take)`, 1 + 30 searxng curl calls, 29 `sleep 1` calls. (g) `docker_ps_exit=1`: FAIL containing `'docker ps -a' failed (exit 1)`. |
@@ -552,15 +561,16 @@ The test file writes a dispatcher `<tmp>/fakebin.py` (its source is a string con
 | H13 | P14 | `--searxng-url http://127.0.0.1:9999/`, `searxng="down"`, `--apply`: FAIL searxng whose fix line contains `QWEN_AGENT_SEARXNG_URL` and `no_proxy`; no `docker` call. |
 | H14 | P12 | In H3's run, every `curl` call's argv starts `-sS --noproxy * --max-time 5`. |
 | H15 | P8, P14 | (a) Linux all-pass: the model curl URL is `http://127.0.0.1:11434/api/tags`. macOS: `http://127.0.0.1:8177/v1/models`. `--model-url http://127.0.0.1:11434` (no `/v1`) still gives `.../api/tags`. (b) The script text contains `fleet_lib.probe_url` and `fleet_lib.parse_loaded_models`, and does not contain `api/tags` or `/models`. (c) `model="down"`, `--apply`: `FAIL model: ollama not reachable at http://127.0.0.1:11434/api/tags (curl exit 7)`, no `ollama` call. (d) `ollama` absent, `model="missing"`, `--apply`: FAIL with the not-on-PATH fix line. (e) `--model-url http://127.0.0.1:11500/v1`, `model="missing"`, `--apply`: FAIL with the `by hand` line, no `ollama` call. (f) `fix.model="exit:1"`: `(fix exited 1)`. (g) `python3` absent: `FAIL model: python3 cannot load fleet_lib from <WS>`. |
-| H16 | P15 | ufw parsing, check mode, `ufw_out` = the header plus these rows (as `"%-26s %-12s%-26s"`, with an optional ` # fleet` comment). PASS: `8190 ALLOW 192.168.1.0/24`; `8190/tcp` + `8190/udp` rows; `8190 ALLOW Anywhere`; `8190 ALLOW 192.168.1.0/24 # fleet`. FAIL with the missing protocols shown: only `8190/tcp` (`udp`); only `8190 (v6) ALLOW Anywhere (v6)` (`tcp, udp`); `8190 DENY 192.168.1.0/24`; `8190 ALLOW OUT 192.168.1.0/24`; `8190 ALLOW 10.0.0.0/8`; `8190 on eth0 ALLOW 192.168.1.0/24`. `Status: inactive` gives `PASS firewall: ufw inactive`. `ufw` absent and firewalld not running gives `PASS firewall: no host firewall active`. `ufw_out="weird"` gives `FAIL firewall: unrecognized 'ufw status' output 'weird'`. |
-| H17 | P15 | `absent += {"ufw"}`, `firewalld="running"`. (a) No rules, `--apply`: `plus_lines` are the tcp `--add-rich-rule='...'` line (exact text in P10's example), the matching udp line, then `+ sudo firewall-cmd --reload`; `FIXED firewall: firewalld allows 8190 tcp+udp from 192.168.1.0/24`. (b) The tcp rule present: only the udp add and the reload. (c) `sudo_n_ok=false`, check mode: UNKNOWN. |
-| H18 | P15 | ufw `UFW_OK` and `firewalld="running"`, `--apply`: `FAIL firewall: ufw and firewalld are both active`, with no `ufw allow` and no `firewall-cmd --add-rich-rule` call. |
-| H19 | P15, P18 | macOS, `sfw_global="Firewall is enabled. (State = 1)"`. (a) `sfw_apps=[[python_exe,"allow"]]`: `PASS firewall: application firewall on; <python_exe> allowed`. (b) `sfw_apps=[]`, `--apply`: `+ sudo <tmp>/sfw/socketfilterfw --add <python_exe>`, then `+ sudo <tmp>/sfw/socketfilterfw --unblockapp <python_exe>`, then FIXED. (c) `[[python_exe,"block"]]`, `--apply`: only the `--unblockapp` line, then FIXED. (d) `sfw_apps=[["/usr/bin/python3","allow"]]`: FAIL (a different path does not count). (e) `sfw_blockall="Firewall has block all state set to enabled."`, `--apply`: FAIL block all, with no `--add` call. (f) `sfw_global="gibberish"`: FAIL unrecognized. (g) Every socketfilterfw call is logged under the fake, which proves the env seam is used. |
+| H16 | P15 | ufw parsing, check mode, `ufw_out` = the header plus these rows (as `"%-26s %-12s%-26s"`, with an optional ` # fleet` comment). PASS: `8190 ALLOW 192.168.1.0/24`; `8190/tcp` + `8190/udp` rows; `8190 ALLOW Anywhere`; `8190 ALLOW 192.168.1.0/24 # fleet`. FAIL with the missing protocols shown: only `8190/tcp` (`udp`); only `8190 (v6) ALLOW Anywhere (v6)` (`tcp, udp`); `8190 DENY 192.168.1.0/24`; `8190 ALLOW OUT 192.168.1.0/24`; `8190 ALLOW 10.0.0.0/8`; `8190 on eth0 ALLOW 192.168.1.0/24`. `Status: inactive` gives `PASS firewall: ufw inactive`. `ufw` absent and firewalld not running gives `PASS firewall: no host firewall active`. `ufw_out="weird"` gives `FAIL firewall: unrecognized 'ufw status' output 'weird'`. Non-default port, `--port 8191`: the default `UFW_OK` (an `8190` row only) gives `FAIL firewall: ufw active; no rule allows 8191 tcp, udp from 192.168.1.0/24` with `  fix: sudo ufw allow from 192.168.1.0/24 to any port 8191`; a `8191 ALLOW 192.168.1.0/24` row gives `PASS firewall: ufw allows 8191 tcp+udp from 192.168.1.0/24`; `8191/tcp` + `8190/udp` rows give FAIL (`udp`). With `--apply` and `UFW_OK`: `+ sudo ufw allow from 192.168.1.0/24 to any port 8191`, then FIXED. |
+| H17 | P15 | `absent += {"ufw"}`, `firewalld="running"`. (a) No rules, `--apply`: `plus_lines` are the tcp `--add-rich-rule='...'` line (exact text in P10's example), the matching udp line, then `+ sudo firewall-cmd --reload`; `FIXED firewall: firewalld allows 8190 tcp+udp from 192.168.1.0/24`. (b) The tcp rule present: only the udp add and the reload. (c) `sudo_n_ok=false`, check mode: UNKNOWN. (d) `--port 8191 --apply` with both 8190 rich rules present: the plus lines are the tcp and udp `--add-rich-rule` lines with `port="8191"`, then the reload, then `FIXED firewall: firewalld allows 8191 tcp+udp from 192.168.1.0/24`; the 8190 rules are untouched. |
+| H18 | P15 | ufw `UFW_OK` and `firewalld="running"`, `--apply`: `FAIL firewall: ufw and firewalld are both active`, with no `ufw allow` and no `firewall-cmd --add-rich-rule` call. With `--port 8191`, the fix line contains `to any port 8191` and does not contain `8190`. |
+| H19 | P15, P18 | macOS, `sfw_global="Firewall is enabled. (State = 1)"`. (a) `sfw_apps=[[python_exe,"allow"]]`: `PASS firewall: application firewall on; <python_exe> allowed`. (b) `sfw_apps=[]`, `--apply`: `+ sudo <tmp>/sfw/socketfilterfw --add <python_exe>`, then `+ sudo <tmp>/sfw/socketfilterfw --unblockapp <python_exe>`, then FIXED. (c) `[[python_exe,"block"]]`, `--apply`: only the `--unblockapp` line, then FIXED. (d) `sfw_apps=[["/usr/bin/python3","allow"]]`: FAIL (a different path does not count). (e) `sfw_blockall="Firewall has block all state set to enabled."`, `--apply`: FAIL block all, with no `--add` call. (f) `sfw_global="gibberish"`: FAIL unrecognized. (g) Every socketfilterfw call is logged under the fake, which proves the env seam is used. (h) (a) and (b) repeated with `--port 8191` print the same lines, with no port in them. |
 | H20 | P13 | Linux clock, `--apply`, `clock_linux="no"`. (a) `lag.clock=3`: FIXED, exactly 3 `sleep 2` calls. (b) `fix.clock="noop"`: `FAIL clock: NTPSynchronized=no (fix did not take)`, 16 `timedatectl show` calls in total, 14 `sleep 2` calls. (c) `timedatectl` absent: FAIL `timedatectl not found`, no `set-ntp` call. |
 | H21 | P13 | `os="FreeBSD"`: stdout is exactly `FAIL platform: unsupported OS 'FreeBSD'`, the fix line, and `summary: 0 pass, 0 fixed, 1 fail, 0 unknown, 0 skip`; exit 1; `calls()` holds only `id -u` and `uname -s`. |
 | H22 | P9 | `--apply`, `sudo_v_exit=1`: stdout is exactly P9's three lines with `exit 1`; exit 1; `calls()` holds only `id -u` and `sudo -v`. |
 | H23 | P17 | The script text contains none of `fleet.env`, `QWEN_AGENT_FLEET` or `.config/qwen-agent`. Its only `${NAME...}` or `$NAME` reads of variables that are not set by the script are `HOME`, `PATH`, `FLEET_PREP_SOCKETFILTERFW`, `BASH_SOURCE` and `BASH_REMATCH` (checked by review; there is no automated test of variable provenance). |
 | H24 | P10 | In H1 and H3, every stdout line except the fakes' own fix output (`pulling manifest`, excluded by exact text) fully matches one regex in `LINE_FORMS` (Section 6.4). |
+| H26 | P6, P14 | `--no-searxng`. (a) Linux all-pass, check mode, `searxng="down"`: `SKIP searxng: disabled by --no-searxng`; summary `6 pass, 0 fixed, 0 fail, 0 unknown, 1 skip`; exit 0; no `curl` call whose argv contains `-o` (the SearXNG form); no `docker` call. (b) The same with `--apply`, `containers=[]`: the same SKIP line, `plus_lines == []`, no SearXNG curl, no docker call, stable dir absent, exit 0. (c) macOS all-pass (vllm args) with `--no-searxng`: `5 pass, 0 fixed, 0 fail, 0 unknown, 2 skip`, exit 0. |
 | H25 | P13a | macOS, `pytest_ok=false`, `--apply`: `+ python3 -m pip install --user pytest`, then `FIXED packages`. macOS, `py_ok=false`, `--apply`: FAIL with the `xcode-select --install` fix line, and no `xcode-select` call. |
 
 ### 6.4 Regex lists (Python literals, copied verbatim into the test file)
@@ -598,7 +608,8 @@ Every requirement has a test, except P17's variable-provenance clause (review on
 | L2 | .168, interactive ssh, after `git clone --depth 1 --branch qwen-agent-redteam ... /tmp/qa-prep` | `bash /tmp/qa-prep/qwen-agent-workspace/scripts/fleet-host-prep.sh --model-server-type ollama --model qwen3.5:9b` | `FAIL searxng`, `UNKNOWN firewall`, other checks PASS, exit 1 (S2) |
 | L3 | .168, run by the user | the same with `--apply` | exit 0 (S3); `curl -s 'http://127.0.0.1:8888/search?q=test&format=json'` returns JSON; `sudo ufw status` shows `8190 ALLOW 192.168.1.0/24` |
 | L4 | .168 | the same `--apply` again | no `+ ` line, exit 0 (S4); then `rm -rf /tmp/qa-prep` |
-| L5 | both | `python3 -m pytest tests/ -q -rA` from `WS` (the [FLEET] T70 procedure) | S5 |
+| L6 | vision-185 (macOS, 192.168.1.185) | `bash ~/local_agent_harness/qwen-agent-workspace/scripts/fleet-host-prep.sh --model-server-type vllm --model DreamFast/Qwen3-VL-4b-Heretic --no-searxng`. The model server is mlx_vlm 0.7.2 on `:8177`, with an OpenAI-compatible `/v1/models`. | `SKIP searxng: disabled by --no-searxng`, `SKIP linger`, `PASS model: 'DreamFast/Qwen3-VL-4b-Heretic' served by vllm at http://127.0.0.1:8177/v1/models`; exit 0, or with `--apply` added for any other FAIL (see R7) |
+| L5 | all hosts | `python3 -m pytest tests/ -q -rA` from `WS` (the [FLEET] T70 procedure) | S5 |
 
 The script must be committed and pushed on `qwen-agent-redteam` before L2.
 
@@ -640,12 +651,17 @@ The script must be committed and pushed on `qwen-agent-redteam` before L2.
 19. P15: a ufw `Anywhere` allow counts as covering the LAN.
 20. P15: firewalld adds only the missing rich rules, then reloads.
 21. Section 6: the dispatcher, state-file and fix-group harness; exit 99 for unexpected argv.
+22. P6: `--no-searxng` with `--searxng-url` is checked fourth (after `--model`), and `--port` sixth (after `--lan-cidr`).
+23. P6: `--port` rejects leading zeros (`^[1-9][0-9]{3,4}$`, then 1024-65535).
+24. P15: the macOS firewall messages do not mention the port, because the macOS rule is per binary.
 
 ## 10. Contradictions and risks
 
-- **C1. The brief's firewall path resolution is wrong for framework Pythons.** `os.path.realpath(sys.executable)` gives `.../bin/python3.13`, but the process that opens sockets is `.../Resources/Python.app/Contents/MacOS/Python` (verified on this Mac for python.org 3.13 and CLT 3.9). P15 uses `PY_EXE` (the running image). The firewall is off on the Mac today, so this matters only if it is turned on. Whether macOS keys the allow rule to that inner binary or to the bundle is live-only and not verified.
+- **C1. The brief's firewall path resolution is wrong for framework Pythons (resolved).** `os.path.realpath(sys.executable)` gives `.../bin/python3.13`, but the process that opens sockets is `.../Resources/Python.app/Contents/MacOS/Python` (verified on this Mac for python.org 3.13 and CLT 3.9). P15 uses `PY_EXE` (the running image). The firewall is off on the Mac today, so this matters only if it is turned on. Resolution: the coordinator approved keeping the `--listapps` parse and the running-image path (`PY_EXE`) as specified. Whether macOS keys the allow rule to that inner binary or to the bundle is **unverified**. Neither the Mac nor any live step can verify it while the Mac's application firewall is off. It must be checked the first time a fleet host runs with the firewall on.
 - **R1. sudo needs a TTY.** `ssh host 'bash fleet-host-prep.sh ... --apply'` without `-t` fails at `sudo -v` (exit 1, nothing changed). R0 says to use an interactive session.
 - **R2. First SearXNG start on .168 pulls the digest-pinned image** from Docker Hub inside `compose up`, which has no timeout. After `up`, SearXNG must answer within 30 s, or the check reports `fix did not take`. A re-run then passes without changes, since the container is up.
 - **R3. `pip install --user` fails on an externally managed Python** (Homebrew, PEP 668). The script reports `(fix exited N)`. The Mac's python.org build is not affected.
 - **R4. `ufw` must be on PATH.** On a host whose PATH lacks `/usr/sbin`, an active ufw would be missed and the check would report `no host firewall active`. The default PATHs on Ubuntu and Fedora include `/usr/sbin`. The script does not add it (that would break test isolation).
 - **R5. `systemsetup -setusingnetworktime`** may require Full Disk Access for the terminal on recent macOS. If so, the fix exits nonzero and the user turns the setting on in System Settings.
+- **R6. `--port` covers the firewall only.** It does not change the fleet daemon itself. [FLEET] F30's default beacon target is `255.255.255.255:8190`. Whether a daemon on another port sends or receives beacons on its own port is for the follow-up multi-agent spec to decide. A host whose firewall admits only `--port 8191` may still need 8190/udp for beacons.
+- **R7. mlx_vlm lists cached models, not just the loaded one.** mlx_vlm's `/v1/models` (vision-185) lists every cached model with a `loaded` flag. `fleet_lib.parse_loaded_models("vllm", ...)` collects every `id` and ignores `loaded`, so the model check passes for a cached model that is not loaded. [FLEET] F14's skill verification has the same behavior. This is accepted for host prep: the model is on disk, and the first request loads it.
