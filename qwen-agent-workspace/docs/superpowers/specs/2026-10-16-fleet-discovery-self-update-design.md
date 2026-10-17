@@ -22,6 +22,8 @@ Terms:
 - **Deploy root** `D`: `~/.local/share/qwen-agent/`.
 - **Release**: a git tag matching `vYYYY.MM.DD[.N]`, checked out as a worktree under `D/releases/<tag>/`.
 
+> **Superseded in part by multi-agent hosts** (`docs/superpowers/specs/2026-10-17-fleet-multi-agent-hosts-design.md`, M1-M3): a machine may run several agents, and `D` is now each agent's root `~/agents/<host_id>/`.
+
 ---
 
 ## 0. Purpose and scope
@@ -207,6 +209,8 @@ All threads are daemon threads. The main thread waits on a `threading.Event` tha
 
 ### 1.3 `fleet_lib` public names [spec choice]
 
+> **Superseded in part by multi-agent hosts** (M2, M5, M6, Section 4.1): `DEPLOY_ROOT` and `SYSTEMD_UNIT` are replaced; `deploy_root`, `fleet_env_path` and `log_dir` take a `host_id`.
+
 Constants (module level, exact values):
 
 ```python
@@ -287,6 +291,8 @@ Functions in `fleet_lib` may open sockets or run subprocesses when called (`fetc
 
 ### 2.1 Location and schema
 
+> **Superseded in part by multi-agent hosts** (M7, M19): F7 rule 8's port range becomes 1024..65535; rule 12 is unchanged.
+
 - **F5.** The registry for a fleet is `fleets/<fleet_id>.json` in the repo, under `WS`. **[spec choice: under `qwen-agent-workspace/`, beside `bin/`, so that `REPO_ROOT/fleets/` finds it in every release worktree.]** It is delivered to hosts only by self-update (or by `install`). The daemon reads `os.path.join(REPO_ROOT, "fleets", fleet_id + ".json")` unless `run --registry PATH` is given (F92).
 - **F6.** Schema (UTF-8 JSON object):
 
@@ -330,6 +336,8 @@ Functions in `fleet_lib` may open sockets or run subprocesses when called (`fetc
 - **F9.** `self_entry(registry, host_id)` returns `registry["hosts"][host_id]`. If `host_id` is absent, it raises `RegistryError("host_id '<id>' is not in the fleet registry; valid IDs: <sorted ids joined by ', '>")`.
 
 ### 2.2 Self-identity
+
+> **Superseded in part by multi-agent hosts** (M31): the unset-`QWEN_AGENT_HOST_ID` message lists the agents on disk, and is checked before `fleet.env`.
 
 - **F10.** A daemon identifies itself only by the environment variable `QWEN_AGENT_HOST_ID`. Its IP address is never used for this. If the variable is unset or empty, `run` exits 2 (F100) with the registry's valid IDs listed.
 - **F11.** A daemon uses a peer only if the peer is **both** registered (its `/health` `host_id` is a key in this daemon's registry) **and** heard from (Section 5). A same-fleet daemon whose `host_id` is unregistered is ignored. The first time each such `host_id` is seen, one WARNING line is logged: `ignoring unregistered host_id '<id>' at <ip>`.
@@ -393,6 +401,8 @@ Functions in `fleet_lib` may open sockets or run subprocesses when called (`fetc
 
 ### 3.1 `fleet.env`
 
+> **Superseded in part by multi-agent hosts** (M4): F19's path is `~/agents/<host_id>/fleet.env`; F20's write is atomic.
+
 - **F19.** `fleet_env_path()` returns `os.path.expanduser("~/.config/qwen-agent/fleet.env")`. The file contains exactly two lines, in this order, each ending with `\n`:
 
 ```
@@ -416,6 +426,8 @@ QWEN_AGENT_FLEET_TOKEN=<64 lowercase hex>
 - **F22.** Only `bin/qwen-agentd` reads `fleet.env`, through `load_fleet_env`. `bin/qwen-agent` never reads it, and no code anywhere exports its values into an environment.
 
 ### 3.2 `init-fleet` and `join`
+
+> **Superseded in part by multi-agent hosts** (M27-M29): both take `--agent-id`; `join --from-agent` is added.
 
 - **F23.** `qwen-agentd init-fleet`:
   1. If `fleet_env_path()` exists: print `qwen-agentd: <path> already exists; remove it first to create a new fleet` to stderr and exit 2.
@@ -511,6 +523,8 @@ QWEN_AGENT_FLEET_TOKEN=<64 lowercase hex>
 
 ### 5.1 Beacon send
 
+> **Superseded in part by multi-agent hosts** (M16): F30's default targets are `255.255.255.255:<p>` for each distinct registry port.
+
 - **F30.** The `beacon-send` thread:
   - opens one UDP socket with `SO_BROADCAST`;
   - every `BEACON_INTERVAL`, starting at thread start, builds `make_beacon(key, self_port, int(time.time()), nonce)` with a fresh nonce;
@@ -520,6 +534,8 @@ QWEN_AGENT_FLEET_TOKEN=<64 lowercase hex>
   The target list defaults to `[("255.255.255.255", 8190)]` **[spec choice]**. It is set by `run --beacon-targets` (F92); the value `none` means an empty list. A send counts as successful when every `sendto` returned without `OSError`. On the transition from success to failure, log at WARNING: `beacon send failed (<ExcType>: <msg>); relying on poll fallback`. On the transition back, log at INFO: `beacon send recovered`.
 
 ### 5.2 Beacon receive
+
+> **Superseded in part by multi-agent hosts** (M15): F31's default `beacon_port` is the agent's own registry port.
 
 - **F31.** The daemon binds the UDP socket `("0.0.0.0", beacon_port)` at startup (F95 step 8) and hands it to the `beacon-recv` thread. The socket sets `SO_BROADCAST` and does **not** set `SO_REUSEADDR`. `beacon_port` defaults to 8190 and is set by `run --beacon-port` (F92). It reads datagrams of up to 2048 bytes; a larger datagram is truncated and therefore fails as `malformed`. Each datagram goes through `verify_beacon`.
 - **F32.** For an `ok` beacon from source IP `ip`, with `port = beacon["port"]`:
@@ -973,6 +989,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 
 ### 9.1 Deploy root
 
+> **Superseded in part by multi-agent hosts** (M2, M3, M9-M12): F80's `D` is `~/agents/<host_id>/`, and `~/.local/bin/qwen-agent` and `~/.local/bin/qwen-agent-<id>` are generated wrappers, not symlinks.
+
 - **F80.** `deploy_root()` returns `os.path.expanduser(DEPLOY_ROOT)`, i.e. `D = ~/.local/share/qwen-agent/`. It is the same on every host. The daemon that self-updates always runs from `D`, never from the dev checkout `~/local_agent_harness`. Layout:
 
   | Path | What | Created by |
@@ -1120,6 +1138,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 
 ### 9.8 Supervisors
 
+> **Superseded in part by multi-agent hosts** (M6): F90's label is `com.qwen-agent.qwen-agentd.<id>` and its unit is `qwen-agentd-<id>.service`.
+
 - **F90.** `install` writes and loads one service per platform. The interpreter recorded in it is `sys.executable` of the `install` process (`PY` below). `HOST_ID` is `install --host-id`. **[spec choice]**
   - **macOS** (`sys.platform == "darwin"`): `~/Library/LaunchAgents/com.qwen-agent.qwen-agentd.plist`, written with `plistlib.dumps` of exactly:
 
@@ -1157,6 +1177,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 
 ### 9.9 `install`
 
+> **Superseded in part by multi-agent hosts** (M25, M26): F91 takes `--agent-id` (alias `--host-id`) and `--default`, writes wrappers, and prints new lines.
+
 - **F91.** `qwen-agentd install --host-id ID [--origin URL] [--no-service]`. `--origin` (default `ORIGIN_URL`) and `--no-service` (write and load no service file, and skip the linger check) are test hooks. `install` is idempotent: re-running it refreshes the launcher, the symlink and the service, but never re-clones and never changes `current`. Steps, in order; every failure prints the message shown to stderr and exits 2 **[spec choice]**:
   1. `ID` must match `HOST_ID_RE`: `qwen-agentd: invalid --host-id '<ID>'`.
   2. `git --version` must exit 0: `qwen-agentd: git is required`.
@@ -1184,6 +1206,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 ## 10. Daemon CLI, startup, errors, logs
 
 ### 10.1 Subcommands
+
+> **Superseded in part by multi-agent hosts** (M23, M30, M15, M16): F92's flags and defaults and F94's port and agent resolution.
 
 - **F92.** `bin/qwen-agentd [SUBCOMMAND] [FLAGS]`, parsed with `argparse` subparsers. If `argv` is empty or `argv[0]` starts with `-`, `"run"` is inserted as the subcommand, so `run` is the default. **[spec choice]**
 
@@ -1222,6 +1246,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 
 ### 10.2 `run` startup and lifecycle
 
+> **Superseded in part by multi-agent hosts** (M31): F95's step order.
+
 - **F95.** `run` startup, in order. Any failure in steps 3-9 is a startup error (F100).
   1. `t0 = time.monotonic()`.
   2. Parse and validate the flags (F92).
@@ -1241,6 +1267,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 - **F99.** Exit codes of the other subcommands: `init-fleet` and `join` 0 or 2 (F23, F26); `install` 0 or 2 (F91); `selftest` pytest's code (F93); `status` 0 or 1 (F94). In every subcommand, an unexpected exception is caught at the top of `main`, which prints `qwen-agentd: internal error: <ExcType>: <msg>` to stderr (and logs it at ERROR under `run`) and exits 1. No traceback is ever printed. **[spec choice]**
 
 ### 10.3 Startup errors
+
+> **Superseded in part by multi-agent hosts** (M31): F100's unset-ID and missing-`fleet.env` messages; neither is logged.
 
 - **F100.** Each of these makes `run` print the message to stderr, log it at ERROR when logging is already set up (step 3 onward), and exit 2:
 
@@ -1271,6 +1299,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 
 ### 10.5 Logs
 
+> **Superseded in part by multi-agent hosts** (M5): F107's directory is `~/agents/<host_id>/logs` on every platform.
+
 - **F107.** `log_dir()` returns `~/Library/Logs/qwen-agentd` when `sys.platform == "darwin"`, else `~/.local/state/qwen-agentd` (both via `os.path.expanduser`). `run` creates it with `os.makedirs(..., exist_ok=True)` and then `os.chmod(dir, 0o700)`. Files in it **[spec choice]**:
   - `qwen-agentd.log`, the daemon log;
   - `last-run.stderr` (F50);
@@ -1286,6 +1316,8 @@ Line numbers refer to `bin/qwen-agent` as read on 2026-10-16 (Section 0.2). No o
 ---
 
 ## 11. Tests
+
+> **Superseded in part by multi-agent hosts** (Section 5): the 11.2 helpers `make_fleet`, `daemon_log_dir`, `read_log` and `start_daemon` change, and T25, T29a, T61 and the CLI tests are migrated.
 
 ### 11.1 Rules for every new test [spec choice]
 
@@ -1404,6 +1436,8 @@ Fixture: a local bare repo `<tmp>/origin.git`, built by the test. Each commit ho
 
 ## 12. Rollout
 
+> **Multi-agent hosts:** R1-R10 below use that spec's layout (M2-M6, M23-M30): agent `mac-local` on this Mac and `ollama-168` on .168, both on port 8190.
+
 Steps R0-R3 set the fleet up; R4-R10 are the live acceptance checks. Run them in order.
 
 - **R0. Prerequisites, on both hosts.** On each host, run `scripts/fleet-host-prep.sh` until it exits 0. Its behavior is specified in `docs/superpowers/specs/2026-10-17-fleet-host-prep-design.md`. It checks, in this order: platform; packages (`python3` >= 3.9, `git`, pytest); clock (NTP, F40); that the model server serves this host's model (through `fleet_lib.probe_url` and `fleet_lib.parse_loaded_models`, F13, F14); that SearXNG answers at `http://127.0.0.1:8888/`; that the host firewall admits TCP and UDP 8190 from 192.168.1.0/24; and, on Linux, user lingering (F90). Without `--apply` it changes nothing. With `--apply` it asks for the sudo password once, fixes what it can, and prints every command it runs as a `+ <command>` line. It never touches `fleet.env` or any fleet secret. It never installs Docker or Ollama, and never starts a model server. It stops before R1. The script must be committed and pushed on `qwen-agent-redteam` before the .168 steps below, because .168 clones that branch.
@@ -1413,25 +1447,25 @@ Steps R0-R3 set the fleet up; R4-R10 are the live acceptance checks. Run them in
     1. `git clone --depth 1 --branch qwen-agent-redteam https://github.com/reubenpatterson1/local_agent_harness.git /tmp/qa-prep`
     2. `bash /tmp/qa-prep/qwen-agent-workspace/scripts/fleet-host-prep.sh --model-server-type ollama --model qwen3.5:9b --apply`
     3. `rm -rf /tmp/qa-prep`. This is safe because the script copies SearXNG's `docker-compose.yml` and `settings.yml` to `~/.local/share/qwen-agent/searxng/` and runs compose from there.
-  - **Fallback if .168 cannot run Docker:** after R3, give the .168 service `QWEN_AGENT_SEARXNG_URL=<a reachable instance>` with `systemctl --user edit qwen-agentd` (a drop-in containing `[Service]` and `Environment=QWEN_AGENT_SEARXNG_URL=...`), then `systemctl --user restart qwen-agentd`. The Mac's instance listens only on `127.0.0.1:8888` (`searxng/docker-compose.yml:31`), so .168 cannot use it. Re-run the script with `--searxng-url <that URL>` to check it.
-- **R1. Create the fleet, on mac-local, from the dev checkout.** Run `python3 ~/local_agent_harness/qwen-agent-workspace/bin/qwen-agentd init-fleet`. Note the `fleet_id`. Leave the join string in that terminal only; it is never saved (F23).
+  - **Fallback if .168 cannot run Docker:** after R3, give the .168 service `QWEN_AGENT_SEARXNG_URL=<a reachable instance>` with `systemctl --user edit qwen-agentd-ollama-168` (a drop-in containing `[Service]` and `Environment=QWEN_AGENT_SEARXNG_URL=...`), then `systemctl --user restart qwen-agentd-ollama-168`. The Mac's instance listens only on `127.0.0.1:8888` (`searxng/docker-compose.yml:31`), so .168 cannot use it. Re-run the script with `--searxng-url <that URL>` to check it.
+- **R1. Create the fleet, on mac-local, from the dev checkout.** Run `python3 ~/local_agent_harness/qwen-agent-workspace/bin/qwen-agentd init-fleet --agent-id mac-local`. It writes `~/agents/mac-local/fleet.env` (mode 0600, in a new `~/agents/mac-local/` of mode 0700). Note the `fleet_id`. Leave the join string in that terminal only; it is never saved (F23).
 - **R2. Registry and first release.** Create `qwen-agent-workspace/fleets/<fleet_id>.json` with exactly F18's content. Run the full test suite (T70-T72). Commit, push the branch, then `git tag v<YYYY.MM.DD>` and `git push origin v<YYYY.MM.DD>`, using the release date.
 - **R3. Install and join.**
-  - **R3a, mac-local:** `python3 ~/local_agent_harness/qwen-agent-workspace/bin/qwen-agentd install --host-id mac-local`. `fleet.env` already exists from R1, so the daemon starts.
+  - **R3a, mac-local:** `python3 ~/local_agent_harness/qwen-agent-workspace/bin/qwen-agentd install --agent-id mac-local --default`. `fleet.env` already exists from R1, so the daemon starts. This creates `~/agents/mac-local/`, the LaunchAgent `com.qwen-agent.qwen-agentd.mac-local` (`~/Library/LaunchAgents/com.qwen-agent.qwen-agentd.mac-local.plist`), and the wrapper `~/.local/bin/qwen-agent-mac-local`. `--default` is required on this Mac: `~/.local/bin/qwen-agent` is already a (dangling) symlink to `/Users/reubenpatterson/qwen-agent-workspace/bin/qwen-agent`, and install replaces it with mac-local's wrapper, as F91's install also replaced a symlink there. The dev checkout is not touched: `~/local_agent_harness/qwen-agent-workspace/bin/qwen-agent` still works, and talks to the daemon on 8190.
   - **R3b, ollama-168, over ssh:**
     1. `git clone --branch v<YYYY.MM.DD> --depth 1 https://github.com/reubenpatterson1/local_agent_harness.git /tmp/qa-bootstrap`
-    2. `python3 /tmp/qa-bootstrap/qwen-agent-workspace/bin/qwen-agentd install --host-id ollama-168`
-    3. `python3 ~/.local/share/qwen-agent/current/qwen-agent-workspace/bin/qwen-agentd join`, then paste the join string at the hidden prompt. Copy it by hand from the R1 terminal into this ssh session.
-    4. `rm -rf /tmp/qa-bootstrap`. The service picks up `fleet.env` on its next 10 s restart.
+    2. `python3 /tmp/qa-bootstrap/qwen-agent-workspace/bin/qwen-agentd install --agent-id ollama-168 --default`
+    3. `python3 ~/agents/ollama-168/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id ollama-168`, then paste the join string at the hidden prompt. Copy it by hand from the R1 terminal into this ssh session.
+    4. `rm -rf /tmp/qa-bootstrap`. The service `qwen-agentd-ollama-168.service` picks up `~/agents/ollama-168/fleet.env` on its next 10 s restart.
   - **R3c, mac-local:** delete `~/.zshenv` lines 11-12 (`export SKILL_ENDPOINT_RESEARCHER=...`, `export SKILL_MODEL_RESEARCHER=...`) and the comment on line 10 that introduces them. Open a new shell; `env | grep '^SKILL_'` prints nothing. **[spec choice: line 10 goes too, since it only introduces lines 11-12.]**
-  - **R3d, both hosts:** `QWEN_AGENT_HOST_ID` is in each service's environment because `install --host-id` wrote it (F90). Check with `launchctl print gui/$(id -u)/com.qwen-agent.qwen-agentd | grep QWEN_AGENT_HOST_ID` on the Mac and `systemctl --user show qwen-agentd -p Environment` on .168. On the Mac, `realpath ~/.local/bin/qwen-agent` resolves into `~/.local/share/qwen-agent/releases/<tag>/qwen-agent-workspace/bin/qwen-agent`.
-- **R4. K1, beacon mode.** Within 45 s after the later of the two daemons started, `qwen-agentd status` on each host lists the other, `via beacon`, and `discovery beacon`. (Here and below, `qwen-agentd` means `~/.local/share/qwen-agent/current/qwen-agent-workspace/bin/qwen-agentd`.) If the Mac reports `discovery poll`, broadcast is being blocked (for example by Netskope); record that, and the fleet runs in poll mode (F105).
-- **R5. K1, poll mode.** On the Mac: stop the service (`launchctl bootout gui/$(id -u)/com.qwen-agent.qwen-agentd`), then run `QWEN_AGENT_HOST_ID=mac-local python3 ~/.local/share/qwen-agent/current/qwen-agent-workspace/bin/qwen-agentd run --beacon-targets none` in a terminal. Within 75 s, `qwen-agentd status` on .168 lists `mac-local ... via poll`. Stop the foreground daemon with Ctrl-C, then restore the service with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.qwen-agent.qwen-agentd.plist`.
-- **R6. K2.** On .168: `systemctl --user stop qwen-agentd`. Within 90 s, `qwen-agentd status` on the Mac no longer lists `ollama-168`, and the Mac log has `peer ollama-168 down`. Then `systemctl --user start qwen-agentd`.
-- **R7. K3.** In the new shell from R3c (no `SKILL_*` set), run `qwen-agent`. The REPL prints `[fleet: ...; delegate targets: investigator, analyst, planner, researcher]`. Ask a question and tell the model to use `delegate_to_skill` with `skill="researcher"`. The UI shows `[delegating to researcher on ollama-168, ...]`, and the tool result is a non-empty answer. The .168 log has a `run end skill=researcher ... http=200 status=ok` line.
-- **R8. K8.** Stop the Mac service. `qwen-agent --user-prompt "..."` works exactly as before the fleet: there is no fleet line, the enum is unfiltered, and delegation is local. Restore the service.
-- **R9. K5.** On each host, with the token supplied by file descriptor (so it never appears in an argv): `grep -rlF -f <(sed -n 's/^QWEN_AGENT_FLEET_TOKEN=//p' ~/.config/qwen-agent/fleet.env) <log dir> ~/.local/share/qwen-agent ~/local_agent_harness` prints nothing (`~/local_agent_harness` exists only on the Mac). `ps eww <daemon pid>`, and the same for a running `/run` child during R7, show no `QWEN_AGENT_FLEET_` variable. `sudo tcpdump -A -c 3 -i any udp port 8190` on .168 shows only the beacon fields `fleet_tag`, `nonce`, `port`, `proto`, `sig`, `ts`.
-- **R10. K6.** Commit a no-op change (a doc edit), tag `v<YYYY.MM.DD>.1`, and push the tag. Within 30 min, `qwen-agentd status` on both hosts shows that version, with `update: status=ok`.
+  - **R3d, both hosts:** `QWEN_AGENT_HOST_ID` is in each service's environment because `install --agent-id` wrote it (F90, multi-agent M6). Check with `launchctl print gui/$(id -u)/com.qwen-agent.qwen-agentd.mac-local | grep QWEN_AGENT_HOST_ID` on the Mac and `systemctl --user show qwen-agentd-ollama-168 -p Environment` on .168. On each host, `grep -x '# agent-id: <id>' ~/.local/bin/qwen-agent` matches, `grep QWEN_AGENT_DAEMON_URL= ~/.local/bin/qwen-agent-<id>` shows `http://127.0.0.1:8190`, and `realpath ~/agents/<id>/current/qwen-agent-workspace/bin/qwen-agent` resolves into `~/agents/<id>/releases/<tag>/qwen-agent-workspace/bin/qwen-agent`. If a service does not start, its startup error is in `~/agents/mac-local/logs/launchd.err` (Mac) or `journalctl --user -u qwen-agentd-ollama-168` (.168).
+- **R4. K1, beacon mode.** Within 45 s after the later of the two daemons started, `qwen-agentd status --agent-id <id>` on each host lists the other, `via beacon`, and `discovery beacon`. (Here and below, `qwen-agentd` on a host means `~/agents/<id>/current/qwen-agent-workspace/bin/qwen-agentd`, where `<id>` is `mac-local` on the Mac and `ollama-168` on .168.) If the Mac reports `discovery poll`, broadcast is being blocked (for example by Netskope); record that, and the fleet runs in poll mode (F105).
+- **R5. K1, poll mode.** On the Mac: stop the service (`launchctl bootout gui/$(id -u)/com.qwen-agent.qwen-agentd.mac-local`), then run `QWEN_AGENT_HOST_ID=mac-local python3 ~/agents/mac-local/current/qwen-agent-workspace/bin/qwen-agentd run --beacon-targets none` in a terminal. Within 75 s, `qwen-agentd status --agent-id ollama-168` on .168 lists `mac-local ... via poll`. Stop the foreground daemon with Ctrl-C, then restore the service with `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.qwen-agent.qwen-agentd.mac-local.plist`.
+- **R6. K2.** On .168: `systemctl --user stop qwen-agentd-ollama-168`. Within 90 s, `qwen-agentd status --agent-id mac-local` on the Mac no longer lists `ollama-168`, and `~/agents/mac-local/logs/qwen-agentd.log` has `peer ollama-168 down`. Then `systemctl --user start qwen-agentd-ollama-168`.
+- **R7. K3.** In the new shell from R3c (no `SKILL_*` set), run `qwen-agent` (the `~/.local/bin/qwen-agent` wrapper, which runs mac-local's release). The REPL prints `[fleet: qwen-agentd at http://127.0.0.1:8190; ...; delegate targets: investigator, analyst, planner, researcher]`. Ask a question and tell the model to use `delegate_to_skill` with `skill="researcher"`. The UI shows `[delegating to researcher on ollama-168, ...]`, and the tool result is a non-empty answer. `~/agents/ollama-168/logs/qwen-agentd.log` on .168 has a `run end skill=researcher ... http=200 status=ok` line.
+- **R8. K8.** Stop the Mac service (`launchctl bootout gui/$(id -u)/com.qwen-agent.qwen-agentd.mac-local`). `qwen-agent --user-prompt "..."` works exactly as before the fleet: there is no fleet line, the enum is unfiltered, and delegation is local. Restore the service (`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.qwen-agent.qwen-agentd.mac-local.plist`).
+- **R9. K5.** On each host, with the token supplied by file descriptor (so it never appears in an argv): `grep -rlF --exclude=fleet.env -f <(sed -n 's/^QWEN_AGENT_FLEET_TOKEN=//p' ~/agents/<id>/fleet.env) ~/agents ~/.local/bin ~/local_agent_harness` prints nothing (`~/local_agent_harness` exists only on the Mac; `--exclude=fleet.env` skips every agent's own secret file, and the logs are under `~/agents/<id>/logs`). `ps eww <daemon pid>`, and the same for a running `/run` child during R7, show no `QWEN_AGENT_FLEET_` variable. `sudo tcpdump -A -c 3 -i any udp port 8190` on .168 shows only the beacon fields `fleet_tag`, `nonce`, `port`, `proto`, `sig`, `ts`.
+- **R10. K6.** Commit a no-op change (a doc edit), tag `v<YYYY.MM.DD>.1`, and push the tag. Within 30 min, `qwen-agentd status --agent-id <id>` on both hosts shows that version, with `update: status=ok`.
 
 K4 and K7 have no live step; tests T45, T26 and T60 cover them.
 
@@ -1499,6 +1533,8 @@ Every **[spec choice]** in this document, one line each. Values in the Section 1
 ---
 
 ## 14. Accepted risks and known limitations
+
+> **Multi-agent hosts:** in L7 and L8, read `~/agents/<id>/repo` and `install --agent-id <id>` (M2, M25).
 
 No design question is open. The items below were accepted with the design, or follow from it.
 
