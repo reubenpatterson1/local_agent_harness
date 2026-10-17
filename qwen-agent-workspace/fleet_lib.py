@@ -1647,3 +1647,114 @@ def fetch_recent(daemon_url, n):
     """(result, None) or (None, message) for loopback GET /traces/recent?n=<n> (tracing spec TR28)."""
     status, raw = _loopback_get(daemon_url, "/traces/recent?n=%d" % n, TRACE_RECENT_TIMEOUT)
     return _loopback_result(daemon_url, status, raw, valid_recent_result)
+
+
+class TraceStore(object):
+    """A(<id>)/logs/trace.jsonl and its backups trace.jsonl.1 .. .3 (tracing spec TR10-TR12).
+
+    The daemon is the only writer. Every method holds one lock, so concurrent handler
+    threads never interleave or tear a line, and a read never sees a rotation half done.
+    Construction does no I/O.
+    """
+
+    def __init__(self, directory, max_bytes=LOG_MAX_BYTES, backups=LOG_BACKUPS):
+        self.path = os.path.join(directory, TRACE_FILE_NAME)
+        self.max_bytes = max_bytes
+        self.backups = backups
+        self._lock = threading.Lock()
+
+    def _names(self):
+        """The store's files, oldest first: path.<backups>, ..., path.1, path."""
+        return ["%s.%d" % (self.path, i) for i in range(self.backups, 0, -1)] + [self.path]
+
+    def append(self, record):
+        """Append one valid stored-form record; rotate first when the line would pass max_bytes."""
+        reason = trace_record_error(record)
+        if reason is not None:
+            raise ValueError("bad trace record: %s" % reason)
+        line = canonical_json(record) + b"\n"
+        with self._lock:
+            try:
+                size = os.path.getsize(self.path)
+            except FileNotFoundError:
+                size = 0
+            if size > 0 and size + len(line) > self.max_bytes:
+                for i in range(self.backups - 1, 0, -1):
+                    older = "%s.%d" % (self.path, i)
+                    if os.path.lexists(older):
+                        os.replace(older, "%s.%d" % (self.path, i + 1))
+                os.replace(self.path, self.path + ".1")
+            fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+
+    def _records(self, needle=None):
+        """Every valid stored record, oldest file first, line order; the caller holds the lock."""
+        for name in self._names():
+            try:
+                f = open(name, "rb")
+            except FileNotFoundError:
+                continue
+            with f:
+                for line in f:
+                    if needle is not None and needle not in line:
+                        continue
+                    rec = _json_loads_or_none(line)
+                    if trace_record_error(rec) is None:
+                        yield rec
+
+    def query(self, trace_id, max_records=TRACE_MAX_RECORDS, max_bytes=TRACE_QUERY_MAX_BYTES):
+        """(records, truncated) of one trace: oldest file first, at most max_records records whose
+        canonical encodings (plus one separator byte each) total at most max_bytes."""
+        needle = ('"trace_id":"%s"' % trace_id).encode("ascii")
+        records, total = [], 0
+        with self._lock:
+            for rec in self._records(needle):
+                if rec["trace_id"] != trace_id:
+                    continue
+                size = len(canonical_json(rec)) + 1
+                if len(records) >= max_records or total + size > max_bytes:
+                    return records, True
+                records.append(rec)
+                total += size
+        return records, False
+
+    def recent(self, n):
+        """Up to n root spans of this store, newest first, each with its trace's local span
+        count and delegations (tracing spec TR12)."""
+        roots, counts, hops, forwarded, tools = {}, {}, {}, set(), []
+        with self._lock:
+            for rec in self._records():
+                tid = rec["trace_id"]
+                counts[tid] = counts.get(tid, 0) + 1
+                if rec["parent_span_id"] is None:
+                    best = roots.get(tid)
+                    if best is None or (rec["start"], rec["span_id"]) < (best["start"], best["span_id"]):
+                        roots[tid] = rec
+                if rec["kind"] == "delegate":
+                    forwarded.add(rec["parent_span_id"])
+                    hops.setdefault(tid, []).append(
+                        (rec["start"], rec["span_id"], "%s@%s" % (rec["attrs"]["skill"], rec["attrs"]["target"])))
+                elif (rec["kind"] == "tool" and rec["name"] == "delegate_to_skill" and rec["status"] == "ok"
+                      and rec["attrs"]["key"].startswith("skill=")):
+                    tools.append(rec)
+        for rec in tools:
+            skill = rec["attrs"]["key"][len("skill="):].split(" ")[0]
+            if rec["span_id"] not in forwarded and skill in KNOWN_SKILLS:
+                hops.setdefault(rec["trace_id"], []).append(
+                    (rec["start"], rec["span_id"], "%s@%s" % (skill, rec["agent"])))
+        out = []
+        for root in sorted(roots.values(), key=lambda r: (-r["start"], r["trace_id"]))[:n]:
+            delegated = []
+            for _start, _span, hop in sorted(hops.get(root["trace_id"], [])):
+                if hop not in delegated:
+                    delegated.append(hop)
+            out.append({"trace_id": root["trace_id"], "start": root["start"], "dur_ms": root["dur_ms"],
+                        "status": root["status"], "kind": root["kind"], "name": root["name"],
+                        "spans": counts[root["trace_id"]], "delegated": delegated})
+        return out

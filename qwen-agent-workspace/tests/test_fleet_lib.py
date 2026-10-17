@@ -1986,3 +1986,112 @@ def test_trt13_post_span_fetch_clients_and_delegate_retry():
             fleet_lib.canonical_json({"skill": "researcher", "task": "t", "host_id": "h"})]
     finally:
         srv.close()
+
+
+# --- fleet tracing: the trace store (tracing spec TR10-TR12) ---
+
+TR_TRACES = ("1" * 32, "2" * 32, "3" * 32)
+
+
+def _tr_span(trace_id, kind="tool", parent=TR_PARENT, start=1760000000.0, agent="alpha", name="calculate",
+             status="ok", attrs=None, span_id=None):
+    """A valid stored record with a fresh span ID unless one is given."""
+    return fleet_lib.make_record(trace_id, span_id or fleet_lib.new_span_id(), parent, agent, kind, name, start,
+                                 1000.0, status, attrs if attrs is not None else _tr_attrs(kind), now=1001.0)
+
+
+def _tr_lines(path):
+    with open(path, "rb") as f:
+        return f.read().splitlines()
+
+
+def test_trt9_store_rotation_modes_query_and_concurrency(tmp_path):
+    store = fleet_lib.TraceStore(str(tmp_path), max_bytes=2000, backups=3)
+    assert os.listdir(str(tmp_path)) == []
+    appended = []
+    for i in range(60):
+        rec = _tr_span(TR_TRACES[i % 3], start=1760000000.0 + i)
+        store.append(rec)
+        appended.append(rec)
+    base = os.path.join(str(tmp_path), "trace.jsonl")
+    assert sorted(os.listdir(str(tmp_path))) == ["trace.jsonl", "trace.jsonl.1", "trace.jsonl.2", "trace.jsonl.3"]
+    for name in os.listdir(str(tmp_path)):
+        path = os.path.join(str(tmp_path), name)
+        assert os.path.getsize(path) <= 2000, name
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600, name
+    kept = [json.loads(line) for name in (base + ".3", base + ".2", base + ".1", base) for line in _tr_lines(name)]
+    assert kept == appended[-len(kept):] and len(kept) < 60
+    assert appended[0] not in kept
+    for trace_id in TR_TRACES:
+        records, truncated = store.query(trace_id)
+        assert truncated is False
+        assert records == [r for r in kept if r["trace_id"] == trace_id] and records
+    with open(base + ".2", "ab") as f:
+        f.write(b"garbage line\n" + fleet_lib.canonical_json(appended[-1])[:40] + b"\n")
+    records, _truncated = store.query(TR_TRACES[0])
+    assert records == [r for r in kept if r["trace_id"] == TR_TRACES[0]]
+    before = [(n, os.path.getsize(os.path.join(str(tmp_path), n))) for n in sorted(os.listdir(str(tmp_path)))]
+    with pytest.raises(ValueError) as e:
+        store.append(dict(appended[0], status="OK"))
+    assert str(e.value) == "bad trace record: status"
+    assert [(n, os.path.getsize(os.path.join(str(tmp_path), n))) for n in sorted(os.listdir(str(tmp_path)))] == before
+
+    other = tmp_path / "threads"
+    other.mkdir()
+    shared = fleet_lib.TraceStore(str(other))
+
+    def writer(k):
+        for i in range(200):
+            shared.append(_tr_span(TR_TRACES[k % 3], start=1760000000.0 + i))
+
+    threads = [threading.Thread(target=writer, args=(k,)) for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    lines = _tr_lines(str(other / "trace.jsonl"))
+    assert len(lines) == 1600
+    assert all(fleet_lib.trace_record_error(json.loads(line)) is None for line in lines)
+
+
+def test_trt10_query_caps(tmp_path):
+    store = fleet_lib.TraceStore(str(tmp_path))
+    records = [_tr_span(TR_TRACES[0], start=1760000000.0 + i) for i in range(2001)]
+    for rec in records[:2000]:
+        store.append(rec)
+    assert store.query(TR_TRACES[0]) == (records[:2000], False)
+    store.append(records[2000])
+    assert store.query(TR_TRACES[0]) == (records[:2000], True)
+    ten = sum(len(fleet_lib.canonical_json(r)) + 1 for r in records[:10])
+    assert store.query(TR_TRACES[0], max_bytes=ten) == (records[:10], True)
+    assert store.query(TR_TRACES[1]) == ([], False)
+
+
+def test_trt11_recent_lists_roots_with_their_delegations(tmp_path):
+    store = fleet_lib.TraceStore(str(tmp_path))
+    a, b, c, d = TR_TRACES + ("4" * 32,)
+    turn_a = _tr_span(a, "turn", None, 1760000300.0, name="repl")
+    tool_a = _tr_span(a, "tool", turn_a["span_id"], 1760000301.0, name="delegate_to_skill",
+                      attrs=dict(_tr_attrs("tool"), key="skill=investigator"))
+    deleg_bravo = _tr_span(a, "delegate", tool_a["span_id"], 1760000302.0, name="investigator",
+                           attrs=dict(_tr_attrs("delegate"), skill="investigator", target="bravo"))
+    tool_a2 = _tr_span(a, "tool", turn_a["span_id"], 1760000303.0, name="delegate_to_skill",
+                       attrs=dict(_tr_attrs("tool"), key="skill=analyst"))
+    deleg_charlie = _tr_span(a, "delegate", tool_a2["span_id"], 1760000304.0, name="analyst", status="busy",
+                             attrs=dict(_tr_attrs("delegate"), skill="analyst", target="charlie"))
+    turn_b = _tr_span(b, "turn", None, 1760000200.0, name="oneshot")
+    tool_b = _tr_span(b, "tool", turn_b["span_id"], 1760000201.0, name="delegate_to_skill",
+                      attrs=dict(_tr_attrs("tool"), key="skill=analyst"))
+    model_b = _tr_span(b, "model", turn_b["span_id"], 1760000202.0, name="m")
+    turn_c = _tr_span(c, "turn", None, 1760000100.0, name="repl", status="max_rounds")
+    run_d = _tr_span(d, "run", TR_PARENT, 1760000400.0, name="researcher")
+    for rec in (turn_c, run_d, turn_b, tool_b, model_b, deleg_charlie, turn_a, tool_a, deleg_bravo, tool_a2):
+        store.append(rec)
+    entries = store.recent(10)
+    assert [e["trace_id"] for e in entries] == [a, b, c]
+    assert entries[0] == {"trace_id": a, "start": 1760000300.0, "dur_ms": 1000, "status": "ok", "kind": "turn",
+                          "name": "repl", "spans": 5, "delegated": ["investigator@bravo", "analyst@charlie"]}
+    assert (entries[1]["spans"], entries[1]["delegated"], entries[1]["name"]) == (3, ["analyst@alpha"], "oneshot")
+    assert (entries[2]["spans"], entries[2]["delegated"], entries[2]["status"]) == (1, [], "max_rounds")
+    assert store.recent(1) == entries[:1]
+    assert fleet_lib.TraceStore(str(tmp_path / "absent")).recent(10) == []
