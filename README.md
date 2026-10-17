@@ -99,6 +99,17 @@ injection payloads against an abliterated model with the guardrails **on**
 measures how effective the harness alone is at stopping a model that does not
 resist from doing something harmful.
 
+The fleet's `vision` skill hosts a second abliterated model,
+`DreamFast/Qwen3-VL-4b-Heretic` (a 4B Qwen3-VL vision-language model with its
+refusals removed), on the `vision-185` agent. It is run only with the guardrails
+**on**: it is a `--skill=vision` child of the real harness with no tools at all,
+so an instruction injected into it, including text written inside an image, can
+change only the words of its answer. That answer returns to the delegating agent
+as untrusted tool output, and every tool that agent then calls still goes through
+the harness's approval tiers and path confinement. Images reach it only through
+`delegate_to_skill`'s `images` parameter, as workspace-confined PNG or JPEG files
+of at most 16 MiB in total.
+
 The safe/production harness this range is derived from lives in this same
 repository at `qwen-agent-workspace/bin/qwen-agent`. The range itself
 (`agent/`, `testsite/`, `collector/`) is the offensive test rig for it, not the
