@@ -988,14 +988,43 @@ def _status_agent(explicit, view):
     return ids[0] if len(ids) == 1 else None
 
 
+def _status_port(explicit):
+    """(port, None) or (None, stderr message) from the agent's registries (multi-agent spec M30 step 1).
+
+    An installed agent's daemon runs from A(<id>)/current, a dev daemon from this checkout.
+    """
+    host_id, message = fleet_lib.resolve_agent(explicit)
+    if message is not None:
+        return None, message
+    d = fleet_lib.deploy_root(host_id)
+    if os.path.lexists(os.path.join(d, "current")):
+        fleets_dir = os.path.join(d, "current", fleet_lib.WS_SUBDIR, "fleets")
+    else:
+        fleets_dir = os.path.join(REPO_ROOT, "fleets")
+    port, files = fleet_lib.agent_port(fleets_dir, host_id)
+    if not files:
+        return None, "qwen-agentd: agent '%s' is not in any registry in %s; pass --port N" % (host_id, fleets_dir)
+    if port is None:
+        return None, ("qwen-agentd: agent '%s' has different ports in %s in %s; pass --port N"
+                      % (host_id, ", ".join(files), fleets_dir))
+    return port, None
+
+
 def cmd_status(args):
+    """F94 with multi-agent spec M30: an explicit --port wins; otherwise the agent's registry port."""
     explicit = None
     if args.agent_id is not None:
         explicit, message = fleet_lib.resolve_agent(args.agent_id)
         if message is not None:
             _err(message)
             return 2
-    url = "http://127.0.0.1:%d" % args.port
+    port = args.port
+    if port is None:
+        port, message = _status_port(explicit)
+        if message is not None:
+            _err(message)
+            return 2
+    url = "http://127.0.0.1:%d" % port
     view, _warning = fleet_lib.fetch_view(url)
     lines = []
     if view is None:
@@ -1434,7 +1463,7 @@ def _build_parser():
     p.set_defaults(func=cmd_run)
     p = sub.add_parser("status", help="print an agent's fleet view and update state")
     _add_agent_id(p)
-    p.add_argument("--port", type=int, default=fleet_lib.DEFAULT_PORT)
+    p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("install", help="install an agent into ~/agents/<id> with its service and commands")
     _add_agent_id(p, required=True)

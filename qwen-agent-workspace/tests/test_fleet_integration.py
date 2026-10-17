@@ -896,3 +896,20 @@ def test_multi_agent_focus_5_from_agent_with_a_loose_secret_file(agentd, capsys,
     assert (out, err) == ("", "qwen-agentd: %s must be mode 0600 (chmod 600 %s)\n" % (source, source))
     assert _no_token_in(token, out, err)
     assert not os.path.lexists(fleet_lib.deploy_root("bravo"))
+
+
+def test_mt12_status_resolves_the_agent_port(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    agents = home / "agents"
+    proc = _run_agentd(home, ["status"])
+    assert (proc.returncode, proc.stdout, proc.stderr) == (
+        2, "", "qwen-agentd: no agent found in %s; pass --agent-id ID\n" % agents)
+    ftu.make_fleet(home, "alpha")
+    ftu.make_fleet(home, "bravo")
+    proc = _run_agentd(home, ["status"])
+    assert (proc.returncode, proc.stdout, proc.stderr) == (
+        2, "", "qwen-agentd: more than one agent in %s (alpha, bravo); pass --agent-id ID\n" % agents)
+    proc = _run_agentd(home, ["status", "--agent-id", "zulu"])
+    assert (proc.returncode, proc.stdout, proc.stderr) == (
+        2, "", "qwen-agentd: agent 'zulu' is not in any registry in %s; pass --port N\n" % os.path.join(WS, "fleets"))

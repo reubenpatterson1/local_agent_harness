@@ -586,3 +586,21 @@ def test_mt22_install_port_from_the_release_registry(tmp_path, monkeypatch):
     assert proc.returncode == 2
     assert proc.stderr == ("qwen-agentd: agent 'h1' has different ports in 0123456789abcdef.json, "
                            "fedcba9876543210.json of release v2026.01.01\n")
+
+
+def test_mt24_status_port_from_the_installed_release(tmp_path):
+    home, origin, p1, _p2 = _two_agent_origin(tmp_path)
+    assert _install_agent(home, origin, "h1").returncode == 0
+    proc = _agentd(home, "status", "--agent-id", "h1")
+    assert proc.returncode == 1
+    assert proc.stdout == ("daemon: not reachable at http://127.0.0.1:%d\n"
+                           "update: status=ok from=- to=v2026.01.01 attempts=0 bad_tags=-\n" % p1)
+    fleets = os.path.join(str(home), "agents", "h1", "current", "qwen-agent-workspace", "fleets")
+    other = _registry(ftu.free_port())
+    other["fleet_id"] = ftu.OTHER_FLEET_ID
+    with open(os.path.join(fleets, ftu.OTHER_FLEET_ID + ".json"), "w", encoding="utf-8") as f:
+        json.dump(other, f)
+    proc = _agentd(home, "status")
+    assert (proc.returncode, proc.stdout, proc.stderr) == (
+        2, "", "qwen-agentd: agent 'h1' has different ports in 0123456789abcdef.json, fedcba9876543210.json "
+               "in %s; pass --port N\n" % fleets)
