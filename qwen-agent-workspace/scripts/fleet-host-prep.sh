@@ -299,6 +299,164 @@ ck_platform() {
 }
 
 # ---------------------------------------------------------------------------
+# packages (P13a)
+# ---------------------------------------------------------------------------
+
+PK_PY=0
+PK_GIT=0
+PK_PYTEST=0
+
+t_packages() {
+    local missing=''
+    PK_PY=0
+    PK_GIT=0
+    PK_PYTEST=0
+    if command -v python3 >/dev/null 2>&1 && python3 -c "$PY_VERSION" >/dev/null 2>&1; then
+        PK_PY=1
+    fi
+    if git --version >/dev/null 2>&1; then
+        PK_GIT=1
+    fi
+    if [ "$PK_PY" = 1 ] && python3 -c "$PY_PYTEST" >/dev/null 2>&1; then
+        PK_PYTEST=1
+    fi
+    if [ "$PK_PY" = 1 ] && [ "$PK_GIT" = 1 ] && [ "$PK_PYTEST" = 1 ]; then
+        CK_RESULT=pass
+        CK_DETAIL='python3 >= 3.9, git, pytest'
+        return
+    fi
+    if [ "$PK_PY" != 1 ]; then
+        missing='python3 >= 3.9'
+    fi
+    if [ "$PK_GIT" != 1 ]; then
+        missing="${missing:+$missing, }git"
+    fi
+    if [ "$PK_PYTEST" != 1 ]; then
+        missing="${missing:+$missing, }pytest"
+    fi
+    CK_RESULT=fail
+    CK_DETAIL="missing: $missing"
+}
+
+ck_packages() {
+    t_packages
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    if [ "$OS" = linux ]; then
+        case "$PKG" in
+            apt) set_fix fix_packages_apt ;;
+            dnf) set_fix fix_packages_dnf ;;
+            *) CK_FIXLINE="install python3 (>= 3.9), git and pytest with this host's package manager, then re-run" ;;
+        esac
+    elif [ "$PK_PY" != 1 ] || [ "$PK_GIT" != 1 ]; then
+        CK_FIXLINE='xcode-select --install (or install Python >= 3.9 from python.org), then re-run'
+    else
+        set_fix fix_packages_pip
+    fi
+}
+
+fix_packages_apt() {
+    step sudo apt-get update || return
+    step sudo apt-get install -y python3 git python3-pytest
+}
+
+fix_packages_dnf() {
+    step sudo dnf install -y python3 git python3-pytest
+}
+
+fix_packages_pip() {
+    step python3 -m pip install --user pytest
+}
+
+# ---------------------------------------------------------------------------
+# clock (P13)
+# ---------------------------------------------------------------------------
+
+t_clock() {
+    if [ "$OS" = linux ]; then
+        t_clock_linux
+    else
+        t_clock_mac
+    fi
+}
+
+t_clock_linux() {
+    local out rc
+    out=$(timedatectl show -p NTPSynchronized 2>/dev/null)
+    rc=$?
+    CK_RESULT=fail
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="timedatectl show failed (exit $rc)"
+    elif [ "$out" = 'NTPSynchronized=yes' ]; then
+        CK_RESULT=pass
+        CK_DETAIL='NTPSynchronized=yes'
+    else
+        CK_DETAIL="$out"
+    fi
+}
+
+# |offset| < 5 s exactly when the integer part of the offset is < 5.
+t_clock_mac() {
+    local out rc line tok rest t ip
+    out=$(sntp -t 3 time.apple.com 2>/dev/null)
+    rc=$?
+    CK_RESULT=fail
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="sntp failed (exit $rc)"
+        return
+    fi
+    line="${out%%"$NL"*}"
+    read -r tok rest <<<"$line"
+    if ! [[ $tok =~ $RE_OFFSET ]]; then
+        CK_DETAIL="unparseable sntp output '$line'"
+        return
+    fi
+    t="${tok#[+-]}"
+    ip="${t%%.*}"
+    if [ "${#ip}" -gt 9 ] || [ $((10#$ip)) -ge 5 ]; then
+        CK_DETAIL="offset $tok s from time.apple.com (limit 5 s)"
+        return
+    fi
+    CK_RESULT=pass
+    CK_DETAIL="offset $tok s from time.apple.com"
+}
+
+ck_clock() {
+    CK_RESULT=fail
+    if [ "$OS" = linux ]; then
+        if ! command -v timedatectl >/dev/null 2>&1; then
+            CK_DETAIL='timedatectl not found'
+            CK_FIXLINE='enable NTP time synchronization on this host by hand, then re-run'
+            return
+        fi
+    elif ! command -v sntp >/dev/null 2>&1; then
+        CK_DETAIL='sntp not found'
+        CK_FIXLINE='turn on System Settings > General > Date & Time > Set time and date automatically'
+        return
+    fi
+    t_clock
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    if [ "$OS" = linux ]; then
+        set_fix fix_clock_linux
+    else
+        set_fix fix_clock_mac
+    fi
+    CK_POLLS=15
+    CK_SLEEP=2
+}
+
+fix_clock_linux() {
+    step sudo timedatectl set-ntp true
+}
+
+fix_clock_mac() {
+    step sudo systemsetup -setusingnetworktime on
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing (P5)
 # ---------------------------------------------------------------------------
 
@@ -428,6 +586,8 @@ if [ -z "$OS" ]; then
     print_summary
     exit 1
 fi
+run_check packages
+run_check clock
 
 # ---------------------------------------------------------------------------
 # Summary (P10) and exit status (P11)

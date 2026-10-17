@@ -670,3 +670,156 @@ def test_check_mode_never_runs_sudo_v():
     assert r.named("sudo", "-v") == []
     assert r.lines[-1].startswith("summary: ")
     assert r.rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 4: packages and clock (H4b, H4c, H11, H20, H25, P13a)
+# ---------------------------------------------------------------------------
+
+APT_FIX = "sudo apt-get update && sudo apt-get install -y python3 git python3-pytest"
+
+
+def test_packages_linux_check_mode_reports_every_missing_item():
+    r = run(LINUX_ARGS, linux_state(py_ok=False, pytest_ok=False), ALL_FAIL_ABSENT)
+    assert r.status("packages") == "FAIL packages: missing: python3 >= 3.9, git, pytest"
+    assert r.fix_after("packages") == "  fix: " + APT_FIX
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+def test_packages_apt_fix_runs_update_then_install():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(py_ok=False, pytest_ok=False), ALL_FAIL_ABSENT)
+    assert plus_lines(r.out) == ["+ sudo apt-get update",
+                                 "+ sudo apt-get install -y python3 git python3-pytest"]
+    assert r.status("packages") == "FIXED packages: python3 >= 3.9, git, pytest"
+    assert r.rc == 0
+
+
+def test_packages_dnf_fix():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(py_ok=False), {"apt-get", "sntp", "git"})
+    assert r.status("platform") == "PASS platform: linux/dnf"
+    assert plus_lines(r.out) == ["+ sudo dnf install -y python3 git python3-pytest"]
+    assert r.status("packages") == "FIXED packages: python3 >= 3.9, git, pytest"
+    assert r.rc == 0
+
+
+def test_h4b_packages_fix_exit_keeps_the_pre_fix_detail():
+    r = run(LINUX_ARGS + ["--apply"],
+            linux_state(py_ok=False, pytest_ok=False, fix={"packages": "exit:100"}), ALL_FAIL_ABSENT)
+    assert r.status("packages") == "FAIL packages: missing: python3 >= 3.9, git, pytest (fix exited 100)"
+    assert r.fix_after("packages") == "  fix: " + APT_FIX
+    assert r.rc == 1
+
+
+def test_h4c_apt_update_failure_stops_the_install():
+    r = run(LINUX_ARGS + ["--apply"],
+            linux_state(py_ok=False, pytest_ok=False, fix={"apt_update": "exit:100"}), ALL_FAIL_ABSENT)
+    assert plus_lines(r.out) == ["+ sudo apt-get update"]
+    assert r.named("apt-get", "install") == []
+    assert r.status("packages").endswith("(fix exited 100)")
+    assert r.rc == 1
+
+
+def test_packages_without_a_package_manager_has_no_automatic_fix():
+    for extra in ([], ["--apply"]):
+        r = run(LINUX_ARGS + extra, linux_state(), {"apt-get", "dnf", "sntp", "git"})
+        assert r.status("packages") == "FAIL packages: missing: git"
+        assert r.fix_after("packages") == ("  fix: install python3 (>= 3.9), git and pytest with this "
+                                           "host's package manager, then re-run")
+        assert plus_lines(r.out) == []
+        assert r.rc == 1
+
+
+def test_h25_macos_pip_installs_only_pytest():
+    r = run(MAC_ARGS + ["--apply"], mac_state(pytest_ok=False), MAC_ABSENT)
+    assert plus_lines(r.out) == ["+ python3 -m pip install --user pytest"]
+    assert r.status("packages") == "FIXED packages: python3 >= 3.9, git, pytest"
+    assert r.rc == 0
+
+
+@pytest.mark.parametrize("state,absent,missing", [
+    (mac_state(py_ok=False), MAC_ABSENT, "python3 >= 3.9, pytest"),
+    (mac_state(), MAC_ABSENT | {"git"}, "git"),
+], ids=["no-python", "no-git"])
+def test_h25_macos_without_python_or_git_never_runs_xcode_select(state, absent, missing):
+    r = run(MAC_ARGS + ["--apply"], state, absent)
+    assert r.status("packages") == "FAIL packages: missing: " + missing
+    assert r.fix_after("packages") == ("  fix: xcode-select --install (or install Python >= 3.9 "
+                                       "from python.org), then re-run")
+    assert r.named("xcode-select") == []
+    assert plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+SNTP_TAIL = " +/- 0.010472 time.apple.com 17.253.4.125"
+
+
+@pytest.mark.parametrize("tok,ok", [
+    ("+0.01", True), ("-0.25", True), ("+4.999", True), ("4", True),
+    ("12.3", False), ("-7.5", False), ("5.0", False),
+])
+def test_h11_macos_clock_offsets(tok, ok):
+    r = run(MAC_ARGS, mac_state(sntp_out=tok + SNTP_TAIL), MAC_ABSENT)
+    if ok:
+        assert r.status("clock") == "PASS clock: offset %s s from time.apple.com" % tok
+        assert r.rc == 0
+    else:
+        assert r.status("clock") == "FAIL clock: offset %s s from time.apple.com (limit 5 s)" % tok
+        assert r.fix_after("clock") == "  fix: sudo systemsetup -setusingnetworktime on"
+        assert r.rc == 1
+    assert mutating(r.calls()) == []
+
+
+def test_h11_macos_clock_failures():
+    r = run(MAC_ARGS, mac_state(sntp_out="garbage from sntp"), MAC_ABSENT)
+    assert r.status("clock") == "FAIL clock: unparseable sntp output 'garbage from sntp'"
+    r = run(MAC_ARGS, mac_state(sntp_exit=1), MAC_ABSENT)
+    assert r.status("clock") == "FAIL clock: sntp failed (exit 1)"
+    assert r.fix_after("clock") == "  fix: sudo systemsetup -setusingnetworktime on"
+    r = run(MAC_ARGS + ["--apply"], mac_state(), MAC_ABSENT | {"sntp"})
+    assert r.status("clock") == "FAIL clock: sntp not found"
+    assert r.fix_after("clock") == ("  fix: turn on System Settings > General > Date & Time > "
+                                    "Set time and date automatically")
+    assert r.named("systemsetup") == []
+    assert r.rc == 1
+
+
+def test_h11_macos_clock_fix():
+    r = run(MAC_ARGS + ["--apply"],
+            mac_state(sntp_out="12.3 +/- 0.01 time.apple.com 1.2.3.4"), MAC_ABSENT)
+    assert plus_lines(r.out) == ["+ sudo systemsetup -setusingnetworktime on"]
+    assert r.status("clock") == "FIXED clock: offset +0.001000 s from time.apple.com"
+    assert r.rc == 0
+
+
+def test_linux_clock_check_mode():
+    r = run(LINUX_ARGS, linux_state(clock_linux="no"))
+    assert r.status("clock") == "FAIL clock: NTPSynchronized=no"
+    assert r.fix_after("clock") == "  fix: sudo timedatectl set-ntp true"
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+def test_h20a_linux_clock_poll_waits_for_sync():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(clock_linux="no", lag={"clock": 3}))
+    assert plus_lines(r.out) == ["+ sudo timedatectl set-ntp true"]
+    assert r.status("clock") == "FIXED clock: NTPSynchronized=yes"
+    assert len(r.named("sleep", "2")) == 3
+    assert r.rc == 0
+
+
+def test_h20b_linux_clock_poll_gives_up_after_15_rechecks():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(clock_linux="no", fix={"clock": "noop"}))
+    assert r.status("clock") == "FAIL clock: NTPSynchronized=no (fix did not take)"
+    assert r.fix_after("clock") == "  fix: sudo timedatectl set-ntp true"
+    assert len(r.named("timedatectl", "show")) == 16
+    assert len(r.named("sleep", "2")) == 14
+    assert r.rc == 1
+
+
+def test_h20c_linux_without_timedatectl():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(clock_linux="no"), LINUX_ABSENT | {"timedatectl"})
+    assert r.status("clock") == "FAIL clock: timedatectl not found"
+    assert r.fix_after("clock") == "  fix: enable NTP time synchronization on this host by hand, then re-run"
+    assert r.named("sudo", "timedatectl") == []
+    assert r.rc == 1
