@@ -899,6 +899,51 @@ fix_firewall_firewalld() {
 }
 
 # ---------------------------------------------------------------------------
+# linger (P16)
+# ---------------------------------------------------------------------------
+
+LINGER_USER=''
+
+t_linger() {
+    local out rc
+    out=$(loginctl show-user "$LINGER_USER" -p Linger 2>/dev/null)
+    rc=$?
+    CK_RESULT=fail
+    if [ "$rc" -ne 0 ]; then
+        CK_DETAIL="'loginctl show-user' failed (exit $rc) for $LINGER_USER"
+    elif [ "$out" = 'Linger=yes' ]; then
+        CK_RESULT=pass
+        CK_DETAIL="Linger=yes for $LINGER_USER"
+    else
+        CK_DETAIL="$out for $LINGER_USER"
+    fi
+}
+
+ck_linger() {
+    if [ "$OS" = mac ]; then
+        CK_RESULT=skip
+        CK_DETAIL='not applicable on macOS'
+        return
+    fi
+    LINGER_USER=$(id -un 2>/dev/null)
+    if ! command -v loginctl >/dev/null 2>&1; then
+        CK_RESULT=fail
+        CK_DETAIL='loginctl not found'
+        CK_FIXLINE="the fleet service needs systemd user services; enable lingering for $LINGER_USER by hand"
+        return
+    fi
+    t_linger
+    if [ "$CK_RESULT" = pass ]; then
+        return
+    fi
+    set_fix fix_linger
+}
+
+fix_linger() {
+    step sudo loginctl enable-linger "$LINGER_USER"
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing (P5)
 # ---------------------------------------------------------------------------
 
@@ -1033,6 +1078,7 @@ run_check clock
 run_check model
 run_check searxng
 run_check firewall
+run_check linger
 
 # ---------------------------------------------------------------------------
 # Summary (P10) and exit status (P11)

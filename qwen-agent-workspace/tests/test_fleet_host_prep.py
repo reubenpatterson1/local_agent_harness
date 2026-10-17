@@ -1305,3 +1305,182 @@ def test_h6_accepted_values(extra, row):
     r = run(LINUX_ARGS + extra, linux_state(ufw_out=UFW_HEAD + row))
     assert r.status("firewall").startswith("PASS firewall: ufw allows ")
     assert r.rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: linger and whole runs (H1-H5, H4a, H7, H8 and H26 summaries, H14, H24)
+# ---------------------------------------------------------------------------
+
+CHECKS = ["platform", "packages", "clock", "model", "searxng", "firewall", "linger"]
+
+
+def assert_line_forms(r, allowed_extra=()):
+    for line in r.lines:
+        if line in allowed_extra:
+            continue
+        assert any(re.fullmatch(form, line) for form in LINE_FORMS), line
+
+
+def test_linger_check_mode():
+    r = run(LINUX_ARGS, linux_state(linger="no"))
+    assert r.status("linger") == "FAIL linger: Linger=no for tester"
+    assert r.fix_after("linger") == "  fix: sudo loginctl enable-linger tester"
+    assert mutating(r.calls()) == []
+    assert r.rc == 1
+
+
+def test_linger_fix():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(linger="no"))
+    assert plus_lines(r.out) == ["+ sudo loginctl enable-linger tester"]
+    assert r.status("linger") == "FIXED linger: Linger=yes for tester"
+    assert r.rc == 0
+
+
+def test_h4a_linger_fix_that_does_not_take():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(linger="no", fix={"linger": "noop"}))
+    assert r.status("linger") == "FAIL linger: Linger=no for tester (fix did not take)"
+    assert r.fix_after("linger") == "  fix: sudo loginctl enable-linger tester"
+    assert r.rc == 1
+
+
+def test_linger_without_loginctl():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(linger="no"), LINUX_ABSENT | {"loginctl"})
+    assert r.status("linger") == "FAIL linger: loginctl not found"
+    assert r.fix_after("linger") == ("  fix: the fleet service needs systemd user services; enable lingering "
+                                     "for tester by hand")
+    assert plus_lines(r.out) == []
+    assert r.rc == 1
+
+
+def test_h1_check_mode_all_fail_changes_nothing():
+    r = run(LINUX_ARGS, all_fail_state(), ALL_FAIL_ABSENT)
+    sx = r.sx
+    assert r.lines == [
+        "PASS platform: linux/apt",
+        "FAIL packages: missing: python3 >= 3.9, git, pytest",
+        "  fix: " + APT_FIX,
+        "FAIL clock: NTPSynchronized=no",
+        "  fix: sudo timedatectl set-ntp true",
+        "FAIL model: 'qwen3.5:9b' not served by ollama at %s (serving: other-model:1b)" % OLLAMA_PROBE,
+        "  fix: ollama pull qwen3.5:9b",
+        "FAIL searxng: no answer at %s (curl exit 7)" % SEARXNG_DEFAULT,
+        "  fix: docker start qwen-agent-searxng if that container exists, else: mkdir -p %s && cp %s %s %s && "
+        "docker compose -p qwen-agent-searxng -f %s up -d (or re-run with --apply)"
+        % (shown(sx), shown(WS + "/searxng/docker-compose.yml"), shown(WS + "/searxng/settings.yml"),
+           shown(sx + "/"), shown(sx + "/docker-compose.yml")),
+        "FAIL firewall: ufw active; no rule allows 8190 tcp, udp from 192.168.1.0/24",
+        "  fix: sudo ufw allow from 192.168.1.0/24 to any port 8190",
+        "FAIL linger: Linger=no for tester",
+        "  fix: sudo loginctl enable-linger tester",
+        "summary: 1 pass, 0 fixed, 6 fail, 0 unknown, 0 skip",
+    ]
+    assert [l.split(" ")[1] for l in status_lines(r.out)] == [c + ":" for c in CHECKS]
+    assert mutating(r.calls()) == []
+    assert r.named("docker") == [] and r.named("ollama") == []
+    assert not os.path.exists(r.sx)
+    assert_line_forms(r)
+    assert r.rc == 1
+
+
+def test_h2a_linux_all_pass():
+    r = run(LINUX_ARGS)
+    assert r.lines == [
+        "PASS platform: linux/apt",
+        "PASS packages: python3 >= 3.9, git, pytest",
+        "PASS clock: NTPSynchronized=yes",
+        "PASS model: 'qwen3.5:9b' served by ollama at " + OLLAMA_PROBE,
+        "PASS searxng: HTTP 200 at " + SEARXNG_DEFAULT,
+        "PASS firewall: ufw allows 8190 tcp+udp from 192.168.1.0/24",
+        "PASS linger: Linger=yes for tester",
+        "summary: 7 pass, 0 fixed, 0 fail, 0 unknown, 0 skip",
+    ]
+    assert r.rc == 0
+
+
+def test_h2b_macos_all_pass():
+    r = run(MAC_ARGS, mac_state(containers=["qwen-agent-searxng"]), MAC_ABSENT)
+    assert r.lines == [
+        "PASS platform: macOS 26.5.2",
+        "PASS packages: python3 >= 3.9, git, pytest",
+        "PASS clock: offset +0.003142 s from time.apple.com",
+        "PASS model: 'qwen38-6bit' served by vllm at " + VLLM_PROBE,
+        "PASS searxng: HTTP 200 at " + SEARXNG_DEFAULT,
+        "PASS firewall: application firewall off",
+        "SKIP linger: not applicable on macOS",
+        "summary: 6 pass, 0 fixed, 0 fail, 0 unknown, 1 skip",
+    ]
+    assert r.rc == 0
+
+
+def test_h3_apply_all_fail_fixes_everything():
+    r = run(LINUX_ARGS + ["--apply"], all_fail_state(), ALL_FAIL_ABSENT)
+    names = [(c["name"], c["argv"]) for c in r.calls()]
+    assert names.count(("sudo", ["-v"])) == 1
+    assert names.index(("id", ["-u"])) < names.index(("sudo", ["-v"])) < names.index(("uname", ["-s"]))
+    assert plus_lines(r.out) == [
+        "+ sudo apt-get update",
+        "+ sudo apt-get install -y python3 git python3-pytest",
+        "+ sudo timedatectl set-ntp true",
+        "+ ollama pull qwen3.5:9b",
+    ] + compose_plus_lines(r) + [
+        "+ sudo ufw allow from 192.168.1.0/24 to any port 8190",
+        "+ sudo loginctl enable-linger tester",
+    ]
+    assert [l.split(" ", 2)[:2] for l in status_lines(r.out)] == (
+        [["PASS", "platform:"]] + [["FIXED", c + ":"] for c in CHECKS[1:]])
+    fixed_model = "FIXED model: 'qwen3.5:9b' served by ollama at " + OLLAMA_PROBE
+    assert r.lines.index("+ ollama pull qwen3.5:9b") < r.lines.index("pulling manifest") < r.lines.index(fixed_model)
+    assert r.lines[-1] == "summary: 1 pass, 6 fixed, 0 fail, 0 unknown, 0 skip"
+    assert_searxng_copied(r)
+    # H14: every curl call starts with the fixed probe settings.
+    assert r.named("curl") != []
+    assert all(c["argv"][:5] == ["-sS", "--noproxy", "*", "--max-time", "5"] for c in r.named("curl"))
+    # H24
+    assert_line_forms(r, allowed_extra=("pulling manifest",))
+    assert r.rc == 0
+
+
+def test_h4b_a_failed_fix_does_not_stop_later_checks():
+    r = run(LINUX_ARGS + ["--apply"], all_fail_state(fix={"packages": "exit:100"}), ALL_FAIL_ABSENT)
+    assert r.status("packages") == "FAIL packages: missing: python3 >= 3.9, git, pytest (fix exited 100)"
+    for name, prefix in (("timedatectl", "set-ntp"), ("ollama", "pull"), ("docker", "compose"),
+                         ("ufw", "allow"), ("loginctl", "enable-linger")):
+        assert r.named(name, prefix) != [], name
+    assert r.lines[-1] == "summary: 1 pass, 5 fixed, 1 fail, 0 unknown, 0 skip"
+    assert r.rc == 1
+
+
+@pytest.mark.parametrize("args,state,absent", [
+    (LINUX_ARGS, linux_state(), LINUX_ABSENT),
+    (MAC_ARGS, mac_state(containers=["qwen-agent-searxng"]), MAC_ABSENT),
+], ids=["linux", "macos"])
+def test_h5_apply_on_a_passing_host_changes_nothing(args, state, absent):
+    r = run(args + ["--apply"], state, absent)
+    assert plus_lines(r.out) == [] and mutating(r.calls()) == []
+    assert len(r.named("sudo", "-v")) == 1
+    assert r.rc == 0
+
+
+def test_h7_no_package_manager_still_fixes_linger():
+    r = run(LINUX_ARGS + ["--apply"], linux_state(linger="no"), {"apt-get", "dnf", "sntp", "git"})
+    assert r.status("platform") == "PASS platform: linux (no apt-get/dnf: packages must be installed by hand)"
+    assert r.status("packages") == "FAIL packages: missing: git"
+    assert r.fix_after("packages") == ("  fix: install python3 (>= 3.9), git and pytest with this host's "
+                                       "package manager, then re-run")
+    assert r.status("linger") == "FIXED linger: Linger=yes for tester"
+    assert r.rc == 1
+
+
+def test_h8_summary_counts_unknown():
+    r = run(LINUX_ARGS, linux_state(sudo_n_ok=False))
+    assert r.lines[-1] == "summary: 6 pass, 0 fixed, 0 fail, 1 unknown, 0 skip"
+    assert r.rc == 1
+
+
+def test_h26_summary_counts_skips():
+    r = run(LINUX_ARGS + ["--no-searxng"], linux_state(searxng="down"))
+    assert r.lines[-1] == "summary: 6 pass, 0 fixed, 0 fail, 0 unknown, 1 skip"
+    assert r.rc == 0
+    r = run(MAC_ARGS + ["--no-searxng"], mac_state(), MAC_ABSENT)
+    assert r.lines[-1] == "summary: 5 pass, 0 fixed, 0 fail, 0 unknown, 2 skip"
+    assert r.rc == 0
