@@ -394,6 +394,12 @@ class NonceCache(object):
             self._seen[nonce] = now
             return True
 
+    def seen(self, nonce):
+        """True if nonce was added less than `retention` seconds ago. Never records it (vision spec V8)."""
+        with self._lock:
+            added = self._seen.get(nonce)
+            return added is not None and self.clock() - added < self.retention
+
     def prune(self):
         with self._lock:
             now = self.clock()
@@ -497,6 +503,25 @@ def verify_request(key, method, path, headers, body, now, cache):
     return _verify_signed(
         key, lambda ts_text, nonce: _request_input(method, path, ts_text, nonce, body),
         headers, now, cache)
+
+
+def prefilter_request(headers, now, cache):
+    """"ok", "bad", "skew" or "replay" from a request's X-Fleet-* headers alone (vision spec V9).
+
+    For a POST /run body over MAX_BODY, before the body is read. The signature covers
+    sha256(body), so it cannot be checked yet: this checks the headers' presence and
+    format, then the timestamp skew, then that the nonce is unseen. It never records
+    the nonce; verify_request does, after the body is read.
+    """
+    parsed = _signature_headers(headers)
+    if parsed is None:
+        return "bad"
+    ts_text, nonce, _sig = parsed
+    if abs(now - int(ts_text)) > SKEW_WINDOW:
+        return "skew"
+    if cache.seen(nonce):
+        return "replay"
+    return "ok"
 
 
 def sign_response(key, status_code, method, path, request_nonce, body, now, nonce):
@@ -891,12 +916,18 @@ def fetch_view(daemon_url):
     return view, None
 
 
-def delegate_once(daemon_url, skill, task, host_id):
-    """POST /delegate for one named peer -> (outcome, envelope, detail). Never raises (F68)."""
+def delegate_once(daemon_url, skill, task, host_id, images=None):
+    """POST /delegate for one named peer -> (outcome, envelope, detail). Never raises (F68).
+
+    images is the wire list (vision spec V10, V20); None sends the three-key body unchanged.
+    """
     if daemon_url is None:
         return "daemon_error", None, "no daemon"
     try:
-        body = canonical_json({"skill": skill, "task": task, "host_id": host_id})
+        request = {"skill": skill, "task": task, "host_id": host_id}
+        if images is not None:
+            request["images"] = images
+        body = canonical_json(request)
         conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url),
                                           timeout=DELEGATE_CLIENT_TIMEOUT)
         try:

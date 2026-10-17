@@ -1570,3 +1570,57 @@ def test_vt7_vision_185_registry_entry_and_mlx_vlm_models():
     assert loaded == {"DreamFast/Qwen3-VL-4b-Heretic", "mlx-community/other"}
     assert fleet_lib.verify_skills(_VISION_185, loaded) == [
         {"skill": "vision", "model": "DreamFast/Qwen3-VL-4b-Heretic", "verified": True}]
+
+
+# --- vision agent: pre-body checks and the client (vision spec V8-V10) ---
+
+def test_vt6_nonce_seen_and_prefilter_request():
+    clock = _Clock(1000.0)
+    cache = fleet_lib.NonceCache(retention=120, clock=clock)
+    assert cache.seen("n1") is False
+    assert len(cache) == 0
+    assert cache.check_and_add("n1") is True
+    assert cache.seen("n1") is True
+    clock.t = 1119.9
+    assert cache.seen("n1") is True
+    clock.t = 1120.0
+    assert cache.seen("n1") is False
+    assert cache.seen("n2") is False
+    assert len(cache) == 1
+    assert cache.check_and_add("n2") is True
+
+    body = b'{"skill":"vision"}'
+    headers = fleet_lib.sign_request(KEY, "POST", "/run", body, NOW, NONCE_A)
+    requests = fleet_lib.NonceCache()
+    assert fleet_lib.prefilter_request(headers, NOW, requests) == "ok"
+    assert len(requests) == 0
+    for name in headers:
+        missing = dict(headers)
+        del missing[name]
+        assert fleet_lib.prefilter_request(missing, NOW, requests) == "bad", name
+    assert fleet_lib.prefilter_request(dict(headers, **{"X-Fleet-Sig": "z" * 64}), NOW, requests) == "bad"
+    assert fleet_lib.prefilter_request(dict(headers, **{"X-Fleet-Nonce": "a" * 31}), NOW, requests) == "bad"
+    late = fleet_lib.sign_request(KEY, "POST", "/run", body, NOW - 61, NONCE_B)
+    assert fleet_lib.prefilter_request(late, NOW, requests) == "skew"
+    edge = fleet_lib.sign_request(KEY, "POST", "/run", body, NOW - 60, NONCE_B)
+    assert fleet_lib.prefilter_request(edge, NOW, requests) == "ok"
+    assert fleet_lib.prefilter_request(dict(headers, **{"X-Fleet-Sig": "0" * 64}), NOW, requests) == "ok"
+    assert len(requests) == 0
+    assert fleet_lib.verify_request(KEY, "POST", "/run", headers, body, NOW, requests) == "ok"
+    assert fleet_lib.prefilter_request(headers, NOW, requests) == "replay"
+    assert fleet_lib.prefilter_request({"X-Fleet-Ts": None}, NOW, requests) == "bad"
+
+
+def test_vt8_delegate_once_sends_images_only_when_given():
+    srv = _Scripted({("POST", "/delegate"): (200, json.dumps(
+        {"outcome": "ok", "envelope": _ENVELOPE, "detail": ""}).encode())})
+    try:
+        wire = _wire(V_PNG, "image/png")
+        assert fleet_lib.delegate_once(srv.url, "vision", "t", "v1", [wire]) == ("ok", _ENVELOPE, "")
+        assert json.loads(srv.requests[-1][2]) == {"skill": "vision", "task": "t", "host_id": "v1",
+                                                   "images": [wire]}
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h") == ("ok", _ENVELOPE, "")
+        assert srv.requests[-1][2] == fleet_lib.canonical_json({"skill": "researcher", "task": "t",
+                                                                "host_id": "h"})
+    finally:
+        srv.close()
