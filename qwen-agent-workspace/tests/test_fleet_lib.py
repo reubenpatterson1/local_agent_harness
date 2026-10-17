@@ -1272,3 +1272,148 @@ def test_mt1b_agent_root_paths(monkeypatch):
                 func(bad)
     assert not hasattr(fleet_lib, "DEPLOY_ROOT")
     assert not hasattr(fleet_lib, "SYSTEMD_UNIT")
+
+
+# --- multi-agent hosts: the generated commands (multi-agent spec M9-M12) ----------------
+
+def _m9_wrapper(home):
+    return ("#!/bin/sh\n"
+            "# qwen-agentd wrapper\n"
+            "# agent-id: mac-local\n"
+            "QWEN_AGENT_DAEMON_URL=http://127.0.0.1:8190\n"
+            "export QWEN_AGENT_DAEMON_URL\n"
+            "exec '%s/agents/mac-local/current/qwen-agent-workspace/bin/qwen-agent' \"$@\"\n" % home).encode("utf-8")
+
+
+def _fake_release_harness(home, host_id, script):
+    """An executable stand-in for A(<id>)/current/qwen-agent-workspace/bin/qwen-agent."""
+    target = os.path.join(str(home), "agents", host_id, "current", "qwen-agent-workspace", "bin", "qwen-agent")
+    os.makedirs(os.path.dirname(target))
+    with open(target, "w") as f:
+        f.write(script)
+    os.chmod(target, 0o755)
+
+
+def _run_wrapper(tmp_path, data, argv, env_extra=None):
+    w = str(tmp_path / "w")
+    with open(w, "wb") as f:
+        f.write(data)
+    os.chmod(w, 0o755)
+    env = dict((k, v) for k, v in os.environ.items() if k != "QWEN_AGENT_DAEMON_URL")
+    env.update(env_extra or {})
+    return subprocess.run(["/bin/sh", w] + list(argv), env=env, capture_output=True, timeout=30)
+
+
+def test_mt2_wrapper_bytes_and_detection(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", "/h")
+    data = fleet_lib.wrapper_bytes("mac-local", 8190)
+    assert data == _m9_wrapper("/h")
+    for bad in BAD_AGENT_IDS:
+        with pytest.raises(ValueError):
+            fleet_lib.wrapper_bytes(bad, 8190)
+    for bad_port in (1023, 65536, True, "8190"):
+        with pytest.raises(ValueError):
+            fleet_lib.wrapper_bytes("mac-local", bad_port)
+    monkeypatch.setenv("HOME", "/h/it's")
+    assert fleet_lib.wrapper_bytes("x", 8190).decode("utf-8").splitlines()[-1] == (
+        "exec '/h/it'\\''s/agents/x/current/qwen-agent-workspace/bin/qwen-agent' \"$@\"")
+    assert fleet_lib.is_wrapper(data) is True
+    assert fleet_lib.is_wrapper(b"#!/bin/sh\n# qwen-agentd wrapper\n") is True
+    for not_wrapper in (b"# qwen-agentd wrapper extra\n", b"#  qwen-agentd wrapper\n", b""):
+        assert fleet_lib.is_wrapper(not_wrapper) is False
+    assert fleet_lib.wrapper_agent_id(data) == "mac-local"
+    assert fleet_lib.wrapper_agent_id(b"#!/bin/sh\n# qwen-agentd wrapper\n") is None
+    assert fleet_lib.wrapper_agent_id(b"# qwen-agentd wrapper\n# agent-id: Bad\n") is None
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_release_harness(tmp_path, "x", "#!/bin/sh\nprintf '%s;%s;%s' \"$QWEN_AGENT_DAEMON_URL\" \"$1\" \"$2\"\n")
+    proc = _run_wrapper(tmp_path, fleet_lib.wrapper_bytes("x", 8191), ["a b", "c"])
+    assert (proc.returncode, proc.stdout) == (0, b"http://127.0.0.1:8191;a b;c")
+
+
+def test_multi_agent_focus_1_wrapper_overrides_an_inherited_daemon_url(tmp_path, monkeypatch):
+    """Multi-agent Review Focus 1: a shell that already exports QWEN_AGENT_DAEMON_URL (another agent's port,
+    or a leftover from debugging) still reaches the wrapper's own agent."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_release_harness(tmp_path, "x", "#!/bin/sh\nprintf '%s' \"$QWEN_AGENT_DAEMON_URL\"\n")
+    for inherited in ("http://127.0.0.1:9999", "", "not a url"):
+        proc = _run_wrapper(tmp_path, fleet_lib.wrapper_bytes("x", 8191), [],
+                            {"QWEN_AGENT_DAEMON_URL": inherited})
+        assert (proc.returncode, proc.stdout) == (0, b"http://127.0.0.1:8191"), inherited
+
+
+def test_multi_agent_focus_2_wrapper_passes_shell_metacharacters_verbatim(tmp_path, monkeypatch):
+    """Multi-agent Review Focus 2: prompts typed through the wrapper keep their exact bytes: globs, $VARS,
+    quotes, backslashes, newlines and empty arguments are neither expanded nor dropped."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _fake_release_harness(tmp_path, "x", "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\"; done\n")
+    argv = ["*", "$HOME", "what's \"this\"?", "a\\b", "line1\nline2", "", "--user-prompt=x y"]
+    proc = _run_wrapper(tmp_path, fleet_lib.wrapper_bytes("x", 8191), argv)
+    assert proc.returncode == 0
+    assert proc.stdout == "".join("[%s]" % a for a in argv).encode("utf-8")
+
+
+def test_mt3_classify_write_and_actions(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", "/h")
+    data = fleet_lib.wrapper_bytes("mac-local", 8190)
+    path = str(tmp_path / "cmd")
+    assert fleet_lib.classify_command_path(path) == ("absent", None)
+    os.symlink(str(tmp_path / "nowhere"), path)
+    assert fleet_lib.classify_command_path(path) == ("symlink", None)
+    os.unlink(path)
+    with open(path, "wb") as f:
+        f.write(data)
+    assert fleet_lib.classify_command_path(path) == ("wrapper", "mac-local")
+    with open(path, "wb") as f:
+        f.write(b"#!/bin/sh\necho mine\n")
+    assert fleet_lib.classify_command_path(path) == ("other", None)
+    assert fleet_lib.classify_command_path(str(tmp_path)) == ("other", None)
+    big = b"# qwen-agentd wrapper\n"
+    with open(path, "wb") as f:
+        f.write(big + b"x" * (fleet_lib.WRAPPER_MAX_BYTES + 1 - len(big)))
+    assert os.path.getsize(path) == fleet_lib.WRAPPER_MAX_BYTES + 1
+    assert fleet_lib.classify_command_path(path) == ("other", None)
+
+    out = str(tmp_path / "bin" / "qwen-agent-x")
+    os.makedirs(os.path.dirname(out))
+    with open(out + ".tmp", "w") as f:
+        f.write("leftover")
+    old_umask = os.umask(0o077)
+    try:
+        fleet_lib.write_wrapper(out, data)
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(os.stat(out).st_mode) == 0o755
+    assert not os.path.lexists(out + ".tmp")
+    with open(out, "rb") as f:
+        assert f.read() == data
+    target = str(tmp_path / "target")
+    with open(target, "w") as f:
+        f.write("untouched")
+    link = str(tmp_path / "bin" / "qwen-agent")
+    os.symlink(target, link)
+    fleet_lib.write_wrapper(link, data)
+    assert not os.path.islink(link)
+    with open(link, "rb") as f:
+        assert f.read() == data
+    with open(target) as f:
+        assert f.read() == "untouched"
+
+    for kind, action in (("absent", "write"), ("symlink", "write"), ("wrapper", "write"), ("other", "refuse")):
+        assert fleet_lib.agent_command_action(kind) == action
+    rows = [
+        (("absent", None, "h1", False), "write"),
+        (("absent", None, "h1", True), "write"),
+        (("wrapper", "h1", "h1", False), "write"),
+        (("wrapper", "h1", "h1", True), "write"),
+        (("wrapper", "h2", "h1", True), "write"),
+        (("wrapper", None, "h1", True), "write"),
+        (("symlink", None, "h1", True), "write"),
+        (("other", None, "h1", True), "refuse"),
+        (("wrapper", "h2", "h1", False), "keep"),
+        (("wrapper", None, "h1", False), "keep"),
+        (("symlink", None, "h1", False), "keep"),
+        (("other", None, "h1", False), "keep"),
+    ]
+    for args, action in rows:
+        assert fleet_lib.default_command_action(*args) == action, args

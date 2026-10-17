@@ -73,6 +73,9 @@ BIN_DIR = "~/.local/bin"                    # where the agent commands live (mul
 COMMAND_NAME = "qwen-agent"                 # ~/.local/bin/qwen-agent and qwen-agent-<id> (multi-agent spec M8)
 MIN_PORT = 1024                             # lowest registry port (multi-agent spec M7)
 BROADCAST_ADDR = "255.255.255.255"          # the default beacon target address (multi-agent spec M16)
+WRAPPER_MARKER = "# qwen-agentd wrapper"    # the line that marks a generated command (multi-agent spec M9)
+WRAPPER_ID_PREFIX = "# agent-id: "          # the wrapper line that names its agent (multi-agent spec M9)
+WRAPPER_MAX_BYTES = 65536                   # a larger file is never a wrapper (multi-agent spec M10)
 SUPERVISOR_RESTART_DELAY = 10 # s, launchd ThrottleInterval and systemd RestartSec
 LOG_MAX_BYTES = 5242880       # 5 MB
 LOG_BACKUPS = 3
@@ -1101,3 +1104,90 @@ def agent_port(fleets_dir, host_id):
     if len(ports) == 1:
         return ports.pop(), files
     return None, files
+
+
+def _sh_single_quote(s):
+    """s as one POSIX sh single-quoted word, ' written as '\\'' (multi-agent spec M9)."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def wrapper_bytes(host_id, port):
+    """The exact wrapper file for one agent (multi-agent spec M9)."""
+    _check_agent_id(host_id)
+    if not (_is_int(port) and MIN_PORT <= port <= 65535):
+        raise ValueError("invalid port %r" % (port,))
+    target = os.path.join(deploy_root(host_id), "current", WS_SUBDIR, "bin", "qwen-agent")
+    return ("#!/bin/sh\n"
+            + WRAPPER_MARKER + "\n"
+            + WRAPPER_ID_PREFIX + host_id + "\n"
+            + "QWEN_AGENT_DAEMON_URL=http://127.0.0.1:%d\n" % port
+            + "export QWEN_AGENT_DAEMON_URL\n"
+            + "exec " + _sh_single_quote(target) + ' "$@"\n').encode("utf-8")
+
+
+def is_wrapper(data):
+    """True when one whole line of data equals WRAPPER_MARKER (multi-agent spec M10)."""
+    return WRAPPER_MARKER.encode("ascii") in data.split(b"\n")
+
+
+def wrapper_agent_id(data):
+    """The agent ID on the first "# agent-id: " line of data, or None (multi-agent spec M10)."""
+    prefix = WRAPPER_ID_PREFIX.encode("ascii")
+    for line in data.split(b"\n"):
+        if line.startswith(prefix):
+            try:
+                value = line[len(prefix):].decode("ascii")
+            except UnicodeDecodeError:
+                return None
+            return value if HOST_ID_RE.fullmatch(value) else None
+    return None
+
+
+def classify_command_path(path):
+    """(kind, found_id): "absent", "symlink", "wrapper" (with its agent ID) or "other" (multi-agent spec M10)."""
+    if not os.path.lexists(path):
+        return "absent", None
+    if os.path.islink(path):
+        return "symlink", None
+    if os.path.isfile(path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read(WRAPPER_MAX_BYTES + 1)
+        except OSError:
+            return "other", None
+        if len(data) <= WRAPPER_MAX_BYTES and is_wrapper(data):
+            return "wrapper", wrapper_agent_id(data)
+    return "other", None
+
+
+def write_wrapper(path, data):
+    """Atomically replace path (a symlink itself, never its target) with data, mode 0755 (multi-agent spec M10)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
+    os.fchmod(fd, 0o755)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def agent_command_action(kind):
+    """The action for ~/.local/bin/qwen-agent-<id> of this kind: "write" or "refuse" (multi-agent spec M11)."""
+    return "write" if kind in ("absent", "symlink", "wrapper") else "refuse"
+
+
+def default_command_action(kind, found_id, host_id, make_default):
+    """The action for ~/.local/bin/qwen-agent: "write", "refuse" or "keep" (multi-agent spec M12)."""
+    if kind == "absent":
+        return "write"
+    if kind == "wrapper" and found_id == host_id:
+        return "write"
+    if make_default and kind in ("symlink", "wrapper"):
+        return "write"
+    if make_default and kind == "other":
+        return "refuse"
+    return "keep"
