@@ -1168,3 +1168,93 @@ def test_mt6_agent_ids_on_disk_and_resolve_agent(tmp_path, monkeypatch):
         None, "qwen-agentd: more than one agent in %s (alpha, bravo); pass --agent-id ID" % agents)
     assert fleet_lib.resolve_agent("zed") == ("zed", None)
     assert fleet_lib.resolve_agent("Bad") == (None, "qwen-agentd: invalid --agent-id 'Bad'")
+
+
+# --- multi-agent hosts: registry ports, beacon targets, agent_port, fleet.env (M4, M7, M16, M19, M24) ---
+
+def test_mt4_port_range_and_duplicate_address(monkeypatch):
+    reg = _f18_registry()
+    reg["hosts"]["mac-local"]["port"] = 1023
+    errors = fleet_lib.validate_registry(reg, TEST_FLEET_ID)
+    assert len(errors) == 1 and errors[0].startswith("hosts.mac-local.port: must be an integer in 1024..65535")
+    for good in (1024, 65535):
+        reg["hosts"]["mac-local"]["port"] = good
+        assert fleet_lib.validate_registry(reg, TEST_FLEET_ID) == []
+
+    def agent(port):
+        return {"role": "agent", "address": "192.168.1.185", "port": port,
+                "model_server": {"type": "vllm", "url": "http://127.0.0.1:8000/v1"},
+                "model": "m", "skills": []}
+    two = {"protocol": 1, "fleet_id": TEST_FLEET_ID,
+           "hosts": {"vision-185": agent(8190), "gemma-185": agent(8190)}}
+    assert fleet_lib.validate_registry(two, TEST_FLEET_ID) == [
+        "hosts.vision-185: address 192.168.1.185:8190 is already used by hosts.gemma-185"]
+    two["hosts"]["gemma-185"]["port"] = 8191
+    assert fleet_lib.validate_registry(two, TEST_FLEET_ID) == []
+
+
+def test_mt5_default_beacon_targets(tmp_path):
+    assert fleet_lib.default_beacon_targets(_f18_registry()) == [("255.255.255.255", 8190)]
+    reg = _f18_registry()
+    reg["hosts"]["mac-local"]["port"] = 9000
+    reg["hosts"]["ollama-168"]["port"] = 8191
+    reg["hosts"]["gemma-185"] = dict(reg["hosts"]["ollama-168"], address="192.168.1.185", port=8190)
+    reg["hosts"]["orchestrator"]["port"] = 8190
+    expected = [("255.255.255.255", 8190), ("255.255.255.255", 8191), ("255.255.255.255", 9000)]
+    assert fleet_lib.default_beacon_targets(reg) == expected
+    reg["hosts"]["orchestrator"]["port"] = 9100
+    with_orchestrator = expected + [("255.255.255.255", 9100)]
+    assert fleet_lib.default_beacon_targets(reg) == with_orchestrator
+    loaded = fleet_lib.load_registry(_write_json(tmp_path / "r.json", reg), TEST_FLEET_ID)
+    assert fleet_lib.default_beacon_targets(loaded) == with_orchestrator
+    raw = _f18_registry()
+    loaded = fleet_lib.load_registry(_write_json(tmp_path / "f18.json", raw), TEST_FLEET_ID)
+    assert fleet_lib.default_beacon_targets(loaded) == fleet_lib.default_beacon_targets(raw)
+
+
+def test_mt7_agent_port_and_atomic_fleet_env(tmp_path):
+    fleets = tmp_path / "fleets"
+    assert fleet_lib.agent_port(str(fleets), "h1") == (None, [])
+    fleets.mkdir()
+    assert fleet_lib.agent_port(str(fleets), "h1") == (None, [])
+
+    def registry(fleet_id, port):
+        host = {"role": "agent", "address": "127.0.0.1", "model_server": {"type": "vllm",
+                "url": "http://127.0.0.1:9/v1"}, "model": "m", "skills": []}
+        if port is not None:
+            host["port"] = port
+        return {"protocol": 1, "fleet_id": fleet_id, "hosts": {"h1": host}}
+    _write_json(fleets / "a.json", registry(TEST_FLEET_ID, 9001))
+    assert fleet_lib.agent_port(str(fleets), "h1") == (9001, ["a.json"])
+    assert fleet_lib.agent_port(str(fleets), "h2") == (None, [])
+    _write_json(fleets / "a.json", registry(TEST_FLEET_ID, None))
+    assert fleet_lib.agent_port(str(fleets), "h1") == (8190, ["a.json"])
+    _write_json(fleets / "a.json", registry(TEST_FLEET_ID, 9001))
+    _write_json(fleets / "b.json", registry("fedcba9876543210", 9001))
+    assert fleet_lib.agent_port(str(fleets), "h1") == (9001, ["a.json", "b.json"])
+    _write_json(fleets / "b.json", registry("fedcba9876543210", 9002))
+    assert fleet_lib.agent_port(str(fleets), "h1") == (None, ["a.json", "b.json"])
+    _write_json(fleets / "b.json", registry("fedcba9876543210", 9001))
+    (fleets / "bad.json").write_text("{not json")
+    invalid = registry(TEST_FLEET_ID, 9005)
+    invalid["protocol"] = 2
+    _write_json(fleets / "invalid.json", invalid)
+    (fleets / "notes.txt").write_text(json.dumps(registry(TEST_FLEET_ID, 9006)))
+    assert fleet_lib.agent_port(str(fleets), "h1") == (9001, ["a.json", "b.json"])
+
+    path = str(tmp_path / "agents" / "h1" / "fleet.env")
+    os.makedirs(os.path.dirname(path))
+    with open(path + ".tmp", "w") as f:
+        f.write("leftover")
+    fleet_lib.write_fleet_env(path, TEST_FLEET_ID, TEST_TOKEN)
+    assert not os.path.lexists(path + ".tmp")
+    assert stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert fleet_lib.load_fleet_env(path) == (TEST_FLEET_ID, TEST_TOKEN)
+    with open(path, "rb") as f:
+        before = f.read()
+    with pytest.raises(FileExistsError):
+        fleet_lib.write_fleet_env(path, "fedcba9876543210", OTHER_TOKEN)
+    with open(path, "rb") as f:
+        assert f.read() == before
+    assert not os.path.lexists(path + ".tmp")

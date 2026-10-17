@@ -74,6 +74,8 @@ FLEET_ENV_NAME = "fleet.env"                # A(<id>)/fleet.env (multi-agent spe
 SYSTEMD_UNIT_FMT = "qwen-agentd-%s.service" # systemd_unit(<id>) (multi-agent spec M6)
 BIN_DIR = "~/.local/bin"                    # where the agent commands live (multi-agent spec M8)
 COMMAND_NAME = "qwen-agent"                 # ~/.local/bin/qwen-agent and qwen-agent-<id> (multi-agent spec M8)
+MIN_PORT = 1024                             # lowest registry port (multi-agent spec M7)
+BROADCAST_ADDR = "255.255.255.255"          # the default beacon target address (multi-agent spec M16)
 SUPERVISOR_RESTART_DELAY = 10 # s, launchd ThrottleInterval and systemd RestartSec
 LOG_MAX_BYTES = 5242880       # 5 MB
 LOG_BACKUPS = 3
@@ -164,9 +166,9 @@ def _validate_hosts(hosts):
             except ValueError:
                 errors.append("%s.address: must be an IPv4 dotted quad" % loc)
         port = host.get("port", DEFAULT_PORT)
-        port_ok = _is_int(port) and 1 <= port <= 65535
+        port_ok = _is_int(port) and MIN_PORT <= port <= 65535
         if not port_ok:
-            errors.append("%s.port: must be an integer in 1..65535" % loc)
+            errors.append("%s.port: must be an integer in %d..65535" % (loc, MIN_PORT))
         if "model_server" in host:
             errors.extend(_validate_model_server(loc + ".model_server", host["model_server"]))
         if "model" in host and not (isinstance(host["model"], str) and host["model"] != ""):
@@ -246,15 +248,25 @@ def fleet_env_path():
 
 
 def write_fleet_env(path, fleet_id, token):
-    """Create fleet.env (dir 0700, file 0600). An existing file raises FileExistsError (F20)."""
+    """Create fleet.env atomically (dir 0700, file 0600) through <path>.tmp and os.link.
+
+    An existing path raises FileExistsError and is never replaced (F20, multi-agent spec M4).
+    """
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     os.chmod(directory, 0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="ascii") as f:
         f.write("%s=%s\n%s=%s\n" % (FLEET_ENV_KEYS[0], fleet_id, FLEET_ENV_KEYS[1], token))
         f.flush()
         os.fsync(f.fileno())
+    try:
+        os.link(tmp, path)
+    finally:
+        os.unlink(tmp)
 
 
 def load_fleet_env(path):
@@ -1056,3 +1068,40 @@ def resolve_agent(explicit):
     if not ids:
         return None, "qwen-agentd: no agent found in %s; pass --agent-id ID" % root
     return None, "qwen-agentd: more than one agent in %s (%s); pass --agent-id ID" % (root, ", ".join(ids))
+
+
+def default_beacon_targets(registry):
+    """One broadcast target per distinct registry port, ascending (multi-agent spec M16)."""
+    ports = set(h.get("port", DEFAULT_PORT) for h in registry["hosts"].values())
+    return [(BROADCAST_ADDR, p) for p in sorted(ports)]
+
+
+def agent_port(fleets_dir, host_id):
+    """(port or None, files): host_id's port in the valid registries of fleets_dir (multi-agent spec M24).
+
+    files lists, sorted, every *.json in fleets_dir that parses, passes validate_registry
+    against its own fleet_id, and has host_id in hosts. port is None unless all of them
+    agree. Unreadable files are skipped; a missing directory gives (None, []).
+    """
+    try:
+        names = sorted(os.listdir(fleets_dir))
+    except OSError:
+        return None, []
+    files = []
+    ports = set()
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(fleets_dir, name), "r", encoding="utf-8") as f:
+                obj = json.loads(f.read())
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not (isinstance(obj, dict) and isinstance(obj.get("hosts"), dict) and host_id in obj["hosts"]
+                and validate_registry(obj, obj.get("fleet_id")) == []):
+            continue
+        files.append(name)
+        ports.add(obj["hosts"][host_id].get("port", DEFAULT_PORT))
+    if len(ports) == 1:
+        return ports.pop(), files
+    return None, files
