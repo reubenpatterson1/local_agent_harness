@@ -7,6 +7,7 @@ Every spawned process gets HOME=<tmp dir> and a QWEN_AGENT_SEARXNG_URL that poin
 at a closed port, so no test touches real user state or needs a running SearXNG.
 """
 
+import base64
 import http.client
 import http.server
 import importlib.machinery
@@ -33,6 +34,9 @@ OTHER_FLEET_ID = "fedcba9876543210"
 OTHER_TOKEN = "a7" * 32
 INTEGRATION_SCALE = "0.1"
 SELF_UPDATE_SCALE = "0.01"
+# Test images are byte strings, never decoded pictures (vision spec 7.1).
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8
+JPEG_BYTES = b"\xff\xd8\xff\xe0" + bytes(range(255, -1, -1)) * 8
 
 _ISSUED_PORTS = set()
 _DROP_PREFIXES = ("QWEN_AGENT_", "SKILL_ENDPOINT_", "SKILL_MODEL_")
@@ -78,6 +82,11 @@ def clean_env(home, **extra):
     env["QWEN_AGENT_SEARXNG_URL"] = "http://127.0.0.1:%d" % free_port()
     env.update(extra)
     return env
+
+
+def wire(data, media_type):
+    """One wire image (vision spec V20): {"media_type", "data": standard base64}."""
+    return {"media_type": media_type, "data": base64.b64encode(data).decode("ascii")}
 
 
 def make_fleet(home, host_id, fleet_id=TEST_FLEET_ID, token=TEST_TOKEN):
@@ -359,13 +368,15 @@ class Fleet(object):
 
     Each daemon has its own HOME, stub model server, HTTP port and beacon port, and
     beacons to the other two (plus `extra_targets`). `beacons=False` gives every
-    daemon --beacon-targets none. `extra_args` / `stub_kwargs` / `env_extra` are
-    keyed by name. `extra_hosts` adds registry entries for hosts no daemon runs
-    (for example an in-process fake peer). Nothing starts until start().
+    daemon --beacon-targets none. `extra_args` / `stub_kwargs` / `env_extra` / `skills`
+    are keyed by name; `skills` replaces that name's STANDARD_HOSTS skills list in the
+    registry. `extra_hosts` adds registry entries for hosts no daemon runs (for example
+    an in-process fake peer). Nothing starts until start().
     """
 
     def __init__(self, root, names=("alpha", "bravo", "charlie"), beacons=True, extra_targets=(),
-                 extra_args=None, stub_kwargs=None, extra_hosts=None, start_stubs=True, env_extra=None):
+                 extra_args=None, stub_kwargs=None, extra_hosts=None, start_stubs=True, env_extra=None,
+                 skills=None):
         self.root = str(root)
         self.names = list(names)
         self.beacons = beacons
@@ -377,7 +388,7 @@ class Fleet(object):
         hosts = {}
         spec = dict((h[0], h) for h in STANDARD_HOSTS)
         for name in self.names:
-            _n, kind, skills, model, answer = spec[name]
+            _n, kind, default_skills, model, answer = spec[name]
             home = os.path.join(self.root, name)
             os.makedirs(home)
             make_fleet(home, name)
@@ -391,7 +402,7 @@ class Fleet(object):
                 self.server_ports[name] = free_port()
             url = "http://127.0.0.1:%d/v1" % self.server_ports[name]
             hosts[name] = {"port": self.ports[name], "model_server": {"type": kind, "url": url},
-                           "model": model, "skills": skills}
+                           "model": model, "skills": list((skills or {}).get(name, default_skills))}
         hosts.update(extra_hosts or {})
         self.registry = write_registry(os.path.join(self.root, "registry.json"), TEST_FLEET_ID, hosts)
 
@@ -463,11 +474,32 @@ _HOOK_SOURCES = {
         "    json.dump({'argv': sys.argv, 'env': dict(os.environ)}, f)\n"
         "os.execv(sys.executable, [sys.executable, %r] + sys.argv[1:])\n" % QWEN_AGENT
     ),
+    "hang": (
+        "import time\n"
+        "time.sleep(600)\n"
+    ),
+    "imagestat": (
+        "import hashlib, json, os, stat, sys\n"
+        "images = []\n"
+        "args = sys.argv[1:]\n"
+        "for i, arg in enumerate(args[:-1]):\n"
+        "    if arg == '--image':\n"
+        "        path = args[i + 1]\n"
+        "        with open(path, 'rb') as f:\n"
+        "            digest = hashlib.sha256(f.read()).hexdigest()\n"
+        "        images.append({'path': path, 'mode': stat.S_IMODE(os.stat(path).st_mode),\n"
+        "                       'dir_mode': stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode),\n"
+        "                       'sha256': digest})\n"
+        "with open(os.path.abspath(__file__) + '.json', 'w') as f:\n"
+        "    json.dump({'argv': sys.argv, 'images': images}, f)\n"
+        "print(%r)\n"
+        "sys.exit(0)\n" % CANNED_LINE
+    ),
 }
 
 
 def write_hook(path, kind):
-    """Write an executable --qwen-agent-bin stand-in: "slow", "envdump" or "canned"."""
+    """Write an executable --qwen-agent-bin stand-in: "slow", "envdump", "canned", "hang" or "imagestat"."""
     with open(str(path), "w", encoding="utf-8") as f:
         f.write(_HOOK_SOURCES[kind])
     os.chmod(str(path), 0o755)

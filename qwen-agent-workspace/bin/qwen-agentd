@@ -40,6 +40,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -195,6 +196,7 @@ def _is_int(value):
 
 _PORT_RE = re.compile(r"[0-9]{1,5}")
 _LENGTH_RE = re.compile(r"[0-9]{1,12}")
+_RUN_KEYS = frozenset(("skill", "task", "request_id"))
 
 
 def _parse_port(text):
@@ -457,12 +459,30 @@ class Daemon(object):
         self.table = fleet_lib.LivenessTable(self.registry, self.host_id,
                                              self.scaled(fleet_lib.LIVE_WINDOW))
         self._bind_sockets()
+        self.remove_stale_image_dirs()
         self.probe()
         self._start_threads()
         LOG.info("qwen-agentd %s started host_id=%s port=%d beacon_port=%d beacon_targets=%d skills=%s"
                  % (self.version, self.host_id, self.port, self.beacon_port, len(self.beacon_targets),
                     ",".join("%s:%s" % (i["skill"], "verified" if i["verified"] else "unverified")
                              for i in self.skills_state)))
+
+    def remove_stale_image_dirs(self):
+        """Delete A(<id>)/tmp/images-* left by a killed run; runs after the bind (vision spec V19)."""
+        root = os.path.join(fleet_lib.deploy_root(self.host_id), fleet_lib.RUN_TMP_SUBDIR)
+        try:
+            names = os.listdir(root)
+        except OSError:
+            return
+        removed = 0
+        for name in names:
+            if name.startswith(fleet_lib.RUN_TMP_PREFIX):
+                path = os.path.join(root, name)
+                shutil.rmtree(path, ignore_errors=True)
+                if not os.path.lexists(path):
+                    removed += 1
+        if removed:
+            LOG.info("removed %d stale image dir(s) from %s" % (removed, root))
 
     def _bind_sockets(self):
         """F95 step 8: the TCP listener, then the UDP beacon socket."""
@@ -754,13 +774,17 @@ class Daemon(object):
     # --- POST /run (F47-F54c) ----------------------------------------------------------
 
     def handle_run(self, body):
-        """(status, body bytes) for a verified POST /run. One run at a time per host."""
+        """(status, body bytes) for a verified POST /run. One run at a time per host (vision spec V16)."""
         req = _json_or_none(body)
-        if not (isinstance(req, dict) and set(req) == {"skill", "task", "request_id"}
-                and all(isinstance(v, str) for v in req.values())
+        if not (isinstance(req, dict) and set(req) in (_RUN_KEYS, _RUN_KEYS | {"images"})
+                and all(isinstance(req[k], str) for k in _RUN_KEYS)
                 and req["task"].strip() != ""
                 and fleet_lib.REQUEST_ID_RE.fullmatch(req["request_id"])):
             return 400, fleet_lib.canonical_json({"error": "bad request"})
+        try:
+            images = fleet_lib.request_images(req)
+        except fleet_lib.ImageError as e:
+            return e.status, fleet_lib.canonical_json({"error": e.reason})
         if not self.run_lock.acquire(False):
             return 409, fleet_lib.canonical_json({"error": "busy"})
         skill, task, request_id = req["skill"], req["task"], req["request_id"]
@@ -771,8 +795,10 @@ class Daemon(object):
                 code, raw = 400, fleet_lib.canonical_json({"error": "skill not served: %s" % skill})
                 return code, raw
             started = time.monotonic()
-            LOG.info("run start skill=%s request_id=%s task_chars=%d" % (skill, request_id, len(task)))
-            code, status, raw = self.spawn_run(skill, task)
+            LOG.info("run start skill=%s request_id=%s task_chars=%d images=%d image_bytes=%d"
+                     % (skill, request_id, len(task), len(images or []),
+                        sum(len(data) for _media_type, data in images or [])))
+            code, status, raw = self.spawn_run(skill, task, images)
             return code, raw
         finally:
             self.run_lock.release()
@@ -780,11 +806,40 @@ class Daemon(object):
                 LOG.info("run end skill=%s request_id=%s http=%d status=%s seconds=%.1f"
                          % (skill, request_id, code, status, time.monotonic() - started))
 
-    def spawn_run(self, skill, task):
-        """Run this release's bin/qwen-agent --skill child -> (http code, envelope status, body)."""
+    def spawn_run(self, skill, task, images=None):
+        """Run this release's bin/qwen-agent --skill child -> (http code, envelope status, body).
+
+        images, decoded [(media_type, bytes)], are written to a private directory under
+        A(<id>)/tmp, passed as --image paths, and removed on every exit (vision spec V17, V18).
+        """
         argv = [sys.executable, self.qwen_agent_bin, "--skill=" + skill, "--user-prompt=" + task,
                 "--base-url=" + self.entry["model_server"]["url"], "--model=" + self.entry["model"],
                 "--model-server-type=" + self.entry["model_server"]["type"]]
+        if not images:
+            return self._run_child(argv)
+        image_dir = None
+        try:
+            try:
+                root = os.path.join(fleet_lib.deploy_root(self.host_id), fleet_lib.RUN_TMP_SUBDIR)
+                os.makedirs(root, exist_ok=True)
+                os.chmod(root, 0o700)
+                image_dir = tempfile.mkdtemp(prefix=fleet_lib.RUN_TMP_PREFIX, dir=root)
+                for index, (media_type, data) in enumerate(images, 1):
+                    path = os.path.join(image_dir, "image-%d.%s" % (index, fleet_lib.IMAGE_EXTENSIONS[media_type]))
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.fchmod(fd, 0o600)
+                    with os.fdopen(fd, "wb") as f:
+                        f.write(data)
+                    argv.extend(["--image", path])
+            except OSError as e:
+                return 500, "-", fleet_lib.canonical_json({"error": "cannot stage images: %s" % type(e).__name__})
+            return self._run_child(argv)
+        finally:
+            if image_dir is not None:
+                shutil.rmtree(image_dir, ignore_errors=True)
+
+    def _run_child(self, argv):
+        """Start argv as the /run child and map its result (F50-F54c, multi-agent spec M32)."""
         err_path = os.path.join(fleet_lib.log_dir(self.host_id), "last-run.stderr")
         fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
