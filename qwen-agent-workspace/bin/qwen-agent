@@ -222,6 +222,12 @@ EXIT_ABNORMAL = 3                          # one-shot: turn ended with no final 
 
 DECISION_SCHEMA = "qwen-agent.decision.v1"   # value of each decision-log line's "schema" field
 DECISION_LOG_NAME = "tool_decisions.log"     # workspace-relative JSON Lines tool-decision log
+TRACE_RING_SIZE = 20       # REPL turns that /trace N reaches back to (tracing spec TR40)
+TRACE_TURN_BUDGET = 2.0    # s, all POST /spans of one turn together; never scaled (tracing spec TR46)
+# Each equals its fleet_lib namesake (TRACE_ENV_ID, TRACE_ENV_PARENT); bin/qwen-agent keeps its own
+# copy because it must work without fleet_lib (fleet spec F70). Test TRT20 checks that they agree.
+TRACE_ENV_KEYS = ("QWEN_AGENT_TRACE_ID", "QWEN_AGENT_PARENT_SPAN")
+TRACE_USAGE = "usage: /trace [N | TRACE_ID]  (N from 1 to 20 counts back from the last turn)"
 
 # True only in --prompt mode. Redirects the confirmation UI to stderr so stdout
 # carries nothing but the JSON envelope. Never true in the REPL.
@@ -657,6 +663,8 @@ TOOLS = None
 TOOL_BY_NAME = None
 FLEET = None
 FLEET_DAEMON_URL = None
+TURN_TRACE = None   # the turn being traced (a dict, TR41), or None
+TRACE_RING = []     # trace IDs of this REPL session's turns, oldest first, at most TRACE_RING_SIZE
 
 
 def _load_fleet_lib():
@@ -1425,6 +1433,7 @@ def exec_delegate_to_skill(args, args_ns):
     new_session = (args_ns.skill is None)
     child_env = os.environ.copy()
     child_env["QWEN_AGENT_PREFLIGHT_DONE"] = "1"   # see setup(): skips the tools prefill
+    _trace_child_env(child_env)
     proc = subprocess.Popen(
         argv, cwd=str(WORKSPACE), stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1479,12 +1488,14 @@ def _delegate_remote(skill, task, candidates, images=None):
     duplicate guard and the circuit breaker treat it like any other tool failure.
     """
     current = [None]
+    context = _trace_context()
+    trace = None if context is None else {"trace_id": context[0], "parent_span_id": context[1]}
 
     def attempt(host_id):
         current[0] = host_id
         print("[delegating to %s on %s, up to %ds...]" % (skill, host_id, SKILL_SUBPROCESS_TIMEOUT),
               file=_ui())
-        outcome, envelope, _detail = FLEET.delegate_once(FLEET_DAEMON_URL, skill, task, host_id, images)
+        outcome, envelope, _detail = FLEET.delegate_once(FLEET_DAEMON_URL, skill, task, host_id, images, trace)
         if outcome != "ok":
             print("[%s on %s failed: %s]" % (skill, host_id, outcome), file=_ui())
         return outcome, envelope
@@ -1949,6 +1960,182 @@ def dispatch(tc, i, n, args_ns, history):
 
 
 # ---------------------------------------------------------------------------
+# Tracing (docs/superpowers/specs/2026-10-17-fleet-tracing-design.md)
+# ---------------------------------------------------------------------------
+
+def _trace_begin(name, inherit):
+    """Start tracing one turn and return its trace ID, or None (tracing off). Never raises.
+
+    Tracing is on only with fleet_lib loaded and a usable QWEN_AGENT_DAEMON_URL. inherit=True
+    (one-shot only) takes the trace and parent from QWEN_AGENT_TRACE_ID / QWEN_AGENT_PARENT_SPAN.
+    """
+    global TURN_TRACE
+    TURN_TRACE = None
+    if FLEET is None or FLEET_DAEMON_URL is None:
+        return None
+    try:
+        context = FLEET.trace_env_context(os.environ) if inherit else None
+        trace_id, parent = context if context is not None else (FLEET.new_trace_id(), None)
+        # Inherited: no turn span; the model and tool spans hang off the inherited parent (TR42).
+        TURN_TRACE = {"trace_id": trace_id, "span_id": parent if context is not None else FLEET.new_span_id(),
+                      "parent": None, "post_turn": context is None, "name": name,
+                      "start": round(time.time(), 3), "t0": time.monotonic(), "budget": TRACE_TURN_BUDGET,
+                      "dead": False, "tool_span": None, "model_calls": 0}
+    except Exception:
+        TURN_TRACE = None
+        return None
+    return trace_id
+
+
+def _trace_end(outcome):
+    """Post the turn span last (only for a turn that inherited no trace), then stop tracing. Never raises."""
+    global TURN_TRACE
+    t = TURN_TRACE
+    try:
+        if t is not None and t["post_turn"]:
+            _trace_post("turn", t["span_id"], t["parent"], t["name"], t["start"], t["t0"],
+                        FLEET.trace_token(outcome["status"]) or "error",
+                        {"rounds": int(outcome["rounds"]), "tool_calls": len(outcome["tool_calls"])})
+    except Exception:
+        pass
+    TURN_TRACE = None
+
+
+def _trace_post(kind, span_id, parent, name, start, t0, status, attrs):
+    """POST one finished span to the local daemon within the turn's budget; drop it on any failure."""
+    t = TURN_TRACE
+    if t is None or t["dead"]:
+        return
+    try:
+        record = FLEET.make_record(t["trace_id"], span_id, parent, None, kind, name, start, t0, status, attrs)
+        left = t["budget"]
+        if left <= 0:
+            t["dead"] = True
+            return
+        began = time.monotonic()
+        ok = FLEET.post_span(FLEET_DAEMON_URL, record, min(FLEET.TRACE_POST_TIMEOUT, left))
+        t["budget"] = left - (time.monotonic() - began)
+        if not ok:
+            t["dead"] = True
+    except (Exception, KeyboardInterrupt):
+        t["dead"] = True
+
+
+def _trace_context():
+    """(trace_id, current tool span ID) while a traced tool call runs, else None."""
+    t = TURN_TRACE
+    if t is None or t["tool_span"] is None:
+        return None
+    return t["trace_id"], t["tool_span"]
+
+
+def _trace_child_env(env):
+    """Point a local --skill child at the current tool span; never pass on an inherited trace."""
+    for key in TRACE_ENV_KEYS:
+        env.pop(key, None)
+    context = _trace_context()
+    if context is not None:
+        env[TRACE_ENV_KEYS[0]], env[TRACE_ENV_KEYS[1]] = context
+
+
+def _trace_model_begin():
+    """(span_id, start, t0, call number) for one traced chat call, or None. Never raises."""
+    t = TURN_TRACE
+    if t is None:
+        return None
+    try:
+        t["model_calls"] += 1
+        return FLEET.new_span_id(), round(time.time(), 3), time.monotonic(), t["model_calls"]
+    except Exception:
+        return None
+
+
+def _trace_model_end(span, args_ns, tools, result, error):
+    """Post one model span: timing, token usage and finish_reason, never the messages or the answer."""
+    if span is None or TURN_TRACE is None:
+        return
+    try:
+        span_id, start, t0, call = span
+        status, http = "ok", None
+        if isinstance(error, urllib.error.HTTPError):
+            status, http = "http_error", FLEET.trace_count(error.code)
+        elif isinstance(error, KeyboardInterrupt):
+            status = "interrupted"
+        elif isinstance(error, (urllib.error.URLError, OSError)):
+            status = "network_error"
+        elif isinstance(error, ValueError):
+            status = "malformed_response"
+        elif error is not None:
+            status = "error"
+        usage = result.get("usage") if isinstance(result, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        finish = None
+        try:
+            finish = result["choices"][0].get("finish_reason")
+        except Exception:
+            pass
+        _trace_post("model", span_id, TURN_TRACE["span_id"], FLEET.trace_name(getattr(args_ns, "model", None)),
+                    start, t0, status,
+                    {"call": call, "tools": bool(tools), "prompt_tokens": FLEET.trace_count(usage.get("prompt_tokens")),
+                     "completion_tokens": FLEET.trace_count(usage.get("completion_tokens")),
+                     "finish_reason": FLEET.trace_token(finish), "http": http})
+    except Exception:
+        pass
+
+
+def _trace_tool_begin():
+    """(span_id, start, t0) for one traced tool call, made current for delegation, or None."""
+    t = TURN_TRACE
+    if t is None:
+        return None
+    try:
+        span = (FLEET.new_span_id(), round(time.time(), 3), time.monotonic())
+        t["tool_span"] = span[0]
+        return span
+    except Exception:
+        return None
+
+
+def _trace_key(name, args):
+    """A tool span's key: the decision-log key (_call_key), except that delegate_to_skill
+    records only its skill and image count, never its task."""
+    if not isinstance(args, dict):
+        return ""
+    try:
+        if name == "delegate_to_skill":
+            key = "skill=%s" % (args.get("skill", ""),)
+            if isinstance(args.get("images"), list):
+                key += " images=%d" % len(args["images"])
+            return _trace_clip(key)
+        return _call_key(name, args)
+    except Exception:
+        return ""
+
+
+def _trace_tool_end(span, record, round_num):
+    """Post one tool span from dispatch's record. Never raises."""
+    t = TURN_TRACE
+    if span is None or t is None:
+        return
+    try:
+        t["tool_span"] = None
+        name = record.get("tool")
+        decision = record["outcome"]
+        error = record["result"].startswith("ERROR:")
+        try:
+            outcome = _auto_trace_outcome(str(name), record["result"])
+        except Exception:
+            outcome = ""
+        _trace_post("tool", span[0], t["span_id"],
+                    name if isinstance(name, str) and name in TOOL_BY_NAME else "unknown",
+                    span[1], span[2], ("error" if error else "ok") if decision == "approved" else decision,
+                    {"round": round_num, "decision": decision, "key": _trace_key(name, record.get("arguments")),
+                     "outcome": outcome, "error": error})
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Section 11.1: wire contract
 # ---------------------------------------------------------------------------
 
@@ -1990,8 +2177,15 @@ def chat_completion(base_url, messages, args_ns, include_tools=True):
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=args_ns.request_timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    span = _trace_model_begin()
+    try:
+        with urllib.request.urlopen(req, timeout=args_ns.request_timeout) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except BaseException as e:
+        _trace_model_end(span, args_ns, "tools" in body, None, e)
+        raise
+    _trace_model_end(span, args_ns, "tools" in body, result, None)
+    return result
 
 
 def assistant_echo(msg, tool_calls, round_num):
@@ -3685,7 +3879,9 @@ def run_turn(messages, args_ns, snapshot):
 
         n = len(tool_calls)
         for i, tc in enumerate(tool_calls, start=1):
+            tool_span = _trace_tool_begin()
             record = dispatch(tc, i, n, args_ns, history)
+            _trace_tool_end(tool_span, record, round_num)
             record["round"] = round_num
             record["id"] = tc_id(tc, i, round_num)
             records.append(record)
@@ -3768,6 +3964,10 @@ def repl(args_ns):
         turn_index += 1
         snapshot = len(messages)
         messages.append({"role": "user", "content": line})
+        trace_id = _trace_begin("repl", False)
+        if trace_id is not None:
+            TRACE_RING.append(trace_id)
+            del TRACE_RING[:-TRACE_RING_SIZE]
 
         outcome = run_turn(messages, args_ns, snapshot)
         if outcome["answer"] is not None:
@@ -3791,6 +3991,7 @@ def repl(args_ns):
                 "any, is a forced summary. Use /resume to continue from this session's checkpoints, or /reset to start clean.]\n"
                 % CONTEXT_WINDOW
             )
+        _trace_end(outcome)
 
         # The harness-enforced memory write. Deliberately the LAST thing in the
         # turn: the answer and any [stopped: ...] notice are already on screen, so
@@ -3883,7 +4084,9 @@ def oneshot(args_ns):
     if args_ns.system_prompt is not None:
         system_msg = {"role": "system", "content": system_msg["content"] + "\n\n" + args_ns.system_prompt}
     messages = [system_msg, _oneshot_user_message(args_ns)]
+    _trace_begin(args_ns.skill or "oneshot", True)
     outcome = run_turn(messages, args_ns, 1)
+    _trace_end(outcome)
 
     if outcome["status"] == "max_rounds":
         sys.stderr.write(
