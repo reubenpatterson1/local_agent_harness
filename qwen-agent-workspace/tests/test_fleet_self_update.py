@@ -116,10 +116,11 @@ def _deploy(home):
     return os.path.join(str(home), "agents", "h1")
 
 
-def test_t61_install_layout_and_idempotence(tmp_path):
+def test_t61_install_layout_and_idempotence(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
-    origin = Origin(tmp_path / "o", _registry(ftu.free_port()))
+    port = ftu.free_port()
+    origin = Origin(tmp_path / "o", _registry(port))
     proc = _install(home, origin)
     assert proc.returncode == 2
     assert proc.stderr == ("qwen-agentd: no release tags (vYYYY.MM.DD[.N]) at %s; tag a release first\n"
@@ -128,17 +129,28 @@ def test_t61_install_layout_and_idempotence(tmp_path):
     proc = _install(home, origin)
     assert proc.returncode == 0, proc.stderr
     d = _deploy(home)
-    assert proc.stdout == ("installed v2026.01.01 at %s\n"
-                           "next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id h1 "
-                           "(or init-fleet --agent-id h1); the service retries every 10 s\n" % (d, d))
+    bindir = os.path.join(str(home), ".local", "bin")
+    lines = ("installed v2026.01.01 at %s\n" % d
+             + "command: %s/qwen-agent-h1 (daemon port %d)\n" % (bindir, port)
+             + "default: %s/qwen-agent runs agent h1\n" % bindir)
+    assert proc.stdout == lines + ("next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id h1 "
+                                   "(or init-fleet --agent-id h1); the service retries every 10 s\n" % d)
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(os.path.join(d, "qwen-agentd-launch")).st_mode) == 0o755
     assert stat.S_IMODE(os.stat(os.path.join(d, "update-state.json")).st_mode) == 0o600
     assert os.readlink(os.path.join(d, "current")) == "releases/v2026.01.01"
     assert os.path.isdir(os.path.join(d, "repo", "refs"))
-    link = os.path.join(str(home), ".local", "bin", "qwen-agent")
-    assert os.readlink(link) == os.path.join(d, "current", "qwen-agent-workspace", "bin", "qwen-agent")
-    assert os.path.realpath(link) == os.path.realpath(
+    monkeypatch.setenv("HOME", str(home))
+    wrapper = fleet_lib.wrapper_bytes("h1", port)
+    for name in ("qwen-agent", "qwen-agent-h1"):
+        path = os.path.join(bindir, name)
+        assert os.path.isfile(path) and not os.path.islink(path)
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o755
+        with open(path, "rb") as f:
+            assert f.read() == wrapper
+    target = os.path.join(d, "current", "qwen-agent-workspace", "bin", "qwen-agent")
+    assert wrapper.decode("utf-8").splitlines()[-1] == "exec '%s' \"$@\"" % target
+    assert os.path.realpath(target) == os.path.realpath(
         os.path.join(d, "releases", "v2026.01.01", "qwen-agent-workspace", "bin", "qwen-agent"))
     state = fleet_lib.read_state(os.path.join(d, "update-state.json"))
     assert state == {"from": None, "to": "v2026.01.01", "status": "ok", "attempts": 0, "bad_tags": []}
@@ -149,7 +161,7 @@ def test_t61_install_layout_and_idempotence(tmp_path):
     ftu.make_fleet(home, "h1", ftu.TEST_FLEET_ID, secrets.token_hex(32))
     proc = _install(home, origin)
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "installed v2026.01.01 at %s\n" % d
+    assert proc.stdout == lines
     assert os.readlink(os.path.join(d, "current")) == "releases/v2026.01.01"
     assert fleet_lib.read_state(os.path.join(d, "update-state.json")) == state
 
@@ -420,3 +432,157 @@ def test_t63_update_waits_for_an_in_flight_run(tmp_path):
         ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 2 * UPDATE_PERIOD + 10)
     finally:
         sup.close()
+
+
+# --- multi-agent hosts: install per agent, the generated commands (M3, M11-M13, M24-M26) ---
+
+def _agentd(home, *args):
+    return subprocess.run([sys.executable, ftu.AGENTD] + list(args), env=ftu.clean_env(home),
+                          capture_output=True, text=True, timeout=300)
+
+
+def _install_agent(home, origin, host_id, *extra):
+    return _agentd(home, "install", "--agent-id", host_id, "--origin", origin.bare, "--no-service", *extra)
+
+
+def _two_agent_origin(tmp_path):
+    """Origin whose registry lists h1 and h2 on their own free ports, tagged v2026.01.01."""
+    home = tmp_path / "home"
+    home.mkdir()
+    p1, p2 = ftu.free_port(), ftu.free_port()
+    registry = _registry(p1)
+    registry["hosts"]["h2"] = dict(registry["hosts"]["h1"], port=p2, model="h2-model")
+    origin = Origin(tmp_path / "o", registry)
+    origin.release("v2026.01.01")
+    return home, origin, p1, p2
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _paths(home):
+    """(qwen-agent-h1, qwen-agent-h2, qwen-agent) under <home>/.local/bin."""
+    bindir = os.path.join(str(home), ".local", "bin")
+    return (os.path.join(bindir, "qwen-agent-h1"), os.path.join(bindir, "qwen-agent-h2"),
+            os.path.join(bindir, "qwen-agent"))
+
+
+def test_mt20_two_agents_one_home(tmp_path, monkeypatch):
+    home, origin, p1, p2 = _two_agent_origin(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    w1, w2 = fleet_lib.wrapper_bytes("h1", p1), fleet_lib.wrapper_bytes("h2", p2)
+    cmd1, cmd2, default = _paths(home)
+    a1, a2 = os.path.join(str(home), "agents", "h1"), os.path.join(str(home), "agents", "h2")
+    # (1) the first agent sets the default
+    proc = _install_agent(home, origin, "h1")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == (
+        "installed v2026.01.01 at %s\n" % a1
+        + "command: %s (daemon port %d)\n" % (cmd1, p1)
+        + "default: %s runs agent h1\n" % default
+        + "next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id h1 "
+          "(or init-fleet --agent-id h1); the service retries every 10 s\n" % a1)
+    for path in (cmd1, default):
+        assert os.path.isfile(path) and not os.path.islink(path)
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o755
+        assert _read(path) == w1
+    # (2) a second agent (through the --host-id alias) leaves the default alone
+    proc = _agentd(home, "install", "--host-id", "h2", "--origin", origin.bare, "--no-service")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[:3] == [
+        "installed v2026.01.01 at %s" % a2, "command: %s (daemon port %d)" % (cmd2, p2),
+        "default: %s unchanged; pass --default to make it run agent h2" % default]
+    assert _read(cmd2) == w2 and _read(default) == w1
+    for root in (a1, a2):
+        for name in ("repo", "current", "update-state.json", "qwen-agentd-launch"):
+            assert os.path.lexists(os.path.join(root, name)), (root, name)
+        assert os.path.realpath(os.path.join(root, "current")) == os.path.join(root, "releases", "v2026.01.01")
+    # (3) --default moves the default to h2
+    proc = _install_agent(home, origin, "h2", "--default")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[2] == "default: %s runs agent h2" % default
+    assert _read(default) == w2
+    # (4) re-installing h1 rewrites its own command and keeps h2 as the default
+    fleet_lib.write_wrapper(cmd1, fleet_lib.wrapper_bytes("h1", 1024))
+    proc = _install_agent(home, origin, "h1")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines()[1:3] == [
+        "command: %s (daemon port %d)" % (cmd1, p1),
+        "default: %s unchanged; pass --default to make it run agent h1" % default]
+    assert _read(cmd1) == w1 and _read(default) == w2
+    # (5) h2 takes h1's fleet secret without seeing it
+    token = secrets.token_hex(32)
+    ftu.make_fleet(home, "h1", ftu.TEST_FLEET_ID, token)
+    proc = _agentd(home, "join", "--agent-id", "h2", "--from-agent", "h1")
+    assert (proc.returncode, proc.stderr) == (0, "")
+    assert proc.stdout == "qwen-agentd: joined fleet %s (copied from agent h1)\n" % ftu.TEST_FLEET_ID
+    assert token not in proc.stdout
+    env2 = os.path.join(a2, "fleet.env")
+    assert stat.S_IMODE(os.stat(env2).st_mode) == 0o600
+    assert _read(env2) == _read(os.path.join(a1, "fleet.env"))
+    # (6) nothing was written outside the two agent roots, ~/.local/bin and the origin
+    allowed = (os.path.join(str(home), "agents"), os.path.join(str(home), ".local", "bin"), str(tmp_path / "o"))
+    for root, dirs, files in os.walk(str(tmp_path)):
+        for name in dirs + files:
+            path = os.path.join(root, name)
+            assert any(path == a or path.startswith(a + os.sep) or a.startswith(path + os.sep)
+                       for a in allowed), path
+
+
+def test_mt21_commands_are_never_clobbered(tmp_path, monkeypatch):
+    home, origin, _p1, p2 = _two_agent_origin(tmp_path)
+    cmd1, _cmd2, default = _paths(home)
+    assert _install_agent(home, origin, "h1").returncode == 0
+    # (a) a hand-written qwen-agent-h1 is kept, with a warning and no command: line
+    with open(cmd1, "w") as f:
+        f.write("#!/bin/sh\necho mine\n")
+    proc = _install_agent(home, origin, "h1")
+    assert proc.returncode == 0, proc.stderr
+    assert ("qwen-agentd: warning: not replacing %s: not a symlink or a qwen-agentd wrapper" % cmd1) in proc.stderr
+    assert _read(cmd1) == b"#!/bin/sh\necho mine\n"
+    assert not any(line.startswith("command: ") for line in proc.stdout.splitlines())
+    # (b) a hand-written default is kept even with --default; stdout has no default: line
+    with open(default, "w") as f:
+        f.write("#!/bin/sh\necho default\n")
+    proc = _install_agent(home, origin, "h1", "--default")
+    assert proc.returncode == 0, proc.stderr
+    assert ("qwen-agentd: warning: not replacing %s: not a symlink or a qwen-agentd wrapper" % default) in proc.stderr
+    assert _read(default) == b"#!/bin/sh\necho default\n"
+    assert not any(line.startswith("default: ") for line in proc.stdout.splitlines())
+    # (c) a dangling symlink (the Mac's old dev link) is kept without --default, replaced with it
+    os.unlink(default)
+    os.symlink("/nonexistent", default)
+    proc = _install_agent(home, origin, "h2")
+    assert proc.returncode == 0, proc.stderr
+    assert "default: %s unchanged; pass --default to make it run agent h2" % default in proc.stdout.splitlines()
+    assert os.readlink(default) == "/nonexistent"
+    proc = _install_agent(home, origin, "h2", "--default")
+    assert proc.returncode == 0, proc.stderr
+    assert not os.path.islink(default)
+    monkeypatch.setenv("HOME", str(home))
+    assert _read(default) == fleet_lib.wrapper_bytes("h2", p2)
+
+
+def test_mt22_install_port_from_the_release_registry(tmp_path, monkeypatch):
+    home, origin, _p1, _p2 = _two_agent_origin(tmp_path)
+    # (a) an agent missing from every registry warns and uses 8190
+    proc = _install_agent(home, origin, "h3")
+    assert proc.returncode == 0, proc.stderr
+    assert ("qwen-agentd: warning: agent 'h3' is not in any registry of release v2026.01.01; "
+            "its commands use port 8190") in proc.stderr
+    monkeypatch.setenv("HOME", str(home))
+    assert _read(os.path.join(str(home), ".local", "bin", "qwen-agent-h3")) == fleet_lib.wrapper_bytes("h3", 8190)
+    # (b) two registries of one release that disagree on h1's port: exit 2
+    home2 = tmp_path / "home2"
+    home2.mkdir()
+    origin2 = Origin(tmp_path / "o2", _registry(ftu.free_port()))
+    other = _registry(ftu.free_port())
+    other["fleet_id"] = ftu.OTHER_FLEET_ID
+    origin2.write(os.path.join("fleets", ftu.OTHER_FLEET_ID + ".json"), json.dumps(other, indent=2))
+    origin2.release("v2026.01.01")
+    proc = _install_agent(home2, origin2, "h1")
+    assert proc.returncode == 2
+    assert proc.stderr == ("qwen-agentd: agent 'h1' has different ports in 0123456789abcdef.json, "
+                           "fedcba9876543210.json of release v2026.01.01\n")

@@ -3,11 +3,11 @@
 
   qwen-agentd [run] [--registry PATH] [--beacon-targets LIST] [--beacon-port N]
                     [--qwen-agent-bin PATH] [--timing-scale X]
-  qwen-agentd init-fleet
-  qwen-agentd join [STRING]
-  qwen-agentd install --host-id ID [--origin URL] [--no-service]
+  qwen-agentd init-fleet [--agent-id ID]
+  qwen-agentd join [--agent-id ID] [STRING | --from-agent ID]
+  qwen-agentd install --agent-id ID [--default] [--origin URL] [--no-service]
   qwen-agentd selftest
-  qwen-agentd status [--port N]
+  qwen-agentd status [--agent-id ID] [--port N]
 
 Every host in the fleet runs `run`. The daemon advertises the skills its host
 serves and runs them locally, against its own model server, when a peer sends a
@@ -1271,21 +1271,34 @@ def cmd_install(args):
         swap_current(d, tag)
         fleet_lib.write_state(state_path(d), {"from": None, "to": tag, "status": "ok", "attempts": 0,
                                               "bad_tags": []})
+    tag = os.path.basename(os.path.realpath(current))
+    port, files = fleet_lib.agent_port(os.path.join(current, fleet_lib.WS_SUBDIR, "fleets"), host_id)
+    if port is None and files:
+        _err("qwen-agentd: agent '%s' has different ports in %s of release %s" % (host_id, ", ".join(files), tag))
+        return 2
+    if not files:
+        _err("qwen-agentd: warning: agent '%s' is not in any registry of release %s; its commands use port %d"
+             % (host_id, tag, fleet_lib.DEFAULT_PORT))
+        port = fleet_lib.DEFAULT_PORT
     launcher_tmp = os.path.join(d, ".qwen-agentd-launch.tmp")
     shutil.copyfile(os.path.join(current, fleet_lib.WS_SUBDIR, "bin", "qwen-agentd-launch"), launcher_tmp)
     os.chmod(launcher_tmp, 0o755)
     os.replace(launcher_tmp, os.path.join(d, "qwen-agentd-launch"))
-    bindir = os.path.expanduser("~/.local/bin")
-    os.makedirs(bindir, exist_ok=True)
-    link = os.path.join(bindir, "qwen-agent")
-    if os.path.lexists(link) and not os.path.islink(link):
-        _err("qwen-agentd: warning: not replacing %s: not a symlink" % link)
+    wrapper = fleet_lib.wrapper_bytes(host_id, port)
+    command = fleet_lib.command_path(host_id)
+    kind, _found = fleet_lib.classify_command_path(command)
+    command_action = fleet_lib.agent_command_action(kind)
+    if command_action == "write":
+        fleet_lib.write_wrapper(command, wrapper)
     else:
-        link_tmp = link + ".tmp"
-        if os.path.lexists(link_tmp):
-            os.unlink(link_tmp)
-        os.symlink(os.path.join(current, fleet_lib.WS_SUBDIR, "bin", "qwen-agent"), link_tmp)
-        os.replace(link_tmp, link)
+        _err("qwen-agentd: warning: not replacing %s: not a symlink or a qwen-agentd wrapper" % command)
+    default = fleet_lib.default_command_path()
+    kind, found = fleet_lib.classify_command_path(default)
+    default_action = fleet_lib.default_command_action(kind, found, host_id, args.make_default)
+    if default_action == "write":
+        fleet_lib.write_wrapper(default, wrapper)
+    elif default_action == "refuse":
+        _err("qwen-agentd: warning: not replacing %s: not a symlink or a qwen-agentd wrapper" % default)
     service_path = None
     if not args.no_service:
         ok, result = install_service(sys.executable, d, host_id)
@@ -1293,7 +1306,13 @@ def cmd_install(args):
             _err(result)
             return 2
         service_path = result
-    print("installed %s at %s" % (os.path.basename(os.path.realpath(current)), d))
+    print("installed %s at %s" % (tag, d))
+    if command_action == "write":
+        print("command: %s (daemon port %d)" % (command, port))
+    if default_action == "write":
+        print("default: %s runs agent %s" % (default, host_id))
+    elif default_action == "keep":
+        print("default: %s unchanged; pass --default to make it run agent %s" % (default, host_id))
     if service_path is not None:
         print("service: %s" % service_path)
     if not os.path.exists(fleet_lib.fleet_env_path(host_id)):
@@ -1419,6 +1438,7 @@ def _build_parser():
     p.set_defaults(func=cmd_status)
     p = sub.add_parser("install", help="install an agent into ~/agents/<id> with its service and commands")
     _add_agent_id(p, required=True)
+    p.add_argument("--default", dest="make_default", action="store_true", default=False)
     p.add_argument("--origin", default=fleet_lib.ORIGIN_URL, metavar="URL")
     p.add_argument("--no-service", action="store_true", default=False)
     p.set_defaults(func=cmd_install)
