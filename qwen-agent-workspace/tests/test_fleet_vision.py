@@ -441,3 +441,78 @@ def test_vt27_unsigned_peer_503_is_busy_and_413_is_peer_error(tmp_path):
         assert all(set(b) == {"skill", "task", "request_id", "images"} for b in delta.run_bodies)
     finally:
         delta.close()
+
+
+# --- the real harness round trip, and what reaches logs (V5-V34 end to end, V22, VK5) ---
+
+def _vision_round_trip(tmp_path):
+    """alpha (no skills) and bravo (vision, the real bin/qwen-agent child); the real
+    harness on alpha's stub delegates a.png and b.jpg to vision -> (fleet, proc, caller home)."""
+    fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), skills={"bravo": ["vision"]},
+                      stub_kwargs={"alpha": {"delegate_skill": "vision",
+                                             "delegate_images": ["a.png", "b.jpg"]}}).start()
+    ftu.wait_until(lambda: fleet_lib.route_candidates("vision", fleet.view("alpha")) == ["bravo"], 4.5)
+    caller = tmp_path / "caller"
+    ws = caller / "ws"
+    ws.mkdir(parents=True)
+    (ws / "a.png").write_bytes(ftu.PNG_BYTES)
+    (ws / "b.jpg").write_bytes(ftu.JPEG_BYTES)
+    env = ftu.clean_env(caller, QWEN_AGENT_DAEMON_URL=fleet.daemons["alpha"].url)
+    proc = subprocess.run([sys.executable, ftu.QWEN_AGENT, "--user-prompt=go", "--workspace=%s" % ws,
+                           "--base-url=%s" % fleet.stubs["alpha"].url, "--model=alpha-model"],
+                          env=env, capture_output=True, text=True, timeout=120)
+    return fleet, proc
+
+
+def _image_parts(request):
+    """The content list of the request's user message when it carries images, else None."""
+    for message in request.get("messages") or []:
+        if message.get("role") == "user" and isinstance(message.get("content"), list):
+            return message["content"]
+    return None
+
+
+def test_vt20_harness_delegates_images_to_the_vision_peer(tmp_path):
+    fleet, proc = _vision_round_trip(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    envelope = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert envelope["status"] == "ok" and "BRAVO-ANSWER" in envelope["answer"]
+    assert "[delegating to vision on bravo, up to 900s...]" in proc.stderr
+    with_images = [r for r in fleet.stubs["bravo"].requests if _image_parts(r) is not None]
+    assert len(with_images) == 1
+    parts = _image_parts(with_images[0])
+    assert [p["type"] for p in parts] == ["text", "image_url", "image_url"]
+    urls = [p["image_url"]["url"] for p in parts[1:]]
+    assert urls[0].startswith("data:image/png;base64,") and urls[1].startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(urls[0].split(",", 1)[1]) == ftu.PNG_BYTES
+    assert base64.b64decode(urls[1].split(",", 1)[1]) == ftu.JPEG_BYTES
+    assert "tools" not in with_images[0] and "tool_choice" not in with_images[0]
+    assert not any("image_url" in json.dumps(r) for r in fleet.stubs["alpha"].requests)
+    bravo_log = fleet.daemons["bravo"].log()
+    assert re.search(r"run start skill=vision request_id=[0-9a-f]+ task_chars=9 images=2 image_bytes=%d\n"
+                     % (len(ftu.PNG_BYTES) + len(ftu.JPEG_BYTES)), bravo_log), bravo_log
+    assert re.search(r"run end skill=vision request_id=[0-9a-f]+ http=200 status=ok seconds=", bravo_log)
+    assert os.listdir(_agent_tmp(fleet.homes["bravo"], "bravo")) == []
+
+
+def test_vt26_no_image_bytes_task_text_or_secret_reaches_any_log(tmp_path):
+    fleet, proc = _vision_round_trip(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    status, delegated = ftu.delegate(fleet.ports["alpha"], "vision", "stub task", "bravo",
+                                     images=[PNG_WIRE, JPEG_WIRE])
+    assert status == 200 and delegated["outcome"] == "ok", delegated
+    blobs = [json.dumps(fleet.view("alpha")).encode(), json.dumps(delegated).encode()]
+    for name in fleet.names:
+        log_dir = ftu.daemon_log_dir(fleet.homes[name], name)
+        for entry in os.listdir(log_dir):
+            with open(os.path.join(log_dir, entry), "rb") as f:
+                blobs.append(f.read())
+    assert os.path.exists(os.path.join(ftu.daemon_log_dir(fleet.homes["bravo"], "bravo"), "last-run.stderr"))
+    needles = [ftu.PNG_BYTES, ftu.JPEG_BYTES, b"stub task", ftu.TEST_TOKEN.encode("ascii"), ftu.TEST_KEY,
+               fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN).encode("ascii")]
+    for wire_image in (PNG_WIRE, JPEG_WIRE):
+        needles += [wire_image["data"].encode("ascii"), wire_image["data"][:40].encode("ascii")]
+    for blob in blobs:
+        for needle in needles:
+            assert needle not in blob, needle[:40]
+    assert os.listdir(_agent_tmp(fleet.homes["bravo"], "bravo")) == []

@@ -125,11 +125,13 @@ class StubModelServer(object):
     GET /api/tags. POST /v1/chat/completions records the parsed body in .requests
     and answers either one delegate_to_skill tool call (when delegate_skill is set
     and no message has role "tool") or `answer` plus " | <last tool result>".
+    delegate_images, when not None, is added to that tool call's arguments as "images".
     port=0 picks a free port; a fixed port lets a test start the stub late.
     """
 
-    def __init__(self, kind, model, answer, delegate_skill=None, port=0):
+    def __init__(self, kind, model, answer, delegate_skill=None, port=0, delegate_images=None):
         self.kind, self.model, self.answer, self.delegate_skill = kind, model, answer, delegate_skill
+        self.delegate_images = delegate_images
         self.requests = []
         self._lock = threading.Lock()
         stub = self
@@ -163,11 +165,13 @@ class StubModelServer(object):
                     stub.requests.append(body)
                 tool_msgs = [m for m in body.get("messages") or [] if m.get("role") == "tool"]
                 if stub.delegate_skill and not tool_msgs:
+                    arguments = {"skill": stub.delegate_skill, "task": "stub task"}
+                    if stub.delegate_images is not None:
+                        arguments["images"] = stub.delegate_images
                     message = {"role": "assistant", "content": "", "tool_calls": [{
                         "id": "call_stub_1", "type": "function",
                         "function": {"name": "delegate_to_skill",
-                                     "arguments": json.dumps({"skill": stub.delegate_skill,
-                                                              "task": "stub task"})}}]}
+                                     "arguments": json.dumps(arguments)}}]}
                     finish = "tool_calls"
                 else:
                     content = stub.answer
