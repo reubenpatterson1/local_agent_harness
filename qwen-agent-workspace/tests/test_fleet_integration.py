@@ -479,7 +479,7 @@ def test_t48_run_endpoint(tmp_path):
     nonce = os.urandom(16).hex()
     headers = fleet_lib.sign_request(ftu.TEST_KEY, "POST", "/run", b"", int(time.time()), nonce)
     assert ftu.raw_request(port, "POST", "/run", headers) == (411, b"")
-    headers = dict(headers, **{"Content-Length": str(fleet_lib.MAX_BODY + 1)})
+    headers = dict(headers, **{"Content-Length": str(fleet_lib.MAX_IMAGE_BODY + 1)})
     assert ftu.raw_request(port, "POST", "/run", headers) == (413, b"")
     assert ftu._request(port, "POST", "/run", _run_body("researcher", "x"),
                         {"Content-Type": "application/json"})[0::2] == (401, b"")

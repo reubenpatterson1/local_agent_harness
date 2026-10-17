@@ -382,28 +382,39 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
             if not _LENGTH_RE.fullmatch(length_text.strip()):
                 return self._send(400, b"")
             length = int(length_text.strip())
-        if length > fleet_lib.MAX_BODY:
+        if length > fleet_lib.body_cap(kind, name):
             return self._send(413, b"")
-        body = self.rfile.read(length) if length else b""
-        if len(body) != length:
-            return
-        if kind == "loopback":
-            if not self._loopback_request_ok(method):
-                return self._send(403, b"")
-            status, obj = fleet.loopback_endpoint(name, body)
-            return self._send(status, fleet_lib.canonical_json(obj))
-        now = int(time.time())
-        verdict = fleet_lib.verify_request(fleet.key, method, path, self.headers, body, now,
-                                           fleet.request_nonces)
-        if verdict == "skew":
-            fleet.warn_skew_once(client_ip, int(self.headers.get("X-Fleet-Ts")) - now)
-        if verdict != "ok":
-            return self._send(401, b"")
-        if kind == "unknown":
-            status, raw = 404, fleet_lib.canonical_json({"error": "not found"})
-        else:
-            status, raw = fleet.signed_endpoint(name, body)
-        self._send(status, raw, (method, path, self.headers.get("X-Fleet-Nonce")))
+        if kind == "loopback" and not self._loopback_request_ok(method):
+            return self._send(403, b"")
+        slot = False
+        if kind == "signed" and name == "run" and length > fleet_lib.MAX_BODY:
+            if fleet_lib.prefilter_request(self.headers, int(time.time()), fleet.request_nonces) != "ok":
+                return self._send(401, b"")
+            if not fleet.large_body_slots.acquire(False):
+                return self._send(503, b"")
+            slot = True
+        try:
+            body = self.rfile.read(length) if length else b""
+            if len(body) != length:
+                return
+            if kind == "loopback":
+                status, obj = fleet.loopback_endpoint(name, body)
+                return self._send(status, fleet_lib.canonical_json(obj))
+            now = int(time.time())
+            verdict = fleet_lib.verify_request(fleet.key, method, path, self.headers, body, now,
+                                               fleet.request_nonces)
+            if verdict == "skew":
+                fleet.warn_skew_once(client_ip, int(self.headers.get("X-Fleet-Ts")) - now)
+            if verdict != "ok":
+                return self._send(401, b"")
+            if kind == "unknown":
+                status, raw = 404, fleet_lib.canonical_json({"error": "not found"})
+            else:
+                status, raw = fleet.signed_endpoint(name, body)
+            self._send(status, raw, (method, path, self.headers.get("X-Fleet-Nonce")))
+        finally:
+            if slot:
+                fleet.large_body_slots.release()
 
 
 class Daemon(object):
@@ -421,6 +432,7 @@ class Daemon(object):
         self.qwen_agent_bin = args.qwen_agent_bin
         self.stop = threading.Event()
         self.run_lock = threading.Lock()
+        self.large_body_slots = threading.BoundedSemaphore(fleet_lib.LARGE_BODY_SLOTS)
         self.beacon_nonces = fleet_lib.NonceCache()
         self.request_nonces = fleet_lib.NonceCache()
         self.response_nonces = fleet_lib.NonceCache()
