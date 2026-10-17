@@ -2095,3 +2095,149 @@ def test_trt11_recent_lists_roots_with_their_delegations(tmp_path):
     assert (entries[2]["spans"], entries[2]["delegated"], entries[2]["status"]) == (1, [], "max_rounds")
     assert store.recent(1) == entries[:1]
     assert fleet_lib.TraceStore(str(tmp_path / "absent")).recent(10) == []
+
+
+# --- fleet tracing: merging peer answers and rendering (tracing spec TR13, TR16-TR18) ---
+
+TR_T0 = 1792245802.0   # 2026-10-17 14:03:22 UTC, the start of the TR16 example's turn
+
+
+def _tr_example():
+    """The eight records of the TR16 example; ollama-168's clock runs 30 s behind mac-local's."""
+    def rec(span_id, parent, agent, kind, name, start, dur_ms, attrs, status="ok"):
+        return {"v": 1, "trace_id": TR_TRACE, "span_id": span_id, "parent_span_id": parent, "agent": agent,
+                "kind": kind, "name": name, "start": start, "dur_ms": dur_ms, "status": status, "attrs": attrs}
+
+    req = TR_REQ
+    return [
+        rec("1000000000000001", None, "mac-local", "turn", "repl", TR_T0, 12400,
+            {"rounds": 2, "tool_calls": 1}),
+        rec("1000000000000002", "1000000000000001", "mac-local", "model", "qwen38-6bit", TR_T0 + 0.01, 1900,
+            {"call": 1, "tools": True, "prompt_tokens": 812, "completion_tokens": 64,
+             "finish_reason": "tool_calls", "http": None}),
+        rec("1000000000000003", "1000000000000001", "mac-local", "tool", "delegate_to_skill", TR_T0 + 1.95, 8600,
+            {"round": 1, "decision": "approved", "key": "skill=researcher", "outcome": "ok, 912 characters",
+             "error": False}),
+        rec("1000000000000004", "1000000000000003", "mac-local", "delegate", "researcher", TR_T0 + 2.0, 8500,
+            {"skill": "researcher", "target": "ollama-168", "request_id": req, "http": 200, "images": 0}),
+        rec("2000000000000001", "1000000000000004", "ollama-168", "run", "researcher", TR_T0 + 2.1 - 30, 8300,
+            {"skill": "researcher", "request_id": req, "http": 200, "images": 0, "image_bytes": 0}),
+        rec("2000000000000002", "2000000000000001", "ollama-168", "agent", "researcher", TR_T0 + 2.1 - 30, 8300,
+            {"skill": "researcher", "request_id": req, "http": 200, "envelope_status": "ok"}),
+        rec("2000000000000003", "2000000000000002", "ollama-168", "model", "qwen3.5:9b", TR_T0 + 2.5 - 30, 6800,
+            {"call": 1, "tools": True, "prompt_tokens": 402, "completion_tokens": 188, "finish_reason": "stop",
+             "http": None}),
+        rec("1000000000000005", "1000000000000001", "mac-local", "model", "qwen38-6bit", TR_T0 + 10.6, 1800,
+            {"call": 2, "tools": True, "prompt_tokens": 1290, "completion_tokens": 140, "finish_reason": "stop",
+             "http": None}),
+    ]
+
+
+_TR16_LINES = [
+    "trace 4bf92f3577b3  2026-10-17 14:03:22  12.4s  agents: mac-local, ollama-168  spans: 8",
+    "turn repl  12.4s  ok  rounds=2  tools=1  @mac-local",
+    "  model qwen38-6bit  1.9s  ok  812→64 tok  tool_calls  @mac-local",
+    "  tool delegate_to_skill  skill=researcher  8.6s  ok  -> ok, 912 characters  @mac-local",
+    "    delegate researcher -> ollama-168  req=9c1e0b7d2a4f6e83  http=200  8.5s  ok  @mac-local",
+    "      run researcher  req=9c1e0b7d2a4f6e83  http=200  8.3s  ok  @ollama-168",
+    "        agent researcher  req=9c1e0b7d2a4f6e83  http=200  8.3s  ok  @ollama-168",
+    "          model qwen3.5:9b  6.8s  ok  402→188 tok  stop  @ollama-168",
+    "  model qwen38-6bit  1.8s  ok  1290→140 tok  stop  @mac-local",
+]
+
+
+def _tr_result(records, missing=(), truncated=()):
+    return {"schema": "qwen-agentd.trace.v1", "trace_id": TR_TRACE, "records": list(records),
+            "missing": list(missing), "truncated": list(truncated)}
+
+
+def test_trt7_render_trace_matches_the_example_despite_skew():
+    records = _tr_example()
+    assert all(fleet_lib.trace_record_error(r) is None for r in records)
+    assert fleet_lib.render_trace(_tr_result(records), localtime=time.gmtime) == _TR16_LINES
+    assert fleet_lib.render_trace(_tr_result(reversed(records)), localtime=time.gmtime) == _TR16_LINES
+    for ms, shown in ((0, "0ms"), (999, "999ms"), (1000, "1.0s"), (12449, "12.4s"), (None, "-")):
+        assert fleet_lib.fmt_ms(ms) == shown
+
+
+def test_trt8_orphans_warnings_cycles_and_depth():
+    records = _tr_example()
+    no_run = [r for r in records if r["kind"] != "run"]
+    lines = fleet_lib.render_trace(_tr_result(no_run), localtime=time.gmtime)
+    i = lines.index("… span 2000000000000001 on ollama-168 (not retrieved)")
+    assert lines[i + 1] == "  agent researcher  req=9c1e0b7d2a4f6e83  http=200  8.3s  ok  @ollama-168"
+    assert lines[i + 2] == "    model qwen3.5:9b  6.8s  ok  402→188 tok  stop  @ollama-168"
+    assert lines[4] == "    delegate researcher -> ollama-168  req=9c1e0b7d2a4f6e83  http=200  8.5s  ok  @mac-local"
+    no_delegate = [r for r in records if r["kind"] != "delegate"]
+    for missing, where in (([{"agent": "bravo", "reason": "unreachable (timeout)"}], "bravo"),
+                           ([], "?"),
+                           ([{"agent": "bravo", "reason": "bad response"},
+                             {"agent": "charlie", "reason": "unreachable (timeout)"}], "?")):
+        lines = fleet_lib.render_trace(_tr_result(no_delegate, missing), localtime=time.gmtime)
+        assert "… span 1000000000000004 on %s (not retrieved)" % where in lines
+    lines = fleet_lib.render_trace(_tr_result(
+        no_run, [{"agent": "charlie", "reason": "not in the registry"},
+                 {"agent": "bravo", "reason": "unreachable (connection refused)"}],
+        [{"agent": "ollama-168", "count": 2000}, {"agent": "alpha", "count": 7}]), localtime=time.gmtime)
+    assert lines[1:5] == ["! bravo: unreachable (connection refused)", "! charlie: not in the registry",
+                          "(truncated: alpha returned the first 7 records)",
+                          "(truncated: ollama-168 returned the first 2000 records)"]
+    no_root = [r for r in records if r["kind"] != "turn"]
+    lines = fleet_lib.render_trace(_tr_result(no_root), localtime=time.gmtime)
+    assert lines[0] == "trace 4bf92f3577b3  2026-10-17 14:02:54  -  agents: mac-local, ollama-168  spans: 7"
+    assert fleet_lib.render_trace(_tr_result([]), localtime=time.gmtime) == [
+        "trace 4bf92f3577b3  -  -  agents: none  spans: 0"]
+    a = dict(records[1], span_id="3000000000000001", parent_span_id="3000000000000002")
+    b = dict(records[1], span_id="3000000000000002", parent_span_id="3000000000000001", start=TR_T0 + 1)
+    lines = fleet_lib.render_trace(_tr_result([a, b]), localtime=time.gmtime)
+    assert len(lines) == 3 and sum("model qwen38-6bit" in line for line in lines) == 2
+    chain, parent = [], None
+    for i in range(3000):
+        span = "%016x" % (i + 1)
+        chain.append(dict(records[1], span_id=span, parent_span_id=parent, start=TR_T0 + i))
+        parent = span
+    lines = fleet_lib.render_trace(_tr_result(chain), localtime=time.gmtime)
+    assert len(lines) == 3001 and lines[-1].startswith("  " * 2999 + "model ")
+
+
+def test_trt12_peer_trace_result_and_merge():
+    records = _tr_example()
+    peer = [r for r in records if r["agent"] == "ollama-168"]
+
+    def body(obj):
+        return json.dumps(obj).encode()
+
+    good = {"agent": "ollama-168", "trace_id": TR_TRACE, "records": peer, "truncated": False}
+    assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", None, None, "unreachable (timeout)") == \
+        ([], "unreachable (timeout)", None)
+    assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", 404, b"{}", None) == \
+        ([], "no trace support (http 404)", None)
+    assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", 500, b"{}", None) == ([], "error (http 500)", None)
+    for bad in (b"not json", body(dict(good, agent="bravo")), body(dict(good, trace_id="1" * 32)),
+                body(dict(good, truncated=1)), body(dict(good, records={}))):
+        assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", 200, bad, None) == ([], "bad response", None)
+    assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", 200, body(good), None) == (peer, None, None)
+    mixed = dict(good, records=peer + [records[0], dict(peer[0], trace_id="1" * 32, span_id="5" * 16),
+                                       dict(peer[1], status="BAD", span_id="6" * 16)], truncated=True)
+    assert fleet_lib.peer_trace_result(TR_TRACE, "ollama-168", 200, body(mixed), None) == (peer, None, 6)
+    dup = dict(records[0], start=TR_T0 + 99)
+    merged = fleet_lib.merge_records([records[7], records[0], dup] + peer)
+    assert merged == sorted([records[7], records[0]] + peer, key=lambda r: (r["start"], r["agent"], r["span_id"]))
+    assert dup not in merged
+
+
+def test_trt14_render_recent_table():
+    traces = [
+        {"trace_id": TR_TRACE, "start": TR_T0, "dur_ms": 12400, "status": "ok", "kind": "turn", "name": "repl",
+         "spans": 5, "delegated": ["researcher@ollama-168", "analyst@mac-local"]},
+        {"trace_id": "1" * 32, "start": TR_T0 - 3600, "dur_ms": 850, "status": "max_rounds", "kind": "turn",
+         "name": "oneshot", "spans": 12, "delegated": []},
+    ]
+    assert fleet_lib.render_recent(traces, localtime=time.gmtime) == [
+        "time                 trace id                               dur  status        spans  delegated",
+        "2026-10-17 14:03:22  4bf92f3577b34da6a3ce929d0e0e4736     12.4s  ok                5  "
+        "researcher@ollama-168, analyst@mac-local",
+        "2026-10-17 13:03:22  11111111111111111111111111111111     850ms  max_rounds       12  -",
+    ]
+    assert fleet_lib.render_recent([], localtime=time.gmtime) == [
+        "time                 trace id                               dur  status        spans  delegated"]

@@ -1758,3 +1758,150 @@ class TraceStore(object):
                         "status": root["status"], "kind": root["kind"], "name": root["name"],
                         "spans": counts[root["trace_id"]], "delegated": delegated})
         return out
+
+
+def peer_trace_result(trace_id, host_id, status, raw, reason):
+    """(records, missing_reason, truncated_count) for one peer's GET /trace/<id> (tracing spec TR27).
+
+    reason is the transport failure from the daemon's call (or None). Records that fail
+    validation, name another agent or another trace are dropped silently.
+    """
+    if reason is not None:
+        return [], reason, None
+    if status == 404:
+        return [], "no trace support (http 404)", None
+    if status != 200:
+        return [], "error (http %d)" % status, None
+    obj = _json_loads_or_none(raw)
+    if not (isinstance(obj, dict) and obj.get("agent") == host_id and obj.get("trace_id") == trace_id
+            and isinstance(obj.get("records"), list) and isinstance(obj.get("truncated"), bool)):
+        return [], "bad response", None
+    records = [r for r in obj["records"]
+               if trace_record_error(r) is None and r["agent"] == host_id and r["trace_id"] == trace_id]
+    return records, None, (len(obj["records"]) if obj["truncated"] else None)
+
+
+def merge_records(records):
+    """Records with each span_id kept once (first wins), ordered by (start, agent, span_id)."""
+    seen, out = set(), []
+    for r in records:
+        if r["span_id"] not in seen:
+            seen.add(r["span_id"])
+            out.append(r)
+    return sorted(out, key=lambda r: (r["start"], r["agent"], r["span_id"]))
+
+
+_ELLIPSIS = "…"
+_ARROW = "→"
+
+
+def fmt_ms(ms):
+    """A duration for display: "<n>ms" under one second, else "<s.s>s"; None gives "-"."""
+    if ms is None:
+        return "-"
+    if ms < 1000:
+        return "%dms" % ms
+    return "%.1fs" % (ms / 1000.0)
+
+
+def _dash(value):
+    return "-" if value is None else str(value)
+
+
+def _span_line(r):
+    """One tree line for one record (tracing spec TR16)."""
+    a, d, s, who = r["attrs"], fmt_ms(r["dur_ms"]), r["status"], "@" + r["agent"]
+    if r["kind"] == "turn":
+        return "turn %s  %s  %s  rounds=%d  tools=%d  %s" % (r["name"], d, s, a["rounds"], a["tool_calls"], who)
+    if r["kind"] == "model":
+        return "model %s  %s  %s  %s%s%s tok  %s  %s" % (
+            r["name"], d, s, "?" if a["prompt_tokens"] is None else a["prompt_tokens"], _ARROW,
+            "?" if a["completion_tokens"] is None else a["completion_tokens"], a["finish_reason"] or "-", who)
+    if r["kind"] == "tool":
+        return "tool %s  %s  %s  %s  -> %s  %s" % (r["name"], a["key"] or "-", d, s, a["outcome"] or "-", who)
+    if r["kind"] == "delegate":
+        return "delegate %s -> %s  req=%s  http=%s  %s  %s  %s" % (
+            a["skill"], a["target"], _dash(a["request_id"]), _dash(a["http"]), d, s, who)
+    return "%s %s  req=%s  http=%d  %s  %s  %s" % (r["kind"], a["skill"], a["request_id"], a["http"], d, s, who)
+
+
+def _placeholder_agent(orphan, missing):
+    """Where a missing parent span lives: the orphan's own agent, except for a run span, whose
+    parent is a delegate span on the calling agent: the one unanswered agent, else "?"."""
+    if orphan["kind"] != "run":
+        return orphan["agent"]
+    agents = sorted(set(m["agent"] for m in missing))
+    return agents[0] if len(agents) == 1 else "?"
+
+
+def render_trace(result, localtime=time.localtime):
+    """The trace tree of a GET /trace?id= result, built from parent links (tracing spec TR17)."""
+    records = merge_records(result["records"])
+    by_id = dict((r["span_id"], r) for r in records)
+
+    def order(r):
+        return (r["start"], r["span_id"])
+
+    roots, children, orphans = [], {}, {}
+    for r in records:
+        parent = r["parent_span_id"]
+        if parent is None:
+            roots.append(r)
+        elif parent in by_id:
+            children.setdefault(parent, []).append(r)
+        else:
+            orphans.setdefault(parent, []).append(r)
+    roots.sort(key=order)
+    for group in list(children.values()) + list(orphans.values()):
+        group.sort(key=order)
+    if roots:
+        start, dur = roots[0]["start"], fmt_ms(roots[0]["dur_ms"])
+    elif records:
+        start, dur = min(r["start"] for r in records), "-"
+    else:
+        start, dur = None, "-"
+    when = "-" if start is None else time.strftime("%Y-%m-%d %H:%M:%S", localtime(start))
+    agents = sorted(set(r["agent"] for r in records))
+    lines = ["trace %s  %s  %s  agents: %s  spans: %d"
+             % (result["trace_id"][:12], when, dur, ", ".join(agents) or "none", len(records))]
+    for m in sorted(result["missing"], key=lambda m: (m["agent"], m["reason"])):
+        lines.append("! %s: %s" % (m["agent"], m["reason"]))
+    for t in sorted(result["truncated"], key=lambda t: t["agent"]):
+        lines.append("(truncated: %s returned the first %d records)" % (t["agent"], t["count"]))
+    visited = set()
+
+    def walk(top, depth):
+        stack = [(top, depth)]
+        while stack:
+            node, level = stack.pop()
+            if node["span_id"] in visited:
+                continue
+            visited.add(node["span_id"])
+            lines.append("  " * level + _span_line(node))
+            for child in reversed(children.get(node["span_id"], [])):
+                stack.append((child, level + 1))
+
+    for r in roots:
+        walk(r, 0)
+    for parent in sorted(orphans, key=lambda p: order(orphans[p][0])):
+        lines.append("%s span %s on %s (not retrieved)"
+                     % (_ELLIPSIS, parent, _placeholder_agent(orphans[parent][0], result["missing"])))
+        for r in orphans[parent]:
+            walk(r, 1)
+    for r in sorted(records, key=order):
+        if r["span_id"] not in visited:
+            walk(r, 0)
+    return lines
+
+
+_RECENT_FMT = "%-19s  %-32s  %8s  %-12s  %5s  %s"
+
+
+def render_recent(traces, localtime=time.localtime):
+    """The trace --recent table: a header line, then one line per root span, newest first."""
+    lines = [_RECENT_FMT % ("time", "trace id", "dur", "status", "spans", "delegated")]
+    for t in traces:
+        lines.append(_RECENT_FMT % (time.strftime("%Y-%m-%d %H:%M:%S", localtime(t["start"])), t["trace_id"],
+                                    fmt_ms(t["dur_ms"]), t["status"], t["spans"],
+                                    ", ".join(t["delegated"]) or "-"))
+    return lines
