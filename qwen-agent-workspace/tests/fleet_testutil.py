@@ -550,3 +550,9 @@ def recent(port, n=10):
     """(status, parsed body or None) of loopback GET /traces/recent?n=<n>."""
     status, _headers, raw = _request(port, "GET", "/traces/recent?n=%d" % n, timeout=30)
     return status, (json.loads(raw) if raw else None)
+
+
+def trace_cli(home, args):
+    """`qwen-agentd trace <args>` with HOME=home -> the CompletedProcess (text mode)."""
+    return subprocess.run([sys.executable, AGENTD, "trace"] + list(args), env=clean_env(home),
+                          capture_output=True, text=True, timeout=60)

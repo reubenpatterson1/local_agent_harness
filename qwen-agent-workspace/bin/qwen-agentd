@@ -8,6 +8,8 @@
   qwen-agentd install --agent-id ID [--default] [--origin URL] [--no-service]
   qwen-agentd selftest
   qwen-agentd status [--agent-id ID] [--port N]
+  qwen-agentd trace [--agent-id ID | --port N] [--json] TRACE_ID
+  qwen-agentd trace [--agent-id ID | --port N] --recent [N]
 
 Every host in the fleet runs `run`. The daemon advertises the skills its host
 serves and runs them locally, against its own model server, when a peer sends a
@@ -1306,6 +1308,68 @@ def cmd_status(args):
     return rc
 
 
+_RECENT_N_RE = re.compile(r"[0-9]{1,3}")
+
+
+def cmd_trace(args):
+    """Print one trace as a tree (or as JSON), or this agent's recent traces (tracing spec TR29)."""
+    explicit = None
+    if args.agent_id is not None:
+        explicit, message = fleet_lib.resolve_agent(args.agent_id)
+        if message is not None:
+            _err(message)
+            return 2
+    if args.trace_id is not None and args.recent is not None:
+        _err("qwen-agentd: trace takes a TRACE_ID or --recent, not both")
+        return 2
+    if args.trace_id is None and args.recent is None:
+        _err("qwen-agentd: trace needs a TRACE_ID or --recent [N]")
+        return 2
+    if args.recent is not None:
+        if args.as_json:
+            _err("qwen-agentd: --json applies to trace TRACE_ID only")
+            return 2
+        if not (_RECENT_N_RE.fullmatch(args.recent) and 1 <= int(args.recent) <= fleet_lib.TRACE_RECENT_MAX):
+            _err("qwen-agentd: invalid --recent %s (1 to %d)"
+                 % (fleet_lib.shown_value(args.recent), fleet_lib.TRACE_RECENT_MAX))
+            return 2
+    elif not fleet_lib.valid_trace_id(args.trace_id):
+        _err("qwen-agentd: invalid trace id %s (32 lowercase hex characters)" % fleet_lib.shown_value(args.trace_id))
+        return 2
+    port = args.port
+    if port is not None and not 1 <= port <= 65535:
+        _err("qwen-agentd: invalid --port %d" % port)
+        return 2
+    if port is None:
+        port, message = _status_port(explicit)
+        if message is not None:
+            _err(message)
+            return 2
+    url = "http://127.0.0.1:%d" % port
+    if args.recent is not None:
+        result, error = fleet_lib.fetch_recent(url, int(args.recent))
+        if error is not None:
+            _err("qwen-agentd: " + error)
+            return 1
+        if not result["traces"]:
+            _err("qwen-agentd: no traces recorded on %s" % result["agent"])
+            return 1
+        sys.stdout.write("\n".join(fleet_lib.render_recent(result["traces"])) + "\n")
+        return 0
+    result, error = fleet_lib.fetch_trace(url, args.trace_id)
+    if error is not None:
+        _err("qwen-agentd: " + error)
+        return 1
+    if args.as_json:
+        sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write("\n".join(fleet_lib.render_trace(result)) + "\n")
+    if not result["records"]:
+        _err("qwen-agentd: no records for trace %s" % args.trace_id)
+        return 1
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # releases: git, staging, the gate, the current symlink (F80, F81, F85, F86)
 # ---------------------------------------------------------------------------
@@ -1715,6 +1779,13 @@ def _build_parser():
     _add_agent_id(p)
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(func=cmd_status)
+    p = sub.add_parser("trace", help="print one trace as a tree, or list this agent's recent traces")
+    _add_agent_id(p)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--json", dest="as_json", action="store_true", default=False)
+    p.add_argument("--recent", nargs="?", const=str(fleet_lib.TRACE_RECENT_DEFAULT), default=None, metavar="N")
+    p.add_argument("trace_id", nargs="?", default=None, metavar="TRACE_ID")
+    p.set_defaults(func=cmd_trace)
     p = sub.add_parser("install", help="install an agent into ~/agents/<id> with its service and commands")
     _add_agent_id(p, required=True)
     p.add_argument("--default", dest="make_default", action="store_true", default=False)

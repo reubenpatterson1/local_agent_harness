@@ -247,3 +247,97 @@ def test_tracing_focus_4_traces_survive_a_daemon_restart(tmp_path):
     assert status == 200 and result["records"] == [dict(turn, agent="alpha")]
     status, listed = ftu.recent(fleet.ports["alpha"], 1)
     assert status == 200 and [t["trace_id"] for t in listed["traces"]] == [T]
+
+
+# --- qwen-agentd trace (TR29) ---------------------------------------------------------------
+
+class _OldDaemon(object):
+    """A loopback server that answers every request 401 with an empty body, as a daemon
+    without tracing answers an unsigned GET to an unknown route (F44)."""
+
+    def __init__(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_trt41a_trace_cli_on_one_agent(tmp_path):
+    fleet = _alpha(tmp_path)
+    port, home = fleet.ports["alpha"], fleet.homes["alpha"]
+    older = _span("turn", trace_id="2" * 32, parent=None, name="oneshot", start=round(time.time(), 3) - 60)
+    turn = _span("turn", parent=None, name="repl")
+    model = _span("model", parent=turn["span_id"], name="alpha-model")
+    for rec in (older, turn, model):
+        assert _post_span(port, rec)[0] == 200
+    proc = ftu.trace_cli(home, ["--port", str(port), T])
+    assert (proc.returncode, proc.stderr) == (0, "")
+    expected = fleet_lib.render_trace(ftu.trace(port, T)[1])
+    assert proc.stdout == "\n".join(expected) + "\n"
+    assert proc.stdout.startswith("trace 4bf92f3577b3  ") and "  agents: alpha  spans: 2\n" in proc.stdout
+    assert proc.stdout.splitlines()[2] == "  model alpha-model  %s  ok  3→4 tok  stop  @alpha" % (
+        fleet_lib.fmt_ms(model["dur_ms"]))
+    proc = ftu.trace_cli(home, ["--port", str(port), "--json", T])
+    assert proc.returncode == 0 and json.loads(proc.stdout) == ftu.trace(port, T)[1]
+    assert proc.stdout == json.dumps(json.loads(proc.stdout), indent=2, sort_keys=True) + "\n"
+    proc = ftu.trace_cli(home, ["--port", str(port), "--recent"])
+    lines = proc.stdout.splitlines()
+    assert proc.returncode == 0 and len(lines) == 3
+    assert lines[0] == "time                 trace id                               dur  status        spans  delegated"
+    assert lines[1].split()[2] == T and lines[2].split()[2] == "2" * 32
+    assert lines[1].endswith("  2  -") and lines[2].endswith("  1  -")
+    proc = ftu.trace_cli(home, ["--port", str(port), "--recent", "1"])
+    assert proc.returncode == 0 and proc.stdout.splitlines()[1:] == lines[1:2]
+    for args, message in (
+            (["--recent", "0"], "qwen-agentd: invalid --recent '0' (1 to 100)"),
+            (["--recent", "x"], "qwen-agentd: invalid --recent 'x' (1 to 100)"),
+            (["--recent", "101"], "qwen-agentd: invalid --recent '101' (1 to 100)"),
+            (["--recent", "--json"], "qwen-agentd: --json applies to trace TRACE_ID only"),
+            ([T, "--recent"], "qwen-agentd: trace takes a TRACE_ID or --recent, not both"),
+            ([], "qwen-agentd: trace needs a TRACE_ID or --recent [N]"),
+            (["--port", "70000", T], "qwen-agentd: invalid --port 70000"),
+            (["badid"], "qwen-agentd: invalid trace id 'badid' (32 lowercase hex characters)"),
+            ([T.upper()], "qwen-agentd: invalid trace id '%s' (32 lowercase hex characters)" % T.upper())):
+        proc = ftu.trace_cli(home, args)
+        assert (proc.returncode, proc.stdout, proc.stderr) == (2, "", message + "\n"), args
+    closed = ftu.free_port()
+    proc = ftu.trace_cli(home, ["--port", str(closed), T])
+    assert (proc.returncode, proc.stderr) == (1, "qwen-agentd: daemon not reachable at http://127.0.0.1:%d\n" % closed)
+    proc = ftu.trace_cli(home, ["--port", str(port), "1" * 32])
+    assert proc.returncode == 1
+    assert proc.stdout == "trace 111111111111  -  -  agents: none  spans: 0\n"
+    assert proc.stderr == "qwen-agentd: no records for trace %s\n" % ("1" * 32)
+    old = _OldDaemon()
+    try:
+        for args in ([T], ["--recent"]):
+            proc = ftu.trace_cli(home, ["--port", str(old.port)] + args)
+            assert (proc.returncode, proc.stderr) == (
+                1, "qwen-agentd: the daemon at http://127.0.0.1:%d has no trace support (http 401)\n" % old.port)
+    finally:
+        old.close()
+
+
+def test_tracing_focus_2_fresh_agent_with_no_trace_file(tmp_path):
+    """Review Focus 2: the first `trace --recent` on a newly installed agent, before any
+    turn was traced. Expected: exit 1 with "no traces recorded on <agent>" (not an error
+    about a missing file), `trace <id>` says "no records", and no query creates the file."""
+    fleet = _alpha(tmp_path)
+    port, home = fleet.ports["alpha"], fleet.homes["alpha"]
+    proc = ftu.trace_cli(home, ["--port", str(port), "--recent"])
+    assert (proc.returncode, proc.stdout, proc.stderr) == (1, "", "qwen-agentd: no traces recorded on alpha\n")
+    proc = ftu.trace_cli(home, ["--port", str(port), T])
+    assert proc.returncode == 1 and proc.stderr == "qwen-agentd: no records for trace %s\n" % T
+    assert ftu.trace_files(home, "alpha") == []
+    assert "trace" not in fleet.daemons["alpha"].log()
