@@ -265,15 +265,18 @@ def test_review_focus_3_pasted_join_string_whitespace():
 
 
 def test_t25_token_not_in_git_tree():
-    path = fleet_lib.fleet_env_path()
-    if not os.path.exists(path):
+    paths = [fleet_lib.fleet_env_path(i) for i in fleet_lib.agent_ids_on_disk()]
+    paths = [p for p in paths if os.path.exists(p)]
+    if not paths:
         pytest.skip("no fleet.env on this host")
     inside = subprocess.run(["git", "-C", WS, "rev-parse", "--is-inside-work-tree"],
                             capture_output=True, text=True)
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         pytest.skip("WS is not in a git worktree")
-    _fleet_id, token = fleet_lib.load_fleet_env(path)
-    needles = (token.encode("ascii"), fleet_lib.token_key(token))
+    needles = []
+    for path in paths:
+        _fleet_id, token = fleet_lib.load_fleet_env(path)
+        needles.extend((token.encode("ascii"), fleet_lib.token_key(token)))
     listing = subprocess.run(["git", "-C", WS, "ls-files", "-z"], capture_output=True)
     assert listing.returncode == 0
     leaked = []
@@ -1064,10 +1067,8 @@ def test_t29a_state_io_prune_and_version(tmp_path):
     wrong = d / "releases" / "v2026.10.18" / "workspace"
     wrong.mkdir(parents=True)
     assert fleet_lib.release_version(str(wrong), str(d)) == "dev"
-    assert fleet_lib.deploy_root() == os.path.expanduser("~/.local/share/qwen-agent")
-    expected_logs = ("~/Library/Logs/qwen-agentd" if sys.platform == "darwin"
-                     else "~/.local/state/qwen-agentd")
-    assert fleet_lib.log_dir() == os.path.expanduser(expected_logs)
+    assert fleet_lib.deploy_root("x") == os.path.expanduser("~/agents/x")
+    assert fleet_lib.log_dir("x") == os.path.expanduser("~/agents/x/logs")
 
 
 def test_tag_re_rejects_non_ascii_digits():
@@ -1258,3 +1259,16 @@ def test_mt7_agent_port_and_atomic_fleet_env(tmp_path):
     with open(path, "rb") as f:
         assert f.read() == before
     assert not os.path.lexists(path + ".tmp")
+
+
+def test_mt1b_agent_root_paths(monkeypatch):
+    monkeypatch.setenv("HOME", "/h")
+    assert fleet_lib.deploy_root("mac-local") == "/h/agents/mac-local"
+    assert fleet_lib.fleet_env_path("mac-local") == "/h/agents/mac-local/fleet.env"
+    assert fleet_lib.log_dir("mac-local") == "/h/agents/mac-local/logs"
+    for bad in BAD_AGENT_IDS:
+        for func in (fleet_lib.deploy_root, fleet_lib.fleet_env_path, fleet_lib.log_dir):
+            with pytest.raises(ValueError):
+                func(bad)
+    assert not hasattr(fleet_lib, "DEPLOY_ROOT")
+    assert not hasattr(fleet_lib, "SYSTEMD_UNIT")

@@ -43,7 +43,7 @@ def agentd(monkeypatch, tmp_path):
 
 
 def test_cli_init_fleet(agentd, capsys):
-    assert agentd.main(["init-fleet"]) == 0
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 0
     out = capsys.readouterr().out.splitlines()
     assert len(out) == 4
     assert out[0].startswith("fleet_id: ")
@@ -52,10 +52,10 @@ def test_cli_init_fleet(agentd, capsys):
     assert out[1] == "join string (shown once; copy it to each other host over ssh):"
     assert out[3] == ("next: create fleets/%s.json (see the fleet spec, Section 2.4), commit, "
                       "tag a release" % fleet_id)
-    path = fleet_lib.fleet_env_path()
+    path = fleet_lib.fleet_env_path("alpha")
     assert fleet_lib.parse_join_string(out[2]) == fleet_lib.load_fleet_env(path)
     assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
-    assert agentd.main(["init-fleet"]) == 2
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ("qwen-agentd: %s already exists; remove it first to create a new fleet\n" % path)
@@ -63,19 +63,19 @@ def test_cli_init_fleet(agentd, capsys):
 
 def test_cli_join(agentd, capsys, monkeypatch):
     s = fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN)
-    assert agentd.main(["join", "not-a-join-string"]) == 2
+    assert agentd.main(["join", "--agent-id", "alpha", "not-a-join-string"]) == 2
     assert capsys.readouterr().err == "qwen-agentd: invalid join string\n"
     prompts = []
     monkeypatch.setattr(agentd.getpass, "getpass", lambda prompt: prompts.append(prompt) or s + "\n")
-    assert agentd.main(["join"]) == 0
+    assert agentd.main(["join", "--agent-id", "alpha"]) == 0
     assert prompts == ["join string: "]
     assert capsys.readouterr().out == "qwen-agentd: joined fleet %s\n" % ftu.TEST_FLEET_ID
-    path = fleet_lib.fleet_env_path()
+    path = fleet_lib.fleet_env_path("alpha")
     assert fleet_lib.load_fleet_env(path) == (ftu.TEST_FLEET_ID, ftu.TEST_TOKEN)
-    assert agentd.main(["join", s]) == 0
+    assert agentd.main(["join", "--agent-id", "alpha", s]) == 0
     assert capsys.readouterr().out == "qwen-agentd: already joined fleet %s\n" % ftu.TEST_FLEET_ID
     other = fleet_lib.make_join_string(ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
-    assert agentd.main(["join", other]) == 2
+    assert agentd.main(["join", "--agent-id", "alpha", other]) == 2
     assert capsys.readouterr().err == ("qwen-agentd: %s exists for a different fleet; remove it first\n" % path)
 
 
@@ -83,7 +83,7 @@ def test_cli_internal_error_is_one_line(agentd, capsys, monkeypatch):
     def boom(*args):
         raise RuntimeError("disk on fire")
     monkeypatch.setattr(agentd.fleet_lib, "write_fleet_env", boom)
-    assert agentd.main(["init-fleet"]) == 1
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 1
     err = capsys.readouterr().err
     assert err == "qwen-agentd: internal error: RuntimeError: disk on fire\n"
     assert "Traceback" not in err
@@ -116,7 +116,7 @@ def _single(tmp_path, skills=("researcher",), kind="ollama", start_stub=True, ex
     """One daemon 'alpha' with its own stub model server; returns (daemon, stub, registry)."""
     home = tmp_path / "alpha"
     home.mkdir()
-    ftu.make_fleet(home)
+    ftu.make_fleet(home, "alpha")
     stub = ftu.StubModelServer(kind, "alpha-model", "ALPHA-ANSWER") if start_stub else None
     stub_url = stub.url if stub else "http://127.0.0.1:%d/v1" % ftu.free_port()
     registry = ftu.write_registry(tmp_path / "registry.json", ftu.TEST_FLEET_ID, {
@@ -171,7 +171,7 @@ def test_run_endpoints_and_peers_view(tmp_path):
     log = daemon.log()
     assert ("qwen-agentd dev started host_id=alpha port=%d beacon_port=%d beacon_targets=0 "
             "skills=researcher:verified" % (daemon.port, daemon.beacon_port)) in log
-    log_dir = ftu.daemon_log_dir(daemon.home)
+    log_dir = ftu.daemon_log_dir(daemon.home, "alpha")
     assert stat.S_IMODE(os.stat(log_dir).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(os.path.join(log_dir, "qwen-agentd.log")).st_mode) == 0o600
     daemon.proc.send_signal(signal.SIGTERM)
@@ -195,18 +195,19 @@ def test_run_startup_errors(tmp_path):
         "bravo": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
                   "model": "m", "skills": []}})
     base = ["run", "--registry", registry, "--beacon-targets", "none", "--beacon-port", str(ftu.free_port())]
-    env_path = os.path.join(str(home), ".config", "qwen-agent", "fleet.env")
+    env_path = os.path.join(str(home), "agents", "alpha", "fleet.env")
 
     proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "alpha"})
     assert proc.returncode == 2
-    assert proc.stderr == ("qwen-agentd: %s not found; run qwen-agentd init-fleet or qwen-agentd join\n"
-                           % env_path)
-    ftu.make_fleet(home)
+    assert proc.stderr == ("qwen-agentd: %s not found; run qwen-agentd init-fleet --agent-id alpha or "
+                           "qwen-agentd join --agent-id alpha\n" % env_path)
+    ftu.make_fleet(home, "alpha")
 
     proc = _run_agentd(home, base)
     assert proc.returncode == 2
-    assert proc.stderr == "qwen-agentd: QWEN_AGENT_HOST_ID is not set; valid IDs: alpha, bravo\n"
+    assert proc.stderr == "qwen-agentd: QWEN_AGENT_HOST_ID is not set; agents on this machine: alpha\n"
 
+    ftu.make_fleet(home, "charlie")
     proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "charlie"})
     assert proc.stderr == ("qwen-agentd: host_id 'charlie' is not in the fleet registry; "
                            "valid IDs: alpha, bravo\n") and proc.returncode == 2
@@ -232,6 +233,7 @@ def test_run_startup_errors(tmp_path):
         assert (proc.returncode, proc.stderr) == (2, message + "\n"), flags
 
     first = ftu.start_daemon(home, "alpha", registry, ftu.free_port(), "none")
+    ftu.make_fleet(home, "bravo")
     proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "alpha"})
     assert proc.returncode == 2
     assert proc.stderr == ("qwen-agentd: TCP port %d is already in use (is another qwen-agentd running?)\n"
@@ -240,7 +242,6 @@ def test_run_startup_errors(tmp_path):
                               "--beacon-port", str(first.beacon_port)], {"QWEN_AGENT_HOST_ID": "bravo"})
     assert (proc.returncode, proc.stderr) == (2, "qwen-agentd: UDP port %d is already in use\n" % first.beacon_port)
     assert "Traceback" not in first.log()
-    assert "ERROR MainThread qwen-agentd: QWEN_AGENT_HOST_ID is not set" in ftu.read_log(home)
 
 
 def test_status_command(tmp_path):
@@ -377,7 +378,7 @@ def test_t45_foreign_fleet_is_invisible_and_silent(tmp_path):
     before = _log_lines(alpha)
     echo_home = os.path.join(str(tmp_path), "echo")
     os.makedirs(echo_home)
-    ftu.make_fleet(echo_home, ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
+    ftu.make_fleet(echo_home, "echo", ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
     echo_port = ftu.free_port()
     echo_registry = ftu.write_registry(os.path.join(str(tmp_path), "echo-registry.json"), ftu.OTHER_FLEET_ID, {
         "echo": {"port": echo_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
@@ -416,7 +417,7 @@ def test_review_focus_1_own_beacon_echo_is_silent(tmp_path):
     own beacon. It must be dropped silently (it is a replay), never bound as a peer."""
     home = tmp_path / "solo"
     home.mkdir()
-    ftu.make_fleet(home)
+    ftu.make_fleet(home, "solo")
     beacon_port = ftu.free_port()
     registry = ftu.write_registry(tmp_path / "registry.json", ftu.TEST_FLEET_ID, {
         "solo": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
@@ -435,7 +436,7 @@ def test_unregistered_same_fleet_host_warns_once(tmp_path):
     fleet.start()
     zulu_home = os.path.join(str(tmp_path), "zulu")
     os.makedirs(zulu_home)
-    ftu.make_fleet(zulu_home)
+    ftu.make_fleet(zulu_home, "zulu")
     zulu_registry = ftu.write_registry(os.path.join(str(tmp_path), "zulu-registry.json"), ftu.TEST_FLEET_ID, {
         "zulu": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
                  "model": "m", "skills": []}})
@@ -505,7 +506,7 @@ def test_t48_run_endpoint(tmp_path):
     assert "run end skill=researcher request_id=req-1 http=200 status=ok seconds=" in log
     assert "run end skill=researcher request_id=req-1 http=502 status=- seconds=" in log
     assert "one" not in [w for line in log.splitlines() for w in line.split()]
-    stderr_path = os.path.join(ftu.daemon_log_dir(fleet.homes["bravo"]), "last-run.stderr")
+    stderr_path = os.path.join(ftu.daemon_log_dir(fleet.homes["bravo"], "bravo"), "last-run.stderr")
     assert stat.S_IMODE(os.stat(stderr_path).st_mode) == 0o600
 
 
@@ -712,10 +713,124 @@ def test_t46_no_secret_leaves_the_daemon(tmp_path):
                fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN).encode("ascii"))
     blobs = list(datagrams) + bodies
     for name in fleet.names:
-        log_dir = ftu.daemon_log_dir(fleet.homes[name])
+        log_dir = ftu.daemon_log_dir(fleet.homes[name], name)
         for entry in os.listdir(log_dir):
             with open(os.path.join(log_dir, entry), "rb") as f:
                 blobs.append(f.read())
     for blob in blobs:
         for needle in needles:
             assert needle not in blob
+
+
+# --- multi-agent hosts: run identity, init-fleet/join resolution, status agent (M22, M27, M28, M30, M31) ---
+
+def _identity_registry(tmp_path):
+    return ftu.write_registry(tmp_path / "id-registry.json", ftu.TEST_FLEET_ID, {
+        "alpha": {"port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                  "model": "m", "skills": []}})
+
+
+def test_mt11_run_identity_errors_before_logging(tmp_path):
+    registry = _identity_registry(tmp_path)
+    base = ["run", "--registry", registry, "--beacon-targets", "none", "--beacon-port", str(ftu.free_port())]
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    proc = _run_agentd(empty, base)
+    assert (proc.returncode, proc.stderr) == (
+        2, "qwen-agentd: QWEN_AGENT_HOST_ID is not set; agents on this machine: none\n")
+    assert not os.path.lexists(str(empty / "agents"))
+    home = tmp_path / "home"
+    home.mkdir()
+    ftu.make_fleet(home, "alpha")
+    proc = _run_agentd(home, base)
+    assert (proc.returncode, proc.stderr) == (
+        2, "qwen-agentd: QWEN_AGENT_HOST_ID is not set; agents on this machine: alpha\n")
+    proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "Bad_Id"})
+    assert (proc.returncode, proc.stderr) == (2, "qwen-agentd: invalid QWEN_AGENT_HOST_ID 'Bad_Id'\n")
+    charlie = home / "agents" / "charlie"
+    proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "charlie"})
+    assert (proc.returncode, proc.stderr) == (
+        2, "qwen-agentd: %s not found; run qwen-agentd init-fleet --agent-id charlie or "
+           "qwen-agentd join --agent-id charlie\n" % (charlie / "fleet.env"))
+    assert not os.path.lexists(str(charlie))
+    ftu.make_fleet(home, "charlie")
+    proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": "charlie"})
+    message = "qwen-agentd: host_id 'charlie' is not in the fleet registry; valid IDs: alpha"
+    assert (proc.returncode, proc.stderr) == (2, message + "\n")
+    assert "ERROR MainThread " + message in ftu.read_log(home, "charlie")
+
+
+def test_multi_agent_focus_3_host_id_with_stray_whitespace_is_rejected(tmp_path):
+    """Multi-agent Review Focus 3: QWEN_AGENT_HOST_ID with a stray space or newline (a plist, unit or
+    shell typo) is refused by name, and nothing is created under ~/agents."""
+    registry = _identity_registry(tmp_path)
+    base = ["run", "--registry", registry, "--beacon-targets", "none", "--beacon-port", str(ftu.free_port())]
+    home = tmp_path / "home"
+    home.mkdir()
+    ftu.make_fleet(home, "alpha")
+    for value in ("alpha ", "alpha\n", " alpha"):
+        proc = _run_agentd(home, base, {"QWEN_AGENT_HOST_ID": value})
+        assert (proc.returncode, proc.stderr) == (2, "qwen-agentd: invalid QWEN_AGENT_HOST_ID '%s'\n" % value)
+    assert os.listdir(str(home / "agents")) == ["alpha"]
+    assert os.listdir(str(home / "agents" / "alpha")) == ["fleet.env"]
+
+
+def test_mt13_init_fleet_and_join_resolve_the_agent(agentd, capsys, monkeypatch, tmp_path):
+    agents = tmp_path / "home" / "agents"
+    assert agentd.main(["init-fleet"]) == 2
+    assert capsys.readouterr() == ("", "qwen-agentd: no agent found in %s; pass --agent-id ID\n" % agents)
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 4 and out[0].startswith("fleet_id: ")
+    assert stat.S_IMODE(os.stat(str(agents / "alpha")).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(fleet_lib.fleet_env_path("alpha")).st_mode) == 0o600
+    assert agentd.main(["init-fleet"]) == 2
+    assert capsys.readouterr().err == ("qwen-agentd: %s already exists; remove it first to create a new fleet\n"
+                                       % fleet_lib.fleet_env_path("alpha"))
+    ftu.make_fleet(tmp_path / "home", "bravo")
+
+    def no_prompt(prompt):
+        raise AssertionError("join prompted for the secret")
+    monkeypatch.setattr(agentd.getpass, "getpass", no_prompt)
+    assert agentd.main(["join"]) == 2
+    assert capsys.readouterr() == (
+        "", "qwen-agentd: more than one agent in %s (alpha, bravo); pass --agent-id ID\n" % agents)
+    s = fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN)
+    assert agentd.main(["join", "--host-id", "erin", s]) == 0
+    assert capsys.readouterr() == ("qwen-agentd: joined fleet %s\n" % ftu.TEST_FLEET_ID, "")
+    assert fleet_lib.load_fleet_env(fleet_lib.fleet_env_path("erin")) == (ftu.TEST_FLEET_ID, ftu.TEST_TOKEN)
+
+
+def test_multi_agent_focus_4_mistyped_agent_id_never_prompts(agentd, capsys, monkeypatch, tmp_path):
+    """Multi-agent Review Focus 4: a mistyped --agent-id (an upper-case letter, a path) on join or
+    init-fleet is refused before the hidden prompt asks for the secret, and nothing is
+    created under ~/agents."""
+    prompts = []
+    monkeypatch.setattr(agentd.getpass, "getpass", lambda prompt: prompts.append(prompt) or "")
+    for bad in ("Mac-Local", "../mac-local", "mac-local/x"):
+        for argv in (["join", "--agent-id", bad], ["init-fleet", "--agent-id", bad]):
+            assert agentd.main(argv) == 2
+            assert capsys.readouterr() == ("", "qwen-agentd: invalid --agent-id '%s'\n" % bad)
+    assert prompts == []
+    assert not os.path.lexists(str(tmp_path / "home" / "agents"))
+    assert not os.path.lexists(str(tmp_path / "mac-local"))
+
+
+def test_mt12_status_update_line_agent(tmp_path):
+    daemon, _stub, _registry = _single(tmp_path)
+    ftu.make_fleet(daemon.home, "bravo")
+    proc = _run_agentd(daemon.home, ["status", "--port", str(daemon.port)])
+    assert proc.returncode == 0 and proc.stdout.splitlines()[-1] == "update: not installed"
+    fleet_lib.write_state(os.path.join(str(daemon.home), "agents", "alpha", "update-state.json"),
+                          {"from": None, "to": "v2026.01.01", "status": "ok", "attempts": 0, "bad_tags": []})
+    installed = "update: status=ok from=- to=v2026.01.01 attempts=0 bad_tags=-"
+    proc = _run_agentd(daemon.home, ["status", "--port", str(daemon.port)])
+    assert proc.returncode == 0 and proc.stdout.splitlines()[-1] == installed
+    proc = _run_agentd(daemon.home, ["status", "--agent-id", "alpha", "--port", str(daemon.port)])
+    assert proc.returncode == 0 and proc.stdout.splitlines()[-1] == installed
+    proc = _run_agentd(daemon.home, ["status", "--agent-id", "Bad", "--port", str(daemon.port)])
+    assert (proc.returncode, proc.stdout, proc.stderr) == (2, "", "qwen-agentd: invalid --agent-id 'Bad'\n")
+    daemon.kill()
+    proc = _run_agentd(daemon.home, ["status", "--port", str(daemon.port)])
+    assert proc.returncode == 1
+    assert proc.stdout == "daemon: not reachable at %s\nupdate: not installed\n" % daemon.url

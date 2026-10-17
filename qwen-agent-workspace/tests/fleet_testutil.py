@@ -79,9 +79,9 @@ def clean_env(home, **extra):
     return env
 
 
-def make_fleet(home, fleet_id=TEST_FLEET_ID, token=TEST_TOKEN):
-    """Write <home>/.config/qwen-agent/fleet.env; returns its path."""
-    path = os.path.join(str(home), ".config", "qwen-agent", "fleet.env")
+def make_fleet(home, host_id, fleet_id=TEST_FLEET_ID, token=TEST_TOKEN):
+    """Write <home>/agents/<host_id>/fleet.env; returns its path."""
+    path = os.path.join(str(home), "agents", host_id, "fleet.env")
     fleet_lib.write_fleet_env(path, fleet_id, token)
     return path
 
@@ -180,15 +180,13 @@ class StubModelServer(object):
         self.httpd.server_close()
 
 
-def daemon_log_dir(home):
-    """fleet_lib.log_dir() as it resolves under HOME=home."""
-    if sys.platform == "darwin":
-        return os.path.join(str(home), "Library", "Logs", "qwen-agentd")
-    return os.path.join(str(home), ".local", "state", "qwen-agentd")
+def daemon_log_dir(home, host_id):
+    """fleet_lib.log_dir(host_id) as it resolves under HOME=home: <home>/agents/<host_id>/logs."""
+    return os.path.join(str(home), "agents", host_id, "logs")
 
 
-def read_log(home):
-    path = os.path.join(daemon_log_dir(home), "qwen-agentd.log")
+def read_log(home, host_id):
+    path = os.path.join(daemon_log_dir(home, host_id), "qwen-agentd.log")
     if not os.path.exists(path):
         return ""
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -201,7 +199,7 @@ class DaemonProc(object):
         self.url = "http://127.0.0.1:%d" % port
 
     def log(self):
-        return read_log(self.home)
+        return read_log(self.home, self.host_id)
 
     def kill(self):
         _kill(self.proc)
@@ -373,7 +371,7 @@ class Fleet(object):
             _n, kind, skills, model, answer = spec[name]
             home = os.path.join(self.root, name)
             os.makedirs(home)
-            make_fleet(home)
+            make_fleet(home, name)
             self.homes[name] = home
             self.ports[name] = free_port()
             self.beacon_ports[name] = free_port()

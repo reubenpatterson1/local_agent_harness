@@ -113,7 +113,7 @@ def _install(home, origin):
 
 
 def _deploy(home):
-    return os.path.join(str(home), ".local", "share", "qwen-agent")
+    return os.path.join(str(home), "agents", "h1")
 
 
 def test_t61_install_layout_and_idempotence(tmp_path):
@@ -129,8 +129,8 @@ def test_t61_install_layout_and_idempotence(tmp_path):
     assert proc.returncode == 0, proc.stderr
     d = _deploy(home)
     assert proc.stdout == ("installed v2026.01.01 at %s\n"
-                           "next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join (or init-fleet); "
-                           "the service retries every 10 s\n" % (d, d))
+                           "next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id h1 "
+                           "(or init-fleet --agent-id h1); the service retries every 10 s\n" % (d, d))
     assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(os.path.join(d, "qwen-agentd-launch")).st_mode) == 0o755
     assert stat.S_IMODE(os.stat(os.path.join(d, "update-state.json")).st_mode) == 0o600
@@ -142,11 +142,11 @@ def test_t61_install_layout_and_idempotence(tmp_path):
         os.path.join(d, "releases", "v2026.01.01", "qwen-agent-workspace", "bin", "qwen-agent"))
     state = fleet_lib.read_state(os.path.join(d, "update-state.json"))
     assert state == {"from": None, "to": "v2026.01.01", "status": "ok", "attempts": 0, "bad_tags": []}
-    assert os.path.exists(os.path.join(ftu.daemon_log_dir(home), "gate-v2026.01.01.log"))
+    assert os.path.exists(os.path.join(ftu.daemon_log_dir(home, "h1"), "gate-v2026.01.01.log"))
     assert not os.path.exists(os.path.join(str(home), "Library", "LaunchAgents"))
     assert not os.path.exists(os.path.join(str(home), ".config", "systemd"))
     origin.release("v2026.01.02")
-    ftu.make_fleet(home, ftu.TEST_FLEET_ID, secrets.token_hex(32))
+    ftu.make_fleet(home, "h1", ftu.TEST_FLEET_ID, secrets.token_hex(32))
     proc = _install(home, origin)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "installed v2026.01.01 at %s\n" % d
@@ -159,35 +159,78 @@ def test_install_rejects_bad_host_id_and_failing_first_release(tmp_path):
     home.mkdir()
     proc = subprocess.run([sys.executable, ftu.AGENTD, "install", "--host-id", "Mac_Local", "--no-service"],
                           env=ftu.clean_env(home), capture_output=True, text=True, timeout=60)
-    assert (proc.returncode, proc.stderr) == (2, "qwen-agentd: invalid --host-id 'Mac_Local'\n")
+    assert (proc.returncode, proc.stderr) == (2, "qwen-agentd: invalid --agent-id 'Mac_Local'\n")
     origin = Origin(tmp_path / "o", _registry(ftu.free_port()))
     origin.append("tests/test_fleet_lib.py", "\n\ndef test_gate_must_fail():\n    assert False\n")
     origin.release("v2026.01.01")
     proc = _install(home, origin)
     assert proc.returncode == 2
     assert proc.stderr == ("qwen-agentd: first release v2026.01.01 failed its gate (selftest exit 1); see %s\n"
-                           % os.path.join(ftu.daemon_log_dir(home), "gate-v2026.01.01.log"))
+                           % os.path.join(ftu.daemon_log_dir(home, "h1"), "gate-v2026.01.01.log"))
     assert not os.path.lexists(os.path.join(_deploy(home), "current"))
 
 
 def test_service_definitions():
     agentd = ftu.load_script("qwen_agentd_services", ftu.AGENTD)
-    plist = agentd.launchd_plist_dict("/usr/bin/python3", "/h/.local/share/qwen-agent", "mac-local",
-                                      "/h/Library/Logs/qwen-agentd")
+    plist = agentd.launchd_plist_dict("/usr/bin/python3", "/h/agents/mac-local", "mac-local",
+                                      "/h/agents/mac-local/logs")
     assert plist == {
-        "Label": "com.qwen-agent.qwen-agentd",
-        "ProgramArguments": ["/usr/bin/python3", "/h/.local/share/qwen-agent/qwen-agentd-launch"],
+        "Label": "com.qwen-agent.qwen-agentd.mac-local",
+        "ProgramArguments": ["/usr/bin/python3", "/h/agents/mac-local/qwen-agentd-launch"],
         "EnvironmentVariables": {"QWEN_AGENT_HOST_ID": "mac-local",
                                  "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
         "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
-        "StandardOutPath": "/h/Library/Logs/qwen-agentd/launchd.out",
-        "StandardErrorPath": "/h/Library/Logs/qwen-agentd/launchd.err"}
+        "StandardOutPath": "/h/agents/mac-local/logs/launchd.out",
+        "StandardErrorPath": "/h/agents/mac-local/logs/launchd.err"}
     assert plistlib.loads(plistlib.dumps(plist)) == plist
-    assert agentd.systemd_unit_text("/usr/bin/python3", "/home/u/.local/share/qwen-agent", "ollama-168") == (
+    assert agentd.systemd_unit_text("/usr/bin/python3", "/home/u/agents/ollama-168", "ollama-168") == (
         "[Unit]\nDescription=qwen-agent fleet daemon\nStartLimitIntervalSec=0\n\n"
-        "[Service]\nExecStart=/usr/bin/python3 /home/u/.local/share/qwen-agent/qwen-agentd-launch\n"
+        "[Service]\nExecStart=/usr/bin/python3 /home/u/agents/ollama-168/qwen-agentd-launch\n"
         "Environment=QWEN_AGENT_HOST_ID=ollama-168\nRestart=always\nRestartSec=10\n\n"
         "[Install]\nWantedBy=default.target\n")
+
+
+def test_mt23_install_service_is_per_agent(tmp_path, monkeypatch):
+    """MT23: two agents in one HOME get two plists or two units, each loaded under its own name.
+    subprocess.run is recorded, so no real launchctl or systemctl ever runs."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    agentd = ftu.load_script("qwen_agentd_mt23", ftu.AGENTD)
+    calls = []
+
+    def record(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    monkeypatch.setattr(agentd.subprocess, "run", record)
+    py = "/usr/bin/python3"
+    monkeypatch.setattr(agentd.sys, "platform", "darwin")
+    domain = "gui/%d" % os.getuid()
+    expected = []
+    for x in ("a", "b"):
+        ok, path = agentd.install_service(py, fleet_lib.deploy_root(x), x)
+        assert ok and path == os.path.join(str(home), "Library", "LaunchAgents",
+                                           "com.qwen-agent.qwen-agentd.%s.plist" % x)
+        with open(path, "rb") as f:
+            plist = plistlib.loads(f.read())
+        assert plist["Label"] == "com.qwen-agent.qwen-agentd." + x
+        assert plist["EnvironmentVariables"]["QWEN_AGENT_HOST_ID"] == x
+        assert plist["StandardErrorPath"] == os.path.join(fleet_lib.log_dir(x), "launchd.err")
+        expected += [["launchctl", "bootout", "%s/com.qwen-agent.qwen-agentd.%s" % (domain, x)],
+                     ["launchctl", "bootstrap", domain, path]]
+    assert calls == expected
+    del calls[:]
+    monkeypatch.setattr(agentd.sys, "platform", "linux")
+    expected = []
+    for x in ("a", "b"):
+        ok, path = agentd.install_service(py, fleet_lib.deploy_root(x), x)
+        unit = "qwen-agentd-%s.service" % x
+        assert ok and path == os.path.join(str(home), ".config", "systemd", "user", unit)
+        with open(path, encoding="utf-8") as f:
+            assert f.read() == agentd.systemd_unit_text(py, fleet_lib.deploy_root(x), x)
+        expected += [["systemctl", "--user", "daemon-reload"], ["systemctl", "--user", "enable", unit],
+                     ["systemctl", "--user", "restart", unit]]
+    assert calls == expected
 
 
 def test_linger_check(monkeypatch):
@@ -281,7 +324,7 @@ def _setup(tmp_path, skills=(), server_url=None):
     proc = _install(home, origin)
     assert proc.returncode == 0, proc.stderr
     token = secrets.token_hex(32)
-    ftu.make_fleet(home, ftu.TEST_FLEET_ID, token)
+    ftu.make_fleet(home, "h1", ftu.TEST_FLEET_ID, token)
     return origin, home, bytes.fromhex(token), port
 
 
@@ -326,7 +369,7 @@ def test_t60_switch_gate_failure_and_crash_rollback(tmp_path):
         assert set(state["bad_tags"]) >= {"v2026.01.03", "v2026.01.04"}
         assert os.readlink(os.path.join(_deploy(home), "current")) == "releases/v2026.01.02"
         ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 20)
-        log = ftu.read_log(home)
+        log = ftu.read_log(home, "h1")
         assert "update: switching v2026.01.01 -> v2026.01.02" in log
         assert "update: now running v2026.01.02 (from v2026.01.01)" in log
         assert "update: v2026.01.03 failed its gate (selftest exit 1); marked bad" in log
@@ -346,7 +389,7 @@ def test_t62_dirty_tree_blocks_the_update(tmp_path):
         time.sleep(3 * UPDATE_PERIOD)
         assert _version(key, port) == "v2026.01.01"
         assert ("WARNING updater update: v2026.01.02 available but the current release has modified "
-                "tracked files; not updating") in ftu.read_log(home)
+                "tracked files; not updating") in ftu.read_log(home, "h1")
         subprocess.run(["git", "-C", os.path.join(_deploy(home), "current"), "checkout", "--", "."],
                        check=True, capture_output=True, env=ftu.clean_env(home))
         ftu.wait_until(lambda: _version(key, port) == "v2026.01.02", 2 * UPDATE_PERIOD + 10)
@@ -370,7 +413,7 @@ def test_t63_update_waits_for_an_in_flight_run(tmp_path):
         origin.release("v2026.01.02")
         time.sleep(3 * UPDATE_PERIOD)
         assert _version(key, port) == "v2026.01.01"
-        assert "INFO updater update: v2026.01.02 deferred: a run is in flight" in ftu.read_log(home)
+        assert "INFO updater update: v2026.01.02 deferred: a run is in flight" in ftu.read_log(home, "h1")
         ftu.release_hook(hook, "hold")
         held.join(30)
         assert result["run"] == 200

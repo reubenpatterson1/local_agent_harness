@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """qwen-agentd-launch -- the stable entry point the supervisor runs (fleet spec F89).
 
-install copies this file to ~/.local/share/qwen-agent/qwen-agentd-launch, outside
+install copies this file to ~/agents/<id>/qwen-agentd-launch, outside
 releases/, so no self-update ever replaces it. Every supervisor start passes
 through here. While the update state is "pending" (a new release has not yet
 passed its own post-update self-check) each start is counted, and the start that

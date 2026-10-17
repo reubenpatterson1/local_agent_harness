@@ -67,7 +67,11 @@ def _strip_fleet_env(environ):
 # ---------------------------------------------------------------------------
 
 def cmd_init_fleet(args):
-    path = fleet_lib.fleet_env_path()
+    host_id, message = fleet_lib.resolve_agent(args.agent_id)
+    if message is not None:
+        _err(message)
+        return 2
+    path = fleet_lib.fleet_env_path(host_id)
     if os.path.lexists(path):
         _err("qwen-agentd: %s already exists; remove it first to create a new fleet" % path)
         return 2
@@ -84,13 +88,17 @@ def cmd_init_fleet(args):
 
 
 def cmd_join(args):
+    host_id, message = fleet_lib.resolve_agent(args.agent_id)
+    if message is not None:
+        _err(message)
+        return 2
     raw = args.string if args.string is not None else getpass.getpass("join string: ")
     try:
         fleet_id, token = fleet_lib.parse_join_string(raw)
     except fleet_lib.FleetEnvError:
         _err("qwen-agentd: invalid join string")
         return 2
-    path = fleet_lib.fleet_env_path()
+    path = fleet_lib.fleet_env_path(host_id)
     if os.path.lexists(path):
         try:
             existing = fleet_lib.load_fleet_env(path)
@@ -130,9 +138,9 @@ class _PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
         return stream
 
 
-def setup_logging():
-    """<log_dir>/qwen-agentd.log, 5 MB x 3, INFO (F107, F108). Only `run` logs."""
-    directory = fleet_lib.log_dir()
+def setup_logging(host_id):
+    """A(<id>)/logs/qwen-agentd.log, 5 MB x 3, INFO (F107, F108, multi-agent spec M5). Only `run` logs."""
+    directory = fleet_lib.log_dir(host_id)
     os.makedirs(directory, exist_ok=True)
     os.chmod(directory, 0o700)
     handler = _PrivateRotatingFileHandler(os.path.join(directory, "qwen-agentd.log"),
@@ -362,8 +370,11 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
 class Daemon(object):
     """One `qwen-agentd run`: state, sockets, threads and endpoint logic (F95)."""
 
-    def __init__(self, args, beacon_targets, beacon_port, scale, t0):
+    def __init__(self, args, beacon_targets, beacon_port, scale, t0, host_id, fleet_id, key):
         self.args = args
+        self.host_id = host_id
+        self.fleet_id = fleet_id
+        self.key = key
         self.beacon_targets = beacon_targets
         self.beacon_port = beacon_port
         self.scale = scale
@@ -381,42 +392,27 @@ class Daemon(object):
         self.skills_state = []
         self._prev_verified = {}
         self.beacon_ok = True
-        self.key = None
         self.httpd = None
         self.udp = None
 
     def scaled(self, seconds):
         return seconds * self.scale
 
-    # --- startup (F95 steps 4-11) -------------------------------------------------
+    # --- startup (multi-agent spec M31 steps 6-13) -------------------------------
 
     def start(self):
-        path = fleet_lib.fleet_env_path()
+        registry_path = self.args.registry or os.path.join(REPO_ROOT, "fleets", self.fleet_id + ".json")
         try:
-            fleet_id, token = fleet_lib.load_fleet_env(path)
-        except FileNotFoundError:
-            raise StartupError("qwen-agentd: %s not found; run qwen-agentd init-fleet or "
-                               "qwen-agentd join" % path)
-        except fleet_lib.FleetEnvError as e:
-            raise StartupError("qwen-agentd: %s" % e)
-        self.key = fleet_lib.token_key(token)
-        del token
-        registry_path = self.args.registry or os.path.join(REPO_ROOT, "fleets", fleet_id + ".json")
-        try:
-            self.registry = fleet_lib.load_registry(registry_path, fleet_id)
+            self.registry = fleet_lib.load_registry(registry_path, self.fleet_id)
         except fleet_lib.RegistryError as e:
             raise StartupError("qwen-agentd: %s" % e)
-        self.host_id = os.environ.get("QWEN_AGENT_HOST_ID", "")
-        if self.host_id == "":
-            raise StartupError("qwen-agentd: QWEN_AGENT_HOST_ID is not set; valid IDs: %s"
-                               % ", ".join(sorted(self.registry["hosts"])))
         try:
             self.entry = fleet_lib.self_entry(self.registry, self.host_id)
         except fleet_lib.RegistryError as e:
             raise StartupError("qwen-agentd: %s" % e)
         self.port = self.entry["port"]
         self.loopback_url = "http://127.0.0.1:%d" % self.port
-        self.version = fleet_lib.release_version(REPO_ROOT, fleet_lib.deploy_root())
+        self.version = fleet_lib.release_version(REPO_ROOT, fleet_lib.deploy_root(self.host_id))
         self.table = fleet_lib.LivenessTable(self.registry, self.host_id,
                                              self.scaled(fleet_lib.LIVE_WINDOW))
         self._bind_sockets()
@@ -479,7 +475,7 @@ class Daemon(object):
         self._thread("http", self.httpd.serve_forever)
         if self.version != "dev":
             self._thread("updater", self.updater_loop)
-        state = fleet_lib.read_state(state_path(fleet_lib.deploy_root()))
+        state = fleet_lib.read_state(state_path(fleet_lib.deploy_root(self.host_id)))
         if state["status"] == "pending" and state["to"] == self.version:
             self._thread("confirm", lambda: self.confirm_loop(state))
 
@@ -748,7 +744,7 @@ class Daemon(object):
         argv = [sys.executable, self.qwen_agent_bin, "--skill=" + skill, "--user-prompt=" + task,
                 "--base-url=" + self.entry["model_server"]["url"], "--model=" + self.entry["model"],
                 "--model-server-type=" + self.entry["model_server"]["type"]]
-        err_path = os.path.join(fleet_lib.log_dir(), "last-run.stderr")
+        err_path = os.path.join(fleet_lib.log_dir(self.host_id), "last-run.stderr")
         fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w") as err:
@@ -873,7 +869,7 @@ class Daemon(object):
                 return
 
     def _confirm_switch(self):
-        d = fleet_lib.deploy_root()
+        d = fleet_lib.deploy_root(self.host_id)
         st = fleet_lib.read_state(state_path(d))
         new = {"from": st["from"], "to": st["to"], "status": "ok", "attempts": 0, "bad_tags": st["bad_tags"]}
         fleet_lib.write_state(state_path(d), new)
@@ -890,15 +886,41 @@ class Daemon(object):
         return 0
 
 
+def _run_identity():
+    """(host_id, fleet_id, key) from QWEN_AGENT_HOST_ID and its fleet.env (multi-agent spec M31 steps 3-4).
+
+    Runs before logging is set up, so its errors go to stderr only and create nothing on disk.
+    """
+    host_id = os.environ.get("QWEN_AGENT_HOST_ID", "")
+    if host_id == "":
+        raise StartupError("qwen-agentd: QWEN_AGENT_HOST_ID is not set; agents on this machine: %s"
+                           % (", ".join(fleet_lib.agent_ids_on_disk()) or "none"))
+    if not fleet_lib.HOST_ID_RE.fullmatch(host_id):
+        raise StartupError("qwen-agentd: invalid QWEN_AGENT_HOST_ID '%s'" % host_id)
+    path = fleet_lib.fleet_env_path(host_id)
+    try:
+        fleet_id, token = fleet_lib.load_fleet_env(path)
+    except FileNotFoundError:
+        raise StartupError("qwen-agentd: %s not found; run qwen-agentd init-fleet --agent-id %s or "
+                           "qwen-agentd join --agent-id %s" % (path, host_id, host_id))
+    except fleet_lib.FleetEnvError as e:
+        raise StartupError("qwen-agentd: %s" % e)
+    key = fleet_lib.token_key(token)
+    del token
+    return host_id, fleet_id, key
+
+
 def cmd_run(args):
+    """Multi-agent spec M31 steps 1-5; Daemon.start does steps 6-13."""
     t0 = time.monotonic()
     try:
         targets, beacon_port, scale = _validate_run_flags(args)
+        host_id, fleet_id, key = _run_identity()
     except StartupError as e:
         _err(str(e))
         return 2
-    setup_logging()
-    daemon = Daemon(args, targets, beacon_port, scale, t0)
+    setup_logging(host_id)
+    daemon = Daemon(args, targets, beacon_port, scale, t0, host_id, fleet_id, key)
     signal.signal(signal.SIGTERM, lambda signum, frame: daemon.stop.set())
     signal.signal(signal.SIGINT, lambda signum, frame: daemon.stop.set())
     try:
@@ -921,7 +943,28 @@ def _format_skills(skills):
                      for i in skills)
 
 
+def _status_agent(explicit, view):
+    """The agent whose update state `status` prints, or None (multi-agent spec M30 step 3).
+
+    The --agent-id flag, else the answering daemon's own host_id, else the single agent on disk.
+    """
+    if explicit is not None:
+        return explicit
+    if view is not None:
+        host_id = view["self"]["host_id"]
+        if fleet_lib.HOST_ID_RE.fullmatch(host_id):
+            return host_id
+    ids = fleet_lib.agent_ids_on_disk()
+    return ids[0] if len(ids) == 1 else None
+
+
 def cmd_status(args):
+    explicit = None
+    if args.agent_id is not None:
+        explicit, message = fleet_lib.resolve_agent(args.agent_id)
+        if message is not None:
+            _err(message)
+            return 2
     url = "http://127.0.0.1:%d" % args.port
     view, _warning = fleet_lib.fetch_view(url)
     lines = []
@@ -941,8 +984,9 @@ def cmd_status(args):
         if not view["peers"]:
             lines.append("peers: none")
         rc = 0
-    state_file = os.path.join(fleet_lib.deploy_root(), "update-state.json")
-    if not os.path.exists(state_file):
+    agent = _status_agent(explicit, view)
+    state_file = None if agent is None else state_path(fleet_lib.deploy_root(agent))
+    if state_file is None or not os.path.exists(state_file):
         lines.append("update: not installed")
     else:
         st = fleet_lib.read_state(state_file)
@@ -1031,7 +1075,7 @@ def gate_release(d, tag):
         return False, "py_compile %s" % type(e).__name__
     if proc.returncode != 0:
         return False, "py_compile exit %d" % proc.returncode
-    logs = fleet_lib.log_dir()
+    logs = os.path.join(d, fleet_lib.LOGS_SUBDIR)
     os.makedirs(logs, exist_ok=True)
     fd = os.open(os.path.join(logs, "gate-%s.log" % tag), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
@@ -1073,7 +1117,7 @@ LAUNCHD_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 def launchd_plist_dict(py, d, host_id, logs):
-    return {"Label": fleet_lib.LAUNCHD_LABEL,
+    return {"Label": fleet_lib.launchd_label(host_id),
             "ProgramArguments": [py, d + "/qwen-agentd-launch"],
             "EnvironmentVariables": {"QWEN_AGENT_HOST_ID": host_id, "PATH": LAUNCHD_PATH},
             "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": fleet_lib.SUPERVISOR_RESTART_DELAY,
@@ -1115,23 +1159,24 @@ def _write_file_atomic(path, data, mode=0o644):
 
 
 def install_service(py, d, host_id):
-    """Write and load the platform's service -> (ok, service path or error message) (F90)."""
+    """Write and load this agent's service -> (ok, service path or error message) (F90, multi-agent spec M6)."""
     if sys.platform == "darwin":
-        path = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % fleet_lib.LAUNCHD_LABEL)
-        _write_file_atomic(path, plistlib.dumps(launchd_plist_dict(py, d, host_id, fleet_lib.log_dir())))
+        label = fleet_lib.launchd_label(host_id)
+        path = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % label)
+        _write_file_atomic(path, plistlib.dumps(launchd_plist_dict(py, d, host_id, fleet_lib.log_dir(host_id))))
         domain = "gui/%d" % os.getuid()
-        subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, fleet_lib.LAUNCHD_LABEL)],
-                       capture_output=True)
+        subprocess.run(["launchctl", "bootout", "%s/%s" % (domain, label)], capture_output=True)
         rc = subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True).returncode
         if rc != 0:
             return False, "qwen-agentd: launchctl bootstrap failed (exit %d)" % rc
         return True, path
     if sys.platform.startswith("linux"):
-        path = os.path.expanduser("~/.config/systemd/user/%s" % fleet_lib.SYSTEMD_UNIT)
+        unit = fleet_lib.systemd_unit(host_id)
+        path = os.path.expanduser("~/.config/systemd/user/%s" % unit)
         _write_file_atomic(path, systemd_unit_text(py, d, host_id).encode("utf-8"))
         for cmd in (["systemctl", "--user", "daemon-reload"],
-                    ["systemctl", "--user", "enable", fleet_lib.SYSTEMD_UNIT],
-                    ["systemctl", "--user", "restart", fleet_lib.SYSTEMD_UNIT]):
+                    ["systemctl", "--user", "enable", unit],
+                    ["systemctl", "--user", "restart", unit]):
             rc = subprocess.run(cmd, capture_output=True).returncode
             if rc != 0:
                 return False, "qwen-agentd: %s failed (exit %d)" % (" ".join(cmd), rc)
@@ -1140,11 +1185,13 @@ def install_service(py, d, host_id):
 
 
 def cmd_install(args):
-    """F91, steps 1-11. Idempotent: never re-clones and never changes an existing D/current."""
-    d = fleet_lib.deploy_root()
-    if not fleet_lib.HOST_ID_RE.fullmatch(args.host_id):
-        _err("qwen-agentd: invalid --host-id '%s'" % args.host_id)
+    """F91 with D = A(<id>) (multi-agent spec M25). Idempotent: never re-clones, never changes D/current."""
+    host_id = args.agent_id
+    if not fleet_lib.HOST_ID_RE.fullmatch(host_id):
+        _err("qwen-agentd: invalid --agent-id '%s'" % host_id)
         return 2
+    d = fleet_lib.deploy_root(host_id)
+    logs = fleet_lib.log_dir(host_id)
     if not git(["--version"])[0]:
         _err("qwen-agentd: git is required")
         return 2
@@ -1163,7 +1210,7 @@ def cmd_install(args):
             _err("qwen-agentd: user lingering is off, so the daemon would stop at logout; run: "
                  "sudo loginctl enable-linger %s" % user)
             return 2
-    for directory in (d, fleet_lib.log_dir()):
+    for directory in (d, logs):
         os.makedirs(directory, exist_ok=True)
         os.chmod(directory, 0o700)
     repo = os.path.join(d, "repo")
@@ -1189,7 +1236,7 @@ def cmd_install(args):
             ok, detail = gate_release(d, tag)
         if not ok:
             _err("qwen-agentd: first release %s failed its gate (%s); see %s"
-                 % (tag, detail, os.path.join(fleet_lib.log_dir(), "gate-%s.log" % tag)))
+                 % (tag, detail, os.path.join(logs, "gate-%s.log" % tag)))
             return 2
         swap_current(d, tag)
         fleet_lib.write_state(state_path(d), {"from": None, "to": tag, "status": "ok", "attempts": 0,
@@ -1211,7 +1258,7 @@ def cmd_install(args):
         os.replace(link_tmp, link)
     service_path = None
     if not args.no_service:
-        ok, result = install_service(sys.executable, d, args.host_id)
+        ok, result = install_service(sys.executable, d, host_id)
         if not ok:
             _err(result)
             return 2
@@ -1219,9 +1266,9 @@ def cmd_install(args):
     print("installed %s at %s" % (os.path.basename(os.path.realpath(current)), d))
     if service_path is not None:
         print("service: %s" % service_path)
-    if not os.path.exists(fleet_lib.fleet_env_path()):
-        print("next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join (or init-fleet); "
-              "the service retries every 10 s" % d)
+    if not os.path.exists(fleet_lib.fleet_env_path(host_id)):
+        print("next: run %s/current/qwen-agent-workspace/bin/qwen-agentd join --agent-id %s "
+              "(or init-fleet --agent-id %s); the service retries every 10 s" % (d, host_id, host_id))
     return 0
 
 
@@ -1255,7 +1302,7 @@ class UpdateCtx(object):
 
     def __init__(self, daemon):
         self.daemon = daemon
-        self.d = fleet_lib.deploy_root()
+        self.d = fleet_lib.deploy_root(daemon.host_id)
         self.repo = os.path.join(self.d, "repo")
 
     def fetch(self):
@@ -1310,13 +1357,20 @@ class UpdateCtx(object):
 # CLI (F92, F99). Keep this section last.
 # ---------------------------------------------------------------------------
 
+def _add_agent_id(p, required=False):
+    """--agent-id ID with --host-id as an exact alias (multi-agent spec M23)."""
+    p.add_argument("--agent-id", "--host-id", dest="agent_id", default=None, metavar="ID", required=required)
+
+
 def _build_parser():
     parser = argparse.ArgumentParser(prog="qwen-agentd", description="qwen-agent fleet daemon")
     sub = parser.add_subparsers(dest="command")
     sub.required = True
     p = sub.add_parser("init-fleet", help="create a new fleet and print its join string once")
+    _add_agent_id(p)
     p.set_defaults(func=cmd_init_fleet)
     p = sub.add_parser("join", help="join an existing fleet (prompts when STRING is omitted)")
+    _add_agent_id(p)
     p.add_argument("string", nargs="?", default=None, metavar="STRING")
     p.set_defaults(func=cmd_join)
     p = sub.add_parser("selftest", help="run this release's fleet unit tests (the update gate)")
@@ -1328,11 +1382,12 @@ def _build_parser():
     p.add_argument("--qwen-agent-bin", default=os.path.join(REPO_ROOT, "bin", "qwen-agent"), metavar="PATH")
     p.add_argument("--timing-scale", default="1.0", metavar="X")
     p.set_defaults(func=cmd_run)
-    p = sub.add_parser("status", help="print this host's fleet view and update state")
+    p = sub.add_parser("status", help="print an agent's fleet view and update state")
+    _add_agent_id(p)
     p.add_argument("--port", type=int, default=fleet_lib.DEFAULT_PORT)
     p.set_defaults(func=cmd_status)
-    p = sub.add_parser("install", help="install this host into ~/.local/share/qwen-agent and its service")
-    p.add_argument("--host-id", required=True, metavar="ID")
+    p = sub.add_parser("install", help="install an agent into ~/agents/<id> with its service and commands")
+    _add_agent_id(p, required=True)
     p.add_argument("--origin", default=fleet_lib.ORIGIN_URL, metavar="URL")
     p.add_argument("--no-service", action="store_true", default=False)
     p.set_defaults(func=cmd_install)

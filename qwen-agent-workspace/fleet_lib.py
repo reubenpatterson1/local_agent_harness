@@ -19,7 +19,6 @@ import ipaddress
 import json
 import os
 import re
-import sys
 import threading
 import time
 
@@ -64,10 +63,8 @@ DAEMON_URL_RE = re.compile(r"^http://127\.0\.0\.1:([0-9]{1,5})$")
 VIEW_TIMEOUT = 2              # s, bin/qwen-agent GET /peers; never scaled
 DELEGATE_CLIENT_TIMEOUT = 960 # s, bin/qwen-agent POST /delegate = FORWARD_TIMEOUT + 30; never scaled
 ORIGIN_URL = "https://github.com/reubenpatterson1/local_agent_harness.git"
-DEPLOY_ROOT = "~/.local/share/qwen-agent"   # passed through os.path.expanduser at every use
 WS_SUBDIR = "qwen-agent-workspace"          # the workspace directory inside a release worktree
-LAUNCHD_LABEL = "com.qwen-agent.qwen-agentd"
-SYSTEMD_UNIT = "qwen-agentd.service"
+LAUNCHD_LABEL = "com.qwen-agent.qwen-agentd"   # the base of launchd_label(<id>) (multi-agent spec M6)
 AGENTS_DIR = "~/agents"                     # A(<id>) = ~/agents/<id>, expanded at every use (multi-agent spec M2)
 LOGS_SUBDIR = "logs"                        # A(<id>)/logs (multi-agent spec M5)
 FLEET_ENV_NAME = "fleet.env"                # A(<id>)/fleet.env (multi-agent spec M4)
@@ -242,9 +239,9 @@ def self_entry(registry, host_id):
 # Section 3: trust -- fleet.env and join strings (F19-F28)
 # ---------------------------------------------------------------------------
 
-def fleet_env_path():
-    """~/.config/qwen-agent/fleet.env, the only place the token is stored (F19)."""
-    return os.path.expanduser("~/.config/qwen-agent/fleet.env")
+def fleet_env_path(host_id):
+    """A(<id>)/fleet.env, the only place this agent's token is stored (F19, multi-agent spec M4)."""
+    return os.path.join(deploy_root(host_id), FLEET_ENV_NAME)
 
 
 def write_fleet_env(path, fleet_id, token):
@@ -851,16 +848,15 @@ def delegate_once(daemon_url, skill, task, host_id):
 _STATUSES = ("ok", "pending", "rolled_back")
 
 
-def deploy_root():
-    """D = ~/.local/share/qwen-agent, the same on every host (F80)."""
-    return os.path.expanduser(DEPLOY_ROOT)
+def deploy_root(host_id):
+    """A(<id>) = ~/agents/<id>, this agent's root (multi-agent spec M2)."""
+    _check_agent_id(host_id)
+    return os.path.join(os.path.expanduser(AGENTS_DIR), host_id)
 
 
-def log_dir():
-    """The daemon's log directory (F107)."""
-    if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Logs/qwen-agentd")
-    return os.path.expanduser("~/.local/state/qwen-agentd")
+def log_dir(host_id):
+    """A(<id>)/logs, this agent's log directory on every platform (F107, multi-agent spec M5)."""
+    return os.path.join(deploy_root(host_id), LOGS_SUBDIR)
 
 
 def tag_key(tag):
