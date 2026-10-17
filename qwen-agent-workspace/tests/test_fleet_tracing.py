@@ -139,3 +139,111 @@ def test_trt44_signed_peer_trace_endpoint(tmp_path):
     assert (status, json.loads(raw)) == (200, {"agent": "bravo", "trace_id": "2" * 32, "records": [],
                                                "truncated": False})
     assert fleet.daemons["bravo"].log() == before
+
+
+# --- loopback GET /trace?id= (fan-out) and GET /traces/recent (TR27, TR28) --------------
+
+def _append_lines(home, host_id, records):
+    """Append stored-form records to an agent's trace.jsonl the way its daemon would."""
+    path = os.path.join(ftu.daemon_log_dir(home, host_id), "trace.jsonl")
+    with open(path, "ab") as f:
+        for rec in records:
+            f.write(fleet_lib.canonical_json(rec) + b"\n")
+
+
+def _delegate_record(agent, target, parent, start):
+    return fleet_lib.make_record(T, fleet_lib.new_span_id(), parent, agent, "delegate", "researcher", start,
+                                 0.0, "unreachable", {"skill": "researcher", "target": target, "request_id": "r1",
+                                                      "http": None, "images": 0}, now=0.5)
+
+
+def test_tr27_fanout_two_rounds_and_missing_reasons(tmp_path):
+    fleet = ftu.Fleet(tmp_path, names=("alpha", "bravo"), extra_hosts={"charlie": {
+        "port": ftu.free_port(), "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+        "model": "charlie-model", "skills": ["analyst"]}}).start()
+    ftu.wait_until(lambda: fleet.peer_ids("alpha") == ["bravo"], 4.5)
+    alpha, bravo = fleet.ports["alpha"], fleet.ports["bravo"]
+    turn = _span("turn", parent=None, name="repl")
+    tool = _span(parent=turn["span_id"], name="delegate_to_skill")
+    for rec in (turn, tool):
+        assert _post_span(alpha, rec)[0] == 200
+    now = round(time.time(), 3)
+    to_charlie = _delegate_record("alpha", "charlie", tool["span_id"], now)
+    to_delta = _delegate_record("alpha", "delta", tool["span_id"], now + 0.001)
+    _append_lines(fleet.homes["alpha"], "alpha", [to_charlie, to_delta])
+    peer = _span("model", parent=to_charlie["span_id"], name="bravo-model")
+    assert _post_span(bravo, peer)[0] == 200
+    started = time.monotonic()
+    status, result = ftu.trace(alpha, T)
+    assert time.monotonic() - started < 3
+    assert status == 200 and fleet_lib.valid_trace_result(result, T)
+    expected = [dict(turn, agent="alpha"), dict(tool, agent="alpha"), to_charlie, to_delta, dict(peer, agent="bravo")]
+    assert result["records"] == fleet_lib.merge_records(expected)
+    assert result["missing"] == [{"agent": "charlie", "reason": "unreachable (connection refused)"},
+                                 {"agent": "delta", "reason": "not in the registry"}]
+    assert result["truncated"] == []
+    assert ftu.trace(alpha, "1" * 32) == (200, {"schema": "qwen-agentd.trace.v1", "trace_id": "1" * 32,
+                                                "records": [], "missing": [], "truncated": []})
+    status, listed = ftu.recent(alpha)
+    assert status == 200 and fleet_lib.valid_recent_result(listed)
+    assert listed["agent"] == "alpha" and [t["trace_id"] for t in listed["traces"]] == [T]
+    assert listed["traces"][0]["spans"] == 4
+    assert listed["traces"][0]["delegated"] == ["researcher@charlie", "researcher@delta"]
+    assert ftu._request(alpha, "GET", "/traces/recent")[0] == 200
+    assert ftu.recent(bravo) == (200, {"schema": "qwen-agentd.recent.v1", "agent": "bravo", "traces": []})
+
+
+def test_trt45_query_endpoints_refuse_browsers_and_bad_queries(tmp_path):
+    fleet = _alpha(tmp_path)
+    port = fleet.ports["alpha"]
+    before = fleet.daemons["alpha"].log()
+    body = fleet_lib.canonical_json(_span())
+    requests = (("POST", "/spans", body), ("GET", "/trace?id=" + T, None), ("GET", "/traces/recent", None))
+    for method, path, payload in requests:
+        json_type = {"Content-Type": "application/json"} if method == "POST" else {}
+        for headers in (dict(json_type, Host="evil.example:%d" % port),
+                        dict(json_type, Origin="http://evil.example")):
+            assert ftu._request(port, method, path, payload, headers)[0::2] == (403, b""), (path, headers)
+    assert ftu._request(port, "POST", "/spans", body, {"Content-Type": "text/plain"})[0::2] == (403, b"")
+    if sys.platform.startswith("linux"):
+        for method, path, payload in requests:
+            headers = {"Content-Length": str(len(payload or b"")), "Content-Type": "application/json"}
+            assert ftu.raw_request(port, method, path, headers, payload or b"",
+                                   source=("127.0.0.2", 0)) == (403, b"")
+    assert ftu._request(port, "GET", "/trace?id=xyz")[0::2] == (400, b'{"error":"bad trace id"}')
+    assert ftu._request(port, "GET", "/trace")[0::2] == (400, b'{"error":"bad trace id"}')
+    for n in ("101", "0", "abc", "", "1000"):
+        assert ftu._request(port, "GET", "/traces/recent?n=" + n)[0::2] == (400, b'{"error":"bad n"}'), n
+    assert ftu.read_records(fleet.homes["alpha"], "alpha") == []
+    assert fleet.daemons["alpha"].log() == before
+
+
+def test_tr26_to_tr28_unreadable_store_answers_500(tmp_path):
+    fleet = ftu.Fleet(tmp_path, names=("alpha",))
+    os.makedirs(os.path.join(ftu.daemon_log_dir(fleet.homes["alpha"], "alpha"), "trace.jsonl"))
+    fleet.start()
+    port = fleet.ports["alpha"]
+    status, _h, raw, _s = _signed_get(port, "/trace/" + T)
+    assert (status, raw) == (500, b'{"error":"trace store unreadable: IsADirectoryError"}')
+    assert ftu.trace(port, T) == (500, {"error": "trace store unreadable: IsADirectoryError"})
+    assert ftu.recent(port) == (500, {"error": "trace store unreadable: IsADirectoryError"})
+    assert _post_span(port, _span()) == (200, b'{"ok":true}')
+    assert _post_span(port, _span()) == (200, b'{"ok":true}')
+    log = fleet.daemons["alpha"].log()
+    assert log.count("trace: cannot write ") == 1
+    assert " WARNING " in log and "trace: cannot write %s: IsADirectoryError\n" % os.path.join(
+        ftu.daemon_log_dir(fleet.homes["alpha"], "alpha"), "trace.jsonl") in log
+
+
+def test_tracing_focus_4_traces_survive_a_daemon_restart(tmp_path):
+    """Review Focus 4: every self-update restarts the daemon. Expected: a trace recorded
+    before the restart is still listed by --recent and returned by GET /trace?id= after it."""
+    fleet = _alpha(tmp_path)
+    turn = _span("turn", parent=None, name="repl")
+    assert _post_span(fleet.ports["alpha"], turn)[0] == 200
+    fleet.daemons["alpha"].kill()
+    ftu.start_daemon(fleet.homes["alpha"], "alpha", fleet.registry, fleet.beacon_ports["alpha"], "none")
+    status, result = ftu.trace(fleet.ports["alpha"], T)
+    assert status == 200 and result["records"] == [dict(turn, agent="alpha")]
+    status, listed = ftu.recent(fleet.ports["alpha"], 1)
+    assert status == 200 and [t["trace_id"] for t in listed["traces"]] == [T]

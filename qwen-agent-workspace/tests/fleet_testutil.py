@@ -538,3 +538,15 @@ def read_records(home, host_id):
         with open(path, encoding="utf-8") as f:
             records.extend(json.loads(line) for line in f if line.strip())
     return records
+
+
+def trace(port, trace_id):
+    """(status, parsed body or None) of loopback GET /trace?id=<trace_id>."""
+    status, _headers, raw = _request(port, "GET", "/trace?id=" + trace_id, timeout=30)
+    return status, (json.loads(raw) if raw else None)
+
+
+def recent(port, n=10):
+    """(status, parsed body or None) of loopback GET /traces/recent?n=<n>."""
+    status, _headers, raw = _request(port, "GET", "/traces/recent?n=%d" % n, timeout=30)
+    return status, (json.loads(raw) if raw else None)

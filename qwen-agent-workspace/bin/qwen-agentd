@@ -198,6 +198,8 @@ _PORT_RE = re.compile(r"[0-9]{1,5}")
 _LENGTH_RE = re.compile(r"[0-9]{1,12}")
 _RUN_KEYS = frozenset(("skill", "task", "request_id"))
 _DELEGATE_KEYS = frozenset(("skill", "task", "host_id"))
+_TRACE_QUERY_RE = re.compile(r"/trace\?id=([0-9a-f]{32})")
+_RECENT_QUERY_RE = re.compile(r"/traces/recent\?n=([0-9]{1,3})")
 
 
 def _parse_port(text):
@@ -644,6 +646,10 @@ class Daemon(object):
             return 200, self.peers_view()
         if name == "spans":
             return self.handle_spans(body)
+        if name == "trace_query":
+            return self.handle_trace_query(path)
+        if name == "recent":
+            return self.handle_recent(path)
         return self.handle_delegate(body)
 
     # --- tracing: the store, POST /spans and the query endpoints (tracing spec TR21-TR28) ---
@@ -687,6 +693,111 @@ class Daemon(object):
             return 500, fleet_lib.canonical_json({"error": "trace store unreadable: %s" % type(e).__name__})
         return 200, fleet_lib.canonical_json({"agent": self.host_id, "trace_id": trace_id,
                                               "records": records, "truncated": truncated})
+
+    def handle_trace_query(self, path):
+        """(status, object) for loopback GET /trace?id=<id> (tracing spec TR27)."""
+        match = _TRACE_QUERY_RE.fullmatch(path)
+        if match is None or not fleet_lib.valid_trace_id(match.group(1)):
+            return 400, {"error": "bad trace id"}
+        try:
+            return 200, self.trace_query(match.group(1))
+        except OSError as e:
+            return 500, {"error": "trace store unreadable: %s" % type(e).__name__}
+
+    def trace_call(self, address, port, path):
+        """(status, raw, None) of a verified signed GET, or (None, None, reason) (tracing spec TR27)."""
+        nonce = secrets.token_hex(16)
+        headers = fleet_lib.sign_request(self.key, "GET", path, b"", int(time.time()), nonce)
+        try:
+            conn = http.client.HTTPConnection(address, port, timeout=fleet_lib.PEER_HTTP_TIMEOUT)
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                status, resp_headers = resp.status, resp.headers
+                raw = resp.read(fleet_lib.MAX_BODY + 1)
+            finally:
+                conn.close()
+        except (socket.timeout, TimeoutError):
+            return None, None, "unreachable (timeout)"
+        except ConnectionRefusedError:
+            return None, None, "unreachable (connection refused)"
+        except Exception as e:
+            return None, None, "unreachable (%s)" % type(e).__name__
+        if len(raw) > fleet_lib.MAX_BODY:
+            return None, None, "bad response (too large)"
+        if fleet_lib.verify_response(self.key, status, "GET", path, nonce, resp_headers, raw,
+                                     int(time.time()), self.response_nonces) != "ok":
+            return None, None, "bad signature (http %d)" % status
+        return status, raw, None
+
+    def _fetch_peer_traces(self, targets, trace_id):
+        """{host_id: (status, raw, reason)} for [(host_id, address, port)], all at once, within TRACE_FANOUT_DEADLINE."""
+        results, lock, path = {}, threading.Lock(), "/trace/" + trace_id
+
+        def work(host_id, address, port):
+            result = self.trace_call(address, port, path)
+            with lock:
+                results[host_id] = result
+
+        threads = [self._thread("trace-fetch", lambda h=h, a=a, p=p: work(h, a, p)) for h, a, p in targets]
+        deadline = time.monotonic() + fleet_lib.TRACE_FANOUT_DEADLINE
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+        with lock:
+            out = dict(results)
+        for host_id, _address, _port in targets:
+            out.setdefault(host_id, (None, None, "unreachable (timeout)"))
+        return out
+
+    def _merge_round(self, trace_id, targets, merged, missing, truncated):
+        results = self._fetch_peer_traces(targets, trace_id)
+        for host_id in sorted(results):
+            status, raw, reason = results[host_id]
+            records, why, count = fleet_lib.peer_trace_result(trace_id, host_id, status, raw, reason)
+            if why is not None:
+                missing.append({"agent": host_id, "reason": why})
+                continue
+            merged.extend(records)
+            if count is not None:
+                truncated.append({"agent": host_id, "count": count})
+
+    def trace_query(self, trace_id):
+        """This agent's records of a trace merged with every reachable peer's (tracing spec TR27)."""
+        records, cut = self.trace_store.query(trace_id)
+        merged, missing, truncated = list(records), [], []
+        if cut:
+            truncated.append({"agent": self.host_id, "count": len(records)})
+        round1 = [(p["host_id"], p["address"], p["port"]) for p in self.table.live_peers()
+                  if p["host_id"] != self.host_id]
+        self._merge_round(trace_id, round1, merged, missing, truncated)
+        asked = set([self.host_id] + [h for h, _a, _p in round1])
+        round2 = []
+        for target in sorted(set(r["attrs"]["target"] for r in merged if r["kind"] == "delegate") - asked):
+            host = self.registry["hosts"].get(target)
+            if host is None:
+                missing.append({"agent": target, "reason": "not in the registry"})
+            else:
+                round2.append((target, host["address"], host["port"]))
+        self._merge_round(trace_id, round2, merged, missing, truncated)
+        return {"schema": fleet_lib.TRACE_SCHEMA, "trace_id": trace_id,
+                "records": fleet_lib.merge_records(merged),
+                "missing": sorted(missing, key=lambda m: m["agent"]),
+                "truncated": sorted(truncated, key=lambda t: t["agent"])}
+
+    def handle_recent(self, path):
+        """(status, object) for loopback GET /traces/recent[?n=N] (tracing spec TR28)."""
+        if path == "/traces/recent":
+            n = fleet_lib.TRACE_RECENT_DEFAULT
+        else:
+            match = _RECENT_QUERY_RE.fullmatch(path)
+            n = int(match.group(1)) if match is not None else 0
+            if not 1 <= n <= fleet_lib.TRACE_RECENT_MAX:
+                return 400, {"error": "bad n"}
+        try:
+            traces = self.trace_store.recent(n)
+        except OSError as e:
+            return 500, {"error": "trace store unreadable: %s" % type(e).__name__}
+        return 200, {"schema": fleet_lib.RECENT_SCHEMA, "agent": self.host_id, "traces": traces}
 
     # --- discovery: beacons, bind attempts, poll fallback (F11, F30-F39) -------------
 
