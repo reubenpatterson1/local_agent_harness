@@ -17,10 +17,10 @@ Also supports a one-shot programmatic mode: --user-prompt TEXT runs a single tur
 and prints one JSON object to stdout (see
 docs/specs/2026-08-21-qwen-agent-oneshot-api-design.md). In that mode,
 --system-prompt TEXT optionally appends to the built-in system message.
---image PATH attaches one PNG to that one-shot user message as an OpenAI-style
-image_url content block. The file's raw bytes are base64-encoded as-is: no image
-processing happens here, which is what keeps this file standard-library-only --
-resize upstream (see bin/ltx-movie's Phase 0).
+--image PATH attaches a PNG or JPEG to that one-shot user message as an OpenAI-style
+image_url content block; repeat it for up to four images. The file's raw bytes are
+base64-encoded as-is: no image processing happens here, which is what keeps this file
+standard-library-only -- resize upstream (see bin/ltx-movie's Phase 0).
 """
 
 import argparse
@@ -154,6 +154,7 @@ SKILL_TOOL_NAMES = {
     "analyst":      ("search", "fetch_url", "read_file", "calculate"),
     "planner":      ("search", "fetch_url", "read_file"),
     "researcher":   ("search", "fetch_url", "read_file", "calculate"),
+    "vision":       (),
 }
 # INVARIANT: every name above is a member of AUTO_APPROVE_TOOLS. No skill
 # subprocess can therefore ever reach the confirmation prompt. Do not add bash,
@@ -164,15 +165,19 @@ SKILL_TOOL_NAMES = {
 # Which skill names delegate_to_skill's own enum permits, keyed by the CURRENT
 # process's skill context (None == top level / unrestricted).
 DELEGATE_TARGETS = {
-    None:            ("investigator", "analyst", "planner", "researcher"),
-    "investigator":  ("analyst", "researcher"),
+    None:            ("investigator", "analyst", "planner", "researcher", "vision"),
+    "investigator":  ("analyst", "researcher", "vision"),
 }
+# Skills that only a fleet peer (or this host, when its daemon verifies them) can serve.
+# They are left out of delegate_to_skill when no fleet view is available (vision spec V25).
+FLEET_ONLY_SKILLS = ("vision",)
 
 SKILL_THINK_TEMP_DEFAULTS = {
     "investigator": {"think": True,  "temperature": 0.7},
     "planner":      {"think": True,  "temperature": 0.7},
     "analyst":      {"think": False, "temperature": 0.2},
     "researcher":   {"think": False, "temperature": 0.7},
+    "vision":       {"think": False, "temperature": 0.2},
 }
 
 # Search grounding (see docs/specs/2026-08-21-qwen-agent-search-grounding-design.md).
@@ -625,7 +630,8 @@ def build_tools_for_context(skill, delegate_targets=None):
         names = SKILL_TOOL_NAMES[skill]
     tools = [_BASE_TOOL_BY_NAME[n] for n in names if n not in ("delegate_to_skill", "calculate")]
     if "delegate_to_skill" in names:
-        targets = DELEGATE_TARGETS[skill] if delegate_targets is None else tuple(delegate_targets)
+        targets = (tuple(t for t in DELEGATE_TARGETS[skill] if t not in FLEET_ONLY_SKILLS)
+                   if delegate_targets is None else tuple(delegate_targets))
         if targets:
             tools.append(_build_delegate_tool(targets))
     if "calculate" in names:
@@ -3668,21 +3674,32 @@ def repl(args_ns):
 
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+# Each equals its fleet_lib namesake; bin/qwen-agent keeps its own copies because it must
+# work without fleet_lib (fleet spec F70). Test VT10 checks that they agree.
+IMAGE_MAGIC = (("image/png", PNG_MAGIC), ("image/jpeg", JPEG_MAGIC))
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 16777216    # 16 MiB decoded, all images of one delegation together
 
 
-def _is_png(path):
-    """True when the file's first 8 bytes are the PNG signature.
+def _sniff_media_type(head):
+    """The media type whose magic bytes start `head`, or None (vision spec V37)."""
+    for media_type, magic in IMAGE_MAGIC:
+        if head.startswith(magic):
+            return media_type
+    return None
 
-    The data URL below hardcodes image/png, so the format is verified from the file's
-    own magic bytes and never guessed from its extension. Unreadable == not a PNG;
-    main()'s isfile check has already run, so the only way here is a real I/O error,
-    which the caller reports the same way as a wrong format.
+
+def _image_media_type(path):
+    """image/png or image/jpeg from the file's own first bytes; None when unreadable or neither.
+
+    The data URL's media type is never guessed from the file extension.
     """
     try:
         with open(path, "rb") as f:
-            return f.read(len(PNG_MAGIC)) == PNG_MAGIC
+            return _sniff_media_type(f.read(len(PNG_MAGIC)))
     except OSError:
-        return False
+        return None
 
 
 def _b64_image(path):
@@ -3704,13 +3721,16 @@ def _oneshot_user_message(args_ns):
     no-image branch returns exactly what this file has always sent, so no existing call
     path (REPL, tool-calling rounds, unseeded one-shot) changes shape at all.
     """
-    if getattr(args_ns, "image", None) is None:
+    images = getattr(args_ns, "image", None)
+    if images is None:
         return {"role": "user", "content": args_ns.user_prompt}
-    return {"role": "user", "content": [
-        {"type": "text", "text": args_ns.user_prompt},
-        {"type": "image_url",
-         "image_url": {"url": "data:image/png;base64," + _b64_image(args_ns.image)}},
-    ]}
+    if isinstance(images, str):
+        images = [images]
+    content = [{"type": "text", "text": args_ns.user_prompt}]
+    for path in images:
+        content.append({"type": "image_url", "image_url": {
+            "url": "data:%s;base64,%s" % (_image_media_type(path), _b64_image(path))}})
+    return {"role": "user", "content": content}
 
 
 def oneshot(args_ns):
@@ -3781,13 +3801,13 @@ def parse_args(argv):
                              "chat_template_kwargs.enable_thinking.")
     parser.add_argument("--user-prompt", type=str, default=None)
     parser.add_argument("--system-prompt", type=str, default=None)
-    parser.add_argument("--image", type=str, default=None,
-                        help="PATH to a PNG attached to the one-shot user message as an "
-                             "image_url content block (requires --user-prompt). The bytes "
-                             "are base64-encoded as-is; qwen-agent does no image "
-                             "processing -- resize upstream.")
+    parser.add_argument("--image", action="append", default=None, metavar="PATH",
+                        help="PATH to a PNG or JPEG attached to the one-shot user message as an "
+                             "image_url content block (requires --user-prompt). Repeat for up "
+                             "to 4 images, attached in order. The bytes are base64-encoded "
+                             "as-is; qwen-agent does no image processing -- resize upstream.")
     parser.add_argument("--skill", type=str, default=None,
-                        choices=("investigator", "analyst", "planner", "researcher"))
+                        choices=("investigator", "analyst", "planner", "researcher", "vision"))
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--danger-auto-approve", action="store_true", default=False,
                         help="Skip the confirmation prompt for EVERY tool call except "
@@ -3834,14 +3854,20 @@ def main():
     if args_ns.image is not None and args_ns.user_prompt is None:
         sys.stderr.write("qwen-agent: --image requires --user-prompt.\n")
         sys.exit(2)
-    if args_ns.image is not None and not os.path.isfile(args_ns.image):
-        sys.stderr.write("qwen-agent: --image file not found: %s\n" % args_ns.image)
+    if args_ns.image is not None and len(args_ns.image) > MAX_IMAGES:
+        sys.stderr.write("qwen-agent: at most %d --image files are allowed; got %d.\n"
+                         % (MAX_IMAGES, len(args_ns.image)))
         sys.exit(2)
-    if args_ns.image is not None and not _is_png(args_ns.image):
-        sys.stderr.write(
-            "qwen-agent: --image must be a PNG (the data URL is emitted as "
-            "image/png); %s is not.\n" % args_ns.image
-        )
+    for path in args_ns.image or ():
+        if not os.path.isfile(path):
+            sys.stderr.write("qwen-agent: --image file not found: %s\n" % path)
+            sys.exit(2)
+        if _image_media_type(path) is None:
+            sys.stderr.write("qwen-agent: --image must be a PNG or JPEG (detected from the "
+                             "file's first bytes); %s is neither.\n" % path)
+            sys.exit(2)
+    if args_ns.skill == "vision" and not args_ns.image:
+        sys.stderr.write("qwen-agent: --skill=vision requires at least one --image.\n")
         sys.exit(2)
 
     if args_ns.skill is not None:

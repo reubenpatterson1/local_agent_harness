@@ -95,8 +95,8 @@ def _run_main(qa, monkeypatch, argv, load_fleet=None):
 
 def test_t30_researcher_constants_and_prompt(qa):
     assert qa.SKILL_TOOL_NAMES["researcher"] == ("search", "fetch_url", "read_file", "calculate")
-    assert qa.DELEGATE_TARGETS[None] == ("investigator", "analyst", "planner", "researcher")
-    assert qa.DELEGATE_TARGETS["investigator"] == ("analyst", "researcher")
+    assert qa.DELEGATE_TARGETS[None] == ("investigator", "analyst", "planner", "researcher", "vision")
+    assert qa.DELEGATE_TARGETS["investigator"] == ("analyst", "researcher", "vision")
     assert set(qa.DELEGATE_TARGETS) == {None, "investigator"}
     assert qa.SKILL_THINK_TEMP_DEFAULTS["researcher"] == {"think": False, "temperature": 0.7}
     unsafe = _load(UNSAFE_PATH, "qwen_agent_unsafe_for_prompt")
@@ -371,7 +371,7 @@ def test_t38_bad_daemon_url_or_view_falls_back(qa, monkeypatch, tmp_path, capsys
             "fleet routing disabled\n" % bad)
         assert daemon.requests == []
         enum = qa.TOOL_BY_NAME["delegate_to_skill"]["function"]["parameters"]["properties"]["skill"]["enum"]
-        assert enum == list(qa.DELEGATE_TARGETS[None])
+        assert enum == ["investigator", "analyst", "planner", "researcher"]
     finally:
         daemon.close()
     warning = ("qwen-agent: warning: qwen-agentd at %s returned an unrecognized fleet view; "
