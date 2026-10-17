@@ -109,7 +109,7 @@ def _join_from_agent(host_id, source_id, string):
         _err("qwen-agentd: join takes STRING or --from-agent, not both")
         return 2
     if not fleet_lib.HOST_ID_RE.fullmatch(source_id):
-        _err("qwen-agentd: invalid --from-agent '%s'" % source_id)
+        _err("qwen-agentd: invalid --from-agent %s" % fleet_lib.shown_value(source_id))
         return 2
     if source_id == host_id:
         _err("qwen-agentd: --from-agent names agent '%s' itself" % host_id)
@@ -1258,7 +1258,7 @@ def cmd_install(args):
     """F91 with D = A(<id>) (multi-agent spec M25). Idempotent: never re-clones, never changes D/current."""
     host_id = args.agent_id
     if not fleet_lib.HOST_ID_RE.fullmatch(host_id):
-        _err("qwen-agentd: invalid --agent-id '%s'" % host_id)
+        _err("qwen-agentd: invalid --agent-id %s" % fleet_lib.shown_value(host_id))
         return 2
     d = fleet_lib.deploy_root(host_id)
     logs = fleet_lib.log_dir(host_id)

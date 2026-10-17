@@ -1417,3 +1417,16 @@ def test_mt3_classify_write_and_actions(tmp_path, monkeypatch):
     ]
     for args, action in rows:
         assert fleet_lib.default_command_action(*args) == action, args
+
+
+def test_mt3_write_wrapper_failure_leaves_no_tmp(tmp_path, monkeypatch):
+    path = str(tmp_path / "bin" / "qwen-agent")
+    fleet_lib.write_wrapper(path, b"old\n")
+    def boom(fd):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(fleet_lib.os, "fsync", boom)
+    with pytest.raises(OSError):
+        fleet_lib.write_wrapper(path, b"new\n")
+    assert not os.path.lexists(path + ".tmp")
+    with open(path, "rb") as f:
+        assert f.read() == b"old\n"

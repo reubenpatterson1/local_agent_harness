@@ -371,7 +371,7 @@ def test_t60_switch_gate_failure_and_crash_rollback(tmp_path):
             "tests/test_fleet_lib.py", "\n\ndef test_gate_must_fail():\n    assert False\n"))
         ftu.wait_until(lambda: "v2026.01.03" in _state(home)["bad_tags"], 60)
         assert _version(key, port) == "v2026.01.02"
-        assert not os.path.exists(os.path.join(_deploy(home), "releases", "v2026.01.03"))
+        ftu.wait_until(lambda: not os.path.exists(os.path.join(_deploy(home), "releases", "v2026.01.03")), 30)
         # (3) a release that passes the gate but cannot start (registry {}): rolled back.
         origin.release("v2026.01.04", parent="v2026.01.02",
                        change=lambda o: o.write(o.registry_rel, "{}"))

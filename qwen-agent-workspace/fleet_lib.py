@@ -1014,6 +1014,16 @@ def _check_agent_id(host_id):
         raise ValueError("invalid agent id %r" % (host_id,))
 
 
+_TOKEN_RUN_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def shown_value(value):
+    """'<value>' for an error message, unless it holds a token-shaped run (multi-agent spec MK5)."""
+    if isinstance(value, str) and _TOKEN_RUN_RE.search(value):
+        return "(a value that looks like a join string; not shown)"
+    return "'%s'" % (value,)
+
+
 def launchd_label(host_id):
     """com.qwen-agent.qwen-agentd.<id>, this agent's LaunchAgent label (multi-agent spec M6)."""
     _check_agent_id(host_id)
@@ -1059,7 +1069,7 @@ def resolve_agent(explicit):
     if explicit is not None:
         if isinstance(explicit, str) and HOST_ID_RE.fullmatch(explicit):
             return explicit, None
-        return None, "qwen-agentd: invalid --agent-id '%s'" % (explicit,)
+        return None, "qwen-agentd: invalid --agent-id %s" % shown_value(explicit)
     root = os.path.expanduser(AGENTS_DIR)
     ids = agent_ids_on_disk()
     if len(ids) == 1:
@@ -1167,12 +1177,19 @@ def write_wrapper(path, data):
     if os.path.lexists(tmp):
         os.unlink(tmp)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o755)
-    os.fchmod(fd, 0o755)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o755)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def agent_command_action(kind):

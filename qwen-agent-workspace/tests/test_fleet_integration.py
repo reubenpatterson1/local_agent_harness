@@ -813,7 +813,7 @@ def test_multi_agent_focus_4_mistyped_agent_id_never_prompts(agentd, capsys, mon
             assert capsys.readouterr() == ("", "qwen-agentd: invalid --agent-id '%s'\n" % bad)
     assert prompts == []
     assert not os.path.lexists(str(tmp_path / "home" / "agents"))
-    assert not os.path.lexists(str(tmp_path / "mac-local"))
+    assert not os.path.lexists(str(tmp_path / "home" / "mac-local"))
 
 
 def test_mt12_status_update_line_agent(tmp_path):
@@ -958,3 +958,12 @@ def test_mt10_two_agents_one_home_default_beacons(tmp_path):
     def lists(daemon, other, port):
         return [(p["host_id"], p["port"]) for p in ftu.peers(daemon.port)[1]["peers"]] == [(other, port)]
     ftu.wait_until(lambda: lists(alpha, "bravo", pb) and lists(bravo, "alpha", pa), 7.5)
+
+
+def test_mk5_invalid_agent_id_never_echoes_token(agentd, capsys):
+    s = fleet_lib.make_join_string("0" * 16, "a" * 64)
+    for argv in (["join", "--agent-id", s], ["join", "--agent-id", "bravo", "--from-agent", s]):
+        assert agentd.main(argv) == 2
+        captured = capsys.readouterr()
+        assert "a" * 64 not in captured.err
+        assert "a" * 64 not in captured.out
