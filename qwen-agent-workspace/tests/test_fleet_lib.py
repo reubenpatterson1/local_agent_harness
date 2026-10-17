@@ -1812,3 +1812,177 @@ def test_trt4_attribute_schema_has_no_free_text_beyond_tool_key_and_outcome():
     assert fleet_lib.run_status(200, "max_rounds") == "error"
     assert fleet_lib.run_status(409, None) == "busy"
     assert fleet_lib.run_status(502, None) == "error"
+
+
+# --- fleet tracing: propagation helpers and loopback clients (tracing spec TR7, TR8, TR14, TR15) ---
+
+def test_trt5_trace_field_context_and_child_env():
+    field = {"trace_id": TR_TRACE, "parent_span_id": TR_SPAN}
+    assert fleet_lib.valid_trace_field(field) is True
+    for bad in (dict(field, extra=1), {"trace_id": TR_TRACE}, None, [], "x",
+                {"trace_id": TR_TRACE.upper(), "parent_span_id": TR_SPAN},
+                {"trace_id": TR_TRACE, "parent_span_id": "0" * 16},
+                {"trace_id": TR_TRACE, "parent_span_id": TR_TRACE}):
+        assert fleet_lib.valid_trace_field(bad) is False, bad
+    trace_id, parent = fleet_lib.trace_context(None)
+    assert fleet_lib.valid_trace_id(trace_id) and parent is None
+    assert fleet_lib.trace_context(field) == (TR_TRACE, TR_SPAN)
+    env_ok = {"QWEN_AGENT_TRACE_ID": TR_TRACE, "QWEN_AGENT_PARENT_SPAN": TR_SPAN}
+    assert fleet_lib.trace_env_context(env_ok) == (TR_TRACE, TR_SPAN)
+    for env in ({}, {"QWEN_AGENT_TRACE_ID": TR_TRACE}, {"QWEN_AGENT_PARENT_SPAN": TR_SPAN},
+                dict(env_ok, QWEN_AGENT_PARENT_SPAN=TR_SPAN.upper()),
+                dict(env_ok, QWEN_AGENT_PARENT_SPAN=TR_SPAN[:15]),
+                dict(env_ok, QWEN_AGENT_TRACE_ID="0" * 32)):
+        assert fleet_lib.trace_env_context(env) is None, env
+    environ = {
+        "QWEN_AGENT_FLEET_ID": TEST_FLEET_ID,
+        "QWEN_AGENT_FLEET_TOKEN": TEST_TOKEN,
+        "SKILL_ENDPOINT_RESEARCHER": "http://192.168.1.168:11434/v1",
+        "SKILL_MODEL_RESEARCHER": "qwen3.5:9b",
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/Users/test",
+        "QWEN_AGENT_HOST_ID": "mac-local",
+        "QWEN_AGENT_DAEMON_URL": "http://127.0.0.1:1",
+        "QWEN_AGENT_TRACE_ID": "1" * 32,
+        "QWEN_AGENT_PARENT_SPAN": "2" * 16,
+    }
+    before = dict(environ)
+    for trace in (None, (TR_TRACE, TR_SPAN)):
+        env = fleet_lib.build_child_env(environ, "http://127.0.0.1:8190", trace)
+        assert environ == before
+        for gone in ("QWEN_AGENT_FLEET_ID", "QWEN_AGENT_FLEET_TOKEN", "SKILL_ENDPOINT_RESEARCHER",
+                     "SKILL_MODEL_RESEARCHER"):
+            assert gone not in env
+        for kept in ("PATH", "HOME", "QWEN_AGENT_HOST_ID"):
+            assert env[kept] == environ[kept]
+        assert env["QWEN_AGENT_DAEMON_URL"] == "http://127.0.0.1:8190"
+        assert not any(TEST_TOKEN in v for v in env.values())
+        if trace is None:
+            assert "QWEN_AGENT_TRACE_ID" not in env and "QWEN_AGENT_PARENT_SPAN" not in env
+        else:
+            assert (env["QWEN_AGENT_TRACE_ID"], env["QWEN_AGENT_PARENT_SPAN"]) == trace
+
+
+class _TrServer(object):
+    """A loopback server for TRT13: routes[(method, path)] = (status, body bytes, delay s).
+
+    Records (method, path, Content-Type, body) of every request; unknown routes answer 404.
+    """
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _serve(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                outer.requests.append((self.command, self.path, self.headers.get("Content-Type"), body))
+                status, raw, delay = outer.routes.get((self.command, self.path), (404, b"", 0))
+                time.sleep(delay)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+
+            do_GET = _serve
+            do_POST = _serve
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def test_trt13_post_span_fetch_clients_and_delegate_retry():
+    record = _tr_record("tool", agent=None)
+    srv = _TrServer({("POST", "/spans"): (200, b'{"ok":true}', 0)})
+    try:
+        assert fleet_lib.post_span(srv.url, record) is True
+        assert srv.requests == [("POST", "/spans", "application/json", fleet_lib.canonical_json(record))]
+        srv.routes[("POST", "/spans")] = (500, b"{}", 0)
+        assert fleet_lib.post_span(srv.url, record) is False
+        srv.routes[("POST", "/spans")] = (200, b'{"ok":true}', 3)
+        started = time.monotonic()
+        assert fleet_lib.post_span(srv.url, record) is False
+        assert time.monotonic() - started < 2.5
+    finally:
+        srv.close()
+    closed = "http://127.0.0.1:%d" % _closed_port()
+    assert fleet_lib.post_span(closed, record) is False
+    assert fleet_lib.post_span(None, record) is False
+
+    result = {"schema": "qwen-agentd.trace.v1", "trace_id": TR_TRACE, "records": [_tr_record()],
+              "missing": [{"agent": "bravo", "reason": "unreachable (timeout)"}],
+              "truncated": [{"agent": "alpha", "count": 2000}]}
+    recent = {"schema": "qwen-agentd.recent.v1", "agent": "alpha", "traces": [
+        {"trace_id": TR_TRACE, "start": 1760000000.123, "dur_ms": 12400, "status": "ok", "kind": "turn",
+         "name": "repl", "spans": 5, "delegated": ["researcher@bravo"]}]}
+    trace_path, recent_path = "/trace?id=" + TR_TRACE, "/traces/recent?n=3"
+    srv = _TrServer({})
+    try:
+        cases = (
+            ((401, b"", 0), "the daemon at %s has no trace support (http 401)" % srv.url),
+            ((404, b"", 0), "the daemon at %s has no trace support (http 404)" % srv.url),
+            ((500, b"{}", 0), "the daemon at %s answered http 500" % srv.url),
+            ((200, b"not json", 0), "the daemon at %s returned an unrecognized trace response" % srv.url),
+            ((200, b'{"schema": "qwen-agentd.trace.v1"}', 0),
+             "the daemon at %s returned an unrecognized trace response" % srv.url),
+        )
+        for answer, message in cases:
+            srv.routes = {("GET", trace_path): answer, ("GET", recent_path): answer}
+            assert fleet_lib.fetch_trace(srv.url, TR_TRACE) == (None, message)
+            assert fleet_lib.fetch_recent(srv.url, 3) == (None, message)
+        srv.routes = {("GET", trace_path): (200, json.dumps(result).encode(), 0),
+                      ("GET", recent_path): (200, json.dumps(recent).encode(), 0)}
+        assert fleet_lib.fetch_trace(srv.url, TR_TRACE) == (result, None)
+        assert fleet_lib.fetch_recent(srv.url, 3) == (recent, None)
+        assert fleet_lib.fetch_trace(srv.url, "1" * 32) == (None, "the daemon at %s has no trace support "
+                                                            "(http 404)" % srv.url)
+        bad_records = dict(result, records=[dict(_tr_record(), status="BAD")])
+        srv.routes[("GET", trace_path)] = (200, json.dumps(bad_records).encode(), 0)
+        assert fleet_lib.fetch_trace(srv.url, TR_TRACE)[0] is None
+        bad_recent = dict(recent, traces=[dict(recent["traces"][0], spans=True)])
+        srv.routes[("GET", recent_path)] = (200, json.dumps(bad_recent).encode(), 0)
+        assert fleet_lib.fetch_recent(srv.url, 3)[0] is None
+    finally:
+        srv.close()
+    assert fleet_lib.fetch_trace(closed, TR_TRACE) == (None, "daemon not reachable at %s" % closed)
+    assert fleet_lib.fetch_recent(closed, 3) == (None, "daemon not reachable at %s" % closed)
+
+    field = {"trace_id": TR_TRACE, "parent_span_id": TR_SPAN}
+    ok = json.dumps({"outcome": "ok", "envelope": _ENVELOPE, "detail": ""}).encode()
+    srv = _TrServer({("POST", "/delegate"): (200, ok, 0)})
+    try:
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h", None, field) == ("ok", _ENVELOPE, "")
+        assert [json.loads(r[3]) for r in srv.requests] == [
+            {"skill": "researcher", "task": "t", "host_id": "h", "trace": field}]
+        del srv.requests[:]
+        srv.routes[("POST", "/delegate")] = (400, b'{"error":"bad request"}', 0)
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h", trace=field) == \
+            ("daemon_error", None, "http 400")
+        assert [json.loads(r[3]) for r in srv.requests] == [
+            {"skill": "researcher", "task": "t", "host_id": "h", "trace": field},
+            {"skill": "researcher", "task": "t", "host_id": "h"}]
+        del srv.requests[:]
+        srv.routes[("POST", "/delegate")] = (400, b'{"error":"other"}', 0)
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h", trace=field) == \
+            ("daemon_error", None, "http 400")
+        assert len(srv.requests) == 1
+        del srv.requests[:]
+        srv.routes[("POST", "/delegate")] = (400, b'{"error":"bad request"}', 0)
+        assert fleet_lib.delegate_once(srv.url, "researcher", "t", "h") == ("daemon_error", None, "http 400")
+        assert [r[3] for r in srv.requests] == [
+            fleet_lib.canonical_json({"skill": "researcher", "task": "t", "host_id": "h"})]
+    finally:
+        srv.close()

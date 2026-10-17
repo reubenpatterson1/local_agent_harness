@@ -608,16 +608,21 @@ def verify_skills(entry, loaded):
             for s in entry["skills"]]
 
 
-def build_child_env(environ, daemon_url):
-    """A new env for a /run child: no fleet secrets, no SKILL_* overrides (F54a)."""
+def build_child_env(environ, daemon_url, trace=None):
+    """A new env for a /run child: no fleet secrets, no SKILL_* overrides (F54a), and no
+    inherited trace; trace=(trace_id, parent_span_id) sets the child's (tracing spec TR8)."""
     env = {}
     for key, value in environ.items():
         if key.startswith(FLEET_ENV_PREFIX):
             continue
         if key.startswith("SKILL_ENDPOINT_") or key.startswith("SKILL_MODEL_"):
             continue
+        if key in (TRACE_ENV_ID, TRACE_ENV_PARENT):
+            continue
         env[key] = value
     env["QWEN_AGENT_DAEMON_URL"] = daemon_url
+    if trace is not None:
+        env[TRACE_ENV_ID], env[TRACE_ENV_PARENT] = trace
     return env
 
 
@@ -944,17 +949,9 @@ def fetch_view(daemon_url):
     return view, None
 
 
-def delegate_once(daemon_url, skill, task, host_id, images=None):
-    """POST /delegate for one named peer -> (outcome, envelope, detail). Never raises (F68).
-
-    images is the wire list (vision spec V10, V20); None sends the three-key body unchanged.
-    """
-    if daemon_url is None:
-        return "daemon_error", None, "no daemon"
+def _post_delegate(daemon_url, request):
+    """(status, raw, None) of one loopback POST /delegate, or (None, None, <ExcType>)."""
     try:
-        request = {"skill": skill, "task": task, "host_id": host_id}
-        if images is not None:
-            request["images"] = images
         body = canonical_json(request)
         conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url),
                                           timeout=DELEGATE_CLIENT_TIMEOUT)
@@ -962,12 +959,33 @@ def delegate_once(daemon_url, skill, task, host_id, images=None):
             conn.request("POST", "/delegate", body=body,
                          headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
             resp = conn.getresponse()
-            status = resp.status
-            raw = resp.read(MAX_BODY + 1)
+            return resp.status, resp.read(MAX_BODY + 1), None
         finally:
             conn.close()
     except Exception as e:
-        return "daemon_error", None, type(e).__name__
+        return None, None, type(e).__name__
+
+
+def delegate_once(daemon_url, skill, task, host_id, images=None, trace=None):
+    """POST /delegate for one named peer -> (outcome, envelope, detail). Never raises (F68).
+
+    images is the wire list (vision spec V10, V20); trace is the {"trace_id", "parent_span_id"}
+    field (tracing spec TR15). A daemon that answers a traced body 400 {"error": "bad request"}
+    predates tracing; the same request is sent once more without the field.
+    """
+    if daemon_url is None:
+        return "daemon_error", None, "no daemon"
+    request = {"skill": skill, "task": task, "host_id": host_id}
+    if images is not None:
+        request["images"] = images
+    if trace is not None:
+        request["trace"] = trace
+    status, raw, error = _post_delegate(daemon_url, request)
+    if trace is not None and status == 400 and _json_loads_or_none(raw) == {"error": "bad request"}:
+        del request["trace"]
+        status, raw, error = _post_delegate(daemon_url, request)
+    if error is not None:
+        return "daemon_error", None, error
     if status != 200:
         return "daemon_error", None, "http %d" % status
     try:
@@ -1500,3 +1518,132 @@ def run_status(http, envelope_status):
     if http == 200 and envelope_status == "ok":
         return "ok"
     return "busy" if http == 409 else "error"
+
+
+def valid_trace_field(obj):
+    """True for {"trace_id", "parent_span_id"} with valid IDs and no other key (tracing spec TR7)."""
+    return (isinstance(obj, dict) and set(obj) == {"trace_id", "parent_span_id"}
+            and valid_trace_id(obj["trace_id"]) and valid_span_id(obj["parent_span_id"]))
+
+
+def trace_context(field):
+    """(trace_id, parent_span_id) from a validated trace field, or a new trace with no parent."""
+    if field is None:
+        return new_trace_id(), None
+    return field["trace_id"], field["parent_span_id"]
+
+
+def trace_env_context(environ):
+    """(trace_id, parent_span_id) from QWEN_AGENT_TRACE_ID and QWEN_AGENT_PARENT_SPAN when both are valid, else None."""
+    trace_id, parent = environ.get(TRACE_ENV_ID, ""), environ.get(TRACE_ENV_PARENT, "")
+    if valid_trace_id(trace_id) and valid_span_id(parent):
+        return trace_id, parent
+    return None
+
+
+def _json_loads_or_none(raw):
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError, TypeError):
+        return None
+
+
+def valid_trace_result(obj, trace_id):
+    """True iff obj is a GET /trace?id=<trace_id> result (tracing spec TR14, TR27). Never raises."""
+    try:
+        if not (isinstance(obj, dict) and obj.get("schema") == TRACE_SCHEMA and obj.get("trace_id") == trace_id):
+            return False
+        records, missing, truncated = obj.get("records"), obj.get("missing"), obj.get("truncated")
+        if not (isinstance(records, list) and all(trace_record_error(r) is None for r in records)):
+            return False
+        if not (isinstance(missing, list) and all(
+                isinstance(m, dict) and set(m) == {"agent", "reason"}
+                and isinstance(m["agent"], str) and isinstance(m["reason"], str) for m in missing)):
+            return False
+        return isinstance(truncated, list) and all(
+            isinstance(t, dict) and set(t) == {"agent", "count"}
+            and isinstance(t["agent"], str) and _is_int(t["count"]) for t in truncated)
+    except Exception:
+        return False
+
+
+_RECENT_KEYS = frozenset(("trace_id", "start", "dur_ms", "status", "kind", "name", "spans", "delegated"))
+
+
+def valid_recent_result(obj):
+    """True iff obj is a GET /traces/recent result (tracing spec TR14, TR28). Never raises."""
+    try:
+        if not (isinstance(obj, dict) and obj.get("schema") == RECENT_SCHEMA
+                and isinstance(obj.get("agent"), str) and HOST_ID_RE.fullmatch(obj["agent"])
+                and isinstance(obj.get("traces"), list)):
+            return False
+        for t in obj["traces"]:
+            if not (isinstance(t, dict) and set(t) == _RECENT_KEYS and valid_trace_id(t["trace_id"])
+                    and (_is_int(t["start"]) or isinstance(t["start"], float))
+                    and _is_int(t["dur_ms"]) and _is_int(t["spans"])
+                    and isinstance(t["status"], str) and TRACE_TOKEN_RE.fullmatch(t["status"])
+                    and isinstance(t["kind"], str) and t["kind"] in TRACE_KINDS
+                    and isinstance(t["name"], str) and TRACE_NAME_RE.fullmatch(t["name"])
+                    and isinstance(t["delegated"], list) and all(isinstance(d, str) for d in t["delegated"])):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def post_span(daemon_url, record, timeout=TRACE_POST_TIMEOUT):
+    """True iff the local daemon accepted one finished span (loopback POST /spans, tracing spec TR22)."""
+    if daemon_url is None:
+        return False
+    try:
+        body = canonical_json(record)
+        conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url), timeout=timeout)
+        try:
+            conn.request("POST", "/spans", body=body,
+                         headers={"Content-Type": "application/json", "Content-Length": str(len(body))})
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read(MAX_BODY + 1)
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    return status == 200
+
+
+def _loopback_get(daemon_url, path, timeout):
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", _loopback_port(daemon_url), timeout=timeout)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            return resp.status, resp.read(TRACE_CLIENT_MAX_BYTES + 1)
+        finally:
+            conn.close()
+    except Exception:
+        return None, None
+
+
+def _loopback_result(daemon_url, status, raw, check):
+    if status is None:
+        return None, "daemon not reachable at %s" % daemon_url
+    if status in (401, 404):
+        return None, "the daemon at %s has no trace support (http %d)" % (daemon_url, status)
+    if status != 200:
+        return None, "the daemon at %s answered http %d" % (daemon_url, status)
+    obj = _json_loads_or_none(raw) if len(raw) <= TRACE_CLIENT_MAX_BYTES else None
+    if not check(obj):
+        return None, "the daemon at %s returned an unrecognized trace response" % daemon_url
+    return obj, None
+
+
+def fetch_trace(daemon_url, trace_id):
+    """(result, None) or (None, message) for loopback GET /trace?id=<trace_id> (tracing spec TR27)."""
+    status, raw = _loopback_get(daemon_url, "/trace?id=" + trace_id, TRACE_QUERY_TIMEOUT)
+    return _loopback_result(daemon_url, status, raw, lambda obj: valid_trace_result(obj, trace_id))
+
+
+def fetch_recent(daemon_url, n):
+    """(result, None) or (None, message) for loopback GET /traces/recent?n=<n> (tracing spec TR28)."""
+    status, raw = _loopback_get(daemon_url, "/traces/recent?n=%d" % n, TRACE_RECENT_TIMEOUT)
+    return _loopback_result(daemon_url, status, raw, valid_recent_result)
