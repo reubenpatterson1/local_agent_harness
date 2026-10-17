@@ -1624,3 +1624,191 @@ def test_vt8_delegate_once_sends_images_only_when_given():
                                                                 "host_id": "h"})
     finally:
         srv.close()
+
+
+# --- fleet tracing: constants, IDs, the record and its validator (tracing spec TR1-TR6) ---
+
+TR_TRACE = "4bf92f3577b34da6a3ce929d0e0e4736"
+TR_SPAN = "00f067aa0ba902b7"
+TR_PARENT = "53995c3f42cd8ad8"
+TR_REQ = "9c1e0b7d2a4f6e83"
+
+
+def _tr_attrs(kind):
+    """One valid attrs object per kind, with exactly the keys of tracing spec TR4."""
+    return copy.deepcopy({
+        "turn": {"rounds": 2, "tool_calls": 1},
+        "model": {"call": 1, "tools": True, "prompt_tokens": 812, "completion_tokens": 64,
+                  "finish_reason": "tool_calls", "http": None},
+        "tool": {"round": 1, "decision": "approved", "key": "skill=researcher",
+                 "outcome": "ok, 912 characters", "error": False},
+        "delegate": {"skill": "researcher", "target": "ollama-168", "request_id": TR_REQ, "http": 200,
+                     "images": 0},
+        "run": {"skill": "researcher", "request_id": TR_REQ, "http": 200, "images": 0, "image_bytes": 0},
+        "agent": {"skill": "researcher", "request_id": TR_REQ, "http": 200, "envelope_status": "ok"},
+    }[kind])
+
+
+def _tr_record(kind="tool", agent="mac-local", **changes):
+    """A valid stored-form record (posted form when agent is None), then `changes` applied."""
+    rec = fleet_lib.make_record(TR_TRACE, TR_SPAN, TR_PARENT, agent, kind, "delegate_to_skill",
+                                1760000000.123, 1000.0, "ok", _tr_attrs(kind), now=1001.0)
+    rec.update(changes)
+    return rec
+
+
+def test_trt1_trace_constants_and_ids(monkeypatch):
+    assert fleet_lib.TRACE_FILE_NAME == "trace.jsonl"
+    assert fleet_lib.TRACE_SCHEMA == "qwen-agentd.trace.v1"
+    assert fleet_lib.RECENT_SCHEMA == "qwen-agentd.recent.v1"
+    assert fleet_lib.TRACE_RECORD_VERSION == 1
+    assert fleet_lib.TRACE_KINDS == ("turn", "model", "tool", "delegate", "run", "agent")
+    assert fleet_lib.TRACE_POSTED_KINDS == ("turn", "model", "tool")
+    assert fleet_lib.TRACE_ENV_ID == "QWEN_AGENT_TRACE_ID"
+    assert fleet_lib.TRACE_ENV_PARENT == "QWEN_AGENT_PARENT_SPAN"
+    assert fleet_lib.TRACE_SPAN_MAX_BYTES == 8192
+    assert fleet_lib.TRACE_TEXT_CHARS == 256
+    assert fleet_lib.TRACE_COUNT_MAX == 10 ** 15
+    assert fleet_lib.TRACE_DUR_MAX_MS == 10 ** 10
+    assert fleet_lib.TRACE_MAX_RECORDS == 2000
+    assert fleet_lib.TRACE_QUERY_MAX_BYTES == 1048576 - 4096
+    assert fleet_lib.TRACE_POST_TIMEOUT == 2
+    assert fleet_lib.TRACE_FANOUT_DEADLINE == 6
+    assert fleet_lib.TRACE_QUERY_TIMEOUT == 20
+    assert fleet_lib.TRACE_RECENT_TIMEOUT == 5
+    assert fleet_lib.TRACE_RECENT_DEFAULT == 10
+    assert fleet_lib.TRACE_RECENT_MAX == 100
+    assert fleet_lib.TRACE_CLIENT_MAX_BYTES == 33554432
+    assert fleet_lib.TRACE_ID_RE.pattern == "[0-9a-f]{32}"
+    assert fleet_lib.SPAN_ID_RE.pattern == "[0-9a-f]{16}"
+    assert fleet_lib.TRACE_NAME_RE.pattern == "[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,127}"
+    assert fleet_lib.TRACE_TOKEN_RE.pattern == "[a-z][a-z_]{0,31}"
+    assert fleet_lib._TRACE_TEXT_BAD_RE.pattern == "[\\x00-\\x1f\\x7f]"
+    trace_ids = [fleet_lib.new_trace_id() for _ in range(1000)]
+    span_ids = [fleet_lib.new_span_id() for _ in range(1000)]
+    assert all(fleet_lib.TRACE_ID_RE.fullmatch(t) for t in trace_ids) and len(set(trace_ids)) == 1000
+    assert all(fleet_lib.SPAN_ID_RE.fullmatch(s) for s in span_ids) and len(set(span_ids)) == 1000
+    for func, nbytes in ((fleet_lib.new_trace_id, 16), (fleet_lib.new_span_id, 8)):
+        drawn = ["0" * (2 * nbytes), "ab" * nbytes]
+        asked = []
+        monkeypatch.setattr(fleet_lib.secrets, "token_hex", lambda n: asked.append(n) or drawn.pop(0))
+        assert func() == "ab" * nbytes
+        assert asked == [nbytes, nbytes] and drawn == []
+    monkeypatch.undo()
+    assert fleet_lib.valid_trace_id(TR_TRACE) and fleet_lib.valid_span_id(TR_SPAN)
+    for bad in (TR_TRACE.upper(), TR_TRACE[:31], TR_TRACE + "0", "0" * 32, None, 5, TR_TRACE.encode()):
+        assert fleet_lib.valid_trace_id(bad) is False, bad
+    for bad in (TR_SPAN.upper(), TR_SPAN[:15], TR_SPAN + "0", "0" * 16, None, TR_TRACE):
+        assert fleet_lib.valid_span_id(bad) is False, bad
+
+
+def test_trt2_make_record_per_kind():
+    for kind in fleet_lib.TRACE_KINDS:
+        rec = fleet_lib.make_record(TR_TRACE, TR_SPAN, None, "mac-local", kind, "researcher",
+                                    1760000000.5, 1000.0, "ok", _tr_attrs(kind), now=1000.0 + 1.2345)
+        assert rec["dur_ms"] == 1235, kind
+        assert rec["agent"] == "mac-local" and rec["v"] == 1
+        assert fleet_lib.trace_record_error(rec) is None, kind
+        assert json.loads(fleet_lib.canonical_json(rec)) == rec
+        posted = fleet_lib.make_record(TR_TRACE, TR_SPAN, TR_PARENT, None, kind, "researcher",
+                                       1760000000.5, 1000.0, "ok", _tr_attrs(kind), now=1001.0)
+        assert "agent" not in posted
+        expected = None if kind in ("turn", "model", "tool") else "kind"
+        assert fleet_lib.trace_record_error(posted, posted=True) == expected, kind
+    rec = fleet_lib.make_record(TR_TRACE, TR_SPAN, None, "a", "turn", "repl", 1.0, 1000.0, "ok",
+                                _tr_attrs("turn"), now=999.0)
+    assert rec["dur_ms"] == 0
+
+
+def _trt3_cases():
+    """(mutated record, posted, exact reason) for every TRT3 mutation."""
+    def without(key):
+        rec = _tr_record()
+        del rec[key]
+        return rec
+
+    def attrs(**changes):
+        a = _tr_attrs("tool")
+        a.update(changes)
+        return a
+
+    def model_attrs(**changes):
+        a = _tr_attrs("model")
+        a.update(changes)
+        return a
+
+    return [
+        ([], False, "record"),
+        ("rec", False, "record"),
+        (without("status"), False, "keys"),
+        (_tr_record(task="secret task"), False, "keys"),
+        (_tr_record(), True, "keys"),
+        (_tr_record(v=2), False, "v"),
+        (_tr_record(v=True), False, "v"),
+        (_tr_record(trace_id=TR_TRACE.upper()), False, "trace_id"),
+        (_tr_record(trace_id="0" * 32), False, "trace_id"),
+        (_tr_record(span_id=TR_SPAN.upper()), False, "span_id"),
+        (_tr_record(span_id="0" * 16), False, "span_id"),
+        (_tr_record(span_id=TR_SPAN[:15]), False, "span_id"),
+        (_tr_record(parent_span_id=TR_SPAN), False, "parent_span_id"),
+        (_tr_record(agent="Bad"), False, "agent"),
+        (_tr_record("run", agent=None), True, "kind"),
+        (_tr_record(name="has space"), False, "name"),
+        (_tr_record(start=-1), False, "start"),
+        (_tr_record(start=float("nan")), False, "start"),
+        (_tr_record(start="1"), False, "start"),
+        (_tr_record(start=True), False, "start"),
+        (_tr_record(dur_ms=-1), False, "dur_ms"),
+        (_tr_record(dur_ms=1.5), False, "dur_ms"),
+        (_tr_record(status="OK"), False, "status"),
+        (_tr_record(attrs=dict(_tr_attrs("tool"), prompt="p")), False, "attrs"),
+        (_tr_record(attrs=attrs(key="k" * 257)), False, "attrs.key"),
+        (_tr_record(attrs=attrs(key="line\nbreak")), False, "attrs.key"),
+        (_tr_record("model", attrs=model_attrs(prompt_tokens=True)), False, "attrs.prompt_tokens"),
+    ]
+
+
+def test_trt3_trace_record_error_reasons():
+    for rec, posted, reason in _trt3_cases():
+        assert fleet_lib.trace_record_error(rec, posted=posted) == reason, (reason, rec)
+        if isinstance(rec, dict):
+            for value in rec.values():
+                if isinstance(value, str) and len(value) >= 3:
+                    assert value not in reason
+    assert fleet_lib.trace_record_error(_tr_record()) is None
+    long_key = _tr_record(attrs=dict(_tr_attrs("tool"), key="k" * 256, outcome="é" * 256))
+    assert fleet_lib.trace_record_error(long_key) is None
+
+
+def test_trt4_attribute_schema_has_no_free_text_beyond_tool_key_and_outcome():
+    assert fleet_lib._TRACE_ATTRS == {
+        "turn": {"rounds": "int", "tool_calls": "int"},
+        "model": {"call": "int", "tools": "bool", "prompt_tokens": "int?", "completion_tokens": "int?",
+                  "finish_reason": "token?", "http": "int?"},
+        "tool": {"round": "int", "decision": "token", "key": "text", "outcome": "text", "error": "bool"},
+        "delegate": {"skill": "name", "target": "agent", "request_id": "reqid?", "http": "int?",
+                     "images": "int"},
+        "run": {"skill": "name", "request_id": "reqid", "http": "int", "images": "int", "image_bytes": "int"},
+        "agent": {"skill": "name", "request_id": "reqid", "http": "int", "envelope_status": "token?"},
+    }
+    text = set((kind, key) for kind, schema in fleet_lib._TRACE_ATTRS.items()
+               for key, typ in schema.items() if typ.rstrip("?") == "text")
+    assert text == {("tool", "key"), ("tool", "outcome")}
+    forbidden = {"task", "prompt", "answer", "messages", "content", "data", "images_data", "token", "text",
+                 "result", "arguments"}
+    for schema in fleet_lib._TRACE_ATTRS.values():
+        assert not (set(schema) & forbidden)
+    assert set(fleet_lib._TRACE_ATTRS) == set(fleet_lib.TRACE_KINDS)
+    assert fleet_lib.trace_name("qwen38-6bit") == "qwen38-6bit"
+    assert fleet_lib.trace_name("has space") == "unknown" and fleet_lib.trace_name(None) == "unknown"
+    assert fleet_lib.trace_skill("researcher") == "researcher"
+    assert fleet_lib.trace_skill("find the secret plan") == "unknown" and fleet_lib.trace_skill(3) == "unknown"
+    assert fleet_lib.trace_token("tool_calls") == "tool_calls"
+    assert fleet_lib.trace_token("Stop") is None and fleet_lib.trace_token(None) is None
+    assert fleet_lib.trace_count(812) == 812
+    for bad in (True, -1, 10 ** 15 + 1, 1.0, "3", None):
+        assert fleet_lib.trace_count(bad) is None
+    assert fleet_lib.run_status(200, "ok") == "ok"
+    assert fleet_lib.run_status(200, "max_rounds") == "error"
+    assert fleet_lib.run_status(409, None) == "busy"
+    assert fleet_lib.run_status(502, None) == "error"

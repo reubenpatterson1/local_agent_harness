@@ -20,6 +20,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import threading
 import time
 
@@ -89,6 +90,33 @@ LOG_MAX_BYTES = 5242880       # 5 MB
 LOG_BACKUPS = 3
 RUN_TMP_SUBDIR = "tmp"        # A(<id>)/tmp holds one private directory per image run (V17)
 RUN_TMP_PREFIX = "images-"    # prefix of each run's directory; stale ones are removed at startup (V19)
+# --- tracing (docs/superpowers/specs/2026-10-17-fleet-tracing-design.md) ---
+TRACE_FILE_NAME = "trace.jsonl"     # A(<id>)/logs/trace.jsonl, rotated LOG_MAX_BYTES x LOG_BACKUPS (TR10)
+TRACE_SCHEMA = "qwen-agentd.trace.v1"     # loopback GET /trace?id= response (TR27)
+RECENT_SCHEMA = "qwen-agentd.recent.v1"   # loopback GET /traces/recent response (TR28)
+TRACE_RECORD_VERSION = 1
+TRACE_KINDS = ("turn", "model", "tool", "delegate", "run", "agent")
+TRACE_POSTED_KINDS = ("turn", "model", "tool")    # the kinds a qwen-agent may POST /spans
+TRACE_ENV_ID = "QWEN_AGENT_TRACE_ID"
+TRACE_ENV_PARENT = "QWEN_AGENT_PARENT_SPAN"
+TRACE_SPAN_MAX_BYTES = 8192         # POST /spans body cap (TR9)
+TRACE_TEXT_CHARS = 256              # longest tool key or outcome attribute
+TRACE_COUNT_MAX = 10 ** 15          # largest integer attribute
+TRACE_DUR_MAX_MS = 10 ** 10
+TRACE_MAX_RECORDS = 2000            # records one agent returns for one trace
+TRACE_QUERY_MAX_BYTES = MAX_BODY - 4096   # their encoded size; 4 KiB is left for the envelope
+TRACE_POST_TIMEOUT = 2              # s, bin/qwen-agent POST /spans; never scaled
+TRACE_FANOUT_DEADLINE = PEER_HTTP_TIMEOUT + 1   # s, one fan-out round to peers; never scaled
+TRACE_QUERY_TIMEOUT = 20            # s, a client's GET /trace?id= (two fan-out rounds plus margin)
+TRACE_RECENT_TIMEOUT = 5            # s, a client's GET /traces/recent
+TRACE_RECENT_DEFAULT = 10
+TRACE_RECENT_MAX = 100
+TRACE_CLIENT_MAX_BYTES = 33554432   # largest /trace?id= or /traces/recent response a client reads
+TRACE_ID_RE = re.compile(r"[0-9a-f]{32}")
+SPAN_ID_RE = re.compile(r"[0-9a-f]{16}")
+TRACE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,127}")
+TRACE_TOKEN_RE = re.compile(r"[a-z][a-z_]{0,31}")
+_TRACE_TEXT_BAD_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # Every regex above is applied with .fullmatch(), never .match(): "$" alone also
 # matches just before a trailing newline, so "mac-local\n" would otherwise pass.
@@ -1320,3 +1348,155 @@ def default_command_action(kind, found_id, host_id, make_default):
     if make_default and kind == "other":
         return "refuse"
     return "keep"
+
+
+# ---------------------------------------------------------------------------
+# Tracing: IDs, records, the store, the clients and the tree (tracing spec)
+# ---------------------------------------------------------------------------
+
+def _valid_id(value, regex):
+    return isinstance(value, str) and regex.fullmatch(value) is not None and value.strip("0") != ""
+
+
+def valid_trace_id(value):
+    """True for 32 lowercase hex characters, not all zero (W3C trace-id shape)."""
+    return _valid_id(value, TRACE_ID_RE)
+
+
+def valid_span_id(value):
+    """True for 16 lowercase hex characters, not all zero (W3C parent-id shape)."""
+    return _valid_id(value, SPAN_ID_RE)
+
+
+def new_trace_id():
+    """A fresh trace ID from secrets.token_hex(16); the all-zero value is drawn again."""
+    while True:
+        value = secrets.token_hex(16)
+        if valid_trace_id(value):
+            return value
+
+
+def new_span_id():
+    """A fresh span ID from secrets.token_hex(8); the all-zero value is drawn again."""
+    while True:
+        value = secrets.token_hex(8)
+        if valid_span_id(value):
+            return value
+
+
+_TRACE_KEYS = frozenset(("v", "trace_id", "span_id", "parent_span_id", "agent", "kind", "name",
+                         "start", "dur_ms", "status", "attrs"))
+_TRACE_ATTRS = {
+    "turn": {"rounds": "int", "tool_calls": "int"},
+    "model": {"call": "int", "tools": "bool", "prompt_tokens": "int?", "completion_tokens": "int?",
+              "finish_reason": "token?", "http": "int?"},
+    "tool": {"round": "int", "decision": "token", "key": "text", "outcome": "text", "error": "bool"},
+    "delegate": {"skill": "name", "target": "agent", "request_id": "reqid?", "http": "int?",
+                 "images": "int"},
+    "run": {"skill": "name", "request_id": "reqid", "http": "int", "images": "int", "image_bytes": "int"},
+    "agent": {"skill": "name", "request_id": "reqid", "http": "int", "envelope_status": "token?"},
+}
+
+
+def make_record(trace_id, span_id, parent_span_id, agent, kind, name, start, t0, status, attrs, now=None):
+    """One finished span (tracing spec TR4). agent None gives the /spans form, without "agent".
+
+    start is round(time.time(), 3) at the span's start; t0 is time.monotonic() then, so
+    dur_ms is immune to wall-clock steps. now (a monotonic time) is for tests.
+    """
+    end = time.monotonic() if now is None else now
+    record = {"v": TRACE_RECORD_VERSION, "trace_id": trace_id, "span_id": span_id,
+              "parent_span_id": parent_span_id, "kind": kind, "name": name, "start": start,
+              "dur_ms": max(0, int(round((end - t0) * 1000))), "status": status, "attrs": attrs}
+    if agent is not None:
+        record["agent"] = agent
+    return record
+
+
+def _trace_attr_ok(kind, value):
+    if kind.endswith("?"):
+        if value is None:
+            return True
+        kind = kind[:-1]
+    if kind == "int":
+        return _is_int(value) and 0 <= value <= TRACE_COUNT_MAX
+    if kind == "bool":
+        return isinstance(value, bool)
+    if not isinstance(value, str):
+        return False
+    if kind == "text":
+        return len(value) <= TRACE_TEXT_CHARS and _TRACE_TEXT_BAD_RE.search(value) is None
+    regex = {"token": TRACE_TOKEN_RE, "name": TRACE_NAME_RE, "agent": HOST_ID_RE, "reqid": REQUEST_ID_RE}[kind]
+    return regex.fullmatch(value) is not None
+
+
+def trace_record_error(rec, posted=False):
+    """None for a valid trace record, else the name of its first bad field (tracing spec TR4).
+
+    posted=True checks the /spans form: no "agent", and only TRACE_POSTED_KINDS. Never raises;
+    the result never contains any part of rec.
+    """
+    try:
+        if not isinstance(rec, dict):
+            return "record"
+        if set(rec) != (_TRACE_KEYS - {"agent"} if posted else _TRACE_KEYS):
+            return "keys"
+        if not (_is_int(rec["v"]) and rec["v"] == TRACE_RECORD_VERSION):
+            return "v"
+        if not valid_trace_id(rec["trace_id"]):
+            return "trace_id"
+        if not valid_span_id(rec["span_id"]):
+            return "span_id"
+        parent = rec["parent_span_id"]
+        if parent is not None and not (valid_span_id(parent) and parent != rec["span_id"]):
+            return "parent_span_id"
+        if not posted and not (isinstance(rec["agent"], str) and HOST_ID_RE.fullmatch(rec["agent"])):
+            return "agent"
+        if not (isinstance(rec["kind"], str) and rec["kind"] in (TRACE_POSTED_KINDS if posted else TRACE_KINDS)):
+            return "kind"
+        if not (isinstance(rec["name"], str) and TRACE_NAME_RE.fullmatch(rec["name"])):
+            return "name"
+        start = rec["start"]
+        if not ((_is_int(start) or isinstance(start, float)) and 0 <= start < 10 ** 11):
+            return "start"
+        if not (_is_int(rec["dur_ms"]) and 0 <= rec["dur_ms"] <= TRACE_DUR_MAX_MS):
+            return "dur_ms"
+        if not (isinstance(rec["status"], str) and TRACE_TOKEN_RE.fullmatch(rec["status"])):
+            return "status"
+        schema = _TRACE_ATTRS[rec["kind"]]
+        attrs = rec["attrs"]
+        if not (isinstance(attrs, dict) and set(attrs) == set(schema)):
+            return "attrs"
+        for key in sorted(schema):
+            if not _trace_attr_ok(schema[key], attrs[key]):
+                return "attrs." + key
+        return None
+    except Exception:
+        return "record"
+
+
+def trace_name(value):
+    """value when it is a valid span name, else "unknown"."""
+    return value if isinstance(value, str) and TRACE_NAME_RE.fullmatch(value) else "unknown"
+
+
+def trace_skill(value):
+    """A skill for a span: a KNOWN_SKILLS member, else "unknown" (a /run body's skill is unchecked text)."""
+    return value if isinstance(value, str) and value in KNOWN_SKILLS else "unknown"
+
+
+def trace_token(value):
+    """value when it matches TRACE_TOKEN_RE, else None (envelope statuses, finish_reason)."""
+    return value if isinstance(value, str) and TRACE_TOKEN_RE.fullmatch(value) else None
+
+
+def trace_count(value):
+    """value when it is an int attribute (usage token counts), else None."""
+    return value if _is_int(value) and 0 <= value <= TRACE_COUNT_MAX else None
+
+
+def run_status(http, envelope_status):
+    """The status of a run span (tracing spec TR4)."""
+    if http == 200 and envelope_status == "ok":
+        return "ok"
+    return "busy" if http == 409 else "error"
