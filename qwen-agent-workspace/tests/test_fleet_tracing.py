@@ -389,9 +389,11 @@ def test_trt48_run_child_gets_the_agent_span_as_its_parent(tmp_path):
 class _OldPeer(object):
     """An in-process registered peer 'delta' from before tracing: its /run answers a body with
     a "trace" key with a signed 400 {"error": "bad request"} and any other body with the canned
-    envelope; GET /trace/<id> is an unknown route (signed 404 {"error": "not found"})."""
+    envelope; GET /trace/<id> is an unknown route (signed 404 {"error": "not found"}).
+    answer="other" answers a traced body with a signed 400 {"error": "other"}, "unsigned" with an
+    unsigned 400 {"error": "bad request"} (neither may trigger the retry)."""
 
-    def __init__(self, port):
+    def __init__(self, port, answer="old"):
         self.run_bodies = []
         outer = self
 
@@ -401,10 +403,10 @@ class _OldPeer(object):
             def log_message(self, *args):
                 pass
 
-            def _reply(self, status, raw):
+            def _reply(self, status, raw, sign=True):
                 headers = fleet_lib.sign_response(ftu.TEST_KEY, status, self.command, self.path,
                                                   self.headers.get("X-Fleet-Nonce"), raw,
-                                                  int(time.time()), os.urandom(16).hex())
+                                                  int(time.time()), os.urandom(16).hex()) if sign else {}
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(raw)))
                 for name, value in headers.items():
@@ -427,7 +429,8 @@ class _OldPeer(object):
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
                 outer.run_bodies.append(body)
                 if "trace" in body:
-                    self._reply(400, fleet_lib.canonical_json({"error": "bad request"}))
+                    self._reply(400, fleet_lib.canonical_json({"error": "other" if answer == "other" else "bad request"}),
+                                sign=answer != "unsigned")
                 else:
                     self._reply(200, ftu.CANNED_LINE.encode("utf-8"))
 
@@ -470,6 +473,43 @@ def test_trt43_old_peer_gets_one_untraced_retry_and_shows_as_no_trace_support(tm
             delegate["attrs"]["request_id"])) and lines[3].endswith("  ok  @alpha")
     finally:
         delta.close()
+
+
+@pytest.mark.parametrize("answer, outcome", [("other", "peer_error"), ("unsigned", "bad_signature")])
+def test_tr25_no_retry_for_another_400_body_or_an_unsigned_400(tmp_path, answer, outcome):
+    delta_port = ftu.free_port()
+    fleet = ftu.Fleet(tmp_path, names=("alpha",), extra_hosts={"delta": {
+        "port": delta_port, "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+        "model": "delta-model", "skills": ["researcher"]}})
+    delta = _OldPeer(delta_port, answer)
+    try:
+        fleet.start()
+        ftu.send_beacon(ftu.TEST_KEY, delta_port, fleet.beacon_ports["alpha"])
+        ftu.wait_until(lambda: "delta" in fleet.peer_ids("alpha"), 3.0)
+        status, body = ftu.delegate(fleet.ports["alpha"], "researcher", "t", "delta",
+                                    trace={"trace_id": T, "parent_span_id": P})
+        assert status == 200 and body["outcome"] == outcome, body
+        assert len(delta.run_bodies) == 1 and "trace" in delta.run_bodies[0]
+        [delegate] = _of_kind(ftu.read_records(fleet.homes["alpha"], "alpha"), "delegate")
+        assert (delegate["status"], delegate["attrs"]["http"]) == (outcome, 400)
+    finally:
+        delta.close()
+
+
+def test_tr24_a_not_live_delegation_records_a_delegate_span(tmp_path):
+    fleet = _alpha(tmp_path)
+    port, home = fleet.ports["alpha"], fleet.homes["alpha"]
+    assert ftu.delegate(port, "researcher", "t", "bravo", trace={"trace_id": T, "parent_span_id": P}) == \
+        (200, {"outcome": "not_live", "envelope": None, "detail": ""})
+    assert ftu.delegate(port, "analyst", "t", "alpha")[1]["outcome"] == "not_live"
+    traced, untraced = ftu.read_records(home, "alpha")
+    assert (traced["trace_id"], traced["parent_span_id"], traced["kind"], traced["name"], traced["status"]) == \
+        (T, P, "delegate", "researcher", "not_live")
+    assert traced["attrs"] == {"skill": "researcher", "target": "bravo", "request_id": None, "http": None,
+                               "images": 0}
+    assert untraced["trace_id"] != T and untraced["parent_span_id"] is None
+    assert (untraced["status"], untraced["attrs"]["target"]) == ("not_live", "alpha")
+    assert [e["trace_id"] for e in ftu.recent(port)[1]["traces"]] == [untraced["trace_id"]]
 
 
 def test_tracing_focus_5_a_crashed_child_still_leaves_run_and_agent_spans(tmp_path):
