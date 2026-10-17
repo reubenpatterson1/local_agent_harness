@@ -92,12 +92,42 @@ def cmd_join(args):
     if message is not None:
         _err(message)
         return 2
+    if args.from_agent is not None:
+        return _join_from_agent(host_id, args.from_agent, args.string)
     raw = args.string if args.string is not None else getpass.getpass("join string: ")
     try:
         fleet_id, token = fleet_lib.parse_join_string(raw)
     except fleet_lib.FleetEnvError:
         _err("qwen-agentd: invalid join string")
         return 2
+    return _save_join(host_id, fleet_id, token, "")
+
+
+def _join_from_agent(host_id, source_id, string):
+    """join --from-agent: copy agent source_id's secret to host_id, never printing it (multi-agent spec M29)."""
+    if string is not None:
+        _err("qwen-agentd: join takes STRING or --from-agent, not both")
+        return 2
+    if not fleet_lib.HOST_ID_RE.fullmatch(source_id):
+        _err("qwen-agentd: invalid --from-agent '%s'" % source_id)
+        return 2
+    if source_id == host_id:
+        _err("qwen-agentd: --from-agent names agent '%s' itself" % host_id)
+        return 2
+    source = fleet_lib.fleet_env_path(source_id)
+    try:
+        fleet_id, token = fleet_lib.load_fleet_env(source)
+    except FileNotFoundError:
+        _err("qwen-agentd: %s not found; agent '%s' has not joined a fleet" % (source, source_id))
+        return 2
+    except fleet_lib.FleetEnvError as e:
+        _err("qwen-agentd: %s" % e)
+        return 2
+    return _save_join(host_id, fleet_id, token, " (copied from agent %s)" % source_id)
+
+
+def _save_join(host_id, fleet_id, token, suffix):
+    """F26 steps 3-4 for both join forms: never overwrite; the same fleet is exit 0 (multi-agent spec M28, M29)."""
     path = fleet_lib.fleet_env_path(host_id)
     if os.path.lexists(path):
         try:
@@ -110,7 +140,7 @@ def cmd_join(args):
         _err("qwen-agentd: %s exists for a different fleet; remove it first" % path)
         return 2
     fleet_lib.write_fleet_env(path, fleet_id, token)
-    print("qwen-agentd: joined fleet %s" % fleet_id)
+    print("qwen-agentd: joined fleet %s%s" % (fleet_id, suffix))
     return 0
 
 
@@ -1371,6 +1401,7 @@ def _build_parser():
     p.set_defaults(func=cmd_init_fleet)
     p = sub.add_parser("join", help="join an existing fleet (prompts when STRING is omitted)")
     _add_agent_id(p)
+    p.add_argument("--from-agent", dest="from_agent", default=None, metavar="ID")
     p.add_argument("string", nargs="?", default=None, metavar="STRING")
     p.set_defaults(func=cmd_join)
     p = sub.add_parser("selftest", help="run this release's fleet unit tests (the update gate)")

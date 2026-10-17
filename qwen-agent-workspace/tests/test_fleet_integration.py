@@ -834,3 +834,65 @@ def test_mt12_status_update_line_agent(tmp_path):
     proc = _run_agentd(daemon.home, ["status", "--port", str(daemon.port)])
     assert proc.returncode == 1
     assert proc.stdout == "daemon: not reachable at %s\nupdate: not installed\n" % daemon.url
+
+
+# --- multi-agent hosts: join --from-agent (M29, M36) -------------------------------------
+
+def _no_token_in(token, *texts):
+    """True when no text contains the token or any 16-character substring of it."""
+    pieces = [token[i:i + 16] for i in range(len(token) - 15)]
+    return not any(p in t for t in texts for p in pieces)
+
+
+def test_mt13_join_from_agent(agentd, capsys, monkeypatch, tmp_path):
+    def no_prompt(prompt):
+        raise AssertionError("join prompted for the secret")
+    monkeypatch.setattr(agentd.getpass, "getpass", no_prompt)
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 0
+    capsys.readouterr()
+    fid, token = fleet_lib.load_fleet_env(fleet_lib.fleet_env_path("alpha"))
+    assert agentd.main(["join", "--agent-id", "bravo", "--from-agent", "alpha"]) == 0
+    out, err = capsys.readouterr()
+    assert (out, err) == ("qwen-agentd: joined fleet %s (copied from agent alpha)\n" % fid, "")
+    assert _no_token_in(token, out, err)
+    bravo = fleet_lib.fleet_env_path("bravo")
+    with open(fleet_lib.fleet_env_path("alpha"), "rb") as fa, open(bravo, "rb") as fb:
+        assert fa.read() == fb.read()
+    assert stat.S_IMODE(os.stat(bravo).st_mode) == 0o600
+    assert not os.path.lexists(bravo + ".tmp")
+    assert agentd.main(["join", "--agent-id", "bravo", "--from-agent", "alpha"]) == 0
+    assert capsys.readouterr() == ("qwen-agentd: already joined fleet %s\n" % fid, "")
+    s = fleet_lib.make_join_string(fid, token)
+    for argv, message in (
+            (["--agent-id", "alpha", "--from-agent", "alpha"], "qwen-agentd: --from-agent names agent 'alpha' itself"),
+            (["--agent-id", "carol", "--from-agent", "dave"],
+             "qwen-agentd: %s not found; agent 'dave' has not joined a fleet" % fleet_lib.fleet_env_path("dave")),
+            (["--agent-id", "carol", "--from-agent", "Bad_Id"], "qwen-agentd: invalid --from-agent 'Bad_Id'"),
+            (["--agent-id", "carol", "--from-agent", "alpha", s],
+             "qwen-agentd: join takes STRING or --from-agent, not both")):
+        assert agentd.main(["join"] + argv) == 2, argv
+        out, err = capsys.readouterr()
+        assert (out, err) == ("", message + "\n"), argv
+        assert _no_token_in(token, out, err)
+    assert not os.path.lexists(fleet_lib.deploy_root("carol"))
+    os.unlink(bravo)
+    fleet_lib.write_fleet_env(bravo, ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
+    assert agentd.main(["join", "--agent-id", "bravo", "--from-agent", "alpha"]) == 2
+    assert capsys.readouterr() == ("", "qwen-agentd: %s exists for a different fleet; remove it first\n" % bravo)
+    assert fleet_lib.load_fleet_env(bravo) == (ftu.OTHER_FLEET_ID, ftu.OTHER_TOKEN)
+
+
+def test_multi_agent_focus_5_from_agent_with_a_loose_secret_file(agentd, capsys, tmp_path):
+    """Multi-agent Review Focus 5: the source agent's fleet.env was copied around and is now mode 0644.
+    join --from-agent refuses with F21's chmod hint, writes nothing for the target agent,
+    and prints no part of the token."""
+    assert agentd.main(["init-fleet", "--agent-id", "alpha"]) == 0
+    capsys.readouterr()
+    source = fleet_lib.fleet_env_path("alpha")
+    _fid, token = fleet_lib.load_fleet_env(source)
+    os.chmod(source, 0o644)
+    assert agentd.main(["join", "--agent-id", "bravo", "--from-agent", "alpha"]) == 2
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "qwen-agentd: %s must be mode 0600 (chmod 600 %s)\n" % (source, source))
+    assert _no_token_in(token, out, err)
+    assert not os.path.lexists(fleet_lib.deploy_root("bravo"))
