@@ -544,6 +544,17 @@ def test_trt26_slash_trace(qa, monkeypatch, tmp_path):
     assert qa.TRACE_RING == []
 
 
+def test_tr47_ctrl_c_during_a_trace_query_keeps_the_repl(qa, monkeypatch, tmp_path):
+    _state(qa, monkeypatch, tmp_path, _closed_url())
+
+    def interrupted(daemon_url, trace_id):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(qa.FLEET, "fetch_trace", interrupted)
+    out = _repl(qa, monkeypatch, ["hello", "/trace", "/trace " + T, "/trace 1"])
+    assert out == "hi 2\n" + "trace query cancelled\n" * 3 + "\n"
+
+
 def test_tracing_focus_3_an_interrupted_repl_turn_is_still_traced(qa, monkeypatch, tmp_path):
     """Review Focus 3: Ctrl-C while the model is answering a REPL turn. Expected: the turn
     still gets a trace (its model span and turn span say "interrupted"), the next turn gets a

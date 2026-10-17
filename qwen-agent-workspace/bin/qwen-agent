@@ -2552,7 +2552,10 @@ def slash_trace(raw):
         trace_id = arg
     else:
         return [TRACE_USAGE]
-    result, error = FLEET.fetch_trace(FLEET_DAEMON_URL, trace_id)
+    try:
+        result, error = FLEET.fetch_trace(FLEET_DAEMON_URL, trace_id)
+    except KeyboardInterrupt:
+        return ["trace query cancelled"]
     if error is not None:
         return [error]
     lines = FLEET.render_trace(result)
