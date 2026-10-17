@@ -513,3 +513,221 @@ def test_tracing_focus_5_a_crashed_child_still_leaves_run_and_agent_spans(tmp_pa
     count = len(records)
     assert _signed_run(port, run_body("x", "req-4", {"trace_id": T})) == (400, b'{"error":"bad request"}')
     assert len(ftu.read_records(home, "bravo")) == count
+
+
+# --- the chain: three daemons and the real harness end to end (TR17, TR22-TR27, TR42-TR45, TR50) ---
+
+CHAIN_ANSWER = "ALPHA-ANSWER | BRAVO-ANSWER | CHARLIE-ANSWER"
+
+
+def _chain(tmp_path, prompt="go", tasks=("stub task", "stub task"), before_start=None):
+    """alpha's real harness delegates investigator to bravo, whose child delegates analyst to
+    charlie (tracing spec 6.5) -> (fleet, harness CompletedProcess, the newest trace ID on
+    alpha or None)."""
+    fleet = ftu.Fleet(tmp_path, skills={"bravo": ["investigator"]},
+                      stub_kwargs={"alpha": {"delegate_skill": "investigator", "delegate_task": tasks[0]},
+                                   "bravo": {"delegate_skill": "analyst", "delegate_task": tasks[1]}})
+    if before_start is not None:
+        before_start(fleet)
+    fleet.start()
+    ftu.wait_until(fleet.all_see_each_other, 4.5)
+    proc = _harness(fleet, tmp_path, prompt)
+    return fleet, proc, _newest(fleet)
+
+
+def _harness(fleet, tmp_path, prompt="go"):
+    """The real bin/qwen-agent one-shot on alpha's stub, routed through alpha's daemon."""
+    home = tmp_path / "caller"
+    home.mkdir(exist_ok=True)
+    env = ftu.clean_env(home, QWEN_AGENT_DAEMON_URL=fleet.daemons["alpha"].url)
+    return subprocess.run([sys.executable, ftu.QWEN_AGENT, "--user-prompt=" + prompt,
+                           "--base-url=%s" % fleet.stubs["alpha"].url, "--model=alpha-model"],
+                          env=env, capture_output=True, text=True, timeout=180)
+
+
+def _newest(fleet):
+    status, listed = ftu.recent(fleet.ports["alpha"])
+    if status != 200 or not listed["traces"]:
+        return None
+    return listed["traces"][0]["trace_id"]
+
+
+def _depth(line):
+    return (len(line) - len(line.lstrip(" "))) // 2
+
+
+_CHAIN_SHAPE = [
+    (0, r"turn oneshot  \S+  ok  rounds=2  tools=1  @alpha"),
+    (1, r"model alpha-model  \S+  ok  1→1 tok  tool_calls  @alpha"),
+    (1, r"tool delegate_to_skill  skill=investigator  \S+  ok  -> ok, \d+ characters  @alpha"),
+    (2, r"delegate investigator -> bravo  req=(?P<r1>[0-9a-f]{16})  http=200  \S+  ok  @alpha"),
+    (3, r"run investigator  req=(?P<r1b>[0-9a-f]{16})  http=200  \S+  ok  @bravo"),
+    (4, r"agent investigator  req=[0-9a-f]{16}  http=200  \S+  ok  @bravo"),
+    (5, r"model bravo-model  \S+  ok  1→1 tok  tool_calls  @bravo"),
+    (5, r"tool delegate_to_skill  skill=analyst  \S+  ok  -> ok, \d+ characters  @bravo"),
+    (6, r"delegate analyst -> charlie  req=(?P<r2>[0-9a-f]{16})  http=200  \S+  ok  @bravo"),
+    (7, r"run analyst  req=(?P<r2b>[0-9a-f]{16})  http=200  \S+  ok  @charlie"),
+    (8, r"agent analyst  req=[0-9a-f]{16}  http=200  \S+  ok  @charlie"),
+    (9, r"model charlie-model  \S+  ok  1→1 tok  stop  @charlie"),
+    (5, r"model bravo-model  \S+  ok  1→1 tok  stop  @bravo"),
+    (1, r"model alpha-model  \S+  ok  1→1 tok  stop  @alpha"),
+]
+
+
+# The _CHAIN_SHAPE indices in printed order. A model call and the tool call it returned can
+# start in the same millisecond (starts are rounded to 1 ms, TR4); TR17 then orders those two
+# siblings by span_id, so the tool's subtree may print before the first model line, on alpha
+# (index 1 after 12) or on bravo (index 6 after 11), or both.
+_CHAIN_ORDERS = [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+                 [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 13],
+                 [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 6, 12, 13],
+                 [0, 2, 3, 4, 5, 7, 8, 9, 10, 11, 6, 12, 1, 13]]
+
+
+def test_trt40_one_connected_tree_across_three_agents(tmp_path):
+    fleet, proc, trace_id = _chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1])["answer"] == CHAIN_ANSWER
+    home, alpha = fleet.homes["alpha"], fleet.ports["alpha"]
+    cli = ftu.trace_cli(home, ["--port", str(alpha), trace_id])
+    assert cli.returncode == 0, cli.stderr
+    lines = cli.stdout.splitlines()
+    assert re.fullmatch(r"trace %s  \S+ \S+  \S+  agents: alpha, bravo, charlie  spans: 14" % trace_id[:12],
+                        lines[0]), lines[0]
+    assert len(lines) == 15 and not any(line.startswith(("!", "…", "(truncated")) for line in lines)
+    ids, order = {}, []
+    for line in lines[1:]:
+        hits = [n for n, (depth, pattern) in enumerate(_CHAIN_SHAPE)
+                if depth == _depth(line) and re.fullmatch(pattern, line.strip()) and n not in order]
+        assert hits, line
+        order.append(hits[0])
+        ids.update(re.fullmatch(_CHAIN_SHAPE[hits[0]][1], line.strip()).groupdict())
+    assert order in _CHAIN_ORDERS, order
+    assert ids["r1"] == ids["r1b"] and ids["r2"] == ids["r2b"]
+    assert [_depth(line) for line in lines[1:]].count(0) == 1
+    assert "run start skill=investigator request_id=%s task_chars=9 " % ids["r1"] in fleet.daemons["bravo"].log()
+    assert "delegate skill=investigator host=bravo request_id=%s outcome=ok" % ids["r1"] in \
+        fleet.daemons["alpha"].log()
+    cli = ftu.trace_cli(home, ["--port", str(alpha), "--json", trace_id])
+    result = json.loads(cli.stdout)
+    assert cli.returncode == 0 and len(result["records"]) == 14
+    spans = set(r["span_id"] for r in result["records"])
+    assert all(r["parent_span_id"] in spans for r in result["records"] if r["parent_span_id"] is not None)
+    assert [r["kind"] for r in result["records"]].count("turn") == 1
+    assert (result["missing"], result["truncated"]) == ([], [])
+
+
+def test_trt41b_recent_lists_the_chain_runs(tmp_path):
+    fleet, proc, first = _chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    proc = _harness(fleet, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    second = _newest(fleet)
+    assert second != first
+    home, alpha = fleet.homes["alpha"], str(fleet.ports["alpha"])
+    cli = ftu.trace_cli(home, ["--port", alpha, "--recent"])
+    lines = cli.stdout.splitlines()
+    assert cli.returncode == 0 and len(lines) == 3
+    assert lines[0] == "time                 trace id                               dur  status        spans  delegated"
+    assert [line.split()[2] for line in lines[1:]] == [second, first]
+    for line in lines[1:]:
+        assert line.split()[4:] == ["ok", "5", "investigator@bravo"], line
+    cli = ftu.trace_cli(home, ["--port", alpha, "--recent", "1"])
+    assert cli.returncode == 0 and cli.stdout.splitlines()[1:] == lines[1:2]
+    cli = ftu.trace_cli(fleet.homes["bravo"], ["--port", str(fleet.ports["bravo"]), "--recent"])
+    assert (cli.returncode, cli.stderr) == (1, "qwen-agentd: no traces recorded on bravo\n")
+
+
+def _stopped_peer_lines(cli, d_span):
+    assert cli.returncode == 0, cli.stderr
+    lines = cli.stdout.splitlines()
+    assert "! bravo: unreachable (connection refused)" in lines
+    i = lines.index("… span %s on bravo (not retrieved)" % d_span)
+    assert re.fullmatch(r"  run analyst  req=[0-9a-f]{16}  http=200  \S+  ok  @charlie", lines[i + 1])
+    assert re.fullmatch(r"    agent analyst  req=[0-9a-f]{16}  http=200  \S+  ok  @charlie", lines[i + 2])
+    assert re.fullmatch(r"      model charlie-model  \S+  ok  1→1 tok  stop  @charlie", lines[i + 3])
+    [k] = [n for n, line in enumerate(lines) if line.startswith("    delegate investigator -> bravo")]
+    assert _depth(lines[k + 1]) <= 2
+
+
+def test_trt42_a_stopped_peer_leaves_a_partial_tree(tmp_path):
+    fleet, proc, trace_id = _chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    home, alpha = fleet.homes["alpha"], str(fleet.ports["alpha"])
+    result = json.loads(ftu.trace_cli(home, ["--port", alpha, "--json", trace_id]).stdout)
+    [d_span] = [r["span_id"] for r in result["records"] if r["kind"] == "delegate" and r["agent"] == "bravo"]
+    fleet.daemons["bravo"].kill()
+    assert "bravo" in fleet.peer_ids("alpha")
+    _stopped_peer_lines(ftu.trace_cli(home, ["--port", alpha, trace_id]), d_span)
+    ftu.wait_until(lambda: "bravo" not in fleet.peer_ids("alpha"), 15)
+    _stopped_peer_lines(ftu.trace_cli(home, ["--port", alpha, trace_id]), d_span)
+
+
+def test_trt47_no_prompt_task_answer_image_or_secret_reaches_traces_or_logs(tmp_path):
+    fleet, proc, trace_id = _chain(tmp_path / "chain", prompt="go TRSENTINEL-PROMPT",
+                                   tasks=("TRSENTINEL-TASK-A", "TRSENTINEL-TASK-B"))
+    assert proc.returncode == 0, proc.stderr
+    home, alpha = fleet.homes["alpha"], str(fleet.ports["alpha"])
+    blobs = [json.dumps(ftu.trace(fleet.ports["alpha"], trace_id)[1]).encode(),
+             json.dumps(ftu.recent(fleet.ports["alpha"])[1]).encode()]
+    for args in ([trace_id], ["--json", trace_id], ["--recent"]):
+        cli = ftu.trace_cli(home, ["--port", alpha] + args)
+        assert cli.returncode == 0
+        blobs.append(cli.stdout.encode("utf-8"))
+    stderr_blobs = []
+    for name in fleet.names:
+        log_dir = ftu.daemon_log_dir(fleet.homes[name], name)
+        for entry in os.listdir(log_dir):
+            with open(os.path.join(log_dir, entry), "rb") as f:
+                (stderr_blobs if entry == "last-run.stderr" else blobs).append(f.read())
+    assert len(ftu.trace_files(home, "alpha")) == 1 and stderr_blobs
+    for blob in blobs:
+        for needle in (b"TRSENTINEL", b"ALPHA-ANSWER", b"BRAVO-ANSWER", b"CHARLIE-ANSWER"):
+            assert needle not in blob, needle
+    secrets = (ftu.TEST_TOKEN.encode("ascii"), ftu.TEST_KEY,
+               fleet_lib.make_join_string(ftu.TEST_FLEET_ID, ftu.TEST_TOKEN).encode("ascii"))
+    for blob in blobs + stderr_blobs:
+        for needle in secrets:
+            assert needle not in blob
+
+    vision = ftu.Fleet(tmp_path / "vision", names=("alpha", "bravo"), skills={"bravo": ["vision"]},
+                       stub_kwargs={"alpha": {"delegate_skill": "vision",
+                                              "delegate_images": ["a.png", "b.jpg"]}}).start()
+    ftu.wait_until(lambda: fleet_lib.route_candidates("vision", vision.view("alpha")) == ["bravo"], 4.5)
+    caller = tmp_path / "vision" / "caller"
+    ws = caller / "ws"
+    ws.mkdir(parents=True)
+    (ws / "a.png").write_bytes(ftu.PNG_BYTES)
+    (ws / "b.jpg").write_bytes(ftu.JPEG_BYTES)
+    env = ftu.clean_env(caller, QWEN_AGENT_DAEMON_URL=vision.daemons["alpha"].url)
+    proc = subprocess.run([sys.executable, ftu.QWEN_AGENT, "--user-prompt=go", "--workspace=%s" % ws,
+                           "--base-url=%s" % vision.stubs["alpha"].url, "--model=alpha-model"],
+                          env=env, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    needles = [ftu.PNG_BYTES, ftu.JPEG_BYTES]
+    for data in (ftu.PNG_BYTES, ftu.JPEG_BYTES):
+        needles.append(base64.b64encode(data)[:40])
+    for name in vision.names:
+        paths = ftu.trace_files(vision.homes[name], name)
+        assert paths, name
+        for path in paths:
+            with open(path, "rb") as f:
+                blob = f.read()
+            for needle in needles:
+                assert needle not in blob, (path, needle[:12])
+    keys = [r["attrs"]["key"] for r in ftu.read_records(vision.homes["alpha"], "alpha") if r["kind"] == "tool"]
+    assert keys == ["skill=vision images=2"]
+
+
+def test_trt49_an_unwritable_store_never_changes_a_run(tmp_path):
+    def store_is_a_directory(fleet):
+        os.makedirs(os.path.join(ftu.daemon_log_dir(fleet.homes["alpha"], "alpha"), "trace.jsonl"))
+
+    fleet, proc, trace_id = _chain(tmp_path, before_start=store_is_a_directory)
+    assert proc.returncode == 0, proc.stderr
+    envelope = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert (envelope["status"], envelope["answer"]) == ("ok", CHAIN_ANSWER)
+    assert trace_id is None
+    assert _post_span(fleet.ports["alpha"], _span()) == (200, b'{"ok":true}')
+    assert fleet.daemons["alpha"].log().count("trace: cannot write ") == 1
+    assert [r["kind"] for r in ftu.read_records(fleet.homes["bravo"], "bravo")].count("run") == 1
