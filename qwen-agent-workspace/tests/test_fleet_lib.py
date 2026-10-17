@@ -2026,10 +2026,20 @@ def test_trt9_store_rotation_modes_query_and_concurrency(tmp_path):
         records, truncated = store.query(trace_id)
         assert truncated is False
         assert records == [r for r in kept if r["trace_id"] == trace_id] and records
+    needle = ('"trace_id":"%s"' % TR_TRACES[0]).encode("ascii")
+    whole = fleet_lib.canonical_json(_tr_span(TR_TRACES[0]))
+    torn = whole[:whole.index(needle) + len(needle) + 3]
+    invalid = fleet_lib.canonical_json(dict(_tr_span(TR_TRACES[0]), status="BAD"))
+    bad_root = fleet_lib.canonical_json(dict(_tr_span("4" * 32, "turn", None, name="repl"), status="BAD"))
+    torn_root = fleet_lib.canonical_json(_tr_span("6" * 32, "turn", None, name="repl"))[:-20]
+    assert needle in torn and needle in invalid
     with open(base + ".2", "ab") as f:
-        f.write(b"garbage line\n" + fleet_lib.canonical_json(appended[-1])[:40] + b"\n")
+        f.write(b"\n".join((b"garbage line", torn, invalid, bad_root, torn_root)) + b"\n")
     records, _truncated = store.query(TR_TRACES[0])
     assert records == [r for r in kept if r["trace_id"] == TR_TRACES[0]]
+    store.append(_tr_span("5" * 32, "turn", None, 1760000500.0, name="repl"))
+    assert store.recent(10) == [{"trace_id": "5" * 32, "start": 1760000500.0, "dur_ms": 1000, "status": "ok",
+                                 "kind": "turn", "name": "repl", "spans": 1, "delegated": []}]
     before = [(n, os.path.getsize(os.path.join(str(tmp_path), n))) for n in sorted(os.listdir(str(tmp_path)))]
     with pytest.raises(ValueError) as e:
         store.append(dict(appended[0], status="OK"))
@@ -2049,9 +2059,30 @@ def test_trt9_store_rotation_modes_query_and_concurrency(tmp_path):
         t.start()
     for t in threads:
         t.join(60)
+    assert not any(t.is_alive() for t in threads)
     lines = _tr_lines(str(other / "trace.jsonl"))
     assert len(lines) == 1600
     assert all(fleet_lib.trace_record_error(json.loads(line)) is None for line in lines)
+
+    rotating = tmp_path / "rotating"
+    rotating.mkdir()
+    small = fleet_lib.TraceStore(str(rotating), max_bytes=2000)
+
+    def small_writer(k):
+        for i in range(50):
+            small.append(_tr_span(TR_TRACES[k % 3], start=1760000000.0 + i))
+
+    threads = [threading.Thread(target=small_writer, args=(k,)) for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert not any(t.is_alive() for t in threads)
+    names = sorted(os.listdir(str(rotating)))
+    assert names == ["trace.jsonl", "trace.jsonl.1", "trace.jsonl.2", "trace.jsonl.3"]
+    assert all(os.path.getsize(str(rotating / n)) <= 2000 for n in names)
+    lines = [line for n in names for line in _tr_lines(str(rotating / n))]
+    assert lines and all(fleet_lib.trace_record_error(json.loads(line)) is None for line in lines)
 
 
 def test_trt10_query_caps(tmp_path):
@@ -2198,6 +2229,39 @@ def test_trt8_orphans_warnings_cycles_and_depth():
         parent = span
     lines = fleet_lib.render_trace(_tr_result(chain), localtime=time.gmtime)
     assert len(lines) == 3001 and lines[-1].startswith("  " * 2999 + "model ")
+
+
+def test_trt8b_render_escapes_controls_bidi_and_line_separators():
+    records = _tr_example()
+    text = "x\u009b2J\u202eevil\u2028y\u2069z\u0085"
+    shown = "x\\u009b2J\\u202eevil\\u2028y\\u2069z\\u0085"
+    tool = dict(records[2], attrs=dict(records[2]["attrs"], key=text, outcome=text))
+    assert fleet_lib.trace_record_error(tool) is None
+    lines = fleet_lib.render_trace(_tr_result([records[0], tool], [{"agent": "b\u202ex", "reason": "r\x1b[31m\u2029"}],
+                                              [{"agent": "c\u0085", "count": 3}]), localtime=time.gmtime)
+    assert lines[1:5] == ["! b\\u202ex: r\\u001b[31m\\u2029", "(truncated: c\\u0085 returned the first 3 records)",
+                          _TR16_LINES[1], "  tool delegate_to_skill  %s  8.6s  ok  -> %s  @mac-local" % (shown, shown)]
+    assert tool["attrs"]["key"] == text
+    no_delegate = [r for r in records if r["kind"] != "delegate"]
+    lines = fleet_lib.render_trace(_tr_result(no_delegate, [{"agent": "b\u202ex", "reason": "x"}]),
+                                   localtime=time.gmtime)
+    assert "… span 1000000000000004 on b\\u202ex (not retrieved)" in lines
+    assert fleet_lib.render_trace(_tr_result(records), localtime=time.gmtime) == _TR16_LINES
+
+
+def test_trt13b_valid_recent_result_bounds_and_hop_shape():
+    entry = {"trace_id": TR_TRACE, "start": 1760000000.5, "dur_ms": 0, "status": "ok", "kind": "turn",
+             "name": "repl", "spans": 0, "delegated": ["researcher@bravo", "analyst@mac-local"]}
+    obj = {"schema": fleet_lib.RECENT_SCHEMA, "agent": "alpha", "traces": [entry]}
+    assert fleet_lib.valid_recent_result(obj)
+    assert fleet_lib.valid_recent_result(dict(obj, traces=[dict(entry, start=0, dur_ms=fleet_lib.TRACE_DUR_MAX_MS)]))
+    for key, value in (("start", 1e20), ("start", float("nan")), ("start", float("inf")), ("start", -1),
+                       ("start", 10 ** 11), ("dur_ms", -1), ("dur_ms", fleet_lib.TRACE_DUR_MAX_MS + 1),
+                       ("spans", -1), ("delegated", ["researcher"]), ("delegated", ["researcher@"]),
+                       ("delegated", ["@bravo"]), ("delegated", ["researcher@Bravo"]),
+                       ("delegated", ["researcher@bravo\x1b[2J"]), ("delegated", ["r e@bravo"]),
+                       ("delegated", [1])):
+        assert not fleet_lib.valid_recent_result(dict(obj, traces=[dict(entry, **{key: value})])), (key, value)
 
 
 def test_trt12_peer_trace_result_and_merge():

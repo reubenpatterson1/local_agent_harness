@@ -1583,6 +1583,14 @@ def valid_trace_result(obj, trace_id):
 _RECENT_KEYS = frozenset(("trace_id", "start", "dur_ms", "status", "kind", "name", "spans", "delegated"))
 
 
+def _valid_hop(value):
+    """True for "<skill>@<host_id>" (a TR12 delegated entry): a span name, "@", a HOST_ID_RE id."""
+    if not isinstance(value, str):
+        return False
+    skill, at, agent = value.rpartition("@")
+    return at == "@" and TRACE_NAME_RE.fullmatch(skill) is not None and HOST_ID_RE.fullmatch(agent) is not None
+
+
 def valid_recent_result(obj):
     """True iff obj is a GET /traces/recent result (tracing spec TR14, TR28). Never raises."""
     try:
@@ -1592,12 +1600,13 @@ def valid_recent_result(obj):
             return False
         for t in obj["traces"]:
             if not (isinstance(t, dict) and set(t) == _RECENT_KEYS and valid_trace_id(t["trace_id"])
-                    and (_is_int(t["start"]) or isinstance(t["start"], float))
-                    and _is_int(t["dur_ms"]) and _is_int(t["spans"])
+                    and (_is_int(t["start"]) or isinstance(t["start"], float)) and 0 <= t["start"] < 10 ** 11
+                    and _is_int(t["dur_ms"]) and 0 <= t["dur_ms"] <= TRACE_DUR_MAX_MS
+                    and _is_int(t["spans"]) and t["spans"] >= 0
                     and isinstance(t["status"], str) and TRACE_TOKEN_RE.fullmatch(t["status"])
                     and isinstance(t["kind"], str) and t["kind"] in TRACE_KINDS
                     and isinstance(t["name"], str) and TRACE_NAME_RE.fullmatch(t["name"])
-                    and isinstance(t["delegated"], list) and all(isinstance(d, str) for d in t["delegated"])):
+                    and isinstance(t["delegated"], list) and all(_valid_hop(d) for d in t["delegated"])):
                 return False
         return True
     except Exception:
@@ -1806,6 +1815,12 @@ def merge_records(records):
 
 _ELLIPSIS = "…"
 _ARROW = "→"
+_TRACE_UNSAFE_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def _printable(text):
+    """text with C0/C1 controls, bidi overrides and line separators shown as \\uXXXX (display only)."""
+    return _TRACE_UNSAFE_RE.sub(lambda m: "\\u%04x" % ord(m.group(0)), text)
 
 
 def fmt_ms(ms):
@@ -1831,7 +1846,8 @@ def _span_line(r):
             r["name"], d, s, "?" if a["prompt_tokens"] is None else a["prompt_tokens"], _ARROW,
             "?" if a["completion_tokens"] is None else a["completion_tokens"], a["finish_reason"] or "-", who)
     if r["kind"] == "tool":
-        return "tool %s  %s  %s  %s  -> %s  %s" % (r["name"], a["key"] or "-", d, s, a["outcome"] or "-", who)
+        return "tool %s  %s  %s  %s  -> %s  %s" % (r["name"], _printable(a["key"] or "-"), d, s,
+                                                   _printable(a["outcome"] or "-"), who)
     if r["kind"] == "delegate":
         return "delegate %s -> %s  req=%s  http=%s  %s  %s  %s" % (
             a["skill"], a["target"], _dash(a["request_id"]), _dash(a["http"]), d, s, who)
@@ -1878,9 +1894,9 @@ def render_trace(result, localtime=time.localtime):
     lines = ["trace %s  %s  %s  agents: %s  spans: %d"
              % (result["trace_id"][:12], when, dur, ", ".join(agents) or "none", len(records))]
     for m in sorted(result["missing"], key=lambda m: (m["agent"], m["reason"])):
-        lines.append("! %s: %s" % (m["agent"], m["reason"]))
+        lines.append("! %s: %s" % (_printable(m["agent"]), _printable(m["reason"])))
     for t in sorted(result["truncated"], key=lambda t: t["agent"]):
-        lines.append("(truncated: %s returned the first %d records)" % (t["agent"], t["count"]))
+        lines.append("(truncated: %s returned the first %d records)" % (_printable(t["agent"]), t["count"]))
     visited = set()
 
     def walk(top, depth):
@@ -1898,7 +1914,7 @@ def render_trace(result, localtime=time.localtime):
         walk(r, 0)
     for parent in sorted(orphans, key=lambda p: order(orphans[p][0])):
         lines.append("%s span %s on %s (not retrieved)"
-                     % (_ELLIPSIS, parent, _placeholder_agent(orphans[parent][0], result["missing"])))
+                     % (_ELLIPSIS, parent, _printable(_placeholder_agent(orphans[parent][0], result["missing"]))))
         for r in orphans[parent]:
             walk(r, 1)
     for r in sorted(records, key=order):
