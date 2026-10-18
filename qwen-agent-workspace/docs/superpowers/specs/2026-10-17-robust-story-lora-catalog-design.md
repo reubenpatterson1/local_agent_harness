@@ -1112,7 +1112,8 @@ Repeatable (`action="append"`, `dest="lora_trigger"`, default None). After the `
 | LCT17 | LC15 | a manifest built without `--catalog-loras` is byte-identical to today's (the B2 golden still matches) |
 | LCT18 | LC16 | `ltx-story-images --dry-run --lora-trigger t`: printed prompts start `t. `; without the flag unchanged |
 | LCT19 | LC17 | render `load_manifest` accepts valid `catalog_loras` and rejects each invalid entry |
-| LCT20 | LC17 | `build_units` order: global, catalog (motion then style), character; catalog dict exact |
+| LCT20 | LC17 | `build_units` order: catalog motion/physics, global, catalog style, character; catalog dict exact |
+| LCT20b | LC17 | a style-first manifest still renders motion/physics first: units and dry-run argv are zz-motion, global, aa-style, character (no sort by id) |
 | LCT21 | LC17 | provenance: catalog entry has `catalog_id` and the file's sha; a manifest without catalog entries yields provenance equal to today's for the same unit (dict equality with a golden built from the old function's output, captured as a literal in the test) |
 | LCT22 | LC17 | sha mismatch -> exit 2 message (dry run and real); duplicates with `--lora` and with a character -> exit 2 |
 | LCT23 | LC17 | `--dry-run` with catalog entries prints `lora: <path> @ 0.7 (<id>)` and the first render command contains one `--lora PATH 0.7` per entry in unit order |
@@ -1200,7 +1201,7 @@ RST60-RST63 above. Additionally `git diff --stat <base>` lists only G1-G14 (and 
 | LC14 | LCT15 | |
 | LC15 | LCT16, LCT17 | |
 | LC16 | LCT18 | |
-| LC17 | LCT19-LCT25, LCT30 | pixels with a real LoRA: RSR3 |
+| LC17 | LCT19-LCT25 (incl. LCT20b), LCT30 | pixels with a real LoRA: RSR3 |
 | LC18 | LCT26 | |
 | LC19 | LCT27 | |
 | LC20 | LCT29 | |
