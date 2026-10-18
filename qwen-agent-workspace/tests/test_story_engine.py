@@ -1853,3 +1853,67 @@ def test_rst56b_n15_in_recheck_and_plan_free_report(ws, monkeypatch, capsys, sto
     assert se.plan_free_report(path, "chained", 3, [], ltx_movie._validate_story_md, ws=ws) == []
     assert se.plan_free_report(path, "chained", 4, [], ltx_movie._validate_story_md, ws=ws) == [
         "expected exactly 4 panels, found 3"]
+
+
+def _plan_path(ctx):
+    return os.path.join(ctx.story_dir, "plan.json")
+
+
+def test_rst44b_recheck_stale_plan_cast_does_not_mask(ws, monkeypatch, capsys, story_env):
+    seu.ronin(story_env["lib"])
+    ctx, text = _saved_story(ws, monkeypatch, mode="shots")
+    plan = _read_json(_plan_path(ctx))
+    plan["cast"].append({"id": "c3", "phrase": "the ronin", "cast_name": "ronin",
+                         "descriptor": "a lean man in a grey kimono"})
+    with open(_plan_path(ctx), "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    _edit_story(ctx, "Narration: He knew the letter could not wait.",
+                "Narration: The ronin knew the letter could not wait.")
+    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    assert " N15 " in capsys.readouterr().err
+
+
+def test_rst44c_recheck_malformed_plan_falls_back(ws, monkeypatch, capsys, story_env):
+    def malform_cast_none(p):
+        p["cast"] = None
+
+    def malform_no_phrase(p):
+        p["cast"].append({"cast_name": "x"})
+
+    def malform_beat(p):
+        del p["beats"][0]["cast"]
+
+    def malform_loras(p):
+        p["loras"] = None
+
+    def malform_locations(p):
+        p["locations"] = "x"
+
+    for i, mutate in enumerate((malform_cast_none, malform_no_phrase, malform_beat,
+                                malform_loras, malform_locations)):
+        ctx, _t = _saved_story(ws, monkeypatch, ctx_kw={"story_id": "m%d" % i})
+        plan = _read_json(_plan_path(ctx))
+        mutate(plan)
+        with open(_plan_path(ctx), "w", encoding="utf-8") as f:
+            json.dump(plan, f)
+        got = se.recheck(ctx, ltx_movie._validate_story_md)
+        got_err = capsys.readouterr().err
+        os.remove(_plan_path(ctx))
+        assert se.recheck(ctx, ltx_movie._validate_story_md) == got
+        assert capsys.readouterr().err == got_err
+
+
+def test_rst44d_recheck_no_plan_enforces_n15(ws, monkeypatch, capsys, story_env):
+    seu.ronin(story_env["lib"])
+    ctx, text = _saved_story(ws, monkeypatch)
+    os.remove(_plan_path(ctx))
+    _edit_story(ctx, "Narration: The rain had not stopped since dawn.\n",
+                "Narration: The ronin watched the rain.\n")
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (2, [])
+    err = capsys.readouterr().err
+    assert " N15 " in err
+    assert err.endswith("ltx-movie: story.md names library characters that were not declared "
+                        "with --character; fix story.md and re-run\n")
+    members = se._character_lib(WS).resolve_cast([(None, "ronin")])
+    declared = seu.make_ctx(se, ws, mode="chained", panels=3, members=members)
+    assert se.recheck(declared, ltx_movie._validate_story_md) == (0, [])

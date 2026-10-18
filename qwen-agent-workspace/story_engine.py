@@ -444,11 +444,14 @@ def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
 def _undeclared_masks(lib, ctx, plan, undeclared):
     """Mask strings for undeclared_references: declared members' name, trigger and phrase, plus each
     plan cast phrase that does not itself name an undeclared character (RS37)."""
+    member_names = {m.name for m in ctx.members}
     masks = [m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
     if plan:
         masks += [e["phrase"] for e in plan["cast"] if isinstance(e.get("phrase"), str)
-                  and (e.get("cast_name") or not undeclared_references(lib, e["phrase"], undeclared,
-                                                                       exact_phrase=True))]
+                  and ((e.get("cast_name") in member_names)
+                       or (not e.get("cast_name")
+                           and not undeclared_references(lib, e["phrase"], undeclared,
+                                                         exact_phrase=True)))]
     return masks
 
 
@@ -2339,6 +2342,19 @@ def plan_free_report(story_md, mode, panels, members, legacy_validate, ws=None):
     return hard
 
 
+def _undeclared_gate(ctx, story_md, legacy_validate, passed):
+    """passed, unless story.md names a library character that was not declared (RS37)."""
+    n15 = [v for v in plan_free_report(story_md, ctx.mode, ctx.panels, ctx.members,
+                                       legacy_validate, ws=ctx.ws) if " N15 " in v]
+    if not n15:
+        return passed
+    for v in n15:
+        print("  - %s" % v, file=sys.stderr)
+    print("ltx-movie: story.md names library characters that were not declared with --character; "
+          "fix story.md and re-run", file=sys.stderr)
+    return 2, []
+
+
 def recheck(ctx, legacy_validate):
     """Re-check an existing story.md instead of regenerating it (RS28). Returns (exit code,
     advisories). legacy_validate is bin/ltx-movie's _validate_story_md."""
@@ -2347,62 +2363,65 @@ def recheck(ctx, legacy_validate):
         print(warning)
     lib = _character_lib(ctx.ws)
     plan = load_plan(ctx)
-    if plan is None:
-        if ctx.mode != "shots":
-            violations = legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")
-            if violations:
-                print("Error: story.md failed validation:", file=sys.stderr)
-                for v in violations:
-                    print("  - %s" % v, file=sys.stderr)
-                print("Hand-edit %s to fix the violations above and rerun; story.md already exists "
-                      "so Phase 1 will be skipped next time (pass --force-story to regenerate it "
-                      "instead)." % story_md, file=sys.stderr)
-                return 1, []
-            return 0, []
+    if plan is not None:
         try:
+            hard = ([] if ctx.mode == "shots"
+                    else list(legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")))
+            advisory = []
             text, parsed = _read_story(ctx, story_md)
-            violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members)
-            advisories = lib.shots_advisories(parsed, ctx.members)
-        except OSError as e:
-            violations, advisories = ["story: cannot read story.md: %s" % e], []
+            undeclared = undeclared_characters(ctx)
+            writers_by_panel = []
+            for k, panel in enumerate(parsed, start=1):
+                fields = story_fields(ctx.mode, k, panel)
+                writers_by_panel.append(dict(fields))
+                h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, dict(fields),
+                                     RECHECK_IDS, undeclared)
+                hard += h
+                advisory += a
+            advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
+            if ctx.mode == "shots":
+                hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+                advisory += lib.shots_advisories(parsed, ctx.members)
+            if ctx.auto_lora:
+                compatible = dict((e["id"], e) for e in compatible_entries(ctx))
+                catalog = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
+                lh, la = lora_checks(ctx, plan, compatible, catalog)
+                hard += lh
+                advisory += la
+            _write_json(os.path.join(ctx.story_dir, "story_checks.json"),
+                        _checks_doc(ctx, {"hard": hard, "advisory": advisory}, source="recheck"))
+            if hard:
+                print("Error: story.md fails the story checks:", file=sys.stderr)
+                for message in hard:
+                    print("  - %s" % message, file=sys.stderr)
+                print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
+                      "regenerate it." % story_md, file=sys.stderr)
+                return 2, advisory
+            return 0, advisory
+        except (KeyError, TypeError, AttributeError, ValueError, IndexError):
+            pass
+    if ctx.mode != "shots":
+        violations = legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")
         if violations:
-            print("Error: story.md breaks the shot rules:", file=sys.stderr)
+            print("Error: story.md failed validation:", file=sys.stderr)
             for v in violations:
                 print("  - %s" % v, file=sys.stderr)
-            print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
-                  "have the story model write a new one." % story_md, file=sys.stderr)
-            return 2, []
-        return 0, advisories
-    hard = ([] if ctx.mode == "shots"
-            else list(legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")))
-    advisory = []
-    text, parsed = _read_story(ctx, story_md)
-    undeclared = undeclared_characters(ctx)
-    writers_by_panel = []
-    for k, panel in enumerate(parsed, start=1):
-        fields = story_fields(ctx.mode, k, panel)
-        writers_by_panel.append(dict(fields))
-        h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, dict(fields),
-                             RECHECK_IDS, undeclared)
-        hard += h
-        advisory += a
-    advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
-    if ctx.mode == "shots":
-        hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members)
-        advisory += lib.shots_advisories(parsed, ctx.members)
-    if ctx.auto_lora:
-        compatible = dict((e["id"], e) for e in compatible_entries(ctx))
-        catalog = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
-        lh, la = lora_checks(ctx, plan, compatible, catalog)
-        hard += lh
-        advisory += la
-    _write_json(os.path.join(ctx.story_dir, "story_checks.json"),
-                _checks_doc(ctx, {"hard": hard, "advisory": advisory}, source="recheck"))
-    if hard:
-        print("Error: story.md fails the story checks:", file=sys.stderr)
-        for message in hard:
-            print("  - %s" % message, file=sys.stderr)
+            print("Hand-edit %s to fix the violations above and rerun; story.md already exists "
+                  "so Phase 1 will be skipped next time (pass --force-story to regenerate it "
+                  "instead)." % story_md, file=sys.stderr)
+            return 1, []
+        return _undeclared_gate(ctx, story_md, legacy_validate, (0, []))
+    try:
+        text, parsed = _read_story(ctx, story_md)
+        violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+        advisories = lib.shots_advisories(parsed, ctx.members)
+    except OSError as e:
+        violations, advisories = ["story: cannot read story.md: %s" % e], []
+    if violations:
+        print("Error: story.md breaks the shot rules:", file=sys.stderr)
+        for v in violations:
+            print("  - %s" % v, file=sys.stderr)
         print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
-              "regenerate it." % story_md, file=sys.stderr)
-        return 2, advisory
-    return 0, advisory
+              "have the story model write a new one." % story_md, file=sys.stderr)
+        return 2, []
+    return _undeclared_gate(ctx, story_md, legacy_validate, (0, advisories))
