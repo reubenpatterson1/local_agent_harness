@@ -834,3 +834,248 @@ def test_lct18_story_images_lora_trigger(tmp_path, capsys):
     assert lines[2].endswith(" | 'ink2. Inkstyle courier on the quay.'")
     assert lines[1] == lines[3] == "    loras: none"
     assert not os.path.exists(out_dir)
+
+
+# --- LCT19-LCT25, LCT30: bin/ltx-mlx-render catalog_loras (LC17, 1.4) ------------------------
+
+render = importlib.machinery.SourceFileLoader(
+    "ltx_mlx_render_for_lora_catalog", os.path.join(WS, "bin", "ltx-mlx-render")).load_module()
+
+
+def _still(directory):
+    from PIL import Image
+    path = os.path.join(str(directory), "panel_01.png")
+    Image.new("RGB", (64, 64), (40, 40, 40)).save(path)
+    return path
+
+
+def _chain_panels(directory, catalog_by_panel, characters=None):
+    image = _still(directory)
+    panels = []
+    for i, entries in enumerate(catalog_by_panel, start=1):
+        panel = {"index": i, "image_path": image if i == 1 else None,
+                 "conditioning": "still" if i == 1 else "chain",
+                 "panel_text": "panel %d text" % i, "motion_prompt": "panel %d motion" % i,
+                 "catalog_loras": entries}
+        if characters and i in characters:
+            panel["characters"] = characters[i]
+        panels.append(panel)
+    return panels
+
+
+def _write_render_manifest(directory, panels, story_id="cat-render"):
+    path = os.path.join(str(directory), "manifest.json")
+    with open(path, "w") as f:
+        json.dump({"schema_version": 3, "story_id": story_id, "fps": 24, "panels": panels}, f)
+    return path
+
+
+class _RenderHarness(object):
+    """bin/ltx-mlx-render's main() in-process with generate_video, probe_streams,
+    assert_clips_uniform, build_concat_command, clip_frame_count and prepare_chain_seed stubbed
+    (as tests/test_casting_pipeline.py's _CastHarness); every stub render writes 128 bytes
+    unique to that call."""
+
+    def __init__(self, monkeypatch, directory, panels):
+        self.dir = str(directory)
+        self.received = []
+        self.renders = [0]
+        self.manifest = _write_render_manifest(self.dir, panels)
+        self.model = os.path.join(self.dir, "model-fixture")
+        os.makedirs(self.model, exist_ok=True)
+        with open(os.path.join(self.model, "split_model.json"), "w") as f:
+            json.dump({"recipe": "ltx-2.5"}, f)
+        self.clips = os.path.join(self.dir, "clips")
+        os.makedirs(self.clips, exist_ok=True)
+        self.out = os.path.join(self.dir, "movie.mp4")
+        fake_bin = os.path.join(self.dir, "fake-ltx")
+        with open(fake_bin, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake_bin, 0o755)
+        harness = self
+
+        def _gen(prompt, output_path, image_path=None, **kw):
+            harness.renders[0] += 1
+            index = int(os.path.basename(output_path)[len("panel_"):-len(".mp4")])
+            harness.received.append((index, kw))
+            with open(output_path, "wb") as f:
+                f.write(("render %d" % harness.renders[0]).encode().ljust(128, b"\0"))
+            return os.path.abspath(output_path)
+
+        def _seed(unit, args):
+            with open(unit["image_path"], "wb") as f:
+                f.write(b"seed")
+            return []
+
+        monkeypatch.setattr(render.SKILL, "generate_video", _gen)
+        monkeypatch.setattr(render.SKILL, "LTX2_MLX_BIN", fake_bin)
+        monkeypatch.setattr(render, "probe_streams", lambda p: {"streams": []})
+        monkeypatch.setattr(render, "assert_clips_uniform", lambda pairs, w, h, fr: None)
+        monkeypatch.setattr(render, "build_concat_command", lambda lp, out: [
+            sys.executable, "-c", "import sys; open(sys.argv[1],'wb').write(b'MOVIE')", out])
+        monkeypatch.setattr(render, "clip_frame_count", lambda p: 241)
+        monkeypatch.setattr(render, "prepare_chain_seed", _seed)
+        monkeypatch.setattr(render, "story_dir_for",
+                            lambda sid: os.path.join(harness.dir, "stories", sid))
+
+    def run(self, *extra):
+        return render.main([self.manifest, self.out, "--clips-dir", self.clips,
+                            "--skip-input-screen", "--model", self.model, "--width", "64",
+                            "--height", "64"] + list(extra))
+
+    def loras(self, index):
+        return [kw.get("loras") for i, kw in self.received if i == index][-1]
+
+
+def _render_entries(tmp_path):
+    fast = _entry(tmp_path, "fast-motion", "motion", 0.7, ["fastmo"])
+    grain = _entry(tmp_path, "film-grain", "style", 0.8, ["grainfilm"])
+    return fast, grain
+
+
+def test_lct19_load_manifest_validates_catalog_loras(tmp_path):
+    fast, grain = _render_entries(tmp_path)
+    good = _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[fast, grain], [], [fast]]))
+    assert render.load_manifest(good)["panels"][0]["catalog_loras"] == [fast, grain]
+    cases = [
+        ({"x": 1}, "panel 1: catalog_loras must be a list"),
+        ([dict(fast, extra=1)], "panel 1: catalog_loras entry must have exactly the keys id, "
+                                "kind, path, sha256, strength, triggers"),
+        ([dict(fast, kind="character")], "panel 1: catalog_loras fast-motion: kind must be "
+                                         "style, motion or physics, got 'character'"),
+        ([dict(fast, path="/no/such.safetensors")], "panel 1: catalog_loras fast-motion: path is "
+                                                    "not a readable file: '/no/such.safetensors'"),
+        ([dict(fast, strength=3)], "panel 1: catalog_loras fast-motion: strength must be a number "
+                                   "in (0, 2], got 3"),
+        ([fast, fast], "panel 1: catalog_loras lists a LoRA twice"),
+        ([grain, dict(grain, id="big-style")], "panel 1: catalog_loras has more than one style or "
+                                               "motion/physics LoRA"),
+    ]
+    for entries, message in cases:
+        path = _write_render_manifest(tmp_path, _chain_panels(tmp_path, [entries, [], []]))
+        with pytest.raises(ValueError) as exc:
+            render.load_manifest(path)
+        assert str(exc.value) == message
+
+
+def test_lct20_unit_lora_order(tmp_path, story_env):
+    fast, grain = _render_entries(tmp_path)
+    seu.kyra(story_env["lib"])
+    video = os.path.join(story_env["lib"], "kyra", "lora", "video.safetensors")
+    character = {"name": "kyra", "phrase": "the woman in grey", "trigger": "kyrawmn",
+                 "video_lora": video, "strength": 1.0}
+    panels = _chain_panels(tmp_path, [[fast, grain], [], []], characters={1: [character]})
+    data = render.load_manifest(_write_render_manifest(tmp_path, panels))
+    units = render.build_units(data["panels"], 0, str(tmp_path / "clips"),
+                               global_loras=[{"path": "/g.safetensors", "strength": 0.5}])
+    assert units[0]["loras"] == [
+        {"kind": "global", "name": None, "path": "/g.safetensors", "strength": 0.5},
+        {"kind": "catalog", "name": "fast-motion", "path": fast["path"], "strength": 0.7,
+         "catalog_id": "fast-motion"},
+        {"kind": "catalog", "name": "film-grain", "path": grain["path"], "strength": 0.8,
+         "catalog_id": "film-grain"},
+        {"kind": "character", "name": "kyra", "path": video, "strength": 1.0}]
+    assert units[1]["loras"] == [{"kind": "global", "name": None, "path": "/g.safetensors",
+                                  "strength": 0.5}]
+
+
+def test_lct21_provenance(tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.setattr(render, "model_identity", lambda model, strict=False: None)
+    fast, _grain = _render_entries(tmp_path)
+    global_lora = seu.lora_file(str(tmp_path / "files"), "global")
+    args = render.build_parser().parse_args(["/m.json", "/o.mp4", "--model", "M"])
+    unit = {"index": 1, "label": "panel-1", "seed": 1, "prompt": "p", "image_path": None,
+            "clip_path": "/c/panel_01.mp4", "log_path": None, "conditioning": "t2v",
+            "chain_source": None,
+            "loras": [{"kind": "global", "name": None, "path": global_lora, "strength": 1.0}]}
+    assert render.build_clip_provenance(unit, args) == {
+        "schema_version": 2, "backend": "ltx-2-mlx", "model": "M", "model_identity": None,
+        "gemma": args.gemma, "lora_path": None,
+        "prompt_sha256": hashlib.sha256(b"p").hexdigest(), "conditioning": "t2v",
+        "image_sha256": None, "chain_source_sha256": None, "chain_frame_index": None, "seed": 1,
+        "width": args.width, "height": args.height, "frames": args.frames,
+        "fps": args.frame_rate, "low_ram": True, "tile_frames": 1, "tile_spatial": 1,
+        "loras": [{"kind": "global", "path": global_lora, "sha256": seu.sha256_file(global_lora),
+                   "strength": 1.0}]}
+    unit["loras"].append({"kind": "catalog", "name": "fast-motion", "path": fast["path"],
+                          "strength": 0.7, "catalog_id": "fast-motion"})
+    assert render.build_clip_provenance(unit, args)["loras"][1] == {
+        "kind": "catalog", "path": fast["path"], "sha256": fast["sha256"], "strength": 0.7,
+        "catalog_id": "fast-motion"}
+
+
+def test_lct22_sha_and_duplicate_checks(tmp_path, monkeypatch, capsys, story_env):
+    fast, grain = _render_entries(tmp_path)
+    harness = _RenderHarness(monkeypatch, tmp_path, _chain_panels(tmp_path, [[], [fast], []]))
+    with open(fast["path"], "r+b") as f:
+        f.seek(-1, 2)
+        f.write(b"\x07")
+    for extra in (["--dry-run"], []):
+        assert harness.run(*extra) == 2
+        assert capsys.readouterr().err == (
+            "Error: panel 2: catalog LoRA fast-motion does not match its cataloged sha256; the "
+            "file changed since bin/lora-catalog add (run bin/lora-catalog verify)\n")
+    assert harness.received == []
+    fast, grain = _render_entries(tmp_path / "again")
+    _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[], [fast], []]))
+    assert harness.run("--dry-run", "--lora", fast["path"] + ":0.5") == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA fast-motion (panel 2) is also passed with --lora; pass it once\n")
+    seu.kyra(story_env["lib"])
+    video = os.path.join(story_env["lib"], "kyra", "lora", "video.safetensors")
+    clash = dict(fast, path=video, sha256=seu.sha256_file(video))
+    character = {"name": "kyra", "phrase": "p", "trigger": "kyrawmn", "video_lora": video,
+                 "strength": 1.0}
+    _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[], [clash], []],
+                                                   characters={2: [character]}))
+    assert harness.run("--dry-run") == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA fast-motion (panel 2) is also character kyra's video LoRA\n")
+
+
+def test_lct23_dry_run_lists_catalog_loras(tmp_path, monkeypatch, capsys):
+    fast, grain = _render_entries(tmp_path)
+    harness = _RenderHarness(monkeypatch, tmp_path,
+                             _chain_panels(tmp_path, [[fast, grain], [fast], []]))
+    assert harness.run("--dry-run") == 0
+    out = capsys.readouterr().out
+    assert ("            lora: %s @ 0.7 (fast-motion)\n            lora: %s @ 0.8 (film-grain)\n"
+            % (fast["path"], grain["path"])) in out
+    command = [l for l in out.splitlines() if l.startswith("first render command: ")][0]
+    assert (" --lora %s 0.7 --lora %s 0.8 --distilled " % (fast["path"], grain["path"])) in command
+
+
+def test_lct24_per_panel_loras_reach_generate_video(tmp_path, monkeypatch):
+    fast, grain = _render_entries(tmp_path)
+    harness = _RenderHarness(monkeypatch, tmp_path, _chain_panels(tmp_path, [[grain], [fast, grain],
+                                                                             []]))
+    assert harness.run() == 0
+    assert harness.loras(1) == [(grain["path"], 0.8)]
+    assert harness.loras(2) == [(fast["path"], 0.7), (grain["path"], 0.8)]
+    assert harness.loras(3) is None
+
+
+def test_lct25_resume_with_catalog_loras(tmp_path, monkeypatch):
+    fast, grain = _render_entries(tmp_path)
+    harness = _RenderHarness(monkeypatch, tmp_path, _chain_panels(tmp_path, [[], [fast], []]))
+    assert harness.run() == 0
+    assert [i for i, _kw in harness.received] == [1, 2, 3]
+    harness.received[:] = []
+    assert harness.run("--resume", "--force") == 0
+    assert harness.received == []
+    _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[], [dict(fast, strength=0.8)], []]))
+    assert harness.run("--resume", "--force") == 0
+    assert [i for i, _kw in harness.received] == [2, 3]
+
+
+def test_lct30_chained_manifest_per_panel_units(tmp_path, monkeypatch, capsys):
+    fast, grain = _render_entries(tmp_path)
+    panels = _chain_panels(tmp_path, [[grain], [fast, grain], [grain]])
+    data = render.load_manifest(_write_render_manifest(tmp_path, panels))
+    units = render.build_units(data["panels"], 0, str(tmp_path / "clips"))
+    assert [[l["name"] for l in u["loras"]] for u in units] == [
+        ["film-grain"], ["fast-motion", "film-grain"], ["film-grain"]]
+    harness = _RenderHarness(monkeypatch, tmp_path, panels)
+    assert harness.run("--dry-run", "--on-panel-failure", "stop") == 0
+    assert "panel  2: I2V chained" in capsys.readouterr().out

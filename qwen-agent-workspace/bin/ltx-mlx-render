@@ -255,12 +255,55 @@ def load_manifest(path):
                     raise ValueError("panel %d: character %s's strength must be a number in (0, 1], "
                                      "got %r" % (index, name, strength))
 
+        if "catalog_loras" in panel:
+            entries = panel["catalog_loras"]
+            if not isinstance(entries, list):
+                raise ValueError("panel %d: catalog_loras must be a list" % index)
+            for entry in entries:
+                problem = _catalog_lora_problem(entry)
+                if problem:
+                    raise ValueError("panel %d: catalog_loras %s" % (index, problem))
+            ids = [entry["id"] for entry in entries]
+            if len(set(ids)) != len(ids):
+                raise ValueError("panel %d: catalog_loras lists a LoRA twice" % index)
+            if (sum(1 for e in entries if e["kind"] == "style") > 1
+                    or sum(1 for e in entries if e["kind"] != "style") > 1):
+                raise ValueError("panel %d: catalog_loras has more than one style or "
+                                 "motion/physics LoRA" % index)
+
         panel_text = panel.get("panel_text")
         if not isinstance(panel_text, str) or not panel_text.strip():
             raise ValueError("panel %d: panel_text is required and must be a "
                              "non-empty string" % index)
 
     return data
+
+
+_CATALOG_ID_RE = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_CATALOG_SHA_RE = re.compile(r"[0-9a-f]{64}")
+_CATALOG_ENTRY_KEYS = {"id", "kind", "path", "sha256", "strength", "triggers"}
+
+
+def _catalog_lora_problem(entry):
+    """None, or what is wrong with one manifest catalog_loras entry (robust story spec LC15)."""
+    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_KEYS:
+        return "entry must have exactly the keys id, kind, path, sha256, strength, triggers"
+    if not isinstance(entry["id"], str) or not _CATALOG_ID_RE.fullmatch(entry["id"]):
+        return "id must match [a-z][a-z0-9-]{1,31}, got %r" % (entry["id"],)
+    if entry["kind"] not in ("style", "motion", "physics"):
+        return "%s: kind must be style, motion or physics, got %r" % (entry["id"], entry["kind"])
+    path = entry["path"]
+    if (not isinstance(path, str) or not os.path.isabs(path) or not os.path.isfile(path)
+            or not os.access(path, os.R_OK)):
+        return "%s: path is not a readable file: %r" % (entry["id"], path)
+    if not isinstance(entry["sha256"], str) or not _CATALOG_SHA_RE.fullmatch(entry["sha256"]):
+        return "%s: sha256 must be 64 lowercase hex characters" % entry["id"]
+    strength = entry["strength"]
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0 < strength <= 2:
+        return "%s: strength must be a number in (0, 2], got %r" % (entry["id"], strength)
+    if not isinstance(entry["triggers"], list) or not all(isinstance(t, str) for t in entry["triggers"]):
+        return "%s: triggers must be a list of strings" % entry["id"]
+    return None
 
 
 def resolve_prompt(panel):
@@ -305,6 +348,9 @@ def build_units(panels, seed, clips_dir, run_root=None, global_loras=()):
         }
         loras = [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
                  for g in global_loras]
+        loras += [{"kind": "catalog", "name": e["id"], "path": e["path"],
+                   "strength": float(e["strength"]), "catalog_id": e["id"]}
+                  for e in (panel.get("catalog_loras") or [])]
         loras += [{"kind": "character", "name": c["name"], "path": c["video_lora"],
                    "strength": float(c["strength"])} for c in (panel.get("characters") or [])]
         if loras:
@@ -438,9 +484,13 @@ def build_clip_provenance(unit, args, *, strict=False):
         "tile_frames": args.tile_frames, "tile_spatial": args.tile_spatial,
     }
     if unit.get("loras"):
-        provenance["loras"] = [{"kind": l["kind"], "path": l["path"],
-                                "sha256": lora_sha256(l["path"]), "strength": l["strength"]}
-                               for l in unit["loras"]]
+        provenance["loras"] = []
+        for l in unit["loras"]:
+            entry = {"kind": l["kind"], "path": l["path"], "sha256": lora_sha256(l["path"]),
+                     "strength": l["strength"]}
+            if l["kind"] == "catalog":
+                entry["catalog_id"] = l["catalog_id"]
+            provenance["loras"].append(entry)
     return provenance
 
 
@@ -1077,8 +1127,9 @@ def main(argv=None):
         print("Error: --lora: %s" % e, file=sys.stderr)
         return 2
     cast_entries = [(p["index"], c) for p in panels for c in (p.get("characters") or [])]
+    catalog_entries = [(p["index"], e) for p in panels for e in (p.get("catalog_loras") or [])]
     args.global_loras = []
-    if len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries:
+    if len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries and not catalog_entries:
         args.lora_path = parsed[0][0]                       # legacy route (5.7.2)
     elif parsed:
         args.lora_path = None
@@ -1098,6 +1149,31 @@ def main(argv=None):
             if real in seen:
                 print("Error: --lora %s is also character %s's video LoRA (panel %d); pass it "
                       "once" % (seen[real], c["name"], index), file=sys.stderr)
+                return 2
+    if catalog_entries:
+        global_reals = set(os.path.realpath(g["path"]) for g in args.global_loras)
+        by_index = dict((p["index"], p) for p in panels)
+        for index, entry in catalog_entries:
+            real = os.path.realpath(entry["path"])
+            if real in global_reals:
+                print("Error: catalog LoRA %s (panel %d) is also passed with --lora; pass it once"
+                      % (entry["id"], index), file=sys.stderr)
+                return 2
+            for c in by_index[index].get("characters") or []:
+                if os.path.realpath(c["video_lora"]) == real:
+                    print("Error: catalog LoRA %s (panel %d) is also character %s's video LoRA"
+                          % (entry["id"], index, c["name"]), file=sys.stderr)
+                    return 2
+        checked = set()
+        for index, entry in catalog_entries:
+            real = os.path.realpath(entry["path"])
+            if real in checked:
+                continue
+            checked.add(real)
+            if lora_sha256(entry["path"]) != entry["sha256"]:
+                print("Error: panel %d: catalog LoRA %s does not match its cataloged sha256; the "
+                      "file changed since bin/lora-catalog add (run bin/lora-catalog verify)"
+                      % (index, entry["id"]), file=sys.stderr)
                 return 2
 
     story_id = manifest.get("story_id") or "story"
