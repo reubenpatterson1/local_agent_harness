@@ -713,3 +713,124 @@ def test_fix1_mismatch_and_dry_run_cases(tmp_path, monkeypatch, story_env, capsy
     assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run",
                            "--no-review"]) == 0
     assert "--catalog-loras" not in capsys.readouterr().out
+
+
+# --- LCT16-LCT18: bin/ltx-story-manifest --catalog-loras, bin/ltx-story-images --lora-trigger ---
+
+story_manifest = importlib.machinery.SourceFileLoader(
+    "ltx_story_manifest_for_lora_catalog", os.path.join(WS, "bin", "ltx-story-manifest")).load_module()
+story_images = importlib.machinery.SourceFileLoader(
+    "ltx_story_images_for_lora_catalog", os.path.join(WS, "bin", "ltx-story-images")).load_module()
+CHAIN_STORY = """# Test
+
+## Panel 1 — One
+Image: A courier stands on a wet quay beside the boats.
+Motion: The courier pushes off.
+Narration: It rained.
+
+## Panel 2 — Two
+Motion: The courier pedals hard.
+Narration: It rained more.
+
+## Panel 3 — Three
+Motion: FASTMO blur as the courier arrives.
+Narration: It stopped.
+"""
+
+
+def _manifest_inputs(tmp_path, monkeypatch, lists):
+    from PIL import Image
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(story_manifest, "WS", ws)
+    story_md = str(tmp_path / "story.md")
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(CHAIN_STORY)
+    image = str(tmp_path / "panel_01.png")
+    Image.new("RGB", (64, 64), (9, 9, 9)).save(image)
+    catalog_path = str(tmp_path / "catalog_loras.json")
+    with open(catalog_path, "w", encoding="utf-8") as f:
+        json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": "m1", "panels": lists}, f)
+    argv = ["--story-id", "m1", "--prompts-md", story_md, "--chain", "--image", image,
+            "--fps", "24", "--target-seconds", "18.125", "--min-frames", "145",
+            "--max-frames", "145", "--force", "--catalog-loras", catalog_path]
+    return ws, argv, catalog_path
+
+
+def _entry(tmp_path, entry_id, kind, strength, triggers):
+    path = seu.lora_file(str(tmp_path / "files"), entry_id)
+    return {"id": entry_id, "kind": kind, "path": path, "sha256": seu.sha256_file(path),
+            "strength": strength, "triggers": triggers}
+
+
+def test_lct16_manifest_catalog_loras(tmp_path, monkeypatch, capsys):
+    fast = _entry(tmp_path, "fast-motion", "motion", 0.7, ["fastmo"])
+    grain = _entry(tmp_path, "film-grain", "style", 0.8, ["grainfilm"])
+    ws, argv, catalog_path = _manifest_inputs(tmp_path, monkeypatch, [[grain], [fast, grain], [fast]])
+    assert story_manifest.main(argv) == 0
+    out = capsys.readouterr().out
+    assert out.endswith("catalog: panel 1: film-grain@0.8\ncatalog: panel 2: fast-motion@0.7, "
+                        "film-grain@0.8\ncatalog: panel 3: fast-motion@0.7\n")
+    with open(os.path.join(ws, "generated", "stories", "m1", "manifest.json")) as f:
+        manifest = json.load(f)
+    panels = manifest["panels"]
+    assert [p["catalog_loras"] for p in panels] == [[grain], [fast, grain], [fast]]
+    assert [p["motion_prompt"] for p in panels] == [
+        "grainfilm. The courier pushes off.", "fastmo, grainfilm. The courier pedals hard.",
+        "FASTMO blur as the courier arrives."]
+    assert panels[0]["panel_text"] == "A courier stands on a wet quay beside the boats."
+    assert manifest["schema_version"] == 3
+    bad_cases = [
+        ([[grain], [fast]], "panels must be a list of exactly 3 lists"),
+        ([[dict(grain, path="rel.safetensors")], [], []],
+         "panel 1 entry 1: path must be an absolute path to a readable file, got 'rel.safetensors'"),
+        ([[grain, dict(grain, id="other-grain")], [], []],
+         "panel 1 has more than one style or motion/physics LoRA"),
+        ([[grain, grain], [], []], "panel 1 lists a LoRA twice"),
+        ([[dict(grain, strength=True)], [], []],
+         "panel 1 entry 1: strength must be a number in (0, 2], got True"),
+        ([[dict(grain, extra=1)], [], []],
+         "panel 1 entry 1: must be an object with exactly the keys id, kind, path, sha256, "
+         "strength, triggers"),
+    ]
+    for lists, reason in bad_cases:
+        with open(catalog_path, "w", encoding="utf-8") as f:
+            json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": "m1", "panels": lists}, f)
+        assert story_manifest.main(argv) == 2
+        assert capsys.readouterr().err == "Error: --catalog-loras %s: %s\n" % (catalog_path, reason)
+    with open(catalog_path, "w", encoding="utf-8") as f:
+        json.dump({"schema": "other"}, f)
+    assert story_manifest.main(argv) == 2
+    glob_argv = ["--story-id", "m1", "--glob", "panel_*.png", "--catalog-loras", catalog_path]
+    with pytest.raises(SystemExit) as exc:
+        story_manifest.main(glob_argv)
+    assert exc.value.code == 2
+    assert "--catalog-loras requires --chain, --shots or --no-images" in capsys.readouterr().err
+
+
+def test_lct17_manifest_without_catalog_is_unchanged(tmp_path):
+    regression = importlib.machinery.SourceFileLoader(
+        "casting_regression_for_lct17", os.path.join(WS, "tests", "test_casting_regression.py")
+    ).load_module()
+    text = regression.b2_text(str(tmp_path))
+    with open(regression.GOLDEN_B2, encoding="utf-8") as f:
+        assert text == f.read()
+    assert "catalog_loras" not in text
+
+
+def test_lct18_story_images_lora_trigger(tmp_path, capsys):
+    story_md = str(tmp_path / "story.md")
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(CHAIN_STORY.replace("Motion: The courier pedals hard.",
+                                    "Image: Inkstyle courier on the quay.\nMotion: The courier "
+                                    "pedals hard."))
+    out_dir = str(tmp_path / "images")
+    base = ["--story-md", story_md, "--out-dir", out_dir, "--only", "1,2", "--dry-run"]
+    assert story_images.main(base) == 0
+    plain = capsys.readouterr().out.splitlines()
+    assert plain[0].endswith(" | 'A courier stands on a wet quay beside the boats.'")
+    assert story_images.main(base + ["--lora-trigger", "inkstyle", "--lora-trigger", "ink2"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].endswith(" | 'inkstyle, ink2. A courier stands on a wet quay beside the boats.'")
+    assert lines[2].endswith(" | 'ink2. Inkstyle courier on the quay.'")
+    assert lines[1] == lines[3] == "    loras: none"
+    assert not os.path.exists(out_dir)

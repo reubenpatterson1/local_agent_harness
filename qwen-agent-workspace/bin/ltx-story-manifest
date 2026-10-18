@@ -162,12 +162,74 @@ def build_parser():
                               "or more of them (default 0.8, provisional); one character uses "
                               "1.0, except with --shots, where every cast character uses this "
                               "strength")
+    parser.add_argument("--catalog-loras", dest="catalog_loras", default=None, metavar="PATH",
+                         help="per-panel catalog LoRAs (bin/ltx-movie's catalog_loras.json): each "
+                              "panel gets a catalog_loras list and its triggers are prefixed to its "
+                              "motion_prompt")
     return parser
 
 
 def _character_lib():
     return importlib.machinery.SourceFileLoader(
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
+
+
+def _lora_catalog():
+    return importlib.machinery.SourceFileLoader(
+        "lora_catalog", os.path.join(WS, "lora_catalog.py")).load_module()
+
+
+_CATALOG_ID_RE = re.compile(r"[a-z][a-z0-9-]{1,31}")
+_CATALOG_SHA_RE = re.compile(r"[0-9a-f]{64}")
+_CATALOG_ENTRY_KEYS = {"id", "kind", "path", "sha256", "strength", "triggers"}
+
+
+def _catalog_entry_problem(entry):
+    if not isinstance(entry, dict) or set(entry) != _CATALOG_ENTRY_KEYS:
+        return "must be an object with exactly the keys id, kind, path, sha256, strength, triggers"
+    if not isinstance(entry["id"], str) or not _CATALOG_ID_RE.fullmatch(entry["id"]):
+        return "id must match [a-z][a-z0-9-]{1,31}, got %r" % (entry["id"],)
+    if entry["kind"] not in ("style", "motion", "physics"):
+        return "kind must be style, motion or physics, got %r" % (entry["kind"],)
+    path = entry["path"]
+    if (not isinstance(path, str) or not os.path.isabs(path) or not os.path.isfile(path)
+            or not os.access(path, os.R_OK)):
+        return "path must be an absolute path to a readable file, got %r" % (path,)
+    if not isinstance(entry["sha256"], str) or not _CATALOG_SHA_RE.fullmatch(entry["sha256"]):
+        return "sha256 must be 64 lowercase hex characters"
+    strength = entry["strength"]
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not 0 < strength <= 2:
+        return "strength must be a number in (0, 2], got %r" % (strength,)
+    if not isinstance(entry["triggers"], list) or not all(isinstance(t, str) for t in entry["triggers"]):
+        return "triggers must be a list of strings"
+    return None
+
+
+def _read_catalog_loras(path, n_panels):
+    """(per-panel lists, None) from bin/ltx-movie's catalog_loras.json, or (None, reason)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, "cannot read it: %s" % e
+    if not isinstance(data, dict) or data.get("schema") != "ltx-movie.catalog-loras.v1":
+        return None, "not a JSON object with schema ltx-movie.catalog-loras.v1"
+    lists = data.get("panels")
+    if (not isinstance(lists, list) or len(lists) != n_panels
+            or not all(isinstance(entries, list) for entries in lists)):
+        return None, "panels must be a list of exactly %d lists" % n_panels
+    for i, entries in enumerate(lists, start=1):
+        for j, entry in enumerate(entries, start=1):
+            problem = _catalog_entry_problem(entry)
+            if problem:
+                return None, "panel %d entry %d: %s" % (i, j, problem)
+        ids = [e["id"] for e in entries]
+        if len(set(ids)) != len(ids):
+            return None, "panel %d lists a LoRA twice" % i
+        if (sum(1 for e in entries if e["kind"] == "style") > 1
+                or sum(1 for e in entries if e["kind"] != "style") > 1):
+            return None, "panel %d has more than one style or motion/physics LoRA" % i
+    return lists, None
 
 
 def _select_images_glob(images_dir, pattern):
@@ -378,6 +440,8 @@ def main(argv=None):
             parser.error("--chain requires exactly one --image (panel 1's still)")
     if args.cast and not (args.chain or args.shots):
         parser.error("--cast requires --chain or --shots")
+    if args.catalog_loras and not (args.chain or args.shots or args.no_images):
+        parser.error("--catalog-loras requires --chain, --shots or --no-images")
     if args.character_strength is not None and not args.cast:
         parser.error("--character-strength requires --cast")
 
@@ -634,6 +698,18 @@ def main(argv=None):
                       "that character gets no LoRA"
                       % (m.phrase, m.name, "Image: or Motion:" if args.shots else "Motion:"))
 
+    if args.catalog_loras:
+        lists, error = _read_catalog_loras(args.catalog_loras, n_panels)
+        if error:
+            print("Error: --catalog-loras %s: %s" % (args.catalog_loras, error), file=sys.stderr)
+            return 2
+        lora_catalog = _lora_catalog()
+        for p, entries in zip(panels, lists):
+            p["catalog_loras"] = [dict(entry) for entry in entries]
+            triggers = [t for entry in entries for t in entry["triggers"]]
+            if triggers:
+                p["motion_prompt"] = lora_catalog.prefix_triggers(p["motion_prompt"], triggers)
+
     for p in panels:
         # Chain mode: the video model receives the Motion: text, so that is what is measured.
         _prompt_length_warning(p["index"], p["motion_prompt"] if (args.chain or args.shots) else p["panel_text"])
@@ -678,6 +754,11 @@ def main(argv=None):
             if p["characters"]:
                 print("cast: panel %d: %s" % (p["index"], ", ".join(
                     "%s@%s" % (c["name"], repr(c["strength"])) for c in p["characters"])))
+    if args.catalog_loras:
+        for p in panels:
+            if p["catalog_loras"]:
+                print("catalog: panel %d: %s" % (p["index"], ", ".join(
+                    "%s@%s" % (e["id"], repr(float(e["strength"]))) for e in p["catalog_loras"])))
 
     return 0
 

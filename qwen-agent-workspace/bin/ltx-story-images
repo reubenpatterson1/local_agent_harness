@@ -134,6 +134,10 @@ def build_parser():
                              "exactly (pinned, as in grounded mode), and every cast character's "
                              "stills LoRA, alone or with another, uses its character.json strength "
                              "or --character-strength (default 0.8)")
+    parser.add_argument("--lora-trigger", dest="lora_trigger", action="append", default=None,
+                        metavar="WORD",
+                        help="a catalog stills LoRA's trigger (repeatable, from bin/ltx-movie): "
+                             "prefixed to every generated panel's prompt that lacks it")
     return parser
 
 
@@ -338,6 +342,14 @@ def main(argv=None):
         print("Error: the selected panels need different stills LoRA sets (z_image_skill loads one "
               "set per process); run one --only panel per invocation", file=sys.stderr)
         return 2
+    if args.lora_trigger:
+        lora_catalog = importlib.machinery.SourceFileLoader(
+            "lora_catalog", os.path.join(WS, "lora_catalog.py")).load_module()
+        for i in selected_indices:
+            if args.seed_image is not None and i == 1:
+                continue
+            prompt, loras = plans.get(i, (compose(panels[i - 1]["image"], style), []))
+            plans[i] = (lora_catalog.prefix_triggers(prompt, args.lora_trigger), loras)
 
     # panel_%02d.png matches bin/ltx-story-manifest's own _PANEL_NUM_RE, so
     # a later `--glob 'panel_*.png'` sorts numerically and never falls back
@@ -449,6 +461,8 @@ def main(argv=None):
     for r in results:
         if r["index"] in plans:
             r["loras"] = plans[r["index"]][1]
+        if args.lora_trigger and r["source"] == "generated":
+            r["lora_triggers"] = list(args.lora_trigger)
 
     with open(os.path.join(args.out_dir, "images.json"), "w") as f:
         json.dump({
