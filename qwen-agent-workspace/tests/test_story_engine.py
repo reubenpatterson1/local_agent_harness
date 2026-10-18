@@ -988,3 +988,23 @@ def test_rst56b_n15_masks_declared_phrase(ws, story_env):
         checks = _story_checks(ws, "shots", plan_mut=lambda raw: raw.update(cast=fixed),
                                part_mut=motion(text), ctx_kw={"members": members})
         assert bool([v for v in checks if " N15 " in v]) == expect, (text, checks)
+
+
+def test_rst56c_n15_invented_phrase_naming_library_character_not_masked(ws, story_env):
+    seu.ronin(story_env["lib"])
+    seu.make_character(story_env["lib"], "wmn", "wmntrg", "the woman", "woman", seu.DESC_K)
+
+    def motion(text):
+        return lambda parts: parts[1].update(motion=text)
+
+    def invented(phrase):
+        fixed = [{"id": "c1", "phrase": "the courier", "descriptor": seu.COURIER},
+                 {"id": "c2", "phrase": phrase, "descriptor": seu.DESC_R}]
+        return lambda raw: raw.update(cast=fixed)
+
+    checks = _story_checks(ws, "shots", plan_mut=invented("the ronin"),
+                           part_mut=motion("The ronin raises a hand."))
+    assert [v for v in checks if " N15 " in v], checks
+    checks = _story_checks(ws, "shots", plan_mut=invented("the woman in grey"),
+                           part_mut=motion("The woman in grey turns."))
+    assert not [v for v in checks if " N15 " in v], checks

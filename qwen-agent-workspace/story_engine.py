@@ -441,6 +441,17 @@ def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
     return hits
 
 
+def _undeclared_masks(lib, ctx, plan, undeclared):
+    """Mask strings for undeclared_references: declared members' name, trigger and phrase, plus each
+    plan cast phrase that does not itself name an undeclared character (RS37)."""
+    masks = [m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
+    if plan:
+        masks += [e["phrase"] for e in plan["cast"] if isinstance(e.get("phrase"), str)
+                  and (e.get("cast_name") or not undeclared_references(lib, e["phrase"], undeclared,
+                                                                       exact_phrase=True))]
+    return masks
+
+
 def undeclared_message(prefix, where, hit):
     name, kind, matched = hit
     return ("%s %s names library character %s by its %s '%s'; library characters appear only "
@@ -832,8 +843,7 @@ def plan_checks(ctx, plan, shape=()):
                                     "their look is left to the video model" % (k, c))
     undeclared = undeclared_characters(ctx)
     if undeclared:
-        masks = ([m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
-                 + [entry["phrase"] for entry in plan["cast"] if isinstance(entry.get("phrase"), str)])
+        masks = _undeclared_masks(lib, ctx, plan, undeclared)
         texts = []
         for entry in plan["cast"]:
             if entry["cast_name"] is None:
@@ -1322,9 +1332,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
         if "N11" in ids and label == "Narration" and not text.strip():
             hard.append("%s N11 narration: Narration: is empty" % prefix)
     if "N15" in ids and undeclared:
-        masks = [m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
-        if plan:
-            masks += [entry["phrase"] for entry in plan["cast"] if isinstance(entry.get("phrase"), str)]
+        masks = _undeclared_masks(lib, ctx, plan, undeclared)
         for label, text in [("Title", title)] + list(fields):
             for hit in undeclared_references(lib, text, undeclared, masks=masks):
                 hard.append(undeclared_message("%s N15 undeclared character:" % prefix,
