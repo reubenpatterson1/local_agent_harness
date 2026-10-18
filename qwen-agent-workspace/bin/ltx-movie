@@ -1291,9 +1291,44 @@ def _catalog_plan(args, dry_run=False):
         return None
     if (not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1"
             or plan.get("mode") != _story_mode(args) or plan.get("panels") != args.panels
-            or not isinstance(plan.get("loras"), dict)):
+            or not isinstance(plan.get("loras"), dict)
+            or not all(k in plan for k in ("title", "logline", "cast", "locations", "props",
+                                           "beats", "loras"))):
+        return None
+    if dry_run and not os.path.exists(os.path.join(_story_dir(args.story_id), "story.md")):
         return None
     return plan
+
+
+def _catalog_plan_error(args, plan, picks, dry_run=False):
+    """The LC13 Error line when plan.json's LoRA picks are malformed or fail the catalog checks,
+    else None. picks: every pick about to be resolved."""
+    engine = _story_engine()
+    if not all(engine._is_pick(p) for p in picks):
+        return ("Error: plan.json has malformed LoRA picks; rerun with --force-story or "
+                "--no-auto-lora")
+    return None
+
+
+def _catalog_checks_error(args, plan, dry_run=False):
+    """The LC13 Error line when the plan's LoRA picks fail the engine's catalog checks (L1-L7)."""
+    engine = _story_engine()
+    ctx = _story_context(args, dry_run)
+    compatible = dict((e["id"], e) for e in engine.compatible_entries(ctx))
+    catalog = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
+    try:
+        hard = engine.lora_checks(ctx, plan, compatible, catalog)[0]
+    except (KeyError, TypeError, AttributeError, ValueError, IndexError):
+        return ("Error: plan.json has malformed LoRA picks; rerun with --force-story or "
+                "--no-auto-lora")
+    if hard:
+        return ("Error: plan.json LoRA picks fail the catalog checks (%s); rerun with "
+                "--force-story or --no-auto-lora" % hard[0])
+    return None
+
+
+_MALFORMED_PICKS = ("Error: plan.json has malformed LoRA picks; rerun with --force-story or "
+                    "--no-auto-lora")
 
 
 def _catalog_pick(args, pick):
@@ -1324,16 +1359,29 @@ def _catalog_panel_loras(args, dry_run=False):
     plan = _catalog_plan(args, dry_run)
     if plan is None:
         return None, None
-    global_picks = plan["loras"].get("global") or []
-    per_beat = plan["loras"].get("per_beat") or {}
+    raw_global = plan["loras"].get("global")
+    raw_beat = plan["loras"].get("per_beat")
+    if ((raw_global is not None and not isinstance(raw_global, list))
+            or (raw_beat is not None and not isinstance(raw_beat, dict))
+            or any(not isinstance(v, list) for v in (raw_beat or {}).values())):
+        return _MALFORMED_PICKS, None
+    global_picks = raw_global or []
+    per_beat = raw_beat or {}
     if not global_picks and not any(per_beat.values()):
         return None, None
+    error = _catalog_plan_error(args, plan, global_picks + [p for picks in per_beat.values()
+                                                            for p in picks], dry_run)
+    if error:
+        return error, None
     resolved = {}
     for pick in global_picks + [p for picks in per_beat.values() for p in picks]:
         item, error = _catalog_pick(args, pick)
         if error:
             return error, None
         resolved[id(pick)] = item
+    error = _catalog_checks_error(args, plan, dry_run)
+    if error:
+        return error, None
     panels = []
     for k in range(1, args.panels + 1):
         picks = [resolved[id(p)] for p in global_picks + (per_beat.get(str(k)) or [])]
@@ -1350,7 +1398,15 @@ def _catalog_stills_flags(args, dry_run=False):
     picks = (plan["loras"].get("stills") or []) if plan else []
     if not picks:
         return None, []
+    if not isinstance(picks, list):
+        return _MALFORMED_PICKS, []
+    error = _catalog_plan_error(args, plan, picks, dry_run)
+    if error:
+        return error, []
     item, error = _catalog_pick(args, picks[0])
+    if error:
+        return error, []
+    error = _catalog_checks_error(args, plan, dry_run)
     if error:
         return error, []
     flags = ["--lora", "%s:%s" % (item["path"], repr(float(item["strength"])))]
@@ -1361,12 +1417,8 @@ def _catalog_stills_flags(args, dry_run=False):
 
 def _write_catalog_loras(args, path, panels):
     """<story_dir>/catalog_loras.json (robust story spec 2.8), written atomically."""
-    temporary = "%s.%d.tmp" % (path, os.getpid())
-    with open(temporary, "w", encoding="utf-8") as f:
-        json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": args.story_id,
-                   "panels": panels}, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(temporary, path)
+    _story_engine()._write_json(path, {"schema": "ltx-movie.catalog-loras.v1",
+                                       "story_id": args.story_id, "panels": panels})
 
 
 def _phase1_robust(args):

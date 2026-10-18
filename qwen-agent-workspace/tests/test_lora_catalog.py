@@ -532,7 +532,8 @@ def _catalog_story(tmp_path, monkeypatch, story_env, stills=False, extra=()):
              "stills": [{"id": "ink-stills", "strength": 0.8}] if stills else []}
     with open(os.path.join(story_dir, "plan.json"), "w") as f:
         json.dump({"schema": "ltx-movie.plan.v1", "mode": "chained", "panels": 3,
-                   "loras": loras}, f)
+                   "title": "T", "logline": "x", "cast": [], "locations": [], "props": [],
+                   "beats": [], "loras": loras}, f)
     with open(os.path.join(story_dir, "story.md"), "w") as f:
         f.write("# T\n\n## Panel 1 — A\nImage: The woman in grey waits.\nMotion: x\n"
                 "Narration: y\n")
@@ -631,3 +632,84 @@ def test_story_focus_4_a_cataloged_lora_deleted_after_phase_1(tmp_path, monkeypa
         "Error: catalog LoRA ink-stills changed since it was cataloged (%s); run "
         "bin/lora-catalog verify\n" % entries["ink-stills"]["path"])
     assert not os.path.exists(os.path.join(story_dir, "catalog_loras.json"))
+
+
+# --- fix round 1: a malformed or invalid plan.json never feeds picks into Phases 2 and 3 -------
+
+MALFORMED = ("Error: plan.json has malformed LoRA picks; rerun with --force-story or "
+             "--no-auto-lora\n")
+
+
+def _edit_plan(story_dir, edit):
+    path = os.path.join(story_dir, "plan.json")
+    with open(path) as f:
+        plan = json.load(f)
+    edit(plan)
+    with open(path, "w") as f:
+        json.dump(plan, f)
+
+
+def _p3(*extra):
+    return _movie_args("n", "--story-id", "c1", "--panels", "3", "--no-review", *extra)
+
+
+def test_fix1_plan_missing_beats_gives_no_flags(tmp_path, monkeypatch, story_env, capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env)
+    _edit_plan(story_dir, lambda plan: plan.pop("beats"))
+    calls = _recorded(monkeypatch)
+    assert ltx_movie.phase3_manifest(_p3()) == 0
+    assert "--catalog-loras" not in calls[0]
+    assert not os.path.exists(os.path.join(story_dir, "catalog_loras.json"))
+
+
+def test_fix1_malformed_picks_exit_2(tmp_path, monkeypatch, story_env, capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env)
+    _recorded(monkeypatch)
+
+    def bad_global(plan):
+        plan["loras"]["global"] = ["film-grain"]
+
+    def bad_beat(plan):
+        plan["loras"]["per_beat"] = []
+
+    for edit in (bad_global, bad_beat):
+        _edit_plan(story_dir, edit)
+        assert ltx_movie.phase3_manifest(_p3()) == 2
+        assert capsys.readouterr().err == MALFORMED
+        assert not os.path.exists(os.path.join(story_dir, "catalog_loras.json"))
+
+
+def test_fix1_picks_failing_lora_checks_exit_2(tmp_path, monkeypatch, story_env, capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env)
+    _recorded(monkeypatch)
+
+    def loud(plan):
+        plan["loras"]["global"][0]["strength"] = 99
+
+    _edit_plan(story_dir, loud)
+    assert ltx_movie.phase3_manifest(_p3()) == 2
+    assert capsys.readouterr().err.startswith("Error: plan.json LoRA picks fail the catalog checks (")
+    assert not os.path.exists(os.path.join(story_dir, "catalog_loras.json"))
+
+
+def test_fix1_mismatch_and_dry_run_cases(tmp_path, monkeypatch, story_env, capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env)
+    calls = _recorded(monkeypatch)
+    assert ltx_movie.phase3_manifest(_movie_args("n", "--story-id", "c1", "--panels", "4",
+                                                 "--no-review")) == 0
+    assert "--catalog-loras" not in calls[0]
+    capsys.readouterr()
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run",
+                           "--no-review"]) == 0
+    assert "--catalog-loras" in capsys.readouterr().out
+    seu.make_catalog(story_env["catalog"], [entries["film-grain"]])
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run",
+                           "--no-review"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: plan.json picks catalog LoRA fast-motion, which is no longer in the catalog; "
+        "re-add it with bin/lora-catalog add, or rerun with --no-auto-lora\n")
+    os.remove(os.path.join(story_dir, "story.md"))
+    seu.make_catalog(story_env["catalog"], list(entries.values()))
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run",
+                           "--no-review"]) == 0
+    assert "--catalog-loras" not in capsys.readouterr().out
