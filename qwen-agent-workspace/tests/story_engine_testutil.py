@@ -173,3 +173,157 @@ def make_untrained(lib, name):
     with open(os.path.join(lib, name, "character.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return data
+
+
+# --- the temp workspace and the fake bin/qwen-agent (spec 5.1, 5.2) ------------------------
+
+LINKED_FILES = ("character_lib.py", "story_engine.py", "lora_catalog.py", "fleet_lib.py",
+                "pipeline_log.py", "ltx_image_fit.py", "ltx2_mlx_video_skill.py")
+
+FAKE_AGENT_SOURCE = r'''#!/usr/bin/env python3
+"""Fake bin/qwen-agent for the story engine tests (spec 5.2). Pops the next scripted reply for
+the stage named by the --user-prompt's first line, logs the call, prints one envelope."""
+import json
+import os
+import re
+import sys
+import time
+
+argv = sys.argv[1:]
+prompt = argv[argv.index("--user-prompt") + 1] if "--user-prompt" in argv else ""
+first = prompt.split("\n", 1)[0]
+panel = None
+if first.startswith("You are planning"):
+    stage = "plan"
+elif first.startswith("You are writing panel "):
+    stage = "panel"
+    panel = int(re.match(r"You are writing panel (\d+) of", first).group(1))
+elif first.startswith("You are the critic"):
+    stage = "critic"
+else:
+    stage = "unknown"
+script_path = os.environ["FAKE_AGENT_SCRIPT"]
+with open(script_path, encoding="utf-8") as f:
+    script = json.load(f)
+queue = None
+if stage == "panel":
+    panels = script.setdefault("panel", {})
+    for key in (str(panel), "*"):
+        if panels.get(key):
+            queue = panels[key]
+            break
+elif script.get(stage):
+    queue = script[stage]
+with open(os.environ["FAKE_AGENT_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"argv": argv, "stage": stage, "panel": panel,
+                        "env_preflight": os.environ.get("QWEN_AGENT_PREFLIGHT_DONE")}) + "\n")
+if not queue:
+    sys.exit(9)
+item = queue.pop(0)
+with open(script_path, "w", encoding="utf-8") as f:
+    json.dump(script, f)
+if item.get("sleep"):
+    time.sleep(item["sleep"])
+if item.get("no_envelope"):
+    print("garbage")
+    sys.exit(1)
+status = item.get("status", "ok")
+answer = item.get("answer")
+print("some log line")
+print(json.dumps({"schema": "qwen-agent.oneshot.v1", "status": status, "answer": answer,
+                  "error": None, "rounds": 1, "tool_calls": 0}))
+sys.exit(0 if status == "ok" else 3)
+'''
+
+
+def make_ws(tmp_path, fake_agent=True, fake_judge=False):
+    """<tmp>/ws: symlinks to the real LINKED_FILES, a real bin/ holding symlinks to every real
+    bin/* file except qwen-agent (the fake agent when fake_agent) and judge-story (the fake
+    judge when fake_judge), and generated/stories/. Returns the ws path (str)."""
+    ws = os.path.join(str(tmp_path), "ws")
+    os.makedirs(os.path.join(ws, "bin"))
+    os.makedirs(os.path.join(ws, "generated", "stories"))
+    for name in LINKED_FILES:
+        os.symlink(os.path.join(WS, name), os.path.join(ws, name))
+    for name in sorted(os.listdir(os.path.join(WS, "bin"))):
+        if (name == "qwen-agent" and fake_agent) or (name == "judge-story" and fake_judge):
+            continue
+        os.symlink(os.path.join(WS, "bin", name), os.path.join(ws, "bin", name))
+    if fake_agent:
+        _write_executable(os.path.join(ws, "bin", "qwen-agent"), FAKE_AGENT_SOURCE)
+    if fake_judge:
+        _write_executable(os.path.join(ws, "bin", "judge-story"), FAKE_JUDGE_SOURCE)
+    return ws
+
+
+def _write_executable(path, source):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(source)
+    os.chmod(path, 0o755)
+
+
+def script_agent(monkeypatch, tmp_path, plan=(), panel=None, critic=()):
+    """Write the fake agent's script ({"plan": [...], "panel": {"<k>"|"*": [...]}, "critic":
+    [...]}) and point FAKE_AGENT_SCRIPT / FAKE_AGENT_LOG at it. Returns the log path."""
+    script = os.path.join(str(tmp_path), "agent_script.json")
+    log = os.path.join(str(tmp_path), "agent_log.jsonl")
+    with open(script, "w", encoding="utf-8") as f:
+        json.dump({"plan": list(plan), "panel": dict(panel or {}), "critic": list(critic)}, f)
+    if os.path.exists(log):
+        os.remove(log)
+    monkeypatch.setenv("FAKE_AGENT_SCRIPT", script)
+    monkeypatch.setenv("FAKE_AGENT_LOG", log)
+    return log
+
+
+def agent_log(path):
+    """The fake agent's call records, in call order ([] when it was never called)."""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def answer(obj):
+    """A fake-agent reply item whose answer is obj (a dict is JSON-encoded)."""
+    return {"answer": obj if isinstance(obj, str) else json.dumps(obj)}
+
+
+def make_ctx(se, ws, **overrides):
+    """A story_engine.StoryContext for ws with test defaults (chained, 3 panels, uncast, empty
+    catalog, auto LoRA on); keyword arguments replace fields."""
+    story_id = overrides.pop("story_id", "s1")
+    fields = dict(ws=ws, story_id=story_id,
+                  story_dir=os.path.join(ws, "generated", "stories", story_id), mode="chained",
+                  panels=3, seconds="6",
+                  narrative="A courier carries a sealed letter across a rainy harbour town.",
+                  goal=None, members=[], seed_image=None, seed_agent_image=None,
+                  story_model=None, context_window=None, video_model=VIDEO_MODEL,
+                  auto_lora=True, catalog={"schema_version": 1, "entries": []}, pinned=[],
+                  stills_pinned=[], judge=False)
+    fields.update(overrides)
+    os.makedirs(fields["story_dir"], exist_ok=True)
+    return se.StoryContext(**fields)
+
+
+FAKE_JUDGE_SOURCE = r'''#!/usr/bin/env python3
+"""Fake bin/judge-story --patches for the story engine tests (spec 5.2)."""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+with open(os.environ["FAKE_JUDGE_LOG"], "a", encoding="utf-8") as f:
+    f.write(json.dumps({"argv": argv}) + "\n")
+reply = json.loads(os.environ["FAKE_JUDGE_REPLY"])
+if "exit" in reply:
+    print("judge-story failed")
+    sys.exit(reply["exit"])
+story_md = argv[argv.index("--story-md") + 1]
+with open(os.path.join(os.path.dirname(story_md), "judgment.patches.json"), "w",
+          encoding="utf-8") as f:
+    json.dump({"scores": reply["scores"], "verdict": reply["verdict"],
+               "patches": reply["patches"]}, f)
+print("Scores: ...")
+sys.exit(0)
+'''

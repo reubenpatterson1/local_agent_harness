@@ -462,3 +462,12 @@ def test_lct29_lora_catalog_exit_codes(tmp_path, story_env):
     assert _cli(*_add_argv(lora, "fast-motion")).returncode == 0
     os.remove(lora)
     assert _cli("verify").returncode == 1
+
+
+def test_lct27_deploy_pipeline_files():
+    build_pkg = importlib.machinery.SourceFileLoader(
+        "build_pkg_for_lct27", os.path.join(WS, "scripts", "deploy", "build_pkg.py")).load_module()
+    files = list(build_pkg.PIPELINE_FILES)
+    at = files.index("character_lib.py")
+    assert files[at + 1:at + 3] == ["story_engine.py", "lora_catalog.py"]
+    assert "bin/lora-catalog" not in files and "fleet_lib.py" not in files
