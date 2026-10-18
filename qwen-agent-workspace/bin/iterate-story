@@ -47,6 +47,9 @@ STOP_MAX_ROUNDS = "max-rounds reached"
 VERSION_RE = re.compile(r"(?:story\.v(\d+)\.md|story_prompt\.v(\d+)\.txt|judgment\.v(\d+)\.json)")
 # Lines of captured child output shown on failure; bin/ltx-movie's splitlines()[-40:].
 TAIL_LINES = 40
+DEPRECATION_NOTICE = ("iterate-story is deprecated: bin/ltx-movie's default story engine now "
+                      "checks, critiques and patches the story itself (add --judge for the "
+                      "Claude gate).")
 # The one panel-count sentence removed from the judge's revised_prompt (spec 3.2, G19).
 PANEL_COUNT_DECLARATION_RE = re.compile(
     r"The file must contain EXACTLY \d+ panel sections?, numbered 1 through \d+ in order\.")
@@ -245,6 +248,42 @@ def story_md_hash(story_md_path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def _robust_plan(story_dir):
+    """<story_dir>/plan.json when bin/ltx-movie's default engine wrote it, else None."""
+    try:
+        with open(os.path.join(story_dir, "plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return plan if isinstance(plan, dict) and plan.get("schema") == "ltx-movie.plan.v1" else None
+
+
+def build_engine_cmd(story_id, plan, goal=None, story_model=None, story_context_window=None):
+    """The bin/ltx-movie argv that regenerates a default-engine story with the --judge gate
+    (robust story spec RS33)."""
+    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-movie"), plan["narrative"],
+           "--story-id", story_id, "--panels", str(plan["panels"])]
+    if plan["mode"] == "shots":
+        cmd.append("--shots")
+    elif plan["mode"] == "no_stills":
+        cmd.append("--no-stills")
+    for entry in plan["cast"]:
+        if entry.get("cast_name"):
+            cmd += ["--character", entry["cast_name"]]
+    if plan.get("seed_image"):
+        cmd += ["--seed-image", plan["seed_image"]]
+    for pin in plan["loras"].get("pinned", []):
+        cmd += ["--lora", "%s:%s" % (pin["path"], repr(float(pin["strength"])))]
+    if goal or plan.get("goal"):
+        cmd += ["--goal", goal or plan["goal"]]
+    cmd += ["--force-story", "--no-review", "--story-only", "--judge"]
+    if story_model is not None:
+        cmd += ["--story-model", story_model]
+    if story_context_window is not None:
+        cmd += ["--story-context-window", str(story_context_window)]
+    return cmd
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -254,6 +293,17 @@ def main(argv=None):
         parser.error("--max-rounds must be at least 1")
 
     story_dir, story_md_path, story_prompt_path = resolve_paths(args.story_id)
+    plan = _robust_plan(story_dir)
+    if plan is not None:
+        print(DEPRECATION_NOTICE, file=sys.stderr)
+        print("iterate-story: --threshold and --max-rounds are ignored on the default engine; its "
+              "thresholds are fixed", file=sys.stderr)
+        cmd = build_engine_cmd(args.story_id, plan, args.goal, args.story_model,
+                               args.story_context_window)
+        result = _run(cmd)
+        _log_run(story_dir, 1, "ltx-movie", cmd, result)
+        sys.stdout.write(result.stdout or "")
+        return result.returncode
     if not os.path.isfile(story_md_path):
         print("Error: story.md not found: %s" % story_md_path, file=sys.stderr)
         return 2
@@ -269,6 +319,7 @@ def main(argv=None):
         print('Error: no "## Panel" headers found in story.md: %s; cannot pin the panel '
               'count.' % story_md_path, file=sys.stderr)
         return 2
+    print(DEPRECATION_NOTICE, file=sys.stderr)
 
     version_base = find_version_base(story_dir)
     history = []

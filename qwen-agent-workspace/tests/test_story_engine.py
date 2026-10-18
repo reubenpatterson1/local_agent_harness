@@ -2364,3 +2364,146 @@ def test_rst57c_dry_run_lists_the_undeclared_characters(story_env):
     assert proc.returncode == 0, proc.stderr
     assert (' Never use these names or referring phrases, which belong to characters who are not '
             'in this movie: ronin ("the ronin").') in proc.stdout
+
+
+# --- RST48, RST49: bin/judge-story --patches, bin/iterate-story (RS32, RS33) --------------------
+
+judge_story = importlib.machinery.SourceFileLoader(
+    "judge_story_for_story_engine", os.path.join(WS, "bin", "judge-story")).load_module()
+iterate_story = importlib.machinery.SourceFileLoader(
+    "iterate_story_for_story_engine", os.path.join(WS, "bin", "iterate-story")).load_module()
+
+
+class _FakeAnthropic(object):
+    """Stands in for anthropic.Anthropic (the tests/test_judge_story.py pattern)."""
+
+    def __init__(self, scripted):
+        self.scripted = list(scripted)
+        self.calls = []
+        self.messages = type("M", (), {})()
+        self.messages.create = self._create
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.scripted.pop(0)
+
+
+def _anthropic_message(name, tool_input):
+    import anthropic
+    return anthropic.types.Message.model_validate({
+        "id": "msg_test", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
+        "stop_reason": "tool_use", "stop_sequence": None,
+        "content": [{"type": "tool_use", "id": "toolu_test", "name": name, "input": tool_input}],
+        "usage": {"input_tokens": 100, "output_tokens": 50}})
+
+
+def test_rst48_judge_story_patches(ws, monkeypatch, capsys, tmp_path):
+    ctx, text = _saved_story(ws, monkeypatch)
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    checks = {"hard": [{"message": "panel 2: N7 dialogue and text: Motion: says 'yells'"}],
+              "advisory": [{"message": "panel 3: N13 repeat: Motion: repeats panel 2's action "
+                                       "(similarity 0.71)"}]}
+    with open(os.path.join(ctx.story_dir, "story_checks.json"), "w") as f:
+        json.dump(checks, f)
+    review = {"scores": {"renderability": 6, "continuity": 8, "story": 7}, "verdict": "revise",
+              "patches": [{"target": "panel", "index": 2, "field": "motion", "reason": "dialogue",
+                           "replacement": "The courier pedals on."}]}
+    fake = _FakeAnthropic([_anthropic_message("submit_review", review)])
+    monkeypatch.setattr(judge_story.anthropic, "Anthropic", fake)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    monkeypatch.setattr(judge_story, "WS", WS)
+    assert judge_story.main(["--story-md", story_md, "--patches"]) == 0
+    kwargs = fake.calls[0]
+    assert kwargs["system"] == judge_story.PATCH_SYSTEM_PROMPT_TEMPLATE.replace(
+        "@@GOAL@@", judge_story.DEFAULT_GOAL)
+    assert kwargs["tools"] == [{"name": "submit_review", "description": (
+        "Submit your review of the story: three 1-10 scores, a verdict, and at most 8 patches. "
+        "You must call this exactly once."), "input_schema": judge_story.SUBMIT_REVIEW_SCHEMA}]
+    plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
+    assert kwargs["messages"] == [{"role": "user", "content": se.build_critic_prompt(
+        plan, text, ([checks["hard"][0]["message"]], [checks["advisory"][0]["message"]]),
+        for_judge=True)}]
+    judgment = _read_json(os.path.join(ctx.story_dir, "judgment.patches.json"))
+    assert list(judgment) == ["story_md_path", "plan_path", "model", "effort", "goal", "timestamp",
+                              "usage", "scores", "verdict", "patches"]
+    assert list(judgment["scores"]) == ["continuity", "story", "renderability"]
+    assert judgment["patches"] == review["patches"]
+    assert capsys.readouterr().out == ("Scores:\n  continuity      8\n  story           7\n"
+                                       "  renderability   6\n\nVerdict: revise\nPatches: 1\n")
+    os.remove(os.path.join(ctx.story_dir, "plan.json"))
+    assert judge_story.main(["--story-md", story_md, "--patches"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: plan.json not found: %s. --patches needs a story written by bin/ltx-movie's "
+        "default story engine.\n" % os.path.join(ctx.story_dir, "plan.json"))
+    with pytest.raises(SystemExit) as exc:
+        judge_story.main(["--story-md", story_md, "--patches", "--target-panels", "3"])
+    assert exc.value.code == 2
+    assert "--patches cannot be combined with --target-panels" in capsys.readouterr().err
+    with open(os.path.join(ctx.story_dir, "story_prompt.txt"), "w") as f:
+        f.write("PROMPT")
+    judgment_input = {"scores": dict((k, 7) for k in judge_story.SCORE_KEYS), "critique": "c",
+                      "revised_prompt": "r"}
+    fake = _FakeAnthropic([_anthropic_message("submit_judgment", judgment_input)])
+    monkeypatch.setattr(judge_story.anthropic, "Anthropic", fake)
+    assert judge_story.main(["--story-md", story_md]) == 0
+    assert fake.calls[0]["system"] == judge_story.SYSTEM_PROMPT
+    assert fake.calls[0]["tools"][0]["name"] == "submit_judgment"
+    assert list(_read_json(os.path.join(ctx.story_dir, "judgment.json"))) == [
+        "story_md_path", "story_prompt_path", "model", "effort", "goal", "timestamp", "usage",
+        "scores", "critique", "revised_prompt"]
+
+
+class _Completed(object):
+    def __init__(self, returncode, stdout):
+        self.returncode, self.stdout = returncode, stdout
+
+
+def test_rst49_iterate_story_wrapper(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(iterate_story, "WS", str(tmp_path))
+    story_dir = tmp_path / "generated" / "stories" / "it1"
+    story_dir.mkdir(parents=True)
+    plan = {"schema": "ltx-movie.plan.v1", "mode": "shots", "panels": 4,
+            "narrative": "A ronin at dusk.", "seed_image": "/s/seed.png", "goal": "plan goal",
+            "cast": [{"id": "c1", "cast_name": "kyra"}, {"id": "c2", "cast_name": None},
+                     {"id": "c3", "cast_name": "ronin"}],
+            "loras": {"pinned": [{"path": "/p/a.safetensors", "strength": 1.0},
+                                 {"path": "/p/b.safetensors", "strength": 0.5}]}}
+    (story_dir / "plan.json").write_text(json.dumps(plan))
+    calls = []
+    monkeypatch.setattr(iterate_story, "_run",
+                        lambda cmd: calls.append(cmd) or _Completed(3, "engine output\n"))
+    rc = iterate_story.main(["--story-id", "it1", "--threshold", "8", "--goal", "cli goal",
+                             "--story-model", "M", "--story-context-window", "9000"])
+    assert rc == 3
+    assert calls == [[sys.executable, os.path.join(str(tmp_path), "bin", "ltx-movie"),
+                      "A ronin at dusk.", "--story-id", "it1", "--panels", "4", "--shots",
+                      "--character", "kyra", "--character", "ronin", "--seed-image",
+                      "/s/seed.png", "--lora", "/p/a.safetensors:1.0", "--lora",
+                      "/p/b.safetensors:0.5", "--goal", "cli goal", "--force-story",
+                      "--no-review", "--story-only", "--judge", "--story-model", "M",
+                      "--story-context-window", "9000"]]
+    out, err = capsys.readouterr()
+    assert out == "engine output\n"
+    assert err == (iterate_story.DEPRECATION_NOTICE + "\niterate-story: --threshold and "
+                   "--max-rounds are ignored on the default engine; its thresholds are fixed\n")
+    assert "=== round 1: ltx-movie ===" in (story_dir / "iterate-story.log").read_text()
+    plan.update(mode="no_stills", goal=None, seed_image=None)
+    (story_dir / "plan.json").write_text(json.dumps(plan))
+    iterate_story.main(["--story-id", "it1", "--threshold", "8"])
+    assert calls[-1][7] == "--no-stills" and "--goal" not in calls[-1]
+    capsys.readouterr()
+    (story_dir / "plan.json").unlink()
+    assert iterate_story.main(["--story-id", "it1", "--threshold", "8"]) == 2
+    out, err = capsys.readouterr()
+    assert err.startswith("Error: story.md not found") and iterate_story.DEPRECATION_NOTICE not in err
+    (story_dir / "story.md").write_text("## Panel 1 — A\nMotion: x\n")
+    (story_dir / "story_prompt.txt").write_text("P")
+    monkeypatch.setattr(iterate_story, "_run", lambda cmd: _Completed(1, "judge failed"))
+    assert iterate_story.main(["--story-id", "it1", "--threshold", "8"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err.startswith(iterate_story.DEPRECATION_NOTICE + "\nError: round 1: judge-story "
+                          "exited 1")

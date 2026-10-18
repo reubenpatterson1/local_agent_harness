@@ -137,6 +137,55 @@ RETRY_USER_MESSAGE = ("You did not call the submit_judgment tool. Call submit_ju
                       "with your scores, critique, and revised_prompt. Do not reply with "
                       "plain text.")
 
+# --patches (docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md RS32): review a
+# story written by bin/ltx-movie's default engine and return per-panel patches.
+REVIEW_TOOL_NAME = "submit_review"
+REVIEW_TOOL_DESCRIPTION = ("Submit your review of the story: three 1-10 scores, a verdict, and at "
+                           "most 8 patches. You must call this exactly once.")
+REVIEW_SCORE_KEYS = ("continuity", "story", "renderability")
+PATCH_FIELDS = ("beat.action", "beat.shot", "beat.camera", "location.setting", "lora", "motion",
+                "image", "prompt", "narration")
+SUBMIT_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "scores": {
+            "type": "object",
+            "properties": {key: {"type": "integer", "minimum": 1, "maximum": 10}
+                           for key in REVIEW_SCORE_KEYS},
+            "required": list(REVIEW_SCORE_KEYS),
+        },
+        "verdict": {"type": "string", "enum": ["ok", "revise"]},
+        "patches": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "enum": ["plan", "panel"]},
+                    "index": {"type": "integer", "minimum": 0},
+                    "field": {"type": "string", "enum": list(PATCH_FIELDS)},
+                    "reason": {"type": "string"},
+                    "replacement": {},
+                },
+                "required": ["target", "index", "field", "reason", "replacement"],
+            },
+        },
+    },
+    "required": ["scores", "verdict", "patches"],
+}
+PATCH_SYSTEM_PROMPT_TEMPLATE = (
+    "You are an expert story editor reviewing a story written for an AI image-and-video "
+    "generation pipeline. The target output goal is @@GOAL@@.\n"
+    "\n"
+    "The user message holds the movie's plan, its story.md and the problems the pipeline's own "
+    "checks found. Score the story and propose at most 8 exact patches, following the "
+    "instructions in the user message.\n"
+    "\n"
+    "You must deliver your review by calling the submit_review tool exactly once. Do not put the "
+    "review in a plain text reply; a response without a submit_review call is a failure.")
+RETRY_REVIEW_MESSAGE = ("You did not call the submit_review tool. Call submit_review now with "
+                        "your scores, verdict and patches. Do not reply with plain text.")
+
 
 def validate_judgment_input(tool_input):
     """Raise jsonschema.ValidationError unless tool_input matches SUBMIT_JUDGMENT_SCHEMA.
@@ -168,10 +217,10 @@ def build_user_message(story_md_text, story_prompt_text, target_panels=None):
     return message
 
 
-def find_tool_use(response):
-    """First content block that is a submit_judgment tool call, else None."""
+def find_tool_use(response, name=TOOL_NAME):
+    """First content block that is a call of the named tool (submit_judgment), else None."""
     for block in response.content:
-        if block.type == "tool_use" and block.name == TOOL_NAME:
+        if block.type == "tool_use" and block.name == name:
             return block
     return None
 
@@ -208,6 +257,10 @@ def build_parser():
                        help="instruct the judge that revised_prompt must target exactly N "
                             "panels (used by bin/iterate-story to keep the panel count "
                             "stable across rounds)")
+    parser.add_argument("--patches", action="store_true", default=False,
+                        help="review a story written by bin/ltx-movie's default engine: read the "
+                             "sibling plan.json and story_checks.json and return per-panel "
+                             "patches (judgment.patches.json) instead of a revised prompt")
     parser.add_argument("--goal", dest="goal", type=parse_goal, default=None, metavar="TEXT",
                         help="the target output goal stated in the judge's system prompt, "
                              "worded to complete 'The target output goal is TEXT.' "
@@ -230,17 +283,17 @@ def resolve_paths(story_id, story_md):
     return story_dir, story_md_path, story_prompt_path
 
 
-def _create_message(client, system_prompt, messages):
+def _create_message(client, system_prompt, messages, tool=None):
     """One non-streaming judging call with the fixed spec 4.1 parameters and the given
     system prompt. No temperature, top_k, or top_p: extended thinking rejects non-default
-    values."""
+    values. tool replaces the submit_judgment tool definition (--patches)."""
     return client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         thinking={"type": "adaptive"},
         output_config={"effort": EFFORT},
         system=system_prompt,
-        tools=[{
+        tools=[tool or {
             "name": TOOL_NAME,
             "description": TOOL_DESCRIPTION,
             "input_schema": SUBMIT_JUDGMENT_SCHEMA,
@@ -260,13 +313,129 @@ def _write_raw(story_dir, responses):
     return path
 
 
+def _story_engine():
+    """story_engine.py's namespace, loaded by path from WS (robust story spec RS32). The file is
+    executed into a fresh dict rather than imported, so this script gains no import statement
+    (spec RSK3)."""
+    path = os.path.join(WS, "story_engine.py")
+    namespace = {"__name__": "story_engine_for_judge", "__file__": path}
+    with open(path, encoding="utf-8") as f:
+        exec(compile(f.read(), path, "exec"), namespace)
+    return namespace
+
+
+def _story_checks_messages(story_dir):
+    """(hard, advisory) messages from the sibling story_checks.json; ([], []) when it is absent
+    or unreadable."""
+    try:
+        with open(os.path.join(story_dir, "story_checks.json"), encoding="utf-8") as f:
+            checks = json.load(f)
+        return ([v["message"] for v in checks["hard"]],
+                [v["message"] for v in checks["advisory"]])
+    except Exception:
+        return [], []
+
+
+def main_patches(args, story_dir, story_md_path):
+    """--patches: per-panel patches for a robust-engine story (robust story spec RS32)."""
+    plan_path = os.path.join(story_dir, "plan.json")
+    if not os.path.isfile(plan_path):
+        print("Error: plan.json not found: %s. --patches needs a story written by bin/ltx-movie's "
+              "default story engine." % plan_path, file=sys.stderr)
+        return 2
+    with open(story_md_path, encoding="utf-8") as f:
+        story_md_text = f.read()
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            plan = json.load(f)
+    except ValueError as e:
+        print("Error: plan.json is not valid JSON: %s: %s" % (plan_path, e), file=sys.stderr)
+        return 2
+    violations = _story_checks_messages(story_dir)
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: ANTHROPIC_API_KEY is not set; export it in your environment to run "
+              "judge-story.", file=sys.stderr)
+        return 1
+    client = anthropic.Anthropic()
+    user_message = _story_engine()["build_critic_prompt"](plan, story_md_text, violations,
+                                                          catalog_lines=None, for_judge=True)
+    goal = DEFAULT_GOAL if args.goal is None else args.goal
+    system_prompt = PATCH_SYSTEM_PROMPT_TEMPLATE.replace(GOAL_TOKEN, goal)
+    tool = {"name": REVIEW_TOOL_NAME, "description": REVIEW_TOOL_DESCRIPTION,
+            "input_schema": SUBMIT_REVIEW_SCHEMA}
+    responses = []
+    try:
+        responses.append(_create_message(client, system_prompt,
+                                         [{"role": "user", "content": user_message}], tool))
+        block = find_tool_use(responses[0], REVIEW_TOOL_NAME)
+        if block is None:
+            responses.append(_create_message(client, system_prompt, [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": responses[0].content},
+                {"role": "user", "content": RETRY_REVIEW_MESSAGE},
+            ], tool))
+            block = find_tool_use(responses[1], REVIEW_TOOL_NAME)
+    except anthropic.APIError as e:
+        print("Error: Anthropic API call failed: %s: %s" % (type(e).__name__, e),
+              file=sys.stderr)
+        return 1
+    if block is None:
+        raw_path = _write_raw(story_dir, responses)
+        print("Error: Claude did not call submit_review after one retry; raw responses "
+              "written to %s" % raw_path, file=sys.stderr)
+        return 1
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        jsonschema.validate(instance=block.input, schema=SUBMIT_REVIEW_SCHEMA)
+    except jsonschema.ValidationError as e:
+        _write_raw(story_dir, responses)
+        print("Error: submit_review input failed schema validation: %s" % e.message,
+              file=sys.stderr)
+        return 1
+    review = block.input
+    thinking_counts = [r.usage.output_tokens_details.thinking_tokens for r in responses
+                       if r.usage.output_tokens_details is not None
+                       and r.usage.output_tokens_details.thinking_tokens is not None]
+    judgment = {
+        "story_md_path": story_md_path,
+        "plan_path": plan_path,
+        "model": MODEL,
+        "effort": EFFORT,
+        "goal": goal,
+        "timestamp": timestamp,
+        "usage": {
+            "input_tokens": sum(r.usage.input_tokens for r in responses),
+            "output_tokens": sum(r.usage.output_tokens for r in responses),
+            "thinking_tokens": sum(thinking_counts) if thinking_counts else None,
+        },
+        "scores": {name: review["scores"][name] for name in REVIEW_SCORE_KEYS},
+        "verdict": review["verdict"],
+        "patches": review["patches"],
+    }
+    with open(os.path.join(story_dir, "judgment.patches.json"), "w", encoding="utf-8") as f:
+        json.dump(judgment, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print("Scores:")
+    for name in REVIEW_SCORE_KEYS:
+        print("  %-14s  %d" % (name, judgment["scores"][name]))
+    print()
+    print("Verdict: %s" % judgment["verdict"])
+    print("Patches: %d" % len(judgment["patches"]))
+    return 0
+
+
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.patches and args.target_panels is not None:
+        parser.error("--patches cannot be combined with --target-panels")
     story_dir, story_md_path, story_prompt_path = resolve_paths(args.story_id, args.story_md)
 
     if not os.path.isfile(story_md_path):
         print("Error: story.md not found: %s" % story_md_path, file=sys.stderr)
         return 2
+    if args.patches:
+        return main_patches(args, story_dir, story_md_path)
     if not os.path.isfile(story_prompt_path):
         print("Error: story_prompt.txt not found: %s. judge-story needs the original "
               "story-generation prompt to produce revised_prompt. This story may predate "
