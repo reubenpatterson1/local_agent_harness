@@ -13,6 +13,7 @@ import importlib.machinery
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -969,9 +970,9 @@ def test_lct20_unit_lora_order(tmp_path, story_env):
     units = render.build_units(data["panels"], 0, str(tmp_path / "clips"),
                                global_loras=[{"path": "/g.safetensors", "strength": 0.5}])
     assert units[0]["loras"] == [
-        {"kind": "global", "name": None, "path": "/g.safetensors", "strength": 0.5},
         {"kind": "catalog", "name": "fast-motion", "path": fast["path"], "strength": 0.7,
          "catalog_id": "fast-motion"},
+        {"kind": "global", "name": None, "path": "/g.safetensors", "strength": 0.5},
         {"kind": "catalog", "name": "film-grain", "path": grain["path"], "strength": 0.8,
          "catalog_id": "film-grain"},
         {"kind": "character", "name": "kyra", "path": video, "strength": 1.0}]
@@ -1079,3 +1080,26 @@ def test_lct30_chained_manifest_per_panel_units(tmp_path, monkeypatch, capsys):
     harness = _RenderHarness(monkeypatch, tmp_path, panels)
     assert harness.run("--dry-run", "--on-panel-failure", "stop") == 0
     assert "panel  2: I2V chained" in capsys.readouterr().out
+
+
+def test_lct20b_motion_first_stable_partition(tmp_path, monkeypatch, capsys, story_env):
+    style = _entry(tmp_path, "aa-style", "style", 0.8, ["aastyle"])
+    motion = _entry(tmp_path, "zz-motion", "motion", 0.7, ["zzmo"])
+    seu.kyra(story_env["lib"])
+    video = os.path.join(story_env["lib"], "kyra", "lora", "video.safetensors")
+    character = {"name": "kyra", "phrase": "the woman in grey", "trigger": "kyrawmn",
+                 "video_lora": video, "strength": 1.0}
+    user = seu.lora_file(str(tmp_path / "files"), "user")
+    panels = _chain_panels(tmp_path, [[style, motion], [], []], characters={1: [character]})
+    data = render.load_manifest(_write_render_manifest(tmp_path, panels))
+    units = render.build_units(data["panels"], 0, str(tmp_path / "clips"),
+                               global_loras=[{"path": user, "strength": 0.5}])
+    expected = [motion["path"], user, style["path"], video]
+    assert [l["path"] for l in units[0]["loras"]] == expected
+    harness = _RenderHarness(monkeypatch, tmp_path, panels)
+    assert harness.run("--dry-run", "--lora", user + ":0.5") == 0
+    out = capsys.readouterr().out
+    command = [l for l in out.splitlines() if l.startswith("first render command: ")][0]
+    argv = shlex.split(command[len("first render command: "):])
+    paths = [argv[i + 1] for i, a in enumerate(argv) if a == "--lora"]
+    assert paths == expected

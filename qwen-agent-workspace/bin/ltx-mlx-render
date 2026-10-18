@@ -346,11 +346,17 @@ def build_units(panels, seed, clips_dir, run_root=None, global_loras=()):
             "chain_source": (os.path.join(clips_dir, "panel_%02d.mp4" % (i - 1)) if chained
                              else None),
         }
-        loras = [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
-                 for g in global_loras]
-        loras += [{"kind": "catalog", "name": e["id"], "path": e["path"],
-                   "strength": float(e["strength"]), "catalog_id": e["id"]}
-                  for e in (panel.get("catalog_loras") or [])]
+        catalog = panel.get("catalog_loras") or []
+        catalog = ([e for e in catalog if e["kind"] in ("motion", "physics")]
+                   + [e for e in catalog if e["kind"] not in ("motion", "physics")])
+        catalog_units = [{"kind": "catalog", "name": e["id"], "path": e["path"],
+                          "strength": float(e["strength"]), "catalog_id": e["id"]}
+                         for e in catalog]
+        n_lead = sum(1 for e in catalog if e["kind"] in ("motion", "physics"))
+        loras = catalog_units[:n_lead]
+        loras += [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
+                  for g in global_loras]
+        loras += catalog_units[n_lead:]
         loras += [{"kind": "character", "name": c["name"], "path": c["video_lora"],
                    "strength": float(c["strength"])} for c in (panel.get("characters") or [])]
         if loras:

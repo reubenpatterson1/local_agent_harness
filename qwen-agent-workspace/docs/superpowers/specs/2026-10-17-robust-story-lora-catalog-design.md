@@ -989,7 +989,7 @@ Repeatable (`action="append"`, `dest="lora_trigger"`, default None). After the `
 
 - `load_manifest`: an optional per-panel `catalog_loras` (any schema version) must be a list of dicts with exactly the six keys and LC15's per-entry rules (`path` readable); violations raise `ValueError("panel %d: catalog_loras ...")` (exit 2 through `main`).
 - `main`, after the existing global/character checks (`:1073-1102`): a catalog entry whose path's realpath equals a `--lora` global's -> `Error: catalog LoRA %s (panel %d) is also passed with --lora; pass it once` (2); equals one of that panel's character `video_lora` -> `Error: catalog LoRA %s (panel %d) is also character %s's video LoRA` (2); then for each distinct catalog path, `lora_sha256(path) != entry["sha256"]` -> `Error: panel %d: catalog LoRA %s does not match its cataloged sha256; the file changed since bin/lora-catalog add (run bin/lora-catalog verify)` (2). These run before the `--dry-run` short-circuit.
-- `build_units`: `loras = global entries; then catalog entries in manifest order; then character entries`. A catalog unit entry is `{"kind": "catalog", "name": id, "path": path, "strength": float(strength), "catalog_id": id}`. **[spec choice: user `--lora` globals stay first, so the existing "global ahead of character" contract and every existing provenance stay byte-identical; inside the catalog slice the order is the approved motion/physics, then style; the sum in `fuse_loras` makes order irrelevant to pixels]**
+- `build_units`: `loras = catalog motion/physics entries (manifest order); then global entries; then catalog style entries; then character entries`. Catalog entries are stably partitioned by kind (motion/physics before style, original order within a kind), so a hand-edited style-first manifest still renders motion first. A catalog unit entry is `{"kind": "catalog", "name": id, "path": path, "strength": float(strength), "catalog_id": id}`. **[amended 2026-10-17 at implementation: the user's rule is that the motion/physics adapter is always listed first; runs without catalog entries are byte-identical to before; the sum in `fuse_loras` keeps pixels unchanged]**
 - `build_clip_provenance`: a catalog entry is recorded as `{"kind": "catalog", "path", "sha256": lora_sha256(path), "strength", "catalog_id": id}`; global and character entries unchanged.
 - `print_dry_run` needs no change (it prints `l["name"] or "global"`, which is the id).
 
@@ -1280,7 +1280,7 @@ For each premise: `python3 bin/ltx-movie "<narrative>" --story-id <id>-L <flags>
 25. LC7: `--default-strength 1.0`, `--strength-range 0.5,1.0`.
 26. LC10: `verify` exits 1 on problems.
 27. LC12: pins stay on the global `--lora` route; pins skip the range check.
-28. LC17: render order global, catalog (motion/physics, style), character.
+28. LC17: render order catalog motion/physics, global, catalog style, character.
 29. LC18: triggers lead the prompt as `t1, t2. <prompt>`.
 30. LC19: `bin/lora-catalog` is not shipped in the deploy package.
 31. 7.2: `plan_free_report` is the common hard-violation yardstick for the A/B.
