@@ -295,11 +295,16 @@ def main(argv=None):
     story_dir, story_md_path, story_prompt_path = resolve_paths(args.story_id)
     plan = _robust_plan(story_dir)
     if plan is not None:
+        try:
+            cmd = build_engine_cmd(args.story_id, plan, args.goal, args.story_model,
+                                   args.story_context_window)
+        except (KeyError, TypeError, AttributeError, ValueError):
+            print("Error: %s is not a usable plan.json; regenerate the story with bin/ltx-movie "
+                  "--force-story" % os.path.join(story_dir, "plan.json"), file=sys.stderr)
+            return 2
         print(DEPRECATION_NOTICE, file=sys.stderr)
         print("iterate-story: --threshold and --max-rounds are ignored on the default engine; its "
               "thresholds are fixed", file=sys.stderr)
-        cmd = build_engine_cmd(args.story_id, plan, args.goal, args.story_model,
-                               args.story_context_window)
         result = _run(cmd)
         _log_run(story_dir, 1, "ltx-movie", cmd, result)
         sys.stdout.write(result.stdout or "")

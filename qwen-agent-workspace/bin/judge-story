@@ -351,14 +351,24 @@ def main_patches(args, story_dir, story_md_path):
     except ValueError as e:
         print("Error: plan.json is not valid JSON: %s: %s" % (plan_path, e), file=sys.stderr)
         return 2
+    not_a_plan = ("Error: %s is not a plan.json written by bin/ltx-movie's default story engine. "
+                  "--patches needs a story written by bin/ltx-movie's default story engine."
+                  % plan_path)
+    if not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1":
+        print(not_a_plan, file=sys.stderr)
+        return 2
     violations = _story_checks_messages(story_dir)
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("Error: ANTHROPIC_API_KEY is not set; export it in your environment to run "
               "judge-story.", file=sys.stderr)
         return 1
     client = anthropic.Anthropic()
-    user_message = _story_engine()["build_critic_prompt"](plan, story_md_text, violations,
-                                                          catalog_lines=None, for_judge=True)
+    try:
+        user_message = _story_engine()["build_critic_prompt"](plan, story_md_text, violations,
+                                                              catalog_lines=None, for_judge=True)
+    except (KeyError, TypeError, AttributeError, ValueError):
+        print(not_a_plan, file=sys.stderr)
+        return 2
     goal = DEFAULT_GOAL if args.goal is None else args.goal
     system_prompt = PATCH_SYSTEM_PROMPT_TEMPLATE.replace(GOAL_TOKEN, goal)
     tool = {"name": REVIEW_TOOL_NAME, "description": REVIEW_TOOL_DESCRIPTION,
