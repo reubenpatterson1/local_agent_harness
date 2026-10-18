@@ -1917,3 +1917,343 @@ def test_rst44d_recheck_no_plan_enforces_n15(ws, monkeypatch, capsys, story_env)
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     declared = seu.make_ctx(se, ws, mode="chained", panels=3, members=members)
     assert se.recheck(declared, ltx_movie._validate_story_md) == (0, [])
+
+
+# --- RST2-RST4, RST39b, RST40, RST42, RST46, RST50-RST54: bin/ltx-movie (RS2, RS25, RS29,
+# RS31, RS34, RS35) -------------------------------------------------------------------------
+
+LEGACY_STORY = """# Legacy
+
+## Panel 1 — One
+Image: A courier stands on a wet quay.
+Motion: The courier pushes off.
+Narration: It rained.
+
+## Panel 2 — Two
+Motion: The courier pedals on.
+Narration: It rained more.
+
+## Panel 3 — Three
+Motion: The courier arrives.
+Narration: It stopped.
+"""
+NARRATIVE = "A courier carries a sealed letter across a rainy harbour town."
+
+
+@pytest.fixture
+def movie(tmp_path, monkeypatch):
+    """A temp workspace with the fake agent; ltx_movie.WS points at it; no sudo check."""
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    monkeypatch.setattr(ltx_movie, "_check_sudo_and_start_keepalive", lambda: None)
+    return ws
+
+
+class _LegacyPopen(object):
+    """Records each Popen argv; communicate() writes LEGACY_STORY to the story.md named by the
+    story id in the prompt and exits 0."""
+    calls = []
+
+    def __init__(self, cmd, **kwargs):
+        _LegacyPopen.calls.append(list(cmd))
+        self.cmd = cmd
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        story_id = re.search(r'\(story-id "([^"]+)"\)', self.cmd[-1]).group(1)
+        with open(os.path.join(ltx_movie.WS, "generated", "stories", story_id, "story.md"),
+                  "w", encoding="utf-8") as f:
+            f.write(LEGACY_STORY)
+        return "", None
+
+
+def test_rst2_flags_and_parse_goal():
+    args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x"])
+    assert (args.story_legacy, args.no_auto_lora, args.judge, args.goal) == (False, False, False,
+                                                                             None)
+    judge_story = importlib.machinery.SourceFileLoader(
+        "judge_story_for_rst2", os.path.join(WS, "bin", "judge-story")).load_module()
+    for text in ("a quiet drama.", "", "two\nlines", "x" * 301, "realistic action", "   "):
+        outcomes = []
+        for parse in (ltx_movie._parse_goal, judge_story.parse_goal):
+            try:
+                outcomes.append(("ok", parse(text)))
+            except Exception as e:
+                outcomes.append((type(e).__name__, str(e)))
+        assert outcomes[0] == outcomes[1], text
+    assert ltx_movie._parse_goal(" a quiet drama. ") == "a quiet drama"
+    args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x", "--story-legacy",
+                                                "--no-auto-lora", "--judge", "--goal", "g."])
+    assert (args.story_legacy, args.no_auto_lora, args.judge, args.goal) == (True, True, True, "g")
+
+
+def _engine_args(*argv):
+    args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x"] + list(argv))
+    return args, ltx_movie._resolve_story_engine(args)
+
+
+def test_rst3_resolve_story_engine(tmp_path, capsys, monkeypatch, story_env):
+    override = str(tmp_path / "override.txt")
+    with open(override, "w") as f:
+        f.write("P")
+    for extra, reason in ((["--story-legacy"], "--story-legacy"),
+                          (["--story-prompt-override", override], "--story-prompt-override")):
+        for flag in (["--judge"], ["--no-auto-lora"], ["--goal", "g"]):
+            _args, rc = _engine_args(*(extra + flag))
+            assert rc == 2
+            assert capsys.readouterr().err == (
+                "Error: %s needs the default story engine; it cannot be combined with %s\n"
+                % (flag[0], reason))
+        args, rc = _engine_args(*extra)
+        assert (rc, args.story_engine, args.story_catalog) == (0, "legacy", None)
+    _args, rc = _engine_args("--judge")
+    assert rc == 2 and capsys.readouterr().err == (
+        "Error: --judge needs ANTHROPIC_API_KEY for bin/judge-story; export it or drop --judge\n")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    args, rc = _engine_args("--judge")
+    assert (rc, args.story_engine) == (0, "robust")
+    args, rc = _engine_args()
+    assert (rc, args.story_engine, args.story_catalog) == (0, "robust", {"schema_version": 1,
+                                                                         "entries": []})
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    with open(path, "w") as f:
+        f.write("[]")
+    _args, rc = _engine_args()
+    assert rc == 2 and capsys.readouterr().err == (
+        "Error: invalid LoRA catalog %s: top level: must be an object with exactly the keys "
+        "entries, schema_version; run bin/lora-catalog verify\n" % path)
+    args, rc = _engine_args("--no-auto-lora")
+    assert (rc, args.story_catalog) == (0, {"schema_version": 1, "entries": []})
+
+
+def test_rst4_direct_phase1_story_call_stays_legacy(movie, monkeypatch):
+    _LegacyPopen.calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", _LegacyPopen)
+    os.makedirs(os.path.join(movie, "generated", "stories", "d1"))
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "d1", "--panels", "3",
+                                                "--no-review"])
+    assert not hasattr(args, "story_engine")
+    assert ltx_movie.phase1_story(args) == 0
+    assert _LegacyPopen.calls[0][4:8] == ["--max-tokens", "4096", "--max-rounds", "4"]
+
+
+def test_rst40_legacy_phase1_is_byte_identical(movie, monkeypatch, tmp_path, story_env, capsys):
+    from PIL import Image
+    with open(os.path.join(story_env["catalog"], "catalog.json"), "w") as f:
+        f.write("[]")
+    _LegacyPopen.calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", _LegacyPopen)
+    seed = str(tmp_path / "seed.png")
+    Image.new("RGB", (704, 448), (10, 20, 30)).save(seed)
+    head = [sys.executable, os.path.join(movie, "bin", "qwen-agent"), "--workspace", movie,
+            "--max-tokens", "4096", "--max-rounds", "4", "--request-timeout", "600"]
+    cases = [
+        ("l1", [], [], False),
+        ("l2", ["--force-story"], ["--danger-auto-approve"], False),
+        ("l3", ["--story-model", "andrevp/Qwen", "--story-context-window", "262144"],
+         ["--model", "andrevp/Qwen", "--context-window", "262144"], False),
+        ("l4", ["--seed-image", seed],
+         ["--image", os.path.join(movie, "generated", "stories", "l4", "seed_downscaled.png")],
+         True),
+    ]
+    for story_id, flags, middle, seeded in cases:
+        argv = [NARRATIVE, "--story-id", story_id, "--panels", "3", "--story-legacy",
+                "--story-only", "--no-review"] + flags
+        assert ltx_movie.main(argv) == 0, capsys.readouterr().err
+        prompt = ltx_movie.build_story_prompt(NARRATIVE, story_id, 3, False, seeded, seconds="6")
+        assert _LegacyPopen.calls[-1] == head + middle + ["--user-prompt", prompt]
+        with open(os.path.join(movie, "generated", "stories", story_id, "story_prompt.txt")) as f:
+            assert f.read() == prompt
+    assert len(_LegacyPopen.calls) == 4
+
+
+def test_rst42_legacy_moves_a_stale_plan_aside(movie, monkeypatch, capsys):
+    _LegacyPopen.calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", _LegacyPopen)
+    story_dir = os.path.join(movie, "generated", "stories", "m1")
+    os.makedirs(story_dir)
+    with open(os.path.join(story_dir, "plan.json"), "w") as f:
+        f.write("{}")
+    assert ltx_movie.main([NARRATIVE, "--story-id", "m1", "--panels", "3", "--story-legacy",
+                           "--dry-run", "--no-review"]) == 0
+    assert os.path.exists(os.path.join(story_dir, "plan.json"))
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "m1", "--panels", "3", "--story-legacy",
+                           "--story-only", "--no-review"]) == 0
+    moved = [n for n in os.listdir(story_dir) if n.startswith("plan.stale-")]
+    assert len(moved) == 1 and re.fullmatch(r"plan\.stale-\d{8}T\d{6}Z-\d+\.json", moved[0])
+    assert not os.path.exists(os.path.join(story_dir, "plan.json"))
+    assert ("note: moved the robust engine's plan.json aside to %s; this story.md is written by "
+            "--story-legacy\n" % os.path.join(story_dir, moved[0])) in capsys.readouterr().out
+
+
+def test_rst46_review_gate(ws, monkeypatch, capsys, story_env):
+    ctx, text = _saved_story(ws, monkeypatch, part_mut=lambda parts: parts[1].update(
+        narration="It rained. It poured."))
+    members = _cast_members(story_env, "kyra")
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt))
+    for no_review in (False, True):
+        args = ltx_movie.build_parser().parse_args(
+            [NARRATIVE, "--story-id", "s1", "--panels", "3"] + (["--no-review"] if no_review else []))
+        assert ltx_movie._resolve_story_engine(args) == 0
+        args.cast_members = members
+        assert ltx_movie._phase1_robust(args) == 0
+        out = capsys.readouterr().out
+        warnings = ("Warning: panel 2: N14 narration form: Narration: is 2 sentences; it should be "
+                    "one sentence of 3-30 words\nWarning: story.md does not use cast phrase 'the "
+                    "woman in grey'; character kyra gets no LoRA in this story\n")
+        note = ("note: %s already exists; re-checking it instead of regenerating it (pass "
+                "--force-story to regenerate)\n" % os.path.join(ctx.story_dir, "story.md"))
+        if no_review:
+            assert out == note + warnings
+        else:
+            assert out == note + "=== story.md ===\n" + text + "\n" + warnings
+    assert prompts == ["Review story.md above. Enter to continue, Ctrl-C to abort: "]
+
+
+def test_rst50_source_literal_counts():
+    with open(os.path.join(WS, "bin", "ltx-movie"), encoding="utf-8") as f:
+        movie = f.read()
+    with open(os.path.join(WS, "bin", "ltx-story-images"), encoding="utf-8") as f:
+        images = f.read()
+    counts = [('["--model", args.story_model]', 2),
+              ('["--context-window", str(args.story_context_window)]', 2),
+              ('"--workspace", WS,', 2), ("_render_flags(args)", 4),
+              ('os.path.join(WS, "bin", "ltx-mlx-render")', 4),
+              ('cmd += ["--image", args.seed_downscaled_path]', 1),
+              ('phase1_cmd += ["--image", paths["seed_downscaled"]]', 1),
+              ('\n        cmd += ["--seed-image", args.seed_image]', 1),
+              ('phase2_cmd += ["--seed-image", args.seed_image]', 1),
+              ('"--glob"', 0), ('"--engine"', 0), ("sudo -S", 0)]
+    for literal, count in counts:
+        assert movie.count(literal) == count, literal
+    for literal, count in (("_compose_prompt(", 3), ('"source": "generated"', 4),
+                           ('"source": "seed"', 3), ("_panel_seed(args.seed, i, grounded)", 2)):
+        assert images.count(literal) == count, literal
+    body = inspect.getsource(ltx_movie.phase2_stills)
+    assert "no_stills" not in body
+
+
+def _main_run(tmp_path, monkeypatch, argv, plan=None, panel=None, critic=()):
+    log = seu.script_agent(monkeypatch, tmp_path, plan=plan or [], panel=panel or {},
+                           critic=list(critic))
+    rc = ltx_movie.main(argv)
+    return rc, seu.agent_log(log)
+
+
+def test_rst51_e2e_chained(movie, tmp_path, monkeypatch):
+    rc, log = _main_run(tmp_path, monkeypatch,
+                        [NARRATIVE, "--story-id", "e1", "--panels", "3", "--story-only",
+                         "--no-review", "--force-story"],
+                        plan=[seu.answer(seu.plan_json("chained", 3))],
+                        panel=_panel_script("chained", 3), critic=[seu.answer(seu.critic_json())])
+    assert rc == 0
+    story_dir = os.path.join(movie, "generated", "stories", "e1")
+    assert ltx_movie._validate_story_md(os.path.join(story_dir, "story.md"), 3) == []
+    for name in ("plan.json", "story_checks.json"):
+        assert os.path.exists(os.path.join(story_dir, name))
+    with open(os.path.join(story_dir, "story_prompt.txt")) as f:
+        assert f.read() == ltx_movie.build_story_prompt(NARRATIVE, "e1", 3, False, False,
+                                                        seconds="6")
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel", "critic"]
+    assert "--skill=analyst" in log[-1]["argv"]
+    assert all("--max-rounds" in r["argv"] and r["argv"][r["argv"].index("--max-rounds") + 1] == "1"
+               for r in log)
+
+
+def test_rst52_e2e_no_stills_with_a_setting_patch(movie, tmp_path, monkeypatch):
+    setting = ("The setting is a stormy fishing harbour in modern Japan, slick black cobblestones "
+               "underfoot, cranes behind, under blue evening light.")
+    patch = {"target": "plan", "index": 1, "field": "location.setting", "reason": "r",
+             "replacement": setting}
+    rc, log = _main_run(tmp_path, monkeypatch,
+                        [NARRATIVE, "--story-id", "e2", "--panels", "2", "--no-stills",
+                         "--story-only", "--no-review"],
+                        plan=[seu.answer(seu.plan_json("no_stills", 2))],
+                        panel=_panel_script("no_stills", 2),
+                        critic=[seu.answer(seu.critic_json((6, 6, 6), "revise", [patch])),
+                                seu.answer(seu.critic_json())])
+    assert rc == 0
+    story_md = os.path.join(movie, "generated", "stories", "e2", "story.md")
+    panels = se._story_manifest(WS)._parse_prompts_md(story_md)[1]
+    assert [150 <= len(p["prompt"].split()) <= 220 for p in panels] == [True, True]
+    assert all(setting in p["prompt"] for p in panels)
+    critic = _read_json(os.path.join(movie, "generated", "stories", "e2", "story_rounds",
+                                     "round_1", "critic.json"))
+    assert critic["applied"] == [patch]
+
+
+def test_rst53_e2e_shots_with_two_characters(movie, tmp_path, monkeypatch, story_env):
+    seu.kyra(story_env["lib"])
+    seu.ronin(story_env["lib"])
+    cast = [{"id": "c1", "phrase": "the woman in grey", "descriptor": "a woman"},
+            {"id": "c2", "phrase": "the ronin", "descriptor": seu.DESC_R}]
+    raw = seu.plan_json("shots", 4, cast=cast)
+    raw["beats"][2]["cast"] = ["c2"]
+    raw["beats"][2]["action"] = "the ronin steps out from behind a cedar trunk onto the trail"
+    panels = _panel_script("shots", 4, phrase="the woman in grey")
+    panels["2"] = [{"answer": "I would rather not"}] + panels["2"]
+    panels["3"] = [seu.answer(seu.panel_json("shots", 3, phrase="the ronin"))]
+    rc, log = _main_run(tmp_path, monkeypatch,
+                        [NARRATIVE, "--story-id", "e3", "--panels", "4", "--shots", "--character",
+                         "kyra", "--character", "ronin", "--story-only", "--no-review"],
+                        plan=[seu.answer(raw)], panel=panels,
+                        critic=[{"answer": "garbage"}, seu.answer(seu.critic_json())])
+    assert rc == 0
+    story_dir = os.path.join(movie, "generated", "stories", "e3")
+    plan = _read_json(os.path.join(story_dir, "plan.json"))
+    assert plan["cast"][:2] == [
+        {"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K, "cast_name": "kyra"},
+        {"id": "c2", "phrase": "the ronin", "descriptor": seu.DESC_R, "cast_name": "ronin"}]
+    checks = _read_json(os.path.join(story_dir, "story_checks.json"))
+    assert checks["hard"] == []
+    assert [(r["stage"], r["panel"]) for r in log].count(("panel", 2)) == 2
+    assert [r["stage"] for r in log].count("critic") == 2
+    with open(os.path.join(story_dir, "story.md")) as f:
+        text = f.read()
+    lib = se._character_lib(WS)
+    members = lib.resolve_cast([(None, "kyra"), (None, "ronin")])
+    parsed = se._story_manifest(WS)._parse_prompts_md(os.path.join(story_dir, "story.md"))[1]
+    assert lib.shots_violations(text, parsed, 4, members) == []
+
+
+def test_rst54_e2e_hard_fail_then_hand_edit_and_recheck(movie, tmp_path, monkeypatch, capsys):
+    argv = [NARRATIVE, "--story-id", "e4", "--panels", "3", "--story-only", "--no-review"]
+    rc, log = _main_run(tmp_path, monkeypatch, argv,
+                        plan=[seu.answer(seu.plan_json("chained", 3))],
+                        panel=_panel_script("chained", 3, p2=[_shouting("chained", 2, SHOUT2),
+                                                              _shouting("chained", 2, SHOUT2)]),
+                        critic=[{"answer": "x"}] * 4)
+    assert rc == 2
+    assert "  - panel 2: N7 dialogue and text: Motion: says 'shouts'\n" in capsys.readouterr().err
+    story_md = os.path.join(movie, "generated", "stories", "e4", "story.md")
+    with open(story_md) as f:
+        text = f.read()
+    with open(story_md, "w") as f:
+        f.write(text.replace("Motion: " + SHOUT2,
+                             "Motion: " + seu.panel_json("chained", 2)["motion"] + "."))
+    rc, again = _main_run(tmp_path, monkeypatch, argv)
+    assert rc == 0 and again == []
+    assert "re-checking it instead of regenerating it" in capsys.readouterr().out
+    assert _read_json(os.path.join(movie, "generated", "stories", "e4",
+                                   "story_checks.json"))["source"] == "recheck"
+
+
+def test_story_focus_5_non_ascii_text_round_trips(movie, tmp_path, monkeypatch):
+    narrative = "東京の雨 — a courier's café run through Shinjuku."
+    raw = seu.plan_json("chained", 2)
+    raw["title"] = "Café 東京"
+    rc, log = _main_run(tmp_path, monkeypatch,
+                        [narrative, "--story-id", "u1", "--panels", "2", "--story-only",
+                         "--no-review"],
+                        plan=[seu.answer(raw)], panel=_panel_script("chained", 2),
+                        critic=[seu.answer(seu.critic_json())])
+    assert rc == 0
+    story_dir = os.path.join(movie, "generated", "stories", "u1")
+    with open(os.path.join(story_dir, "plan.json"), encoding="utf-8") as f:
+        text = f.read()
+    assert narrative in text and "\\u" not in text
+    with open(os.path.join(story_dir, "story.md"), encoding="utf-8") as f:
+        assert f.read().startswith("# Café 東京\n")
+    assert ("Narrative to adapt:\n" + narrative + "\n") in log[0]["argv"][-1]

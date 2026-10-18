@@ -81,7 +81,8 @@ member plus --character-strength, so every panel whose prompt names a cast phras
 with that character's LoRAs (1.0 for one character, --character-strength, default 0.8, for
 two or more). Every casting problem exits 2 before any phase runs. character_lib.py is
 loaded by path only when casting or --shots is used, so an uncast run without --shots
-never reads it.
+never reads it -- on the --story-legacy path and in every dry run; the default story engine
+loads it for its checks.
 
 Shots mode (docs/superpowers/specs/2026-10-06-shots-mode-design.md): --shots makes every
 panel its own shot. Phase 1 uses STORY_PROMPT_TEMPLATE_SHOTS (a Characters list, an Image:
@@ -93,6 +94,14 @@ manifest in which every panel is conditioned on its own still; Phase 4 renders i
 clips (--on-panel-failure skip). Every cast character LoRA defaults to 0.8, alone or
 paired. --redo N[,M] moves those panels' stills and clips, and movie.mp4, into
 <story>/redo/<stamp>-<pid>/ so that only they re-render.
+
+Story engine (docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md): by default
+Phase 1 asks the story model for a JSON plan and then one panel at a time, assembles story.md
+itself, runs deterministic checks and up to three local critic rounds (the fleet analyst skill),
+and exits 2 with story.md, plan.json and story_checks.json saved when hard violations remain; a
+rerun re-checks the existing story.md. --judge adds bin/judge-story --patches as a final gate;
+--story-legacy restores the single-prompt path. The plan may pick catalog LoRAs
+(bin/lora-catalog), which Phases 2 and 3 apply per panel; --no-auto-lora turns that off.
 """
 
 import argparse
@@ -245,6 +254,27 @@ class _RepeatableLoraAction(argparse.Action):
         setattr(namespace, self.dest + "_specs", specs)
         if getattr(namespace, self.dest, None) is None:
             setattr(namespace, self.dest, values)
+
+
+GOAL_MAX_CHARS = 300
+
+
+def _parse_goal(text):
+    """argparse type= for --goal: a copy of bin/judge-story's parse_goal (importing bin/judge-story
+    would import anthropic). Strips surrounding whitespace and then one trailing "." (the prompt
+    supplies its own), and rejects an empty result, a line break, or more than GOAL_MAX_CHARS
+    characters."""
+    goal = text.strip()
+    if goal.endswith("."):
+        goal = goal[:-1].rstrip()
+    if not goal:
+        raise argparse.ArgumentTypeError("must not be empty")
+    if "\n" in goal or "\r" in goal:
+        raise argparse.ArgumentTypeError("must be a single line")
+    if len(goal) > GOAL_MAX_CHARS:
+        raise argparse.ArgumentTypeError("must be at most %d characters (got %d)"
+                                         % (GOAL_MAX_CHARS, len(goal)))
+    return goal
 
 
 def build_parser():
@@ -410,6 +440,20 @@ def build_parser():
                               "calls, with no need to also pass "
                               "--no-story-server-stop-after-story.")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", default=False)
+    parser.add_argument("--story-legacy", dest="story_legacy", action="store_true", default=False,
+                         help="Phase 1 uses the single-prompt story path (one bin/qwen-agent call that "
+                              "writes story.md), exactly as before the robust story engine. See "
+                              "docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md.")
+    parser.add_argument("--no-auto-lora", dest="no_auto_lora", action="store_true", default=False,
+                         help="the story plan picks no catalog LoRAs (generated/loras/catalog.json); "
+                              "--lora/--stills-lora still apply")
+    parser.add_argument("--judge", dest="judge", action="store_true", default=False,
+                         help="after the local critic rounds, run bin/judge-story --patches (Claude; "
+                              "needs ANTHROPIC_API_KEY) as a final gate; a minimum score below 7 "
+                              "applies its patches and runs one more critic round")
+    parser.add_argument("--goal", dest="goal", type=_parse_goal, default=None, metavar="TEXT",
+                         help="the target output goal given to the story planner, the critic and the "
+                              "judge, worded to complete 'The target output goal is TEXT.'")
     return parser
 
 
@@ -716,6 +760,19 @@ def _character_lib():
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
 
 
+def _story_engine():
+    """story_engine.py, the robust Phase 1 engine, loaded by path and only inside function bodies
+    (robust story spec 1.2), so importing this file stays stdlib-only."""
+    return importlib.machinery.SourceFileLoader(
+        "story_engine", os.path.join(WS, "story_engine.py")).load_module()
+
+
+def _lora_catalog():
+    """lora_catalog.py, loaded by path and only inside function bodies (robust story spec 1.2)."""
+    return importlib.machinery.SourceFileLoader(
+        "lora_catalog", os.path.join(WS, "lora_catalog.py")).load_module()
+
+
 def _resolve_casting(args):
     """Validate and resolve --character/--cast into args.cast_members (and args.cast_block when
     Phase 1 will run). Returns 0, or 2 after printing an Error: line. Touches nothing."""
@@ -820,6 +877,43 @@ def _resolve_global_loras(args):
             seen[real] = path
             resolved.append((os.path.abspath(path), strength))
         setattr(args, out_attr, resolved)
+    return 0
+
+
+def _resolve_story_engine(args):
+    """Select Phase 1's story engine (robust story spec RS2): sets args.story_engine to "robust" or
+    "legacy" and args.story_catalog to the loaded LoRA catalog (the empty catalog with
+    --no-auto-lora, None on the legacy engine). Returns 0, or 2 after one Error: line."""
+    legacy = args.story_legacy or args.story_prompt_override is not None
+    reason = "--story-legacy" if args.story_legacy else "--story-prompt-override"
+    if legacy:
+        for flag, given in (("--judge", args.judge), ("--no-auto-lora", args.no_auto_lora),
+                            ("--goal", args.goal is not None)):
+            if given:
+                print("Error: %s needs the default story engine; it cannot be combined with %s"
+                      % (flag, reason), file=sys.stderr)
+                return 2
+        args.story_engine, args.story_catalog = "legacy", None
+        return 0
+    if args.judge and not os.environ.get("ANTHROPIC_API_KEY"):
+        print("Error: --judge needs ANTHROPIC_API_KEY for bin/judge-story; export it or drop "
+              "--judge", file=sys.stderr)
+        return 2
+    if args.no_auto_lora:
+        args.story_catalog = {"schema_version": 1, "entries": []}
+    else:
+        catalog = _lora_catalog()
+        path = catalog.catalog_path(WS)
+        try:
+            args.story_catalog = catalog.load_catalog(path)
+        except catalog.CatalogError as e:
+            reason = str(e)
+            if reason.startswith(path + ": "):
+                reason = reason[len(path) + 2:]
+            print("Error: invalid LoRA catalog %s: %s; run bin/lora-catalog verify" % (path, reason),
+                  file=sys.stderr)
+            return 2
+    args.story_engine = "robust"
     return 0
 
 
@@ -1026,6 +1120,8 @@ def _run_story_agent(cmd, timeout, story_md):
 
 
 def phase1_story(args):
+    if getattr(args, "story_engine", "legacy") == "robust":
+        return _phase1_robust(args)
     paths = _story_paths(args.story_id)
     story_md = paths["story_md"]
     authored = None
@@ -1035,6 +1131,14 @@ def phase1_story(args):
               % story_md)
     else:
         print("=== Phase 1: story ===")
+        stale_plan = os.path.join(_story_dir(args.story_id), "plan.json")
+        if os.path.exists(stale_plan):
+            moved = _unused_path(os.path.join(_story_dir(args.story_id), "plan.stale-%s-%d.json"
+                                              % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+                                                 os.getpid())))
+            os.replace(stale_plan, moved)
+            print("note: moved the robust engine's plan.json aside to %s; this story.md is written "
+                  "by --story-legacy" % moved)
         if args.story_prompt_override is not None:
             with open(args.story_prompt_override, encoding="utf-8") as f:
                 prompt = f.read()
@@ -1108,6 +1212,113 @@ def phase1_story(args):
     if not args.no_review:
         input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
 
+    return 0
+
+
+def _story_mode(args):
+    return ("no_stills" if args.no_stills
+            else "shots" if getattr(args, "shots", False) else "chained")
+
+
+def _story_pins(args, catalog):
+    """Every global video --lora as a pin {"path", "strength", "catalog_id", "kind"} (LC12); the
+    catalog fields come from a video catalog entry with the same realpath, else null."""
+    if getattr(args, "global_video_loras", None):
+        loras = list(args.global_video_loras)
+    elif args.lora_path:
+        loras = [(os.path.abspath(args.lora_path), 1.0)]
+    else:
+        loras = []
+    by_real = dict((os.path.realpath(e["path"]), e) for e in catalog["entries"]
+                   if e["target"] == "video")
+    pins = []
+    for path, strength in loras:
+        entry = by_real.get(os.path.realpath(path))
+        pins.append({"path": path, "strength": strength,
+                     "catalog_id": entry["id"] if entry else None,
+                     "kind": entry["kind"] if entry else None})
+    return pins
+
+
+def _story_context(args, dry_run=False):
+    """The story_engine.StoryContext of this run (robust story spec 2.1)."""
+    engine = _story_engine()
+    paths = _story_paths(args.story_id)
+    seeded = bool(getattr(args, "seed_image", None))
+    catalog = getattr(args, "story_catalog", None) or {"schema_version": 1, "entries": []}
+    if getattr(args, "global_stills_loras", None):
+        stills = [os.path.realpath(path) for path, _strength in args.global_stills_loras]
+    elif args.stills_lora_path:
+        stills = [os.path.realpath(args.stills_lora_path)]
+    else:
+        stills = []
+    if not seeded:
+        agent_image = None
+    elif dry_run:
+        agent_image = paths["seed_downscaled"]
+    else:
+        agent_image = getattr(args, "seed_downscaled_path", None)
+    return engine.StoryContext(
+        ws=WS, story_id=args.story_id, story_dir=paths["story_dir"], mode=_story_mode(args),
+        panels=args.panels, seconds=_clip_seconds(args), narrative=args.narrative,
+        goal=args.goal, members=list(getattr(args, "cast_members", None) or []),
+        seed_image=os.path.abspath(args.seed_image) if seeded else None,
+        seed_agent_image=agent_image, story_model=args.story_model,
+        context_window=args.story_context_window, video_model=args.model,
+        auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
+        stills_pinned=stills, judge=args.judge)
+
+
+def _no_stills_rules():
+    """The Rules: lines of STORY_PROMPT_TEMPLATE_NO_STILLS, each stripped (robust story spec RS12)."""
+    template = STORY_PROMPT_TEMPLATE_NO_STILLS
+    block = template[template.index("Rules:\n") + len("Rules:\n"):
+                     template.index("\n\nNarrative to adapt:")]
+    return "\n".join(line.strip() for line in block.split("\n"))
+
+
+def _phase1_robust(args):
+    """Phase 1 on the robust story engine (robust story spec RS35): re-check an existing story.md
+    (no --force-story), else write story_prompt.txt and run the engine; then the review gate."""
+    paths = _story_paths(args.story_id)
+    story_md = paths["story_md"]
+    engine = _story_engine()
+    ctx = _story_context(args)
+    if os.path.exists(story_md) and not args.force_story:
+        print("note: %s already exists; re-checking it instead of regenerating it (pass "
+              "--force-story to regenerate)" % story_md)
+        rc, advisories = engine.recheck(ctx, _validate_story_md)
+    else:
+        print("=== Phase 1: story ===")
+        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
+                                     bool(getattr(args, "seed_image", None)),
+                                     seconds=_clip_seconds(args),
+                                     cast_block=getattr(args, "cast_block", None),
+                                     shots=getattr(args, "shots", False))
+        with open(os.path.join(paths["story_dir"], "story_prompt.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write(prompt)
+        rc, advisories = engine.run(ctx, no_stills_rules=_no_stills_rules())
+    if rc != 0:
+        return rc
+    if not args.no_review:
+        with open(story_md) as f:
+            content = f.read()
+        print("=== story.md ===")
+        print(content)
+    for advisory in advisories:
+        print("Warning: %s" % advisory)
+    members = getattr(args, "cast_members", None) or []
+    if members:
+        with open(story_md, encoding="utf-8") as f:
+            text = f.read()
+        lib = _character_lib()
+        for m in members:
+            if not lib.phrase_occurs(text, m.phrase):
+                print("Warning: story.md does not use cast phrase %r; character %s gets no LoRA in "
+                      "this story" % (m.phrase, m.name))
+    if not args.no_review:
+        input("Review story.md above. Enter to continue, Ctrl-C to abort: ")
     return 0
 
 
@@ -1856,6 +2067,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_global_loras(args)
+    if rc:
+        return rc
+    rc = _resolve_story_engine(args)
     if rc:
         return rc
 

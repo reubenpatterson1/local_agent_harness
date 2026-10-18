@@ -471,3 +471,37 @@ def test_lct27_deploy_pipeline_files():
     at = files.index("character_lib.py")
     assert files[at + 1:at + 3] == ["story_engine.py", "lora_catalog.py"]
     assert "bin/lora-catalog" not in files and "fleet_lib.py" not in files
+
+
+# --- LCT13: pins in bin/ltx-movie's story context (LC12) ------------------------------------
+
+ltx_movie = importlib.machinery.SourceFileLoader(
+    "ltx_movie_for_lora_catalog", os.path.join(WS, "bin", "ltx-movie")).load_module()
+
+
+def _movie_args(*argv):
+    args = ltx_movie.build_parser().parse_args(list(argv))
+    args.video_width, args.video_height = 704, 448
+    for resolve in (ltx_movie._resolve_shots, ltx_movie._resolve_casting,
+                    ltx_movie._resolve_global_loras, ltx_movie._resolve_story_engine):
+        assert resolve(args) == 0
+    return args
+
+
+def test_lct13_pins(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    fast = seu.lora_file(files, "fast")
+    other = seu.lora_file(files, "other")
+    seu.make_catalog(story_env["catalog"], [seu.catalog_entry(fast, "fast-motion")])
+    args = _movie_args("n", "--story-id", "p1", "--lora", fast + ":0.7", "--lora", other)
+    assert ltx_movie._story_context(args).pinned == [
+        {"path": fast, "strength": 0.7, "catalog_id": "fast-motion", "kind": "motion"},
+        {"path": other, "strength": 1.0, "catalog_id": None, "kind": None}]
+    flags = ltx_movie._render_flags(args)
+    assert flags[flags.index("--lora"):flags.index("--lora") + 4] == [
+        "--lora", fast + ":0.7", "--lora", other + ":1.0"]
+    legacy = _movie_args("n", "--story-id", "p1", "--lora", other)
+    assert ltx_movie._story_context(legacy).pinned == [
+        {"path": other, "strength": 1.0, "catalog_id": None, "kind": None}]
+    assert ltx_movie._render_flags(legacy)[16:18] == ["--lora", other]
+    assert "--lora" not in ltx_movie._render_flags(_movie_args("n", "--story-id", "p1"))

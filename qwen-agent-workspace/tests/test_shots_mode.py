@@ -840,6 +840,8 @@ def movie_ws(tmp_path, monkeypatch):
     (ws / "generated" / "stories").mkdir(parents=True)
     os.symlink(os.path.join(WS, "bin"), str(ws / "bin"))
     os.symlink(os.path.join(WS, "character_lib.py"), str(ws / "character_lib.py"))
+    os.symlink(os.path.join(WS, "story_engine.py"), str(ws / "story_engine.py"))
+    os.symlink(os.path.join(WS, "lora_catalog.py"), str(ws / "lora_catalog.py"))
     monkeypatch.setattr(ltx_movie, "WS", str(ws))
     return ws
 
