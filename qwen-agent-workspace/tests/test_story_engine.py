@@ -615,3 +615,376 @@ def test_rst55b_p13_masks_declared_and_invented_phrases(ws, story_env):
     seu.make_character(lib_dir, "empty", "", "the empty", "person", seu.DESC_K)
     plain = seu.make_ctx(se, ws, panels=4)
     assert [m for m in _checks(plain, seu.plan_json("chained", 4)) if "empty" in m] == []
+
+
+# --- RST12, RST16-RST21, RST56, RST57: panels (RS12-RS16, RS37) -----------------------------
+
+ltx_movie = importlib.machinery.SourceFileLoader(
+    "ltx_movie_for_story_engine", os.path.join(WS, "bin", "ltx-movie")).load_module()
+DESC30 = ("a young man with short brown hair and a lean build wearing a yellow rain jacket with "
+          "a hood over grey trousers and black boots and a canvas satchel strapped")
+MONK30 = ("an old man with a shaved head and a calm lined face wearing a saffron robe and wooden "
+          "sandals with a string of prayer beads looped twice around his wrist")
+
+
+def _norm(text):
+    return " ".join(text.split())
+
+
+def test_rst12_lexicons():
+    templates = _norm(ltx_movie.STORY_PROMPT_TEMPLATE + " " + ltx_movie.STORY_PROMPT_TEMPLATE_NO_STILLS
+                      + " " + ltx_movie.STORY_PROMPT_TEMPLATE_SHOTS)
+    for example in se.COPIED_EXAMPLES:
+        assert _norm(example) in templates, example
+    for word in ("short", "light", "ring", "cap", "fair"):
+        assert word not in se.APPEARANCE_WORDS
+    assert {"grey", "kimono", "camera", "close-up", "palette"} <= se.APPEARANCE_WORDS
+
+
+def _story(ws, mode, n, plan_mut=None, part_mut=None, ctx_kw=None):
+    """(ctx, plan, parts, text, path) for plan_json/panel_json with the mutations applied."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=n, **(ctx_kw or {}))
+    raw = seu.plan_json(mode, n)
+    if plan_mut:
+        plan_mut(raw)
+    plan, _ = se.normalize_plan(ctx, raw)
+    phrase = plan["cast"][0]["phrase"]
+    parts = [se.parse_panel_reply(ctx, plan, k, json.dumps(seu.panel_json(mode, k, phrase)))
+             for k in range(1, n + 1)]
+    if part_mut:
+        part_mut(parts)
+    text = se.assemble(ctx, plan, parts)
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return ctx, plan, parts, text, path
+
+
+def _story_checks(ws, mode, n=3, **kw):
+    ctx, plan, parts, text, path = _story(ws, mode, n, **kw)
+    hard, advisory = se.panel_checks(ctx, plan, parts, text, path)
+    return hard + advisory
+
+
+def test_rst16_panel_prompt(ws):
+    def fixture(raw):
+        raw["cast"][0]["descriptor"] = DESC30
+        raw["cast"][1]["descriptor"] = MONK30
+        raw["beats"][0]["cast"] = ["c1", "c2"]
+
+    rules = ltx_movie.STORY_PROMPT_TEMPLATE_NO_STILLS
+    rules = rules[rules.index("Rules:\n") + len("Rules:\n"):rules.index("\n\nNarrative to adapt:")]
+    rules = "\n".join(line.strip() for line in rules.split("\n"))
+    expected = {
+        ("chained", 1): ["image: 27 to 77 words describing the opening frame",
+                         "motion: 21 to 46 words in one or two plain sentences: what the characters "
+                         "physically do during these 6 seconds. Name"],
+        ("chained", 2): ["motion: 15 to 35 words in one or two plain sentences: what the characters "
+                         "physically do during these 6 seconds, continuing"],
+        ("no_stills", 1): ["prompt: 53 to 123 words in the present tense"],
+        ("shots", 1): ["image: 20 to 77 words describing this shot's first frame",
+                       "motion: ONE sentence of 6 to 21 words naming ONE character"],
+        ("shots", 2): ["motion: ONE sentence of 5 to 19 words naming ONE character"],
+    }
+    for (mode, k), lines in expected.items():
+        ctx, plan, parts, _text, _path = _story(ws, mode, 3, plan_mut=fixture,
+                                                ctx_kw={"seed_agent_image": "/s/seed.png"}
+                                                if mode == "chained" else None)
+        prompt = se.build_panel_prompt(ctx, plan, parts, k, no_stills_rules=rules)
+        assert prompt.startswith('You are writing panel %d of 3 of a short narrated movie '
+                                 '(story-id "s1").\n' % k)
+        assert prompt.endswith(se.NO_TOOL_SENTENCE)
+        assert "{" not in prompt and "}" not in prompt and "@@" not in prompt
+        for line in lines:
+            assert "\n" + line in prompt, (mode, k, line)
+        assert "\ntitle: a short title for the panel, 2 to 6 words.\n" in prompt
+        assert prompt.count("\nnarration: one sentence of voice-over narration, 3 to 30 words.\n") == 1
+        assert ("The previous panel's Motion: " in prompt) == (mode == "chained" and k >= 2)
+        assert ("It IS this movie's first frame" in prompt) == (mode == "chained" and k == 1)
+        assert ("\nRules:\n" + rules + "\n\n" in prompt) == (mode == "no_stills")
+        assert ("Rules for this shot: two people never touch" in prompt) == (mode == "shots")
+        assert (">> %d. (%s) " % (k, plan["beats"][k - 1]["arc"])) in prompt
+        if k == 1:
+            assert 'referring phrases: "the courier"; "the old monk"\n' in prompt
+    assert len(rules.split("\n")) == 4
+    ctx, plan, parts, _text, _path = _story(ws, "chained", 3)
+    prompt = se.build_panel_prompt(ctx, plan, parts, 2)
+    previous = dict(se.panel_fields(ctx, plan, parts, 1))["Motion"]
+    assert ('referring phrases: "the courier"\nThe previous panel\'s Motion: ' + previous
+            + "\n\nWrite this panel as one JSON object") in prompt
+    fixed = se.build_panel_prompt(ctx, plan, parts, 2, fix=["panel 2: N3 appearance: x",
+                                                            "panel 2: N12 one action: y"])
+    assert ("\n\nYour previous version of this panel was rejected. Problems:\n- panel 2: N3 "
+            "appearance: x\n- panel 2: N12 one action: y\nPrevious version:\ntitle: "
+            + parts[1]["title"] + "\nmotion: " + parts[1]["motion"] + "\nnarration: "
+            + parts[1]["narration"] + "\n\nReply with the JSON object only") in fixed
+    assert se.unparseable_panel_problem("chained", 2) == (
+        "the reply is not one JSON object with the keys title, motion, narration")
+
+
+def test_rst17_cleanup_and_title_fallback(ws):
+    ctx, plan, parts, _t, _p = _story(ws, "shots", 3)
+    lib = se._character_lib(WS)
+    pasted = se.pasted_pieces(ctx, plan, 1)["image"]
+    raw = ('Image:  "The courier stands left.\nThe setting is a RAINY harbour town in modern '
+           'Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. '
+           'Gulls circle.  The shot is a medium shot."')
+    assert se.clean_writer(lib, raw, pasted) == "The courier stands left. Gulls circle."
+    assert se.clean_writer(lib, "“motion: x y”") == "motion: x y"
+    assert se.clean_writer(lib, "MOTION : The courier turns. The camera stays static.",
+                           se.pasted_pieces(ctx, plan, 1)["motion"]) == "The courier turns."
+    assert se.clean_writer(lib, None) == ""
+    reply = dict(seu.panel_json("shots", 1), title="one two three four five six seven")
+    assert se.parse_panel_reply(ctx, plan, 1, json.dumps(reply))["title"] == "the courier pedals a bicycle"
+    plan["beats"][0]["action"] = "the courier's (wet) bike: rolls, slowly away"
+    assert se.title_fallback(plan["beats"][0]["action"]) == "the courier's wet bike rolls"
+    for bad in ("not json", json.dumps(dict(seu.panel_json("shots", 1), motion="  ")),
+                json.dumps({"title": "x", "image": "a b"})):
+        assert se.parse_panel_reply(ctx, plan, 1, bad) is None
+
+
+GOLDEN_CHAINED = """# The Sealed Letter
+
+A courier carries a sealed letter through a rainy harbour town and delivers it at the temple gate.
+
+## Panel 1 — Wet Road
+Image: The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. The courier is a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers. The courier waits on the left. The shot is a medium shot.
+Motion: The courier pushes off. The camera stays static.
+Narration: The rain had not stopped.
+
+## Panel 2 — The Bend
+Motion: The courier leans into the bend.
+Narration: Every street led down to the water.
+"""
+GOLDEN_NO_STILLS = """# The Sealed Letter
+
+A courier carries a sealed letter through a rainy harbour town and delivers it at the temple gate.
+
+## Panel 1 — Wet Road
+Prompt: The courier pedals through the rain. The courier is a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers. The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. The shot is a medium shot. The camera stays static.
+Narration: The rain had not stopped.
+
+## Panel 2 — The Bend
+Prompt: The courier leans into the bend. The courier is a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers. The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. The shot is a wide shot. The camera tracks alongside the movement.
+Narration: Every street led down to the water.
+"""
+GOLDEN_SHOTS = """# The Sealed Letter
+
+A courier carries a sealed letter through a rainy harbour town and delivers it at the temple gate.
+
+## Characters
+- "the courier": a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers.
+- "the old monk": an old man with a shaved head and a calm face wearing a saffron robe and wooden sandals.
+
+## Panel 1 — Wet Road
+Image: The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. The courier is a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers. The courier waits on the left. The shot is a medium shot.
+Motion: The courier pushes off. The camera stays static.
+Narration: The rain had not stopped.
+
+## Panel 2 — The Bend
+Image: The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light. The courier is a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers. The courier leans right. The shot is a wide shot.
+Motion: The courier leans into the bend. The camera tracks alongside the movement.
+Narration: Every street led down to the water.
+"""
+
+
+def test_rst18_assembly_goldens(ws):
+    writer = {
+        "chained": [{"title": "Wet Road", "image": "The courier waits on the left",
+                     "motion": "The courier pushes off", "narration": "The rain had not stopped"},
+                    {"title": "The Bend", "motion": "The courier leans into the bend.",
+                     "narration": "Every street led down to the water."}],
+        "no_stills": [{"title": "Wet Road", "prompt": "The courier pedals through the rain",
+                       "narration": "The rain had not stopped"},
+                      {"title": "The Bend", "prompt": "The courier leans into the bend.",
+                       "narration": "Every street led down to the water."}],
+        "shots": [{"title": "Wet Road", "image": "The courier waits on the left",
+                   "motion": "The courier pushes off", "narration": "The rain had not stopped"},
+                  {"title": "The Bend", "image": "The courier leans right.",
+                   "motion": "The courier leans into the bend.",
+                   "narration": "Every street led down to the water."}],
+    }
+    goldens = {"chained": GOLDEN_CHAINED, "no_stills": GOLDEN_NO_STILLS, "shots": GOLDEN_SHOTS}
+    manifest = se._story_manifest(WS)
+    lib = se._character_lib(WS)
+    for mode, golden in goldens.items():
+        ctx = seu.make_ctx(se, ws, mode=mode, panels=2)
+        plan, _ = se.normalize_plan(ctx, seu.plan_json(mode, 2))
+        text = se.assemble(ctx, plan, writer[mode])
+        assert text == golden, mode
+        path = os.path.join(ctx.story_dir, "golden.md")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        panels = manifest._parse_prompts_md(path)[1]
+        assert [p["number"] for p in panels] == [1, 2]
+        assert [p["title"] for p in panels] == ["Wet Road", "The Bend"]
+        assert [bool(p["image"]) for p in panels] == {"chained": [True, False],
+                                                      "no_stills": [False, False],
+                                                      "shots": [True, True]}[mode]
+        assert all(bool(p["prompt"]) == (mode == "no_stills") for p in panels)
+        assert all(bool(p["motion"]) == (mode != "no_stills") for p in panels)
+        if mode == "shots":
+            assert lib.parse_character_roster(text) == ([("the courier", seu.COURIER + "."),
+                                                         ("the old monk", seu.MONK + ".")], [])
+
+
+def test_rst19_cast_shots_story_has_no_s9_or_s12(ws, story_env):
+    members = _cast_members(story_env, "kyra", "ronin")
+    fixed = [{"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K},
+             {"id": "c2", "phrase": "the ronin", "descriptor": seu.DESC_R}]
+
+    def cast(raw):
+        raw["cast"] = fixed
+        raw["beats"][2]["cast"] = ["c2"]
+
+    ctx, plan, parts, text, path = _story(ws, "shots", 4, plan_mut=cast,
+                                          ctx_kw={"members": members})
+    hard, advisory = se.panel_checks(ctx, plan, parts, text, path)
+    assert not [h for h in hard if " S9 " in h or " S12 " in h]
+    assert "The woman in grey is %s." % seu.DESC_K in text
+
+
+def test_rst20_panel_checks(ws):
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode) == [], mode
+
+    def part(k, **changes):
+        return lambda parts: parts[k - 1].update(changes)
+
+    forty = " ".join(["The courier pedals onward"] * 10)
+    cases = [
+        ("chained", {"part_mut": part(2, motion=forty)},
+         ["panel 2: N1 word count: Motion: is 40 words; it must be 15-35"]),
+        ("chained", {"part_mut": part(2, motion="The courier waves at the woman beside the crates "
+                                                "and keeps pedalling forward in the rain.")},
+         ["panel 2: N2 referring phrase: Motion: names 'woman' outside every referring phrase; "
+          "name each character by their exact phrase"]),
+        ("chained", {"part_mut": part(2, motion="The courier pulls the grey hood tighter and "
+                                                "pedals forward along the road past the boats.")},
+         ["panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
+          "appearance, clothing, setting, lighting, colour, style or camera"]),
+        ("chained", {"part_mut": part(2, motion="The courier pedals past the old monk beside the "
+                                                "crates and on toward the end of the quay.")},
+         ["panel 2: N4 stray cast: Motion: names 'the old monk', who is not in beat 2's cast"]),
+        ("chained", {"part_mut": lambda parts: parts[0].update(
+            image=parts[0]["image"][:300] + " " + seu.TEMPLE)},
+         ["panel 1: N5 setting sentence: Image: contains l2's setting sentence; beat 1 is at l1"]),
+        ("no_stills", {"part_mut": part(2, prompt=seu.panel_json("no_stills", 2)["prompt"]
+                                        + " A fisherman shouts across the water.")},
+         ["panel 2: N7 dialogue and text: Prompt: says 'shouts'"]),
+        ("chained", {"part_mut": part(3, motion='The courier reads the "urgent" note and pedals on '
+                                                "toward the end of the quay.")},
+         ["panel 3: N7 dialogue and text: Motion: contains a double quote"]),
+        ("shots", {"part_mut": part(2, image=seu.panel_json("shots", 2)["image"]
+                                    + " A caption fills the lower edge.")},
+         ["panel 2: N7 dialogue and text: Image: says 'caption'"]),
+        ("chained", {"part_mut": part(2, motion="The courier pedals toward a noise off-screen at "
+                                                "the far end of the long quay.")},
+         ["panel 2: N8 off-screen: Motion: says 'off-screen'; describe only what is in the frame"]),
+        ("chained", {"part_mut": part(2, motion="The courier pedals hard and we cut to the far end "
+                                                "of the quay at once.")},
+         ["panel 2: N9 cut wording: Motion: says 'cut to'; one panel is one continuous shot"]),
+        ("chained", {"part_mut": part(1, narration="<one sentence of voice-over narration>")},
+         ["panel 1: N10 copied example: Narration: contains template text '<one sentence of "
+          "voice-over narration>'"]),
+        ("chained", {"plan_mut": lambda raw: raw["locations"][1].update(
+            setting=se.COPIED_EXAMPLES[0] + ".")},
+         ["plan: N10 copied example: l2's setting contains template text '%s'"
+          % se.COPIED_EXAMPLES[0]]),
+        ("chained", {"part_mut": part(2, narration="")},
+         ["panel 2: N11 narration: Narration: is empty"]),
+        ("chained", {"part_mut": part(2, motion="The courier stops at the crates then pedals "
+                                                "forward along the wet road past the boats.")},
+         ["panel 2: N12 one action: Motion: chains actions with 'then'"]),
+        ("chained", {"part_mut": lambda parts: parts[2].update(motion=parts[1]["motion"])},
+         ["panel 3: N13 repeat: Motion: repeats panel 2's action (similarity 1.00)"]),
+        ("chained", {"part_mut": part(2, narration="It rained. It poured.")},
+         ["panel 2: N14 narration form: Narration: is 2 sentences; it should be one sentence of "
+          "3-30 words"]),
+        ("chained", {"part_mut": part(2, narration="Rain")},
+         ["panel 2: N14 narration form: Narration: is 1 words; it should be one sentence of 3-30 "
+          "words"]),
+    ]
+    for mode, kw, expected in cases:
+        assert _story_checks(ws, mode, **kw) == expected, expected
+    shots_long = _story_checks(ws, "shots", part_mut=part(2, motion=forty))
+    assert not [v for v in shots_long if " N1 " in v]
+    assert [v for v in shots_long if " S4 " in v] == [
+        "panel 2: S4 motion length: Motion: is 46 words; it must be 10-25"]
+    offscreen = _story_checks(ws, "shots", part_mut=part(2, motion="The courier turns toward "
+                                                                   "a noise off-screen."))
+    assert offscreen == ["panel 2: S11 off-screen wording: Motion: says 'off-screen'; use left "
+                         "and right screen direction instead"]
+    ctx, plan, parts, _text, _path = _story(ws, "chained", 3)
+    lib = se._character_lib(WS)
+    fields = [("Image", "The courier stands."), ("Motion", "x"), ("Narration", "y")]
+    assert se._field_checks(ctx, lib, plan, 1, "T", fields, {}, ("N5", "N6"), []) == (
+        ["panel 1: N5 setting sentence: Image: lacks l1's setting sentence word for word",
+         "panel 1: N6 description: Image: lacks c1's description word for word"], [])
+    shots_ctx = ctx._replace(mode="shots")
+    plan["cast"][0]["cast_name"] = "kyra"
+    assert se._field_checks(shots_ctx, lib, plan, 1, "T", fields, {}, ("N6",), []) == ([], [])
+
+
+def test_rst21_shots_rules_are_appended_unchanged(ws):
+    def contact(raw):
+        raw["beats"][1]["cast"] = ["c1", "c2"]
+
+    checks = _story_checks(ws, "shots", plan_mut=contact, part_mut=lambda parts: parts[1].update(
+        motion="The courier strikes the old monk with a heavy staff."))
+    assert checks == ["panel 2: S8 contact: Motion: 'strikes' acts on 'the old monk'; two people "
+                      "touching on screen"]
+
+
+def test_rst56_n15_undeclared_character_in_panels(ws, story_env):
+    seu.ronin(story_env["lib"])
+
+    def refer(parts):
+        parts[0]["title"] = "roninmn Arrives"
+        parts[1]["motion"] = "The ronin raises one hand against the falling rain."
+        parts[2]["narration"] = "Ronin had waited all day."
+
+    checks = _story_checks(ws, "shots", part_mut=refer)
+    tail = "; library characters appear only when declared with --character ronin"
+    assert checks == [
+        "panel 1: N15 undeclared character: Title: names library character ronin by its trigger "
+        "'roninmn'" + tail,
+        "panel 2: N15 undeclared character: Motion: names library character ronin by its "
+        "referring phrase 'The ronin'" + tail,
+        "panel 3: N15 undeclared character: Narration: names library character ronin by its name "
+        "'Ronin'" + tail]
+    members = se._character_lib(WS).resolve_cast([(None, "ronin")])
+    fixed = [{"id": "c1", "phrase": "the ronin", "descriptor": seu.DESC_R}]
+    declared = _story_checks(ws, "shots", plan_mut=lambda raw: raw.update(cast=fixed),
+                             ctx_kw={"members": members})
+    assert not [v for v in declared if " N15 " in v]
+
+
+def test_rst57_reserved_line_in_the_panel_prompt(ws, story_env):
+    seu.ronin(story_env["lib"])
+    ctx, plan, parts, _t, _p = _story(ws, "chained", 3)
+    prompt = se.build_panel_prompt(ctx, plan, parts, 1)
+    assert ('referring phrases: "the courier"\nCharacters who are not in this movie, never to be '
+            'named: ronin ("the ronin").\n\nAn image') not in prompt
+    assert ('referring phrases: "the courier"\nCharacters who are not in this movie, never to be '
+            'named: ronin ("the ronin").\n\nWrite this panel') in prompt
+    members = se._character_lib(WS).resolve_cast([(None, "ronin")])
+    declared = ctx._replace(members=members)
+    assert "never to be named" not in se.build_panel_prompt(declared, plan, parts, 1)
+
+
+def test_rst56b_n15_masks_declared_phrase(ws, story_env):
+    lib = se._character_lib(WS)
+    members = _cast_members(story_env, "kyra")
+    fixed = [{"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K}]
+    seu.make_character(story_env["lib"], "wmn", "wmntrg", "the woman", "woman", seu.DESC_K)
+    undeclared = [("wmn", "wmntrg", "the woman")]
+    assert se.undeclared_references(lib, "the kyra woman waves", undeclared, masks=("kyra",)) == []
+
+    def motion(text):
+        return lambda parts: parts[1].update(motion=text)
+
+    for text, expect in (("The woman in grey turns.", False), ("The woman waves.", True)):
+        checks = _story_checks(ws, "shots", plan_mut=lambda raw: raw.update(cast=fixed),
+                               part_mut=motion(text), ctx_kw={"members": members})
+        assert bool([v for v in checks if " N15 " in v]) == expect, (text, checks)

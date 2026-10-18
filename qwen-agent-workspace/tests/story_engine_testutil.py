@@ -381,3 +381,98 @@ def plan_json(mode, n, cast=None, **overrides):
     }
     plan.update(overrides)
     return plan
+
+
+# --- panel and critic builders (spec 5.2) ------------------------------------------------------
+
+IMAGE_SENTENCES = (
+    "{P} stands on the left of the frame and faces right toward the water.",
+    "Rain streaks across the scene in thin silver lines.",
+    "Puddles reflect the glow of shop signs along the quay.",
+    "Fishing boats rock gently at their moorings in the background.",
+    "The palette is cool blue and slate with warm amber accents.",
+    "The viewpoint is at eye level from across the road.",
+    "The image is a photorealistic film still with soft contrast.",
+    "Gulls circle low over the harbour wall.",
+)
+MOTION_SENTENCES = (
+    "{P} pedals steadily along the wet road toward the far end of the quay.",
+    "{P} leans into the bend and the wheels splash through a shallow puddle.",
+    "{P} glances over one shoulder at the boats rocking behind.",
+    "{P} grips the handlebars more tightly against a gust of wind.",
+    "{P} rises from the saddle to climb the gentle slope ahead.",
+    "{P} slows down beside a stack of wooden crates near the water.",
+    "{P} pushes off from the kerb with one foot to gather speed.",
+    "{P} ducks under a dripping awning at the corner of the street.",
+)
+PROMPT_SENTENCES = (
+    "{P} pedals a bicycle along the wet harbour road as rain drums on the cobblestones.",
+    "Initially the tyres hiss through shallow puddles beside the moored boats.",
+    "As the road bends a gust rattles the shutters of the closed shops.",
+    "A moment later gulls cry overhead and a halyard clinks against a mast.",
+    "Then {P} rises from the saddle to climb the gentle slope.",
+    "The viewpoint follows from the side at eye level.",
+    "Cool blue light falls across the wet stones and the amber shop signs.",
+    "Water splashes up from the front wheel with a soft slap.",
+    "Behind the bicycle the harbour water ripples under the falling rain.",
+    "The chain clicks steadily as the pedals turn.",
+    "{P} swings around a parked handcart loaded with nets.",
+    "A dog barks once from a doorway as the bicycle passes.",
+    "Steam drifts from a noodle stall where a radio hums softly.",
+    "The front brake squeals briefly at the bottom of the hill.",
+    "Initially the lane narrows between tall timber houses.",
+    "{P} stands on the pedals and the frame creaks under the effort.",
+    "Rainwater gurgles down a gutter beside the stone steps.",
+    "A moment later a shutter bangs open above the street.",
+    "The viewpoint drops low as the wheel rolls past a lantern.",
+    "Thunder rumbles far away over the grey hills.",
+)
+SHOTS_MOTION = ("{P} turns slowly toward the harbour wall on the right.",
+                "{P} lifts the sealed letter close to the chest.",
+                "{P} steps forward onto the wet stones.",
+                "{P} raises one hand against the falling rain.")
+NARRATIONS = ("The rain had not stopped since dawn.", "Every street led down to the water.",
+              "He knew the letter could not wait.", "The temple bell was still silent.",
+              "Nobody else was out in the storm.", "The gate stood open at the top.",
+              "His legs burned on the last climb.", "Someone was waiting for this letter.")
+
+
+def _words_from(sentences, phrase, start, count):
+    """Whole sentences (cycled from start) until there are at least count words, {P} -> phrase;
+    the first letter of each sentence is capitalised."""
+    words = []
+    i = start
+    while len(words) < count:
+        sentence = sentences[i % len(sentences)].replace("{P}", phrase)
+        words += (sentence[:1].upper() + sentence[1:]).split()
+        i += 1
+    return " ".join(words)
+
+
+def panel_json(mode, k, phrase="the courier", words=None):
+    """A valid panel-writer reply for panel k (Section 2.3 keys) whose writer texts land inside
+    the RS14 writer targets of plan_json's plan. words maps a key to a minimum word count."""
+    words = dict(words or {})
+    reply = {"title": "Harbour Road Part %d" % k}
+    if mode == "chained":
+        if k == 1:
+            reply["image"] = _words_from(IMAGE_SENTENCES, phrase, 0, words.get("image", 90))
+            reply["motion"] = _words_from(MOTION_SENTENCES, phrase, 0, words.get("motion", 25))
+        else:
+            reply["motion"] = _words_from(MOTION_SENTENCES, phrase, 2 * k - 1,
+                                          words.get("motion", 20))
+    elif mode == "no_stills":
+        reply["prompt"] = _words_from(PROMPT_SENTENCES, phrase, 5 * (k - 1),
+                                     words.get("prompt", 110))
+    else:
+        reply["image"] = _words_from(IMAGE_SENTENCES, phrase, k - 1, words.get("image", 50))
+        motion = SHOTS_MOTION[(k - 1) % len(SHOTS_MOTION)].replace("{P}", phrase)
+        reply["motion"] = motion[:1].upper() + motion[1:]
+    reply["narration"] = NARRATIONS[(k - 1) % len(NARRATIONS)]
+    return reply
+
+
+def critic_json(scores=(8, 8, 8), verdict="ok", patches=()):
+    """A critic reply (Section 2.4)."""
+    return {"scores": dict(zip(("continuity", "story", "renderability"), scores)),
+            "verdict": verdict, "patches": list(patches)}

@@ -413,9 +413,9 @@ def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
             except lib.CharacterError:
                 pattern = None
             if pattern:
-                scan = pattern.sub(lambda mo: " " * len(mo.group(0)), scan)
+                scan = pattern.sub(lambda mo: "\x00" * len(mo.group(0)), scan)
             scan = re.sub(r"(?<![\w-])" + re.escape(m) + r"(?![\w-])",
-                          lambda mo: " " * len(mo.group(0)), scan, flags=re.IGNORECASE)
+                          lambda mo: "\x00" * len(mo.group(0)), scan, flags=re.IGNORECASE)
     hits = []
     for name, trigger, phrase in undeclared:
         hit = None
@@ -960,3 +960,536 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
         if os.path.realpath(e["path"]) in set(ctx.stills_pinned):
             hard.append("plan: L7 stills: %s is also passed with --stills-lora" % _q(e["id"]))
     return hard, advisory
+
+
+# ---------------------------------------------------------------------------
+# Panels: lexicons (RS16), the panel prompt (RS12), writer parts and cleanup (RS13),
+# assembly (RS14), panel checks (RS15) and the undeclared-character check N15 (RS37)
+# ---------------------------------------------------------------------------
+
+APPEARANCE_WORDS = frozenset("""
+    red orange yellow green blue purple violet pink brown black white grey gray silver gold golden
+    crimson scarlet navy beige auburn blonde blond brunette ginger
+    hair haired ponytail braid braided curls curly bald beard bearded moustache mustache stubble
+    freckled wrinkled complexion
+    wearing wears dressed dress shirt jacket coat cloak kimono robe hood hat helmet trousers pants
+    jeans skirt boots shoes sandals gloves scarf belt armor armour uniform tunic vest apron glasses
+    spectacles earrings necklace bracelet
+    slender stocky muscular skinny plump pale tanned
+    lighting lit sunlight moonlight palette colour color cinematic photorealistic rendered style
+    camera lens zoom zooms dolly framing close-up""".split())
+_APPEARANCE_RE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(
+    re.escape(w) for w in sorted(APPEARANCE_WORDS, key=lambda w: (-len(w), w))), re.IGNORECASE)
+DIALOGUE_RE = re.compile(
+    r"\b(?:say|says|said|saying|shout|shouts|shouted|shouting|whisper|whispers|whispered|"
+    r"whispering|yell|yells|yelled|yelling|ask|asks|asked|asking|reply|replies|replied|replying|"
+    r"tell|tells|told|telling|speak|speaks|spoke|speaking|exclaim|exclaims|exclaimed|mutter|"
+    r"mutters|muttered|murmur|murmurs|murmured|call(?:s|ed)?\s+out)\b", re.IGNORECASE)
+ONSCREEN_TEXT_RE = re.compile(
+    r"\b(?:captions?|subtitles?|title\s+cards?|on-screen\s+text|text\s+reading|that\s+reads|"
+    r"which\s+reads|lettering|inscription|written\s+words)\b", re.IGNORECASE)
+CUT_RE = re.compile(
+    r"\b(?:cuts?\s+to|smash\s+cut|jump\s+cut|fades?\s+(?:in|out|to)|dissolves?\s+to|flashback|"
+    r"hours\s+later|the\s+next\s+(?:day|morning))\b", re.IGNORECASE)
+PLACEHOLDER_RE = re.compile(r"<[^<>]{1,80}>")
+COPIED_EXAMPLES = (
+    "The setting is a dense cedar forest in feudal Japan, tall trunks and ferns behind, the "
+    "ground covered in leaf litter, under flat overcast grey light",
+    "walking to a door, opening it, stepping through, and closing it behind them",
+    "raising the blade, drawing back the arm, lunging forward",
+    "recoiling, staggering, clutching the wound, falling",
+    "her eyebrows angle down and her lips press together",
+    "a charge, a draw and a strike",
+)
+_LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration)\s*:\s*", re.IGNORECASE)
+_QUOTE_PAIRS = (('"', '"'), ("“", "”"))
+_TITLE_CHARS_RE = re.compile(r"[^A-Za-z0-9 '-]")
+LABELS = {"image": "Image", "motion": "Motion", "prompt": "Prompt", "narration": "Narration"}
+
+PANEL_PROMPT_TEMPLATE = (
+    'You are writing panel @@K@@ of @@PANELS@@ of a short narrated movie (story-id '
+    '"@@STORY_ID@@").\n'
+    "\n"
+    "Narrative to adapt:\n"
+    "@@NARRATIVE@@\n"
+    "\n"
+    "@@GOAL_PARAGRAPH@@How this movie is made: @@MODE_PARAGRAPH@@\n"
+    "\n"
+    "@@PANEL_RULES@@The beats of the whole movie, one per panel (this panel is marked >>):\n"
+    "@@BEAT_LINES@@\n"
+    "\n"
+    "This panel's beat: @@ACTION@@\n"
+    "Characters on screen in this panel, named only by these exact referring phrases: "
+    "@@CAST_PHRASES@@\n"
+    "@@RESERVED@@@@PREVIOUS@@\n"
+    "@@SEED_PANEL@@Write this panel as one JSON object with exactly these keys:\n"
+    "\n"
+    "@@KEY_LINES@@\n"
+    "\n"
+    "@@FIX_BLOCK@@" + NO_TOOL_SENTENCE)
+SHOTS_PANEL_RULES = ("Rules for this shot: two people never touch on screen, nothing outside the "
+                     "frame is ever mentioned, and who faces whom is shown with fixed left and "
+                     "right screen direction.\n\n")
+SEED_PANEL = ("An image is attached to this message. It IS this movie's first frame: describe in "
+              "image exactly what it shows -- each person's pose and place in the frame, the "
+              "background, the lighting, the colour palette and the visual style -- and start "
+              "motion from that exact pose.\n\n")
+KEY_LINE_TEMPLATES = {
+    "title": "title: a short title for the panel, 2 to 6 words.",
+    "chained_image": (
+        "image: W1 to W2 words describing the opening frame as one still picture: where each "
+        "character stands and which way they face, the background, the lighting and colour "
+        "palette, the camera viewpoint and the rendering style. Do not describe any character's "
+        "appearance or clothing, do not write a sentence about the place itself and do not name "
+        "the shot type: the pipeline adds each character's description, the place's setting "
+        "sentence and the shot type to this field itself."),
+    "chained_motion1": (
+        "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
+        "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
+        "word for word. Describe ONE continuous physical motion, not a sequence of separate "
+        "steps. Do not mention the camera: the pipeline adds the camera sentence."),
+    "chained_motion": (
+        "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
+        "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "
+        "Name each character only by their referring phrase, word for word. Describe ONE "
+        "continuous physical motion, not a sequence of separate steps: @@SECONDS@@ seconds is "
+        "enough for a single gesture, a few footsteps or the start of a movement. Do not describe "
+        "appearance, clothing, setting, lighting, colour, style, camera or lens -- all of that is "
+        "already on screen."),
+    "no_stills_prompt": (
+        "prompt: W1 to W2 words in the present tense: one flowing paragraph in strict "
+        "chronological order that opens with the main action, carries enough separate beats to "
+        "fill the full @@SECONDS@@ seconds, links them with temporal connectors (initially, as, "
+        "then, while, a moment later), names the ambient and environmental sounds alongside the "
+        "actions that make them, and states the camera viewpoint and the lighting and colour. "
+        "Name each character only by their referring phrase. Do not describe any character's "
+        "appearance or clothing, do not write a sentence about the place itself and do not name "
+        "the shot type or the camera motion: the pipeline adds each character's description, the "
+        "place's setting sentence, the shot type and the camera motion itself. Describe only what "
+        "is physically observable, with no mood words, no spoken dialogue and no markdown."),
+    "shots_image": (
+        "image: W1 to W2 words describing this shot's first frame as one still picture: where "
+        "each character stands and which way they face, using fixed left and right screen "
+        "direction; the background; the lighting and colour palette; the camera viewpoint; and "
+        "the rendering style. Do not describe any character's appearance or clothing, do not "
+        "write a sentence about the place itself and do not name the shot type: the pipeline "
+        "adds each character's description, the place's setting sentence and the shot type to "
+        "this field itself. Never name a person who is not in this shot."),
+    "shots_motion": (
+        "motion: ONE sentence of W1 to W2 words naming ONE character by their referring phrase "
+        "and the ONE physical action they perform during these @@SECONDS@@ seconds. Never chain "
+        "actions with then, while, meanwhile, simultaneously, afterwards, followed by or a comma "
+        "before and, and never use a semicolon. Do not mention the camera: the pipeline adds the "
+        "camera sentence."),
+    "narration": "narration: one sentence of voice-over narration, 3 to 30 words.",
+}
+
+
+def writer_keys(mode, k):
+    """The writer parts of panel k (Section 2.3), in order."""
+    if mode == "chained":
+        return ("title", "image", "motion", "narration") if k == 1 else (
+            "title", "motion", "narration")
+    if mode == "no_stills":
+        return ("title", "prompt", "narration")
+    return ("title", "image", "motion", "narration")
+
+
+def writer_targets(ctx, plan, k):
+    """{field: (W1, W2)} for every writer field with a word range (RS14)."""
+    targets = {}
+    for field, pasted in pasted_pieces(ctx, plan, k).items():
+        spec = field_range(ctx, k, field)
+        if spec is None:
+            continue
+        kind, (lo, hi) = spec
+        used = _words(" ".join(p for p in pasted if p))
+        w1 = max(MIN_WRITER_WORDS[kind], lo - used)
+        targets[field] = (w1, max(w1, hi - used))
+    return targets
+
+
+def title_fallback(action):
+    """The first five words of the beat action, letters, digits, spaces, ' and - only."""
+    return _collapse(_TITLE_CHARS_RE.sub("", " ".join(action.split()[:5])))
+
+
+def clean_writer(lib, text, pasted=()):
+    """RS13 cleanup of one writer string: strip; drop one leading field label and one pair of
+    surrounding double quotes; collapse whitespace; blank every case- and whitespace-
+    insensitive occurrence of a pasted sentence (character_lib._passage_spans and _blank, each
+    span widened over the sentence's own full stop); collapse again."""
+    if not isinstance(text, str):
+        return ""
+    text = _LABEL_RE.sub("", text.strip(), count=1).strip()
+    for left, right in _QUOTE_PAIRS:
+        if len(text) >= 2 and text.startswith(left) and text.endswith(right):
+            text = text[1:-1]
+            break
+    text = _collapse(text)
+    pasted = [p for p in pasted if p]
+    if pasted:
+        spans = [(s, e + 1 if text[e:e + 1] == "." else e)
+                 for s, e in lib._passage_spans(text, pasted)]
+        text = _collapse(lib._blank(text, spans))
+    return text
+
+
+def empty_parts(mode, k, plan):
+    parts = {key: "" for key in writer_keys(mode, k)}
+    parts["title"] = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
+    return parts
+
+
+def parse_panel_reply(ctx, plan, k, answer):
+    """The cleaned writer parts of panel k from a reply, or None when the reply is not valid
+    (RS13): every non-title key must hold a string that is non-empty after cleanup."""
+    obj = extract_json(answer)
+    if obj is None:
+        return None
+    lib = _character_lib(ctx.ws)
+    pasted = pasted_pieces(ctx, plan, k)
+    parts = {}
+    for key in writer_keys(ctx.mode, k):
+        if key == "title":
+            continue
+        value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
+        if not value:
+            return None
+        parts[key] = value
+    title = clean_writer(lib, obj.get("title"))
+    if not title or _words(title) > 6:
+        title = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
+    return dict({"title": title}, **parts)
+
+
+def panel_fields(ctx, plan, parts, k):
+    """[(Label, assembled text)] of panel k in file order (RS14)."""
+    p = parts[k - 1]
+    pasted = pasted_pieces(ctx, plan, k)
+
+    def join(pieces):
+        return " ".join(_sentence(piece) for piece in pieces if piece and piece.strip())
+
+    fields = []
+    if (ctx.mode == "chained" and k == 1) or ctx.mode == "shots":
+        image = pasted["image"]
+        fields.append(("Image", join(image[:-1] + [p.get("image", "")] + image[-1:])))
+    if ctx.mode == "no_stills":
+        fields.append(("Prompt", join([p.get("prompt", "")] + pasted["prompt"])))
+    else:
+        fields.append(("Motion", join([p.get("motion", "")] + pasted["motion"])))
+    fields.append(("Narration", _sentence(p.get("narration", ""))))
+    return fields
+
+
+def assemble(ctx, plan, parts):
+    """The story.md text of a plan and its writer parts (RS14)."""
+    lines = ["# " + plan["title"], "", plan["logline"], ""]
+    if ctx.mode == "shots":
+        lines.append("## Characters")
+        lines += ['- "%s": %s.' % (c["phrase"], c["descriptor"]) for c in plan["cast"]]
+        lines.append("")
+    for k in range(1, len(parts) + 1):
+        lines.append("## Panel %d — %s" % (k, parts[k - 1]["title"]))
+        lines += ["%s: %s" % (label, text) for label, text in panel_fields(ctx, plan, parts, k)]
+        lines.append("")
+    return "\n".join(lines[:-1]) + "\n"
+
+
+def _norm_text(text):
+    return " ".join(text.lower().split()).rstrip(".")
+
+
+def _first(regex, text):
+    match = regex.search(text)
+    return " ".join(match.group(0).lower().split()) if match else None
+
+
+def _valid_phrases(lib, plan):
+    phrases = {}
+    for c in plan["cast"]:
+        try:
+            phrases[lib.normalize_phrase(c["phrase"])] = c["id"]
+        except lib.CharacterError:
+            continue
+    return phrases
+
+
+def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
+    """(hard, advisory) of one panel: the RS15 checks named in ids, plus N15 when in ids.
+    fields: [(Label, assembled text)]; writers: {Label: writer text}; plan may be None (then
+    every check that needs the plan is skipped)."""
+    hard, advisory = [], []
+    beat = plan["beats"][k - 1] if plan and k <= len(plan["beats"]) else None
+    phrases = _valid_phrases(lib, plan) if plan else {}
+    by_cast = {c["id"]: c for c in plan["cast"]} if plan else {}
+    by_location = {l["id"]: l for l in plan["locations"]} if plan else {}
+    prefix = "panel %d:" % k
+
+    def add(target, check, name, label, detail):
+        target.append("%s %s %s: %s: %s" % (prefix, check, name, label, detail))
+
+    action_fields = ("Image", "Motion", "Prompt")
+    for label, text in fields:
+        writer = writers.get(label, "")
+        key = label.lower()
+        if "N1" in ids and label != "Narration" and not (ctx.mode == "shots" and label == "Motion"):
+            spec = field_range(ctx, k, key)
+            if spec:
+                lo, hi = spec[1]
+                if not lo <= _words(text) <= hi:
+                    add(hard, "N1", "word count", label,
+                        "is %d words; it must be %d-%d" % (_words(text), lo, hi))
+        if ctx.mode == "chained" and k >= 2 and label == "Motion" and plan:
+            humans = [p for p in phrases if not lib.is_animal_phrase(p)]
+            animals = [p for p in phrases if lib.is_animal_phrase(p)]
+            if "N2" in ids:
+                for sentence in lib._SENTENCE_SPLIT_RE.split(text.strip()):
+                    refs = [r for r in lib._person_refs(sentence, humans, animals, [])
+                            if r[2] in lib.SHOTS_PERSON_NOUNS]
+                    if refs:
+                        add(hard, "N2", "referring phrase", label,
+                            "names %s outside every referring phrase; name each character by "
+                            "their exact phrase" % _q(refs[0][2]))
+                        break
+            if "N3" in ids:
+                blanked = lib._blank(text, lib._passage_spans(
+                    text, list(phrases) + [p["name"] for p in plan["props"] if p["name"]]))
+                word = _first(_APPEARANCE_RE, blanked)
+                if word:
+                    add(hard, "N3", "appearance", label,
+                        "says %s; panels after the first never re-describe appearance, clothing, "
+                        "setting, lighting, colour, style or camera" % _q(word))
+        if "N4" in ids and label != "Narration" and beat is not None:
+            for phrase in lib.find_phrases(writer, list(phrases)):
+                if phrases[phrase] not in beat["cast"]:
+                    add(hard, "N4", "stray cast", label,
+                        "names %s, who is not in beat %d's cast" % (_q(phrase), k))
+                    break
+        pasted_field = ((ctx.mode == "chained" and k == 1 and label == "Image")
+                        or (ctx.mode == "shots" and label == "Image")
+                        or (ctx.mode == "no_stills" and label == "Prompt"))
+        if pasted_field and beat is not None:
+            norm = _norm_text(text)
+            if "N5" in ids and beat["location"] in by_location:
+                own = by_location[beat["location"]]
+                if _norm_text(own["setting"]) not in norm:
+                    add(hard, "N5", "setting sentence", label,
+                        "lacks %s's setting sentence word for word" % own["id"])
+                else:
+                    for other in plan["locations"]:
+                        if (other["id"] != own["id"] and other["setting"]
+                                and _norm_text(other["setting"]) != _norm_text(own["setting"])
+                                and _norm_text(other["setting"]) in norm):
+                            add(hard, "N5", "setting sentence", label,
+                                "contains %s's setting sentence; beat %d is at %s"
+                                % (other["id"], k, own["id"]))
+                            break
+            if "N6" in ids:
+                for cid in beat["cast"]:
+                    entry = by_cast.get(cid)
+                    if entry is None or (ctx.mode == "shots" and entry["cast_name"]):
+                        continue
+                    if _norm_text(entry["descriptor"]) not in norm:
+                        add(hard, "N6", "description", label,
+                            "lacks %s's description word for word" % cid)
+                        break
+        if label in action_fields:
+            if "N7" in ids:
+                if any(q in writer for q in ('"', "“", "”")):
+                    add(hard, "N7", "dialogue and text", label, "contains a double quote")
+                else:
+                    word = _first(DIALOGUE_RE, writer) or _first(ONSCREEN_TEXT_RE, writer)
+                    if word:
+                        add(hard, "N7", "dialogue and text", label, "says %s" % _q(word))
+            if "N8" in ids and ctx.mode != "shots":
+                word = _first(lib._OFFSCREEN_RE, writer)
+                if word:
+                    add(hard, "N8", "off-screen", label,
+                        "says %s; describe only what is in the frame" % _q(word))
+            if "N9" in ids:
+                word = _first(CUT_RE, writer)
+                if word:
+                    add(hard, "N9", "cut wording", label,
+                        "says %s; one panel is one continuous shot" % _q(word))
+        if "N10" in ids:
+            found = PLACEHOLDER_RE.search(writer)
+            copied = found.group(0) if found else next(
+                (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(writer)), None)
+            if copied:
+                add(hard, "N10", "copied example", label, "contains template text %s" % _q(copied))
+        if "N11" in ids and label == "Narration" and not text.strip():
+            hard.append("%s N11 narration: Narration: is empty" % prefix)
+    if "N15" in ids and undeclared:
+        masks = [m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
+        if plan:
+            masks += [entry["phrase"] for entry in plan["cast"] if isinstance(entry.get("phrase"), str)]
+        for label, text in [("Title", title)] + list(fields):
+            for hit in undeclared_references(lib, text, undeclared, masks=masks):
+                hard.append(undeclared_message("%s N15 undeclared character:" % prefix,
+                                               label + ":", hit))
+    if "N12" in ids and ctx.mode == "chained":
+        writer = writers.get("Motion", "")
+        chain = _first(lib._CHAIN_WORD_RE, writer)
+        if chain is None and ";" in writer:
+            chain = ";"
+        if chain is None and lib._COMMA_AND_RE.search(writer):
+            chain = ", and"
+        if chain:
+            add(advisory, "N12", "one action", "Motion", "chains actions with %s" % _q(chain))
+    if "N14" in ids:
+        narration = dict(fields).get("Narration", "")
+        if narration.strip():
+            sentences = [s for s in lib._SENTENCE_SPLIT_RE.split(narration.strip()) if s.strip()]
+            lo, hi = NARRATION_WORDS
+            if len(sentences) != 1:
+                add(advisory, "N14", "narration form", "Narration",
+                    "is %d sentences; it should be one sentence of %d-%d words"
+                    % (len(sentences), lo, hi))
+            elif not lo <= _words(narration) <= hi:
+                add(advisory, "N14", "narration form", "Narration",
+                    "is %d words; it should be one sentence of %d-%d words"
+                    % (_words(narration), lo, hi))
+    return hard, advisory
+
+
+def _repeat_words(lib, text, phrase_words):
+    return {w.lower() for w in lib._WORD_RE.findall(text) if len(w) >= 3} - phrase_words
+
+
+def repeat_advisories(ctx, lib, plan, writers_by_panel):
+    """N13 for consecutive panels' action writer text (Motion, or Prompt in no_stills)."""
+    label = "Prompt" if ctx.mode == "no_stills" else "Motion"
+    phrase_words = set()
+    for c in plan["cast"] if plan else []:
+        phrase_words.update(w.lower() for w in c["phrase"].split())
+    out = []
+    for k in range(2, len(writers_by_panel) + 1):
+        a = _repeat_words(lib, writers_by_panel[k - 2].get(label, ""), phrase_words)
+        b = _repeat_words(lib, writers_by_panel[k - 1].get(label, ""), phrase_words)
+        if a or b:
+            similarity = len(a & b) / float(len(a | b))
+            if similarity >= REPEAT_JACCARD:
+                out.append("panel %d: N13 repeat: %s: repeats panel %d's action (similarity %.2f)"
+                           % (k, label, k - 1, similarity))
+    return out
+
+
+def plan_copied_examples(plan):
+    """N10 at plan scope: every descriptor, setting and action of the plan."""
+    out = []
+    texts = ([("%s's descriptor" % c["id"], c["descriptor"]) for c in plan["cast"]]
+             + [("%s's setting" % l["id"], l["setting"]) for l in plan["locations"]]
+             + [("beat %d's action" % k, b["action"]) for k, b in enumerate(plan["beats"], 1)])
+    for where, text in texts:
+        found = PLACEHOLDER_RE.search(text)
+        copied = found.group(0) if found else next(
+            (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(text)), None)
+        if copied:
+            out.append("plan: N10 copied example: %s contains template text %s" % (where, _q(copied)))
+    return out
+
+
+GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
+                     "N14", "N15")
+
+
+def panel_checks(ctx, plan, parts, text, story_md_path):
+    """(hard, advisory) of an assembled story (RS15): plan-scope N10, then per panel N1-N11 and
+    N15 (hard) and N12-N14 (advisory), then (shots) character_lib.shots_violations and
+    shots_advisories. story_md_path holds text (written by the caller) and is parsed with
+    bin/ltx-story-manifest's _parse_prompts_md."""
+    lib = _character_lib(ctx.ws)
+    undeclared = undeclared_characters(ctx)
+    hard, advisory = plan_copied_examples(plan), []
+    writers_by_panel = []
+    for k in range(1, len(parts) + 1):
+        fields = panel_fields(ctx, plan, parts, k)
+        writers = {LABELS[key]: parts[k - 1].get(key, "") for key in writer_keys(ctx.mode, k)
+                   if key != "title"}
+        writers_by_panel.append(writers)
+        h, a = _field_checks(ctx, lib, plan, k, parts[k - 1]["title"], fields, writers,
+                             GENERATION_CHECKS, undeclared)
+        hard += h
+        advisory += a
+    advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
+    if ctx.mode == "shots":
+        panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
+        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members)
+        advisory += lib.shots_advisories(panels, ctx.members)
+    return hard, advisory
+
+
+def _order_by_panel(lines):
+    """Panel advisories sorted by panel, then N12, N13, N14 (stable)."""
+    order = {"N12": 0, "N13": 1, "N14": 2}
+    return sorted(lines, key=lambda l: (int(l.split(":", 1)[0].split()[1]),
+                                        order.get(l.split()[2], 3)))
+
+
+def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
+    """The exact panel prompt of RS12 (plus the RS37 reserved line)."""
+    beat = plan["beats"][k - 1]
+    by_cast = {c["id"]: c for c in plan["cast"]}
+    targets = writer_targets(ctx, plan, k)
+    if ctx.mode == "no_stills":
+        rules = "Rules:\n" + no_stills_rules + "\n\n" if no_stills_rules else ""
+    elif ctx.mode == "shots":
+        rules = SHOTS_PANEL_RULES
+    else:
+        rules = ""
+    beat_lines = "\n".join((">> " if b["index"] == k else "   ")
+                           + "%d. (%s) %s" % (b["index"], b["arc"], b["action"])
+                           for b in plan["beats"])
+    phrases = "; ".join('"%s"' % by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast)
+    undeclared = undeclared_characters(ctx)
+    reserved = ("Characters who are not in this movie, never to be named: "
+                + reserved_items(undeclared) + ".\n") if undeclared else ""
+    previous = ""
+    if ctx.mode == "chained" and k >= 2:
+        previous = ("The previous panel's Motion: "
+                    + dict(panel_fields(ctx, plan, parts, k - 1))["Motion"] + "\n")
+    seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
+    key_lines = []
+    for key in writer_keys(ctx.mode, k):
+        if key == "title" or key == "narration":
+            line = KEY_LINE_TEMPLATES[key]
+        elif ctx.mode == "chained":
+            line = KEY_LINE_TEMPLATES["chained_image" if key == "image" else
+                                      "chained_motion1" if k == 1 else "chained_motion"]
+        else:
+            line = KEY_LINE_TEMPLATES["%s_%s" % (ctx.mode, key)]
+        if key in targets:
+            line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
+        key_lines.append(line)
+    fix_block = ""
+    if fix is not None:
+        keys = writer_keys(ctx.mode, k)
+        current = parts[k - 1] if k <= len(parts) and parts[k - 1] else {}
+        fix_block = ("Your previous version of this panel was rejected. Problems:\n"
+                     + "\n".join("- " + m for m in fix[:MAX_LISTED])
+                     + "\nPrevious version:\n"
+                     + "\n".join("%s: %s" % (key, current.get(key, "")) for key in keys)
+                     + "\n\n")
+    fragments = [
+        ("@@GOAL_PARAGRAPH@@", _goal_paragraph(ctx.goal)),
+        ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[ctx.mode]),
+        ("@@PANEL_RULES@@", rules),
+        ("@@BEAT_LINES@@", beat_lines),
+        ("@@ACTION@@", beat["action"]),
+        ("@@CAST_PHRASES@@", phrases or "nobody"),
+        ("@@RESERVED@@", reserved),
+        ("@@PREVIOUS@@", previous),
+        ("@@SEED_PANEL@@", seed),
+        ("@@KEY_LINES@@", "\n".join(key_lines)),
+        ("@@FIX_BLOCK@@", fix_block),
+    ]
+    scalars = [("@@K@@", str(k)), ("@@PANELS@@", str(ctx.panels)),
+               ("@@STORY_ID@@", ctx.story_id), ("@@SECONDS@@", ctx.seconds)]
+    return _fill(PANEL_PROMPT_TEMPLATE, fragments, scalars, ctx.narrative)
+
+
+def unparseable_panel_problem(mode, k):
+    return ("the reply is not one JSON object with the keys %s"
+            % ", ".join(writer_keys(mode, k)))
