@@ -1834,6 +1834,62 @@ def phase4_render(args):
 # dry-run plan
 # ---------------------------------------------------------------------------
 
+def _print_legacy_phase1(args, paths, prompt, max_tokens, timeout):
+    """The --story-legacy Phase 1 block of the dry run, exactly as before the robust engine."""
+    print("Would skip if %s already exists (pass --force-story to regenerate)."
+          % paths["story_md"])
+    phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
+                  "--workspace", WS,
+                  "--max-tokens", str(max_tokens), "--max-rounds", "4",
+                  "--request-timeout", "600"]
+    if args.story_model:
+        phase1_cmd += ["--model", args.story_model]
+    if args.story_context_window:
+        phase1_cmd += ["--context-window", str(args.story_context_window)]
+    if getattr(args, "seed_image", None):
+        phase1_cmd += ["--image", paths["seed_downscaled"]]
+    phase1_cmd += ["--user-prompt", prompt]
+    print("Command (subprocess timeout %ds): %s" % (timeout, shlex.join(phase1_cmd)))
+    print()
+    print("Rendered story prompt:")
+    print(prompt)
+    print()
+
+
+def _print_robust_phase1(args, paths):
+    """The robust engine's Phase 1 block of the dry run (robust story spec RS30). Writes nothing;
+    loads story_engine.py and lora_catalog.py only."""
+    engine = _story_engine()
+    ctx = _story_context(args, dry_run=True)
+    compatible = engine.compatible_entries(ctx)
+    print("Would skip if %s already exists and re-check it instead (pass --force-story to "
+          "regenerate)." % paths["story_md"])
+    print("Story engine: a JSON plan, one call per panel, deterministic checks and up to 3 critic "
+          "rounds (analyst via the local qwen-agentd, else a local one-shot); --story-legacy for "
+          "the single-prompt path.")
+    for warning in engine.catalog_warnings(ctx):
+        print(warning)
+    catalog_path = _lora_catalog().catalog_path(WS)
+    if args.no_auto_lora:
+        print("Catalog LoRAs: off (--no-auto-lora)")
+    elif compatible:
+        print("Catalog LoRAs: %d compatible entr%s in %s"
+              % (len(compatible), "y" if len(compatible) == 1 else "ies", catalog_path))
+    else:
+        print("Catalog LoRAs: none compatible in %s" % catalog_path)
+    if args.judge:
+        print("Judge gate: bin/judge-story --patches after the critic rounds.")
+    prompt = engine.build_plan_prompt(ctx, compatible, ctx.pinned)
+    argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_max_tokens(args.panels),
+                            image=ctx.seed_agent_image)
+    print("Command (subprocess timeout %ds): %s"
+          % (engine.plan_timeout(args.panels), shlex.join(argv)))
+    print()
+    print("Rendered plan prompt:")
+    print(prompt)
+    print()
+
+
 def _print_shots_stills_plan(args, cmd):
     """Phase 2's dry-run lines in shots mode (shots spec 5.8). Touches nothing."""
     story_md = _story_paths(args.story_id)["story_md"]
@@ -1905,24 +1961,10 @@ def _print_dry_run_plan(args):
         print(geometry_line)
 
     print("--- Phase 1: story ---")
-    print("Would skip if %s already exists (pass --force-story to regenerate)."
-          % paths["story_md"])
-    phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
-                  "--workspace", WS,
-                  "--max-tokens", str(max_tokens), "--max-rounds", "4",
-                  "--request-timeout", "600"]
-    if args.story_model:
-        phase1_cmd += ["--model", args.story_model]
-    if args.story_context_window:
-        phase1_cmd += ["--context-window", str(args.story_context_window)]
-    if getattr(args, "seed_image", None):
-        phase1_cmd += ["--image", paths["seed_downscaled"]]
-    phase1_cmd += ["--user-prompt", prompt]
-    print("Command (subprocess timeout %ds): %s" % (timeout, shlex.join(phase1_cmd)))
-    print()
-    print("Rendered story prompt:")
-    print(prompt)
-    print()
+    if getattr(args, "story_engine", "legacy") == "robust":
+        _print_robust_phase1(args, paths)
+    else:
+        _print_legacy_phase1(args, paths, prompt, max_tokens, timeout)
 
     if getattr(args, "story_server_stop_after_story", False):
         print("--- Phase 1b: release the story server ---")

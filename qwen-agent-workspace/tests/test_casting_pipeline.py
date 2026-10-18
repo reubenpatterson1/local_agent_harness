@@ -1151,7 +1151,7 @@ def test_p46_dry_run_with_character(tmp_path, monkeypatch, capsys, lib_dir):
     make_character(lib_dir)
     _movie_stories(tmp_path, monkeypatch)
     assert ltx_movie.main(["two travellers", "--story-id", "casting-p46", "--dry-run",
-                           "--no-review", "--character", "kyra"]) == 0
+                           "--no-review", "--character", "kyra", "--story-legacy"]) == 0
     out = capsys.readouterr().out
     video = os.path.join(lib_dir, "kyra", "lora", "video.safetensors")
     assert "--- Cast ---" in out.splitlines()

@@ -2257,3 +2257,110 @@ def test_story_focus_5_non_ascii_text_round_trips(movie, tmp_path, monkeypatch):
     with open(os.path.join(story_dir, "story.md"), encoding="utf-8") as f:
         assert f.read().startswith("# Café 東京\n")
     assert ("Narrative to adapt:\n" + narrative + "\n") in log[0]["argv"][-1]
+
+
+# --- RST41, RST47, RST57 (dry run): the robust dry run (RS30, RSK5) ---------------------------
+
+FORBIDDEN_IN_PHASE1 = ("{", "}", "ltx-mlx-render", "ltx-story-images", "ltx-story-manifest",
+                       "story-server", "--resume", "--chain", "--shots", "--no-images")
+
+
+def test_rst41_legacy_dry_run_matches_the_golden():
+    regression = importlib.machinery.SourceFileLoader(
+        "casting_regression_for_rst41", os.path.join(WS, "tests", "test_casting_regression.py")
+    ).load_module()
+    with open(regression.GOLDEN_B1, encoding="utf-8") as f:
+        assert regression.b1_text() == f.read()
+
+
+def _dry_run(story_id, *flags, env=None):
+    proc = subprocess.run([sys.executable, os.path.join(WS, "bin", "ltx-movie"), NARRATIVE,
+                           "--story-id", story_id, "--dry-run", "--no-review"] + list(flags),
+                          cwd=WS, capture_output=True, text=True,
+                          env=dict(os.environ, **(env or {})))
+    return proc
+
+
+def _phase1_block(out):
+    lines = out.splitlines()
+    start = lines.index("--- Phase 1: story ---")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("--- Phase "))
+    return lines[start:end]
+
+
+def test_rst47_robust_dry_run(tmp_path, story_env, monkeypatch):
+    from PIL import Image
+    seed = str(tmp_path / "seed.png")
+    Image.new("RGB", (704, 448), (10, 20, 30)).save(seed)
+    files = str(tmp_path / "files")
+    seu.make_catalog(story_env["catalog"], [
+        seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+        seu.catalog_entry(seu.lora_file(files, "other"), "other-model", base_models=["X/y"])])
+    catalog_path = os.path.join(story_env["catalog"], "catalog.json")
+    story_dir = os.path.join(WS, "generated", "stories", "rst47-%d" % os.getpid())
+    assert not os.path.exists(story_dir)
+    cases = [
+        ([], "Catalog LoRAs: 1 compatible entry in %s" % catalog_path, False, False),
+        (["--no-stills"], "Catalog LoRAs: 1 compatible entry in %s" % catalog_path, False, False),
+        (["--shots"], "Catalog LoRAs: 1 compatible entry in %s" % catalog_path, False, False),
+        (["--seed-image", seed], "Catalog LoRAs: 1 compatible entry in %s" % catalog_path, True,
+         False),
+        (["--no-auto-lora"], "Catalog LoRAs: off (--no-auto-lora)", False, False),
+        (["--judge"], "Catalog LoRAs: 1 compatible entry in %s" % catalog_path, False, True),
+    ]
+    for flags, catalog_line, seeded, judge in cases:
+        proc = _dry_run(os.path.basename(story_dir), "--panels", "4", *flags,
+                        env={"ANTHROPIC_API_KEY": "test-not-a-key"} if judge else None)
+        assert proc.returncode == 0, proc.stderr
+        block = _phase1_block(proc.stdout)
+        assert block[:4] == [
+            "--- Phase 1: story ---",
+            "Would skip if %s already exists and re-check it instead (pass --force-story to "
+            "regenerate)." % os.path.join(story_dir, "story.md"),
+            "Story engine: a JSON plan, one call per panel, deterministic checks and up to 3 "
+            "critic rounds (analyst via the local qwen-agentd, else a local one-shot); "
+            "--story-legacy for the single-prompt path.",
+            catalog_line]
+        command = block[5 if judge else 4]
+        if judge:
+            assert block[4] == "Judge gate: bin/judge-story --patches after the critic rounds."
+        assert command.startswith("Command (subprocess timeout 600s): ")
+        argv = shlex.split(proc.stdout.split("Command (subprocess timeout 600s): ", 1)[1]
+                           .split("\n\nRendered plan prompt:\n", 1)[0])
+        assert argv[argv.index("--max-rounds") + 1] == "1"
+        assert argv[argv.index("--max-tokens") + 1] == "4096"
+        assert ("--image" in argv) == seeded
+        if seeded:
+            assert argv[argv.index("--image") + 1] == os.path.join(story_dir, "seed_downscaled.png")
+        assert argv[-1].startswith('You are planning a short narrated movie (story-id "rst47-')
+        assert block[block.index("Rendered plan prompt:") + 1].startswith("You are planning")
+        assert not [line for line in proc.stdout.splitlines() if "{" in line or "}" in line]
+        phase1 = "\n".join(block)
+        assert not [s for s in FORBIDDEN_IN_PHASE1 if s in phase1], flags
+    assert not os.path.exists(story_dir)
+    os.remove(catalog_path)
+    proc = _dry_run("rst47b-%d" % os.getpid())
+    assert ("Catalog LoRAs: none compatible in %s" % catalog_path) in proc.stdout.splitlines()
+    script = (
+        "import contextlib, io, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import importlib.machinery\n"
+        "m = importlib.machinery.SourceFileLoader('ltx_movie', %r).load_module()\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "    rc = m.main(['n', '--story-id', 'x', '--dry-run', '--no-review'])\n"
+        "print('RC=%%d' %% rc)\n"
+        "print('CHARACTER_LIB_LOADED=%%s' %% ('character_lib' in sys.modules))\n"
+        "print('FLEET_LOADED=%%s' %% ('fleet_lib_for_story' in sys.modules))\n"
+    ) % (WS, os.path.join(WS, "bin", "ltx-movie"))
+    seu.kyra(story_env["lib"])
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
+    assert proc.stdout.splitlines() == ["RC=0", "CHARACTER_LIB_LOADED=False", "FLEET_LOADED=False"], (
+        proc.stderr)
+
+
+def test_rst57c_dry_run_lists_the_undeclared_characters(story_env):
+    seu.ronin(story_env["lib"])
+    proc = _dry_run("rst57-%d" % os.getpid(), "--panels", "3")
+    assert proc.returncode == 0, proc.stderr
+    assert (' Never use these names or referring phrases, which belong to characters who are not '
+            'in this movie: ronin ("the ronin").') in proc.stdout

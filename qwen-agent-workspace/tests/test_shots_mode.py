@@ -1614,7 +1614,8 @@ def test_s50_dry_run_new_shots_story(lib_dir):
     assert not os.path.exists(story_dir)
     proc = subprocess.run(
         [sys.executable, "bin/ltx-movie", "n", "--story-id", story_id, "--shots", "--panels", "4",
-         "--dry-run", "--no-review", "--character", "kyra", "--character", "ronin"],
+         "--dry-run", "--no-review", "--character", "kyra", "--character", "ronin",
+         "--story-legacy"],
         cwd=WS, env=dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir, STORY_PIPELINE_LOGGED="1"),
         capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
@@ -2523,7 +2524,8 @@ def test_s99_dry_run_shows_the_v2_prompt(lib_dir):
     assert not os.path.exists(story_dir)
     proc = subprocess.run(
         [sys.executable, "bin/ltx-movie", "n", "--story-id", story_id, "--shots", "--panels", "4",
-         "--dry-run", "--no-review", "--character", "kyra", "--character", "ronin"],
+         "--dry-run", "--no-review", "--character", "kyra", "--character", "ronin",
+         "--story-legacy"],
         cwd=WS, env=dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir, STORY_PIPELINE_LOGGED="1"),
         capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr

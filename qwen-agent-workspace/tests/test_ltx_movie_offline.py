@@ -495,7 +495,7 @@ def test_length_too_short():
 def test_length_100_panels_and_tokens():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "narrative", "--story-id", "x",
-         "--length", "100", "--dry-run"],
+         "--length", "100", "--dry-run", "--story-legacy"],
         capture_output=True, text=True, cwd=WS)
     check("L11a --length 100 exits 0", result.returncode == 0,
           "rc=%r stderr=%r" % (result.returncode, result.stderr))
@@ -740,7 +740,7 @@ def test_no_stills_phase_sequencing_source():
 def test_no_stills_dry_run_plan():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-nostills",
-         "--no-stills", "--panels", "6", "--dry-run"],
+         "--no-stills", "--panels", "6", "--dry-run", "--story-legacy"],
         capture_output=True, text=True, cwd=WS,
     )
     out = result.stdout
@@ -768,7 +768,7 @@ def test_no_stills_dry_run_plan():
 def test_default_dry_run_plan_unchanged():
     result = subprocess.run(
         [sys.executable, _SCRIPT_PATH, "a narrative", "--story-id", "unittest-default",
-         "--panels", "6", "--dry-run"],
+         "--panels", "6", "--dry-run", "--story-legacy"],
         capture_output=True, text=True, cwd=WS,
     )
     out = result.stdout

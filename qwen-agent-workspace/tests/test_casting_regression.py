@@ -46,7 +46,8 @@ def _normalize(text, image=None):
 def b1_text():
     proc = subprocess.run(
         [sys.executable, "bin/ltx-movie", "a test narrative", "--story-id",
-         "casting-baseline-dry", "--dry-run", "--no-review", "--model", MODEL_25],
+         "casting-baseline-dry", "--dry-run", "--no-review", "--story-legacy", "--model",
+         MODEL_25],
         cwd=WS, env=dict(os.environ, STORY_PIPELINE_LOGGED="1"), capture_output=True,
         text=True)
     assert proc.returncode == 0, proc.stderr
