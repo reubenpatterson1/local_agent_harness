@@ -74,7 +74,10 @@ def _parse_range(text):
 
 def cmd_add(args):
     path = lora_catalog.catalog_path(WS)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        return _error("cannot write %s: %s" % (os.path.dirname(path), e.strerror or e))
     try:
         span = _parse_range(args.strength_range)
     except ValueError:
@@ -120,9 +123,14 @@ def cmd_add(args):
             if trigger.lower() in char_triggers:
                 return _error("trigger %s is character %s's trigger"
                               % (trigger, char_triggers[trigger.lower()]))
+        try:
+            sha256 = lora_catalog.file_sha256(args.path)
+            size = os.path.getsize(args.path)
+        except OSError:
+            return _error("%s is not a readable file" % args.path)
         entry = {"id": args.entry_id, "kind": args.kind, "path": os.path.abspath(args.path),
-                 "sha256": lora_catalog.file_sha256(args.path),
-                 "bytes": os.path.getsize(args.path), "base_models": list(args.base_models),
+                 "sha256": sha256,
+                 "bytes": size, "base_models": list(args.base_models),
                  "target": args.target, "triggers": list(args.triggers or []), "rank": rank,
                  "alpha": alpha, "default_strength": args.default_strength,
                  "strength_range": span, "description": args.description,
@@ -134,6 +142,8 @@ def cmd_add(args):
                                              "entries": entries + [entry]})
         except lora_catalog.CatalogError as e:
             return _error(str(e))
+        except OSError as e:
+            return _error("cannot write %s: %s" % (path, e.strerror or e))
     print("added %s (%s, %s, rank %d, sha256 %s...) to %s"
           % (entry["id"], entry["kind"], entry["target"], rank, entry["sha256"][:12], path))
     return 0
@@ -199,6 +209,8 @@ def cmd_remove(args):
                                              "entries": kept})
         except lora_catalog.CatalogError as e:
             return _error(str(e))
+        except OSError as e:
+            return _error("cannot write %s: %s" % (path, e.strerror or e))
     print("removed %s from %s" % (args.entry_id, path))
     return 0
 

@@ -429,6 +429,70 @@ def test_lct11_verify(tmp_path, story_env):
     assert (missing.returncode, missing.stderr) == (2, "Error: no catalog entry nope\n")
 
 
+def test_lct31_io_errors_are_reported_not_raised(tmp_path, story_env, monkeypatch, capsys):
+    files = str(tmp_path / "files")
+    entry = seu.catalog_entry(seu.lora_file(files, "m"), "fast-motion")
+
+    def boom(path):
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(lora_catalog, "file_sha256", boom)
+    assert lora_catalog.verify_entry(entry, [entry], {}) == [
+        "%s is missing or unreadable" % entry["path"]]
+    cli = importlib.machinery.SourceFileLoader("lora_catalog_cli", LORA_CATALOG_CLI).load_module()
+    lora = seu.lora_file(files, "n")
+    assert cli.main(_add_argv(lora, "n-motion")) == 2
+    assert capsys.readouterr().err == "Error: %s is not a readable file\n" % lora
+    assert _catalog_bytes(story_env) is None
+    monkeypatch.undo()
+    seu.set_story_env(monkeypatch, tmp_path)
+
+    def full(path, data):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lora_catalog, "save_catalog", full)
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    assert cli.main(_add_argv(lora, "n-motion")) == 2
+    assert capsys.readouterr().err == "Error: cannot write %s: No space left on device\n" % path
+    monkeypatch.undo()
+    seu.set_story_env(monkeypatch, tmp_path)
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    os.chmod(str(ro), 0o500)
+    try:
+        monkeypatch.setenv("LORA_CATALOG_DIR", str(ro / "loras"))
+        assert cli.main(_add_argv(lora, "n-motion")) == 2
+        assert capsys.readouterr().err == "Error: cannot write %s: Permission denied\n" % (
+            ro / "loras")
+    finally:
+        os.chmod(str(ro), 0o700)
+    absent = tmp_path / "absent"
+    monkeypatch.setenv("LORA_CATALOG_DIR", str(absent))
+    assert cli.main(["remove", "x"]) == 2
+    assert capsys.readouterr().err == "Error: no catalog entry x\n"
+    assert not absent.exists()
+    seu.kyra(story_env["lib"])
+    char_json = os.path.join(story_env["lib"], "kyra", "character.json")
+    monkeypatch.setenv("CHARACTER_LIBRARY_DIR", story_env["lib"])
+    os.chmod(char_json, 0)
+    try:
+        assert lora_catalog.fold_characters(WS) == []
+        assert lora_catalog.character_paths(WS) == {}
+    finally:
+        os.chmod(char_json, 0o600)
+    deep = str(tmp_path / "deep.json")
+    with open(deep, "w") as f:
+        f.write("[" * 100000 + "]" * 100000)
+    with pytest.raises(lora_catalog.CatalogError):
+        lora_catalog.load_catalog(deep)
+    body = b"[" * 100000 + b"]" * 100000
+    header = str(tmp_path / "deep.safetensors")
+    with open(header, "wb") as f:
+        f.write(len(body).to_bytes(8, "little") + body)
+    with pytest.raises(lora_catalog.CatalogError):
+        lora_catalog.read_safetensors_header(header)
+
+
 def test_lct12_concurrent_adds_both_land(tmp_path, story_env):
     files = str(tmp_path / "files")
     procs = [subprocess.Popen([sys.executable, LORA_CATALOG_CLI]

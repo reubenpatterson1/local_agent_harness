@@ -173,7 +173,7 @@ def load_catalog(path):
             data = json.load(f)
     except OSError as e:
         raise CatalogError("%s: cannot read: %s" % (path, e))
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise CatalogError("%s: not valid JSON: %s" % (path, e))
     try:
         validate_catalog(data)
@@ -247,7 +247,7 @@ def read_safetensors_header(path):
         if len(raw) != length:
             raise bad
         header = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError, struct.error):
+    except (OSError, ValueError, RecursionError, struct.error):
         raise bad
     if not isinstance(header, dict):
         raise bad
@@ -304,7 +304,7 @@ def fold_characters(ws):
     for name in lib.list_names():
         try:
             data = lib.load_character(name)
-        except lib.CharacterError:
+        except (lib.CharacterError, OSError):
             continue
         video = data["loras"]["video"]
         if not video:
@@ -327,7 +327,7 @@ def character_paths(ws):
     for name in lib.list_names():
         try:
             data = lib.load_character(name)
-        except lib.CharacterError:
+        except (lib.CharacterError, OSError):
             continue
         for kind in ("video", "stills"):
             if data["loras"][kind]:
@@ -375,14 +375,19 @@ def verify_entry(entry, all_entries, char_triggers):
     path = entry["path"]
     readable = os.path.isfile(path) and os.access(path, os.R_OK)
     header = None
+    if readable:
+        try:
+            size = os.path.getsize(path)
+            if size != entry["bytes"]:
+                problems.append("size is %d bytes; the catalog records %d" % (size, entry["bytes"]))
+            elif file_sha256(path) != entry["sha256"]:
+                problems.append("sha256 differs from the catalog; the file changed since it was "
+                                "added")
+        except OSError:
+            readable = False
     if not readable:
         problems.append("%s is missing or unreadable" % path)
     else:
-        size = os.path.getsize(path)
-        if size != entry["bytes"]:
-            problems.append("size is %d bytes; the catalog records %d" % (size, entry["bytes"]))
-        elif file_sha256(path) != entry["sha256"]:
-            problems.append("sha256 differs from the catalog; the file changed since it was added")
         try:
             header = read_safetensors_header(path)
         except CatalogError:
