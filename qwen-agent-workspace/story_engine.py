@@ -1665,3 +1665,160 @@ def parse_critic(answer):
         return None
     return {"scores": {k: scores[k] for k in SCORE_KEYS}, "verdict": obj["verdict"],
             "patches": obj["patches"]}
+
+
+# ---------------------------------------------------------------------------
+# Patches: the per-mode whitelist and application (RS20)
+# ---------------------------------------------------------------------------
+
+PATCH_KEYS = ("target", "index", "field", "reason", "replacement")
+
+
+def lora_patches_allowed(ctx):
+    """lora patches need auto LoRA and at least one compatible video catalog entry."""
+    return ctx.auto_lora and any(e["target"] == "video" for e in compatible_entries(ctx))
+
+
+def patch_ranges(ctx, plan, lora_allowed):
+    """{(target, field): (lo, hi) | None} -- None means "field not allowed in this mode"."""
+    n, mode = ctx.panels, ctx.mode
+    first_only = (1, 1) if mode == "chained" else (1, n)
+    return {("plan", "beat.action"): (1, n),
+            ("plan", "beat.shot"): first_only,
+            ("plan", "beat.camera"): first_only,
+            ("plan", "location.setting"): (1, len(plan["locations"])),
+            ("plan", "lora"): (0, n) if lora_allowed else None,
+            ("panel", "image"): first_only if mode != "no_stills" else None,
+            ("panel", "motion"): (1, n) if mode != "no_stills" else None,
+            ("panel", "prompt"): (1, n) if mode == "no_stills" else None,
+            ("panel", "narration"): (1, n)}
+
+
+def _patch_problem(ranges, patch):
+    if not isinstance(patch, dict) or not all(k in patch for k in PATCH_KEYS):
+        return "not an object with the keys target, index, field, reason and replacement"
+    key = (patch["target"], patch["field"])
+    if not all(isinstance(v, str) for v in key) or key not in ranges:
+        return "unknown target or field"
+    span = ranges[key]
+    if span is None:
+        return "field not allowed in this mode"
+    index = patch["index"]
+    if not isinstance(index, int) or isinstance(index, bool):
+        return "index is not an integer"
+    if not span[0] <= index <= span[1]:
+        allowed = "%d only" % span[0] if span[0] == span[1] else "%d to %d" % span
+        return "index %d is out of range for %s (allowed: %s)" % (index, patch["field"], allowed)
+    if patch["field"] == "lora":
+        if not isinstance(patch["replacement"], list):
+            return "replacement must be a list of picks"
+    elif not isinstance(patch["replacement"], str):
+        return "replacement must be a string"
+    return None
+
+
+def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
+    """(new_state, applied, rejected, regenerate) for a state {"plan", "parts"} and a patch
+    list (RS20). Works on a deep copy. regen(k, plan, parts) -> ("ok", parts_k) | ("failed",
+    None) | ("budget", None) | ("time", None) regenerates panel k after a beat.action patch;
+    without regen the panel keeps its parts. rejected items are {"patch", "reason"}."""
+    new = copy.deepcopy(state)
+    plan, parts = new["plan"], new["parts"]
+    lib = _character_lib(ctx.ws)
+    if lora_allowed is None:
+        lora_allowed = lora_patches_allowed(ctx)
+    ranges = patch_ranges(ctx, plan, lora_allowed)
+    applied, rejected, regenerate = [], [], []
+    accepted, seen = [], set()
+    patches = patches if isinstance(patches, list) else []
+    for i, patch in enumerate(patches):
+        if i >= MAX_PATCHES:
+            rejected.append({"patch": patch, "reason": "over the 8-patch limit"})
+            continue
+        problem = _patch_problem(ranges, patch)
+        if problem is None:
+            key = (patch["target"], patch["index"], patch["field"])
+            if key in seen:
+                problem = "duplicate patch target"
+            seen.add(key)
+        if problem:
+            rejected.append({"patch": patch, "reason": problem})
+        else:
+            accepted.append(patch)
+    compatible_by_id = {e["id"]: e for e in compatible_entries(ctx)}
+    catalog_by_id = {e["id"]: e for e in ctx.catalog.get("entries", [])}
+    for patch in accepted:
+        if patch["target"] != "plan":
+            continue
+        field, index = patch["field"], patch["index"]
+        if field == "beat.action":
+            action = clean_writer(lib, patch["replacement"])
+            words = _words(action)
+            if not 6 <= words <= 40:
+                rejected.append({"patch": patch, "reason": "the new action is %d words; it must "
+                                                           "be 6 to 40" % words})
+                continue
+            plan["beats"][index - 1]["action"] = action
+            regenerate.append(index)
+        elif field in ("beat.shot", "beat.camera"):
+            value = _collapse(patch["replacement"]).lower()
+            allowed = SHOT_TYPES if field == "beat.shot" else CAMERA_KEYS
+            if value not in allowed:
+                rejected.append({"patch": patch, "reason": "%s is not one of: %s"
+                                 % (_q(value), ", ".join(allowed))})
+                continue
+            plan["beats"][index - 1][field.split(".")[1]] = value
+        elif field == "location.setting":
+            setting = _collapse(patch["replacement"])
+            if setting and not setting.endswith((".", "!", "?")):
+                setting += "."
+            problems = _setting_problems(setting)
+            if problems:
+                rejected.append({"patch": patch, "reason": "the new setting " + problems[0]})
+                continue
+            plan["locations"][index - 1]["setting"] = setting
+        else:
+            before = lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+            saved = copy.deepcopy(plan["loras"])
+            if index == 0:
+                plan["loras"]["global"] = patch["replacement"]
+            elif patch["replacement"]:
+                plan["loras"]["per_beat"][str(index)] = patch["replacement"]
+            else:
+                plan["loras"]["per_beat"].pop(str(index), None)
+            broken = [h for h in lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+                      if h not in before]
+            if broken:
+                plan["loras"] = saved
+                rejected.append({"patch": patch, "reason": "would break " + broken[0]})
+                continue
+        applied.append(patch)
+    regenerate = sorted(set(regenerate))
+    for k in regenerate:
+        if regen is None:
+            continue
+        outcome, new_parts = regen(k, plan, parts)
+        if outcome == "ok":
+            parts[k - 1] = new_parts
+        elif outcome in ("budget", "time"):
+            action_patch = [p for p in accepted if p["field"] == "beat.action"
+                            and p["index"] == k][0]
+            rejected.append({"patch": action_patch, "reason": "panel %d regeneration skipped: %s"
+                             % (k, "call budget exhausted" if outcome == "budget"
+                                else "wall-clock cap reached")})
+    for patch in accepted:
+        if patch["target"] != "panel":
+            continue
+        k, field = patch["index"], patch["field"]
+        if k in regenerate:
+            rejected.append({"patch": patch,
+                             "reason": "panel regenerated from a beat.action patch this round"})
+            continue
+        text = clean_writer(lib, patch["replacement"],
+                            pasted_pieces(ctx, plan, k).get(field, ()))
+        if not text:
+            rejected.append({"patch": patch, "reason": "empty after cleanup"})
+            continue
+        parts[k - 1][field] = text
+        applied.append(patch)
+    return new, applied, rejected, regenerate
