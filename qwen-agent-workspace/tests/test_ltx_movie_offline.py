@@ -1608,6 +1608,8 @@ def test_main_block_completeness():
 
 
 if __name__ == "__main__":
+    os.environ["LORA_CATALOG_DIR"] = os.path.join(tempfile.gettempdir(),
+                                                  "ltx-movie-offline-no-catalog-%d" % os.getpid())
     test_parser_defaults()
     test_render_flags_gemma_lora()
     test_stills_lora_reaches_phase2()
