@@ -163,6 +163,16 @@ def agent_cmd(ctx, prompt, *, max_tokens, image=None, skill=None):
     return cmd + ["--user-prompt", prompt]
 
 
+def _report_no_answer(status, err):
+    """A Warning (stdout, like the other Warning: lines) with the last lines of bin/qwen-agent's
+    stderr when a call gave no answer, so the reason (a server that is down, a refused
+    preflight) is not lost."""
+    tail = [line for line in (err or "").splitlines() if line.strip()][-10:]
+    if tail:
+        print("Warning: bin/qwen-agent gave no answer (%s); the last lines of its stderr:\n%s"
+              % (status, "\n".join("  " + line for line in tail)))
+
+
 def run_agent(ctx, prompt, *, max_tokens, timeout, image=None, skill=None, preflight_done=False):
     """(status, answer) of one bin/qwen-agent one-shot call (RS5). status is the envelope's
     status, "timeout" or "no_envelope"; answer is the envelope's non-empty answer or None."""
@@ -173,21 +183,25 @@ def run_agent(ctx, prompt, *, max_tokens, timeout, image=None, skill=None, prefl
     proc = subprocess.Popen(cmd, cwd=ctx.ws, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, errors="replace", env=env)
     try:
-        out, _err = proc.communicate(timeout=timeout)
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.communicate()
+        _out, err = proc.communicate()
+        _report_no_answer("timeout", err)
         return "timeout", None
     lines = [line for line in (out or "").splitlines() if line.strip()]
     try:
         envelope = json.loads(lines[-1])
     except (IndexError, ValueError):
+        _report_no_answer("no_envelope", err)
         return "no_envelope", None
     if not isinstance(envelope, dict) or envelope.get("schema") != ONESHOT_SCHEMA:
+        _report_no_answer("no_envelope", err)
         return "no_envelope", None
     answer = envelope.get("answer")
     if not isinstance(answer, str) or not answer.strip():
         answer = None
+        _report_no_answer(str(envelope.get("status")), err)
     return str(envelope.get("status")), answer
 
 
@@ -395,27 +409,38 @@ def reserved_items(undeclared):
     return ", ".join('%s ("%s")' % (name, phrase) for name, _trigger, phrase in undeclared)
 
 
-def _word_match(word, text):
-    return re.search(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])", text, re.IGNORECASE)
+def _mask_spans(lib, text, masks):
+    """(start, end) of every occurrence in text of each mask string: its referring-phrase regex
+    when it normalizes as a phrase, and its whole-word, case-insensitive literal."""
+    spans = []
+    for m in {m for m in masks if m and m.strip()}:
+        try:
+            pattern = lib._phrase_regex(lib.normalize_phrase(m))
+        except lib.CharacterError:
+            pattern = None
+        if pattern:
+            spans += [mo.span() for mo in pattern.finditer(text)]
+        spans += [mo.span() for mo in re.finditer(r"(?<![\w-])" + re.escape(m) + r"(?![\w-])",
+                                                  text, re.IGNORECASE)]
+    return spans
+
+
+def _first_unmasked(matches, spans):
+    """The first match whose span lies inside no mask span, else None."""
+    for mo in matches:
+        if not any(s <= mo.start() and mo.end() <= e for s, e in spans):
+            return mo
+    return None
 
 
 def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
     """[(name, kind, matched text)] for each undeclared character text refers to, first kind
     per character in the RS37 order: referring phrase, trigger, name. exact_phrase compares a
-    cast entry's phrase by case-insensitive equality instead of occurrence. masks are
-    phrases/words of declared or invented characters; in occurrence mode their spans are
-    blanked before scanning so a reference contained in them is not reported."""
-    scan = text
-    if not exact_phrase and masks:
-        for m in sorted({m for m in masks if m and m.strip()}, key=len, reverse=True):
-            try:
-                pattern = lib._phrase_regex(lib.normalize_phrase(m))
-            except lib.CharacterError:
-                pattern = None
-            if pattern:
-                scan = pattern.sub(lambda mo: "\x00" * len(mo.group(0)), scan)
-            scan = re.sub(r"(?<![\w-])" + re.escape(m) + r"(?![\w-])",
-                          lambda mo: "\x00" * len(mo.group(0)), scan, flags=re.IGNORECASE)
+    cast entry's phrase by case-insensitive equality instead of occurrence. masks are strings of
+    declared or invented characters; in occurrence mode a reference lying wholly inside an
+    occurrence of a mask is not reported, but one that only overlaps a mask (an undeclared phrase
+    that starts with an invented phrase, say) still is."""
+    spans = _mask_spans(lib, text, masks) if not exact_phrase and masks else []
     hits = []
     for name, trigger, phrase in undeclared:
         hit = None
@@ -426,14 +451,16 @@ def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
                 hit = "referring phrase", text
         else:
             try:
-                match = lib._phrase_regex(lib.normalize_phrase(phrase)).search(scan)
+                pattern = lib._phrase_regex(lib.normalize_phrase(phrase))
             except lib.CharacterError:
-                match = None
+                pattern = None
+            match = _first_unmasked(pattern.finditer(text), spans) if pattern else None
             if match:
                 hit = "referring phrase", match.group(0)
         for kind, word in (("trigger", trigger), ("name", name)):
             if hit is None and word.strip():
-                match = _word_match(word, scan)
+                match = _first_unmasked(re.finditer(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])",
+                                                    text, re.IGNORECASE), spans)
                 if match:
                     hit = kind, match.group(0)
         if hit:
@@ -442,16 +469,15 @@ def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
 
 
 def _undeclared_masks(lib, ctx, plan, undeclared):
-    """Mask strings for undeclared_references: declared members' name, trigger and phrase, plus each
-    plan cast phrase that does not itself name an undeclared character (RS37)."""
-    member_names = {m.name for m in ctx.members}
-    masks = [m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
+    """Mask strings for undeclared_references: declared members' name, trigger, phrase and
+    descriptor (their identity sentences are never flagged, RS37), plus each invented plan cast
+    phrase (cast_name null) that does not itself name an undeclared character."""
+    masks = [m for member in ctx.members
+             for m in (member.name, member.trigger, member.phrase, member.descriptor)]
     if plan:
         masks += [e["phrase"] for e in plan["cast"] if isinstance(e.get("phrase"), str)
-                  and ((e.get("cast_name") in member_names)
-                       or (not e.get("cast_name")
-                           and not undeclared_references(lib, e["phrase"], undeclared,
-                                                         exact_phrase=True)))]
+                  and not e.get("cast_name")
+                  and not undeclared_references(lib, e["phrase"], undeclared, exact_phrase=True)]
     return masks
 
 
@@ -1869,9 +1895,21 @@ def better(states, a, b):
     return _key(states, a) < _key(states, b)
 
 
+def _new_rs37(states, i):
+    """1 when states[i] has a P13 or N15 hard violation that round 0 does not have (a patch or a
+    regeneration introduced an undeclared library character), else 0."""
+    base = set(states[0]["hard"])
+    return int(any(parse_violation(m)["id"] in ("P13", "N15") and m not in base
+                   for m in states[i]["hard"]))
+
+
 def best_round(states):
-    """The index of the state with the smallest (hard, -min, -total, -round) (RS22)."""
-    return min(range(len(states)), key=lambda i: _key(states, i) + (-i,))
+    """The index of the state with the smallest (hard, new P13/N15, -min, -total, -round)
+    (RS22; on an equal hard count a state that introduced an undeclared library character
+    loses)."""
+    return min(range(len(states)),
+               key=lambda i: (len(states[i]["hard"]), _new_rs37(states, i))
+               + _key(states, i)[1:] + (-i,))
 
 
 def _checks_doc(ctx, state, source="robust"):
@@ -2312,6 +2350,17 @@ def story_fields(mode, k, panel):
     return [(label, panel[label.lower()]) for label in labels]
 
 
+def _recheck_writers(ctx, lib, plan, k, fields):
+    """{Label: text} for a re-check: each field's text with the plan's pasted sentences for panel
+    k removed by the RS13 cleanup, so N4, N7-N10, N12 and N13 judge the writer text they judged
+    when the story was generated. A panel past the plan's beats keeps its whole field text."""
+    if k > len(plan["beats"]):
+        return dict(fields)
+    pasted = pasted_pieces(ctx, plan, k)
+    return dict((label, clean_writer(lib, text, pasted.get(label.lower(), ())))
+                for label, text in fields)
+
+
 def _read_story(ctx, story_md):
     with open(story_md, encoding="utf-8") as f:
         text = f.read()
@@ -2373,8 +2422,9 @@ def recheck(ctx, legacy_validate):
             writers_by_panel = []
             for k, panel in enumerate(parsed, start=1):
                 fields = story_fields(ctx.mode, k, panel)
-                writers_by_panel.append(dict(fields))
-                h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, dict(fields),
+                writers = _recheck_writers(ctx, lib, plan, k, fields)
+                writers_by_panel.append(writers)
+                h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, writers,
                                      RECHECK_IDS, undeclared)
                 hard += h
                 advisory += a
@@ -2396,10 +2446,16 @@ def recheck(ctx, legacy_validate):
                     print("  - %s" % message, file=sys.stderr)
                 print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
                       "regenerate it." % story_md, file=sys.stderr)
+                if any(parse_violation(m)["id"].startswith("L") for m in hard):
+                    print("The L violations come from plan.json's catalog LoRA picks, not from "
+                          "story.md: restore or re-add the LoRA files (bin/lora-catalog verify), "
+                          "rerun with --no-auto-lora, or pass --force-story to regenerate.",
+                          file=sys.stderr)
                 return 2, advisory
             return 0, advisory
         except (KeyError, TypeError, AttributeError, ValueError, IndexError):
-            pass
+            print("note: %s is malformed; re-checking story.md without it"
+                  % os.path.join(ctx.story_dir, "plan.json"))
     if ctx.mode != "shots":
         violations = legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")
         if violations:

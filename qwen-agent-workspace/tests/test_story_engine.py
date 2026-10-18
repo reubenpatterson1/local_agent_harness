@@ -117,6 +117,23 @@ def test_rst5_agent_cmd(ws):
         assert "--danger-auto-approve" not in cmd
 
 
+NOISY_AGENT = ("#!/usr/bin/env python3\n"
+               "import sys\n"
+               "sys.stderr.write('qwen-agent: http://127.0.0.1:8000/v1/models returned HTTP 503.\\n')\n"
+               "sys.exit(2)\n")
+
+
+def test_rst5b_run_agent_reports_stderr_when_there_is_no_answer(tmp_path, capsys):
+    ws = seu.make_ws(tmp_path)
+    with open(os.path.join(ws, "bin", "qwen-agent"), "w") as f:
+        f.write(NOISY_AGENT)
+    ctx = seu.make_ctx(se, ws)
+    assert se.run_agent(ctx, "p", max_tokens=10, timeout=60) == ("no_envelope", None)
+    assert capsys.readouterr().out == (
+        "Warning: bin/qwen-agent gave no answer (no_envelope); the last lines of its stderr:\n"
+        "  qwen-agent: http://127.0.0.1:8000/v1/models returned HTTP 503.\n")
+
+
 def test_rst6_run_agent(ws, tmp_path, monkeypatch):
     ctx = seu.make_ctx(se, ws)
     log = seu.script_agent(monkeypatch, tmp_path, plan=[
@@ -1010,6 +1027,33 @@ def test_rst56c_n15_invented_phrase_naming_library_character_not_masked(ws, stor
     assert not [v for v in checks if " N15 " in v], checks
 
 
+def test_rst56d_masks_hide_only_references_inside_them(ws, story_env):
+    lib = se._character_lib(WS)
+    kyra = [("kyra", "kyratok", "the woman in grey")]
+    assert se.undeclared_references(lib, "The woman in grey runs.", kyra,
+                                    masks=["the woman"]) == [
+        ("kyra", "referring phrase", "The woman in grey")]
+    wmn = [("wmn", "wmntrg", "the woman")]
+    assert se.undeclared_references(lib, "The woman in grey runs.", wmn,
+                                    masks=["the woman in grey"]) == []
+    ronin = [("ronin", "roninmn", "the ronin")]
+    identity = "The woman in grey is a young woman in a ronin's straw hat."
+    assert se.undeclared_references(lib, identity, ronin,
+                                    masks=["a young woman in a ronin's straw hat"]) == []
+
+    class Member(object):
+        name, trigger, phrase = "kyra", "kyrawmn", "the woman in grey"
+        descriptor = "a young woman in a ronin's straw hat"
+
+    ctx = seu.make_ctx(se, ws, members=[Member()])
+    plan = {"cast": [{"id": "c1", "phrase": "the ronin", "cast_name": "kyra"},
+                     {"id": "c2", "phrase": "the courier", "cast_name": None},
+                     {"id": "c3", "phrase": "the ronin", "cast_name": None}]}
+    assert se._undeclared_masks(lib, ctx, plan, ronin) == [
+        "kyra", "kyrawmn", "the woman in grey", "a young woman in a ronin's straw hat",
+        "the courier"]
+
+
 # --- RST22-RST24, RST26 (validation): the critic (RS17-RS19) ---------------------------------
 
 def test_rst22_critic_prompt(ws, tmp_path):
@@ -1488,6 +1532,19 @@ def test_rst36_ranking():
     assert se.best_round([state(0), state(0)]) == 1
 
 
+def test_rst36b_a_state_that_introduces_n15_loses_a_tie():
+    n7 = "panel 2: N7 dialogue and text: Motion: says 'yells'"
+    n15 = ("panel 2: N15 undeclared character: Motion: names library character ronin by its "
+           "name 'ronin'; library characters appear only when declared with --character ronin")
+    s0 = {"hard": [n7], "scores": {"continuity": 7, "story": 7, "renderability": 7}}
+    s1 = {"hard": [n15], "scores": {"continuity": 9, "story": 9, "renderability": 9}}
+    assert se.best_round([s0, s1]) == 0
+    s1["hard"] = ["panel 3: N1 word count: Motion: is 4 words; it must be 15-35"]
+    assert se.best_round([s0, s1]) == 1
+    s0["hard"], s1["hard"] = [n15], [n15]
+    assert se.best_round([s0, s1]) == 1
+
+
 def test_rst37_budgets_and_the_wall_clock(ws, tmp_path, monkeypatch, capsys):
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
         {"answer": "no"}, seu.answer(seu.plan_json("chained", 3))], panel=_panel_script(
@@ -1897,7 +1954,10 @@ def test_rst44c_recheck_malformed_plan_falls_back(ws, monkeypatch, capsys, story
         with open(_plan_path(ctx), "w", encoding="utf-8") as f:
             json.dump(plan, f)
         got = se.recheck(ctx, ltx_movie._validate_story_md)
-        got_err = capsys.readouterr().err
+        captured = capsys.readouterr()
+        got_err = captured.err
+        assert captured.out.startswith("note: %s is malformed; re-checking story.md without it\n"
+                                       % _plan_path(ctx))
         os.remove(_plan_path(ctx))
         assert se.recheck(ctx, ltx_movie._validate_story_md) == got
         assert capsys.readouterr().err == got_err
@@ -1917,6 +1977,34 @@ def test_rst44d_recheck_no_plan_enforces_n15(ws, monkeypatch, capsys, story_env)
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     declared = seu.make_ctx(se, ws, mode="chained", panels=3, members=members)
     assert se.recheck(declared, ltx_movie._validate_story_md) == (0, [])
+
+
+def test_rst44e_recheck_judges_writer_text_like_generation(ws, monkeypatch, capsys):
+    def mutate(raw):
+        raw["locations"][0]["setting"] = seu.HARBOUR.replace("fishing boats behind",
+                                                             "vendors call out")
+    ctx, plan, parts, text, path = _story(ws, "chained", 3, plan_mut=mutate)
+    assert "vendors call out" in text
+    assert se.panel_checks(ctx, plan, parts, text, path)[0] == []
+    ctx, text = _saved_story(ws, monkeypatch, plan_mut=mutate, ctx_kw={"story_id": "s2"})
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
+    motion = seu.panel_json("chained", 2)["motion"]
+    _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
+    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    assert "  - panel 2: N7 dialogue and text: Motion: says 'yells'\n" in capsys.readouterr().err
+
+
+def test_rst44f_recheck_lora_violations_point_at_plan_json(ws, monkeypatch, capsys):
+    def mutate(raw):
+        raw["loras"] = {"global": [{"id": "gone", "strength": 0.8}], "per_beat": {}, "stills": []}
+    ctx, _text = _saved_story(ws, monkeypatch, plan_mut=mutate)
+    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    err = capsys.readouterr().err
+    assert "  - plan: L1 catalog id: 'gone' is not in the catalog\n" in err
+    assert err.endswith(
+        "The L violations come from plan.json's catalog LoRA picks, not from story.md: restore or "
+        "re-add the LoRA files (bin/lora-catalog verify), rerun with --no-auto-lora, or pass "
+        "--force-story to regenerate.\n")
 
 
 # --- RST2-RST4, RST39b, RST40, RST42, RST46, RST50-RST54: bin/ltx-movie (RS2, RS25, RS29,
@@ -1971,8 +2059,7 @@ def test_rst2_flags_and_parse_goal():
     args = ltx_movie.build_parser().parse_args(["n", "--story-id", "x"])
     assert (args.story_legacy, args.no_auto_lora, args.judge, args.goal) == (False, False, False,
                                                                              None)
-    judge_story = importlib.machinery.SourceFileLoader(
-        "judge_story_for_rst2", os.path.join(WS, "bin", "judge-story")).load_module()
+    judge_story = _judge_story()
     for text in ("a quiet drama.", "", "two\nlines", "x" * 301, "realistic action", "   "):
         outcomes = []
         for parse in (ltx_movie._parse_goal, judge_story.parse_goal):
@@ -2133,6 +2220,12 @@ def test_rst50_source_literal_counts():
         assert images.count(literal) == count, literal
     body = inspect.getsource(ltx_movie.phase2_stills)
     assert "no_stills" not in body
+
+
+def test_rst50b_robust_review_reads_utf8():
+    source = inspect.getsource(ltx_movie._phase1_robust)
+    assert "open(story_md)" not in source
+    assert source.count('open(story_md, encoding="utf-8")') == 2
 
 
 def _main_run(tmp_path, monkeypatch, argv, plan=None, panel=None, critic=()):
@@ -2368,8 +2461,15 @@ def test_rst57c_dry_run_lists_the_undeclared_characters(story_env):
 
 # --- RST48, RST49: bin/judge-story --patches, bin/iterate-story (RS32, RS33) --------------------
 
-judge_story = importlib.machinery.SourceFileLoader(
-    "judge_story_for_story_engine", os.path.join(WS, "bin", "judge-story")).load_module()
+def _judge_story():
+    """bin/judge-story, loaded only by the tests that use it (it imports anthropic and
+    jsonschema, which collecting the engine tests must not need)."""
+    pytest.importorskip("anthropic")
+    pytest.importorskip("jsonschema")
+    return importlib.machinery.SourceFileLoader(
+        "judge_story_for_story_engine", os.path.join(WS, "bin", "judge-story")).load_module()
+
+
 iterate_story = importlib.machinery.SourceFileLoader(
     "iterate_story_for_story_engine", os.path.join(WS, "bin", "iterate-story")).load_module()
 
@@ -2401,6 +2501,7 @@ def _anthropic_message(name, tool_input):
 
 
 def test_rst48_judge_story_patches(ws, monkeypatch, capsys, tmp_path):
+    judge_story = _judge_story()
     ctx, text = _saved_story(ws, monkeypatch)
     story_md = os.path.join(ctx.story_dir, "story.md")
     checks = {"hard": [{"message": "panel 2: N7 dialogue and text: Motion: says 'yells'"}],
@@ -2456,6 +2557,38 @@ def test_rst48_judge_story_patches(ws, monkeypatch, capsys, tmp_path):
         "scores", "critique", "revised_prompt"]
 
 
+def test_rst48b_judge_story_patches_rejects_a_malformed_plan(ws, monkeypatch, capsys):
+    judge_story = _judge_story()
+    ctx, _text = _saved_story(ws, monkeypatch)
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    plan_path = os.path.join(ctx.story_dir, "plan.json")
+    fake = _FakeAnthropic([])
+    monkeypatch.setattr(judge_story.anthropic, "Anthropic", fake)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    monkeypatch.setattr(judge_story, "WS", WS)
+    expected = ("Error: %s is not a plan.json written by bin/ltx-movie's default story engine. "
+                "--patches needs a story written by bin/ltx-movie's default story engine.\n"
+                % plan_path)
+    for bad in ([], {"schema": "ltx-movie.plan.v1", "mode": "chained"}):
+        with open(plan_path, "w", encoding="utf-8") as f:
+            json.dump(bad, f)
+        assert judge_story.main(["--story-md", story_md, "--patches"]) == 2
+        assert capsys.readouterr().err == expected
+    assert fake.calls == []
+
+
+def test_rst48c_engine_tests_collect_without_anthropic(tmp_path):
+    block = tmp_path / "block"
+    block.mkdir()
+    (block / "anthropic.py").write_text("raise ImportError('blocked for this test')\n")
+    (block / "jsonschema.py").write_text("raise ImportError('blocked for this test')\n")
+    env = dict(os.environ, PYTHONPATH=str(block))
+    proc = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-p",
+                           "no:cacheprovider", os.path.join(WS, "tests", "test_story_engine.py")],
+                          cwd=WS, env=env, capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+
+
 class _Completed(object):
     def __init__(self, returncode, stdout):
         self.returncode, self.stdout = returncode, stdout
@@ -2507,6 +2640,13 @@ def test_rst49_iterate_story_wrapper(tmp_path, monkeypatch, capsys):
     assert out == ""
     assert err.startswith(iterate_story.DEPRECATION_NOTICE + "\nError: round 1: judge-story "
                           "exited 1")
+    (story_dir / "plan.json").write_text(json.dumps({"schema": "ltx-movie.plan.v1", "panels": 3}))
+    before = len(calls)
+    assert iterate_story.main(["--story-id", "it1", "--threshold", "8"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: %s is not a usable plan.json; regenerate the story with bin/ltx-movie "
+        "--force-story\n" % (story_dir / "plan.json"))
+    assert len(calls) == before
 
 
 # --- RST61-RST63: interpreters, imports, isolation (RSK2-RSK4) --------------------------------
@@ -2567,6 +2707,13 @@ def test_rst62_import_sets():
         assert _all_imports(os.path.join(WS, rel)) == baseline[rel], rel
     assert _all_imports(os.path.join(WS, "story_engine.py")) == _top_level_imports(
         os.path.join(WS, "story_engine.py"))
+
+
+def test_rst63b_every_suite_gets_a_temporary_catalog(request):
+    assert "lora_catalog_isolation" in request.fixturenames
+    path = request.getfixturevalue("lora_catalog_isolation")
+    assert not path.startswith(WS + os.sep)
+    assert path != os.path.dirname(seu.REAL_CATALOG)
 
 
 def test_rst63_isolation(story_env):
