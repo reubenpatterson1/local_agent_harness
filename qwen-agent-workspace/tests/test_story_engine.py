@@ -2507,3 +2507,78 @@ def test_rst49_iterate_story_wrapper(tmp_path, monkeypatch, capsys):
     assert out == ""
     assert err.startswith(iterate_story.DEPRECATION_NOTICE + "\nError: round 1: judge-story "
                           "exited 1")
+
+
+# --- RST61-RST63: interpreters, imports, isolation (RSK2-RSK4) --------------------------------
+
+CHANGED_FILES = ("story_engine.py", "lora_catalog.py", "bin/lora-catalog", "bin/ltx-movie",
+                 "bin/ltx-story-manifest", "bin/ltx-story-images", "bin/ltx-mlx-render",
+                 "bin/judge-story", "bin/iterate-story", "scripts/deploy/build_pkg.py",
+                 "tests/story_engine_testutil.py", "tests/test_story_engine.py",
+                 "tests/test_lora_catalog.py", "tests/test_ltx_movie_offline.py",
+                 "tests/test_casting_regression.py", "tests/test_casting_pipeline.py",
+                 "tests/test_shots_mode.py", "tests/test_deploy_pkg.py")
+COMPILE_ONLY = ("import sys\n"
+                "for path in sys.argv[1:]:\n"
+                "    with open(path, encoding='utf-8') as f:\n"
+                "        compile(f.read(), path, 'exec')\n"
+                "print('compiled %d' % (len(sys.argv) - 1))\n")
+
+
+def test_rst61_both_interpreters_compile_every_changed_file():
+    paths = [os.path.join(WS, rel) for rel in CHANGED_FILES]
+    for interpreter in ("/usr/bin/python3", sys.executable):
+        proc = subprocess.run([interpreter, "-c", COMPILE_ONLY] + paths, capture_output=True,
+                              text=True)
+        assert (proc.returncode, proc.stdout) == (0, "compiled %d\n" % len(paths)), (
+            interpreter, proc.stderr)
+
+
+def _all_imports(path):
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(node.module)
+    return names
+
+
+def test_rst62_import_sets():
+    assert _top_level_imports(os.path.join(WS, "bin", "lora-catalog")) == {
+        "argparse", "json", "os", "sys", "lora_catalog"}
+    baseline = {
+        "bin/ltx-movie": {"argparse", "glob", "importlib.machinery", "json", "os", "pipeline_log",
+                          "shlex", "subprocess", "sys", "threading", "time"},
+        "bin/ltx-story-images": {"argparse", "importlib.machinery", "json", "os", "pipeline_log",
+                                 "sys", "time"},
+        "bin/ltx-mlx-render": {"argparse", "datetime", "glob", "hashlib", "json",
+                               "ltx2_mlx_video_skill", "os", "re", "shlex", "shutil", "stat",
+                               "subprocess", "sys", "time", "uuid"},
+        "bin/judge-story": {"anthropic", "argparse", "datetime", "json", "jsonschema", "os", "sys"},
+        "bin/ltx-story-manifest": {"PIL", "argparse", "datetime", "glob", "importlib.machinery",
+                                   "json", "os", "re", "sys"},
+    }
+    for rel, names in baseline.items():
+        assert _top_level_imports(os.path.join(WS, rel)) == names, rel
+    for rel in ("bin/ltx-mlx-render", "bin/judge-story"):
+        assert _all_imports(os.path.join(WS, rel)) == baseline[rel], rel
+    assert _all_imports(os.path.join(WS, "story_engine.py")) == _top_level_imports(
+        os.path.join(WS, "story_engine.py"))
+
+
+def test_rst63_isolation(story_env):
+    assert os.environ["HOME"] == story_env["home"]
+    assert os.environ["CHARACTER_LIBRARY_DIR"] == story_env["lib"]
+    assert os.environ["LORA_CATALOG_DIR"] == story_env["catalog"]
+    assert re.fullmatch(r"http://127\.0\.0\.1:\d+", os.environ["QWEN_AGENT_DAEMON_URL"])
+    assert os.environ["STORY_PIPELINE_LOGGED"] == "1"
+    assert "ANTHROPIC_API_KEY" not in os.environ
+    assert seu._stat_or_none(seu.REAL_CATALOG) == seu.REAL_CATALOG_STAT
+    for module in ("tests/test_story_engine.py", "tests/test_lora_catalog.py"):
+        with open(os.path.join(WS, module), encoding="utf-8") as f:
+            source = f.read()
+        assert "@pytest.fixture(autouse=True)\ndef story_env(monkeypatch, tmp_path):\n    return " \
+               "seu.set_story_env(monkeypatch, tmp_path)\n" in source
