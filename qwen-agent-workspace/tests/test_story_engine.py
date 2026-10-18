@@ -1752,3 +1752,104 @@ def test_story_focus_3_ctrl_c_during_a_run_keeps_story_md(ws, tmp_path, monkeypa
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, critic=[seu.answer(seu.critic_json())])
     assert rc == 0
     assert len([n for n in os.listdir(story_dir) if n.startswith("story_rounds-")]) == 1
+
+
+# --- RST44 (engine), RST45, RST56b: re-check (RS28) -----------------------------------------
+
+def _saved_story(ws, monkeypatch, mode="chained", n=3, **kw):
+    """A story.md and plan.json saved in <story_dir> as a run would leave them."""
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    ctx, plan, parts, text, _path = _story(ws, mode, n, **kw)
+    with open(os.path.join(ctx.story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(text)
+    with open(os.path.join(ctx.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    return ctx, text
+
+
+def _edit_story(ctx, old, new):
+    path = os.path.join(ctx.story_dir, "story.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    assert text.count(old) == 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.replace(old, new))
+
+
+def test_rst44_recheck_with_plan(ws, monkeypatch, tmp_path, capsys):
+    log = seu.script_agent(monkeypatch, tmp_path)
+    ctx, text = _saved_story(ws, monkeypatch)
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert (checks["source"], checks["round"], checks["stop_reason"], checks["rounds"],
+            checks["hard"]) == ("recheck", None, None, [], [])
+    motion = seu.panel_json("chained", 2)["motion"]
+    _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (2, [])
+    assert capsys.readouterr().err == (
+        "Error: story.md fails the story checks:\n"
+        "  - panel 2: N7 dialogue and text: Motion: says 'yells'\n"
+        "Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
+        "regenerate it.\n" % story_md)
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert checks["source"] == "recheck" and [h["id"] for h in checks["hard"]] == ["N7"]
+    assert seu.agent_log(log) == []
+    _edit_story(ctx, "Narration: Every street led down to the water.\n", "Narration:\n")
+    se.recheck(ctx, ltx_movie._validate_story_md)
+    hard = [h["message"] for h in _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["hard"]]
+    assert hard == ["panel 2: missing/empty Narration: field",
+                    "panel 2: N7 dialogue and text: Motion: says 'yells'",
+                    "panel 2: N11 narration: Narration: is empty"]
+
+
+def test_rst45_recheck_without_plan(ws, monkeypatch, capsys, story_env):
+    ctx, text = _saved_story(ws, monkeypatch)
+    os.remove(os.path.join(ctx.story_dir, "plan.json"))
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    _edit_story(ctx, "Narration: The rain had not stopped since dawn.\n", "")
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (1, [])
+    assert capsys.readouterr().err == (
+        "Error: story.md failed validation:\n  - panel 1: missing/empty Narration: field\n"
+        "Hand-edit %s to fix the violations above and rerun; story.md already exists so Phase 1 "
+        "will be skipped next time (pass --force-story to regenerate it instead).\n" % story_md)
+    assert not os.path.exists(os.path.join(ctx.story_dir, "story_checks.json"))
+    short, _t = _saved_story(ws, monkeypatch, n=3, ctx_kw={"story_id": "s9"})
+    os.remove(os.path.join(short.story_dir, "plan.json"))
+    motion = seu.panel_json("chained", 2)["motion"]
+    _edit_story(short, "Motion: " + motion, "Motion: The courier pedals on.")
+    assert se.recheck(short, ltx_movie._validate_story_md) == (0, [])
+    shots, _t = _saved_story(ws, monkeypatch, mode="shots", ctx_kw={"story_id": "s8"})
+    os.remove(os.path.join(shots.story_dir, "plan.json"))
+    _edit_story(shots, "Motion: The courier steps forward onto the wet stones.",
+                "Motion: The courier steps forward then turns.")
+    assert se.recheck(shots, ltx_movie._validate_story_md) == (2, [])
+    err = capsys.readouterr().err
+    assert err.startswith("Error: story.md breaks the shot rules:\n")
+    assert "  - panel 3: S5 one action: Motion: chains actions with 'then'\n" in err
+    assert err.endswith("Hand-edit %s to fix the violations above and rerun, or pass "
+                        "--force-story to have the story model write a new one.\n"
+                        % os.path.join(shots.story_dir, "story.md"))
+
+
+def test_rst56b_n15_in_recheck_and_plan_free_report(ws, monkeypatch, capsys, story_env):
+    seu.ronin(story_env["lib"])
+    ctx, text = _saved_story(ws, monkeypatch, mode="shots")
+    _edit_story(ctx, "Narration: He knew the letter could not wait.",
+                "Narration: Ronin knew the letter could not wait.")
+    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    message = ("panel 3: N15 undeclared character: Narration: names library character ronin by "
+               "its name 'Ronin'; library characters appear only when declared with --character "
+               "ronin")
+    assert "  - %s\n" % message in capsys.readouterr().err
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    assert se.plan_free_report(story_md, "shots", 3, [], ltx_movie._validate_story_md,
+                               ws=ws) == [message]
+    members = se._character_lib(WS).resolve_cast([(None, "ronin")])
+    report = se.plan_free_report(story_md, "shots", 3, members, ltx_movie._validate_story_md, ws=ws)
+    assert message not in report
+    chained, _t = _saved_story(ws, monkeypatch, ctx_kw={"story_id": "s7"})
+    path = os.path.join(chained.story_dir, "story.md")
+    assert se.plan_free_report(path, "chained", 3, [], ltx_movie._validate_story_md, ws=ws) == []
+    assert se.plan_free_report(path, "chained", 4, [], ltx_movie._validate_story_md, ws=ws) == [
+        "expected exactly 4 panels, found 3"]

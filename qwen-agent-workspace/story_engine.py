@@ -2273,3 +2273,136 @@ def run_judge(ctx, round_dir):
     except Exception as e:
         return "error", " ".join(str(e).split()) or type(e).__name__, None
     return "ok", "", reply
+
+
+# ---------------------------------------------------------------------------
+# Re-check of an existing story.md (RS28) and the plan-free yardstick (RS28, 7.2)
+# ---------------------------------------------------------------------------
+
+RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15")
+PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
+_PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
+
+
+def load_plan(ctx):
+    """<story_dir>/plan.json when it is a valid plan for ctx's mode and panel count, else None."""
+    try:
+        with open(os.path.join(ctx.story_dir, "plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA
+            or plan.get("mode") != ctx.mode or plan.get("panels") != ctx.panels
+            or not all(k in plan for k in _PLAN_KEYS)):
+        return None
+    return plan
+
+
+def story_fields(mode, k, panel):
+    """[(Label, text)] of a parsed story.md panel, the fields RS3 assembles for mode/panel k."""
+    if mode == "no_stills":
+        labels = ("Prompt", "Narration")
+    elif mode == "chained" and k >= 2:
+        labels = ("Motion", "Narration")
+    else:
+        labels = ("Image", "Motion", "Narration")
+    return [(label, panel[label.lower()]) for label in labels]
+
+
+def _read_story(ctx, story_md):
+    with open(story_md, encoding="utf-8") as f:
+        text = f.read()
+    return text, _story_manifest(ctx.ws)._parse_prompts_md(story_md)[1]
+
+
+def plan_free_report(story_md, mode, panels, members, legacy_validate, ws=None):
+    """The hard violations a re-check computes without a plan (RS28; the 7.2 yardstick for both
+    engines). ws (default: this file's directory) locates the character library and the
+    manifest parser. Prints nothing, writes nothing."""
+    ws = ws or os.path.dirname(os.path.realpath(__file__))
+    ctx = StoryContext(ws=ws, story_id="", story_dir=os.path.dirname(story_md), mode=mode,
+                       panels=panels, seconds="6", narrative="", goal=None, members=members,
+                       seed_image=None, seed_agent_image=None, story_model=None,
+                       context_window=None, video_model="", auto_lora=False,
+                       catalog={"schema_version": 1, "entries": []}, pinned=[], stills_pinned=[],
+                       judge=False)
+    lib = _character_lib(ws)
+    hard = [] if mode == "shots" else list(legacy_validate(story_md, panels, mode == "no_stills"))
+    text, parsed = _read_story(ctx, story_md)
+    undeclared = undeclared_characters(ctx)
+    for k, panel in enumerate(parsed, start=1):
+        fields = story_fields(mode, k, panel)
+        hard += _field_checks(ctx, lib, None, k, panel["title"], fields, dict(fields),
+                              PLAN_FREE_IDS, undeclared)[0]
+    if mode == "shots":
+        hard += lib.shots_violations(text, parsed, panels, members)
+    return hard
+
+
+def recheck(ctx, legacy_validate):
+    """Re-check an existing story.md instead of regenerating it (RS28). Returns (exit code,
+    advisories). legacy_validate is bin/ltx-movie's _validate_story_md."""
+    story_md = os.path.join(ctx.story_dir, "story.md")
+    for warning in catalog_warnings(ctx):
+        print(warning)
+    lib = _character_lib(ctx.ws)
+    plan = load_plan(ctx)
+    if plan is None:
+        if ctx.mode != "shots":
+            violations = legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")
+            if violations:
+                print("Error: story.md failed validation:", file=sys.stderr)
+                for v in violations:
+                    print("  - %s" % v, file=sys.stderr)
+                print("Hand-edit %s to fix the violations above and rerun; story.md already exists "
+                      "so Phase 1 will be skipped next time (pass --force-story to regenerate it "
+                      "instead)." % story_md, file=sys.stderr)
+                return 1, []
+            return 0, []
+        try:
+            text, parsed = _read_story(ctx, story_md)
+            violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+            advisories = lib.shots_advisories(parsed, ctx.members)
+        except OSError as e:
+            violations, advisories = ["story: cannot read story.md: %s" % e], []
+        if violations:
+            print("Error: story.md breaks the shot rules:", file=sys.stderr)
+            for v in violations:
+                print("  - %s" % v, file=sys.stderr)
+            print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
+                  "have the story model write a new one." % story_md, file=sys.stderr)
+            return 2, []
+        return 0, advisories
+    hard = ([] if ctx.mode == "shots"
+            else list(legacy_validate(story_md, ctx.panels, ctx.mode == "no_stills")))
+    advisory = []
+    text, parsed = _read_story(ctx, story_md)
+    undeclared = undeclared_characters(ctx)
+    writers_by_panel = []
+    for k, panel in enumerate(parsed, start=1):
+        fields = story_fields(ctx.mode, k, panel)
+        writers_by_panel.append(dict(fields))
+        h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, dict(fields),
+                             RECHECK_IDS, undeclared)
+        hard += h
+        advisory += a
+    advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
+    if ctx.mode == "shots":
+        hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+        advisory += lib.shots_advisories(parsed, ctx.members)
+    if ctx.auto_lora:
+        compatible = dict((e["id"], e) for e in compatible_entries(ctx))
+        catalog = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
+        lh, la = lora_checks(ctx, plan, compatible, catalog)
+        hard += lh
+        advisory += la
+    _write_json(os.path.join(ctx.story_dir, "story_checks.json"),
+                _checks_doc(ctx, {"hard": hard, "advisory": advisory}, source="recheck"))
+    if hard:
+        print("Error: story.md fails the story checks:", file=sys.stderr)
+        for message in hard:
+            print("  - %s" % message, file=sys.stderr)
+        print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
+              "regenerate it." % story_md, file=sys.stderr)
+        return 2, advisory
+    return 0, advisory
