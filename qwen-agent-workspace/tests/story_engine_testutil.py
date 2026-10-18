@@ -327,3 +327,57 @@ with open(os.path.join(os.path.dirname(story_md), "judgment.patches.json"), "w",
 print("Scores: ...")
 sys.exit(0)
 '''
+
+
+# --- plan builders (spec 5.2) ---------------------------------------------------------------
+
+COURIER = "a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers"
+MONK = "an old man with a shaved head and a calm face wearing a saffron robe and wooden sandals"
+HARBOUR = ("The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, "
+           "fishing boats behind, under grey afternoon light.")
+TEMPLE = ("The setting is a hilltop temple gate in modern Japan, worn stone steps underfoot, "
+          "pine trees behind, under warm sunset light.")
+ACTIONS = (
+    "pedals a bicycle along the wet harbour road past the moored fishing boats",
+    "swerves around a stack of fishing crates on the slippery quay",
+    "rides hard up the narrow lane between the shuttered shops",
+    "brakes at the foot of the temple steps and climbs off the bicycle",
+    "climbs the worn stone steps two at a time toward the gate",
+    "holds out the sealed letter at the temple gate with both hands",
+    "turns back toward the harbour as the rain finally stops",
+    "leans the bicycle against a lamp post beside the gate",
+)
+
+
+def arcs(n):
+    """A valid arc sequence for n beats (RS10 P5/P6)."""
+    if n == 1:
+        return ["climax"]
+    if n == 2:
+        return ["introduction", "resolution"]
+    return ["introduction"] + ["rising"] * (n - 3) + ["climax", "resolution"]
+
+
+def plan_json(mode, n, cast=None, **overrides):
+    """A valid plan-writer reply (Section 2.2 keys) for n beats: cast c1 "the courier" (and c2
+    "the old monk", never on screen), locations l1 (harbour) and l2 (temple), every beat at l1
+    with cast ["c1"]. cast replaces the cast list (e.g. fixed library characters); every
+    keyword replaces a top-level key."""
+    phrase = (cast[0]["phrase"] if cast else "the courier")
+    plan = {
+        "title": "The Sealed Letter",
+        "logline": "A courier carries a sealed letter through a rainy harbour town and "
+                   "delivers it at the temple gate.",
+        "cast": cast if cast is not None else [
+            {"id": "c1", "phrase": "the courier", "descriptor": COURIER},
+            {"id": "c2", "phrase": "the old monk", "descriptor": MONK}],
+        "locations": [{"id": "l1", "setting": HARBOUR}, {"id": "l2", "setting": TEMPLE}],
+        "props": [{"id": "p1", "name": "the sealed letter"}],
+        "beats": [{"index": k, "arc": arc, "action": phrase + " " + ACTIONS[(k - 1) % len(ACTIONS)],
+                   "shot": "medium shot" if k % 2 else "wide shot",
+                   "camera": "static" if k % 2 else "tracking", "location": "l1", "cast": ["c1"]}
+                  for k, arc in enumerate(arcs(n), start=1)],
+        "loras": {"global": [], "per_beat": {}, "stills": []},
+    }
+    plan.update(overrides)
+    return plan
