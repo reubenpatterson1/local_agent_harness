@@ -1501,3 +1501,167 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
 def unparseable_panel_problem(mode, k):
     return ("the reply is not one JSON object with the keys %s"
             % ", ".join(writer_keys(mode, k)))
+
+
+# ---------------------------------------------------------------------------
+# The critic: prompt (RS17), routing (RS18) and reply validation (RS19)
+# ---------------------------------------------------------------------------
+
+CRITIC_PROMPT_TEMPLATE = (
+    'You are the critic for a short narrated movie (story-id "@@STORY_ID@@"). You will not see '
+    "any other context: everything you need is below. Check the draft against its plan and "
+    "propose small, exact fixes.\n"
+    "\n"
+    "How this movie is made: @@MODE_PARAGRAPH@@\n"
+    "\n"
+    "Narrative to adapt:\n"
+    "@@NARRATIVE@@\n"
+    "\n"
+    "@@GOAL_PARAGRAPH@@The plan (JSON):\n"
+    "@@PLAN_JSON@@\n"
+    "\n"
+    "The draft story.md:\n"
+    "@@STORY_MD@@\n"
+    "\n"
+    "Problems the pipeline's own checks found in this draft (fix the hard ones first):\n"
+    "@@VIOLATIONS@@\n"
+    "\n"
+    "Score the draft from 1 (worst) to 10 (best) on each of:\n"
+    "- continuity: characters, places, objects and positions stay consistent from panel to "
+    "panel.\n"
+    "- story: the panels tell the narrative@@GOAL_CLAUSE@@, with a clear introduction, climax "
+    "and resolution, and every panel moves the action forward.\n"
+    "- renderability: every panel shows one concrete physical action that a video model can "
+    "render in @@SECONDS@@ seconds, with no dialogue, no on-screen text and nothing outside the "
+    "frame.\n"
+    "\n"
+    "Then propose at most 8 patches, most important first. Each patch is an object with exactly "
+    "the keys target, index, field, reason and replacement. The allowed patches are:\n"
+    "@@FIELD_LINES@@\n"
+    "A panel replacement holds only the text the writer writes: never include a character's "
+    "description, a setting sentence, the shot type or a camera sentence, because the pipeline "
+    "adds those itself. The number of panels, the characters' referring phrases and their "
+    "descriptions never change.\n"
+    "\n"
+    "@@REPLY_PARAGRAPH@@")
+CRITIC_REPLY_PARAGRAPH = (
+    "Reply with one JSON object with exactly the keys scores, verdict and patches: scores is an "
+    "object with the integer keys continuity, story and renderability; verdict is \"ok\" when "
+    "the draft needs no patch and \"revise\" otherwise; patches is the list of patches (empty "
+    "when the verdict is \"ok\"). Reply with the JSON object only, with no text before or after "
+    "it. Do not call any tool: do NOT read any file, and do NOT run any tool to check it.")
+JUDGE_REPLY_PARAGRAPH = "Call submit_review with your scores, verdict and patches."
+CRITIC_RETRY_SUFFIX = ("\n\nYour previous reply was not one JSON object with the keys scores, "
+                       "verdict and patches in the required form. Reply with that JSON object "
+                       "only.")
+ONLY1 = " (only 1: later panels continue the same picture)"
+
+
+def listed(lines):
+    """At most MAX_LISTED lines, then "- ... and N more"."""
+    if len(lines) <= MAX_LISTED:
+        return list(lines)
+    return list(lines[:MAX_LISTED]) + ["- ... and %d more" % (len(lines) - MAX_LISTED)]
+
+
+def critic_field_lines(mode, catalog_lines):
+    lines = [
+        '- target "plan", field "beat.action", index = the beat number: replacement is the beat\'s '
+        "new action, one sentence of 6 to 40 words; the pipeline rewrites that panel from it.",
+        '- target "plan", field "beat.shot", index = the beat number@@ONLY1@@: replacement is '
+        "exactly one of: " + ", ".join(SHOT_TYPES) + ".",
+        '- target "plan", field "beat.camera", index = the beat number@@ONLY1@@: replacement is '
+        "exactly one of: " + ", ".join(CAMERA_KEYS) + ".",
+        '- target "plan", field "location.setting", index = the place\'s position in the plan\'s '
+        "locations list (1 is the first): replacement is its new setting sentence, 12 to 45 "
+        'words starting "The setting is"; it replaces that sentence in every panel at that '
+        "place."]
+    if catalog_lines:
+        lines.append('- target "plan", field "lora", index 0 for the global picks or a beat '
+                     "number for that beat's own picks: replacement is the complete new list of "
+                     "picks, each an object with the keys id and strength, from this catalog:"
+                     + "\n" + "\n".join(catalog_lines))
+    if mode in ("chained", "shots"):
+        lines.append('- target "panel", field "image", index = the panel number@@ONLY1@@: '
+                     "replacement is the new writer text of that panel's Image: field.")
+        lines.append('- target "panel", field "motion", index = the panel number: replacement is '
+                     "the new writer text of that panel's Motion: field.")
+    else:
+        lines.append('- target "panel", field "prompt", index = the panel number: replacement is '
+                     "the new writer text of that panel's Prompt: field.")
+    lines.append('- target "panel", field "narration", index = the panel number: replacement is '
+                 "the panel's new narration sentence.")
+    return "\n".join(lines)
+
+
+def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for_judge=False):
+    """The exact critic prompt of RS17. violations is (hard, advisory) of the judged state;
+    mode, panels, seconds, narrative, goal and story_id come from the plan."""
+    hard, advisory = violations
+    lines = listed(["- [hard] " + m for m in hard] + ["- [advisory] " + m for m in advisory])
+    plan_json = json.dumps({k: plan[k] for k in ("title", "logline", "cast", "locations", "props",
+                                                 "beats", "loras")}, indent=1, ensure_ascii=False)
+    fragments = [
+        ("@@GOAL_PARAGRAPH@@", _goal_paragraph(plan["goal"])),
+        ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[plan["mode"]]),
+        ("@@VIOLATIONS@@", "\n".join(lines) if lines else "- none"),
+        ("@@GOAL_CLAUSE@@", " and serve the target output goal" if plan["goal"] else ""),
+        ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines)),
+        ("@@ONLY1@@", ONLY1 if plan["mode"] == "chained" else ""),
+        ("@@REPLY_PARAGRAPH@@", JUDGE_REPLY_PARAGRAPH if for_judge else CRITIC_REPLY_PARAGRAPH),
+    ]
+    text = CRITIC_PROMPT_TEMPLATE
+    for token, value in fragments:
+        text = text.replace(token, value)
+    for token, value in (("@@STORY_ID@@", plan["story_id"]), ("@@SECONDS@@", plan["seconds"])):
+        text = text.replace(token, value)
+    text = text.replace("@@PLAN_JSON@@", plan_json).replace("@@STORY_MD@@", story_md_text)
+    return text.replace("@@NARRATIVE@@", plan["narrative"])
+
+
+def run_critic(ctx, prompt):
+    """(status, answer, route) of one critic call (RS18): the fleet's analyst peers in order
+    when this host does not serve analyst, else (and on every failure) a local one-shot
+    bin/qwen-agent --skill=analyst."""
+    fleet = _load_fleet(ctx.ws)
+    if fleet is not None:
+        try:
+            url, _warning = fleet.daemon_url_from_env(os.environ)
+            view, _warning = fleet.fetch_view(url)
+            candidates = fleet.route_candidates("analyst", view) if view is not None else []
+        except Exception:
+            url, candidates = None, []
+        if candidates and candidates != [fleet.LOCAL]:
+            for host_id in candidates:
+                try:
+                    outcome, envelope, detail = fleet.delegate_once(url, "analyst", prompt, host_id)
+                except Exception as e:
+                    outcome, envelope, detail = "error", None, type(e).__name__
+                answer = envelope.get("answer") if isinstance(envelope, dict) else None
+                if (outcome == "ok" and isinstance(envelope, dict)
+                        and envelope.get("status") == "ok"
+                        and isinstance(answer, str) and answer.strip()):
+                    return "ok", answer, "fleet:" + host_id
+                print("Warning: critic on %s failed: %s %s" % (host_id, outcome, detail or ""))
+    status, answer = run_agent(ctx, prompt, max_tokens=CRITIC_MAX_TOKENS, timeout=CRITIC_TIMEOUT,
+                               skill="analyst", preflight_done=True)
+    return status, answer, "local"
+
+
+def _score(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 10
+
+
+def parse_critic(answer):
+    """The critic reply dict, or None unless it has integer scores 1-10 for continuity, story
+    and renderability, a verdict of "ok" or "revise", and a patches list (RS19)."""
+    obj = extract_json(answer)
+    if obj is None:
+        return None
+    scores = obj.get("scores")
+    if not isinstance(scores, dict) or not all(_score(scores.get(k)) for k in SCORE_KEYS):
+        return None
+    if obj.get("verdict") not in ("ok", "revise") or not isinstance(obj.get("patches"), list):
+        return None
+    return {"scores": {k: scores[k] for k in SCORE_KEYS}, "verdict": obj["verdict"],
+            "patches": obj["patches"]}

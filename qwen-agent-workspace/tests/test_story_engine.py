@@ -1008,3 +1008,103 @@ def test_rst56c_n15_invented_phrase_naming_library_character_not_masked(ws, stor
     checks = _story_checks(ws, "shots", plan_mut=invented("the woman in grey"),
                            part_mut=motion("The woman in grey turns."))
     assert not [v for v in checks if " N15 " in v], checks
+
+
+# --- RST22-RST24, RST26 (validation): the critic (RS17-RS19) ---------------------------------
+
+def test_rst22_critic_prompt(ws, tmp_path):
+    texts = {}
+    for mode in ("chained", "no_stills", "shots"):
+        ctx, plan, parts, text, _p = _story(ws, mode, 3)
+        prompt = se.build_critic_prompt(plan, text, ([], []))
+        texts[mode] = prompt
+        assert prompt.startswith('You are the critic for a short narrated movie (story-id "s1").')
+        assert "\nThe draft story.md:\n" + text + "\n\nProblems" in prompt
+        assert "\nProblems the pipeline's own checks found in this draft (fix the hard ones first):"\
+               "\n- none\n" in prompt
+        assert '"title": "The Sealed Letter"' in prompt and '"schema"' not in prompt
+        assert prompt.endswith(se.CRITIC_REPLY_PARAGRAPH)
+        assert "{" in prompt
+        assert 'field "lora"' not in prompt
+        has = {f: ('field "%s"' % f) in prompt for f in ("image", "motion", "prompt")}
+        assert has == {"image": mode != "no_stills", "motion": mode != "no_stills",
+                       "prompt": mode == "no_stills"}, mode
+        assert prompt.count("(only 1: later panels continue the same picture)") == (
+            3 if mode == "chained" else 0)
+        assert "render in 6 seconds" in prompt and "@@" not in prompt
+    ctx, plan, parts, text, _p = _story(ws, "shots", 3)
+    lines = ["- fast-motion: motion LoRA for video, default strength 0.8, range 0.5 to 1.0."]
+    with_lora = se.build_critic_prompt(plan, text, ([], []), catalog_lines=lines)
+    assert ('field "lora", index 0 for the global picks or a beat number for that beat\'s own '
+            "picks: replacement is the complete new list of picks, each an object with the keys "
+            "id and strength, from this catalog:\n" + lines[0] + "\n") in with_lora
+    many = (["panel %d: N1 word count: x" % i for i in range(1, 39)],
+            ["panel 1: N13 repeat: y", "panel 2: N13 repeat: y", "panel 3: N13 repeat: y"])
+    capped = se.build_critic_prompt(plan, text, many)
+    block = capped.split("fix the hard ones first):\n", 1)[1].split("\n\nScore the draft", 1)[0]
+    assert block.split("\n") == (["- [hard] panel %d: N1 word count: x" % i for i in range(1, 39)]
+                                 + ["- [advisory] panel 1: N13 repeat: y",
+                                    "- [advisory] panel 2: N13 repeat: y", "- ... and 1 more"])
+    judge = se.build_critic_prompt(plan, text, many, for_judge=True)
+    assert judge.endswith("\n\nCall submit_review with your scores, verdict and patches.")
+    assert judge[:-len(se.JUDGE_REPLY_PARAGRAPH)] == capped[:-len(se.CRITIC_REPLY_PARAGRAPH)]
+    goal_plan = dict(plan, goal="quiet suspense", narrative="N @@SECONDS@@")
+    goal = se.build_critic_prompt(goal_plan, text, ([], []))
+    assert "\n\nThe target output goal is quiet suspense.\n\nThe plan (JSON):\n" in goal
+    assert "the panels tell the narrative and serve the target output goal, with" in goal
+    assert "Narrative to adapt:\nN @@SECONDS@@\n" in goal
+
+
+def _critic_ws(tmp_path, monkeypatch, critic=()):
+    ws = seu.make_ws(tmp_path)
+    log = seu.script_agent(monkeypatch, tmp_path, critic=list(critic))
+    return seu.make_ctx(se, ws), log
+
+
+def test_rst23_critic_routing(tmp_path, monkeypatch, capsys):
+    prompt = "You are the critic for a test"
+    ctx, log = _critic_ws(tmp_path, monkeypatch, critic=[{"answer": "L1"}, {"answer": "L2"},
+                                                         {"answer": "L3"}, {"answer": "L4"}])
+    local = seu.FakeFleet(seu.fleet_view(True, ["a"]))
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: local)
+    assert se.run_critic(ctx, prompt) == ("ok", "L1", "local")
+    assert local.calls == []
+    records = seu.agent_log(log)
+    assert "--skill=analyst" in records[0]["argv"] and records[0]["env_preflight"] == "1"
+    peers = seu.FakeFleet(seu.fleet_view(False, ["a", "b"]),
+                          [("busy", None, "no capacity"), ("ok", seu.ok_envelope("FLEET"), "")])
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: peers)
+    assert se.run_critic(ctx, prompt) == ("ok", "FLEET", "fleet:b")
+    assert [c[3] for c in peers.calls] == ["a", "b"]
+    assert peers.calls[0][:3] == ("http://127.0.0.1:8190", "analyst", prompt)
+    assert capsys.readouterr().out == "Warning: critic on a failed: busy no capacity\n"
+    failing = seu.FakeFleet(seu.fleet_view(False, ["a"]), [("ok", seu.ok_envelope("  "), "")])
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: failing)
+    assert se.run_critic(ctx, prompt) == ("ok", "L2", "local")
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: None)
+    assert se.run_critic(ctx, prompt) == ("ok", "L3", "local")
+    broken = seu.FakeFleet(seu.fleet_view(False, ["a"]), raise_on_fetch=True)
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: broken)
+    assert se.run_critic(ctx, prompt) == ("ok", "L4", "local")
+    assert broken.calls == []
+    assert len(seu.agent_log(log)) == 4
+
+
+def test_rst24_real_fleet_lib_with_no_daemon(tmp_path, monkeypatch):
+    ctx, log = _critic_ws(tmp_path, monkeypatch, critic=[{"answer": "LOCAL"}])
+    assert se._load_fleet(ctx.ws) is not None
+    assert se.run_critic(ctx, "You are the critic for a test") == ("ok", "LOCAL", "local")
+    assert len(seu.agent_log(log)) == 1
+
+
+def test_rst26a_parse_critic():
+    good = seu.critic_json((7, 6, 8), "revise", [{"target": "panel"}])
+    assert se.parse_critic(json.dumps(good)) == good
+    assert se.parse_critic("```json\n" + json.dumps(dict(good, extra=1)) + "\n```") == good
+    for bad in (dict(good, scores={"continuity": 7, "story": 6}),
+                dict(good, scores={"continuity": True, "story": 6, "renderability": 8}),
+                dict(good, scores={"continuity": 11, "story": 6, "renderability": 8}),
+                dict(good, scores={"continuity": 7.0, "story": 6, "renderability": 8}),
+                dict(good, verdict="maybe"), dict(good, patches={})):
+        assert se.parse_critic(json.dumps(bad)) is None, bad
+    assert se.parse_critic(None) is None

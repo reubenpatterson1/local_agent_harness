@@ -476,3 +476,52 @@ def critic_json(scores=(8, 8, 8), verdict="ok", patches=()):
     """A critic reply (Section 2.4)."""
     return {"scores": dict(zip(("continuity", "story", "renderability"), scores)),
             "verdict": verdict, "patches": list(patches)}
+
+
+# --- the fake fleet (spec 5.2) ------------------------------------------------------------------
+
+class FakeFleet(object):
+    """Stands in for fleet_lib in story_engine.run_critic. view is a fleet view (or None);
+    outcomes are the queued (outcome, envelope, detail) results of delegate_once; calls records
+    every delegate_once call as (url, skill, task, host_id)."""
+
+    LOCAL = "@local"
+
+    def __init__(self, view, outcomes=(), raise_on_fetch=False):
+        self.view = view
+        self.outcomes = list(outcomes)
+        self.raise_on_fetch = raise_on_fetch
+        self.calls = []
+
+    def daemon_url_from_env(self, environ):
+        return "http://127.0.0.1:8190", None
+
+    def fetch_view(self, url):
+        if self.raise_on_fetch:
+            raise OSError("boom")
+        return self.view, None
+
+    def route_candidates(self, skill, view):
+        def serves(skills):
+            return any(s.get("skill") == skill and s.get("verified") is True for s in skills)
+        if serves(view["self"]["skills"]):
+            return [self.LOCAL]
+        return [p["host_id"] for p in view["peers"]
+                if p.get("compatible") is True and serves(p["skills"])]
+
+    def delegate_once(self, url, skill, task, host_id):
+        self.calls.append((url, skill, task, host_id))
+        return self.outcomes.pop(0)
+
+
+def fleet_view(self_serves, peers):
+    """A fleet view: self serves analyst when self_serves; peers are host ids serving it."""
+    analyst = [{"skill": "analyst", "verified": True}]
+    return {"schema": "qwen-agentd.peers.v1",
+            "self": {"host_id": "mac-local", "skills": analyst if self_serves else []},
+            "peers": [{"host_id": h, "compatible": True, "skills": analyst} for h in peers]}
+
+
+def ok_envelope(text):
+    return {"schema": "qwen-agent.oneshot.v1", "status": "ok", "answer": text, "error": None,
+            "rounds": 1, "tool_calls": 0}
