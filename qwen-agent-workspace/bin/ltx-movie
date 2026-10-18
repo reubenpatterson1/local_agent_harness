@@ -1446,7 +1446,7 @@ def _phase1_robust(args):
     if rc != 0:
         return rc
     if not args.no_review:
-        with open(story_md) as f:
+        with open(story_md, encoding="utf-8") as f:
             content = f.read()
         print("=== story.md ===")
         print(content)
