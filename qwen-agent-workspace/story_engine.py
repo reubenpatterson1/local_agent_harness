@@ -1822,3 +1822,454 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
         parts[k - 1][field] = text
         applied.append(patch)
     return new, applied, rejected, regenerate
+
+
+# ---------------------------------------------------------------------------
+# The run: plan calls (RS8), panel calls (RS13), the round controller (RS21), ranking (RS22),
+# budgets and the wall clock (RS23), outputs (RS25-RS27)
+# ---------------------------------------------------------------------------
+
+WRITER_CHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "S4", "S5", "S7",
+                    "S8", "S10", "S11")
+
+
+def _unused_dir(path):
+    """bin/ltx-movie's _unused_path for a directory path (no extension)."""
+    candidate, k = path, 2
+    while os.path.lexists(candidate):
+        candidate = "%s-%d" % (path, k)
+        k += 1
+    return candidate
+
+
+def _reply_text(status, answer):
+    return answer if answer is not None else "<no answer: %s>" % status
+
+
+def _scores_of(states, i):
+    """The scores of states[i], else of its nearest scored ancestor, else None (RS22)."""
+    for j in range(i, -1, -1):
+        if states[j]["scores"]:
+            return states[j]["scores"]
+    return None
+
+
+def _key(states, i):
+    scores = _scores_of(states, i)
+    low = min(scores.values()) if scores else 0
+    total = sum(scores.values()) if scores else 0
+    return (len(states[i]["hard"]), -low, -total)
+
+
+def better(states, a, b):
+    """True when states[a] is strictly better than states[b] (RS21)."""
+    return _key(states, a) < _key(states, b)
+
+
+def best_round(states):
+    """The index of the state with the smallest (hard, -min, -total, -round) (RS22)."""
+    return min(range(len(states)), key=lambda i: _key(states, i) + (-i,))
+
+
+def _checks_doc(ctx, state, source="robust"):
+    return {"schema": CHECKS_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
+            "panels": ctx.panels, "checked_at": _utc(), "source": source,
+            "round": state["round"] if source == "robust" else None,
+            "hard": [parse_violation(m) for m in state["hard"]],
+            "advisory": [parse_violation(m) for m in state["advisory"]],
+            "scores": state.get("scores"), "verdict": state.get("verdict"), "stop_reason": None,
+            "rounds": [], "best_round": None, "judge": None}
+
+
+class _Run(object):
+    """One robust Phase 1 run: budgets, files, run.json and the states of every round."""
+
+    def __init__(self, ctx, no_stills_rules):
+        self.ctx = ctx
+        self.rules = no_stills_rules
+        self.start = _now()
+        self.cap = wall_clock_cap(ctx.panels)
+        self.rounds_dir = os.path.join(ctx.story_dir, "story_rounds")
+        self.agent_calls = 0
+        self.panel_calls = dict((k, 0) for k in range(1, ctx.panels + 1))
+        self.time_up = False
+        self.shape = []
+        self.states = []
+        self.doc = {"schema": RUN_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
+                    "panels": ctx.panels, "started_at": _utc(), "finished_at": None,
+                    "budgets": {"plan_calls": PLAN_MAX_CALLS, "panel_calls": PANEL_MAX_CALLS,
+                                "critic_rounds": CRITIC_MAX_ROUNDS,
+                                "critic_calls_per_round": CRITIC_CALLS_PER_ROUND,
+                                "max_patches": MAX_PATCHES, "wall_clock_s": self.cap},
+                    "calls": [], "stop_reason": None, "best_round": None, "exit": None}
+        compatible = compatible_entries(ctx)
+        self.compatible_by_id = dict((e["id"], e) for e in compatible)
+        self.catalog_by_id = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
+        self.catalog_lines = ([catalog_line(e) for e in compatible if e["target"] == "video"]
+                              if lora_patches_allowed(ctx) else None)
+        self.compatible = compatible
+
+    def expired(self):
+        return _now() - self.start >= self.cap
+
+    def round_dir(self, r):
+        path = os.path.join(self.rounds_dir, "round_%d" % r)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def write_run(self):
+        _write_json(os.path.join(self.rounds_dir, "run.json"), self.doc)
+
+    def record(self, stage, panel, rnd, attempt, route, status, started):
+        self.doc["calls"].append({"stage": stage, "panel": panel, "round": rnd,
+                                  "attempt": attempt, "route": route, "status": status,
+                                  "seconds": round(_now() - started, 1)})
+        self.write_run()
+
+    def agent(self, prompt, max_tokens, timeout, image=None):
+        preflight = self.agent_calls > 0
+        self.agent_calls += 1
+        return run_agent(self.ctx, prompt, max_tokens=max_tokens, timeout=timeout, image=image,
+                         preflight_done=preflight)
+
+    def round0_timeout(self):
+        print("Error: story generation exceeded the wall-clock cap of %ds before every panel was "
+              "written; partial work is kept in %s" % (self.cap, self.round_dir(0)),
+              file=sys.stderr)
+        return self.finish(1)
+
+    def finish(self, code):
+        self.doc["finished_at"] = _utc()
+        self.doc["exit"] = code
+        self.write_run()
+        return code
+
+    # -- plan ------------------------------------------------------------------------------
+
+    def plan_round(self):
+        ctx = self.ctx
+        rdir = self.round_dir(0)
+        prompt = build_plan_prompt(ctx, self.compatible, ctx.pinned)
+        _write_text(os.path.join(rdir, "plan_prompt.txt"), prompt)
+        text, found, problems = prompt, None, []
+        for attempt in range(1, PLAN_MAX_CALLS + 1):
+            if self.expired():
+                return None, "timeout"
+            print("plan: call %d of %d" % (attempt, PLAN_MAX_CALLS))
+            started = _now()
+            status, answer = self.agent(text, plan_max_tokens(ctx.panels),
+                                        plan_timeout(ctx.panels), image=ctx.seed_agent_image)
+            self.record("plan", None, 0, attempt, None, status, started)
+            _write_text(os.path.join(rdir, "plan_reply_%d.txt" % attempt),
+                        _reply_text(status, answer))
+            raw = extract_json(answer)
+            if raw is None:
+                problems = ["the reply is not one JSON object"]
+            else:
+                plan, shape = normalize_plan(ctx, raw)
+                hard = (plan_checks(ctx, plan, shape)[0]
+                        + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
+                found = (plan, shape, hard)
+                problems = hard
+            if not problems:
+                break
+            text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
+                    + "\n".join(listed(["- " + m for m in problems]))
+                    + "\nPrevious reply:\n"
+                    + (answer[:20000] if answer is not None else "<no answer: %s>" % status)
+                    + "\n\nReply with the complete corrected JSON object only.")
+        return found, None
+
+    # -- panels ----------------------------------------------------------------------------
+
+    def panel_call(self, plan, parts, k, rnd, fix):
+        """(valid parts or None) after one panel call; the caller checks the budget."""
+        ctx = self.ctx
+        self.panel_calls[k] += 1
+        n = self.panel_calls[k]
+        print("panel %d/%d: call %d" % (k, ctx.panels, n))
+        rdir = self.round_dir(rnd)
+        prompt = build_panel_prompt(ctx, plan, parts, k, fix=fix, no_stills_rules=self.rules)
+        _write_text(os.path.join(rdir, "panel_%02d_prompt_%d.txt" % (k, n)), prompt)
+        started = _now()
+        image = ctx.seed_agent_image if ctx.mode == "chained" and k == 1 else None
+        status, answer = self.agent(prompt, PANEL_MAX_TOKENS, PANEL_TIMEOUT, image=image)
+        self.record("panel", k, rnd, n, None, status, started)
+        _write_text(os.path.join(rdir, "panel_%02d_reply_%d.txt" % (k, n)),
+                    _reply_text(status, answer))
+        return parse_panel_reply(ctx, plan, k, answer)
+
+    def regenerate(self, state, k, plan, parts, rnd):
+        """("ok", parts_k) | ("failed", None) | ("budget", None) | ("time", None)."""
+        if self.panel_calls[k] >= PANEL_MAX_CALLS:
+            return "budget", None
+        if self.expired():
+            self.time_up = True
+            return "time", None
+        fix = [m for m in state["hard"] + state["advisory"]
+               if parse_violation(m)["index"] == k
+               and parse_violation(m)["scope"] in ("panel", "beat")]
+        if not fix:
+            fix = ["this panel's beat was revised; rewrite the panel for the new beat"]
+        new = self.panel_call(plan, parts, k, rnd, fix)
+        return ("ok", new) if new is not None else ("failed", None)
+
+    # -- states ----------------------------------------------------------------------------
+
+    def make_state(self, rnd, plan, parts):
+        ctx = self.ctx
+        rdir = self.round_dir(rnd)
+        text = assemble(ctx, plan, parts)
+        story_md = os.path.join(rdir, "story.md")
+        _write_text(story_md, text)
+        ph, pa = plan_checks(ctx, plan, self.shape)
+        lh, la = lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)
+        nh, na = panel_checks(ctx, plan, parts, text, story_md)
+        state = {"round": rnd, "plan": plan, "parts": parts, "text": text, "hard": ph + lh + nh,
+                 "advisory": pa + la + na, "scores": None, "verdict": None, "dir": rdir}
+        _write_json(os.path.join(rdir, "plan.json"), plan)
+        _write_json(os.path.join(rdir, "parts.json"), {"panels": [
+            dict([("index", k)] + [(key, p.get(key, "")) for key in writer_keys(ctx.mode, k)])
+            for k, p in enumerate(parts, start=1)]})
+        _write_json(os.path.join(rdir, "story_checks.json"), _checks_doc(ctx, state))
+        print("round %d: %d hard, %d advisory" % (rnd, len(state["hard"]), len(state["advisory"])))
+        self.states.append(state)
+        return state
+
+    # -- critic rounds ---------------------------------------------------------------------
+
+    def critic_round(self, k, judged, passed_only=False):
+        """One RS21 iteration on states[judged]. Returns a stop reason or None (a new state was
+        appended)."""
+        ctx = self.ctx
+        prev = self.states[judged]
+        rdir = os.path.join(self.rounds_dir, "round_%d" % k)
+        base = build_critic_prompt(prev["plan"], prev["text"], (prev["hard"], prev["advisory"]),
+                                   self.catalog_lines)
+        prompt, reply, route, calls = base, None, None, 0
+        for attempt in range(1, CRITIC_CALLS_PER_ROUND + 1):
+            if self.expired():
+                if calls == 0:
+                    return "time_cap"
+                break
+            calls += 1
+            self.round_dir(k)
+            _write_text(os.path.join(rdir, "critic_prompt_%d.txt" % attempt), prompt)
+            started = _now()
+            self.agent_calls += 1
+            status, answer, route = run_critic(ctx, prompt)
+            self.record("critic", None, k, attempt, route, status, started)
+            _write_text(os.path.join(rdir, "critic_reply_%d.txt" % attempt),
+                        _reply_text(status, answer))
+            reply = parse_critic(answer)
+            if reply is not None:
+                break
+            prompt = base + CRITIC_RETRY_SUFFIX
+        critic = {"route": route, "calls": calls, "reply": reply, "applied": [], "rejected": []}
+        critic_path = os.path.join(rdir, "critic.json")
+        if reply is not None:
+            prev["scores"], prev["verdict"] = reply["scores"], reply["verdict"]
+            scores = reply["scores"]
+
+            def line(applied, rejected):
+                print("critic round %d (%s): continuity=%d story=%d renderability=%d verdict=%s; "
+                      "%d patch(es): %d applied, %d rejected"
+                      % (k, route, scores["continuity"], scores["story"],
+                         scores["renderability"], reply["verdict"], len(reply["patches"]),
+                         applied, rejected))
+
+            if (not prev["hard"] and reply["verdict"] == "ok"
+                    and min(scores.values()) >= MIN_OK_SCORE):
+                _write_json(critic_path, critic)
+                line(0, 0)
+                return "passed"
+            if not passed_only and judged >= 1 and not better(self.states, judged, judged - 1):
+                _write_json(critic_path, critic)
+                line(0, 0)
+                return "plateau"
+            new, applied, rejected, _regen = apply_patches(
+                ctx, {"plan": prev["plan"], "parts": prev["parts"]}, reply["patches"],
+                regen=lambda kk, plan, parts: self.regenerate(prev, kk, plan, parts, k))
+            critic["applied"], critic["rejected"] = applied, rejected
+            _write_json(critic_path, critic)
+            line(len(applied), len(rejected))
+            self.make_state(k, new["plan"], new["parts"])
+            return None
+        print("critic round %d: no valid reply after %d call(s); code-only round" % (k, calls))
+        _write_json(critic_path, critic)
+        if (not passed_only and judged >= 1
+                and len(prev["hard"]) >= len(self.states[judged - 1]["hard"])):
+            return "plateau"
+        parts = copy.deepcopy(prev["parts"])
+        plan = copy.deepcopy(prev["plan"])
+        for kk in range(1, ctx.panels + 1):
+            mine = [m for m in prev["hard"] if parse_violation(m)["scope"] == "panel"
+                    and parse_violation(m)["index"] == kk
+                    and parse_violation(m)["id"] in WRITER_CHECK_IDS]
+            if not mine or self.panel_calls[kk] >= PANEL_MAX_CALLS:
+                continue
+            if self.expired():
+                self.time_up = True
+                break
+            new = self.panel_call(plan, parts, kk, k, mine)
+            if new is not None:
+                parts[kk - 1] = new
+        self.make_state(k, plan, parts)
+        return None
+
+    # -- judge -----------------------------------------------------------------------------
+
+    def judge_gate(self):
+        ctx = self.ctx
+        best = self.states[best_round(self.states)]
+        if best["hard"]:
+            return {"status": "skipped", "detail": "best round has hard violations",
+                    "scores": None, "min_score": None, "applied": False}
+        if self.expired():
+            return {"status": "skipped", "detail": "wall-clock cap reached", "scores": None,
+                    "min_score": None, "applied": False}
+        started = _now()
+        status, detail, reply = run_judge(ctx, best["dir"])
+        self.record("judge", None, best["round"], 1, None, status, started)
+        if status != "ok":
+            print("Warning: judge-story failed (%s); keeping the critic's best round" % detail)
+            return {"status": "error", "detail": detail, "scores": None, "min_score": None,
+                    "applied": False}
+        low = min(reply["scores"].values())
+        judge = {"status": "ok", "detail": "min score %d" % low, "scores": reply["scores"],
+                 "min_score": low, "applied": False}
+        if low >= JUDGE_MIN_SCORE:
+            return judge
+        j = len(self.states)
+        rdir = self.round_dir(j)
+        new, applied, rejected, _regen = apply_patches(
+            ctx, {"plan": best["plan"], "parts": best["parts"]}, reply["patches"],
+            regen=lambda kk, plan, parts: self.regenerate(best, kk, plan, parts, j),
+            lora_allowed=False)
+        _write_json(os.path.join(rdir, "judgment.patches.json"), reply)
+        _write_json(os.path.join(rdir, "critic.json"), {
+            "route": None, "calls": 0, "reply": reply, "applied": applied, "rejected": rejected})
+        self.make_state(j, new["plan"], new["parts"])
+        if not self.expired():
+            self.critic_round(j + 1, j, passed_only=True)
+        judge["applied"] = True
+        return judge
+
+    # -- the whole run ---------------------------------------------------------------------
+
+    def go(self):
+        ctx = self.ctx
+        if os.path.lexists(self.rounds_dir):
+            os.replace(self.rounds_dir, _unused_dir(os.path.join(
+                ctx.story_dir, "story_rounds-%s-%d"
+                % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()))))
+        self.round_dir(0)
+        self.write_run()
+        for warning in catalog_warnings(ctx):
+            print(warning)
+        found, why = self.plan_round()
+        if why == "timeout":
+            return self.round0_timeout()
+        fatal = ([h for h in found[2] if parse_violation(h)["id"] in ("P1", "P2")]
+                 if found else ["the reply is not one JSON object"])
+        if fatal:
+            calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])
+            print("Error: the story model did not return a usable plan after %d call(s)" % calls,
+                  file=sys.stderr)
+            for message in fatal:
+                print("  - %s" % message, file=sys.stderr)
+            print("Raw replies are kept in %s. Rerun the same command to try again."
+                  % self.round_dir(0), file=sys.stderr)
+            return self.finish(1)
+        plan, self.shape, _hard = found
+        parts = [empty_parts(ctx.mode, k, plan) for k in range(1, ctx.panels + 1)]
+        valid = 0
+        for k in range(1, ctx.panels + 1):
+            if self.expired():
+                return self.round0_timeout()
+            new = self.panel_call(plan, parts, k, 0, None)
+            if new is None and self.panel_calls[k] < PANEL_MAX_CALLS:
+                if self.expired():
+                    return self.round0_timeout()
+                new = self.panel_call(plan, parts, k, 0,
+                                      [unparseable_panel_problem(ctx.mode, k)])
+            if new is not None:
+                parts[k - 1] = new
+                valid += 1
+        if not valid:
+            print("Error: the story model returned no valid panel in round 0; see %s"
+                  % self.round_dir(0), file=sys.stderr)
+            return self.finish(1)
+        self.make_state(0, plan, parts)
+        stop = None
+        for k in range(1, CRITIC_MAX_ROUNDS + 1):
+            if self.expired():
+                stop = "time_cap"
+                break
+            stop = self.critic_round(k, k - 1)
+            if stop:
+                break
+            if self.time_up:
+                stop = "time_cap"
+                break
+            if k == CRITIC_MAX_ROUNDS:
+                stop = "max_rounds"
+        judge = self.judge_gate() if ctx.judge else None
+        best = best_round(self.states)
+        state = self.states[best]
+        print("stop: %s; best round %d (%d hard)" % (stop, best, len(state["hard"])))
+        doc = _checks_doc(ctx, state)
+        doc.update({"stop_reason": stop, "best_round": best, "judge": judge,
+                    "rounds": [{"round": s["round"], "hard": len(s["hard"]),
+                                "advisory": len(s["advisory"]), "scores": s["scores"],
+                                "verdict": s["verdict"]} for s in self.states]})
+        _write_json(os.path.join(ctx.story_dir, "plan.json"), state["plan"])
+        _write_json(os.path.join(ctx.story_dir, "story_checks.json"), doc)
+        _write_text(os.path.join(ctx.story_dir, "story.md"), state["text"])
+        self.doc["stop_reason"], self.doc["best_round"] = stop, best
+        self.advisories = state["advisory"]
+        if not state["hard"]:
+            return self.finish(0)
+        print("Error: story.md has %d hard violation(s) after the critic rounds (best round %d of "
+              "%d):" % (len(state["hard"]), best, len(self.states) - 1), file=sys.stderr)
+        for message in state["hard"]:
+            print("  - %s" % message, file=sys.stderr)
+        print("story.md, plan.json and story_checks.json are saved in %s. Hand-edit story.md to "
+              "fix the violations above and rerun: story.md already exists, so Phase 1 re-checks "
+              "it instead of regenerating it (pass --force-story to regenerate)." % ctx.story_dir,
+              file=sys.stderr)
+        return self.finish(2)
+
+
+def run(ctx, no_stills_rules=""):
+    """Generate story.md with the robust engine. Returns (exit code, advisories)."""
+    runner = _Run(ctx, no_stills_rules)
+    runner.advisories = []
+    code = runner.go()
+    return code, runner.advisories
+
+
+def run_judge(ctx, round_dir):
+    """("ok", "", reply) or ("error", detail, None) for bin/judge-story --patches on
+    <round_dir>/story.md (RS24); reply is {"scores", "verdict", "patches"}."""
+    cmd = ([sys.executable, os.path.join(ctx.ws, "bin", "judge-story"),
+            "--story-md", os.path.join(round_dir, "story.md"), "--patches"]
+           + (["--goal", ctx.goal] if ctx.goal else []))
+    try:
+        proc = subprocess.run(cmd, cwd=ctx.ws, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, timeout=JUDGE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "error", "timeout", None
+    if proc.returncode != 0:
+        return "error", "exit %d" % proc.returncode, None
+    try:
+        with open(os.path.join(round_dir, "judgment.patches.json"), encoding="utf-8") as f:
+            data = json.load(f)
+        reply = {"scores": {k: data["scores"][k] for k in SCORE_KEYS},
+                 "verdict": data["verdict"], "patches": data["patches"]}
+        if not all(_score(v) for v in reply["scores"].values()) or not isinstance(
+                reply["patches"], list):
+            raise ValueError("invalid judgment.patches.json")
+    except Exception as e:
+        return "error", " ".join(str(e).split()) or type(e).__name__, None
+    return "ok", "", reply

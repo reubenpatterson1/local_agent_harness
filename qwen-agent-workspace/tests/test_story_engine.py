@@ -1297,3 +1297,458 @@ def test_lct28_lora_limits_with_a_cast_character(ws, tmp_path, story_env):
     assert applied == []
     assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion or physics LoRAs on "
                                   "this panel (fast-motion, rain-physics); at most 1"]
+
+
+# --- RST10, RST11, RST17b, RST26b, RST33-RST39, RST43, RST55b, RST58: the run (RS8, RS13,
+# RS21-RS27) -----------------------------------------------------------------------------------
+
+SHOUT2 = "The courier shouts across the quay and pedals on toward the far end of the wet road."
+SHOUT1 = SHOUT2[:-1] + " past the moored boats."
+
+
+def _panel_script(mode, n, phrase="the courier", **overrides):
+    """{"<k>": [one valid reply]} for every panel; overrides p<k>=[items] replace panel k's."""
+    script = dict((str(k), [seu.answer(seu.panel_json(mode, k, phrase))]) for k in range(1, n + 1))
+    for key, items in overrides.items():
+        script[key[1:]] = items
+    return script
+
+
+def _shouting(mode, k, text):
+    return seu.answer(dict(seu.panel_json(mode, k), motion=text))
+
+
+def _run(ws, tmp_path, monkeypatch, mode="chained", n=3, plan=None, panel=None, critic=(),
+         **ctx_kw):
+    log = seu.script_agent(monkeypatch, tmp_path,
+                           plan=plan if plan is not None else [seu.answer(seu.plan_json(mode, n))],
+                           panel=panel if panel is not None else _panel_script(mode, n),
+                           critic=list(critic))
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=n, **ctx_kw)
+    rc, advisories = se.run(ctx)
+    return rc, advisories, ctx, seu.agent_log(log)
+
+
+def _rounds(ctx, r=None):
+    base = os.path.join(ctx.story_dir, "story_rounds")
+    return base if r is None else os.path.join(base, "round_%d" % r)
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_rst10_plan_retry_and_fatal_plan(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
+        {"answer": "I think the story is about rain."}, seu.answer(seu.plan_json("chained", 3))],
+        critic=[seu.answer(seu.critic_json())])
+    assert rc == 0
+    assert os.path.exists(os.path.join(_rounds(ctx, 0), "plan_reply_2.txt"))
+    second = log[1]["argv"][-1]
+    assert ("\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- the reply is not one JSON object\n"
+            "Previous reply:\nI think the story is about rain.\n\nReply with the complete "
+            "corrected JSON object only.") in second
+    assert second.startswith('You are planning a short narrated movie (story-id "s1").')
+    capsys.readouterr()
+    os.makedirs(os.path.join(ws, "generated", "stories", "s2"))
+    with open(os.path.join(ws, "generated", "stories", "s2", "story.md"), "w") as f:
+        f.write("OLD")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="s2",
+                            plan=[{"answer": "nope"}, {"status": "http_error"}])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err == ("Error: the story model did not return a usable plan after 2 call(s)\n"
+                   "  - the reply is not one JSON object\n"
+                   "Raw replies are kept in %s. Rerun the same command to try again.\n"
+                   % _rounds(ctx, 0))
+    with open(os.path.join(ctx.story_dir, "story.md")) as f:
+        assert f.read() == "OLD"
+    assert not os.path.exists(os.path.join(ctx.story_dir, "plan.json"))
+    with open(os.path.join(_rounds(ctx, 0), "plan_reply_2.txt")) as f:
+        assert f.read() == "<no answer: http_error>"
+    assert [r["stage"] for r in log] == ["plan", "plan"]
+
+
+def test_rst11_short_plan_is_fatal(ws, tmp_path, monkeypatch, capsys):
+    short = seu.plan_json("chained", 5)
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, n=6,
+                            plan=[seu.answer(short), seu.answer(short)])
+    assert rc == 1 and len(log) == 2
+    assert capsys.readouterr().err.splitlines()[:2] == [
+        "Error: the story model did not return a usable plan after 2 call(s)",
+        "  - plan: P1 beat count: expected exactly 6 beats, found 5"]
+    assert "plan: P1 beat count: expected exactly 6 beats, found 5" in log[1]["argv"][-1]
+
+
+def test_rst17b_invalid_panel_retried_once_never_three_times(ws, tmp_path, monkeypatch):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_panel_script(
+        "chained", 3, p2=[{"answer": "not json"}, {"answer": "still not json"}]))
+    assert rc == 2
+    panel2 = [r for r in log if r["stage"] == "panel" and r["panel"] == 2]
+    assert len(panel2) == 2
+    assert ("Your previous version of this panel was rejected. Problems:\n- the reply is not one "
+            "JSON object with the keys title, motion, narration\nPrevious version:\ntitle: "
+            "the courier swerves around a\nmotion: \nnarration: \n\n") in panel2[1]["argv"][-1]
+    parts = _read_json(os.path.join(_rounds(ctx, 0), "parts.json"))["panels"]
+    assert parts[1] == {"index": 2, "title": "the courier swerves around a", "motion": "",
+                        "narration": ""}
+
+
+def test_rst26b_critic_retry_and_code_only_round(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_panel_script(
+        "chained", 3, p2=[_shouting("chained", 2, SHOUT2), seu.answer(seu.panel_json("chained", 2))]),
+        critic=[{"answer": "garbage"}, {"answer": "{}"}, {"answer": "still garbage"},
+                seu.answer(seu.critic_json())])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "critic round 1: no valid reply after 2 call(s); code-only round\n" in out
+    assert "critic round 2 (local): continuity=8 story=8 renderability=8 verdict=ok; 0 patch(es): " \
+           "0 applied, 0 rejected\nstop: passed; best round 1 (0 hard)\n" in out
+    assert [(r["stage"], r["panel"]) for r in log] == [
+        ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3), ("critic", None),
+        ("critic", None), ("panel", 2), ("critic", None), ("critic", None)]
+    assert log[5]["argv"][-1].endswith(se.CRITIC_RETRY_SUFFIX)
+    assert "panel 2: N7 dialogue and text: Motion: says 'shouts'" in log[6]["argv"][-1]
+    critic1 = _read_json(os.path.join(_rounds(ctx, 1), "critic.json"))
+    assert critic1 == {"route": "local", "calls": 2, "reply": None, "applied": [], "rejected": []}
+
+
+def test_rst33_stop_passed(ws, tmp_path, monkeypatch, capsys):
+    rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch,
+                                    critic=[seu.answer(seu.critic_json((7, 7, 8)))])
+    assert (rc, advisories) == (0, [])
+    assert capsys.readouterr().out == (
+        "plan: call 1 of 2\npanel 1/3: call 1\npanel 2/3: call 1\npanel 3/3: call 1\n"
+        "round 0: 0 hard, 0 advisory\n"
+        "critic round 1 (local): continuity=7 story=7 renderability=8 verdict=ok; 0 patch(es): "
+        "0 applied, 0 rejected\nstop: passed; best round 0 (0 hard)\n")
+    assert [r["stage"] for r in log].count("critic") == 1
+    assert [r["env_preflight"] for r in log] == [None, "1", "1", "1", "1"]
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert (checks["stop_reason"], checks["best_round"], checks["round"]) == ("passed", 0, 0)
+    assert checks["scores"] == {"continuity": 7, "story": 7, "renderability": 8}
+
+
+def _narration_patch(k, text):
+    return {"target": "panel", "index": k, "field": "narration", "reason": "r",
+            "replacement": text}
+
+
+def test_rst34_stop_plateau(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, critic=[
+        seu.answer(seu.critic_json((6, 6, 6), "revise", [_narration_patch(2, "The streets ran with water.")])),
+        seu.answer(seu.critic_json((5, 5, 5), "revise", [_narration_patch(3, "Never applied.")]))])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.endswith("critic round 2 (local): continuity=5 story=5 renderability=5 "
+                        "verdict=revise; 1 patch(es): 0 applied, 0 rejected\n"
+                        "stop: plateau; best round 0 (0 hard)\n")
+    assert _read_json(os.path.join(_rounds(ctx, 2), "critic.json"))["applied"] == []
+    assert not os.path.exists(os.path.join(_rounds(ctx, 2), "plan.json"))
+    with open(os.path.join(ctx.story_dir, "story.md")) as f:
+        story = f.read()
+    with open(os.path.join(_rounds(ctx, 0), "story.md")) as f:
+        assert f.read() == story
+
+
+def _motion_patch(k, text):
+    return {"target": "panel", "index": k, "field": "motion", "reason": "r", "replacement": text}
+
+
+def test_rst35_stop_max_rounds(ws, tmp_path, monkeypatch, capsys):
+    clean = dict((k, seu.panel_json("chained", k)["motion"]) for k in (1, 2, 3))
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_panel_script(
+        "chained", 3, p1=[_shouting("chained", 1, SHOUT1)], p2=[_shouting("chained", 2, SHOUT2)],
+        p3=[_shouting("chained", 3, SHOUT2.replace("quay", "lane"))]),
+        critic=[seu.answer(seu.critic_json((6, 6, 6), "revise", [_motion_patch(2, clean[2])])),
+                seu.answer(seu.critic_json((6, 6, 6), "revise", [_motion_patch(3, clean[3])])),
+                seu.answer(seu.critic_json((6, 6, 6), "revise", [_motion_patch(1, clean[1])]))])
+    assert rc == 0
+    out = capsys.readouterr().out
+    hard_counts = [int(line.split()[2]) for line in out.splitlines() if line.startswith("round ")]
+    assert hard_counts == [3, 2, 1, 0]
+    assert out.endswith("stop: max_rounds; best round 3 (0 hard)\n")
+    assert sorted(os.listdir(_rounds(ctx))) == ["round_0", "round_1", "round_2", "round_3",
+                                                "run.json"]
+
+
+def test_rst36_ranking():
+    def state(hard, scores=None):
+        return {"hard": ["x"] * hard,
+                "scores": dict(zip(se.SCORE_KEYS, scores)) if scores else None}
+
+    assert se.best_round([state(2, (9, 9, 9)), state(1, (3, 3, 3))]) == 1
+    assert se.best_round([state(1, (6, 9, 9)), state(1, (7, 7, 7))]) == 1
+    assert se.best_round([state(1, (7, 7, 9)), state(1, (7, 7, 8))]) == 0
+    assert se.best_round([state(1, (7, 7, 8)), state(1, (7, 7, 8))]) == 1
+    states = [state(1, (6, 6, 6)), state(1)]
+    assert se.best_round(states) == 1 and not se.better(states, 1, 0)
+    assert se.better([state(2), state(1)], 1, 0)
+    assert se.best_round([state(0), state(0)]) == 1
+
+
+def test_rst37_budgets_and_the_wall_clock(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
+        {"answer": "no"}, seu.answer(seu.plan_json("chained", 3))], panel=_panel_script(
+        "chained", 3, p1=[{"answer": "no"}, seu.answer(seu.panel_json("chained", 1))],
+        p2=[_shouting("chained", 2, SHOUT2), seu.answer(seu.panel_json("chained", 2))],
+        p3=[_shouting("chained", 3, SHOUT2), _shouting("chained", 3, SHOUT2)]),
+        critic=[{"answer": "x"}] * 6)
+    assert rc == 2
+    calls = _read_json(os.path.join(_rounds(ctx), "run.json"))["calls"]
+    stages = [(c["stage"], c["panel"]) for c in calls]
+    assert stages.count(("plan", None)) == 2
+    assert all(stages.count(("panel", k)) <= 2 for k in (1, 2, 3))
+    assert [c["round"] for c in calls if c["stage"] == "critic"] == [1, 1, 2, 2, 3, 3]
+    assert "stop: plateau; best round 2 (1 hard)" in capsys.readouterr().out
+    run_doc = _read_json(os.path.join(_rounds(ctx), "run.json"))
+    assert run_doc["budgets"] == {"plan_calls": 2, "panel_calls": 2, "critic_rounds": 3,
+                                  "critic_calls_per_round": 2, "max_patches": 8,
+                                  "wall_clock_s": 2400}
+    assert (run_doc["exit"], run_doc["stop_reason"], run_doc["best_round"]) == (2, "plateau", 2)
+
+    clock = [0.0]
+    monkeypatch.setattr(se, "_now", lambda: clock[0])
+    real_agent = se.run_agent
+
+    def slow_agent(*args, **kwargs):
+        result = real_agent(*args, **kwargs)
+        clock[0] = 10.0 ** 6
+        return result
+
+    monkeypatch.setattr(se, "run_agent", slow_agent)
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="s2")
+    assert rc == 1 and [r["stage"] for r in log] == ["plan"]
+    assert capsys.readouterr().err == (
+        "Error: story generation exceeded the wall-clock cap of 2400s before every panel was "
+        "written; partial work is kept in %s\n" % _rounds(ctx, 0))
+    assert not os.path.exists(os.path.join(ctx.story_dir, "story.md"))
+
+    clock[0] = 0.0
+    monkeypatch.setattr(se, "run_agent", real_agent)
+    real_critic = se.run_critic
+
+    def slow_critic(*args, **kwargs):
+        result = real_critic(*args, **kwargs)
+        clock[0] = 10.0 ** 6
+        return result
+
+    monkeypatch.setattr(se, "run_critic", slow_critic)
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="s3", critic=[
+        seu.answer(seu.critic_json((6, 6, 6), "revise", [_narration_patch(2, "It rained on.")]))])
+    assert rc == 0
+    assert capsys.readouterr().out.endswith("stop: time_cap; best round 1 (0 hard)\n")
+    for name in ("plan.json", "story.md", "story_checks.json"):
+        assert os.path.exists(os.path.join(ctx.story_dir, name))
+
+
+def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
+    os.makedirs(os.path.join(ws, "generated", "stories", "s1", "story_rounds"))
+    with open(os.path.join(ws, "generated", "stories", "s1", "story_rounds", "old.txt"), "w") as f:
+        f.write("kept")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, critic=[
+        seu.answer(seu.critic_json((6, 6, 6), "revise", [_narration_patch(2, "It rained on.")])),
+        seu.answer(seu.critic_json((8, 8, 8)))])
+    assert rc == 0
+    moved = [n for n in os.listdir(ctx.story_dir) if n.startswith("story_rounds-")]
+    assert len(moved) == 1 and re.fullmatch(r"story_rounds-\d{8}T\d{6}Z-\d+", moved[0])
+    with open(os.path.join(ctx.story_dir, moved[0], "old.txt")) as f:
+        assert f.read() == "kept"
+    plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
+    assert list(plan) == ["schema", "story_id", "mode", "panels", "seconds", "narrative", "goal",
+                          "seed_image", "video_model", "auto_lora", "title", "logline", "cast",
+                          "locations", "props", "beats", "loras"]
+    assert plan["schema"] == "ltx-movie.plan.v1" and plan["panels"] == 3
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert list(checks) == ["schema", "story_id", "mode", "panels", "checked_at", "source",
+                            "round", "hard", "advisory", "scores", "verdict", "stop_reason",
+                            "rounds", "best_round", "judge"]
+    assert checks["source"] == "robust" and checks["best_round"] == 1 and checks["judge"] is None
+    assert checks["rounds"] == [
+        {"round": 0, "hard": 0, "advisory": 0, "scores": {"continuity": 6, "story": 6,
+                                                          "renderability": 6},
+         "verdict": "revise"},
+        {"round": 1, "hard": 0, "advisory": 0, "scores": {"continuity": 8, "story": 8,
+                                                          "renderability": 8},
+         "verdict": "ok"}]
+    assert sorted(os.listdir(_rounds(ctx, 0))) == [
+        "panel_01_prompt_1.txt", "panel_01_reply_1.txt", "panel_02_prompt_1.txt",
+        "panel_02_reply_1.txt", "panel_03_prompt_1.txt", "panel_03_reply_1.txt", "parts.json",
+        "plan.json", "plan_prompt.txt", "plan_reply_1.txt", "story.md", "story_checks.json"]
+    assert sorted(os.listdir(_rounds(ctx, 1))) == [
+        "critic.json", "critic_prompt_1.txt", "critic_reply_1.txt", "parts.json", "plan.json",
+        "story.md", "story_checks.json"]
+    assert sorted(os.listdir(_rounds(ctx, 2))) == ["critic.json", "critic_prompt_1.txt",
+                                                   "critic_reply_1.txt"]
+    round1 = _read_json(os.path.join(_rounds(ctx, 1), "story_checks.json"))
+    assert (round1["round"], round1["stop_reason"], round1["best_round"], round1["rounds"]) == (
+        1, None, None, [])
+    run_doc = _read_json(os.path.join(_rounds(ctx), "run.json"))
+    assert [c["stage"] for c in run_doc["calls"]] == ["plan", "panel", "panel", "panel",
+                                                      "critic", "critic"]
+    assert run_doc["calls"][4]["route"] == "local" and run_doc["exit"] == 0
+    with open(os.path.join(ctx.story_dir, "story.md")) as f:
+        assert "Narration: It rained on.\n" in f.read()
+
+
+def test_rst43_exit_2_message(ws, tmp_path, monkeypatch, capsys):
+    shout3 = SHOUT2.replace("quay", "lane")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_panel_script(
+        "chained", 3, p2=[_shouting("chained", 2, SHOUT2), _shouting("chained", 2, SHOUT2)],
+        p3=[_shouting("chained", 3, shout3), _shouting("chained", 3, shout3)]),
+        critic=[{"answer": "x"}] * 4)
+    assert rc == 2
+    assert capsys.readouterr().err == (
+        "Error: story.md has 2 hard violation(s) after the critic rounds (best round 1 of 1):\n"
+        "  - panel 2: N7 dialogue and text: Motion: says 'shouts'\n"
+        "  - panel 3: N7 dialogue and text: Motion: says 'shouts'\n"
+        "story.md, plan.json and story_checks.json are saved in %s. Hand-edit story.md to fix "
+        "the violations above and rerun: story.md already exists, so Phase 1 re-checks it "
+        "instead of regenerating it (pass --force-story to regenerate).\n" % ctx.story_dir)
+    for name in ("plan.json", "story.md", "story_checks.json"):
+        assert os.path.exists(os.path.join(ctx.story_dir, name))
+    assert [h["id"] for h in _read_json(os.path.join(ctx.story_dir,
+                                                     "story_checks.json"))["hard"]] == ["N7", "N7"]
+
+
+def test_rst55b_p13_forces_plan_call_2(ws, tmp_path, monkeypatch, story_env):
+    seu.ronin(story_env["lib"])
+    bad = seu.plan_json("chained", 3)
+    bad["cast"][1]["phrase"] = "the ronin"
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
+        seu.answer(bad), seu.answer(seu.plan_json("chained", 3))],
+        critic=[seu.answer(seu.critic_json())])
+    assert rc == 0 and [r["stage"] for r in log][:2] == ["plan", "plan"]
+    assert ("- plan: P13 undeclared character: c2's phrase names library character ronin by its "
+            "referring phrase 'the ronin'") in log[1]["argv"][-1]
+
+
+def test_rst58_a_patch_that_names_an_undeclared_character_loses(ws, tmp_path, monkeypatch,
+                                                                 story_env):
+    seu.ronin(story_env["lib"])
+    patch = _motion_patch(2, "The courier waves to the ronin by the crates and pedals on along "
+                             "the quay.")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, critic=[
+        seu.answer(seu.critic_json((8, 8, 8), "revise", [patch])),
+        seu.answer(seu.critic_json((9, 9, 9)))])
+    assert rc == 0
+    assert _read_json(os.path.join(_rounds(ctx, 1), "critic.json"))["applied"] == [patch]
+    round1 = _read_json(os.path.join(_rounds(ctx, 1), "story_checks.json"))
+    assert "N15" in [h["id"] for h in round1["hard"]]
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert (checks["best_round"], checks["stop_reason"]) == (0, "plateau")
+
+
+def _judge_env(monkeypatch, tmp_path, reply):
+    log = os.path.join(str(tmp_path), "judge_log.jsonl")
+    monkeypatch.setenv("FAKE_JUDGE_REPLY", json.dumps(reply))
+    monkeypatch.setenv("FAKE_JUDGE_LOG", log)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    return log
+
+
+def test_rst38_judge_gate(tmp_path, monkeypatch, capsys):
+    ws = seu.make_ws(tmp_path, fake_judge=True)
+    judge_log = _judge_env(monkeypatch, tmp_path, seu.critic_json((8, 9, 8)))
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, judge=True, goal="quiet suspense",
+                            critic=[seu.answer(seu.critic_json((7, 7, 8)))])
+    assert rc == 0
+    judge = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["judge"]
+    assert judge == {"status": "ok", "detail": "min score 8",
+                     "scores": {"continuity": 8, "story": 9, "renderability": 8},
+                     "min_score": 8, "applied": False}
+    argv = seu.agent_log(judge_log)[0]["argv"]
+    assert argv == ["--story-md", os.path.join(_rounds(ctx, 0), "story.md"), "--patches",
+                    "--goal", "quiet suspense"]
+    assert sorted(os.listdir(_rounds(ctx, 1))) == ["critic.json", "critic_prompt_1.txt",
+                                                   "critic_reply_1.txt"]
+
+    _judge_env(monkeypatch, tmp_path, seu.critic_json((5, 7, 7), "revise",
+                                                      [_narration_patch(2, "The judge's line.")]))
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, judge=True, story_id="s2", critic=[
+        seu.answer(seu.critic_json((7, 7, 8))), seu.answer(seu.critic_json((8, 8, 8)))])
+    assert rc == 0
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert checks["judge"]["applied"] is True and checks["judge"]["min_score"] == 5
+    assert checks["best_round"] == 1
+    critic1 = _read_json(os.path.join(_rounds(ctx, 1), "critic.json"))
+    assert critic1["route"] is None and critic1["reply"]["scores"]["continuity"] == 5
+    assert os.path.exists(os.path.join(_rounds(ctx, 1), "judgment.patches.json"))
+    assert os.path.exists(os.path.join(_rounds(ctx, 2), "critic.json"))
+    with open(os.path.join(ctx.story_dir, "story.md")) as f:
+        assert "Narration: The judge's line.\n" in f.read()
+
+    _judge_env(monkeypatch, tmp_path, {"exit": 1})
+    capsys.readouterr()
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, judge=True, story_id="s3",
+                            critic=[seu.answer(seu.critic_json((7, 7, 8)))])
+    assert rc == 0
+    assert "Warning: judge-story failed (exit 1); keeping the critic's best round\n" in (
+        capsys.readouterr().out)
+    judge = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["judge"]
+    assert (judge["status"], judge["detail"], judge["applied"]) == ("error", "exit 1", False)
+
+    judge_log = _judge_env(monkeypatch, tmp_path, seu.critic_json())
+    os.remove(judge_log) if os.path.exists(judge_log) else None
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, judge=True, story_id="s4", panel=_panel_script(
+        "chained", 3, p2=[_shouting("chained", 2, SHOUT2), _shouting("chained", 2, SHOUT2)]),
+        critic=[{"answer": "x"}] * 4)
+    assert rc == 2 and not os.path.exists(judge_log)
+    judge = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["judge"]
+    assert judge == {"status": "skipped", "detail": "best round has hard violations",
+                     "scores": None, "min_score": None, "applied": False}
+
+
+def test_story_focus_1_a_non_ascii_phrase_is_repaired_or_reported(ws, tmp_path, monkeypatch,
+                                                                    capsys):
+    bad = seu.plan_json("chained", 3)
+    bad["cast"][1]["phrase"] = "the café owner"
+    p3 = ("plan: P3 cast entry: c2's phrase word 'café' may contain only letters, digits, "
+          "apostrophes and hyphens (phrase 'the café owner')")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
+        seu.answer(bad), seu.answer(seu.plan_json("chained", 3))],
+        critic=[seu.answer(seu.critic_json())])
+    assert rc == 0 and ("- " + p3) in log[1]["argv"][-1]
+    capsys.readouterr()
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="s2",
+                            plan=[seu.answer(bad), seu.answer(bad)], critic=[{"answer": "x"}] * 4)
+    assert rc == 2
+    assert "  - %s\n" % p3 in capsys.readouterr().err
+
+
+def test_story_focus_2_a_one_panel_story(ws, tmp_path, monkeypatch):
+    rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch, n=1,
+                                    critic=[seu.answer(seu.critic_json())])
+    assert (rc, advisories) == (0, [])
+    plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
+    assert [b["arc"] for b in plan["beats"]] == ["climax"]
+    with open(os.path.join(ctx.story_dir, "story.md")) as f:
+        assert f.read().count("## Panel ") == 1
+    assert "use climax." in log[0]["argv"][-1]
+
+
+def test_story_focus_3_ctrl_c_during_a_run_keeps_story_md(ws, tmp_path, monkeypatch):
+    story_dir = os.path.join(ws, "generated", "stories", "s1")
+    os.makedirs(story_dir)
+    with open(os.path.join(story_dir, "story.md"), "w") as f:
+        f.write("OLD")
+    real = se.run_agent
+
+    def interrupted(ctx, prompt, **kwargs):
+        if prompt.startswith("You are writing panel 2 "):
+            raise KeyboardInterrupt
+        return real(ctx, prompt, **kwargs)
+
+    monkeypatch.setattr(se, "run_agent", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _run(ws, tmp_path, monkeypatch)
+    with open(os.path.join(story_dir, "story.md")) as f:
+        assert f.read() == "OLD"
+    rounds = os.path.join(story_dir, "story_rounds")
+    assert os.path.exists(os.path.join(rounds, "round_0", "panel_01_reply_1.txt"))
+    assert _read_json(os.path.join(rounds, "run.json"))["exit"] is None
+    monkeypatch.setattr(se, "run_agent", real)
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, critic=[seu.answer(seu.critic_json())])
+    assert rc == 0
+    assert len([n for n in os.listdir(story_dir) if n.startswith("story_rounds-")]) == 1
