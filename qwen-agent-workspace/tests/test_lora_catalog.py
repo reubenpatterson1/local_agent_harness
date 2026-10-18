@@ -223,3 +223,242 @@ def test_lct26_prefix_triggers():
     assert lora_catalog.prefix_triggers(p, ["fastmo", "FastMo", "x"]) == "fastmo, x. " + p
     assert lora_catalog.prefix_triggers("the fastmo-like blur", ["fastmo"]) == (
         "fastmo. the fastmo-like blur")
+
+
+# --- LCT7-LCT12, LCT29: bin/lora-catalog (LC7-LC11, LC20) ---------------------------------
+
+def _cli(*argv):
+    return subprocess.run([sys.executable, LORA_CATALOG_CLI] + list(argv), cwd=WS,
+                          capture_output=True, text=True)
+
+
+def _add_argv(path, entry_id, *extra, **kw):
+    argv = ["add", path, "--id", entry_id, "--kind", kw.get("kind", "motion"),
+            "--target", kw.get("target", "video"), "--base-model", seu.VIDEO_MODEL,
+            "--description", "fast motion blur", "--use-when", "a chase or a sprint"]
+    return argv + list(extra)
+
+
+def _catalog_bytes(story_env):
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_lct7_add_happy_path(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    zeta = seu.lora_file(files, "zeta", rank=16)
+    alpha = seu.lora_file(files, "alpha", rank=8)
+    result = _cli(*_add_argv(zeta, "zeta-motion", "--trigger", "zetamo",
+                             "--default-strength", "0.7", "--strength-range", "0.4,0.9",
+                             "--avoid-when", "a still scene"))
+    assert result.returncode == 0, result.stderr
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    sha = seu.sha256_file(zeta)
+    assert result.stdout == "added zeta-motion (motion, video, rank 16, sha256 %s...) to %s\n" % (
+        sha[:12], path)
+    assert result.stderr == ""
+    entry = lora_catalog.load_catalog(path)["entries"][0]
+    assert entry == {
+        "id": "zeta-motion", "kind": "motion", "path": os.path.abspath(zeta), "sha256": sha,
+        "bytes": os.path.getsize(zeta), "base_models": [seu.VIDEO_MODEL], "target": "video",
+        "triggers": ["zetamo"], "rank": 16, "alpha": 16, "default_strength": 0.7,
+        "strength_range": [0.4, 0.9], "description": "fast motion blur",
+        "use_when": "a chase or a sprint", "avoid_when": "a still scene",
+        "added_at": entry["added_at"]}
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", entry["added_at"])
+    result = _cli(*_add_argv(alpha, "alpha-grain", kind="style"))
+    assert result.returncode == 0, result.stderr
+    data = lora_catalog.load_catalog(path)
+    assert [e["id"] for e in data["entries"]] == ["alpha-grain", "zeta-motion"]
+    assert data["entries"][0]["default_strength"] == 1.0
+    assert data["entries"][0]["strength_range"] == [0.5, 1.0]
+    assert data["entries"][0]["avoid_when"] == ""
+    assert sorted(os.listdir(story_env["catalog"])) == [".lock", "catalog.json"]
+    assert oct(os.stat(os.path.join(story_env["catalog"], ".lock")).st_mode & 0o777) == "0o600"
+
+
+def test_lct8_add_errors_leave_the_catalog_unchanged(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    first = seu.lora_file(files, "first", rank=16)
+    assert _cli(*_add_argv(first, "first-motion", "--trigger", "firstmo")).returncode == 0
+    seu.kyra(story_env["lib"])
+    kyra_video = os.path.join(story_env["lib"], "kyra", "lora", "video.safetensors")
+    seu.fake_safetensors(kyra_video, 32, 32)
+    cases = [
+        (_add_argv(seu.lora_file(files, "a", rank=16), "first-motion"),
+         "Error: catalog entry first-motion already exists\n"),
+        (_add_argv(first, "second-motion"),
+         "Error: %s is already cataloged as first-motion\n" % first),
+        (_add_argv(kyra_video, "kyra-copy"),
+         "Error: %s is character kyra's video LoRA; cast it with bin/ltx-movie --character\n"
+         % kyra_video),
+        (_add_argv(seu.lora_file(files, "b", rank=16), "b-motion", "--trigger", "FIRSTMO"),
+         "Error: trigger FIRSTMO is already catalog entry first-motion's trigger\n"),
+        (_add_argv(seu.lora_file(files, "c", rank=16), "c-motion", "--trigger", "kyrawmn"),
+         "Error: trigger kyrawmn is character kyra's trigger\n"),
+        (_add_argv(seu.lora_file(files, "d", rank=16, alpha=8), "d-motion"),
+         "Error: entry d-motion: alpha must equal rank (16); ltx-2-mlx fuses B@A*strength with "
+         "no alpha/rank scaling (fuse_loras.py), so this LoRA would render at the wrong "
+         "strength\n"),
+        (_add_argv(seu.lora_file(files, "e", rank=16, pairs=False), "e-motion"),
+         "Error: %s has no lora_A/lora_B weight pairs; the ltx-2-mlx fuser would ignore it\n"
+         % os.path.join(files, "e.safetensors")),
+        (_add_argv(seu.fake_safetensors(os.path.join(files, "f.safetensors"), 16, None),
+                   "f-motion"),
+         "Error: cannot read the LoRA alpha from the safetensors header; pass --alpha\n"),
+        (_add_argv(seu.lora_file(files, "g", rank=16), "g-motion", "--default-strength", "1.5"),
+         "Error: entry g-motion: strength_range and default_strength must satisfy 0 < lo <= "
+         "default <= hi <= 2, got range [0.5, 1.0] and default 1.5\n"),
+        (_add_argv(os.path.join(files, "missing.safetensors"), "h-motion"),
+         "Error: %s is not a readable file\n" % os.path.join(files, "missing.safetensors")),
+        (_add_argv(seu.lora_file(files, "i", rank=16), "i-motion", "--strength-range", "0.5"),
+         "Error: --strength-range must be LO,HI, got '0.5'\n"),
+    ]
+    before = _catalog_bytes(story_env)
+    for argv, stderr in cases:
+        result = _cli(*argv)
+        assert (result.returncode, result.stdout, result.stderr) == (2, "", stderr), argv
+        assert _catalog_bytes(story_env) == before
+    ok = _cli(*_add_argv(seu.fake_safetensors(os.path.join(files, "j.safetensors"), 16, None),
+                         "j-motion", "--alpha", "16"))
+    assert ok.returncode == 0, ok.stderr
+
+
+def test_lct9_list(tmp_path, story_env):
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    empty = _cli("list")
+    assert (empty.returncode, empty.stdout) == (0, "no LoRAs in %s\n" % path)
+    seu.kyra(story_env["lib"])
+    header = lora_catalog_row("ID", "KIND", "TARGET", "STRENGTH", "TRIGGERS", "BASE_MODELS")
+    kyra_row = lora_catalog_row("char:kyra", "character", "video", "0.8", "kyrawmn",
+                                seu.CHARACTER_BASE_MODEL)
+    only_chars = _cli("list")
+    assert only_chars.stdout == "no LoRAs in %s\n%s\n%s\n" % (path, header, kyra_row)
+    files = str(tmp_path / "files")
+    motion = seu.catalog_entry(seu.lora_file(files, "m"), "fast-motion", triggers=["fastmo"])
+    stills = seu.catalog_entry(seu.lora_file(files, "s"), "ink-stills", kind="style",
+                               target="stills", base_models=[seu.STILLS_MODEL],
+                               default_strength=0.9, strength_range=[0.6, 1.2])
+    seu.make_catalog(story_env["catalog"], [motion, stills])
+    table = _cli("list")
+    assert table.returncode == 0
+    assert table.stdout.splitlines() == [
+        header,
+        lora_catalog_row("fast-motion", "motion", "video", "0.8 (0.5-1.0)", "fastmo",
+                         seu.VIDEO_MODEL),
+        lora_catalog_row("ink-stills", "style", "stills", "0.9 (0.6-1.2)", "",
+                         seu.STILLS_MODEL),
+        kyra_row]
+    filtered = _cli("list", "--model", seu.STILLS_MODEL)
+    assert filtered.stdout.splitlines() == [
+        header, lora_catalog_row("ink-stills", "style", "stills", "0.9 (0.6-1.2)", "",
+                                 seu.STILLS_MODEL)]
+    as_json = json.loads(_cli("list", "--json").stdout)
+    assert list(as_json) == ["catalog", "entries", "characters"]
+    assert as_json["catalog"] == path
+    assert [e["id"] for e in as_json["entries"]] == ["fast-motion", "ink-stills"]
+    assert [c["id"] for c in as_json["characters"]] == ["char:kyra"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("[]")
+    broken = _cli("list")
+    assert broken.returncode == 2 and broken.stderr.startswith("Error: %s: top level" % path)
+
+
+def lora_catalog_row(*cells):
+    return "%-24s %-9s %-7s %-14s %-24s %s" % cells
+
+
+def test_lct10_remove(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    lora = seu.lora_file(files, "m")
+    with open(lora, "rb") as f:
+        lora_bytes = f.read()
+    seu.make_catalog(story_env["catalog"], [seu.catalog_entry(lora, "fast-motion")])
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    unknown = _cli("remove", "nope")
+    assert (unknown.returncode, unknown.stderr) == (2, "Error: no catalog entry nope\n")
+    char = _cli("remove", "char:kyra")
+    assert (char.returncode, char.stderr) == (
+        2, "Error: char:kyra is a library character; manage it with bin/character\n")
+    ok = _cli("remove", "fast-motion")
+    assert (ok.returncode, ok.stdout) == (0, "removed fast-motion from %s\n" % path)
+    assert lora_catalog.load_catalog(path)["entries"] == []
+    with open(lora, "rb") as f:
+        assert f.read() == lora_bytes
+
+
+def test_lct11_verify(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    good = seu.catalog_entry(seu.lora_file(files, "good"), "good-motion", triggers=["goodmo"])
+    seu.make_catalog(story_env["catalog"], [good])
+    clean = _cli("verify")
+    assert (clean.returncode, clean.stdout) == (0, "OK good-motion\nverified 1 entry: 0 problem(s)\n")
+    grown = seu.catalog_entry(seu.lora_file(files, "grown"), "grown-motion")
+    with open(grown["path"], "ab") as f:
+        f.write(b"extra")
+    same = seu.catalog_entry(seu.lora_file(files, "same"), "same-size")
+    with open(same["path"], "r+b") as f:
+        f.seek(-1, 2)
+        f.write(b"\x01")
+    gone = seu.catalog_entry(seu.lora_file(files, "gone"), "gone-motion")
+    os.remove(gone["path"])
+    ranked = seu.catalog_entry(seu.lora_file(files, "ranked", rank=16), "ranked-motion", rank=8)
+    clash = seu.catalog_entry(seu.lora_file(files, "clash"), "clash-motion", triggers=["kyrawmn"])
+    seu.kyra(story_env["lib"])
+    seu.make_catalog(story_env["catalog"], [good, grown, same, gone, ranked, clash])
+    result = _cli("verify")
+    assert result.returncode == 1
+    assert result.stdout.splitlines() == [
+        "FAIL clash-motion: trigger kyrawmn is also character kyra's trigger",
+        "FAIL gone-motion: %s is missing or unreadable" % gone["path"],
+        "OK good-motion",
+        "FAIL grown-motion: size is %d bytes; the catalog records %d"
+        % (grown["bytes"] + 5, grown["bytes"]),
+        "FAIL ranked-motion: the header's rank 16 differs from the recorded rank 8",
+        "FAIL ranked-motion: the header's alpha 16 differs from the recorded alpha 8",
+        "FAIL same-size: sha256 differs from the catalog; the file changed since it was added",
+        "FAIL char:kyra: trigger kyrawmn is also catalog entry clash-motion's trigger",
+        "verified 6 entries: 7 problem(s)"]
+    one = _cli("verify", "good-motion")
+    assert (one.returncode, one.stdout) == (0, "OK good-motion\nverified 1 entry: 0 problem(s)\n")
+    missing = _cli("verify", "nope")
+    assert (missing.returncode, missing.stderr) == (2, "Error: no catalog entry nope\n")
+
+
+def test_lct12_concurrent_adds_both_land(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    procs = [subprocess.Popen([sys.executable, LORA_CATALOG_CLI]
+                              + _add_argv(seu.lora_file(files, name), name + "-motion"),
+                              cwd=WS, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for name in ("one", "two")]
+    for proc in procs:
+        out, err = proc.communicate(timeout=60)
+        assert proc.returncode == 0, err
+    path = os.path.join(story_env["catalog"], "catalog.json")
+    assert [e["id"] for e in lora_catalog.load_catalog(path)["entries"]] == [
+        "one-motion", "two-motion"]
+    assert not [n for n in os.listdir(story_env["catalog"]) if n.endswith(".tmp")]
+
+
+def test_lct29_lora_catalog_exit_codes(tmp_path, story_env):
+    files = str(tmp_path / "files")
+    lora = seu.lora_file(files, "m")
+    table = [
+        (["list"], 0),
+        (_add_argv(lora, "fast-motion"), 0),
+        (_add_argv(lora, "fast-motion"), 2),
+        (["verify"], 0),
+        (["verify", "nope"], 2),
+        (["remove", "nope"], 2),
+        (["remove", "fast-motion"], 0),
+        (["bogus"], 2),
+        (["add", lora], 2),
+    ]
+    for argv, rc in table:
+        assert _cli(*argv).returncode == rc, argv
+    assert _cli(*_add_argv(lora, "fast-motion")).returncode == 0
+    os.remove(lora)
+    assert _cli("verify").returncode == 1

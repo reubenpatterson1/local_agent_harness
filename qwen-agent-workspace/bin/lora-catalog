@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""lora-catalog -- manage the versioned LoRA catalog (generated/loras/catalog.json).
+
+  bin/lora-catalog add PATH --id ID --kind {style,motion,physics} --target {video,stills}
+                   --base-model M [--base-model M ...] [--trigger T ...]
+                   --description TEXT --use-when TEXT [--avoid-when TEXT]
+                   [--default-strength S] [--strength-range LO,HI] [--rank N] [--alpha N]
+  bin/lora-catalog list [--model M] [--json]
+  bin/lora-catalog remove ID
+  bin/lora-catalog verify [ID ...]
+
+bin/ltx-movie's story planner may pick catalog entries per panel (style LoRAs only for the
+whole movie); trained library characters are listed and verified here but are cast only with
+bin/ltx-movie --character. The catalog lives in $LORA_CATALOG_DIR when set (tests only), else
+generated/loras/. add and remove hold the catalog lock for their whole read-modify-write.
+Exit codes: 0 success, 1 verify found problems, 2 usage or validation error. See
+docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md, Section 4.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import lora_catalog  # noqa: E402
+
+ROW_FORMAT = "%-24s %-9s %-7s %-14s %-24s %s"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="lora-catalog",
+        description="Manage the LoRA catalog that bin/ltx-movie's story planner picks from.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    add = sub.add_parser("add", help="catalog a LoRA file")
+    add.add_argument("path", metavar="PATH")
+    add.add_argument("--id", dest="entry_id", required=True)
+    add.add_argument("--kind", choices=lora_catalog.KINDS, required=True)
+    add.add_argument("--target", choices=lora_catalog.TARGETS, required=True)
+    add.add_argument("--base-model", dest="base_models", action="append", required=True,
+                     metavar="M")
+    add.add_argument("--trigger", dest="triggers", action="append", default=None, metavar="T")
+    add.add_argument("--description", required=True)
+    add.add_argument("--use-when", dest="use_when", required=True)
+    add.add_argument("--avoid-when", dest="avoid_when", default="")
+    add.add_argument("--default-strength", dest="default_strength", type=float, default=1.0)
+    add.add_argument("--strength-range", dest="strength_range", default="0.5,1.0",
+                     metavar="LO,HI")
+    add.add_argument("--rank", type=int, default=None)
+    add.add_argument("--alpha", type=int, default=None)
+    lst = sub.add_parser("list", help="list catalog entries and library characters")
+    lst.add_argument("--model", default=None, metavar="M")
+    lst.add_argument("--json", dest="as_json", action="store_true", default=False)
+    rm = sub.add_parser("remove", help="remove a catalog entry (the file is not touched)")
+    rm.add_argument("entry_id", metavar="ID")
+    ver = sub.add_parser("verify", help="check catalog entries against their files")
+    ver.add_argument("entry_ids", metavar="ID", nargs="*")
+    return parser
+
+
+def _error(message):
+    print("Error: %s" % message, file=sys.stderr)
+    return 2
+
+
+def _parse_range(text):
+    parts = text.split(",")
+    if len(parts) != 2:
+        raise ValueError(text)
+    return [float(parts[0]), float(parts[1])]
+
+
+def cmd_add(args):
+    path = lora_catalog.catalog_path(WS)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        span = _parse_range(args.strength_range)
+    except ValueError:
+        return _error("--strength-range must be LO,HI, got %r" % args.strength_range)
+    with lora_catalog.catalog_lock(path):
+        if not os.path.isfile(args.path) or not os.access(args.path, os.R_OK):
+            return _error("%s is not a readable file" % args.path)
+        try:
+            header = lora_catalog.read_safetensors_header(args.path)
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+        if args.target == "video" and not lora_catalog.has_lora_pairs(header):
+            return _error("%s has no lora_A/lora_B weight pairs; the ltx-2-mlx fuser would "
+                          "ignore it" % args.path)
+        header_rank, header_alpha = lora_catalog.rank_alpha(header)
+        rank = args.rank if args.rank is not None else header_rank
+        alpha = args.alpha if args.alpha is not None else header_alpha
+        for name, value in (("rank", rank), ("alpha", alpha)):
+            if value is None:
+                return _error("cannot read the LoRA %s from the safetensors header; pass --%s"
+                              % (name, name))
+        try:
+            catalog = lora_catalog.load_catalog(path)
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+        entries = catalog["entries"]
+        if any(e["id"] == args.entry_id for e in entries):
+            return _error("catalog entry %s already exists" % args.entry_id)
+        real = os.path.realpath(args.path)
+        for e in entries:
+            if os.path.realpath(e["path"]) == real:
+                return _error("%s is already cataloged as %s" % (args.path, e["id"]))
+        owner = lora_catalog.character_paths(WS).get(real)
+        if owner is not None:
+            return _error("%s is character %s's %s LoRA; cast it with bin/ltx-movie --character"
+                          % (args.path, owner[0], owner[1]))
+        char_triggers = lora_catalog.character_triggers(WS)
+        for trigger in args.triggers or []:
+            for e in entries:
+                if trigger.lower() in [t.lower() for t in e["triggers"]]:
+                    return _error("trigger %s is already catalog entry %s's trigger"
+                                  % (trigger, e["id"]))
+            if trigger.lower() in char_triggers:
+                return _error("trigger %s is character %s's trigger"
+                              % (trigger, char_triggers[trigger.lower()]))
+        entry = {"id": args.entry_id, "kind": args.kind, "path": os.path.abspath(args.path),
+                 "sha256": lora_catalog.file_sha256(args.path),
+                 "bytes": os.path.getsize(args.path), "base_models": list(args.base_models),
+                 "target": args.target, "triggers": list(args.triggers or []), "rank": rank,
+                 "alpha": alpha, "default_strength": args.default_strength,
+                 "strength_range": span, "description": args.description,
+                 "use_when": args.use_when, "avoid_when": args.avoid_when,
+                 "added_at": lora_catalog.utc_now()}
+        try:
+            lora_catalog.validate_entry(entry)
+            lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
+                                             "entries": entries + [entry]})
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+    print("added %s (%s, %s, rank %d, sha256 %s...) to %s"
+          % (entry["id"], entry["kind"], entry["target"], rank, entry["sha256"][:12], path))
+    return 0
+
+
+def _strength_text(entry):
+    default = repr(float(entry["default_strength"]))
+    if entry["strength_range"] is None:
+        return default
+    return "%s (%s-%s)" % (default, repr(float(entry["strength_range"][0])),
+                           repr(float(entry["strength_range"][1])))
+
+
+def _row(entry):
+    return ROW_FORMAT % (entry["id"], entry["kind"], entry["target"], _strength_text(entry),
+                         ",".join(entry["triggers"]), ",".join(entry["base_models"]))
+
+
+def cmd_list(args):
+    path = lora_catalog.catalog_path(WS)
+    try:
+        entries = lora_catalog.load_catalog(path)["entries"]
+    except lora_catalog.CatalogError as e:
+        return _error(str(e))
+    characters = lora_catalog.fold_characters(WS)
+    if args.model is not None:
+        entries = [e for e in entries if lora_catalog.compatible(e, args.model)]
+        characters = [c for c in characters if lora_catalog.compatible(c, args.model)]
+    if args.as_json:
+        print(json.dumps({"catalog": path, "entries": entries, "characters": characters},
+                         indent=2, ensure_ascii=False))
+        return 0
+    header = ROW_FORMAT % ("ID", "KIND", "TARGET", "STRENGTH", "TRIGGERS", "BASE_MODELS")
+    if not entries:
+        print("no LoRAs in %s" % path)
+        if characters:
+            print(header)
+    else:
+        print(header)
+        for entry in entries:
+            print(_row(entry))
+    for entry in characters:
+        print(_row(entry))
+    return 0
+
+
+def cmd_remove(args):
+    path = lora_catalog.catalog_path(WS)
+    if args.entry_id.startswith("char:"):
+        return _error("%s is a library character; manage it with bin/character" % args.entry_id)
+    if not os.path.isdir(os.path.dirname(path)):
+        return _error("no catalog entry %s" % args.entry_id)
+    with lora_catalog.catalog_lock(path):
+        try:
+            catalog = lora_catalog.load_catalog(path)
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+        kept = [e for e in catalog["entries"] if e["id"] != args.entry_id]
+        if len(kept) == len(catalog["entries"]):
+            return _error("no catalog entry %s" % args.entry_id)
+        try:
+            lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
+                                             "entries": kept})
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+    print("removed %s from %s" % (args.entry_id, path))
+    return 0
+
+
+def cmd_verify(args):
+    path = lora_catalog.catalog_path(WS)
+    try:
+        entries = lora_catalog.load_catalog(path)["entries"]
+    except lora_catalog.CatalogError as e:
+        return _error(str(e))
+    by_id = {e["id"]: e for e in entries}
+    for entry_id in args.entry_ids:
+        if entry_id not in by_id:
+            return _error("no catalog entry %s" % entry_id)
+    selected = [by_id[i] for i in args.entry_ids] if args.entry_ids else entries
+    char_triggers = lora_catalog.character_triggers(WS)
+    problems = 0
+    for entry in selected:
+        found = lora_catalog.verify_entry(entry, entries, char_triggers)
+        if not found:
+            print("OK %s" % entry["id"])
+        for problem in found:
+            print("FAIL %s: %s" % (entry["id"], problem))
+        problems += len(found)
+    owners = {}
+    for entry in selected:
+        for trigger in entry["triggers"]:
+            owners[trigger.lower()] = entry["id"]
+    for character in lora_catalog.fold_characters(WS):
+        for trigger in character["triggers"]:
+            if trigger.lower() in owners:
+                print("FAIL %s: trigger %s is also catalog entry %s's trigger"
+                      % (character["id"], trigger, owners[trigger.lower()]))
+                problems += 1
+    print("verified %d entr%s: %d problem(s)"
+          % (len(selected), "y" if len(selected) == 1 else "ies", problems))
+    return 1 if problems else 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return {"add": cmd_add, "list": cmd_list, "remove": cmd_remove,
+            "verify": cmd_verify}[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
