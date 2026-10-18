@@ -592,3 +592,26 @@ def test_rst57_reserved_sentence_in_the_plan_prompt(ws, story_env):
     both = se._character_lib(WS).resolve_cast([(None, "kyra"), (None, "ronin")])
     assert "Never use these names" not in se.build_plan_prompt(
         seu.make_ctx(se, ws, mode="shots", members=both), [], [])
+
+
+def test_rst55b_p13_masks_declared_and_invented_phrases(ws, story_env):
+    lib_dir = story_env["lib"]
+    seu.kyra(lib_dir)
+    seu.make_character(lib_dir, "wmn", "wmntrg", "the woman", "woman", seu.DESC_K)
+    members = se._character_lib(WS).resolve_cast([(None, "kyra")])
+    declared = seu.make_ctx(se, ws, panels=4, members=members)
+    raw = seu.plan_json("chained", 4, cast=[
+        {"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K}])
+    raw["beats"][1]["action"] = "the woman in grey crosses the quay."
+    assert [m for m in _checks(declared, raw) if "P13" in m] == []
+    raw["beats"][1]["action"] = "the woman waves."
+    hits = [m for m in _checks(declared, raw) if "P13" in m]
+    assert len(hits) == 1 and "beat 2's action names library character wmn" in hits[0]
+    lib = se._character_lib(WS)
+    undeclared = [("wmn", "wmntrg", "the woman")]
+    text = "the woman in grey walks"
+    assert se.undeclared_references(lib, text, undeclared) == [("wmn", "referring phrase", "the woman")]
+    assert se.undeclared_references(lib, text, undeclared, masks=("the woman in grey",)) == []
+    seu.make_character(lib_dir, "empty", "", "the empty", "person", seu.DESC_K)
+    plain = seu.make_ctx(se, ws, panels=4)
+    assert [m for m in _checks(plain, seu.plan_json("chained", 4)) if "empty" in m] == []

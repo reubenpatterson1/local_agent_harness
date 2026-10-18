@@ -399,26 +399,41 @@ def _word_match(word, text):
     return re.search(r"(?<![\w-])" + re.escape(word) + r"(?![\w-])", text, re.IGNORECASE)
 
 
-def undeclared_references(lib, text, undeclared, exact_phrase=False):
+def undeclared_references(lib, text, undeclared, exact_phrase=False, masks=()):
     """[(name, kind, matched text)] for each undeclared character text refers to, first kind
     per character in the RS37 order: referring phrase, trigger, name. exact_phrase compares a
-    cast entry's phrase by case-insensitive equality instead of occurrence."""
+    cast entry's phrase by case-insensitive equality instead of occurrence. masks are
+    phrases/words of declared or invented characters; in occurrence mode their spans are
+    blanked before scanning so a reference contained in them is not reported."""
+    scan = text
+    if not exact_phrase and masks:
+        for m in sorted({m for m in masks if m and m.strip()}, key=len, reverse=True):
+            try:
+                pattern = lib._phrase_regex(lib.normalize_phrase(m))
+            except lib.CharacterError:
+                pattern = None
+            if pattern:
+                scan = pattern.sub(lambda mo: " " * len(mo.group(0)), scan)
+            scan = re.sub(r"(?<![\w-])" + re.escape(m) + r"(?![\w-])",
+                          lambda mo: " " * len(mo.group(0)), scan, flags=re.IGNORECASE)
     hits = []
     for name, trigger, phrase in undeclared:
         hit = None
-        if exact_phrase:
+        if not phrase.strip():
+            pass
+        elif exact_phrase:
             if text.strip().lower() == phrase.strip().lower():
                 hit = "referring phrase", text
         else:
             try:
-                match = lib._phrase_regex(lib.normalize_phrase(phrase)).search(text)
+                match = lib._phrase_regex(lib.normalize_phrase(phrase)).search(scan)
             except lib.CharacterError:
                 match = None
             if match:
                 hit = "referring phrase", match.group(0)
         for kind, word in (("trigger", trigger), ("name", name)):
-            if hit is None:
-                match = _word_match(word, text)
+            if hit is None and word.strip():
+                match = _word_match(word, scan)
                 if match:
                     hit = kind, match.group(0)
         if hit:
@@ -817,6 +832,8 @@ def plan_checks(ctx, plan, shape=()):
                                     "their look is left to the video model" % (k, c))
     undeclared = undeclared_characters(ctx)
     if undeclared:
+        masks = ([m for member in ctx.members for m in (member.name, member.trigger, member.phrase)]
+                 + [entry["phrase"] for entry in plan["cast"] if isinstance(entry.get("phrase"), str)])
         texts = []
         for entry in plan["cast"]:
             if entry["cast_name"] is None:
@@ -828,7 +845,8 @@ def plan_checks(ctx, plan, shape=()):
         texts += [("beat %d's action" % k, b["action"], False)
                   for k, b in enumerate(beats, start=1)]
         for where, text, exact in texts:
-            for hit in undeclared_references(lib, text, undeclared, exact_phrase=exact):
+            for hit in undeclared_references(lib, text, undeclared, exact_phrase=exact,
+                                        masks=masks):
                 hard.append(undeclared_message("plan: P13 undeclared character:", where, hit))
     return hard, advisory
 
