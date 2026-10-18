@@ -1277,6 +1277,98 @@ def _no_stills_rules():
     return "\n".join(line.strip() for line in block.split("\n"))
 
 
+def _catalog_plan(args, dry_run=False):
+    """This story's plan.json when catalog LoRAs apply (LC13): the robust engine, auto LoRA on,
+    and a valid plan for this mode and panel count (and, in a dry run, no --force-story). Else
+    None."""
+    if (getattr(args, "story_engine", "legacy") != "robust" or getattr(args, "no_auto_lora", False)
+            or (dry_run and args.force_story)):
+        return None
+    try:
+        with open(os.path.join(_story_dir(args.story_id), "plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1"
+            or plan.get("mode") != _story_mode(args) or plan.get("panels") != args.panels
+            or not isinstance(plan.get("loras"), dict)):
+        return None
+    return plan
+
+
+def _catalog_pick(args, pick):
+    """(the catalog-loras entry of one plan pick, None) or (None, the LC13 Error line)."""
+    entries = dict((e["id"], e) for e in (getattr(args, "story_catalog", None) or {}).get(
+        "entries", []))
+    entry = entries.get(pick.get("id"))
+    if entry is None:
+        return None, ("Error: plan.json picks catalog LoRA %s, which is no longer in the catalog; "
+                      "re-add it with bin/lora-catalog add, or rerun with --no-auto-lora"
+                      % pick.get("id"))
+    try:
+        size = os.path.getsize(entry["path"])
+    except OSError:
+        size = None
+    if size != entry["bytes"]:
+        return None, ("Error: catalog LoRA %s changed since it was cataloged (%s); run "
+                      "bin/lora-catalog verify" % (entry["id"], entry["path"]))
+    return {"id": entry["id"], "kind": entry["kind"], "path": entry["path"],
+            "sha256": entry["sha256"], "strength": pick["strength"],
+            "triggers": list(entry["triggers"])}, None
+
+
+def _catalog_panel_loras(args, dry_run=False):
+    """(None, None) when the plan picks no video catalog LoRA; else (None, one list per panel:
+    its motion/physics picks, global then per-beat, then the global style pick) or (the LC13
+    Error line, None)."""
+    plan = _catalog_plan(args, dry_run)
+    if plan is None:
+        return None, None
+    global_picks = plan["loras"].get("global") or []
+    per_beat = plan["loras"].get("per_beat") or {}
+    if not global_picks and not any(per_beat.values()):
+        return None, None
+    resolved = {}
+    for pick in global_picks + [p for picks in per_beat.values() for p in picks]:
+        item, error = _catalog_pick(args, pick)
+        if error:
+            return error, None
+        resolved[id(pick)] = item
+    panels = []
+    for k in range(1, args.panels + 1):
+        picks = [resolved[id(p)] for p in global_picks + (per_beat.get(str(k)) or [])]
+        panels.append([p for p in picks if p["kind"] in ("motion", "physics")]
+                      + [resolved[id(p)] for p in global_picks
+                         if resolved[id(p)]["kind"] == "style"])
+    return None, panels
+
+
+def _catalog_stills_flags(args, dry_run=False):
+    """(None, ["--lora", PATH:STRENGTH, "--lora-trigger", T, ...]) for the plan's stills pick,
+    (None, []) without one, or (the LC13 Error line, []) (LC14)."""
+    plan = _catalog_plan(args, dry_run)
+    picks = (plan["loras"].get("stills") or []) if plan else []
+    if not picks:
+        return None, []
+    item, error = _catalog_pick(args, picks[0])
+    if error:
+        return error, []
+    flags = ["--lora", "%s:%s" % (item["path"], repr(float(item["strength"])))]
+    for trigger in item["triggers"]:
+        flags += ["--lora-trigger", trigger]
+    return None, flags
+
+
+def _write_catalog_loras(args, path, panels):
+    """<story_dir>/catalog_loras.json (robust story spec 2.8), written atomically."""
+    temporary = "%s.%d.tmp" % (path, os.getpid())
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": args.story_id,
+                   "panels": panels}, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(temporary, path)
+
+
 def _phase1_robust(args):
     """Phase 1 on the robust story engine (robust story spec RS35): re-check an existing story.md
     (no --force-story), else write story_prompt.txt and run the engine; then the review gate."""
@@ -1511,6 +1603,11 @@ def phase2_stills(args):
             cmd += ["--lora", "%s:%s" % (path, repr(float(strength)))]
     elif args.stills_lora_path:
         cmd += ["--lora", args.stills_lora_path]
+    error, catalog_flags = _catalog_stills_flags(args)
+    if error:
+        print(error, file=sys.stderr)
+        return 2
+    cmd += catalog_flags
     cmd += _cast_flags(args)
     if getattr(args, "shots", False):
         return _phase2_shots(args, cmd)
@@ -1697,6 +1794,14 @@ def phase3_manifest(args):
                      "--max-frames", str(args.frames),
                      "--force"]
     cmd_manifest += _cast_flags(args)
+    error, catalog_lists = _catalog_panel_loras(args)
+    if error:
+        print(error, file=sys.stderr)
+        return 2
+    if catalog_lists is not None:
+        catalog_path = os.path.join(paths["story_dir"], "catalog_loras.json")
+        _write_catalog_loras(args, catalog_path, catalog_lists)
+        cmd_manifest += ["--catalog-loras", catalog_path]
     print("Running: %s" % shlex.join(cmd_manifest))
     proc = subprocess.run(cmd_manifest, cwd=WS)
     if proc.returncode != 0:
@@ -1998,6 +2103,11 @@ def _print_dry_run_plan(args):
                 phase2_cmd += ["--lora", "%s:%s" % (path, repr(float(strength)))]
         elif args.stills_lora_path:
             phase2_cmd += ["--lora", args.stills_lora_path]
+        error, catalog_flags = _catalog_stills_flags(args, dry_run=True)
+        if error:
+            print(error, file=sys.stderr)
+            return 2
+        phase2_cmd += catalog_flags
         phase2_cmd += _cast_flags(args)
         if getattr(args, "shots", False):
             _print_shots_stills_plan(args, phase2_cmd)
@@ -2020,6 +2130,13 @@ def _print_dry_run_plan(args):
                              "--min-frames", str(args.frames),
                              "--max-frames", str(args.frames), "--force"]
     phase3_manifest_cmd += _cast_flags(args)
+    error, catalog_lists = _catalog_panel_loras(args, dry_run=True)
+    if error:
+        print(error, file=sys.stderr)
+        return 2
+    if catalog_lists is not None:
+        phase3_manifest_cmd += ["--catalog-loras",
+                                os.path.join(paths["story_dir"], "catalog_loras.json")]
     print("Command: %s" % shlex.join(phase3_manifest_cmd))
     phase3_render_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
                          paths["manifest_path"], paths["movie_path"]] \

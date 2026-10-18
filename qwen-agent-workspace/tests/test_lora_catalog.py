@@ -505,3 +505,129 @@ def test_lct13_pins(tmp_path, story_env):
         {"path": other, "strength": 1.0, "catalog_id": None, "kind": None}]
     assert ltx_movie._render_flags(legacy)[16:18] == ["--lora", other]
     assert "--lora" not in ltx_movie._render_flags(_movie_args("n", "--story-id", "p1"))
+
+
+# --- LCT14, LCT15: the catalog flags of Phases 2 and 3 in bin/ltx-movie (LC13, LC14) ---------
+
+class _Done(object):
+    returncode = 0
+
+
+def _catalog_story(tmp_path, monkeypatch, story_env, stills=False, extra=()):
+    """A temp workspace (ltx_movie.WS) with a 3-panel chained story whose plan.json picks
+    film-grain (global style) and fast-motion (beat 2); returns (ws, story_dir, entries)."""
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    files = str(tmp_path / "files")
+    grain = seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style",
+                              triggers=["grainfilm"])
+    fast = seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", triggers=["fastmo"])
+    ink = seu.catalog_entry(seu.lora_file(files, "ink"), "ink-stills", kind="style",
+                            target="stills", base_models=[seu.STILLS_MODEL], triggers=["inkstyle"])
+    seu.make_catalog(story_env["catalog"], [grain, fast, ink] + list(extra))
+    story_dir = os.path.join(ws, "generated", "stories", "c1")
+    os.makedirs(story_dir)
+    loras = {"global": [{"id": "film-grain", "strength": 0.8}],
+             "per_beat": {"2": [{"id": "fast-motion", "strength": 0.7}]},
+             "stills": [{"id": "ink-stills", "strength": 0.8}] if stills else []}
+    with open(os.path.join(story_dir, "plan.json"), "w") as f:
+        json.dump({"schema": "ltx-movie.plan.v1", "mode": "chained", "panels": 3,
+                   "loras": loras}, f)
+    with open(os.path.join(story_dir, "story.md"), "w") as f:
+        f.write("# T\n\n## Panel 1 — A\nImage: The woman in grey waits.\nMotion: x\n"
+                "Narration: y\n")
+    return ws, story_dir, {"film-grain": grain, "fast-motion": fast, "ink-stills": ink}
+
+
+def _recorded(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "run",
+                        lambda cmd, **kw: calls.append(list(cmd)) or _Done())
+    return calls
+
+
+def _item(entry, strength):
+    return {"id": entry["id"], "kind": entry["kind"], "path": entry["path"],
+            "sha256": entry["sha256"], "strength": strength, "triggers": entry["triggers"]}
+
+
+def test_lct14_phase3_catalog_loras(tmp_path, monkeypatch, story_env, capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env)
+    calls = _recorded(monkeypatch)
+    args = _movie_args("n", "--story-id", "c1", "--panels", "3", "--no-review")
+    assert ltx_movie.phase3_manifest(args) == 0
+    path = os.path.join(story_dir, "catalog_loras.json")
+    grain, fast = _item(entries["film-grain"], 0.8), _item(entries["fast-motion"], 0.7)
+    with open(path) as f:
+        assert json.load(f) == {"schema": "ltx-movie.catalog-loras.v1", "story_id": "c1",
+                                "panels": [[grain], [fast, grain], [grain]]}
+    assert calls[0][-2:] == ["--catalog-loras", path]
+    os.remove(path)
+    for flags in (["--no-auto-lora"], ["--story-legacy"]):
+        calls[:] = []
+        assert ltx_movie.phase3_manifest(_movie_args("n", "--story-id", "c1", "--panels", "3",
+                                                     "--no-review", *flags)) == 0
+        assert "--catalog-loras" not in calls[0] and not os.path.exists(path)
+    capsys.readouterr()
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run",
+                           "--no-review"]) == 0
+    manifest_line = [l for l in capsys.readouterr().out.splitlines()
+                     if "ltx-story-manifest" in l][0]
+    assert manifest_line.endswith(" --catalog-loras " + path)
+    assert not os.path.exists(path)
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run", "--no-review",
+                           "--force-story"]) == 0
+    assert "--catalog-loras" not in capsys.readouterr().out
+    with open(entries["fast-motion"]["path"], "ab") as f:
+        f.write(b"x")
+    assert ltx_movie.phase3_manifest(args) == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA fast-motion changed since it was cataloged (%s); run "
+        "bin/lora-catalog verify\n" % entries["fast-motion"]["path"])
+    seu.make_catalog(story_env["catalog"], [entries["film-grain"]])
+    args = _movie_args("n", "--story-id", "c1", "--panels", "3", "--no-review")
+    assert ltx_movie.phase3_manifest(args) == 2
+    assert capsys.readouterr().err == (
+        "Error: plan.json picks catalog LoRA fast-motion, which is no longer in the catalog; "
+        "re-add it with bin/lora-catalog add, or rerun with --no-auto-lora\n")
+
+
+def test_lct15_phase2_stills_pick(tmp_path, monkeypatch, story_env, capsys):
+    seu.kyra(story_env["lib"])
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env, stills=True)
+    calls = _recorded(monkeypatch)
+    args = _movie_args("n", "--story-id", "c1", "--panels", "3", "--no-review", "--character",
+                       "kyra")
+    assert ltx_movie.phase2_stills(args) == 0
+    ink = entries["ink-stills"]["path"]
+    cmd = calls[0]
+    at = cmd.index("--cast")
+    assert cmd[at - 4:at + 2] == ["--lora", ink + ":0.8", "--lora-trigger", "inkstyle", "--cast",
+                                  "the woman in grey=kyra"]
+    capsys.readouterr()
+    assert ltx_movie.main(["n", "--story-id", "c1", "--panels", "3", "--dry-run", "--no-review",
+                           "--character", "kyra"]) == 0
+    line = [l for l in capsys.readouterr().out.splitlines() if "ltx-story-images" in l][0]
+    assert ("--lora %s:0.8 --lora-trigger inkstyle --cast" % ink) in line
+    calls[:] = []
+    assert ltx_movie.phase2_stills(_movie_args("n", "--story-id", "c1", "--panels", "3",
+                                               "--no-review", "--no-auto-lora")) == 0
+    assert "--lora-trigger" not in calls[0] and "--lora" not in calls[0]
+
+
+def test_story_focus_4_a_cataloged_lora_deleted_after_phase_1(tmp_path, monkeypatch, story_env,
+                                                               capsys):
+    ws, story_dir, entries = _catalog_story(tmp_path, monkeypatch, story_env, stills=True)
+    _recorded(monkeypatch)
+    args = _movie_args("n", "--story-id", "c1", "--panels", "3", "--no-review")
+    os.remove(entries["fast-motion"]["path"])
+    os.remove(entries["ink-stills"]["path"])
+    assert ltx_movie.phase3_manifest(args) == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA fast-motion changed since it was cataloged (%s); run "
+        "bin/lora-catalog verify\n" % entries["fast-motion"]["path"])
+    assert ltx_movie.phase2_stills(args) == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA ink-stills changed since it was cataloged (%s); run "
+        "bin/lora-catalog verify\n" % entries["ink-stills"]["path"])
+    assert not os.path.exists(os.path.join(story_dir, "catalog_loras.json"))
