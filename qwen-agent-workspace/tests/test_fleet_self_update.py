@@ -604,3 +604,32 @@ def test_mt24_status_port_from_the_installed_release(tmp_path):
     assert (proc.returncode, proc.stdout, proc.stderr) == (
         2, "", "qwen-agentd: agent 'h1' has different ports in 0123456789abcdef.json, fedcba9876543210.json "
                "in %s; pass --port N\n" % fleets)
+
+
+def test_mpt3_switch_keeps_data_holding_releases(tmp_path):
+    """movie-ui spec MPT3 (MP3): after a switch, an old release whose generated/ holds a file is
+    kept and logged; a data-less release beyond the newest 3 is still removed."""
+    origin, home, key, port = _setup(tmp_path)
+    d = _deploy(home)
+    repo = os.path.join(d, "repo")
+    old_data, old_empty = os.path.join(d, "releases", "v2025.12.01"), os.path.join(d, "releases", "v2025.11.30")
+    for path in (old_data, old_empty, os.path.join(d, "releases", "v2025.12.02")):
+        _git(repo, "worktree", "add", "-q", "--detach", path, "refs/tags/v2026.01.01")
+    story = os.path.join(old_data, fleet_lib.WS_SUBDIR, "generated", "stories", "x")
+    os.makedirs(story)
+    with open(os.path.join(story, "story.md"), "w") as f:
+        f.write("## Panel 1\n")
+    sup = Supervisor(home)
+    try:
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.01", 20)
+        origin.release("v2026.01.02")
+        ftu.wait_until(lambda: _version(key, port) == "v2026.01.02" and _state(home)["status"] == "ok", 60)
+        ftu.wait_until(lambda: not os.path.exists(old_empty), 30)
+        assert os.path.isfile(os.path.join(story, "story.md"))
+        assert sorted(os.listdir(os.path.join(d, "releases"))) == [
+            "v2025.12.01", "v2025.12.02", "v2026.01.01", "v2026.01.02"]
+        log = ftu.read_log(home, "h1")
+        assert "update: keeping v2025.12.01: generated/ holds data" in log
+        assert "keeping v2025.12.02" not in log and "keeping v2025.11.30" not in log
+    finally:
+        sup.close()

@@ -2327,3 +2327,37 @@ def test_trt6_trace_routes_and_spans_cap():
     for kind, name in (("signed", "health"), ("signed", "skills"), ("loopback", "peers"), ("unknown", None),
                        ("signed", "trace"), ("loopback", "trace_query"), ("loopback", "recent")):
         assert fleet_lib.body_cap(kind, name) == fleet_lib.MAX_BODY, (kind, name)
+
+
+# --- movie-ui spec MPT1, MPT2: data-holding releases are never pruned (MP1, MP2) ---------------
+
+def test_mpt1_release_holds_data(tmp_path):
+    rel = tmp_path / "v2026.01.01"
+    assert fleet_lib.release_holds_data(str(rel)) is False
+    gen = rel / fleet_lib.WS_SUBDIR / "generated"
+    (gen / "stories" / "empty").mkdir(parents=True)
+    assert fleet_lib.release_holds_data(str(rel)) is False
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    (gen / "stories" / "link.md").symlink_to(outside)
+    assert fleet_lib.release_holds_data(str(rel)) is False
+    deep = gen / "stories" / "x" / "images"
+    deep.mkdir(parents=True)
+    (deep / "panel_01.png").write_bytes(b"p")
+    assert fleet_lib.release_holds_data(str(rel)) is True
+    other = tmp_path / "v2026.01.02"
+    (other / fleet_lib.WS_SUBDIR).mkdir(parents=True)
+    (other / fleet_lib.WS_SUBDIR / "generated").symlink_to(gen)
+    assert fleet_lib.release_holds_data(str(other)) is False
+
+
+def test_mpt2_releases_to_prune_keeps_protected_names():
+    present = ["v2026.01.01", "v2026.01.02", "v2026.01.03", "v2026.01.04", "v2026.01.05",
+               "v2026.01.06", "notes", ".DS_Store"]
+    st = {"from": "v2026.01.02", "to": "v2026.01.03", "status": "ok", "attempts": 0, "bad_tags": []}
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st, protected={"v2026.01.01"}) == []
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st, protected=()) == ["v2026.01.01"]
+    st["from"] = None
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st, protected={"v2026.01.01"}) == ["v2026.01.02"]
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st, protected=()) == ["v2026.01.01", "v2026.01.02"]
+    assert fleet_lib.releases_to_prune(present, "v2026.01.03", st) == ["v2026.01.01", "v2026.01.02"]

@@ -1216,7 +1216,14 @@ class Daemon(object):
         new = {"from": st["from"], "to": st["to"], "status": "ok", "attempts": 0, "bad_tags": st["bad_tags"]}
         fleet_lib.write_state(state_path(d), new)
         LOG.info("update: now running %s (from %s)" % (new["to"], new["from"]))
-        for tag in fleet_lib.releases_to_prune(os.listdir(os.path.join(d, "releases")), self.version, new):
+        releases = os.path.join(d, "releases")
+        present = os.listdir(releases)
+        protected = set(t for t in present if fleet_lib.release_holds_data(os.path.join(releases, t)))
+        doomed = fleet_lib.releases_to_prune(present, self.version, new, protected)
+        for tag in fleet_lib.releases_to_prune(present, self.version, new):
+            if tag not in doomed:
+                LOG.info("update: keeping %s: generated/ holds data" % tag)
+        for tag in doomed:
             unstage_release(d, tag, log_to_daemon)
 
     def wait(self):

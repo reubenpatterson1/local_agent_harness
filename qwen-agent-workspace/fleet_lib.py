@@ -21,6 +21,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 
@@ -1093,14 +1094,30 @@ def write_state(path, state):
     os.replace(tmp, path)
 
 
-def releases_to_prune(present, current, state):
-    """Release names to unstage: never current, state["from"], or the 3 newest (F88a)."""
+def releases_to_prune(present, current, state, protected=()):
+    """Release names to unstage: never current, state["from"], the 3 newest, or a protected name (F88a, movie-ui spec MP2)."""
     cands = [n for n in present if tag_key(n) is not None]
     keep = {current}
     if state.get("from") is not None:
         keep.add(state["from"])
+    keep.update(protected)
     keep.update(sorted(cands, key=tag_key, reverse=True)[:KEEP_RELEASES])
     return sorted([n for n in cands if n not in keep], key=tag_key)
+
+
+def release_holds_data(release_dir):
+    """True iff <release_dir>/qwen-agent-workspace/generated/ holds a regular file at any depth (movie-ui spec MP1)."""
+    top = os.path.join(release_dir, WS_SUBDIR, "generated")
+    if os.path.islink(top) or not os.path.isdir(top):
+        return False
+    for dirpath, _dirnames, filenames in os.walk(top, followlinks=False):
+        for name in filenames:
+            try:
+                if stat.S_ISREG(os.lstat(os.path.join(dirpath, name)).st_mode):
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def release_version(repo_root, deploy_root):
