@@ -143,7 +143,7 @@ def test_mut11_cancel_term_then_kill_and_same_group_grandchild(state, tmp_path, 
     grand_pid = int(open(grand).read())
     t0 = time.monotonic()
     mt.cancel_marker(state, stubborn)
-    status = _final(state, stubborn)
+    status = _final_within_2s_of_cancel_log(state, stubborn)
     assert status["state"] == "cancelled" and status["exit_code"] == -signal.SIGKILL
     assert time.monotonic() - t0 < 1.0 + 1.0 + 1.0
     log = mt.read_log(state, stubborn)
@@ -159,3 +159,16 @@ def test_runner_refuses_a_job_that_is_not_starting(state, tmp_path):
                           capture_output=True, text=True, timeout=30)
     assert (proc.returncode, proc.stdout) == (3, "[movie-ui] job is unknown; nothing to run\n")
     assert lib.read_status(jdir) is None
+
+
+def test_atomic_write_failure_reraises_and_leaves_no_tmp_file(state, monkeypatch):
+    path = os.path.join(state, "y.json")
+
+    def boom(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(lib.os, "replace", boom)
+    with pytest.raises(OSError):
+        lib.write_bytes_atomic(path, b"data")
+    assert [n for n in os.listdir(state) if n.startswith("y.json.tmp-")] == []
+    assert not os.path.exists(path)
