@@ -765,7 +765,7 @@ GC8 holds. Every test that touches movie-ui sets `HOME` to a temp directory (`mo
 - **MUX5. Long validations.** V2's stills probe and V6 can each take up to 60 s; Validate can take minutes on a cold machine.
 - **MUX6. Environment test hooks.** `LORA_CATALOG_DIR` or `CHARACTER_LIBRARY_DIR` set in movie-ui's environment redirect every workspace's catalog/library (test-only variables, passed through unchanged).
 
-**Open questions (the user must answer before implementation)**
+**Open questions — resolved by the user 2026-10-19: Q1 yes (descendant sweep in); Q2 skip with the training base shown; Q3 yes (config.json clause dropped; intact = every index-listed shard resolves non-empty, or at least one non-empty .safetensors without an index, and no .incomplete blob); Q4 accept.**
 
 - **Q1 (D1).** Approve the runner's descendant process-group sweep (MU23 step 1) so cancel really stops `ltx-2-mlx` and training children? Without it, MUK4 must be reduced to "the job's own process group is gone within 16 s" and a cancelled render's GPU process keeps running.
 - **Q2 (D2).** Is a cast character's video-LoRA base model mismatch acceptable as a non-blocking `skip` (as specified), or should V5 compare against something else (for example the dev model directory as the known-good training base for every `ltx-2.3` pack)?
