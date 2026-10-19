@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""movie-ui-job -- run one movie-ui job detached from the server (movie-ui spec MU21-MU25).
+
+Usage: bin/movie-ui-job [--grace SECONDS] JOB_DIR
+
+The movie-ui dispatcher starts this in its own session with stdout and stderr appended to
+JOB_DIR/log.txt; it holds JOB_DIR/lock for its lifetime, runs the job's argv in a new session,
+handles the cancel marker and writes the final status.json, also while no server is running.
+"""
+
+import argparse
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import movie_ui_lib  # noqa: E402
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="movie-ui-job", description="Run one movie-ui job.")
+    parser.add_argument("--grace", type=float, default=movie_ui_lib.CANCEL_GRACE_S,
+                        help="seconds between SIGTERM and SIGKILL on cancel (default 15.0)")
+    parser.add_argument("job_dir", metavar="JOB_DIR")
+    args = parser.parse_args(argv)
+    return movie_ui_lib.run_job(os.path.abspath(args.job_dir), args.grace)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
