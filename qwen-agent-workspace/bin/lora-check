@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""lora-check -- verify that every LoRA actually matches the architecture of the
+base model it will be fused into, so nothing stale (e.g. an LTX-2.3 LoRA left
+behind after a 2.5 upgrade, or a foreign SDXL/Flux LoRA) survives in the
+catalog or character library.
+
+This closes the gap left by lora_catalog.verify_entry / compatible(): those
+check the *declared* base_models string and that *some* lora_A/lora_B pairs
+exist, but never that the LoRA's target modules and dimensions line up with the
+real base weights. This tool does.
+
+Two depths (hybrid, per the design decision):
+  static (default)  Read only the LoRA's safetensors header and the base model's
+                    weight map (also header-only). Every LoRA target module must
+                    exist in the base with a compatible (out, in) shape. Fast, no
+                    model load. On a quantized base (mlx q8) the input dim is
+                    reconstructed from the quant group size when available, else
+                    the match is name+out-dim only (reported as PARTIAL, not a
+                    silent pass).
+  --deep            Additionally hand the LoRA to the real consumer: z_image's
+                    pipeline.load_lora_weights for stills, and the ltx-2-mlx
+                    fuser for video. Authoritative and future-proof, but needs
+                    the base model + its venv present.
+
+Outcome (per the design decision): report + exit non-zero on any FAIL; with
+--quarantine, move a failing catalog LoRA to generated/loras/quarantine/ and drop
+its catalog entry. Character-library LoRAs are only reported (never moved out
+from under character_lib) -- fix those with bin/character.
+
+Stdlib only. Loads lora_catalog.py (and, for --deep stills, z_image_skill.py) by
+path, the same way the other bin/ tools do.
+
+Usage:
+  lora-check [--deep] [--quarantine] [--json]
+             [--video-base PATH] [--stills-base PATH]
+             [--workspace DIR] [LORA.safetensors ...]
+
+With no LORA arguments it audits the whole catalog plus every character-library
+LoRA. With explicit paths it checks just those (target/base inferred from the
+header, or forced with --video-base/--stills-base).
+"""
+
+import argparse
+import glob
+import importlib.machinery
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+WS = os.environ.get("QWEN_AGENT_WORKSPACE") or os.path.dirname(
+    os.path.dirname(os.path.realpath(__file__)))
+
+
+def _load(mod):
+    return importlib.machinery.SourceFileLoader(
+        mod, os.path.join(WS, mod + ".py")).load_module()
+
+
+lc = _load("lora_catalog")
+
+# Module-name prefixes stripped from BOTH LoRA target modules and base weight
+# names before comparison, so PEFT/diffusers/ltx naming differences don't cause
+# false mismatches. Order does not matter; stripping repeats until stable.
+_PREFIXES = ("base_model.", "model.", "transformer.", "diffusion_model.",
+             "diffusion_model.transformer.", "lora_unet.", "lora_transformer.",
+             "net.", "unet.")
+_QUANT_SUFFIXES = (".scales", ".biases", ".zeros", ".qweight", ".qzeros")
+
+
+def _core(name):
+    """A normalized module path: '.weight' dropped, known prefixes peeled."""
+    n = name[:-7] if name.endswith(".weight") else name
+    changed = True
+    while changed:
+        changed = False
+        for p in _PREFIXES:
+            if n.startswith(p):
+                n, changed = n[len(p):], True
+    return n
+
+
+def _shape(header, key):
+    t = header.get(key)
+    sh = t.get("shape") if isinstance(t, dict) else None
+    return sh if isinstance(sh, list) and all(isinstance(x, int) for x in sh) else None
+
+
+def lora_targets(header):
+    """{normalized_module: (rank, in_features, out_features)} for each complete
+    lora_A/lora_B pair. in = A.shape[1], out = B.shape[0], rank = A.shape[0]."""
+    out = {}
+    for key in header:
+        if not key.endswith(lc.LORA_A_SUFFIX):
+            continue
+        base = key[:-len(lc.LORA_A_SUFFIX)]
+        bkey = base + lc.LORA_B_SUFFIX
+        if bkey not in header:
+            continue
+        a, b = _shape(header, key), _shape(header, bkey)
+        if not a or not b or len(a) != 2 or len(b) != 2:
+            continue
+        rank, in_f, out_f = a[0], a[1], b[0]
+        out[_core(base)] = (rank, in_f, out_f)
+    return out
+
+
+def _read_quant_group_size(base_dir):
+    """mlx quant group_size from a config.json under base_dir, else None."""
+    for cfg in glob.glob(os.path.join(base_dir, "**", "config.json"), recursive=True):
+        try:
+            with open(cfg, encoding="utf-8") as f:
+                q = json.load(f).get("quantization")
+            if isinstance(q, dict) and lc._is_int(q.get("group_size")):
+                return q["group_size"]
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def base_linear_map(base_dir):
+    """{normalized_module: (out, in_or_None, quantized_bool)} for every linear-like
+    weight across all *.safetensors under base_dir. in is None when it can't be
+    derived (a quantized weight with no usable scales/group size)."""
+    group = _read_quant_group_size(base_dir)
+    names = {}        # core -> raw base key for '.weight'
+    headers = {}
+    for st in glob.glob(os.path.join(base_dir, "**", "*.safetensors"), recursive=True):
+        try:
+            h = lc.read_safetensors_header(st)
+        except lc.CatalogError:
+            continue
+        headers[st] = h
+    merged = {}
+    for h in headers.values():
+        for k, v in h.items():
+            if k != "__metadata__":
+                merged.setdefault(k, v)
+    out = {}
+    for key in merged:
+        if not key.endswith(".weight"):
+            continue
+        core = _core(key)
+        wshape = _shape(merged, key)
+        if not wshape or len(wshape) != 2:
+            continue
+        stem = key[:-len(".weight")]
+        quantized = any((stem + s) in merged for s in _QUANT_SUFFIXES)
+        out_f = wshape[0]
+        in_f = None
+        if not quantized:
+            in_f = wshape[1]
+        else:
+            scales = merged.get(stem + ".scales")
+            ssh = scales.get("shape") if isinstance(scales, dict) else None
+            if isinstance(ssh, list) and len(ssh) == 2 and group:
+                in_f = ssh[1] * group
+        out[core] = (out_f, in_f, quantized)
+    return out
+
+
+def _match_base(base_map, module):
+    """Find the base entry for a LoRA module, tolerating prefix/suffix differences.
+    Returns (out, in, quantized) or None."""
+    if module in base_map:
+        return base_map[module]
+    for core, info in base_map.items():
+        if core.endswith("." + module) or module.endswith("." + core):
+            return info
+    return None
+
+
+def static_check(lora_path, base_dir):
+    """(status, problems) where status is PASS / PARTIAL / FAIL / UNVERIFIED."""
+    try:
+        header = lc.read_safetensors_header(lora_path)
+    except lc.CatalogError as e:
+        return "FAIL", [str(e)]
+    targets = lora_targets(header)
+    if not targets:
+        return "FAIL", ["no lora_A/lora_B weight pairs; nothing to fuse"]
+    rank, alpha = lc.rank_alpha(header)
+    problems, partial = [], False
+    if rank is not None and alpha is not None and rank != alpha:
+        problems.append("alpha %d != rank %d (ltx-2-mlx fuses with no alpha/rank "
+                        "scaling, so strength would be wrong)" % (alpha, rank))
+    if not base_dir or not os.path.isdir(base_dir):
+        return "UNVERIFIED", ["base model not found on disk; ran header-only checks "
+                              "(rank/alpha, lora pairs) but could not match modules"] + problems
+    base_map = base_linear_map(base_dir)
+    if not base_map:
+        return "UNVERIFIED", ["no readable base weights under %s" % base_dir] + problems
+    missing, mism = [], []
+    for module, (lrank, in_f, out_f) in sorted(targets.items()):
+        info = _match_base(base_map, module)
+        if info is None:
+            missing.append(module)
+            continue
+        b_out, b_in, quant = info
+        if b_out != out_f:
+            mism.append("%s: out %d vs base %d" % (module, out_f, b_out))
+        elif b_in is None:
+            partial = True            # quantized, in not derivable -> name+out only
+        elif b_in != in_f:
+            mism.append("%s: in %d vs base %d" % (module, in_f, b_in))
+    if missing:
+        problems.append("%d/%d target modules absent from the base (wrong "
+                        "architecture): %s%s" % (len(missing), len(targets),
+                        ", ".join(missing[:5]), " ..." if len(missing) > 5 else ""))
+    if mism:
+        problems.append("dimension mismatch: " + "; ".join(mism[:5])
+                        + (" ..." if len(mism) > 5 else ""))
+    if missing or mism:
+        return "FAIL", problems
+    if partial:
+        problems.append("quantized base: matched module names + output dims; input "
+                        "dims not verifiable without unpacking")
+        return "PARTIAL", problems
+    return ("PASS", problems) if not problems else ("FAIL", problems)
+
+
+def deep_check(lora_path, target, stills_base, video_base):
+    """Authoritative check via the real consumer. (status, problems)."""
+    if target == "stills":
+        try:
+            zi = _load("z_image_skill")
+        except Exception as e:                       # noqa: BLE001 - report, don't crash
+            return "UNVERIFIED", ["could not import z_image_skill for --deep: %s" % e]
+        try:
+            zi.load_pipeline(loras=[(lora_path, 1.0)])
+            return "PASS", ["z_image accepted and fused the LoRA"]
+        except ValueError as e:
+            return "FAIL", ["z_image rejected the LoRA: %s" % e]
+        except Exception as e:                       # noqa: BLE001
+            return "UNVERIFIED", ["z_image load failed (environment/base issue): %s" % e]
+    # video: probe ltx-2-mlx for a fuse/validate subcommand.
+    binpath = os.path.expanduser(
+        os.environ.get("LTX2_MLX_BIN", "~/ltx-2-mlx/.venv/bin/ltx-2-mlx"))
+    if not os.path.exists(binpath):
+        return "UNVERIFIED", ["ltx-2-mlx binary not found (%s); skipped --deep video" % binpath]
+    try:
+        help_txt = subprocess.run([binpath, "fuse", "--help"], capture_output=True,
+                                  text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        return "UNVERIFIED", ["could not probe ltx-2-mlx fuse: %s" % e]
+    if not help_txt:
+        return "UNVERIFIED", ["this ltx-2-mlx build has no 'fuse' validate path; "
+                              "relied on the static check for video"]
+    return "UNVERIFIED", ["ltx-2-mlx 'fuse' exists; run it manually to fuse-test "
+                          "(no safe non-rendering dry-run is wired here yet)"]
+
+
+def infer_target(header):
+    """'stills' vs 'video' guess from module names (video LTX LoRAs name temporal/
+    DiT blocks; z_image stills name the Z-Image transformer). Default 'video'."""
+    joined = " ".join(_core(k) for k in header if k.endswith(lc.LORA_A_SUFFIX)).lower()
+    if "img" in joined or "txt" in joined or "single" in joined:  # Z-Image DiT-ish
+        return "stills"
+    return "video"
+
+
+def resolve_base_dir(model):
+    """A local snapshot dir for a base model given as an absolute path or an HF
+    repo id ('org/name'). Searches the Z-Image, ltx-2-mlx, default HF, and
+    ~/mlx_models caches (hub-cache and plain local_dir layouts). None if absent."""
+    if not model:
+        return None
+    if os.path.isdir(model):
+        return model
+    needle = "models--" + model.replace("/", "--")
+    homes = [os.environ.get("Z_IMAGE_HF_HOME", os.path.expanduser("~/hf_home")),
+             os.path.expanduser("~/ltx-2-mlx/hf_cache"),
+             os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")),
+             os.path.expanduser("~/mlx_models")]
+    for home in homes:
+        for d in glob.glob(os.path.join(home, "hub", needle)):
+            snaps = sorted(glob.glob(os.path.join(d, "snapshots", "*")))
+            if snaps:
+                return snaps[-1]
+        direct = os.path.join(home, os.path.basename(model))
+        if os.path.isdir(direct):
+            return direct
+    return None
+
+
+def locate_base(target, stills_base, video_base):
+    """Resolve the base model dir for a target, honoring overrides then common caches."""
+    if target == "stills" and stills_base:
+        return stills_base
+    if target == "video" and video_base:
+        return video_base
+    hf_homes = [os.environ.get("Z_IMAGE_HF_HOME", os.path.expanduser("~/hf_home")),
+                os.path.expanduser("~/ltx-2-mlx/hf_cache"),
+                os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))]
+    needle = "Tongyi-MAI--Z-Image-Turbo" if target == "stills" else "ltx-2.3-mlx"
+    for home in hf_homes:
+        for d in glob.glob(os.path.join(home, "hub", "models--*%s*" % needle.replace("/", "--"))):
+            snaps = sorted(glob.glob(os.path.join(d, "snapshots", "*")))
+            if snaps:
+                return snaps[-1]
+    return None
+
+
+def enumerate_catalog_and_chars():
+    """[(path, target, source)] for every catalog entry and character-library LoRA."""
+    items = []
+    try:
+        data = lc.load_catalog(lc.catalog_path(WS))
+        for e in data["entries"]:
+            items.append((e["path"], e["target"], "catalog:%s" % e["id"]))
+    except lc.CatalogError as e:
+        print("warning: catalog unreadable: %s" % e, file=sys.stderr)
+    try:
+        for real, (name, kind) in lc.character_paths(WS).items():
+            items.append((real, "video" if kind == "video" else "stills",
+                          "character:%s/%s" % (name, kind)))
+    except Exception as e:                           # noqa: BLE001
+        print("warning: character library unreadable: %s" % e, file=sys.stderr)
+    return items
+
+
+def quarantine_catalog_entry(path):
+    """Move the file to generated/loras/quarantine/ and drop matching catalog entries."""
+    qdir = os.path.join(lc.catalog_dir(WS), "quarantine")
+    os.makedirs(qdir, exist_ok=True)
+    cpath = lc.catalog_path(WS)
+    with lc.catalog_lock(cpath):
+        data = lc.load_catalog(cpath)
+        kept = [e for e in data["entries"]
+                if os.path.realpath(e["path"]) != os.path.realpath(path)]
+        dropped = len(data["entries"]) - len(kept)
+        if os.path.exists(path):
+            shutil.move(path, os.path.join(qdir, os.path.basename(path)))
+        if dropped:
+            lc.save_catalog(cpath, {"schema_version": lc.SCHEMA_VERSION, "entries": kept})
+    return dropped
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="lora-check")
+    ap.add_argument("loras", nargs="*", help="specific .safetensors to check")
+    ap.add_argument("--deep", action="store_true", help="also validate via the real consumer")
+    ap.add_argument("--quarantine", action="store_true",
+                    help="move FAILing catalog LoRAs aside and drop their entries")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--video-base", help="path to the LTX video base model dir")
+    ap.add_argument("--stills-base", help="path to the Z-Image stills base model dir")
+    ap.add_argument("--workspace", help="override the workspace dir")
+    args = ap.parse_args(argv)
+    global WS
+    if args.workspace:
+        WS = args.workspace
+
+    if args.loras:
+        items = []
+        for p in args.loras:
+            try:
+                tgt = infer_target(lc.read_safetensors_header(p))
+            except lc.CatalogError:
+                tgt = "video"
+            items.append((p, tgt, "arg"))
+    else:
+        items = enumerate_catalog_and_chars()
+
+    results, any_fail = [], False
+    for path, target, source in items:
+        base = locate_base(target, args.stills_base, args.video_base)
+        status, problems = static_check(path, base)
+        if args.deep and status in ("PASS", "PARTIAL"):
+            dstatus, dproblems = deep_check(path, target, args.stills_base, args.video_base)
+            problems += ["[deep] " + p for p in dproblems]
+            if dstatus == "FAIL":
+                status = "FAIL"
+            elif dstatus == "PASS" and status == "PARTIAL":
+                status = "PASS"
+        quarantined = False
+        if status == "FAIL":
+            any_fail = True
+            if args.quarantine and source.startswith("catalog:"):
+                quarantined = bool(quarantine_catalog_entry(path))
+        results.append({"path": path, "target": target, "source": source,
+                        "status": status, "problems": problems,
+                        "quarantined": quarantined})
+
+    if args.json:
+        print(json.dumps({"results": results}, indent=2))
+    else:
+        if not results:
+            print("No LoRAs found (empty catalog and character library).")
+        for r in results:
+            print("[%s] %s  (%s, %s)" % (r["status"], r["path"], r["target"], r["source"]))
+            for p in r["problems"]:
+                print("    - " + p)
+            if r["quarantined"]:
+                print("    -> quarantined and removed from the catalog")
+        n_fail = sum(1 for r in results if r["status"] == "FAIL")
+        print("\n%d checked, %d FAIL, %d unverified/partial"
+              % (len(results), n_fail,
+                 sum(1 for r in results if r["status"] in ("UNVERIFIED", "PARTIAL"))))
+    return 1 if any_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

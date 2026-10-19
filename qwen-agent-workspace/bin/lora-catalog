@@ -5,19 +5,24 @@
                    --base-model M [--base-model M ...] [--trigger T ...]
                    --description TEXT --use-when TEXT [--avoid-when TEXT]
                    [--default-strength S] [--strength-range LO,HI] [--rank N] [--alpha N]
+                   [--no-arch-check]
   bin/lora-catalog list [--model M] [--json]
   bin/lora-catalog remove ID
   bin/lora-catalog verify [ID ...]
 
 bin/ltx-movie's story planner may pick catalog entries per panel (style LoRAs only for the
 whole movie); trained library characters are listed and verified here but are cast only with
-bin/ltx-movie --character. The catalog lives in $LORA_CATALOG_DIR when set (tests only), else
+bin/ltx-movie --character. `add` runs bin/lora-check's architecture gate against each declared
+--base-model found on disk and refuses a LoRA whose tensors don't match (override with
+--no-arch-check; an unlocatable base is a warning, not a refusal). The catalog lives in
+$LORA_CATALOG_DIR when set (tests only), else
 generated/loras/. add and remove hold the catalog lock for their whole read-modify-write.
 Exit codes: 0 success, 1 verify found problems, 2 usage or validation error. See
 docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md, Section 4.
 """
 
 import argparse
+import importlib.machinery
 import json
 import os
 import sys
@@ -27,6 +32,38 @@ sys.path.insert(0, WS)
 import lora_catalog  # noqa: E402
 
 ROW_FORMAT = "%-24s %-9s %-7s %-14s %-24s %s"
+
+
+def _load_checker():
+    """bin/lora-check loaded as a module (it has no .py extension)."""
+    return importlib.machinery.SourceFileLoader(
+        "lora_check", os.path.join(WS, "bin", "lora-check")).load_module()
+
+
+def _arch_gate(path, target, base_models):
+    """Architecture gate for `add`: for every declared base model that can be
+    located on disk, the LoRA must statically match it. Returns (ok, messages).
+    FAIL against any located base blocks the add; if none can be located the add
+    proceeds with an 'unverified' warning (the base may not be installed yet)."""
+    try:
+        checker = _load_checker()
+    except Exception as e:  # noqa: BLE001 - tooling problem must not block cataloging
+        return True, ["architecture check unavailable (%s); skipped" % e]
+    located = [(bm, checker.resolve_base_dir(bm)) for bm in base_models]
+    located = [(bm, d) for bm, d in located if d]
+    if not located:
+        return True, ["architecture UNVERIFIED: none of the declared base models are on "
+                      "disk yet; run bin/lora-check once the base is installed"]
+    fails, oks = [], []
+    for bm, d in located:
+        status, problems = checker.static_check(path, d)
+        if status == "FAIL":
+            fails.append("%s: %s" % (bm, "; ".join(problems)))
+        else:
+            oks.append("%s (%s)" % (bm, status))
+    if fails:
+        return False, ["architecture mismatch vs declared base model(s): " + " | ".join(fails)]
+    return True, ["architecture OK vs " + ", ".join(oks)]
 
 
 def build_parser():
@@ -50,6 +87,9 @@ def build_parser():
                      metavar="LO,HI")
     add.add_argument("--rank", type=int, default=None)
     add.add_argument("--alpha", type=int, default=None)
+    add.add_argument("--no-arch-check", dest="arch_check", action="store_false", default=True,
+                     help="skip the architecture-match gate (bin/lora-check) against the "
+                          "declared base model(s)")
     lst = sub.add_parser("list", help="list catalog entries and library characters")
     lst.add_argument("--model", default=None, metavar="M")
     lst.add_argument("--json", dest="as_json", action="store_true", default=False)
@@ -99,6 +139,13 @@ def cmd_add(args):
             if value is None:
                 return _error("cannot read the LoRA %s from the safetensors header; pass --%s"
                               % (name, name))
+        if args.arch_check:
+            ok, messages = _arch_gate(args.path, args.target, args.base_models)
+            for message in messages:
+                print("arch: %s" % message, file=sys.stderr)
+            if not ok:
+                return _error("refusing to catalog %s: it does not match the base architecture "
+                              "(use --no-arch-check to override)" % args.path)
         try:
             catalog = lora_catalog.load_catalog(path)
         except lora_catalog.CatalogError as e:
