@@ -209,3 +209,111 @@ def test_descendant_groups_and_the_ps_fallback(monkeypatch, capsys):
     monkeypatch.setattr(lib, "process_table", lambda: None)
     assert lib.cancel_groups(4242) == [4242]
     assert capsys.readouterr().out == "[movie-ui] ps failed; signalling process group 4242 only\n"
+
+
+def _lock_held(state, job_id):
+    fd = os.open(os.path.join(lib.job_dir(state, job_id), "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def test_mut13_liveness_recovery_lost_and_orphans(state, tmp_path):
+    ready = _ready_file(tmp_path, "ready")
+    job_id = mt.make_job(state, mt.py_argv("import time; open(%r, 'w').write('1'); time.sleep(60)" % ready),
+                         str(tmp_path))
+    runner = mt.dispatch(state, job_id)
+    mt.wait_until(lambda: os.path.exists(ready), 10)
+    jdir = lib.job_dir(state, job_id)
+    assert lib.job_alive(jdir) is True
+    lib.startup_recovery(state)
+    assert mt.status_of(state, job_id)["state"] == "running"
+    pgid = mt.status_of(state, job_id)["pgid"]
+    os.kill(runner.pid, signal.SIGKILL)
+    runner.wait(5)
+    assert lib.job_alive(jdir) is False
+    lost = mt.status_of(state, job_id)
+    assert lost["state"] == "lost" and lost["exit_code"] is None and lost["ended"] is None
+    assert lost["pgid"] == pgid and lib.parse_utc(lost["detected"]) is not None
+    assert lib.orphan_info(lost) == {"pgid": pgid, "alive": True}
+    assert lib.kill_orphan(state, job_id) == pgid
+    mt.wait_until(lambda: not lib.group_alive(pgid), 5)
+    assert lib.orphan_info(mt.status_of(state, job_id)) is None
+    assert lib.kill_orphan(state, job_id) is None
+    # A running job with no runner at startup, and a starting job past the 10 s grace, are lost.
+    dead = mt.make_job(state, ["true"], str(tmp_path), status={"state": "running", "dispatched": lib.utc_now(),
+                                                               "runner_pid": 1, "pgid": None, "started": lib.utc_now()})
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+    stale = mt.make_job(state, ["true"], str(tmp_path), status={"state": "starting", "dispatched": old})
+    fresh = mt.make_job(state, ["true"], str(tmp_path), status={"state": "starting", "dispatched": lib.utc_now()})
+    lib.startup_recovery(state)
+    assert mt.status_of(state, dead)["state"] == "lost"
+    assert mt.status_of(state, stale)["state"] == "lost"
+    assert mt.status_of(state, fresh)["state"] == "starting"
+    assert lib.job_alive(lib.job_dir(state, fresh)) is True
+
+
+def test_mut14_queue_fifo_one_runner_at_a_time_and_actions(state, tmp_path):
+    ws = str(tmp_path)
+    ids = [mt.make_job(state, mt.py_argv("import time; time.sleep(0.6)"), ws) for _ in range(3)]
+    assert lib.read_queue(state) == ids
+    launched, max_held = [], 0
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        got = lib.dispatch_tick(state, mt.WS)
+        if got:
+            launched.append(got)
+        max_held = max(max_held, sum(1 for i in ids if _lock_held(state, i)))
+        if all(mt.status_of(state, i).get("state") == "done" for i in ids):
+            break
+        time.sleep(0.1)
+    assert launched == ids
+    assert max_held == 1
+    starts = [mt.status_of(state, i)["started"] for i in ids]
+    assert starts == sorted(starts)
+    # move, cancel, no-ops, and the queue across a restart
+    a, b, c = (mt.make_job(state, ["true"], ws) for _ in range(3))
+    assert lib.move_job(state, c, "up") == [a, c, b]
+    assert lib.move_job(state, a, "up") == [a, c, b]
+    assert lib.move_job(state, b, "down") == [a, c, b]
+    assert lib.move_job(state, ids[0], "up") is None
+    assert lib.cancel_job(state, c) == "cancelled"
+    assert lib.read_queue(state) == [a, b]
+    assert mt.status_of(state, c) == {"state": "cancelled", "exit_code": None, "ended": mt.status_of(state, c)["ended"]}
+    assert lib.cancel_job(state, c) is None
+    lib.write_queue(state, lib.read_queue(state) + ["bogus", c, a, "20261019-000000-ffff"])
+    lib.startup_recovery(state)
+    assert lib.read_queue(state) == [a, b]
+    assert lib.delete_job(state, a) is False
+    assert lib.delete_job(state, c) is True and not os.path.exists(lib.job_dir(state, c))
+    # a job whose workspace was removed by self-update
+    gone = os.path.join(ws, "pruned-release")
+    os.mkdir(gone)
+    lost_ws = mt.make_job(state, ["true"], gone)
+    lib.write_queue(state, [lost_ws, a, b])
+    os.rmdir(gone)
+    assert lib.dispatch_tick(state, mt.WS) == a
+    assert mt.status_of(state, lost_ws) == {"state": "failed", "exit_code": None,
+                                            "ended": mt.status_of(state, lost_ws)["ended"],
+                                            "error": "workspace no longer exists (removed by self-update)"}
+    assert lib.read_queue(state) == [b]
+
+
+def test_review_focus_3_cancel_while_starting(state, tmp_path):
+    """Review Focus 3: Cancel pressed in the instant between dispatch and the runner's start."""
+    job_id = mt.make_job(state, mt.py_argv("open(%r, 'w').write('ran')" % _ready_file(tmp_path, "ran")),
+                         str(tmp_path))
+    jdir = lib.job_dir(state, job_id)
+    lib.write_queue(state, [])
+    lib.write_status(jdir, {"state": "starting", "dispatched": lib.utc_now()})
+    assert lib.cancel_job(state, job_id) == "cancelling"
+    proc = subprocess.run([sys.executable, os.path.join(mt.WS, "bin", "movie-ui-job"), jdir],
+                          capture_output=True, text=True, timeout=30)
+    assert (proc.returncode, proc.stdout) == (0, "[movie-ui] cancelled before start\n")
+    status = lib.read_status(jdir)
+    assert status == {"state": "cancelled", "exit_code": None, "ended": status["ended"]}
+    assert not os.path.exists(_ready_file(tmp_path, "ran"))

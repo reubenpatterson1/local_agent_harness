@@ -345,3 +345,155 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
     write_status(jdir, final)
     _say("exit %d (%s)" % (code, state))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Liveness, the dispatcher, startup recovery and job actions (MU26, MU29-MU31, MU68).
+# Every function here that reads or writes queue.json or a status is called with STORE_LOCK
+# held (movie_ui_server.STORE_LOCK).
+# ---------------------------------------------------------------------------
+
+def job_alive(jdir, now=None):
+    """True while a runner holds jdir/lock, or the job is "starting" and was dispatched less than
+    STARTING_GRACE_S ago; otherwise False, after writing the "lost" status when the job was
+    starting or running (MU29). Never consults a PID (MU25)."""
+    fd = os.open(os.path.join(jdir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        try:
+            status = read_status(jdir) or {}
+            state = status.get("state")
+            if state not in ACTIVE_STATES:
+                return False
+            if state == "starting":
+                dispatched = parse_utc(status.get("dispatched"))
+                current = time.time() if now is None else now
+                if dispatched is not None and current - dispatched < STARTING_GRACE_S:
+                    return True
+            lost = dict(status)
+            lost.update({"state": "lost", "exit_code": None, "ended": None, "detected": utc_now()})
+            write_status(jdir, lost)
+            return False
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def active_job_ids(state):
+    """IDs of the jobs whose status state is "starting" or "running"."""
+    return [i for i in list_job_ids(state)
+            if (read_status(job_dir(state, i)) or {}).get("state") in ACTIVE_STATES]
+
+
+def dispatch_tick(state, ui_ws):
+    """One dispatcher tick (MU30). Returns the ID of the job it dispatched, else None."""
+    for job_id in active_job_ids(state):
+        if job_alive(job_dir(state, job_id)):
+            return None
+    queue = read_queue(state)
+    while queue:
+        job_id = queue.pop(0)
+        write_queue(state, queue)
+        jdir = job_dir(state, job_id)
+        job = read_job(jdir)
+        if job is None:
+            continue
+        if not os.path.isdir(job["workspace"]):
+            write_status(jdir, {"state": "failed", "exit_code": None, "ended": utc_now(),
+                                "error": "workspace no longer exists (removed by self-update)"})
+            continue
+        dispatched = utc_now()
+        write_status(jdir, {"state": "starting", "dispatched": dispatched})
+        try:
+            launch_runner(state, job_id, ui_ws)
+        except OSError as e:
+            write_status(jdir, {"state": "failed", "dispatched": dispatched, "exit_code": None,
+                                "ended": utc_now(), "error": "cannot start runner: %s" % (e.strerror or e)})
+        return job_id
+    return None
+
+
+def startup_recovery(state):
+    """Rewrite queue.json without IDs that are malformed, duplicated, lack job.json or already
+    have a status; then re-attach or mark lost every starting/running job (MU31)."""
+    kept = []
+    for job_id in read_queue(state):
+        jdir = job_dir(state, job_id)
+        if (JOB_ID_RE.fullmatch(job_id) and job_id not in kept
+                and os.path.isfile(os.path.join(jdir, "job.json"))
+                and not os.path.lexists(os.path.join(jdir, "status.json"))):
+            kept.append(job_id)
+    write_queue(state, kept)
+    for job_id in active_job_ids(state):
+        job_alive(job_dir(state, job_id))
+
+
+def job_state(state, job_id, queue):
+    """The status state, else "queued" when job_id is in queue, else "unknown" (MU67)."""
+    status = read_status(job_dir(state, job_id))
+    if status is not None and isinstance(status.get("state"), str):
+        return status["state"]
+    return "queued" if job_id in queue else "unknown"
+
+
+def cancel_job(state, job_id):
+    """"cancelled" for a queued job (removed from the queue), "cancelling" for a starting or
+    running one (the cancel marker is created), None otherwise (MU68)."""
+    queue = read_queue(state)
+    current = job_state(state, job_id, queue)
+    jdir = job_dir(state, job_id)
+    if current == "queued":
+        write_queue(state, [i for i in queue if i != job_id])
+        write_status(jdir, {"state": "cancelled", "exit_code": None, "ended": utc_now()})
+        return "cancelled"
+    if current in ACTIVE_STATES:
+        write_bytes_atomic(os.path.join(jdir, "cancel"), b"")
+        return "cancelling"
+    return None
+
+
+def move_job(state, job_id, direction):
+    """Swap a queued job with its neighbour ("up" or "down"; a no-op at an end). Returns the new
+    queue, or None when the job is not queued (MU68)."""
+    queue = read_queue(state)
+    if job_id not in queue or job_state(state, job_id, queue) != "queued":
+        return None
+    i = queue.index(job_id)
+    j = i - 1 if direction == "up" else i + 1
+    if 0 <= j < len(queue):
+        queue[i], queue[j] = queue[j], queue[i]
+        write_queue(state, queue)
+    return queue
+
+
+def delete_job(state, job_id):
+    """Remove a finished (done, failed, cancelled, lost) job's directory; True when removed,
+    False when the job is not finished (MU68). Story outputs are never touched."""
+    if job_state(state, job_id, read_queue(state)) not in FINISHED_STATES:
+        return False
+    shutil.rmtree(job_dir(state, job_id), ignore_errors=True)
+    return True
+
+
+def orphan_info(status):
+    """{"pgid": G, "alive": True} for a lost job whose recorded group still exists, else None
+    (MU26)."""
+    if not isinstance(status, dict) or status.get("state") != "lost":
+        return None
+    pgid = status.get("pgid")
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1:
+        return None
+    return {"pgid": pgid, "alive": True} if group_alive(pgid) else None
+
+
+def kill_orphan(state, job_id):
+    """SIGKILL a lost job's live orphan group; returns the pgid, or None when there is none (MU68)."""
+    info = orphan_info(read_status(job_dir(state, job_id)))
+    if info is None:
+        return None
+    _killpg_quiet(info["pgid"], signal.SIGKILL)
+    return info["pgid"]
