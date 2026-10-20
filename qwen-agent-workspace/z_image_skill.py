@@ -248,6 +248,30 @@ def _get_img2img_pipeline(lora_path=None, loras=None):
     return _img2img_pipeline
 
 
+def generate_variation(seed_image, prompt, output_path=None, strength=0.45,
+                       generator=None, lora_path=None, loras=None, **kwargs):
+    """One pixel-anchored img2img image from seed_image at `strength`, saved to
+    output_path. The single-image primitive behind generate_variations, matching
+    generate_image's interface so a caller (e.g. the dataset child) can pick
+    text2img or img2img per job. seed_image is a PIL.Image or a path. Defaults:
+    num_inference_steps=9, guidance_scale=0.0 (distilled turbo). Returns the PIL
+    image; it is screened by content_safety first."""
+    from PIL import Image
+    if isinstance(seed_image, str):
+        seed_image = Image.open(seed_image).convert("RGB")
+    pipeline = _get_img2img_pipeline(lora_path=lora_path, loras=loras)
+    kwargs.setdefault("num_inference_steps", 9)
+    kwargs.setdefault("guidance_scale", 0.0)
+    if generator is not None:
+        kwargs["generator"] = generator
+    result = pipeline(prompt=prompt, image=seed_image, strength=strength, **kwargs)
+    image = result.images[0]
+    content_safety.assert_image_safe(image, skill="z_image_skill", prompt=prompt)
+    if output_path:
+        image.save(output_path)
+    return image
+
+
 def generate_variations(seed_image, prompts, strength=0.45, output_dir=None,
                         lora_path=None, loras=None, base_seed=0, **kwargs):
     """Produce pixel-anchored variants of a seed image: for each prompt, run
@@ -258,7 +282,7 @@ def generate_variations(seed_image, prompts, strength=0.45, output_dir=None,
     seed_image: a PIL.Image or a path to one.
     prompts: an iterable of prompt strings; one variant per prompt.
     strength: 0..1 denoise strength. Lower preserves the seed's detail (less
-        pose/framing variation); higher varies more and preserves less. ~0.4-0.55
+        pose/framing variation); higher varies more and preserves less. ~0.4-0.6
         is the usual sweet spot. Note the turbo schedule is short, so the
         effective step count is ~num_inference_steps * strength.
     output_dir: if set, each variant is saved as var_00.png, var_01.png, ...
@@ -267,20 +291,15 @@ def generate_variations(seed_image, prompts, strength=0.45, output_dir=None,
     from PIL import Image
     if isinstance(seed_image, str):
         seed_image = Image.open(seed_image).convert("RGB")
-    pipeline = _get_img2img_pipeline(lora_path=lora_path, loras=loras)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     images = []
     for i, prompt in enumerate(prompts):
-        call_kwargs = dict(kwargs)
-        call_kwargs.setdefault("num_inference_steps", 9)
-        call_kwargs.setdefault("guidance_scale", 0.0)
-        call_kwargs.setdefault("generator", torch.Generator("cpu").manual_seed(base_seed + i))
-        result = pipeline(prompt=prompt, image=seed_image, strength=strength, **call_kwargs)
-        image = result.images[0]
-        content_safety.assert_image_safe(image, skill="z_image_skill", prompt=prompt)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-            image.save(os.path.join(output_dir, "var_%02d.png" % i))
-        images.append(image)
+        out = os.path.join(output_dir, "var_%02d.png" % i) if output_dir else None
+        gen = torch.Generator("cpu").manual_seed(base_seed + i)
+        images.append(generate_variation(seed_image, prompt, output_path=out,
+                                          strength=strength, generator=gen,
+                                          lora_path=lora_path, loras=loras, **dict(kwargs)))
     return images
 
 

@@ -1394,9 +1394,18 @@ def child_zimage(spec_path):
     for job in spec["jobs"]:
         started = time.monotonic()
         try:
-            z_image_skill.generate_image(job["prompt"], output_path=job["output_path"],
-                                         width=job["width"], height=job["height"],
-                                         generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
+            if job.get("image"):
+                # img2img job: pixel-anchor on job["image"] so identity and fine
+                # details (scars, jewelry) carry through; the seed image fixes the
+                # geometry, so width/height are taken from it, not the job.
+                z_image_skill.generate_variation(
+                    job["image"], job["prompt"], output_path=job["output_path"],
+                    strength=job.get("strength", 0.6),
+                    generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
+            else:
+                z_image_skill.generate_image(job["prompt"], output_path=job["output_path"],
+                                             width=job["width"], height=job["height"],
+                                             generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
             status = "ok"
         except ContentSafetyError:
             status = "blocked"
