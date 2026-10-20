@@ -28,8 +28,8 @@ _FIELDS = [("width", "width", ["--width"], int),
 
 def test_overrides_only_fire_on_big_tier(monkeypatch):
     s = _skill()
-    assert s.autotune_overrides(128) == {"low_ram": False, "width": 1344,
-                                         "height": 768, "num_frames": 241}
+    assert s.autotune_overrides(128) == {"low_ram": False, "width": 1024,
+                                         "height": 576, "num_frames": 241}
     assert s.autotune_overrides(96) != {}      # at threshold
     assert s.autotune_overrides(48) == {}      # 48 GB dev host unchanged
     assert s.autotune_overrides(16) == {}      # lean host unchanged
@@ -63,9 +63,9 @@ def test_apply_overrides_unset_fields_on_big_host(monkeypatch):
     monkeypatch.setenv(s.AUTOTUNE_MEM_ENV, "128")
     args = _Args(width=704, height=448, frames=145, no_low_ram=False)
     applied = s.maybe_autotune_apply(args, ["--prompt", "x"], _FIELDS)
-    assert args.width == 1344 and args.height == 768 and args.frames == 241
+    assert args.width == 1024 and args.height == 576 and args.frames == 241
     assert args.no_low_ram is True            # low_ram off
-    assert set(applied) == {"width=1344", "height=768", "frames=241", "no_low_ram=True"}
+    assert set(applied) == {"width=1024", "height=576", "frames=241", "no_low_ram=True"}
 
 
 def test_apply_respects_explicit_flags(monkeypatch):
@@ -77,7 +77,7 @@ def test_apply_respects_explicit_flags(monkeypatch):
     applied = s.maybe_autotune_apply(args, ["--width", "640", "--no-low-ram"], _FIELDS)
     assert args.width == 640                  # respected
     assert args.no_low_ram is False           # respected (not overridden to True)
-    assert args.height == 768 and args.frames == 241   # the unset ones still tuned
+    assert args.height == 576 and args.frames == 241   # the unset ones still tuned
     assert "width=640" not in " ".join(applied)
 
 
