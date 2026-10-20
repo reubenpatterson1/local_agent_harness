@@ -149,7 +149,8 @@ def test_fix_result_send_failures_are_500_and_json_constants_rejected(env, capfd
     hdr = {"Content-Type": "application/json"}
     status, _h, payload = mt.api(s, "POST", "/api/preview", raw=b'{"n": "\\ud800"}', headers=hdr)
     assert (status, payload) == (400, {"error": "invalid JSON body"})
-    for raw in (b"NaN", b'{"n": Infinity}', b'{"n": -Infinity}'):
+    for raw in (b"NaN", b'{"n": Infinity}', b'{"n": -Infinity}',
+                b'{"n": 1e999}', b'{"n": -1e999}'):
         assert mt.api(s, "POST", "/api/preview", raw=raw, headers=hdr)[0] == 400
 
 
@@ -166,6 +167,7 @@ def test_fix_token_host_methods_and_content_length(env):
     assert out.split(b"\r\n")[0].split(b" ")[1] == b"401"
     assert b"access-control-" not in out.lower()
     assert mt.api(s, "PATCH", "/api/host")[0] == 405
+    assert mt.api(s, "FOO", "/api/host", token=None)[0] == 401
     hdr = {"Content-Type": "application/json"}
     for bad in ("-1", "abc"):
         status, _h, payload = mt.api(s, "POST", "/api/preview", raw=b"{}",

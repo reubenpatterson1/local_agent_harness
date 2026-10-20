@@ -278,11 +278,11 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
     def _write(self, data):
         try:
             self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             pass
 
     def send_json(self, status, obj, headers=()):
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        body = json.dumps(obj, ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -394,7 +394,7 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             return None
         try:
             obj = json.loads(self.rfile.read(n).decode("utf-8"), parse_constant=_bad_constant)
-            json.dumps(obj, ensure_ascii=False).encode("utf-8")
+            json.dumps(obj, ensure_ascii=False, allow_nan=False).encode("utf-8")
         except (UnicodeDecodeError, ValueError, RecursionError):
             self.send_json(400, {"error": "invalid JSON body"})
             return None
