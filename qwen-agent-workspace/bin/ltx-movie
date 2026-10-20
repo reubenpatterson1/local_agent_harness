@@ -1147,6 +1147,15 @@ def _run_story_agent(cmd, timeout, story_md):
 
 
 def phase1_story(args):
+    if args.story_model is None:
+        # Auto-detect the served model so BOTH Phase 1 engines (robust + legacy)
+        # match it without the operator passing --story-model. Done here, before the
+        # robust branch returns, so the robust StoryContext also gets the resolved name.
+        resolved = _resolve_story_model()
+        if resolved:
+            args.story_model = resolved
+            print("story model auto-detected from %s: %s"
+                  % (STORY_BASE_URL, resolved), file=sys.stderr)
     if getattr(args, "story_engine", "legacy") == "robust":
         return _phase1_robust(args)
     paths = _story_paths(args.story_id)
@@ -1184,13 +1193,7 @@ def phase1_story(args):
                "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
                "--request-timeout", "600"]
-        if args.story_model is None:
-            # Auto-detect the served model so Phase 1 matches it without --story-model.
-            args.story_model = _resolve_story_model()
-            if args.story_model:
-                print("story model auto-detected from %s: %s"
-                      % (STORY_BASE_URL, args.story_model), file=sys.stderr)
-        if args.story_model:
+        if args.story_model:  # resolved at the top of phase1_story
             cmd += ["--model", args.story_model]
         if args.story_context_window:
             cmd += ["--context-window", str(args.story_context_window)]
