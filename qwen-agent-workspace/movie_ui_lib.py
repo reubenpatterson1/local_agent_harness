@@ -1246,6 +1246,7 @@ def list_models():
 
 SAFETENSORS_HEADER_MAX = 104857600
 DRY_RUN_TIMEOUT = 60
+VERIFY_TIMEOUT = 300
 
 
 class _ToolError(Exception):
@@ -1297,7 +1298,8 @@ def safetensors_problem(path):
 def lora_checks(fields, ws_real, cache, smoke=False):
     """V4's records: catalog verify, then one LoRA file record per free path."""
     lists = [fields["video_loras"]] + ([] if smoke else [fields["stills_loras"]])
-    ids = set(item["id"] for items in lists for item in items if item.get("id") is not None)
+    chosen = set(item["id"] for items in lists for item in items if item.get("id") is not None)
+    ids = set(chosen)
     out = []
     try:
         if fields["auto_lora"] is True and fields["story_legacy"] is False and not smoke:
@@ -1312,9 +1314,28 @@ def lora_checks(fields, ws_real, cache, smoke=False):
         if not ids:
             out.append(check("V4", "catalog verify", "skip", "no catalog LoRA chosen or pickable"))
         else:
-            run = run_light(tool_argv(ws_real, "lora-catalog", "verify", *sorted(ids)), ws_real)
-            out.append(check("V4", "catalog verify", "pass" if run["exit_code"] == 0 else "fail",
-                             run["stdout"] + run["stderr"]))
+            run = run_light(tool_argv(ws_real, "lora-catalog", "verify", *sorted(ids)), ws_real,
+                            timeout=VERIFY_TIMEOUT)
+            if run["timed_out"]:
+                out.append(check("V4", "catalog verify", "fail",
+                                 "bin/lora-catalog verify timed out after %d s" % VERIFY_TIMEOUT))
+            elif run["exit_code"] == 0:
+                out.append(check("V4", "catalog verify", "pass", run["stdout"] + run["stderr"]))
+            else:
+                chosen_fails, auto_fails = [], []
+                for line in run["stdout"].splitlines():
+                    found = re.match(r"FAIL (\S+?)(:|$)", line)
+                    if found:
+                        (chosen_fails if found.group(1) in chosen else auto_fails).append(line)
+                if not chosen_fails and not auto_fails:
+                    out.append(check("V4", "catalog verify", "fail", run["stdout"] + run["stderr"]))
+                elif chosen_fails:
+                    out.append(check("V4", "catalog verify", "fail", "\n".join(chosen_fails)))
+                else:
+                    out.append(check("V4", "catalog verify", "pass", run["stdout"] + run["stderr"]))
+                if auto_fails:
+                    out.append(check("V4", "LoRAs auto set", "skip",
+                                     "the planner will skip these entries:\n" + "\n".join(auto_fails)))
     for items in lists:
         for item in items:
             if item.get("id") is None:
@@ -1376,6 +1397,10 @@ def compat_checks(fields, ws_real, cache, smoke=False):
         out.append(check("V5", "characters", "skip", "no character cast"))
     for name in fields["characters"]:
         run = run_light(tool_argv(ws_real, "character", "show", name), ws_real)
+        if run["timed_out"]:
+            out.append(check("V5", "character %s" % name, "fail",
+                             "bin/character show %s timed out after %d s" % (name, LIGHT_TIMEOUT)))
+            continue
         if run["exit_code"] != 0:
             out.append(check("V5", "character %s" % name, "fail", run["stderr"].strip() or run["stdout"].strip()))
             continue

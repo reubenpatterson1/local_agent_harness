@@ -311,8 +311,11 @@ def test_mut6_v4_loras_intact(env):
     assert records == [lib.check("V4", "catalog verify", "pass", "OK ink\nOK pan\nverified 2 entries: 0 problem(s)\n")]
     verify_calls = [c["argv"] for c in mt.stub_calls(ws) if c["sub"] == "verify"]
     assert verify_calls == [["verify", "ink", "pan"]]
+    stray = _entry("stray", target="stills", kind="style")
+    _catalog(env, video=[pan, stray], stills=[ink])
     records = lib.lora_checks(mt.fields(ws, mode="no_stills"), ws, {})
     assert mt.stub_calls(ws)[-1]["argv"] == ["verify", "pan"]
+    assert records == [lib.check("V4", "catalog verify", "pass", "OK pan\nverified 1 entries: 0 problem(s)\n")]
     records = lib.lora_checks(mt.fields(ws, story_legacy=True), ws, {})
     assert records == [lib.check("V4", "catalog verify", "skip", "no catalog LoRA chosen or pickable")]
     _catalog(env, video=[pan], stills=[ink],
@@ -431,3 +434,38 @@ def test_mu43_run_checks_order_and_v1_short_circuit(env, monkeypatch):
         ("V6", "dry run", "pass")]
     assert lib.checks_pass(good) and not lib.checks_pass(bad)
     assert len(lib.check("V6", "dry run", "fail", "x" * 30000)["detail"]) == 20000
+
+
+def test_v4_auto_set_fail_does_not_block_but_chosen_fail_does(env):
+    ws = env["ws"]
+    pan, ink = _entry("pan"), _entry("ink", target="stills", kind="style")
+    out = "OK pan\nFAIL ink: sha256 changed since it was cataloged\nverified 2 entries: 1 problem(s)\n"
+    _catalog(env, video=[pan], stills=[ink], verify={"exit": 1, "stdout": out})
+    records = lib.lora_checks(mt.fields(ws, auto_lora=True, video_loras=[_item(pan)]), ws, {})
+    assert [(r["name"], r["status"]) for r in records] == [("catalog verify", "pass"), ("LoRAs auto set", "skip")]
+    assert records[1]["detail"] == "the planner will skip these entries:\nFAIL ink: sha256 changed since it was cataloged"
+    records = lib.lora_checks(mt.fields(ws, auto_lora=True, video_loras=[_item(pan)], stills_loras=[_item(ink)]), ws, {})
+    assert (records[0]["status"], records[0]["detail"]) == ("fail", "FAIL ink: sha256 changed since it was cataloged")
+    _catalog(env, video=[pan], stills=[ink], verify={"exit": 2, "stderr": "Error: no catalog entry pan\n"})
+    records = lib.lora_checks(mt.fields(ws, auto_lora=True), ws, {})
+    assert [(r["status"], r["detail"]) for r in records] == [("fail", "Error: no catalog entry pan\n")]
+
+
+def _timed_out(argv, cwd, env=None, timeout=None):
+    return {"argv": list(argv), "exit_code": None, "stdout": "partial", "stderr": "", "timed_out": True}
+
+
+def test_v4_verify_timeout_is_reported(env, monkeypatch):
+    ws = env["ws"]
+    pan = _entry("pan")
+    monkeypatch.setattr(lib, "run_light", _timed_out)
+    records = lib.lora_checks(mt.fields(ws, auto_lora=False, video_loras=[_item(pan)]), ws, {})
+    assert records == [lib.check("V4", "catalog verify", "fail", "bin/lora-catalog verify timed out after 300 s")]
+
+
+def test_v5_character_show_timeout_is_reported(env, monkeypatch):
+    ws = env["ws"]
+    monkeypatch.setattr(lib, "run_light", _timed_out)
+    records = lib.compat_checks(mt.fields(ws, characters=["kyra"]), ws, {})
+    assert records[-1] == lib.check("V5", "character kyra", "fail",
+                                    "bin/character show kyra timed out after %d s" % lib.LIGHT_TIMEOUT)
