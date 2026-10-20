@@ -284,6 +284,7 @@ def test_mut14_queue_fifo_one_runner_at_a_time_and_actions(state, tmp_path):
     assert lib.cancel_job(state, c) == "cancelled"
     assert lib.read_queue(state) == [a, b]
     assert mt.status_of(state, c) == {"state": "cancelled", "exit_code": None, "ended": mt.status_of(state, c)["ended"]}
+    assert lib.parse_utc(mt.status_of(state, c)["ended"]) is not None
     assert lib.cancel_job(state, c) is None
     lib.write_queue(state, lib.read_queue(state) + ["bogus", c, a, "20261019-000000-ffff"])
     lib.startup_recovery(state)
@@ -300,6 +301,7 @@ def test_mut14_queue_fifo_one_runner_at_a_time_and_actions(state, tmp_path):
     assert mt.status_of(state, lost_ws) == {"state": "failed", "exit_code": None,
                                             "ended": mt.status_of(state, lost_ws)["ended"],
                                             "error": "workspace no longer exists (removed by self-update)"}
+    assert lib.parse_utc(mt.status_of(state, lost_ws)["ended"]) is not None
     assert lib.read_queue(state) == [b]
 
 
@@ -317,3 +319,46 @@ def test_review_focus_3_cancel_while_starting(state, tmp_path):
     status = lib.read_status(jdir)
     assert status == {"state": "cancelled", "exit_code": None, "ended": status["ended"]}
     assert not os.path.exists(_ready_file(tmp_path, "ran"))
+
+
+def test_delete_job_raises_when_removal_fails(state, tmp_path, monkeypatch):
+    job_id = mt.make_job(state, ["true"], str(tmp_path),
+                         status={"state": "done", "exit_code": 0, "ended": lib.utc_now()})
+
+    def boom(*args, **kwargs):
+        raise OSError("boom")
+    monkeypatch.setattr(lib.shutil, "rmtree", boom)
+    with pytest.raises(OSError):
+        lib.delete_job(state, job_id)
+
+
+def test_dispatch_tick_waits_for_a_live_orphan_group(state, tmp_path):
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        pgid = os.getpgid(proc.pid)
+        lost = mt.make_job(state, ["true"], str(tmp_path),
+                           status={"state": "lost", "exit_code": None, "ended": None, "pgid": pgid,
+                                   "detected": lib.utc_now()})
+        queued = mt.make_job(state, ["true"], str(tmp_path))
+        assert lib.orphan_info(mt.status_of(state, lost)) == {"pgid": pgid, "alive": True}
+        assert lib.dispatch_tick(state, mt.WS) is None
+        assert lib.read_queue(state) == [queued]
+        os.killpg(pgid, signal.SIGKILL)
+        proc.wait(5)
+        mt.wait_until(lambda: not lib.group_alive(pgid), 5)
+        assert lib.dispatch_tick(state, mt.WS) == queued
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait(5)
+
+
+def test_dispatch_tick_waits_for_a_fresh_starting_job(state, tmp_path):
+    fresh = mt.make_job(state, ["true"], str(tmp_path),
+                        status={"state": "starting", "dispatched": lib.utc_now()})
+    queued = mt.make_job(state, ["true"], str(tmp_path))
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.read_queue(state) == [queued]
+    assert mt.status_of(state, fresh)["state"] == "starting"

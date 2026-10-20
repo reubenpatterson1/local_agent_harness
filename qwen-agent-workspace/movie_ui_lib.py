@@ -394,20 +394,28 @@ def dispatch_tick(state, ui_ws):
     for job_id in active_job_ids(state):
         if job_alive(job_dir(state, job_id)):
             return None
+    for job_id in list_job_ids(state):
+        if orphan_info(read_status(job_dir(state, job_id))) is not None:
+            return None
     queue = read_queue(state)
     while queue:
         job_id = queue.pop(0)
-        write_queue(state, queue)
         jdir = job_dir(state, job_id)
+        if os.path.lexists(os.path.join(jdir, "status.json")):
+            write_queue(state, queue)
+            continue
         job = read_job(jdir)
         if job is None:
+            write_queue(state, queue)
             continue
         if not os.path.isdir(job["workspace"]):
             write_status(jdir, {"state": "failed", "exit_code": None, "ended": utc_now(),
                                 "error": "workspace no longer exists (removed by self-update)"})
+            write_queue(state, queue)
             continue
         dispatched = utc_now()
         write_status(jdir, {"state": "starting", "dispatched": dispatched})
+        write_queue(state, queue)
         try:
             launch_runner(state, job_id, ui_ws)
         except OSError as e:
@@ -475,7 +483,7 @@ def delete_job(state, job_id):
     False when the job is not finished (MU68). Story outputs are never touched."""
     if job_state(state, job_id, read_queue(state)) not in FINISHED_STATES:
         return False
-    shutil.rmtree(job_dir(state, job_id), ignore_errors=True)
+    shutil.rmtree(job_dir(state, job_id))
     return True
 
 
