@@ -280,3 +280,154 @@ def test_mut5_v3_stale_index_refs_and_walk_cap(env, monkeypatch):
             f.write(b"\x01")
     monkeypatch.setattr(lib, "MAX_MODEL_WALK_ENTRIES", 3)
     assert lib.model_check(local, hub) == (False, "too many files under %s (more than 3)" % local)
+
+
+def _entry(entry_id, target="video", kind="motion", path=None, rng=(0.5, 1.0)):
+    return {"id": entry_id, "kind": kind, "path": path or "/loras/%s.safetensors" % entry_id, "target": target,
+            "strength_range": list(rng), "base_models": []}
+
+
+def _catalog(env, video=(), stills=(), verify=None, extra=None):
+    """Stub `lora-catalog list --model M --json` for the video model and the stills base model."""
+    config = dict(extra or {})
+    for model, entries in ((lib.DEFAULT_MODEL, video), (lib.STILLS_BASE_MODEL, stills)):
+        config["lora-catalog list --model %s --json" % model] = {
+            "stdout": json.dumps({"catalog": "/c", "entries": list(entries), "characters": []})}
+    if verify is not None:
+        config["lora-catalog verify"] = verify
+    mt.stub_config(env["ws"], config)
+    return config
+
+
+def _item(entry, strength=0.8):
+    return {"id": entry["id"], "path": entry["path"], "strength": strength, "kind": entry["kind"]}
+
+
+def test_mut6_v4_loras_intact(env):
+    ws = env["ws"]
+    pan, ink = _entry("pan"), _entry("ink", target="stills", kind="style")
+    _catalog(env, video=[pan], stills=[ink])
+    records = lib.lora_checks(mt.fields(ws), ws, {})
+    assert records == [lib.check("V4", "catalog verify", "pass", "OK ink\nOK pan\nverified 2 entries: 0 problem(s)\n")]
+    verify_calls = [c["argv"] for c in mt.stub_calls(ws) if c["sub"] == "verify"]
+    assert verify_calls == [["verify", "ink", "pan"]]
+    records = lib.lora_checks(mt.fields(ws, mode="no_stills"), ws, {})
+    assert mt.stub_calls(ws)[-1]["argv"] == ["verify", "pan"]
+    records = lib.lora_checks(mt.fields(ws, story_legacy=True), ws, {})
+    assert records == [lib.check("V4", "catalog verify", "skip", "no catalog LoRA chosen or pickable")]
+    _catalog(env, video=[pan], stills=[ink],
+             verify={"exit": 1, "stdout": "FAIL pan: sha256 changed since it was cataloged\nverified 1 entry: 1 problem(s)\n"})
+    records = lib.lora_checks(mt.fields(ws, auto_lora=False, video_loras=[_item(pan)]), ws, {})
+    assert records[0]["status"] == "fail" and "FAIL pan: sha256 changed" in records[0]["detail"]
+    tmp = env["tmp"]
+    good = mt.fake_safetensors(os.path.join(tmp, "good.safetensors"))
+    short = os.path.join(tmp, "short.safetensors")
+    with open(short, "wb") as f:
+        f.write(b"\x10\x00")
+    zero = mt.fake_safetensors(os.path.join(tmp, "zero.safetensors"), n=0)
+    trunc = mt.fake_safetensors(os.path.join(tmp, "trunc.safetensors"), n=500)
+    notjson = os.path.join(tmp, "notjson.safetensors")
+    with open(notjson, "wb") as f:
+        f.write((4).to_bytes(8, "little") + b"[1] ")
+    missing = os.path.join(tmp, "missing.safetensors")
+    free = [{"id": None, "path": p, "strength": 1.0, "kind": None} for p in (good, short, zero, trunc, notjson, missing)]
+    records = lib.lora_checks(mt.fields(ws, auto_lora=False, video_loras=free[:3], stills_loras=free[3:]), ws, {})
+    assert [(r["name"], r["status"], r["detail"]) for r in records[1:]] == [
+        ("LoRA file " + good, "pass", good + ": safetensors header ok"),
+        ("LoRA file " + short, "fail", short + ": not a safetensors file"),
+        ("LoRA file " + zero, "fail", zero + ": not a safetensors file"),
+        ("LoRA file " + trunc, "fail", trunc + ": not a safetensors file"),
+        ("LoRA file " + notjson, "fail", notjson + ": not a safetensors file"),
+        ("LoRA file " + missing, "fail", missing + " is not a readable file")]
+
+
+def _character(name, status="trained", video_base="/ltx/models/ltx-2.3-mlx-q8-dev",
+               stills_base=lib.STILLS_BASE_MODEL, exit_code=0):
+    """{"character show <name>": stub entry} printing the JSON then the files: block (D6)."""
+    data = {"name": name, "status": status,
+            "loras": {"video": {"base_model": video_base} if video_base else None,
+                      "stills": {"base_model": stills_base} if stills_base else None}}
+    text = json.dumps(data, indent=2) + "\nfiles:\n  ok       /lib/%s/seed.png\n" % name
+    entry = {"stdout": text} if exit_code == 0 else {"exit": exit_code, "stderr": "Error: no character %s\n" % name}
+    return {"character show %s" % name: entry}
+
+
+def test_mut7_v5_compatible(env):
+    ws = env["ws"]
+    pan, ink, ink2 = _entry("pan"), _entry("ink", target="stills", kind="style"), _entry("ink2", target="stills",
+                                                                                          kind="style")
+    _catalog(env, video=[pan], stills=[ink, ink2])
+    ok = lib.compat_checks(mt.fields(ws, video_loras=[_item(pan)], stills_loras=[_item(ink)]), ws, {})
+    assert ok[0] == lib.check("V5", "catalog compatibility", "pass", "every catalog LoRA is compatible")
+    assert ok[1] == lib.check("V5", "characters", "skip", "no character cast")
+    cases = [
+        ({"video_loras": [_item(ink)]}, "ink is not a video LoRA compatible with %s" % lib.DEFAULT_MODEL),
+        ({"stills_loras": [_item(pan)]}, "pan is not a stills LoRA compatible with %s" % lib.STILLS_BASE_MODEL),
+        ({"video_loras": [dict(_item(pan), path="/elsewhere.safetensors")]},
+         "pan: path or kind differs from the catalog; reload the LoRA list"),
+        ({"video_loras": [dict(_item(pan), kind="physics")]}, "pan: path or kind differs from the catalog; reload the LoRA list"),
+        ({"video_loras": [_item(pan, 1.5)]}, "pan: strength 1.5 is outside 0.5-1.0"),
+        ({"stills_loras": [_item(ink), _item(ink2)]}, "at most one style LoRA among the stills LoRAs"),
+    ]
+    for overrides, message in cases:
+        record = lib.compat_checks(mt.fields(ws, **overrides), ws, {})[0]
+        assert (record["status"], record["detail"]) == ("fail", message), overrides
+    assert lib.compat_checks(mt.fields(ws), ws, {})[0] == lib.check("V5", "catalog compatibility", "skip",
+                                                                    "no catalog LoRA chosen")
+    extra = {}
+    for spec in (_character("kyra"), _character("ronin", status="untrained", video_base=None),
+                 _character("mei", stills_base="other/model"), _character("hana", video_base=lib.DEFAULT_MODEL),
+                 _character("ghost", exit_code=2)):
+        extra.update(spec)
+    _catalog(env, video=[pan], stills=[ink, ink2], extra=extra)
+    records = lib.compat_checks(mt.fields(ws, characters=["kyra", "ronin", "mei", "hana", "ghost"]), ws, {})
+    assert [(r["name"], r["status"], r["detail"]) for r in records[1:]] == [
+        ("character kyra", "pass", "trained"),
+        ("character kyra video base model", "skip",
+         "video LoRA trained on /ltx/models/ltx-2.3-mlx-q8-dev; bin/ltx-movie does not check this against --model %s"
+         % lib.DEFAULT_MODEL),
+        ("character ronin", "fail", "character ronin is not trained (status untrained)"),
+        ("character mei", "fail", "character mei's stills LoRA is for other/model, not %s" % lib.STILLS_BASE_MODEL),
+        ("character mei video base model", "skip",
+         "video LoRA trained on /ltx/models/ltx-2.3-mlx-q8-dev; bin/ltx-movie does not check this against --model %s"
+         % lib.DEFAULT_MODEL),
+        ("character hana", "pass", "trained"),
+        ("character hana video base model", "pass", "trained on %s" % lib.DEFAULT_MODEL),
+        ("character ghost", "fail", "Error: no character ghost")]
+
+
+def test_mut8_v6_dry_run(env, monkeypatch):
+    ws = env["ws"]
+    fields = mt.fields(ws, action="movie")
+    record = lib.dry_run_check(fields, ws, env["state"])
+    assert record == lib.check("V6", "dry run", "pass", "")
+    call = mt.stub_calls(ws)[-1]
+    assert call["argv"][-2:] == ["--no-review", "--dry-run"] and call["env"]["STORY_PIPELINE_LOGGED"] == "1"
+    assert call["cwd"] == ws
+    mt.stub_config(ws, {"ltx-movie --dry-run": {"exit": 2, "stderr": "Error: --redo needs --shots\n"}})
+    record = lib.dry_run_check(fields, ws, env["state"])
+    assert (record["status"], record["detail"]) == ("fail", "Error: --redo needs --shots\n")
+    monkeypatch.setattr(lib, "DRY_RUN_TIMEOUT", 1)
+    mt.stub_config(ws, {"ltx-movie --dry-run": {"sleep": 3}})
+    record = lib.dry_run_check(fields, ws, env["state"])
+    assert (record["status"], record["detail"]) == ("fail", "bin/ltx-movie --dry-run timed out after 1 s")
+
+
+def test_mu43_run_checks_order_and_v1_short_circuit(env, monkeypatch):
+    ws = env["ws"]
+    bad = lib.run_checks(mt.fields(ws, panels=0), ws, env["state"])
+    assert [(r["id"], r["name"], r["status"]) for r in bad] == [
+        ("V1", "fields", "fail"), ("V2", "host can run it", "skip"), ("V3", "models present and intact", "skip"),
+        ("V4", "LoRAs intact", "skip"), ("V5", "compatible", "skip"), ("V6", "dry run", "skip")]
+    assert bad[1]["detail"] == "skipped: V1 failed"
+    good = lib.run_checks(mt.fields(ws), ws, env["state"])
+    assert [(r["id"], r["name"], r["status"]) for r in good] == [
+        ("V1", "fields", "pass"), ("V2", "render", "skip"), ("V2", "stills", "skip"),
+        ("V2", "story server", "pass"), ("V2", "judge key", "skip"),
+        ("V3", "video model %s" % lib.DEFAULT_MODEL, "skip"), ("V3", "gemma %s" % lib.DEFAULT_GEMMA, "skip"),
+        ("V3", "Z-Image %s" % lib.STILLS_BASE_MODEL, "skip"),
+        ("V3", "Z-Image text encoder %s" % lib.ZIMAGE_TEXT_ENCODER, "skip"),
+        ("V4", "catalog verify", "skip"), ("V5", "catalog compatibility", "skip"), ("V5", "characters", "skip"),
+        ("V6", "dry run", "pass")]
+    assert lib.checks_pass(good) and not lib.checks_pass(bad)
+    assert len(lib.check("V6", "dry run", "fail", "x" * 30000)["detail"]) == 20000

@@ -315,3 +315,15 @@ def make_hf_cache(root, repo, files, refs=True, incomplete=0, broken=()):
         with open(os.path.join(repo_dir, "refs", "main"), "w") as f:
             f.write(rev + "\n")
     return repo_dir
+
+
+# ---------------------------------------------------------------------------
+# Safetensors files
+# ---------------------------------------------------------------------------
+
+def fake_safetensors(path, header=None, n=None):
+    """A minimal safetensors file: 8-byte little-endian header length, then the JSON header."""
+    raw = json.dumps(header if header is not None else {"__metadata__": {}}).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write((len(raw) if n is None else n).to_bytes(8, "little") + raw)
+    return path

@@ -1238,3 +1238,197 @@ def list_models():
                            "bytes": _tree_bytes(os.path.join(repo_dir, "blobs"))})
     models.sort(key=lambda m: (m["hub"], m["repo"]))
     return {"hubs": hubs, "models": models}
+
+
+# ---------------------------------------------------------------------------
+# V4 LoRAs intact, V5 compatible, V6 dry run, and run_checks (MU43, V4-V6)
+# ---------------------------------------------------------------------------
+
+SAFETENSORS_HEADER_MAX = 104857600
+DRY_RUN_TIMEOUT = 60
+
+
+class _ToolError(Exception):
+    """A light bin/ call that failed; str() is the check detail."""
+
+
+def catalog_list(ws_real, model, cache):
+    """The parsed `lora-catalog list --model M --json` object (cached in cache by model)."""
+    if model not in cache:
+        run = run_light(tool_argv(ws_real, "lora-catalog", "list", "--model", model, "--json"), ws_real)
+        try:
+            if run["exit_code"] != 0:
+                raise ValueError
+            value = json.loads(run["stdout"])
+            if not (isinstance(value, dict) and isinstance(value.get("entries"), list)):
+                raise ValueError
+            cache[model] = value
+        except ValueError:
+            cache[model] = _ToolError("bin/lora-catalog list --model %s --json %s: %s" % (
+                model, "timed out" if run["timed_out"] else "exited %s" % run["exit_code"],
+                last_line(run["stderr"]) or "unparsable output"))
+    if isinstance(cache[model], _ToolError):
+        raise cache[model]
+    return cache[model]
+
+
+def safetensors_problem(path):
+    """None when path is a readable safetensors file with a JSON-object header, else the V4 detail."""
+    try:
+        if not os.path.isfile(path):
+            raise OSError
+        with open(path, "rb") as f:
+            head = f.read(8)
+            if len(head) != 8:
+                return "%s: not a safetensors file" % path
+            (n,) = struct.unpack("<Q", head)
+            if not 0 < n <= SAFETENSORS_HEADER_MAX:
+                return "%s: not a safetensors file" % path
+            raw = f.read(n)
+    except OSError:
+        return "%s is not a readable file" % path
+    try:
+        header = json.loads(raw.decode("utf-8")) if len(raw) == n else None
+    except (ValueError, RecursionError):
+        header = None
+    return None if isinstance(header, dict) else "%s: not a safetensors file" % path
+
+
+def lora_checks(fields, ws_real, cache, smoke=False):
+    """V4's records: catalog verify, then one LoRA file record per free path."""
+    lists = [fields["video_loras"]] + ([] if smoke else [fields["stills_loras"]])
+    ids = set(item["id"] for items in lists for item in items if item.get("id") is not None)
+    out = []
+    try:
+        if fields["auto_lora"] is True and fields["story_legacy"] is False and not smoke:
+            m = fields["model"] or DEFAULT_MODEL
+            ids.update(e["id"] for e in catalog_list(ws_real, m, cache)["entries"] if e.get("target") == "video")
+            if fields["mode"] != "no_stills":
+                ids.update(e["id"] for e in catalog_list(ws_real, STILLS_BASE_MODEL, cache)["entries"]
+                           if e.get("target") == "stills")
+    except _ToolError as e:
+        out.append(check("V4", "catalog verify", "fail", str(e)))
+    else:
+        if not ids:
+            out.append(check("V4", "catalog verify", "skip", "no catalog LoRA chosen or pickable"))
+        else:
+            run = run_light(tool_argv(ws_real, "lora-catalog", "verify", *sorted(ids)), ws_real)
+            out.append(check("V4", "catalog verify", "pass" if run["exit_code"] == 0 else "fail",
+                             run["stdout"] + run["stderr"]))
+    for items in lists:
+        for item in items:
+            if item.get("id") is None:
+                problem = safetensors_problem(item["path"])
+                out.append(check("V4", "LoRA file %s" % item["path"], "fail" if problem else "pass",
+                                 problem or "%s: safetensors header ok" % item["path"]))
+    return out
+
+
+def _compat_problems(items, which, entries, target, model):
+    problems = []
+    for item in items:
+        if item.get("id") is None:
+            continue
+        entry = entries.get(item["id"])
+        if entry is None or entry.get("target") != target:
+            problems.append("%s is not a %s LoRA compatible with %s" % (item["id"], target, model))
+            continue
+        if item["path"] != entry.get("path") or item.get("kind") != entry.get("kind"):
+            problems.append("%s: path or kind differs from the catalog; reload the LoRA list" % item["id"])
+        rng = entry.get("strength_range")
+        if isinstance(rng, list) and len(rng) == 2 and not rng[0] <= item["strength"] <= rng[1]:
+            problems.append("%s: strength %s is outside %s-%s" % (item["id"], item["strength"], rng[0], rng[1]))
+    if sum(1 for item in items if item.get("id") is not None and item.get("kind") == "style") > 1:
+        problems.append("at most one style LoRA among the %s LoRAs" % which)
+    return problems
+
+
+def _same_model(a, b):
+    return a == b or (isinstance(a, str) and isinstance(b, str) and os.path.isabs(a) and os.path.isabs(b)
+                      and os.path.realpath(a) == os.path.realpath(b))
+
+
+def compat_checks(fields, ws_real, cache, smoke=False):
+    """V5's records: catalog compatibility, then per cast character its record and, when it has a
+    video LoRA, its video base model record (a mismatch is skip, never fail: D2, Q2)."""
+    m = fields["model"] or DEFAULT_MODEL
+    video = [i for i in fields["video_loras"] if i.get("id") is not None]
+    stills = [] if smoke else [i for i in fields["stills_loras"] if i.get("id") is not None]
+    out = []
+    if not video and not stills:
+        out.append(check("V5", "catalog compatibility", "skip", "no catalog LoRA chosen"))
+    else:
+        try:
+            problems = []
+            if video:
+                entries = dict((e["id"], e) for e in catalog_list(ws_real, m, cache)["entries"])
+                problems += _compat_problems(video, "video", entries, "video", m)
+            if stills:
+                entries = dict((e["id"], e) for e in catalog_list(ws_real, STILLS_BASE_MODEL, cache)["entries"])
+                problems += _compat_problems(stills, "stills", entries, "stills", STILLS_BASE_MODEL)
+        except _ToolError as e:
+            problems = [str(e)]
+        out.append(check("V5", "catalog compatibility", "fail" if problems else "pass",
+                         "; ".join(problems) or "every catalog LoRA is compatible"))
+    if smoke:
+        return out + [not_needed("V5", "characters")]
+    if not fields["characters"]:
+        out.append(check("V5", "characters", "skip", "no character cast"))
+    for name in fields["characters"]:
+        run = run_light(tool_argv(ws_real, "character", "show", name), ws_real)
+        if run["exit_code"] != 0:
+            out.append(check("V5", "character %s" % name, "fail", run["stderr"].strip() or run["stdout"].strip()))
+            continue
+        try:
+            data, _end = json.JSONDecoder().raw_decode(run["stdout"].lstrip())
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            out.append(check("V5", "character %s" % name, "fail", "cannot parse bin/character show %s" % name))
+            continue
+        loras = data.get("loras") if isinstance(data.get("loras"), dict) else {}
+        stills_lora = loras.get("stills") if isinstance(loras.get("stills"), dict) else None
+        if data.get("status") != "trained":
+            out.append(check("V5", "character %s" % name, "fail",
+                             "character %s is not trained (status %s)" % (name, data.get("status"))))
+        elif stills_lora is not None and stills_lora.get("base_model") != STILLS_BASE_MODEL:
+            out.append(check("V5", "character %s" % name, "fail",
+                             "character %s's stills LoRA is for %s, not %s"
+                             % (name, stills_lora.get("base_model"), STILLS_BASE_MODEL)))
+        else:
+            out.append(check("V5", "character %s" % name, "pass", "trained"))
+        video_lora = loras.get("video") if isinstance(loras.get("video"), dict) else None
+        if video_lora is not None:
+            base = video_lora.get("base_model")
+            if _same_model(base, m):
+                out.append(check("V5", "character %s video base model" % name, "pass", "trained on %s" % base))
+            else:
+                out.append(check("V5", "character %s video base model" % name, "skip",
+                                 "video LoRA trained on %s; bin/ltx-movie does not check this against --model %s"
+                                 % (base, m)))
+    return out
+
+
+def dry_run_check(fields, ws_real, state):
+    """V6: build_argv(fields) + ["--dry-run"] with STORY_PIPELINE_LOGGED=1 (D17)."""
+    argv = build_argv(fields, ws_real, state) + ["--dry-run"]
+    run = run_light(argv, ws_real, env=dict(os.environ, STORY_PIPELINE_LOGGED="1"), timeout=DRY_RUN_TIMEOUT)
+    if run["timed_out"]:
+        return check("V6", "dry run", "fail", "bin/ltx-movie --dry-run timed out after %d s" % DRY_RUN_TIMEOUT)
+    return check("V6", "dry run", "pass" if run["exit_code"] == 0 else "fail", run["stdout"] + run["stderr"])
+
+
+V_GROUP_NAMES = (("V2", "host can run it"), ("V3", "models present and intact"), ("V4", "LoRAs intact"),
+                 ("V5", "compatible"), ("V6", "dry run"))
+
+
+def run_checks(fields, ws_real, state, py=sys.executable):
+    """MU43: V1; on a V1 failure one skip per V2-V6; otherwise V2-V6 in order, no short circuit."""
+    errors = validate_fields(fields, ws_real, state)
+    v1 = check("V1", "fields", "fail" if errors else "pass", "\n".join(errors))
+    if errors:
+        return [v1] + [check(i, n, "skip", "skipped: V1 failed") for i, n in V_GROUP_NAMES]
+    cache = {}
+    return ([v1] + host_checks(fields, ws_real, py) + model_checks(fields, ws_real)
+            + lora_checks(fields, ws_real, cache) + compat_checks(fields, ws_real, cache)
+            + [dry_run_check(fields, ws_real, state)])
