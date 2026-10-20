@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "name": "kyra",
+  "trigger": "kyrawmn",
+  "class_noun": "woman",
+  "referring_phrase": "the woman in grey",
+  "descriptor": "a young East Asian woman with fair skin, long black hair pinned up with three jade hairpins, wearing a pale grey silk kimono with a silver obi",
+  "seed": 0,
+  "source": {
+    "type": "seed_image",
+    "path": "/Users/reubenpatterson/local_model_harness/qwen-agent-workspace/generated/charlora/kyrawmn-v1/stills/char_01.png"
+  },
+  "strength": null,
+  "status": "trained",
+  "created_at": "2026-10-06T13:59:02Z",
+  "dataset": {
+    "reference": "char_00",
+    "kept": 23,
+    "total": 25,
+    "min_score": 7,
+    "face_height": 0.446,
+    "contact_sheet": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/dataset/contact_sheet.jpg"
+  },
+  "loras": {
+    "video": {
+      "path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/lora/video.safetensors",
+      "sha256": "c94762ab686b128b25eb95d774f8febff58bf4ad1c8dc5c212c71cfd4254c02d",
+      "base_model": "/Users/reubenpatterson/ltx-2-mlx/models/ltx-2.3-mlx-q8-dev",
+      "rank": 32,
+      "alpha": 32,
+      "steps": 1000,
+      "trained_at": "2026-10-06T15:31:09Z",
+      "sample_path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/tests/video_lora.mp4",
+      "control_path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/tests/video_control.mp4"
+    },
+    "stills": {
+      "path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/lora/stills.safetensors",
+      "sha256": "61acd3333045dfa8557090ba98290d86ad3430e121b603dd879a939de00b55ca",
+      "base_model": "Tongyi-MAI/Z-Image-Turbo",
+      "rank": 16,
+      "alpha": 16,
+      "steps": 667,
+      "trained_at": "2026-10-06T16:25:07Z",
+      "sample_path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/tests/stills_lora.png",
+      "control_path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/characters/kyra/tests/stills_control.png"
+    }
+  },
+  "stills_skip_reason": null
+}

@@ -1,5 +1,8 @@
 # Generated media & run artifacts — never commit (contains an open content finding, large blobs)
-generated/
+generated/*
+# ...except the character library records (datasets, tests, character.json); LoRA weights stay out
+# (*.safetensors below; GitHub's 100 MB limit) and logs stay out (logs/, *.log below)
+!generated/characters/
 # Runtime logs (may contain raw prompts)
 logs/
 *.log
