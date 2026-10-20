@@ -353,6 +353,14 @@ def build_parser():
                               "or more of them (default 0.8, provisional); a panel that names "
                               "one cast character uses 1.0, except with --shots, where every "
                               "cast character uses this strength")
+    parser.add_argument("--action", dest="actions", action="append", default=None,
+                         metavar="NAME[:STRENGTH]",
+                         help="apply a trained action (motion) LoRA from generated/actions/ to "
+                              "every panel (repeatable); NAME or NAME:STRENGTH (0 < STRENGTH <= 2, "
+                              "default the action's default_strength). It is fused with the panel's "
+                              "cast-character LoRAs, so the cast performs the action. Each action "
+                              "LoRA is checked against the video base (bin/lora-check) first. See "
+                              "docs/superpowers/specs/2026-10-20-action-lora-motion-library-design.md.")
     parser.add_argument("--list-characters", dest="list_characters", action="store_true",
                          default=False,
                          help="print the character library table (the same as bin/character "
@@ -904,6 +912,96 @@ def _resolve_global_loras(args):
             seen[real] = path
             resolved.append((os.path.abspath(path), strength))
         setattr(args, out_attr, resolved)
+    return 0
+
+
+def _action_lib():
+    """action_lib.py, loaded by path (stdlib), for --action resolution."""
+    return importlib.machinery.SourceFileLoader(
+        "action_lib", os.path.join(WS, "action_lib.py")).load_module()
+
+
+def _action_lora_arch_ok(path):
+    """(ok, message): whether an action LoRA matches the video base architecture via
+    bin/lora-check's static check. ok is True on PASS/PARTIAL/UNVERIFIED (base not on
+    disk -> unverified, allowed with a warning), False on FAIL. Factored out so tests
+    can stub it."""
+    try:
+        checker = importlib.machinery.SourceFileLoader(
+            "lora_check", os.path.join(WS, "bin", "lora-check")).load_module()
+        base = checker.resolve_base_dir(_video_skill().MODEL_ID)
+        status, problems = checker.static_check(path, base)
+    except Exception as e:  # noqa: BLE001 - a tooling error must not silently pass a bad LoRA
+        return True, "architecture check unavailable (%s); skipped" % e
+    if status == "FAIL":
+        return False, "; ".join(problems)
+    if status == "UNVERIFIED":
+        return True, "unverified (%s)" % "; ".join(problems)
+    return True, status
+
+
+def _resolve_actions(args):
+    """Resolve --action into (abs path, strength) entries, gate each through
+    bin/lora-check, and merge them into args.global_video_loras so they fuse per
+    panel with cast-character LoRAs. Returns 0 or 2."""
+    specs = getattr(args, "actions", None) or []
+    if not specs:
+        return 0
+    lib = _action_lib()
+    resolved = []
+    for spec in specs:
+        name, sep, strength_s = spec.partition(":")
+        try:
+            lib.validate_name(name)
+            data = lib.load_action(name)
+        except lib.ActionError as e:
+            print("Error: --action %s: %s" % (name, e), file=sys.stderr)
+            return 2
+        if data["status"] != "trained" or not data.get("lora"):
+            print("Error: --action %s: not trained yet (run bin/action train %s)" % (name, name),
+                  file=sys.stderr)
+            return 2
+        path = data["lora"]["path"]
+        if not (os.path.isfile(path) and os.access(path, os.R_OK)):
+            print("Error: --action %s: LoRA file missing or unreadable: %s" % (name, path),
+                  file=sys.stderr)
+            return 2
+        if sep:
+            try:
+                strength = float(strength_s)
+            except ValueError:
+                print("Error: --action %s: strength %r is not a number" % (name, strength_s),
+                      file=sys.stderr)
+                return 2
+        else:
+            strength = data["default_strength"]
+        if not 0 < strength <= 2:
+            print("Error: --action %s: strength must satisfy 0 < s <= 2, got %r" % (name, strength),
+                  file=sys.stderr)
+            return 2
+        ok, msg = _action_lora_arch_ok(path)
+        if not ok:
+            print("Error: --action %s: its LoRA does not match the video base architecture: %s"
+                  % (name, msg), file=sys.stderr)
+            return 2
+        if "unverified" in msg:
+            print("warning: --action %s: %s" % (name, msg), file=sys.stderr)
+        resolved.append((os.path.abspath(path), strength))
+
+    # Merge with existing global video LoRAs, promoting any legacy single --lora so
+    # it is not dropped when actions switch us to the merged (multi-LoRA) route.
+    existing = list(getattr(args, "global_video_loras", None) or [])
+    if not existing:
+        gspecs = getattr(args, "lora_path_specs", None) or []
+        if gspecs:
+            skill = _video_skill()
+            try:
+                existing = [(os.path.abspath(p), s) for (p, s, _e)
+                            in (skill.parse_lora_spec(v) for v in gspecs)]
+            except ValueError as e:
+                print("Error: --lora: %s" % e, file=sys.stderr)
+                return 2
+    args.global_video_loras = existing + resolved
     return 0
 
 
@@ -2322,6 +2420,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_global_loras(args)
+    if rc:
+        return rc
+    rc = _resolve_actions(args)
     if rc:
         return rc
     rc = _resolve_story_engine(args)
