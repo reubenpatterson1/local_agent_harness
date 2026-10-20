@@ -47,7 +47,7 @@ LTX2_MLX_BIN = os.environ.get("LTX2_MLX_BIN",
 LTX2_MLX_HF_HOME = os.environ.get("LTX2_MLX_HF_HOME",
                                   os.path.join(LTX2_MLX_DIR, "hf_cache"))
 
-MODEL_ID = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
+MODEL_ID = "dgrauet/ltx-2.3-mlx-q8"
 GEMMA_MODEL_ID = "mlx-community/gemma-3-12b-it-4bit"
 DEFAULT_WIDTH = 704            # 704 % 32 == 0
 DEFAULT_HEIGHT = 448           # 448 % 64 == 0; distilled two-stage snaps H down to a multiple of 64
@@ -58,6 +58,87 @@ DEFAULT_TILE_FRAMES = 1
 DEFAULT_TILE_SPATIAL = 1
 
 STDERR_TAIL_LINES = 40
+
+# ---------------------------------------------------------------------------
+# Host-aware autotune (opt-in, off by default)
+#
+# The DEFAULT_* constants above stay fixed: they are the validated 48 GB
+# dev-host baseline that the golden tests and every fleet host rely on, and the
+# 16 GB port overrides them downward with explicit flags. Autotune is a
+# SEPARATE, env-gated override layer so a large host can raise geometry / drop
+# --low-ram automatically WITHOUT changing those baked defaults (which would
+# break determinism on that host and silently diverge the fleet). It applies
+# only when QWEN_LTX_AUTOTUNE is truthy AND the caller did not pass the flag
+# itself. Tests never set the env, so they see the baseline unchanged.
+#
+# Big-tier geometry from a measured resolution sweep on an M1 Ultra / 128 GB host
+# (241 frames, low_ram off): peak RAM stayed 28-47 GB across the whole range (memory
+# is never the limit), while render time climbs steeply -- ~6 min/panel at 1024x576,
+# ~12.6 min at 1344x768, ~27.7 min at 1600x896. Default is 1024x576 for multi-panel
+# throughput (a 15-panel movie is ~1.5 h, not ~4 h); raise AUTOTUNE_BIG or pass
+# --video-width/--video-height for hero shots. Adjust if a host measures differently.
+AUTOTUNE_ENV = "QWEN_LTX_AUTOTUNE"
+AUTOTUNE_MEM_ENV = "QWEN_LTX_MEM_GIB"      # test/override seam for detected RAM
+AUTOTUNE_BIG_GIB = 96                      # >= this much unified memory -> big tier
+AUTOTUNE_BIG = {"low_ram": False, "width": 1024, "height": 576, "num_frames": 241}
+
+
+def detect_unified_memory_gib():
+    """Total unified memory in GiB, or None if it can't be determined. Honors
+    $QWEN_LTX_MEM_GIB first (a test/override seam)."""
+    forced = os.environ.get(AUTOTUNE_MEM_ENV)
+    if forced:
+        try:
+            return float(forced)
+        except ValueError:
+            return None
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                             text=True, timeout=5)
+        return int(out.stdout.strip()) / (1024 ** 3)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def autotune_enabled():
+    """True when $QWEN_LTX_AUTOTUNE is set to a truthy value (1/true/yes/on)."""
+    return os.environ.get(AUTOTUNE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def autotune_overrides(mem_gib=None):
+    """The geometry/low_ram overrides for this host's memory tier, or {} for no
+    change. Independent of autotune_enabled() so it is testable directly; the
+    entrypoints consult autotune_enabled() before applying it."""
+    if mem_gib is None:
+        mem_gib = detect_unified_memory_gib()
+    if mem_gib is None:
+        return {}
+    if mem_gib >= AUTOTUNE_BIG_GIB:
+        return dict(AUTOTUNE_BIG)
+    return {}
+
+
+def maybe_autotune_apply(args, argv, fields):
+    """When autotune is enabled, override each field on the args namespace that
+    the user did not pass on the command line. No-op (returns []) when autotune
+    is off or the host is below the big tier, so tests and small hosts are
+    unaffected. `fields` is a list of (override_key, attr, [flag_aliases],
+    transform). Returns a list of 'attr=value' strings describing what changed,
+    for the caller to log."""
+    if not autotune_enabled():
+        return []
+    overrides = autotune_overrides()
+    if not overrides:
+        return []
+    applied = []
+    for key, attr, flags, transform in fields:
+        if key not in overrides:
+            continue
+        if any(a == f or a.startswith(f + "=") for a in argv for f in flags):
+            continue  # user passed it explicitly -> respect their value
+        setattr(args, attr, transform(overrides[key]))
+        applied.append("%s=%r" % (attr, getattr(args, attr)))
+    return applied
 
 
 class Ltx2MlxError(RuntimeError):

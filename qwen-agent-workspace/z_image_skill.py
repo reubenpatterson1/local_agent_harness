@@ -232,6 +232,77 @@ def generate_image(prompt: str, output_path: str = None, lora_path=None, loras=N
     return image
 
 
+# Lazily-built img2img pipeline, sharing the txt2img singleton's weights.
+_img2img_pipeline = None
+
+
+def _get_img2img_pipeline(lora_path=None, loras=None):
+    """A ZImageImg2ImgPipeline built via from_pipe() off the loaded txt2img
+    singleton, so it reuses the same transformer / VAE / text encoder with no
+    extra download or second copy in memory. Built once, then cached."""
+    global _img2img_pipeline
+    if _img2img_pipeline is None:
+        from diffusers import ZImageImg2ImgPipeline
+        base = _get_pipeline(lora_path=lora_path, loras=loras)
+        _img2img_pipeline = ZImageImg2ImgPipeline.from_pipe(base)
+    return _img2img_pipeline
+
+
+def generate_variation(seed_image, prompt, output_path=None, strength=0.45,
+                       generator=None, lora_path=None, loras=None, **kwargs):
+    """One pixel-anchored img2img image from seed_image at `strength`, saved to
+    output_path. The single-image primitive behind generate_variations, matching
+    generate_image's interface so a caller (e.g. the dataset child) can pick
+    text2img or img2img per job. seed_image is a PIL.Image or a path. Defaults:
+    num_inference_steps=9, guidance_scale=0.0 (distilled turbo). Returns the PIL
+    image; it is screened by content_safety first."""
+    from PIL import Image
+    if isinstance(seed_image, str):
+        seed_image = Image.open(seed_image).convert("RGB")
+    pipeline = _get_img2img_pipeline(lora_path=lora_path, loras=loras)
+    kwargs.setdefault("num_inference_steps", 9)
+    kwargs.setdefault("guidance_scale", 0.0)
+    if generator is not None:
+        kwargs["generator"] = generator
+    result = pipeline(prompt=prompt, image=seed_image, strength=strength, **kwargs)
+    image = result.images[0]
+    content_safety.assert_image_safe(image, skill="z_image_skill", prompt=prompt)
+    if output_path:
+        image.save(output_path)
+    return image
+
+
+def generate_variations(seed_image, prompts, strength=0.45, output_dir=None,
+                        lora_path=None, loras=None, base_seed=0, **kwargs):
+    """Produce pixel-anchored variants of a seed image: for each prompt, run
+    Z-Image img2img from the seed at `strength`, so the seed's actual pixels --
+    fine details like scars or specific jewelry -- carry into every variant,
+    unlike text-to-image which only gets a text descriptor.
+
+    seed_image: a PIL.Image or a path to one.
+    prompts: an iterable of prompt strings; one variant per prompt.
+    strength: 0..1 denoise strength. Lower preserves the seed's detail (less
+        pose/framing variation); higher varies more and preserves less. ~0.4-0.6
+        is the usual sweet spot. Note the turbo schedule is short, so the
+        effective step count is ~num_inference_steps * strength.
+    output_dir: if set, each variant is saved as var_00.png, var_01.png, ...
+    Returns a list of PIL images. Every image passes through content_safety.
+    """
+    from PIL import Image
+    if isinstance(seed_image, str):
+        seed_image = Image.open(seed_image).convert("RGB")
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    images = []
+    for i, prompt in enumerate(prompts):
+        out = os.path.join(output_dir, "var_%02d.png" % i) if output_dir else None
+        gen = torch.Generator("cpu").manual_seed(base_seed + i)
+        images.append(generate_variation(seed_image, prompt, output_path=out,
+                                          strength=strength, generator=gen,
+                                          lora_path=lora_path, loras=loras, **dict(kwargs)))
+    return images
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 z_image_skill.py \"<prompt>\" [output_path]")

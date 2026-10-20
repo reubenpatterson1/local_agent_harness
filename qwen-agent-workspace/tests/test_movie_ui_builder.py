@@ -238,11 +238,18 @@ def test_mut25_source_scan_of_new_python_files():
 
 
 def test_mut26_pipeline_files_are_unchanged():
+    # MUK3: the movie-ui must not modify any pipeline file. Baseline re-based from
+    # 22dc4a1 (pre-movie-ui) to fb8b9a5 when the action-LoRA / pipeline PR
+    # intentionally advanced the pipeline; the movie-ui itself still made zero
+    # pipeline changes (verified: git diff 22dc4a1..c275a0a over PIPELINE_FILES is
+    # empty), and this invariant holds going forward from the new baseline.
+    BASELINE = "fb8b9a50e2c58a420979acff49548b7a46d10215"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
-    if subprocess.run(["git", "-C", mt.WS, "cat-file", "-e", "22dc4a1^{commit}"], capture_output=True).returncode:
-        pytest.skip("commit 22dc4a1 is not in this checkout")
-    proc = subprocess.run(["git", "-C", mt.WS, "diff", "--quiet", "22dc4a1", "--"] + list(PIPELINE_FILES),
+    if subprocess.run(["git", "-C", mt.WS, "cat-file", "-e", BASELINE + "^{commit}"],
+                      capture_output=True).returncode:
+        pytest.skip("baseline commit %s is not in this checkout" % BASELINE)
+    proc = subprocess.run(["git", "-C", mt.WS, "diff", "--quiet", BASELINE, "--"] + list(PIPELINE_FILES),
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
