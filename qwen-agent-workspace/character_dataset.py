@@ -48,9 +48,12 @@ import ltx2_mlx_video_skill as SKILL  # noqa: E402
 
 STORY_SERVER = os.path.join(WS, "bin", "story-server")
 
-VLM_URL      = "http://127.0.0.1:8177/v1/chat/completions"
-MODELS_URL   = "http://127.0.0.1:8177/v1/models"
-VLM_MODEL    = "qwen38-6bit"
+VLM_URL      = os.environ.get("QWEN_AGENT_VLM_URL", "http://127.0.0.1:8177/v1/chat/completions")
+MODELS_URL   = os.environ.get("QWEN_AGENT_VLM_MODELS_URL", "http://127.0.0.1:8177/v1/models")
+# Model id sent to the VLM. "auto" (via QWEN_AGENT_VLM_MODEL=auto) resolves to the
+# single model the server reports -- so mlx_vlm.server, which has no served-name
+# alias and reports the model by its path, works without a matching hardcoded name.
+VLM_MODEL    = os.environ.get("QWEN_AGENT_VLM_MODEL", "qwen38-6bit")
 WIDTH, HEIGHT = 1024, 640
 STYLE = "photorealistic live-action film still, natural light"
 SHOTS = [
@@ -288,7 +291,7 @@ def image_data_url(path, max_side=768):
 def vlm_call(content_parts, max_tokens=600):
     """POST to the VLM and return the reply text; raise RuntimeError on failure."""
     payload = json.dumps({
-        "model": VLM_MODEL,
+        "model": resolve_vlm_model(),
         "messages": [{"role": "user", "content": content_parts}],
         "temperature": 0,
         "max_tokens": max_tokens,
@@ -357,12 +360,35 @@ def trigger_test_prompt(trigger, class_noun):
 _STATE_RE = re.compile(r"^\s*state:\s*(.+?)\s*$")
 
 
+_resolved_vlm_model = None
+
+
+def _served_model_ids():
+    """The model ids the VLM server reports at MODELS_URL."""
+    req = urllib.request.Request(MODELS_URL, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return [m["id"] for m in json.loads(resp.read())["data"]]
+
+
+def resolve_vlm_model():
+    """The model id to send to the VLM: VLM_MODEL, or when it is 'auto' the single
+    model the server reports (cached). Raises RuntimeError if auto and the server
+    reports anything other than exactly one model."""
+    global _resolved_vlm_model
+    if VLM_MODEL != "auto":
+        return VLM_MODEL
+    if _resolved_vlm_model is None:
+        ids = _served_model_ids()
+        if len(ids) != 1:
+            raise RuntimeError("QWEN_AGENT_VLM_MODEL=auto needs exactly one served model at "
+                               "%s, got %r" % (MODELS_URL, ids))
+        _resolved_vlm_model = ids[0]
+    return _resolved_vlm_model
+
+
 def vlm_ready():
     try:
-        req = urllib.request.Request(MODELS_URL, method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read())
-        return VLM_MODEL in [m["id"] for m in body["data"]]
+        return resolve_vlm_model() in _served_model_ids()
     except Exception:
         return False
 

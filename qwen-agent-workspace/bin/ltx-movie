@@ -766,6 +766,23 @@ def _ltx2_skill():
         "ltx2_mlx_video_skill", os.path.join(WS, "ltx2_mlx_video_skill.py")).load_module()
 
 
+STORY_BASE_URL = os.environ.get("QWEN_AGENT_STORY_BASE_URL", "http://127.0.0.1:8177/v1")
+
+
+def _resolve_story_model(base_url=STORY_BASE_URL):
+    """The single model id the story server reports at base_url/models, or None
+    (server unreachable, or it reports zero or multiple models). Lets Phase 1 match
+    whatever the server serves -- e.g. mlx_lm.server, which reports the model by its
+    path and has no served-name alias -- without the operator passing --story-model."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=3) as resp:
+            ids = [m["id"] for m in json.loads(resp.read()).get("data", [])]
+        return ids[0] if len(ids) == 1 else None
+    except Exception:
+        return None
+
+
 def _story_engine():
     """story_engine.py, the robust Phase 1 engine, loaded by path and only inside function bodies
     (robust story spec 1.2), so importing this file stays stdlib-only."""
@@ -1163,6 +1180,12 @@ def phase1_story(args):
                "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
                "--request-timeout", "600"]
+        if args.story_model is None:
+            # Auto-detect the served model so Phase 1 matches it without --story-model.
+            args.story_model = _resolve_story_model()
+            if args.story_model:
+                print("story model auto-detected from %s: %s"
+                      % (STORY_BASE_URL, args.story_model), file=sys.stderr)
         if args.story_model:
             cmd += ["--model", args.story_model]
         if args.story_context_window:

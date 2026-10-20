@@ -437,6 +437,25 @@ def test_d41_dataset_plan(monkeypatch):
     assert [e["n"] for e in tp] == list(range(1, na * (1 + ns) + 1))   # contiguous numbering
 
 
+def test_d42_resolve_vlm_model(monkeypatch):
+    """resolve_vlm_model returns an explicit VLM_MODEL as-is, or (for 'auto') the
+    single served model; it raises when auto and the server reports != 1 model."""
+    import pytest
+    monkeypatch.setattr(character_dataset, "VLM_MODEL", "qwen38-6bit")
+    monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
+    assert character_dataset.resolve_vlm_model() == "qwen38-6bit"
+
+    monkeypatch.setattr(character_dataset, "VLM_MODEL", "auto")
+    monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
+    monkeypatch.setattr(character_dataset, "_served_model_ids", lambda: ["/mlx_models/qwen3-vl"])
+    assert character_dataset.resolve_vlm_model() == "/mlx_models/qwen3-vl"
+
+    monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
+    monkeypatch.setattr(character_dataset, "_served_model_ids", lambda: ["a", "b"])
+    with pytest.raises(RuntimeError):
+        character_dataset.resolve_vlm_model()
+
+
 def test_d36_child_failure_names_the_log(tmp_path, monkeypatch):
     monkeypatch.setattr(character_dataset, "run_logged", lambda *a, **kw: 1)
     with pytest.raises(DatasetError) as info:
