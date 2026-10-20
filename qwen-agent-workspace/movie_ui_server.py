@@ -1235,11 +1235,35 @@ PANEL_STILL_RE = re.compile(r"^panel_\d{2}\.png$")
 PANEL_CLIP_RE = re.compile(r"^panel_\d{2}\.mp4$")
 
 
-def _matching(directory, regex):
+def _inside(path, base):
+    """True when path's realpath lies strictly inside base's realpath (compared with a trailing separator)."""
     try:
-        return sorted(os.path.join(directory, n) for n in os.listdir(directory) if regex.fullmatch(n))
+        return os.path.realpath(path).startswith(os.path.realpath(base) + os.sep)
+    except ValueError:
+        return False
+
+
+def _matching(directory, regex, base=None):
+    try:
+        paths = sorted(os.path.join(directory, n) for n in os.listdir(directory) if regex.fullmatch(n))
     except OSError:
         return []
+    return [p for p in paths if base is None or _inside(p, base)]
+
+
+def _json_in(base, path):
+    """The parsed JSON at path, or None when it is outside base, unreadable, not UTF-8 or not strict JSON."""
+    if not _inside(path, base):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return json.loads(f.read().decode("utf-8"), parse_constant=_bad_constant)
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def _isfile_in(base, path):
+    return _inside(path, base) and os.path.isfile(path)
 
 
 def _checks_summary(checks):
@@ -1260,15 +1284,19 @@ def _h_stories(self, groups, query, body):
     stories = []
     for name in names:
         sdir = os.path.join(root, name)
-        if not (lib.valid_story_id(name) and name != lib.SMOKE_STORY_ID and os.path.isdir(sdir)):
+        if not (lib.valid_story_id(name) and name != lib.SMOKE_STORY_ID and os.path.isdir(sdir)
+                and _inside(sdir, root)):
             continue
-        mtime = os.stat(sdir).st_mtime
+        try:
+            mtime = os.stat(sdir).st_mtime
+        except OSError:
+            continue
         stories.append((mtime, {
-            "id": name, "story_md": os.path.isfile(os.path.join(sdir, "story.md")),
-            "checks": _checks_summary(lib.read_json(os.path.join(sdir, "story_checks.json"))),
-            "stills": len(_matching(os.path.join(sdir, "images"), PANEL_STILL_RE)),
-            "clips": len(_matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE)),
-            "movie": os.path.isfile(os.path.join(sdir, "movie.mp4")),
+            "id": name, "story_md": _isfile_in(sdir, os.path.join(sdir, "story.md")),
+            "checks": _checks_summary(_json_in(sdir, os.path.join(sdir, "story_checks.json"))),
+            "stills": len(_matching(os.path.join(sdir, "images"), PANEL_STILL_RE, sdir)),
+            "clips": len(_matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE, sdir)),
+            "movie": _isfile_in(sdir, os.path.join(sdir, "movie.mp4")),
             "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))}))
     stories.sort(key=lambda pair: (-pair[0], pair[1]["id"]))
     return 200, {"stories_dir": _fs_text(root), "stories": [s for _m, s in stories]}
@@ -1278,17 +1306,15 @@ def _story_dir(self, groups, value):
     real = self.ws(value)
     story_id = self.story_id(groups[0])
     sdir = lib.story_dir(real, story_id)
-    root = os.path.realpath(os.path.join(real, "generated", "stories"))
-    try:
-        inside = os.path.realpath(sdir).startswith(root + os.sep)
-    except ValueError:
-        inside = False
-    if not (inside and os.path.isdir(sdir)):
+    root = os.path.join(real, "generated", "stories")
+    if not (_inside(sdir, root) and os.path.isdir(sdir)):
         raise ApiError(404, "no story %s in %s" % (story_id, _fs_text(os.path.dirname(sdir))))
     return real, story_id, sdir
 
 
-def _read_bytes(path):
+def _read_bytes(path, base):
+    if not _inside(path, base):
+        return None
     try:
         with open(path, "rb") as f:
             return f.read()
@@ -1298,27 +1324,31 @@ def _read_bytes(path):
 
 def _h_story(self, groups, query, body):
     real, story_id, sdir = _story_dir(self, groups, query.get("ws"))
-    raw = _read_bytes(os.path.join(sdir, "story.md"))
-    plan = lib.read_json(os.path.join(sdir, "plan.json"))
+    raw = _read_bytes(os.path.join(sdir, "story.md"), sdir)
+    plan = _json_in(sdir, os.path.join(sdir, "plan.json"))
     plan = plan if isinstance(plan, dict) else {}
     runs = os.path.join(sdir, "runs")
     try:
         run_names = sorted((n for n in os.listdir(runs)
-                            if os.path.isfile(os.path.join(runs, n, "story_summary.json"))), reverse=True)
+                            if _isfile_in(sdir, os.path.join(runs, n, "story_summary.json"))), reverse=True)
     except OSError:
         run_names = []
     movie = os.path.join(sdir, "movie.mp4")
+    try:
+        files = sorted(_fs_text(n) for n in os.listdir(sdir))
+    except OSError:
+        files = []
     job = newest_job(self.server, ("story", "movie"), real, "story_id", story_id)
-    return 200, {"id": story_id, "dir": _fs_text(sdir), "files": sorted(_fs_text(n) for n in os.listdir(sdir)),
+    return 200, {"id": story_id, "dir": _fs_text(sdir), "files": files,
                  "story_md": None if raw is None else {"text": raw.decode("utf-8", "replace"),
                                                        "sha256": hashlib.sha256(raw).hexdigest()},
-                 "checks": lib.read_json(os.path.join(sdir, "story_checks.json")),
+                 "checks": _json_in(sdir, os.path.join(sdir, "story_checks.json")),
                  "plan_loras": plan.get("loras"), "plan_mode": plan.get("mode"),
-                 "catalog_loras": lib.read_json(os.path.join(sdir, "catalog_loras.json")),
-                 "stills": [_fs_text(p) for p in _matching(os.path.join(sdir, "images"), PANEL_STILL_RE)],
-                 "clips": [_fs_text(p) for p in _matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE)],
-                 "movie": _fs_text(movie) if os.path.isfile(movie) else None,
-                 "summary": lib.read_json(os.path.join(runs, run_names[0], "story_summary.json")) if run_names else None,
+                 "catalog_loras": _json_in(sdir, os.path.join(sdir, "catalog_loras.json")),
+                 "stills": [_fs_text(p) for p in _matching(os.path.join(sdir, "images"), PANEL_STILL_RE, sdir)],
+                 "clips": [_fs_text(p) for p in _matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE, sdir)],
+                 "movie": _fs_text(movie) if _isfile_in(sdir, movie) else None,
+                 "summary": _json_in(sdir, os.path.join(runs, run_names[0], "story_summary.json")) if run_names else None,
                  "last_fields": job["fields"] if job is not None else None}
 
 
@@ -1334,12 +1364,14 @@ def _h_story_save(self, groups, query, body):
     except UnicodeEncodeError:
         raise ApiError(400, "text must be encodable as UTF-8")
     path = os.path.join(sdir, "story.md")
+    if os.path.lexists(path) and not _inside(path, sdir):
+        raise ApiError(404, "not found")
     with STORE_LOCK:
         for job_id in lib.active_job_ids(self.server.state):
             job = self.server.job(job_id)
             if job is not None and job["workspace"] == real and job["story_id"] == story_id:
                 raise ApiError(409, "story %s is in use by job %s" % (story_id, job_id))
-        raw = _read_bytes(path)
+        raw = _read_bytes(path, sdir)
         current = None if raw is None else hashlib.sha256(raw).hexdigest()
         if current != base:
             raise ApiError(409, "story.md changed since it was loaded; reload it", sha256=current)
@@ -1353,6 +1385,12 @@ def _h_story_save(self, groups, query, body):
             lib.write_bytes_atomic(backup, raw)
         lib.write_bytes_atomic(path, data)
     return 200, {"sha256": hashlib.sha256(data).hexdigest(), "backup": backup}
+
+
+def _range_num(digits):
+    """A Range number: leading zeros stripped, more than 18 digits counts as 10**18."""
+    digits = digits.lstrip("0") or "0"
+    return 10 ** 18 if len(digits) > 18 else int(digits)
 
 
 def _h_files(self, groups, query, body):
@@ -1372,38 +1410,47 @@ def _h_files(self, groups, query, body):
         raise ApiError(403, "path not allowed")
     if not os.path.isfile(real):
         raise ApiError(404, "not found")
-    size = os.path.getsize(real)
-    ctype = FILE_TYPES.get(os.path.splitext(real)[1].lower(), "application/octet-stream")
-    start, end, status = 0, size - 1, 200
-    m = RANGE_RE.match(self.headers.get("Range") or "")
-    if m and (m.group(1) or m.group(2)):
-        if m.group(1):
-            start = int(m.group(1))
-            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
-        else:
-            start, end = max(size - int(m.group(2)), 0), size - 1
-            if int(m.group(2)) == 0:
-                start = size
-        if start > end or start >= size:
-            self.send_response(416)
-            for key, value in (("Content-Range", "bytes */%d" % size), ("Content-Length", "0"),
-                               ("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
-                               ("Cache-Control", "no-store")):
-                self.send_header(key, value)
-            self.end_headers()
-            return None
-        status = 206
-    self.send_response(status)
-    self.send_header("Content-Type", ctype)
-    self.send_header("Content-Length", str(end - start + 1))
-    if status == 206:
-        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
-    for key, value in (("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
-                       ("Cache-Control", "no-store")):
-        self.send_header(key, value)
-    self.end_headers()
     try:
-        with open(real, "rb") as f:
+        f = open(real, "rb")
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            raise ApiError(403, "path not allowed")
+        raise ApiError(404, "not found")
+    try:
+        try:
+            size = os.fstat(f.fileno()).st_size
+        except OSError:
+            raise ApiError(404, "not found")
+        ctype = FILE_TYPES.get(os.path.splitext(real)[1].lower(), "application/octet-stream")
+        start, end, status = 0, size - 1, 200
+        m = RANGE_RE.match(self.headers.get("Range") or "")
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = _range_num(m.group(1))
+                end = min(_range_num(m.group(2)), size - 1) if m.group(2) else size - 1
+            else:
+                start, end = max(size - _range_num(m.group(2)), 0), size - 1
+                if _range_num(m.group(2)) == 0:
+                    start = size
+            if start > end or start >= size:
+                self.send_response(416)
+                for key, value in (("Content-Range", "bytes */%d" % size), ("Content-Length", "0"),
+                                   ("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
+                                   ("Cache-Control", "no-store")):
+                    self.send_header(key, value)
+                self.end_headers()
+                return None
+            status = 206
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(end - start + 1))
+        if status == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        for key, value in (("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
+                           ("Cache-Control", "no-store")):
+            self.send_header(key, value)
+        self.end_headers()
+        try:
             f.seek(start)
             left = end - start + 1
             while left > 0:
@@ -1412,8 +1459,10 @@ def _h_files(self, groups, query, body):
                     break
                 self.wfile.write(chunk)
                 left -= len(chunk)
-    except (BrokenPipeError, ConnectionResetError):
-        pass
+        except OSError:
+            pass
+    finally:
+        f.close()
     return None
 
 

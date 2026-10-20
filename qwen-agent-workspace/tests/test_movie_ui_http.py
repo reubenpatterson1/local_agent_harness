@@ -921,3 +921,82 @@ def test_review_focus_2_files_with_spaces_and_non_ascii_names(env):
     status, headers, body = mt.api(s, "GET", "/files?ws=%s&path=%s" % (enc(ws), enc(path)))
     assert (status, headers["content-type"], body) == (200, "image/png", mt.PNG)
     assert mt.api(s, "GET", "/api/stories?ws=" + enc(ws))[2]["stories"][0]["id"] == "ronin-rescue"
+
+
+def test_t14_fix_files_unreadable_gives_clean_403(env):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file modes")
+    s, ws = env["srv"], env["ws"]
+    sdir = _make_story(ws, "ronin-rescue", files=[("clips/locked.mp4", b"data")])
+    locked = os.path.join(sdir, "clips", "locked.mp4")
+    os.chmod(locked, 0)
+    try:
+        status, _h, payload = mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, locked))
+    finally:
+        os.chmod(locked, 0o644)
+    assert (status, payload) == (403, {"error": "path not allowed"})
+
+
+def test_t14_fix_files_prefix_sibling_and_nul(env):
+    s, ws = env["srv"], env["ws"]
+    evil = os.path.join(ws, "generated-evil")
+    os.makedirs(evil)
+    with open(os.path.join(evil, "x.png"), "wb") as f:
+        f.write(mt.PNG)
+    assert mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, os.path.join(evil, "x.png")))[0] == 403
+    assert mt.api(s, "GET", "/files?ws=%s&path=%s/generated/a%%00b.png" % (ws, ws))[0] == 404
+
+
+def test_t14_fix_huge_range_numbers(env):
+    s, ws = env["srv"], env["ws"]
+    sdir = _make_story(ws, "ronin-rescue", files=[("clips/panel_01.mp4", bytes(range(100)))])
+    url = "/files?ws=%s&path=%s" % (ws, os.path.join(sdir, "clips", "panel_01.mp4"))
+    status, headers, _b = mt.api(s, "GET", url, headers={"Range": "bytes=" + "9" * 5000 + "-"})
+    assert (status, headers["content-range"]) == (416, "bytes */100")
+    status, headers, body = mt.api(s, "GET", url, headers={"Range": "bytes=0-" + "9" * 5000})
+    assert (status, len(body)) == (206, 100)
+    assert mt.api(s, "GET", url, headers={"Range": "bytes=0005-0007"})[2] == bytes(range(5, 8))
+
+
+def test_t14_fix_story_json_never_500(env):
+    s, ws = env["srv"], env["ws"]
+    _make_story(ws, "ronin-rescue", "x", files=[
+        ("runs/r1/story_summary.json", b'{"score": NaN}'), ("plan.json", b"\xff\xfe"),
+        ("story_checks.json", b'{"hard": [], "advisory": [], "verdict": NaN}')])
+    detail = mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)
+    assert detail[0] == 200 and detail[2]["summary"] is None and detail[2]["checks"] is None
+    assert detail[2]["plan_mode"] is None
+    listing = mt.api(s, "GET", "/api/stories?ws=" + ws)
+    assert listing[0] == 200 and listing[2]["stories"][0]["checks"] is None
+
+
+def test_t14_fix_story_symlink_escapes(env):
+    s, ws = env["srv"], env["ws"]
+    outside = os.path.join(env["tmp"], "outside-story")
+    os.makedirs(outside)
+    with open(os.path.join(outside, "story.md"), "wb") as f:
+        f.write(b"outside")
+    stories = os.path.join(ws, "generated", "stories")
+    os.makedirs(stories, exist_ok=True)
+    os.symlink(outside, os.path.join(stories, "evil"))
+    assert mt.api(s, "GET", "/api/stories/evil?ws=" + ws)[0] == 404
+    status = mt.api(s, "PUT", "/api/stories/evil/story.md", body={
+        "ws": ws, "text": "pwn", "base_sha256": hashlib.sha256(b"outside").hexdigest()})[0]
+    assert status == 404
+    assert [st["id"] for st in mt.api(s, "GET", "/api/stories?ws=" + ws)[2]["stories"]] == []
+    with open(os.path.join(outside, "story.md"), "rb") as f:
+        assert f.read() == b"outside"
+    # story.md itself a symlink out of its story dir
+    sdir = _make_story(ws, "ronin-rescue")
+    target = os.path.join(env["tmp"], "outside-file.md")
+    with open(target, "wb") as f:
+        f.write(b"secret")
+    os.symlink(target, os.path.join(sdir, "story.md"))
+    detail = mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)[2]
+    assert detail["story_md"] is None
+    assert mt.api(s, "GET", "/api/stories?ws=" + ws)[2]["stories"][0]["story_md"] is False
+    for base in (None, hashlib.sha256(b"secret").hexdigest()):
+        assert mt.api(s, "PUT", "/api/stories/ronin-rescue/story.md",
+                      body={"ws": ws, "text": "pwn", "base_sha256": base})[0] == 404
+    with open(target, "rb") as f:
+        assert f.read() == b"secret"
