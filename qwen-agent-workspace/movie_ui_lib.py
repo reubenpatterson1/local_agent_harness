@@ -518,7 +518,7 @@ def kill_orphan(state, job_id):
 # Compose fields, the command builder and light subprocesses (MU36-MU41, MU59)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"     # bin/ltx-movie:318
+DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"                     # bin/ltx-movie:318, ltx2_mlx_video_skill.py:50
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"          # bin/ltx-movie:319-323
 STILLS_BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"               # lora_catalog.py:29
 ZIMAGE_TEXT_ENCODER = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"   # z_image_skill.py:53

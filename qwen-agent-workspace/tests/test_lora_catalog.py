@@ -27,6 +27,10 @@ import lora_catalog  # noqa: E402
 import story_engine_testutil as seu  # noqa: E402
 
 LORA_CATALOG_CLI = os.path.join(WS, "bin", "lora-catalog")
+# bin/lora-catalog add's architecture gate (bin/lora-check) when no declared base model is on
+# disk -- always the case under story_env (temporary HOME, no HF_HOME).
+ARCH_UNVERIFIED = ("arch: architecture UNVERIFIED: none of the declared base models are on disk "
+                   "yet; run bin/lora-check once the base is installed\n")
 
 
 @pytest.fixture(autouse=True)
@@ -260,7 +264,7 @@ def test_lct7_add_happy_path(tmp_path, story_env):
     sha = seu.sha256_file(zeta)
     assert result.stdout == "added zeta-motion (motion, video, rank 16, sha256 %s...) to %s\n" % (
         sha[:12], path)
-    assert result.stderr == ""
+    assert result.stderr == ARCH_UNVERIFIED
     entry = lora_catalog.load_catalog(path)["entries"][0]
     assert entry == {
         "id": "zeta-motion", "kind": "motion", "path": os.path.abspath(zeta), "sha256": sha,
@@ -290,18 +294,20 @@ def test_lct8_add_errors_leave_the_catalog_unchanged(tmp_path, story_env):
     seu.fake_safetensors(kyra_video, 32, 32)
     cases = [
         (_add_argv(seu.lora_file(files, "a", rank=16), "first-motion"),
-         "Error: catalog entry first-motion already exists\n"),
+         ARCH_UNVERIFIED + "Error: catalog entry first-motion already exists\n"),
         (_add_argv(first, "second-motion"),
-         "Error: %s is already cataloged as first-motion\n" % first),
+         ARCH_UNVERIFIED + "Error: %s is already cataloged as first-motion\n" % first),
         (_add_argv(kyra_video, "kyra-copy"),
-         "Error: %s is character kyra's video LoRA; cast it with bin/ltx-movie --character\n"
+         ARCH_UNVERIFIED
+         + "Error: %s is character kyra's video LoRA; cast it with bin/ltx-movie --character\n"
          % kyra_video),
         (_add_argv(seu.lora_file(files, "b", rank=16), "b-motion", "--trigger", "FIRSTMO"),
-         "Error: trigger FIRSTMO is already catalog entry first-motion's trigger\n"),
+         ARCH_UNVERIFIED + "Error: trigger FIRSTMO is already catalog entry first-motion's trigger\n"),
         (_add_argv(seu.lora_file(files, "c", rank=16), "c-motion", "--trigger", "kyrawmn"),
-         "Error: trigger kyrawmn is character kyra's trigger\n"),
+         ARCH_UNVERIFIED + "Error: trigger kyrawmn is character kyra's trigger\n"),
         (_add_argv(seu.lora_file(files, "d", rank=16, alpha=8), "d-motion"),
-         "Error: entry d-motion: alpha must equal rank (16); ltx-2-mlx fuses B@A*strength with "
+         ARCH_UNVERIFIED
+         + "Error: entry d-motion: alpha must equal rank (16); ltx-2-mlx fuses B@A*strength with "
          "no alpha/rank scaling (fuse_loras.py), so this LoRA would render at the wrong "
          "strength\n"),
         (_add_argv(seu.lora_file(files, "e", rank=16, pairs=False), "e-motion"),
@@ -311,7 +317,8 @@ def test_lct8_add_errors_leave_the_catalog_unchanged(tmp_path, story_env):
                    "f-motion"),
          "Error: cannot read the LoRA alpha from the safetensors header; pass --alpha\n"),
         (_add_argv(seu.lora_file(files, "g", rank=16), "g-motion", "--default-strength", "1.5"),
-         "Error: entry g-motion: strength_range and default_strength must satisfy 0 < lo <= "
+         ARCH_UNVERIFIED
+         + "Error: entry g-motion: strength_range and default_strength must satisfy 0 < lo <= "
          "default <= hi <= 2, got range [0.5, 1.0] and default 1.5\n"),
         (_add_argv(os.path.join(files, "missing.safetensors"), "h-motion"),
          "Error: %s is not a readable file\n" % os.path.join(files, "missing.safetensors")),
@@ -442,7 +449,7 @@ def test_lct31_io_errors_are_reported_not_raised(tmp_path, story_env, monkeypatc
     cli = importlib.machinery.SourceFileLoader("lora_catalog_cli", LORA_CATALOG_CLI).load_module()
     lora = seu.lora_file(files, "n")
     assert cli.main(_add_argv(lora, "n-motion")) == 2
-    assert capsys.readouterr().err == "Error: %s is not a readable file\n" % lora
+    assert capsys.readouterr().err == ARCH_UNVERIFIED + "Error: %s is not a readable file\n" % lora
     assert _catalog_bytes(story_env) is None
     monkeypatch.undo()
     seu.set_story_env(monkeypatch, tmp_path)
@@ -453,7 +460,8 @@ def test_lct31_io_errors_are_reported_not_raised(tmp_path, story_env, monkeypatc
     monkeypatch.setattr(lora_catalog, "save_catalog", full)
     path = os.path.join(story_env["catalog"], "catalog.json")
     assert cli.main(_add_argv(lora, "n-motion")) == 2
-    assert capsys.readouterr().err == "Error: cannot write %s: No space left on device\n" % path
+    assert capsys.readouterr().err == (
+        ARCH_UNVERIFIED + "Error: cannot write %s: No space left on device\n" % path)
     monkeypatch.undo()
     seu.set_story_env(monkeypatch, tmp_path)
     ro = tmp_path / "ro"

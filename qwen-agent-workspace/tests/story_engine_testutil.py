@@ -39,7 +39,7 @@ DESC_R = "a lean man in his late thirties with a topknot and a scarred brow wear
 VIDEO_BYTES = b"fake-video-lora!"
 STILLS_BYTES = b"fake-stills-lora"
 CHARACTER_BASE_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
-VIDEO_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
+VIDEO_MODEL = "dgrauet/ltx-2.3-mlx-q8"                    # bin/ltx-movie --model default
 STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 
@@ -59,6 +59,8 @@ def set_story_env(monkeypatch, tmp_path):
     monkeypatch.setenv("STORY_PIPELINE_LOGGED", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("QWEN_AGENT_PREFLIGHT_DONE", raising=False)
+    for name in ("HF_HOME", "Z_IMAGE_HF_HOME", "QWEN_AGENT_WORKSPACE"):   # bin/lora-check's search
+        monkeypatch.delenv(name, raising=False)
     return {"home": home, "lib": lib, "catalog": catalog}
 
 

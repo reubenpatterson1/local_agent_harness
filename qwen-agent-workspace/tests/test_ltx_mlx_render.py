@@ -51,7 +51,7 @@ def test_parser_defaults():
     check("R1f frame_rate 24 and is an int", a.frame_rate == 24 and isinstance(a.frame_rate, int),
           "got %r" % a.frame_rate)
     check("R1g seed 0", a.seed == 0, "got %r" % a.seed)
-    check("R1h model is the pack id", a.model == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8",
+    check("R1h model is the pack id", a.model == "dgrauet/ltx-2.3-mlx-q8",
           "got %r" % a.model)
     check("R1h1 gemma is SKILL.GEMMA_MODEL_ID", a.gemma == render.SKILL.GEMMA_MODEL_ID,
           "got %r" % a.gemma)

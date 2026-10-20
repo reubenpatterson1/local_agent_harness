@@ -2370,12 +2370,14 @@ def main(argv=None):
         return _list_characters(raw_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
-    _autotuned = _ltx2_skill().maybe_autotune_apply(
-        args, raw_argv,
-        [("width", "video_width", ["--video-width"], int),
-         ("height", "video_height", ["--video-height"], int),
-         ("num_frames", "frames", ["--frames"], int),
-         ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)])
+    _autotuned = []
+    if os.environ.get("QWEN_LTX_AUTOTUNE", "").strip():   # opt-in: unset never loads the skill
+        _autotuned = _ltx2_skill().maybe_autotune_apply(
+            args, raw_argv,
+            [("width", "video_width", ["--video-width"], int),
+             ("height", "video_height", ["--video-height"], int),
+             ("num_frames", "frames", ["--frames"], int),
+             ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)])
     if _autotuned:
         print("autotune (QWEN_LTX_AUTOTUNE): %s" % ", ".join(_autotuned), file=sys.stderr)
     if args.list_characters:                 # an abbreviation (--list-char) got past the pre-scan

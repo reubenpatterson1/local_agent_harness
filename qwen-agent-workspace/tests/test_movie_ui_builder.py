@@ -185,6 +185,14 @@ def test_mut1_smoke_manifest_and_argv(monkeypatch, tmp_path):
         "--lora", "/l/free.safetensors:0.5", "--no-low-ram", "--panel-timeout", "1800"]
 
 
+def test_mut1b_default_model_mirrors_the_pipeline_pin():
+    with open(os.path.join(mt.WS, "bin", "ltx-movie"), encoding="utf-8") as f:
+        movie = re.findall(r'add_argument\("--model", default="([^"]+)"\)', f.read())
+    with open(os.path.join(mt.WS, "ltx2_mlx_video_skill.py"), encoding="utf-8") as f:
+        skill = re.findall(r'^MODEL_ID = "([^"]+)"$', f.read(), re.M)
+    assert movie == skill == [lib.DEFAULT_MODEL]
+
+
 NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui-job", "tests/movie_ui_testutil.py",
           "tests/test_movie_ui_builder.py", "tests/test_movie_ui_checks.py", "tests/test_movie_ui_jobs.py",
           "tests/test_movie_ui_progress.py", "tests/test_movie_ui_http.py", "tests/test_movie_ui_traces.py")

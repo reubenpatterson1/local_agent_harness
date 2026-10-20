@@ -36,7 +36,7 @@ def check(name, condition, detail=""):
 # ---------------------------------------------------------------------------
 
 def test_constants():
-    check("M1a MODEL_ID", skill.MODEL_ID == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8",
+    check("M1a MODEL_ID", skill.MODEL_ID == "dgrauet/ltx-2.3-mlx-q8",
           "got %r" % skill.MODEL_ID)
     check("M1b DEFAULT_WIDTH 704", skill.DEFAULT_WIDTH == 704, "got %r" % skill.DEFAULT_WIDTH)
     check("M1c DEFAULT_HEIGHT 448", skill.DEFAULT_HEIGHT == 448, "got %r" % skill.DEFAULT_HEIGHT)

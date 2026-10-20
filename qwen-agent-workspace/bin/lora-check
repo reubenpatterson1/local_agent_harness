@@ -54,8 +54,15 @@ WS = os.environ.get("QWEN_AGENT_WORKSPACE") or os.path.dirname(
 
 
 def _load(mod):
-    return importlib.machinery.SourceFileLoader(
-        mod, os.path.join(WS, mod + ".py")).load_module()
+    """WS/<mod>.py as module <mod>. Reuses the copy already in sys.modules when it was loaded
+    from the same file: load_module() on a loaded name re-executes the source into that module
+    in place, which would reset a caller's state (bin/lora-catalog runs this mid-command)."""
+    path = os.path.join(WS, mod + ".py")
+    loaded = sys.modules.get(mod)
+    if loaded is not None and os.path.realpath(getattr(loaded, "__file__", None) or "") \
+            == os.path.realpath(path):
+        return loaded
+    return importlib.machinery.SourceFileLoader(mod, path).load_module()
 
 
 lc = _load("lora_catalog")

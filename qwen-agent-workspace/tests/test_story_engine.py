@@ -2688,7 +2688,7 @@ def _all_imports(path):
 
 def test_rst62_import_sets():
     assert _top_level_imports(os.path.join(WS, "bin", "lora-catalog")) == {
-        "argparse", "json", "os", "sys", "lora_catalog"}
+        "argparse", "importlib.machinery", "json", "os", "sys", "lora_catalog"}
     baseline = {
         "bin/ltx-movie": {"argparse", "glob", "importlib.machinery", "json", "os", "pipeline_log",
                           "shlex", "subprocess", "sys", "threading", "time"},

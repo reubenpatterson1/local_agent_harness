@@ -72,7 +72,7 @@ def test_parser_defaults():
     check("L1 image_seed == 0", args.image_seed == 0, "got %r" % args.image_seed)
     check("L1 panel_timeout == 7200", args.panel_timeout == 7200, "got %r" % args.panel_timeout)
     check("L1 model is the pack id",
-          args.model == "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8", "got %r" % args.model)
+          args.model == "dgrauet/ltx-2.3-mlx-q8", "got %r" % args.model)
     check("L1 gemma is the ltx-2-mlx default text encoder",
           args.gemma == "mlx-community/gemma-3-12b-it-4bit", "got %r" % args.gemma)
     check("L1 lora_path defaults to None", args.lora_path is None, "got %r" % args.lora_path)
