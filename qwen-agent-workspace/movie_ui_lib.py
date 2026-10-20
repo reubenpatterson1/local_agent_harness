@@ -659,19 +659,28 @@ def run_light(argv, cwd, env=None, timeout=None):
     limit = LIGHT_TIMEOUT if timeout is None else timeout
     result = {"argv": list(argv), "exit_code": None, "stdout": "", "stderr": "", "timed_out": False}
     try:
-        proc = subprocess.run(argv, cwd=cwd, env=env or dict(os.environ), stdin=subprocess.DEVNULL,
-                              capture_output=True, timeout=limit)
-    except subprocess.TimeoutExpired as e:
-        result["timed_out"] = True
-        result["stdout"] = (e.stdout or b"").decode("utf-8", "replace")
-        result["stderr"] = (e.stderr or b"").decode("utf-8", "replace")
-        return result
+        proc = subprocess.Popen(argv, cwd=cwd, env=env or dict(os.environ), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     except OSError as e:
         result["stderr"] = "%s: %s" % (type(e).__name__, e.strerror or e)
         return result
+    try:
+        out, err = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        _killpg_quiet(proc.pid, signal.SIGKILL)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            out, err = b"", b""
+        result["timed_out"] = True
+        result["stdout"] = (out or b"").decode("utf-8", "replace")
+        result["stderr"] = (err or b"").decode("utf-8", "replace")
+        return result
     result["exit_code"] = proc.returncode
-    result["stdout"] = proc.stdout.decode("utf-8", "replace")
-    result["stderr"] = proc.stderr.decode("utf-8", "replace")
+    result["stdout"] = out.decode("utf-8", "replace")
+    result["stderr"] = err.decode("utf-8", "replace")
     return result
 
 
@@ -714,6 +723,8 @@ def help_flags(ws_real):
         if key in _HELP_CACHE:
             return _HELP_CACHE[key]
     run = run_light(tool_argv(ws_real, "ltx-movie", "--help"), ws_real)
+    if run["timed_out"]:
+        return None, "cannot read bin/ltx-movie --help (timed out after %d s)" % LIGHT_TIMEOUT
     if run["exit_code"] == 0:
         value = (frozenset(parse_help_flags(run["stdout"])), None)
     else:

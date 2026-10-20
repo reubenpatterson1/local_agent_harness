@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -51,8 +52,10 @@ def test_mut1_golden_argv():
          base + ["--panels", "15"] + defaults + ["--lora", "/l/pan.safetensors:0.75", "--lora", "/l/water.safetensors:1.5",
                                                  "--lora", "/l/style.safetensors:1.0", "--lora", "/l/free.safetensors:0.5",
                                                  "--no-review"]),
-        (_f(action="movie", stills_loras=[_lora(None, "/l/s.safetensors", 2), _lora("style", "/l/t.safetensors", 1, "t")]),
-         base + ["--panels", "15"] + defaults + ["--stills-lora", "/l/s.safetensors:2.0",
+        (_f(action="movie", stills_loras=[_lora(None, "/l/s.safetensors", 2), _lora("style", "/l/t.safetensors", 1, "t"),
+                                         _lora("physics", "/l/p.safetensors", 0.5, "p")]),
+         base + ["--panels", "15"] + defaults + ["--stills-lora", "/l/p.safetensors:0.5",
+                                                 "--stills-lora", "/l/s.safetensors:2.0",
                                                  "--stills-lora", "/l/t.safetensors:1.0", "--no-review"]),
         (_f(action="movie", characters=["kyra", "ronin"]),
          base + ["--panels", "15"] + defaults + ["--character", "kyra", "--character", "ronin", "--no-review"]),
@@ -127,3 +130,33 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
     os.utime(os.path.join(ws, "bin", "ltx-movie"), ns=(2 * 10 ** 9, 2 * 10 ** 9))
     assert lib.help_flags(ws) == (None, "cannot read bin/ltx-movie --help (exit 2): ImportError: no torch")
     assert [c["sub"] for c in mt.stub_calls(ws)] == ["--help", "--help", "--help"]
+
+
+def test_run_light_timeout_kills_grandchild(tmp_path):
+    pid_file = str(tmp_path / "grand.pid")
+    code = ("import subprocess, time\n"
+            "p = subprocess.Popen(['sleep', '30'])\n"
+            "open(%r, 'w').write(str(p.pid))\n"
+            "time.sleep(30)\n" % pid_file)
+    grand = None
+    try:
+        result = lib.run_light([sys.executable, "-c", code], str(tmp_path), timeout=1)
+        assert result["timed_out"] is True
+        with open(pid_file) as f:
+            grand = int(f.read())
+        deadline = time.time() + 3
+        gone = False
+        while time.time() < deadline:
+            try:
+                os.kill(grand, 0)
+            except ProcessLookupError:
+                gone = True
+                break
+            time.sleep(0.05)
+        assert gone
+    finally:
+        if grand:
+            try:
+                os.kill(grand, 9)
+            except OSError:
+                pass
