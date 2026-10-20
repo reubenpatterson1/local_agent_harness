@@ -83,10 +83,12 @@ def test_mut1_character_argv():
         "--trigger", "kyrax", "--seed", "0", "--force"]
     assert lib.character_argv("character-regenerate", {"name": "kyra"}, WS, STATE, py=PY) == c + [
         "create", "kyra", "--regenerate"]
+    # character-train routes through the VLM-managing wrapper: [wrapper, py, name, flags].
+    tw = ["/w/bin/character-train-vlm", PY]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": False, "force": False},
-                              WS, STATE, py=PY) == c + ["train", "kyra", "--video"]
+                              WS, STATE, py=PY) == tw + ["kyra", "--video"]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": True, "force": True},
-                              WS, STATE, py=PY) == c + ["train", "kyra", "--video", "--stills", "--force"]
+                              WS, STATE, py=PY) == tw + ["kyra", "--video", "--stills", "--force"]
 
 
 def test_mu36_compose_fields_defaults_and_unknown_keys():

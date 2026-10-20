@@ -680,8 +680,9 @@ def test_mu64_mu65_character_endpoints(env):
     assert (status, payload) == (400, {"error": "invalid fields", "errors": ["choose video, stills or both"]})
     status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/train", body={"ws": ws, "video": True,
                                                                                "force": True})
-    assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
-        "train", "kyra", "--video", "--force"]
+    train_argv = lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"]
+    assert status == 201 and os.path.basename(train_argv[0]) == "character-train-vlm"
+    assert train_argv[2:] == ["kyra", "--video", "--force"]
     status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/regenerate", body={"ws": ws})
     assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
         "create", "kyra", "--regenerate"]

@@ -649,7 +649,11 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
     if kind == "character-regenerate":
         return argv + ["create", fields["name"], "--regenerate"]
     if kind == "character-train":
-        return (argv + ["train", fields["name"]] + (["--video"] if fields.get("video") else [])
+        # Route through character-train-vlm, which stops the VLM (freeing its memory for
+        # training) and always restarts it afterward -- so the UI Train button needs no
+        # manual story-server stop/start. Wrapper args: <python> <name> [flags].
+        wrapper = os.path.join(ws_real, "bin", "character-train-vlm")
+        return ([wrapper, py, fields["name"]] + (["--video"] if fields.get("video") else [])
                 + (["--stills"] if fields.get("stills") else []) + (["--force"] if fields.get("force") else []))
     argv += ["create", fields["name"], "--phrase", fields["phrase"]]
     if fields.get("seed_upload"):

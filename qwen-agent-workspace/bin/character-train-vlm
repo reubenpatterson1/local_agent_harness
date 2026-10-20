@@ -1,0 +1,32 @@
+#!/bin/bash
+# character-train-vlm -- run a character training with the VLM stopped (training reuses
+# its ~34 GB), then ALWAYS bring the VLM back. This lets the movie-ui Train button train
+# without a manual `story-server stop` / restart: the bin/character CT5 gate stays a
+# safety net, because we stop the VLM before training so the gate passes.
+#
+# Usage: character-train-vlm <python> <name> [--video] [--stills] [--force]
+# The VLM is restarted on success, failure, OR cancellation (SIGINT/SIGTERM).
+set -u
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+SS="$DIR/story-server"
+
+restart_vlm() {
+  echo "character-train-vlm: restarting the VLM (story-server mlx-vision)" >&2
+  "$SS" mlx-vision >/dev/null 2>&1 \
+    || echo "character-train-vlm: WARNING: VLM restart failed; run 'bin/story-server mlx-vision'" >&2
+}
+on_signal() { trap - EXIT INT TERM; echo "character-train-vlm: interrupted" >&2; restart_vlm; exit 130; }
+trap restart_vlm EXIT
+trap on_signal INT TERM
+
+[ "$#" -ge 2 ] || { echo "usage: character-train-vlm <python> <name> [--video] [--stills] [--force]" >&2; exit 2; }
+PY="$1"; shift
+
+echo "character-train-vlm: stopping the VLM to free memory for training"
+"$SS" stop >/dev/null 2>&1 || true
+
+"$PY" "$DIR/character" train "$@"
+rc=$?
+echo "character-train-vlm: training exited $rc" >&2
+exit "$rc"   # the EXIT trap restarts the VLM
