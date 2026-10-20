@@ -445,13 +445,19 @@ def test_d42_resolve_vlm_model(monkeypatch):
     monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
     assert character_dataset.resolve_vlm_model() == "qwen38-6bit"
 
+    # auto picks the single LOADED model, ignoring other cached (unloaded) entries
     monkeypatch.setattr(character_dataset, "VLM_MODEL", "auto")
     monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
-    monkeypatch.setattr(character_dataset, "_served_model_ids", lambda: ["/mlx_models/qwen3-vl"])
+    monkeypatch.setattr(character_dataset, "_served_models",
+                        lambda: [{"id": "/mlx_models/qwen3-vl", "loaded": True},
+                                 {"id": "other/cached", "loaded": False},
+                                 {"id": "another/cached", "loaded": False}])
     assert character_dataset.resolve_vlm_model() == "/mlx_models/qwen3-vl"
 
+    # auto with more than one loaded model raises
     monkeypatch.setattr(character_dataset, "_resolved_vlm_model", None)
-    monkeypatch.setattr(character_dataset, "_served_model_ids", lambda: ["a", "b"])
+    monkeypatch.setattr(character_dataset, "_served_models",
+                        lambda: [{"id": "a", "loaded": True}, {"id": "b", "loaded": True}])
     with pytest.raises(RuntimeError):
         character_dataset.resolve_vlm_model()
 

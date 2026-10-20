@@ -363,24 +363,31 @@ _STATE_RE = re.compile(r"^\s*state:\s*(.+?)\s*$")
 _resolved_vlm_model = None
 
 
-def _served_model_ids():
-    """The model ids the VLM server reports at MODELS_URL."""
+def _served_models():
+    """The raw model dicts the VLM server reports at MODELS_URL."""
     req = urllib.request.Request(MODELS_URL, method="GET")
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return [m["id"] for m in json.loads(resp.read())["data"]]
+        return json.loads(resp.read())["data"]
+
+
+def _served_model_ids():
+    return [m["id"] for m in _served_models()]
 
 
 def resolve_vlm_model():
     """The model id to send to the VLM: VLM_MODEL, or when it is 'auto' the single
-    model the server reports (cached). Raises RuntimeError if auto and the server
-    reports anything other than exactly one model."""
+    *loaded* model the server reports (mlx_vlm.server lists every cached model and
+    flags the active one with "loaded": true). Cached. Raises RuntimeError if auto
+    and the server reports other than exactly one loaded model."""
     global _resolved_vlm_model
     if VLM_MODEL != "auto":
         return VLM_MODEL
     if _resolved_vlm_model is None:
-        ids = _served_model_ids()
+        models = _served_models()
+        loaded = [m["id"] for m in models if m.get("loaded")]
+        ids = loaded if loaded else [m["id"] for m in models]
         if len(ids) != 1:
-            raise RuntimeError("QWEN_AGENT_VLM_MODEL=auto needs exactly one served model at "
+            raise RuntimeError("QWEN_AGENT_VLM_MODEL=auto needs exactly one loaded model at "
                                "%s, got %r" % (MODELS_URL, ids))
         _resolved_vlm_model = ids[0]
     return _resolved_vlm_model

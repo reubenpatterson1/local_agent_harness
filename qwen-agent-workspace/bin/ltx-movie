@@ -777,7 +777,11 @@ def _resolve_story_model(base_url=STORY_BASE_URL):
     import urllib.request
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=3) as resp:
-            ids = [m["id"] for m in json.loads(resp.read()).get("data", [])]
+            data = json.loads(resp.read()).get("data", [])
+        # Prefer the loaded model: mlx_lm/mlx_vlm server list every cached model and
+        # flag the active one with "loaded": true.
+        loaded = [m["id"] for m in data if m.get("loaded")]
+        ids = loaded if loaded else [m["id"] for m in data]
         return ids[0] if len(ids) == 1 else None
     except Exception:
         return None
