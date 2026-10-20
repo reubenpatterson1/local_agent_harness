@@ -171,26 +171,33 @@ stage_finalize() {
 ============================================================
  Full harness provisioned (automatable parts).
 
- 1) Serve the researcher model (text-only MLX conversion; port 8177):
-      $MLX_VENV/bin/python -m mlx_lm server \\
-        --model $TEXT_OUT --host 127.0.0.1 --port 8177
+ ONE server for everything. The 32B vision model handles BOTH the
+ tool-calling story/agent path AND image scoring -- validated: it passes
+ qwen-agent's tool-calling preflight. Serve it on :8177:
 
- 2) Run the agent against it:
-      cd $WORKSPACE
-      ./bin/qwen-agent --base-url http://127.0.0.1:8177/v1 --model $TEXT_OUT
+      $MLX_VENV/bin/python -m mlx_vlm server \\
+        --model $VISION_DIR --host 127.0.0.1 --port 8177
 
- 3) Serve the VISION model when needed (separate port, e.g. 8179):
-      $MLX_VENV/bin/python -m mlx_vlm.server \\
-        --model $VISION_DIR --host 127.0.0.1 --port 8179
+ Then (one server is up; run one task at a time):
+   * Video (story auto-detects the served model -- no --model needed):
+       cd $WORKSPACE && ./bin/ltx-movie "..." --story-id my_movie --story-context-window 32768
+       (mlx_vlm /v1/models reports no context length, so qwen-agent assumes
+        16384 unless you pass --story-context-window / --context-window.)
+   * Character stills (two-source, auto model-name resolution):
+       cd $WORKSPACE && CHARACTER_TWO_SOURCE=1 QWEN_AGENT_VLM_MODEL=auto \\
+         $IMG_VENV/bin/python bin/character create NAME --descriptor "..." --class NOUN --phrase "..."
+   * Image gen:   $IMG_VENV/bin/python z_image_skill.py "..." out.png
+   * SearXNG:     http://127.0.0.1:8888/
 
- 4) Image gen:   cd $WORKSPACE && $IMG_VENV/bin/python z_image_skill.py "..." out.png
- 5) MLX video:   ./bin/ltx-movie ...        (uses $LTX2_DIR/.venv/bin/ltx-2-mlx)
- 6) SearXNG:     http://127.0.0.1:8888/
+ Faster text-only alternative (optional): the 27B is converted to a text-only
+ MLX model at $TEXT_OUT; serve it with mlx_lm for quicker story decode when no
+ vision is needed (ltx-movie still auto-detects it):
+      $MLX_VENV/bin/python -m mlx_lm server --model $TEXT_OUT --host 127.0.0.1 --port 8177
 
  STILL NEEDS YOU:
-   * export ANTHROPIC_API_KEY=...   (for judge-story / judge-clips / judge-stills / iterate-story)
-   * The repo's vLLM-Metal auto-start (qwen-serve-guard) is replaced by the
-     manual mlx_lm.server command above — start it yourself before the agent.
+   * export ANTHROPIC_API_KEY=...   (judge-story / judge-clips / judge-stills / iterate-story)
+   * Start the server (above) yourself before the agent -- the repo's vLLM-Metal
+     auto-start (qwen-serve-guard) is not installed.
    * story-server 'text' mode (mtplx) is skipped (peripheral, not installed).
 ============================================================
 EOF
