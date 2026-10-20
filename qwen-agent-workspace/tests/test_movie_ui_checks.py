@@ -2,7 +2,9 @@
 Run from the workspace root: python3 -m pytest tests/test_movie_ui_checks.py -v
 Every test runs under a temporary HOME against a stub workspace."""
 
+import json
 import os
+import shutil
 
 import pytest
 
@@ -176,3 +178,77 @@ def test_mut9_v2_host_checks(env, monkeypatch):
     records = lib.host_checks(mt.fields(env["ws"], action="movie", judge=True, mode="no_stills"), env["ws"], good_py)
     assert [(r["name"], r["status"]) for r in records] == [
         ("render", "fail"), ("stills", "skip"), ("story server", "skip"), ("judge key", "pass")]
+
+
+GOOD = {"model.safetensors": b"\x01" * 16, "embedded_config.json": b"{}"}
+
+
+def test_mut5_v3_models_present_and_intact(env, monkeypatch):
+    tmp = env["tmp"]
+    ltx = os.path.join(tmp, "ltxcache")
+    monkeypatch.setenv("LTX2_MLX_HF_HOME", ltx)
+    hub = os.path.join(ltx, "hub")
+    assert lib.ltx_hub() == hub
+    repo = mt.make_hf_cache(ltx, "org/good", GOOD)
+    ok, detail = lib.model_check("org/good", hub)
+    assert ok and detail == os.path.join(repo, "snapshots", "0123456789abcdef0123456789abcdef01234567")
+    sharded = {"model.safetensors.index.json": json.dumps({"weight_map": {"a": "model-00001.safetensors",
+                                                                          "b": "model-00002.safetensors"}}).encode(),
+               "model-00001.safetensors": b"\x01"}
+    mt.make_hf_cache(ltx, "org/sharded", sharded)
+    assert lib.model_check("org/sharded", hub) == (False, "missing shard: model-00002.safetensors")
+    mt.make_hf_cache(ltx, "org/partial", GOOD, incomplete=3)
+    assert lib.model_check("org/partial", hub) == (False, "download incomplete: 3 partial blob(s)")
+    mt.make_hf_cache(ltx, "org/broken", GOOD, broken=("embedded_config.json",))
+    assert lib.model_check("org/broken", hub) == (False, "broken file: embedded_config.json")
+    mt.make_hf_cache(ltx, "org/empty", {"model.safetensors": b"", "x.json": b"{}"})
+    assert lib.model_check("org/empty", hub) == (False, "empty file: model.safetensors")
+    mt.make_hf_cache(ltx, "org/nosafe", {"config.json": b"{}"})
+    assert lib.model_check("org/nosafe", hub) == (False, "no .safetensors file")
+    mt.make_hf_cache(ltx, "org/badindex", {"m.safetensors.index.json": b"{", "m.safetensors": b"\x01"})
+    assert lib.model_check("org/badindex", hub) == (False, "unreadable index: m.safetensors.index.json")
+    assert lib.model_check("org/absent", hub) == (False, "org/absent is not in %s" % hub)
+    two = mt.make_hf_cache(ltx, "org/two", GOOD, refs=False)
+    os.makedirs(os.path.join(two, "snapshots", "another"))
+    assert lib.model_check("org/two", hub) == (False, "cannot choose a snapshot of org/two (no refs/main)")
+    shutil.rmtree(os.path.join(two, "snapshots", "another"))
+    assert lib.model_check("org/two", hub)[0] is True
+    local = os.path.join(tmp, "local-model")
+    os.makedirs(local)
+    with open(os.path.join(local, "model.safetensors"), "wb") as f:
+        f.write(b"\x01")
+    assert lib.model_check(local, hub) == (True, local)
+    assert lib.model_check(os.path.join(tmp, "nope"), hub) == (False, "%s is not a directory" % os.path.join(tmp, "nope"))
+    # Z-Image: the scoped hub when it holds the repo, else the default HF hub.
+    scoped, default = os.path.join(tmp, "zhome"), os.path.join(tmp, "hfhome")
+    monkeypatch.setenv("Z_IMAGE_HF_HOME", scoped)
+    monkeypatch.setenv("HF_HOME", default)
+    mt.make_hf_cache(default, lib.STILLS_BASE_MODEL, GOOD)
+    assert lib.zimage_hub_for(lib.STILLS_BASE_MODEL) == os.path.join(default, "hub")
+    mt.make_hf_cache(scoped, lib.STILLS_BASE_MODEL, GOOD)
+    assert lib.zimage_hub_for(lib.STILLS_BASE_MODEL) == os.path.join(scoped, "hub")
+    mt.make_hf_cache(ltx, lib.DEFAULT_MODEL, GOOD)
+    records = lib.model_checks(mt.fields(env["ws"], action="movie"), env["ws"])
+    assert [(r["name"], r["status"]) for r in records] == [
+        ("video model %s" % lib.DEFAULT_MODEL, "pass"), ("gemma %s" % lib.DEFAULT_GEMMA, "fail"),
+        ("Z-Image %s" % lib.STILLS_BASE_MODEL, "pass"),
+        ("Z-Image text encoder %s" % lib.ZIMAGE_TEXT_ENCODER, "fail")]
+    assert records[1]["detail"] == "%s is not in %s" % (lib.DEFAULT_GEMMA, hub)
+    story = lib.model_checks(mt.fields(env["ws"]), env["ws"])
+    assert [r["status"] for r in story] == ["skip"] * 4
+
+
+def test_mu63_list_models(env, monkeypatch):
+    tmp = env["tmp"]
+    for var, sub in (("LTX2_MLX_HF_HOME", "l"), ("Z_IMAGE_HF_HOME", "z"), ("HF_HOME", "h")):
+        monkeypatch.setenv(var, os.path.join(tmp, sub))
+    mt.make_hf_cache(os.path.join(tmp, "l"), "org/b-model", GOOD)
+    mt.make_hf_cache(os.path.join(tmp, "l"), "org/a--model", GOOD, incomplete=1)
+    mt.make_hf_cache(os.path.join(tmp, "h"), "Tongyi-MAI/Z-Image-Turbo", GOOD)
+    listing = lib.list_models()
+    assert listing["hubs"] == {"ltx": os.path.join(tmp, "l", "hub"), "zimage": os.path.join(tmp, "z", "hub"),
+                               "hf": os.path.join(tmp, "h", "hub")}
+    rows = [(m["hub"], m["repo"], m["intact"], m["problems"], m["bytes"]) for m in listing["models"]]
+    assert rows == [("hf", "Tongyi-MAI/Z-Image-Turbo", True, [], 18),
+                    ("ltx", "org/a--model", False, ["download incomplete: 1 partial blob(s)"], 19),
+                    ("ltx", "org/b-model", True, [], 18)]

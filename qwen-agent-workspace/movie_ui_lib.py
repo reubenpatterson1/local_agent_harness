@@ -1052,3 +1052,172 @@ def host_checks(fields, ws_real, py=sys.executable):
            _from_pair("V2", "judge key", judge_key_check()) if fields["judge"] is True
            else not_needed("V2", "judge key")]
     return out
+
+
+# ---------------------------------------------------------------------------
+# V3: models present and intact, and the model list of MU63
+# ---------------------------------------------------------------------------
+
+def ltx_hub():
+    """<LTX2_MLX_HF_HOME or <LTX2_MLX_DIR or ~/ltx-2-mlx>/hf_cache>/hub (ltx2_mlx_video_skill.py:47-48)."""
+    home = os.environ.get("LTX2_MLX_HF_HOME") or os.path.join(
+        os.environ.get("LTX2_MLX_DIR") or os.path.expanduser("~/ltx-2-mlx"), "hf_cache")
+    return os.path.join(home, "hub")
+
+
+def zimage_hub():
+    """<Z_IMAGE_HF_HOME or ~/hf_home>/hub (z_image_skill.py:56-59)."""
+    return os.path.join(os.environ.get("Z_IMAGE_HF_HOME") or os.path.expanduser("~/hf_home"), "hub")
+
+
+def hf_hub():
+    """<HF_HOME or ~/.cache/huggingface>/hub, the default HF cache."""
+    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
+
+
+def repo_dir_name(repo_id):
+    return "models--" + repo_id.replace("/", "--")
+
+
+def zimage_hub_for(repo_id):
+    """The scoped Z-Image hub when it holds the repo, else the default HF hub (z_image_skill.py:62-69)."""
+    scoped = zimage_hub()
+    return scoped if os.path.isdir(os.path.join(scoped, repo_dir_name(repo_id))) else hf_hub()
+
+
+def choose_snapshot(repo_dir):
+    """(snapshot path, None) by refs/main, else the only snapshot; (None, reason) otherwise."""
+    try:
+        with open(os.path.join(repo_dir, "refs", "main"), "r", encoding="utf-8") as f:
+            rev = f.read().strip()
+        return os.path.join(repo_dir, "snapshots", rev), None
+    except OSError:
+        pass
+    try:
+        snaps = sorted(n for n in os.listdir(os.path.join(repo_dir, "snapshots"))
+                       if os.path.isdir(os.path.join(repo_dir, "snapshots", n)))
+    except OSError:
+        snaps = []
+    if len(snaps) == 1:
+        return os.path.join(repo_dir, "snapshots", snaps[0]), None
+    return None, "no refs/main"
+
+
+def _nonempty_file(path):
+    real = os.path.realpath(path)
+    return os.path.isfile(real) and os.path.getsize(real) > 0
+
+
+def intact_problems(snapshot, repo_dir=None):
+    """V3's intact rules (b)-(e) on one snapshot (or an absolute model directory when repo_dir is
+    None). The config.json clause of the brief is not applied (D3, Q3)."""
+    problems = []
+    if repo_dir is not None:
+        try:
+            partial = [n for n in os.listdir(os.path.join(repo_dir, "blobs")) if n.endswith(".incomplete")]
+        except OSError:
+            partial = []
+        if partial:
+            problems.append("download incomplete: %d partial blob(s)" % len(partial))
+    safetensors, indexes = 0, []
+    for dirpath, dirnames, filenames in os.walk(snapshot, followlinks=False):
+        dirnames.sort()
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, snapshot)
+            real = os.path.realpath(full)
+            if not os.path.isfile(real):
+                problems.append("broken file: %s" % rel)
+                continue
+            if name.endswith(".safetensors"):
+                safetensors += 1
+                if os.path.getsize(real) == 0:
+                    problems.append("empty file: %s" % rel)
+            if name.endswith(".safetensors.index.json"):
+                indexes.append(full)
+    if safetensors == 0:
+        problems.append("no .safetensors file")
+    for index in indexes:
+        rel = os.path.relpath(index, snapshot)
+        data = read_json(index)
+        if not (isinstance(data, dict) and isinstance(data.get("weight_map"), dict)):
+            problems.append("unreadable index: %s" % rel)
+            continue
+        for shard in sorted(set(v for v in data["weight_map"].values() if isinstance(v, str))):
+            path = os.path.join(os.path.dirname(index), shard)
+            if not _nonempty_file(path):
+                problems.append("missing shard: %s" % os.path.relpath(path, snapshot))
+    return problems
+
+
+def model_check(model_id, hub):
+    """(ok, detail) for one V3 record: an absolute path is checked in place, an HF ID in hub."""
+    if os.path.isabs(model_id):
+        if not os.path.isdir(model_id):
+            return False, "%s is not a directory" % model_id
+        problems = intact_problems(model_id)
+        return (False, "; ".join(problems)) if problems else (True, model_id)
+    repo_dir = os.path.join(hub, repo_dir_name(model_id))
+    if not os.path.isdir(repo_dir):
+        return False, "%s is not in %s" % (model_id, hub)
+    snapshot, reason = choose_snapshot(repo_dir)
+    if snapshot is None:
+        return False, "cannot choose a snapshot of %s (%s)" % (model_id, reason)
+    problems = intact_problems(snapshot, repo_dir)
+    return (False, "; ".join(problems)) if problems else (True, snapshot)
+
+
+def model_checks(fields, ws_real):
+    """V3's four records."""
+    m = fields["model"] or DEFAULT_MODEL
+    g = fields["gemma"] or DEFAULT_GEMMA
+    out = []
+    if render_needed(fields):
+        out.append(_from_pair("V3", "video model %s" % m, model_check(m, ltx_hub())))
+        out.append(_from_pair("V3", "gemma %s" % g, model_check(g, ltx_hub())))
+    else:
+        out += [not_needed("V3", "video model %s" % m), not_needed("V3", "gemma %s" % g)]
+    for name, repo in (("Z-Image %s" % STILLS_BASE_MODEL, STILLS_BASE_MODEL),
+                       ("Z-Image text encoder %s" % ZIMAGE_TEXT_ENCODER, ZIMAGE_TEXT_ENCODER)):
+        if stills_needed(fields):
+            out.append(_from_pair("V3", name, model_check(repo, zimage_hub_for(repo))))
+        else:
+            out.append(not_needed("V3", name))
+    return out
+
+
+def _tree_bytes(path):
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            try:
+                info = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if info.st_mode & 0o170000 == 0o100000:
+                total += info.st_size
+    return total
+
+
+def list_models():
+    """MU63: {"hubs": {"ltx", "zimage", "hf"}, "models": [...]} sorted by (hub, repo)."""
+    hubs = {"ltx": ltx_hub(), "zimage": zimage_hub(), "hf": hf_hub()}
+    models = []
+    for hub_name, hub in hubs.items():
+        try:
+            names = os.listdir(hub)
+        except OSError:
+            continue
+        for name in names:
+            repo_dir = os.path.join(hub, name)
+            if not (name.startswith("models--") and os.path.isdir(repo_dir)):
+                continue
+            org, _sep, rest = name[len("models--"):].partition("--")
+            snapshot, reason = choose_snapshot(repo_dir)
+            problems = (["cannot choose a snapshot (%s)" % reason] if snapshot is None
+                        else intact_problems(snapshot, repo_dir))
+            models.append({"repo": "%s/%s" % (org, rest), "hub": hub_name, "repo_dir": repo_dir,
+                           "intact": not problems, "problems": problems,
+                           "bytes": _tree_bytes(os.path.join(repo_dir, "blobs"))})
+    models.sort(key=lambda m: (m["hub"], m["repo"]))
+    return {"hubs": hubs, "models": models}

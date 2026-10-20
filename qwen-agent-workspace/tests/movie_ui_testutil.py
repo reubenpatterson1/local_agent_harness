@@ -283,3 +283,35 @@ def fields(ws, **overrides):
                                        "narrative": "A ronin rescues a child from a burning village."})
     out.update(overrides)
     return out
+
+
+# ---------------------------------------------------------------------------
+# HF caches
+# ---------------------------------------------------------------------------
+
+def make_hf_cache(root, repo, files, refs=True, incomplete=0, broken=()):
+    """<root>/hub/models--org--name/{blobs, snapshots/<rev>, refs/main} with every snapshot file a
+    symlink into blobs. files maps relpath -> bytes; broken lists relpaths whose blob is missing.
+    Returns the repo directory."""
+    rev = "0123456789abcdef0123456789abcdef01234567"
+    repo_dir = os.path.join(str(root), "hub", "models--" + repo.replace("/", "--"))
+    blobs = os.path.join(repo_dir, "blobs")
+    snap = os.path.join(repo_dir, "snapshots", rev)
+    os.makedirs(blobs, exist_ok=True)
+    os.makedirs(snap, exist_ok=True)
+    for i, (rel, data) in enumerate(sorted(files.items())):
+        blob = os.path.join(blobs, "blob%04d" % i)
+        if rel not in broken:
+            with open(blob, "wb") as f:
+                f.write(data)
+        link = os.path.join(snap, rel)
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        os.symlink(os.path.relpath(blob, os.path.dirname(link)), link)
+    for i in range(incomplete):
+        with open(os.path.join(blobs, "partial%d.incomplete" % i), "wb") as f:
+            f.write(b"x")
+    if refs:
+        os.makedirs(os.path.join(repo_dir, "refs"), exist_ok=True)
+        with open(os.path.join(repo_dir, "refs", "main"), "w") as f:
+            f.write(rev + "\n")
+    return repo_dir
