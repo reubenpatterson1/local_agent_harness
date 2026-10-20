@@ -461,3 +461,12 @@ def copy_ui(tmp):
     if os.path.isdir(static):
         shutil.copytree(static, os.path.join(root, "static", "movie-ui"))
     return root
+
+
+# ---------------------------------------------------------------------------
+# Upload bytes: magic numbers only, never decoded pictures
+# ---------------------------------------------------------------------------
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24

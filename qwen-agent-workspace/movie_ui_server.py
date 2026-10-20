@@ -883,3 +883,325 @@ MovieUIHandler.h_job_cancel = _h_job_cancel
 MovieUIHandler.h_queue_move = _h_queue_move
 MovieUIHandler.h_job_delete = _h_job_delete
 MovieUIHandler.h_job_kill_orphan = _h_job_kill_orphan
+
+
+# ---------------------------------------------------------------------------
+# Uploads, LoRAs, models and characters (MU53, MU59, MU61-MU65)
+# ---------------------------------------------------------------------------
+
+def _fs_text(name):
+    """Text safe for JSON/ApiError from a filesystem name that may hold surrogateescape characters."""
+    return name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def tool_result(tool, run):
+    """MU59: 504 on a timeout, 502 on a non-zero exit (ApiError), else run."""
+    if run["timed_out"]:
+        raise ApiError(504, "%s timed out after %d s" % (tool, lib.LIGHT_TIMEOUT), run=run)
+    if run["exit_code"] != 0:
+        raise ApiError(502, "%s exited %s" % (tool, run["exit_code"]), run=run)
+    return run
+
+
+def _h_upload(self, groups, query, body):
+    media = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    ext, magic = UPLOAD_TYPES[media]
+    ok = (body[:4] == b"RIFF" and body[8:12] == b"WEBP") if magic is None else body.startswith(magic)
+    if not ok:
+        raise ApiError(400, "file content is not %s" % media)
+    upload_id = "%s.%s" % (hashlib.sha256(body).hexdigest(), ext)
+    path = os.path.join(self.server.state, "uploads", upload_id)
+    if not os.path.isfile(path):
+        lib.write_bytes_atomic(path, body)
+    return 201, {"upload_id": upload_id, "path": path, "bytes": len(body)}
+
+
+def _h_loras(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    model = query.get("model")
+    args = ["list", "--json"] + (["--model", model] if model else [])
+    run = tool_result("lora-catalog", lib.run_light(lib.tool_argv(real, "lora-catalog", *args), real))
+    try:
+        obj = json.loads(run["stdout"])
+        if not isinstance(obj, dict):
+            raise ValueError
+    except ValueError:
+        raise ApiError(502, "lora-catalog printed unparsable output", run=run)
+    obj["model"] = model or None
+    return 200, obj
+
+
+def _lora_action(real, args):
+    run = lib.run_light(lib.tool_argv(real, "lora-catalog", *args), real)
+    if run["timed_out"]:
+        raise ApiError(504, "lora-catalog timed out after %d s" % lib.LIGHT_TIMEOUT, run=run)
+    return run
+
+
+def _typed(body, key, kind, name, optional=False):
+    value = body.get(key)
+    if value is None and optional:
+        return None
+    ok = {"str": isinstance(value, str),
+          "str list": isinstance(value, list) and all(isinstance(v, str) for v in value),
+          "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+          "int": isinstance(value, int) and not isinstance(value, bool),
+          "pair": (isinstance(value, list) and len(value) == 2
+                   and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value))}[kind]
+    if not ok:
+        raise ApiError(400, "%s must be %s" % (key, name))
+    return value
+
+
+def _h_lora_add(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    path = _typed(body, "path", "str", "a string")
+    entry_id = _typed(body, "id", "str", "a string")
+    kind = _typed(body, "kind", "str", "a string")
+    target = _typed(body, "target", "str", "a string")
+    base_models = _typed(body, "base_models", "str list", "a list of strings")
+    triggers = _typed(body, "triggers", "str list", "a list of strings")
+    description = _typed(body, "description", "str", "a string")
+    use_when = _typed(body, "use_when", "str", "a string")
+    avoid_when = _typed(body, "avoid_when", "str", "a string", optional=True)
+    strength = _typed(body, "default_strength", "number", "a number")
+    lo, hi = _typed(body, "strength_range", "pair", "a list of two numbers")
+    rank = _typed(body, "rank", "int", "an integer or null", optional=True)
+    alpha = _typed(body, "alpha", "int", "an integer or null", optional=True)
+    if not path.startswith("/"):
+        raise ApiError(400, "path must be an absolute path")
+    for key, value in (("path", path), ("id", entry_id), ("kind", kind), ("target", target),
+                       ("description", description), ("use_when", use_when), ("avoid_when", avoid_when),
+                       ("base_models", base_models), ("triggers", triggers)):
+        for item in (value if isinstance(value, list) else [value]):
+            if item is None:
+                continue
+            if not lib._argv_safe(item):
+                raise ApiError(400, "%s contains invalid characters" % key)
+            if key != "path" and item.startswith("-"):
+                raise ApiError(400, "%s must not start with '-'" % key)
+    args = ["add", path, "--id", entry_id, "--kind", kind, "--target", target]
+    for m in base_models:
+        args += ["--base-model", m]
+    for t in triggers:
+        args += ["--trigger", t]
+    args += ["--description", description, "--use-when", use_when]
+    if avoid_when:
+        args += ["--avoid-when", avoid_when]
+    args += ["--default-strength", repr(float(strength)),
+             "--strength-range", "%s,%s" % (repr(float(lo)), repr(float(hi)))]
+    if rank is not None:
+        args += ["--rank", str(rank)]
+    if alpha is not None:
+        args += ["--alpha", str(alpha)]
+    return 200, {"run": _lora_action(real, args)}
+
+
+def _h_lora_remove(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    return 200, {"run": _lora_action(real, ["remove", _typed(body, "id", "str", "a string")])}
+
+
+VERIFY_LINE_RE = re.compile(r"^(OK|FAIL) (\S+?)(?:: (.*))?$")
+
+
+def parse_verify(stdout):
+    """[{"id", "ok", "problems"}] from lora-catalog verify's OK/FAIL lines, in first-seen order."""
+    results, by_id = [], {}
+    for line in stdout.splitlines():
+        m = VERIFY_LINE_RE.match(line)
+        if not m:
+            continue
+        entry = by_id.get(m.group(2))
+        if entry is None:
+            entry = by_id[m.group(2)] = {"id": m.group(2), "ok": True, "problems": []}
+            results.append(entry)
+        if m.group(1) == "FAIL":
+            entry["ok"] = False
+            entry["problems"].append(m.group(3) or "")
+    return results
+
+
+def _h_lora_verify(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    ids = body.get("ids") or []
+    if not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
+        raise ApiError(400, "ids must be a list of strings")
+    run = _lora_action(real, ["verify"] + ids)
+    return 200, {"run": run, "results": parse_verify(run["stdout"])}
+
+
+def _h_models(self, groups, query, body):
+    self.ws(query.get("ws"))
+    return 200, lib.list_models()
+
+
+LIST_ROW_RE = re.compile(r"^(\S+)\s+(\S+)\s+(dataset|untrained|trained)\s+(yes|no)\s+(yes|no)\s+(.+)$")
+INVALID_ROW_RE = re.compile(r"^(\S+)\s+\(invalid: (.*)\)$")
+FILE_LINE_RE = re.compile(r"^  (ok|MISSING)\s+(.+)$")
+STILL_FILE_RE = re.compile(r"^char_\d{2}\.png$")
+
+
+def parse_character_list(stdout):
+    """MU64: rows of bin/character list."""
+    out = []
+    for line in stdout.splitlines():
+        if line.startswith("NAME ") or line.startswith("no characters in ") or not line.strip():
+            continue
+        m = INVALID_ROW_RE.match(line)
+        if m:
+            out.append({"name": m.group(1), "invalid": m.group(2)})
+            continue
+        m = LIST_ROW_RE.match(line)
+        if m:
+            out.append({"name": m.group(1), "trigger": m.group(2), "status": m.group(3),
+                        "video": m.group(4) == "yes", "stills": m.group(5) == "yes", "phrase": m.group(6),
+                        "invalid": None})
+    return out
+
+
+def _h_characters(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    run = tool_result("character", lib.run_light(lib.tool_argv(real, "character", "list"), real))
+    return 200, {"characters": parse_character_list(run["stdout"])}
+
+
+def newest_job(server, kinds, ws_real, key, value):
+    """The newest job of one of kinds whose workspace is ws_real and job[key] == value, or None."""
+    for job_id in sorted(lib.list_job_ids(server.state), reverse=True):
+        job = server.job(job_id)
+        if job is not None and job["kind"] in kinds and job["workspace"] == ws_real and job.get(key) == value:
+            return job
+    return None
+
+
+def _h_character(self, groups, query, body):
+    real, name = self.ws(query.get("ws")), groups[0]
+    run = tool_result("character", lib.run_light(lib.tool_argv(real, "character", "show", name), real))
+    try:
+        data, end = json.JSONDecoder().raw_decode(run["stdout"].lstrip())
+    except ValueError:
+        raise ApiError(502, "character printed unparsable output", run=run)
+    rest = run["stdout"].lstrip()[end:]
+    files = [{"status": m.group(1), "path": m.group(2)}
+             for m in (FILE_LINE_RE.match(line) for line in rest.splitlines()) if m]
+    dataset = None
+    sheet = (data.get("dataset") or {}).get("contact_sheet") if isinstance(data, dict) else None
+    if isinstance(sheet, str):
+        stills_dir = os.path.join(os.path.dirname(sheet), "stills")
+        try:
+            stills = sorted(os.path.join(stills_dir, _fs_text(n)) for n in os.listdir(stills_dir) if STILL_FILE_RE.fullmatch(n))
+        except OSError:
+            stills = []
+        dataset = {"contact_sheet": sheet, "stills": stills}
+    job = newest_job(self.server, ("character-create",), real, "character", name)
+    face = False
+    if job is not None:
+        parser = lib.ProgressParser(job["kind"], job["fields"])
+        try:
+            with open(os.path.join(lib.job_dir(self.server.state, job["id"]), "log.txt"), "rb") as f:
+                parser.feed(f.read() + b"\n")
+        except OSError:
+            pass
+        face = parser.face_problem
+    return 200, {"character": data, "files": files, "dataset": dataset, "face_problem": face,
+                 "last_create_fields": job["fields"] if job is not None else None}
+
+
+PHRASE_MAX = 200
+
+
+def character_create_errors(body, state):
+    """MU65's field rules for POST /api/characters; [] when they pass."""
+    errors = []
+    name, phrase = body.get("name"), body.get("phrase")
+    seed, descriptor, class_noun = body.get("seed_upload"), body.get("descriptor"), body.get("class_noun")
+    trigger, seed_n, force = body.get("trigger"), body.get("seed"), body.get("force", False)
+    if not (isinstance(name, str) and lib.CHARACTER_NAME_RE.fullmatch(name)):
+        errors.append("character name must match [a-z][a-z0-9-]{1,23}")
+    if not (isinstance(phrase, str) and 1 <= len(phrase.strip()) and len(phrase) <= PHRASE_MAX
+            and "\n" not in phrase and "\r" not in phrase):
+        errors.append("phrase is required")
+    elif not lib._argv_safe(phrase):
+        errors.append("phrase contains invalid characters")
+    elif phrase.strip().startswith("-"):
+        errors.append("phrase must not start with '-'")
+    if (seed is None) == (descriptor is None or descriptor == ""):
+        errors.append("give exactly one of a seed image or a descriptor")
+    if descriptor not in (None, "") and not class_noun:
+        errors.append("a descriptor needs a class noun")
+    if descriptor not in (None, "") and not isinstance(descriptor, str):
+        errors.append("descriptor must be a string")
+    elif descriptor not in (None, "") and not lib._argv_safe(descriptor):
+        errors.append("descriptor contains invalid characters")
+    elif descriptor not in (None, "") and descriptor.strip().startswith("-"):
+        errors.append("descriptor must not start with '-'")
+    if class_noun not in (None, "") and not (isinstance(class_noun, str) and re.fullmatch(r"[a-z]{3,12}", class_noun)):
+        errors.append("class noun must match [a-z]{3,12}")
+    if trigger not in (None, "") and not (isinstance(trigger, str) and re.fullmatch(r"[a-z][a-z0-9]{3,15}", trigger)):
+        errors.append("trigger must match [a-z][a-z0-9]{3,15}")
+    if seed_n is not None and not (isinstance(seed_n, int) and not isinstance(seed_n, bool) and seed_n >= 0):
+        errors.append("seed must be an integer >= 0")
+    if seed is not None and not (isinstance(seed, str) and lib.UPLOAD_ID_RE.fullmatch(seed)
+                                 and os.path.isfile(os.path.join(state, "uploads", seed))):
+        errors.append("seed image upload %s not found" % (_fs_text(seed) if isinstance(seed, str) else seed,))
+    if not isinstance(force, bool):
+        errors.append("force must be true or false")
+    return errors
+
+
+def create_character_job(server, kind, real, fields):
+    with STORE_LOCK:
+        job_id = lib.new_job_id(server.state)
+        argv = lib.character_argv(kind, fields, real, server.state)
+        lib.create_job(server.state, job_id, kind, real, None, fields["name"], argv, fields)
+    return 201, {"job": job_summary(server, job_id, lib.read_queue(server.state))}
+
+
+def _h_character_create(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    errors = character_create_errors(body, self.server.state)
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    fields = dict((k, body.get(k)) for k in ("name", "phrase", "class_noun", "descriptor", "trigger", "seed",
+                                              "seed_upload"))
+    for key in ("class_noun", "descriptor", "trigger"):
+        if fields[key] == "":
+            fields[key] = None
+    fields["force"] = body.get("force", False)
+    fields["ws"] = real
+    return create_character_job(self.server, "character-create", real, fields)
+
+
+def _h_character_regenerate(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    return create_character_job(self.server, "character-regenerate", real, {"ws": real, "name": groups[0]})
+
+
+def _h_character_train(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    fields = {"ws": real, "name": groups[0]}
+    errors = []
+    for key in ("video", "stills", "force"):
+        value = body.get(key, False)
+        if not isinstance(value, bool):
+            errors.append("%s must be true or false" % key)
+        fields[key] = value
+    if not errors and not (fields["video"] or fields["stills"]):
+        errors.append("choose video, stills or both")
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    return create_character_job(self.server, "character-train", real, fields)
+
+
+MovieUIHandler.h_upload = _h_upload
+MovieUIHandler.h_loras = _h_loras
+MovieUIHandler.h_lora_add = _h_lora_add
+MovieUIHandler.h_lora_remove = _h_lora_remove
+MovieUIHandler.h_lora_verify = _h_lora_verify
+MovieUIHandler.h_models = _h_models
+MovieUIHandler.h_characters = _h_characters
+MovieUIHandler.h_character = _h_character
+MovieUIHandler.h_character_create = _h_character_create
+MovieUIHandler.h_character_regenerate = _h_character_regenerate
+MovieUIHandler.h_character_train = _h_character_train

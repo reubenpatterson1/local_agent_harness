@@ -558,3 +558,159 @@ def test_delete_with_content_length_zero_is_an_absent_body(env):
                                                             "ended": lib.utc_now()})
     status, _h, payload = mt.api(s, "DELETE", "/api/jobs/%s" % done, headers={"Content-Length": "0"})
     assert (status, payload) == (200, {"deleted": done})
+
+
+def _upload(s, data, media):
+    return mt.api(s, "POST", "/api/uploads", raw=data, headers={"Content-Type": media})
+
+
+def test_mut21_uploads(env):
+    s, state = env["srv"], env["state"]
+    for data, media, ext in ((mt.PNG, "image/png", "png"), (mt.JPEG, "image/jpeg", "jpg"), (mt.WEBP, "image/webp", "webp")):
+        status, _h, payload = _upload(s, data, media)
+        upload_id = "%s.%s" % (hashlib.sha256(data).hexdigest(), ext)
+        assert (status, payload) == (201, {"upload_id": upload_id, "path": os.path.join(state, "uploads", upload_id),
+                                           "bytes": len(data)})
+        with open(payload["path"], "rb") as f:
+            assert f.read() == data
+        assert _upload(s, data, media)[2]["upload_id"] == upload_id
+    assert _upload(s, mt.JPEG, "image/png")[:3:2] == (400, {"error": "file content is not image/png"})
+    assert _upload(s, mt.PNG, "image/webp")[:3:2] == (400, {"error": "file content is not image/webp"})
+    assert _upload(s, mt.PNG, "image/gif")[:3:2] == (415, {"error": "unsupported content type"})
+    status, _h, payload = mt.api(s, "POST", "/api/uploads", raw=b"",
+                                 headers={"Content-Type": "image/png", "Content-Length": str(20971521)})
+    assert (status, payload) == (413, {"error": "upload larger than 20 MiB"})
+    assert sorted(os.listdir(os.path.join(state, "uploads"))) == sorted(
+        "%s.%s" % (hashlib.sha256(d).hexdigest(), e) for d, e in ((mt.PNG, "png"), (mt.JPEG, "jpg"), (mt.WEBP, "webp")))
+
+
+def test_mu61_mu62_lora_endpoints(env):
+    s, ws = env["srv"], env["ws"]
+    entry = {"id": "pan", "kind": "motion", "target": "video", "path": "/l/pan.safetensors"}
+    mt.stub_config(ws, {
+        "lora-catalog list --json --model M": {"stdout": json.dumps({"catalog": "/c", "entries": [entry],
+                                                                     "characters": []})},
+        "lora-catalog add": {"exit": 2, "stderr": "Error: catalog entry pan already exists\n"},
+        "lora-catalog verify": {"exit": 1, "stdout": "OK ink\nFAIL pan: sha256 changed\nFAIL pan: missing file\n"
+                                                    "verified 2 entries: 2 problem(s)\n"}})
+    status, _h, payload = mt.api(s, "GET", "/api/loras?ws=%s&model=M" % ws)
+    assert (status, payload["entries"], payload["model"]) == (200, [entry], "M")
+    status, _h, payload = mt.api(s, "GET", "/api/loras?ws=%s" % ws)
+    assert status == 200 and payload["entries"] == [] and payload["model"] is None
+    mt.stub_config(ws, {"lora-catalog list": {"exit": 2, "stderr": "Error: invalid catalog\n"}})
+    status, _h, payload = mt.api(s, "GET", "/api/loras?ws=%s" % ws)
+    assert status == 502 and payload["error"] == "lora-catalog exited 2"
+    assert payload["run"]["stderr"] == "Error: invalid catalog\n"
+    mt.stub_config(ws, {"lora-catalog add": {"exit": 2, "stderr": "Error: catalog entry pan already exists\n"},
+                        "lora-catalog verify": {"exit": 1, "stdout": "OK ink\nFAIL pan: sha256 changed\n"
+                                                                    "FAIL pan: missing file\n"}})
+    add = {"ws": ws, "path": "/l/pan.safetensors", "id": "pan", "kind": "motion", "target": "video",
+           "base_models": ["M1", "M2"], "triggers": ["panshot"], "description": "a pan", "use_when": "pans",
+           "avoid_when": "", "default_strength": 0.8, "strength_range": [0.5, 1], "rank": 16, "alpha": None}
+    status, _h, payload = mt.api(s, "POST", "/api/loras", body=add)
+    assert status == 200 and payload["run"]["exit_code"] == 2
+    assert mt.stub_calls(ws)[-1]["argv"] == [
+        "add", "/l/pan.safetensors", "--id", "pan", "--kind", "motion", "--target", "video", "--base-model", "M1",
+        "--base-model", "M2", "--trigger", "panshot", "--description", "a pan", "--use-when", "pans",
+        "--default-strength", "0.8", "--strength-range", "0.5,1.0", "--rank", "16"]
+    assert mt.api(s, "POST", "/api/loras", body=dict(add, triggers="panshot"))[:3:2] == (
+        400, {"error": "triggers must be a list of strings"})
+    assert mt.api(s, "POST", "/api/loras", body=dict(add, rank=1.5))[:3:2] == (
+        400, {"error": "rank must be an integer or null"})
+    status, _h, payload = mt.api(s, "POST", "/api/loras/remove", body={"ws": ws, "id": "pan"})
+    assert status == 200 and mt.stub_calls(ws)[-1]["argv"] == ["remove", "pan"]
+    status, _h, payload = mt.api(s, "POST", "/api/loras/verify", body={"ws": ws, "ids": []})
+    assert status == 200 and mt.stub_calls(ws)[-1]["argv"] == ["verify"]
+    assert payload["results"] == [{"id": "ink", "ok": True, "problems": []},
+                                  {"id": "pan", "ok": False, "problems": ["sha256 changed", "missing file"]}]
+
+
+def test_mu63_models_endpoint(env, monkeypatch):
+    for var, sub in (("LTX2_MLX_HF_HOME", "l"), ("Z_IMAGE_HF_HOME", "z"), ("HF_HOME", "h")):
+        monkeypatch.setenv(var, os.path.join(env["tmp"], sub))
+    mt.make_hf_cache(os.path.join(env["tmp"], "l"), "org/m", {"a.safetensors": b"\x01"})
+    status, _h, payload = mt.api(env["srv"], "GET", "/api/models?ws=" + env["ws"])
+    assert status == 200 and [m["repo"] for m in payload["models"]] == ["org/m"]
+    assert mt.api(env["srv"], "GET", "/api/models")[:3:2] == (400, {"error": "missing ws"})
+
+
+def test_mu64_mu65_character_endpoints(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    sheet = os.path.join(env["tmp"], "lib", "kyra", "dataset", "contact_sheet.jpg")
+    os.makedirs(os.path.join(os.path.dirname(sheet), "stills"))
+    for name in ("char_02.png", "char_01.png", "other.png"):
+        open(os.path.join(os.path.dirname(sheet), "stills", name), "wb").close()
+    show = json.dumps({"name": "kyra", "status": "untrained", "dataset": {"contact_sheet": sheet},
+                       "loras": {"video": None, "stills": None}}, indent=2)
+    mt.stub_config(ws, {
+        "character list": {"stdout": "NAME             TRIGGER          STATUS    VIDEO STILLS PHRASE\n"
+                                     "kyra             kyrax            trained   yes   no     the young woman\n"
+                                     "broken           (invalid: bad json)\n"},
+        "character show kyra": {"stdout": show + "\nfiles:\n  ok       %s\n  MISSING  /lib/kyra/seed.png\n" % sheet}})
+    assert mt.api(s, "GET", "/api/characters?ws=" + ws)[2] == {"characters": [
+        {"name": "kyra", "trigger": "kyrax", "status": "trained", "video": True, "stills": False,
+         "phrase": "the young woman", "invalid": None},
+        {"name": "broken", "invalid": "bad json"}]}
+    detail = mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[2]
+    assert detail["character"]["status"] == "untrained"
+    assert detail["files"] == [{"status": "ok", "path": sheet}, {"status": "MISSING", "path": "/lib/kyra/seed.png"}]
+    stills = os.path.join(os.path.dirname(sheet), "stills")
+    assert detail["dataset"] == {"contact_sheet": sheet, "stills": [os.path.join(stills, "char_01.png"),
+                                                                    os.path.join(stills, "char_02.png")]}
+    assert detail["face_problem"] is False and detail["last_create_fields"] is None
+    seed = _upload(s, mt.PNG, "image/png")[2]["upload_id"]
+    create = {"ws": ws, "name": "kyra", "phrase": "the young woman", "class_noun": None, "descriptor": None,
+              "trigger": None, "seed": None, "seed_upload": seed, "force": False}
+    status, _h, payload = mt.api(s, "POST", "/api/characters", body=create)
+    assert status == 201 and payload["job"]["kind"] == "character-create" and payload["job"]["character"] == "kyra"
+    job = lib.read_job(lib.job_dir(state, payload["job"]["id"]))
+    assert job["argv"][2:] == ["create", "kyra", "--phrase", "the young woman", "--seed-image",
+                               os.path.join(state, "uploads", seed)]
+    with open(os.path.join(lib.job_dir(state, job["id"]), "log.txt"), "wb") as f:
+        f.write(b"Error: the vision model found no face in the seed image; pass --force to proceed anyway.\n")
+    detail = mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[2]
+    assert detail["face_problem"] is True and detail["last_create_fields"]["seed_upload"] == seed
+    status, _h, payload = mt.api(s, "POST", "/api/characters", body=dict(create, name="K", phrase="", seed_upload=None))
+    assert (status, payload["error"]) == (400, "invalid fields")
+    assert payload["errors"] == ["character name must match [a-z][a-z0-9-]{1,23}", "phrase is required",
+                                 "give exactly one of a seed image or a descriptor"]
+    assert mt.api(s, "POST", "/api/characters", body=dict(create, seed_upload=None, descriptor="tall"))[2]["errors"] == [
+        "a descriptor needs a class noun"]
+    status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/train", body={"ws": ws})
+    assert (status, payload) == (400, {"error": "invalid fields", "errors": ["choose video, stills or both"]})
+    status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/train", body={"ws": ws, "video": True,
+                                                                               "force": True})
+    assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
+        "train", "kyra", "--video", "--force"]
+    status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/regenerate", body={"ws": ws})
+    assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
+        "create", "kyra", "--regenerate"]
+    assert payload["job"]["kind"] == "character-regenerate" and payload["job"]["queue_position"] == 3
+    mt.stub_config(ws, {"character show kyra": {"exit": 2, "stderr": "Error: no character kyra\n"}})
+    assert mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[:3:2][0] == 502
+
+
+def test_mu61_lora_add_rejects_flaglike_and_unsafe_values(env):
+    s, ws = env["srv"], env["ws"]
+    add = {"ws": ws, "path": "/l/pan.safetensors", "id": "pan", "kind": "motion", "target": "video",
+           "base_models": ["M1"], "triggers": ["panshot"], "description": "a pan", "use_when": "pans",
+           "avoid_when": "", "default_strength": 0.8, "strength_range": [0.5, 1], "rank": None, "alpha": None}
+    for change, error in ((dict(path="rel/x"), "path must be an absolute path"),
+                          (dict(description="--force"), "description must not start with '-'"),
+                          (dict(triggers=["ok", "-x"]), "triggers must not start with '-'"),
+                          (dict(description="a\x00b"), "description contains invalid characters")):
+        assert mt.api(s, "POST", "/api/loras", body=dict(add, **change))[:3:2] == (400, {"error": error})
+
+
+def test_mu65_character_create_errors_flaglike_and_unsafe(env):
+    base = {"name": "kyra", "phrase": "the woman", "class_noun": "woman", "descriptor": "tall", "trigger": None,
+            "seed": None, "seed_upload": None, "force": False}
+    state = env["state"]
+    assert srv.character_create_errors(base, state) == []
+    for change, error in ((dict(phrase="--x"), "phrase must not start with '-'"),
+                          (dict(phrase=" -x"), "phrase must not start with '-'"),
+                          (dict(phrase="a\x00b"), "phrase contains invalid characters"),
+                          (dict(phrase="a\ud800b"), "phrase contains invalid characters"),
+                          (dict(descriptor="-tall"), "descriptor must not start with '-'"),
+                          (dict(descriptor="a\x00b"), "descriptor contains invalid characters")):
+        assert srv.character_create_errors(dict(base, **change), state) == [error]
