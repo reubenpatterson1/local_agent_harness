@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""action -- build, train and inspect the action LoRA library (generated/actions/).
+
+  bin/action create NAME --trigger PHRASE --descriptor TEXT --clip PATH [--clip PATH ...]
+                   [--performers N] [--width W] [--height H] [--frames F] [--force] [--regenerate]
+  bin/action list
+  bin/action show NAME
+
+create normalizes operator-supplied reference clips of one action (by varied
+performers) into a training dataset and stops for review (dataset/contact_sheet.jpg);
+it needs ffmpeg. Training (bin/action train) is Phase 3 and not yet implemented.
+list/show read the library only (stdlib). An action LoRA is cast into a movie with
+bin/ltx-movie --action NAME (Phase 4).
+
+Exit codes: 0 success, 2 argument or precondition, 3 fewer than MIN_CLIPS clips.
+Spec: docs/superpowers/specs/2026-10-20-action-lora-motion-library-design.md.
+
+list/show import action_lib only; create imports action_dataset (which needs PIL
+and ffmpeg).
+"""
+
+import argparse
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import action_lib  # noqa: E402
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="action", description="Build, train and inspect the action LoRA library.")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+    c = sub.add_parser("create", help="normalize reference clips into a training dataset")
+    c.add_argument("name")
+    c.add_argument("--trigger", required=True, help='Motion: phrase, e.g. "performs a roundhouse kick"')
+    c.add_argument("--descriptor", required=True, help="appearance-free noun phrase, 8-60 words")
+    c.add_argument("--clip", dest="clips", action="append", default=[], metavar="PATH")
+    c.add_argument("--performers", type=int, default=0, help="distinct performers across the clips (>=3)")
+    c.add_argument("--width", type=int, default=None)
+    c.add_argument("--height", type=int, default=None)
+    c.add_argument("--frames", type=int, default=None)
+    c.add_argument("--fps", type=int, default=None)
+    c.add_argument("--force", action="store_true", help="proceed with < 3 performers (not identity-agnostic)")
+    c.add_argument("--regenerate", action="store_true", help="rebuild an existing action's dataset")
+    t = sub.add_parser("train", help="(Phase 3) train the motion LoRA -- not yet implemented")
+    t.add_argument("name")
+    sub.add_parser("list", help="list every action")
+    s = sub.add_parser("show", help="print one action's record")
+    s.add_argument("name")
+    return parser
+
+
+def cmd_list():
+    names = action_lib.list_names()
+    if not names:
+        print("(no actions)")
+        return 0
+    print("%-24s %-10s %-6s %s" % ("name", "status", "clips", "trigger"))
+    for name in names:
+        try:
+            d = action_lib.load_action(name)
+        except action_lib.ActionError as e:
+            print("%-24s %s" % (name, "INVALID: %s" % e))
+            continue
+        clips = (d.get("dataset") or {}).get("clips", "-")
+        print("%-24s %-10s %-6s %s" % (name, d["status"], clips, d["trigger"]))
+    return 0
+
+
+def cmd_show(name):
+    try:
+        d = action_lib.load_action(name)
+    except action_lib.ActionError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    import json
+    print(json.dumps(d, indent=2))
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.command == "list":
+        return cmd_list()
+    if args.command == "show":
+        return cmd_show(args.name)
+    if args.command == "train":
+        print("Error: bin/action train is Phase 3 (not yet implemented); the dataset is ready for "
+              "ltx-2-mlx train once wired.", file=sys.stderr)
+        return 2
+    # create -> action_dataset (heavy: PIL + ffmpeg)
+    import action_dataset
+    # fill geometry defaults from action_dataset so the two stay in sync
+    args.width = args.width if args.width is not None else action_dataset.DEFAULT_WIDTH
+    args.height = args.height if args.height is not None else action_dataset.DEFAULT_HEIGHT
+    args.frames = args.frames if args.frames is not None else action_dataset.DEFAULT_FRAMES
+    args.fps = args.fps if args.fps is not None else action_dataset.DEFAULT_FPS
+    return action_dataset.create(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
