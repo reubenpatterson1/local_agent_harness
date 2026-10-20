@@ -183,3 +183,66 @@ def test_mut1_smoke_manifest_and_argv(monkeypatch, tmp_path):
         "--height", "320", "--frame-rate", "24", "--clips-dir", os.path.join(sdir, "clips"),
         "--model", lib.DEFAULT_MODEL, "--gemma", lib.DEFAULT_GEMMA, "--lora", "/l/pan.safetensors:1.0",
         "--lora", "/l/free.safetensors:0.5", "--no-low-ram", "--panel-timeout", "1800"]
+
+
+NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui-job", "tests/movie_ui_testutil.py",
+          "tests/test_movie_ui_builder.py", "tests/test_movie_ui_checks.py", "tests/test_movie_ui_jobs.py",
+          "tests/test_movie_ui_progress.py", "tests/test_movie_ui_http.py", "tests/test_movie_ui_traces.py")
+CHANGED_PY = ("fleet_lib.py", "bin/qwen-agentd", "tests/test_fleet_lib.py", "tests/test_fleet_self_update.py")
+PIPELINE_FILES = ("bin/ltx-movie", "bin/ltx-mlx-render", "bin/ltx-story-images", "bin/ltx-story-manifest",
+                  "bin/ltx-story-video", "bin/ltx-chain", "bin/ltx-generate", "bin/ltx-host-prep",
+                  "bin/ltx-host-restore", "bin/character", "bin/lora-catalog", "bin/judge-story", "bin/judge-clips",
+                  "bin/judge-stills", "bin/iterate-story", "bin/qwen-agent", "story_engine.py", "character_lib.py",
+                  "character_dataset.py", "lora_catalog.py", "pipeline_log.py", "z_image_skill.py",
+                  "ltx2_mlx_video_skill.py")
+
+
+@pytest.mark.parametrize("python", ["/usr/bin/python3", sys.executable])
+def test_mut25_every_new_and_changed_file_compiles(python, tmp_path):
+    if not os.path.isfile(python):
+        pytest.skip("%s is not installed" % python)
+    paths = [os.path.join(mt.WS, rel) for rel in NEW_PY + CHANGED_PY]
+    proc = subprocess.run([python, "-m", "py_compile"] + paths, capture_output=True, text=True, timeout=120,
+                          env=dict(os.environ, PYTHONPYCACHEPREFIX=str(tmp_path)))
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_mut25_source_scan_of_new_python_files():
+    forbidden = [(re.compile(r"^\s*(import|from)\s+cgi\b", re.M), "cgi"),
+                 (re.compile(r"\burllib\b"), "urllib"),
+                 (re.compile(r"shell\s*=\s*True"), "shell=True"),
+                 (re.compile(r"^\s*match\s+\S.*:\s*$", re.M), "match statement"),
+                 (re.compile(r"->[^:\n]*\|"), "X | Y return annotation"),
+                 (re.compile(r":\s*[A-Za-z_][\w.\[\], ]*\|\s*None"), "X | None annotation"),
+                 (re.compile(r"strict\s*=\s*True\s*\)"), "zip(strict=)"),
+                 (re.compile(r"load_module\("), "load_module")]
+    for rel in NEW_PY:
+        with open(os.path.join(mt.WS, rel), encoding="utf-8") as f:
+            source = f.read()
+        if rel == "tests/test_movie_ui_builder.py":
+            start = source.index("    forbidden = [")
+            end = source.index("    for rel in NEW_PY:", start)
+            source = source[:start] + source[end:]
+        for regex, what in forbidden:
+            assert not regex.search(source), (rel, what)
+    for rel in NEW_PY[:2]:
+        with open(os.path.join(mt.WS, rel), encoding="utf-8") as f:
+            source = f.read()
+        imported = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M))
+        allowed = {"argparse", "calendar", "errno", "fcntl", "hashlib", "hmac", "http.server", "json", "os",
+                   "platform", "re", "secrets", "shlex", "shutil", "signal", "socket", "struct", "subprocess",
+                   "sys", "threading", "time", "fleet_lib", "movie_ui_lib"}
+        assert imported <= allowed, (rel, imported - allowed)
+        for loader in ("importlib", "SourceFileLoader", "runpy", "exec(", "__import__"):
+            assert loader not in source, (rel, loader)
+
+
+def test_mut26_pipeline_files_are_unchanged():
+    root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if root.returncode != 0:
+        pytest.skip("not a git checkout")
+    if subprocess.run(["git", "-C", mt.WS, "cat-file", "-e", "22dc4a1^{commit}"], capture_output=True).returncode:
+        pytest.skip("commit 22dc4a1 is not in this checkout")
+    proc = subprocess.run(["git", "-C", mt.WS, "diff", "--quiet", "22dc4a1", "--"] + list(PIPELINE_FILES),
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
