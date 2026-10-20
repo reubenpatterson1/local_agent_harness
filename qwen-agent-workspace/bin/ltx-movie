@@ -315,7 +315,7 @@ def build_parser():
     parser.add_argument("--image-seed", dest="image_seed", type=int, default=0)
     parser.add_argument("--video-width", dest="video_width", type=int, default=None)
     parser.add_argument("--video-height", dest="video_height", type=int, default=None)
-    parser.add_argument("--model", default="MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8")
+    parser.add_argument("--model", default="dgrauet/ltx-2.3-mlx-q8")
     parser.add_argument("--gemma", default="mlx-community/gemma-3-12b-it-4bit",
                          help="Gemma model for text encoding, passed through to "
                               "ltx-2-mlx's own --gemma. Override this to swap the text "
@@ -758,6 +758,12 @@ def _character_lib():
     run without --shots never reads it (spec 1.2; shots spec 8)."""
     return importlib.machinery.SourceFileLoader(
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
+
+
+def _ltx2_skill():
+    """ltx2_mlx_video_skill.py, loaded by path, for the host-aware autotune helper."""
+    return importlib.machinery.SourceFileLoader(
+        "ltx2_mlx_video_skill", os.path.join(WS, "ltx2_mlx_video_skill.py")).load_module()
 
 
 def _story_engine():
@@ -2236,6 +2242,14 @@ def main(argv=None):
         return _list_characters(raw_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    _autotuned = _ltx2_skill().maybe_autotune_apply(
+        args, raw_argv,
+        [("width", "video_width", ["--video-width"], int),
+         ("height", "video_height", ["--video-height"], int),
+         ("num_frames", "frames", ["--frames"], int),
+         ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)])
+    if _autotuned:
+        print("autotune (QWEN_LTX_AUTOTUNE): %s" % ", ".join(_autotuned), file=sys.stderr)
     if args.list_characters:                 # an abbreviation (--list-char) got past the pre-scan
         print("Error: --list-characters takes no other arguments", file=sys.stderr)
         return 2

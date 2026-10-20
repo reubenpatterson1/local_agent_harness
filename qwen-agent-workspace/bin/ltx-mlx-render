@@ -1103,6 +1103,15 @@ def finish_run(args, raw_argv, manifest, units, unit_results, clips_by_index,
 def main(argv=None):
     raw_argv = argv if argv is not None else sys.argv[1:]
     args = build_parser().parse_args(argv)
+    _autotuned = SKILL.maybe_autotune_apply(
+        args, argv if argv is not None else sys.argv[1:],
+        [("width", "width", ["--width"], int),
+         ("height", "height", ["--height"], int),
+         ("num_frames", "frames", ["--frames"], int),
+         ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)])
+    if _autotuned:
+        print("autotune (%s): %s" % (SKILL.AUTOTUNE_ENV, ", ".join(_autotuned)),
+              file=sys.stderr)
 
     geo_error = validate_cli_geometry(args)
     if geo_error:
