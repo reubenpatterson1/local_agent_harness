@@ -312,8 +312,8 @@ def validate_descriptor(text):
     if text != text.strip():
         raise CharacterError("descriptor: must not have leading or trailing whitespace")
     words = len(text.split())
-    if not 8 <= words <= 60:
-        raise CharacterError("descriptor: must be 8-60 words, got %d" % words)
+    if not 8 <= words <= 70:
+        raise CharacterError("descriptor: must be 8-70 words, got %d" % words)
     if not (text.startswith("a ") or text.startswith("an ")):
         raise CharacterError('descriptor: must start with "a " or "an ", got %r' % (text[:30],))
     if text.endswith("."):
