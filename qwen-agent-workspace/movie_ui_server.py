@@ -1225,3 +1225,199 @@ MovieUIHandler.h_character = _h_character
 MovieUIHandler.h_character_create = _h_character_create
 MovieUIHandler.h_character_regenerate = _h_character_regenerate
 MovieUIHandler.h_character_train = _h_character_train
+
+
+# ---------------------------------------------------------------------------
+# Stories, story.md edits and /files (MU54, MU69, MU70)
+# ---------------------------------------------------------------------------
+
+PANEL_STILL_RE = re.compile(r"^panel_\d{2}\.png$")
+PANEL_CLIP_RE = re.compile(r"^panel_\d{2}\.mp4$")
+
+
+def _matching(directory, regex):
+    try:
+        return sorted(os.path.join(directory, n) for n in os.listdir(directory) if regex.fullmatch(n))
+    except OSError:
+        return []
+
+
+def _checks_summary(checks):
+    if not (isinstance(checks, dict) and isinstance(checks.get("hard"), list)
+            and isinstance(checks.get("advisory"), list)):
+        return None
+    return {"source": checks.get("source"), "hard": len(checks["hard"]), "advisory": len(checks["advisory"]),
+            "verdict": checks.get("verdict")}
+
+
+def _h_stories(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    root = os.path.join(real, "generated", "stories")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        names = []
+    stories = []
+    for name in names:
+        sdir = os.path.join(root, name)
+        if not (lib.valid_story_id(name) and name != lib.SMOKE_STORY_ID and os.path.isdir(sdir)):
+            continue
+        mtime = os.stat(sdir).st_mtime
+        stories.append((mtime, {
+            "id": name, "story_md": os.path.isfile(os.path.join(sdir, "story.md")),
+            "checks": _checks_summary(lib.read_json(os.path.join(sdir, "story_checks.json"))),
+            "stills": len(_matching(os.path.join(sdir, "images"), PANEL_STILL_RE)),
+            "clips": len(_matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE)),
+            "movie": os.path.isfile(os.path.join(sdir, "movie.mp4")),
+            "mtime": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))}))
+    stories.sort(key=lambda pair: (-pair[0], pair[1]["id"]))
+    return 200, {"stories_dir": _fs_text(root), "stories": [s for _m, s in stories]}
+
+
+def _story_dir(self, groups, value):
+    real = self.ws(value)
+    story_id = self.story_id(groups[0])
+    sdir = lib.story_dir(real, story_id)
+    root = os.path.realpath(os.path.join(real, "generated", "stories"))
+    try:
+        inside = os.path.realpath(sdir).startswith(root + os.sep)
+    except ValueError:
+        inside = False
+    if not (inside and os.path.isdir(sdir)):
+        raise ApiError(404, "no story %s in %s" % (story_id, _fs_text(os.path.dirname(sdir))))
+    return real, story_id, sdir
+
+
+def _read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _h_story(self, groups, query, body):
+    real, story_id, sdir = _story_dir(self, groups, query.get("ws"))
+    raw = _read_bytes(os.path.join(sdir, "story.md"))
+    plan = lib.read_json(os.path.join(sdir, "plan.json"))
+    plan = plan if isinstance(plan, dict) else {}
+    runs = os.path.join(sdir, "runs")
+    try:
+        run_names = sorted((n for n in os.listdir(runs)
+                            if os.path.isfile(os.path.join(runs, n, "story_summary.json"))), reverse=True)
+    except OSError:
+        run_names = []
+    movie = os.path.join(sdir, "movie.mp4")
+    job = newest_job(self.server, ("story", "movie"), real, "story_id", story_id)
+    return 200, {"id": story_id, "dir": _fs_text(sdir), "files": sorted(_fs_text(n) for n in os.listdir(sdir)),
+                 "story_md": None if raw is None else {"text": raw.decode("utf-8", "replace"),
+                                                       "sha256": hashlib.sha256(raw).hexdigest()},
+                 "checks": lib.read_json(os.path.join(sdir, "story_checks.json")),
+                 "plan_loras": plan.get("loras"), "plan_mode": plan.get("mode"),
+                 "catalog_loras": lib.read_json(os.path.join(sdir, "catalog_loras.json")),
+                 "stills": [_fs_text(p) for p in _matching(os.path.join(sdir, "images"), PANEL_STILL_RE)],
+                 "clips": [_fs_text(p) for p in _matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE)],
+                 "movie": _fs_text(movie) if os.path.isfile(movie) else None,
+                 "summary": lib.read_json(os.path.join(runs, run_names[0], "story_summary.json")) if run_names else None,
+                 "last_fields": job["fields"] if job is not None else None}
+
+
+def _h_story_save(self, groups, query, body):
+    real, story_id, sdir = _story_dir(self, groups, body.get("ws"))
+    text, base = body.get("text"), body.get("base_sha256")
+    if not isinstance(text, str):
+        raise ApiError(400, "text must be a string")
+    if base is not None and not (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{64}", base)):
+        raise ApiError(400, "base_sha256 must be 64 hex digits or null")
+    try:
+        data = text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ApiError(400, "text must be encodable as UTF-8")
+    path = os.path.join(sdir, "story.md")
+    with STORE_LOCK:
+        for job_id in lib.active_job_ids(self.server.state):
+            job = self.server.job(job_id)
+            if job is not None and job["workspace"] == real and job["story_id"] == story_id:
+                raise ApiError(409, "story %s is in use by job %s" % (story_id, job_id))
+        raw = _read_bytes(path)
+        current = None if raw is None else hashlib.sha256(raw).hexdigest()
+        if current != base:
+            raise ApiError(409, "story.md changed since it was loaded; reload it", sha256=current)
+        backup = None
+        if raw is not None:
+            stem = "%s.bak-%s" % (path, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+            backup, n = stem, 1
+            while os.path.lexists(backup):
+                n += 1
+                backup = "%s-%d" % (stem, n)
+            lib.write_bytes_atomic(backup, raw)
+        lib.write_bytes_atomic(path, data)
+    return 200, {"sha256": hashlib.sha256(data).hexdigest(), "backup": backup}
+
+
+def _h_files(self, groups, query, body):
+    path = query.get("path")
+    real_ws = self.ws(query.get("ws"))
+    if not (isinstance(path, str) and os.path.isabs(path)):
+        raise ApiError(400, "path must be an absolute path")
+    if "\x00" in path:
+        raise ApiError(404, "not found")
+    try:
+        real = os.path.realpath(path)
+    except ValueError:
+        raise ApiError(404, "not found")
+    roots = (os.path.realpath(os.path.join(real_ws, "generated")),
+             os.path.realpath(os.path.join(self.server.state, "uploads")))
+    if not any(real.startswith(root + os.sep) for root in roots):
+        raise ApiError(403, "path not allowed")
+    if not os.path.isfile(real):
+        raise ApiError(404, "not found")
+    size = os.path.getsize(real)
+    ctype = FILE_TYPES.get(os.path.splitext(real)[1].lower(), "application/octet-stream")
+    start, end, status = 0, size - 1, 200
+    m = RANGE_RE.match(self.headers.get("Range") or "")
+    if m and (m.group(1) or m.group(2)):
+        if m.group(1):
+            start = int(m.group(1))
+            end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+        else:
+            start, end = max(size - int(m.group(2)), 0), size - 1
+            if int(m.group(2)) == 0:
+                start = size
+        if start > end or start >= size:
+            self.send_response(416)
+            for key, value in (("Content-Range", "bytes */%d" % size), ("Content-Length", "0"),
+                               ("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
+                               ("Cache-Control", "no-store")):
+                self.send_header(key, value)
+            self.end_headers()
+            return None
+        status = 206
+    self.send_response(status)
+    self.send_header("Content-Type", ctype)
+    self.send_header("Content-Length", str(end - start + 1))
+    if status == 206:
+        self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+    for key, value in (("Accept-Ranges", "bytes"), ("X-Content-Type-Options", "nosniff"),
+                       ("Cache-Control", "no-store")):
+        self.send_header(key, value)
+    self.end_headers()
+    try:
+        with open(real, "rb") as f:
+            f.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = f.read(min(FILE_CHUNK, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    return None
+
+
+MovieUIHandler.h_stories = _h_stories
+MovieUIHandler.h_story = _h_story
+MovieUIHandler.h_story_save = _h_story_save
+MovieUIHandler.h_files = _h_files

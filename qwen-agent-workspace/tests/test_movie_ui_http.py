@@ -756,3 +756,168 @@ def test_fix13_character_empty_seed_upload_is_none(env):
     base = {"name": "kyra", "phrase": "the woman", "class_noun": "woman", "descriptor": "tall", "trigger": None,
             "seed": None, "seed_upload": "", "force": False}
     assert srv.character_create_errors(base, env["state"]) == []
+
+
+def _make_story(ws, story_id, text=None, files=()):
+    sdir = os.path.join(ws, "generated", "stories", story_id)
+    os.makedirs(sdir, exist_ok=True)
+    if text is not None:
+        with open(os.path.join(sdir, "story.md"), "wb") as f:
+            f.write(text.encode("utf-8"))
+    for rel, data in files:
+        path = os.path.join(sdir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+    return sdir
+
+
+def test_mu69_story_list_and_detail(env):
+    s, ws = env["srv"], env["ws"]
+    old = _make_story(ws, "old-one", "## Panel 1\n")
+    os.utime(old, (1000, 1000))
+    checks = {"source": "robust", "hard": [{"id": "N1"}], "advisory": [], "verdict": "ok", "panels": 3}
+    sdir = _make_story(ws, "ronin-rescue", "## Panel 1\n", files=[
+        ("story_checks.json", json.dumps(checks).encode()), ("plan.json", json.dumps({"mode": "shots", "loras": {
+            "global": []}}).encode()), ("images/panel_01.png", b"p"), ("images/panel_02.png", b"p"),
+        ("images/seed.png", b"p"), ("clips/panel_01.mp4", b"m"), ("movie.mp4", b"m"),
+        ("runs/20261019-a/story_summary.json", b'{"run": "a"}'), ("runs/20261019-b/story_summary.json", b'{"run": "b"}')])
+    _make_story(ws, "movie-ui-smoke", "x")
+    _make_story(ws, "a..b", "x")
+    payload = mt.api(s, "GET", "/api/stories?ws=" + ws)[2]
+    assert payload["stories_dir"] == os.path.join(ws, "generated", "stories")
+    assert [st["id"] for st in payload["stories"]] == ["ronin-rescue", "old-one"]
+    first = payload["stories"][0]
+    assert first == {"id": "ronin-rescue", "story_md": True,
+                     "checks": {"source": "robust", "hard": 1, "advisory": 0, "verdict": "ok"},
+                     "stills": 2, "clips": 1, "movie": True, "mtime": first["mtime"]}
+    assert payload["stories"][1]["mtime"] == "1970-01-01T00:16:40Z" and payload["stories"][1]["checks"] is None
+    detail = mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)[2]
+    assert detail["dir"] == sdir and detail["story_md"] == {"text": "## Panel 1\n",
+                                                            "sha256": hashlib.sha256(b"## Panel 1\n").hexdigest()}
+    assert detail["files"] == ["clips", "images", "movie.mp4", "plan.json", "runs", "story.md", "story_checks.json"]
+    assert detail["checks"] == checks and detail["plan_mode"] == "shots" and detail["plan_loras"] == {"global": []}
+    assert detail["stills"] == [os.path.join(sdir, "images", "panel_01.png"), os.path.join(sdir, "images", "panel_02.png")]
+    assert detail["clips"] == [os.path.join(sdir, "clips", "panel_01.mp4")]
+    assert detail["movie"] == os.path.join(sdir, "movie.mp4") and detail["summary"] == {"run": "b"}
+    assert detail["catalog_loras"] is None and detail["last_fields"] is None
+    created = mt.api(s, "POST", "/api/jobs", body=_compose(env, goal="Keep it tense."))[2]
+    job = lib.read_job(lib.job_dir(env["state"], created["job"]["id"]))
+    assert mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)[2]["last_fields"] == job["fields"]
+    assert job["fields"]["goal"] == "Keep it tense."
+    assert mt.api(s, "GET", "/api/stories/nope?ws=" + ws)[0] == 404
+    assert mt.api(s, "GET", "/api/stories/a..b?ws=" + ws)[:3:2] == (404, {"error": "not found"})
+
+
+def test_mut20_story_md_save_backup_and_conflicts(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    sdir = _make_story(ws, "ronin-rescue", "v1\n")
+    sha1 = hashlib.sha256(b"v1\n").hexdigest()
+    put = "/api/stories/ronin-rescue/story.md"
+    status, _h, payload = mt.api(s, "PUT", put, body={"ws": ws, "text": "v2\r\n", "base_sha256": sha1})
+    assert status == 200 and payload["sha256"] == hashlib.sha256(b"v2\r\n").hexdigest()
+    backup = payload["backup"]
+    assert re.fullmatch(re.escape(os.path.join(sdir, "story.md.bak-")) + r"[0-9]{8}T[0-9]{6}Z", backup)
+    with open(backup, "rb") as f:
+        assert f.read() == b"v1\n"
+    with open(os.path.join(sdir, "story.md"), "rb") as f:
+        assert f.read() == b"v2\r\n"
+    status, _h, payload = mt.api(s, "PUT", put, body={"ws": ws, "text": "v3", "base_sha256": sha1})
+    assert (status, payload) == (409, {"error": "story.md changed since it was loaded; reload it",
+                                       "sha256": hashlib.sha256(b"v2\r\n").hexdigest()})
+    sha2 = hashlib.sha256(b"v2\r\n").hexdigest()
+    stamp = backup[len(os.path.join(sdir, "story.md.bak-")):]
+    original = time.strftime
+
+    def frozen(fmt, *args):
+        return stamp if fmt == "%Y%m%dT%H%M%SZ" else original(fmt, *args)
+    monkeypatch.setattr(srv.time, "strftime", frozen)
+    payload = mt.api(s, "PUT", put, body={"ws": ws, "text": "v3", "base_sha256": sha2})[2]
+    assert payload["backup"] == backup + "-2"
+    payload = mt.api(s, "PUT", put, body={"ws": ws, "text": "v4", "base_sha256": hashlib.sha256(b"v3").hexdigest()})[2]
+    assert payload["backup"] == backup + "-3"
+    monkeypatch.setattr(srv.time, "strftime", original)
+    fresh = _make_story(ws, "fresh")
+    assert mt.api(s, "PUT", "/api/stories/fresh/story.md", body={"ws": ws, "text": "x", "base_sha256": sha1})[0] == 409
+    payload = mt.api(s, "PUT", "/api/stories/fresh/story.md", body={"ws": ws, "text": "x", "base_sha256": None})[2]
+    assert payload["backup"] is None and os.path.isfile(os.path.join(fresh, "story.md"))
+    assert mt.api(s, "PUT", "/api/stories/missing/story.md", body={"ws": ws, "text": "x", "base_sha256": None})[0] == 404
+    busy = mt.make_job(state, ["true"], ws, story_id="ronin-rescue", status={
+        "state": "running", "dispatched": lib.utc_now(), "runner_pid": 1, "pgid": None, "started": lib.utc_now()})
+    status, _h, payload = mt.api(s, "PUT", put, body={"ws": ws, "text": "v5",
+                                                      "base_sha256": hashlib.sha256(b"v4").hexdigest()})
+    assert (status, payload) == (409, {"error": "story ronin-rescue is in use by job %s" % busy})
+
+
+def test_mut19_files_roots_ranges_and_token(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    data = bytes(range(100))
+    sdir = _make_story(ws, "ronin-rescue", files=[("clips/panel_01.mp4", data)])
+    clip = os.path.join(sdir, "clips", "panel_01.mp4")
+    outside = os.path.join(env["tmp"], "secret.txt")
+    with open(outside, "w") as f:
+        f.write("secret")
+    os.symlink(outside, os.path.join(sdir, "link.txt"))
+
+    def get(path, token=mt.TOKEN, headers=None, t=None):
+        url = "/files?ws=%s&path=%s" % (ws, path) + ("&t=%s" % t if t else "")
+        return mt.api(s, "GET", url, token=token, headers=headers)
+    status, headers, body = get(clip)
+    assert (status, body) == (200, data)
+    assert headers["content-type"] == "video/mp4" and headers["accept-ranges"] == "bytes"
+    assert headers["x-content-type-options"] == "nosniff" and headers["cache-control"] == "no-store"
+    assert get(clip, token=None)[0] == 401
+    assert get(clip, token=None, t="wrong")[0] == 401
+    assert get(clip, token=None, t=mt.TOKEN)[:3:2] == (200, data)
+    assert get(os.path.join(sdir, "..", "..", "..", "..", "secret.txt"))[:3:2] == (403, {"error": "path not allowed"})
+    assert get(os.path.join(sdir, "link.txt"))[:3:2] == (403, {"error": "path not allowed"})
+    assert get(os.path.join(ws, "generated"))[0] == 403
+    assert get(os.path.join(sdir, "nope.mp4"))[0] == 404
+    for rng, start, end in (("bytes=0-9", 0, 9), ("bytes=10-", 10, 99), ("bytes=-5", 95, 99), ("bytes=90-500", 90, 99)):
+        status, headers, body = get(clip, headers={"Range": rng})
+        assert (status, body) == (206, data[start:end + 1]), rng
+        assert headers["content-range"] == "bytes %d-%d/100" % (start, end)
+        assert headers["content-length"] == str(end - start + 1)
+    for rng in ("bytes=100-", "bytes=9-3", "bytes=-0"):
+        status, headers, body = get(clip, headers={"Range": rng})
+        assert (status, headers["content-range"], body) == (416, "bytes */100", b""), rng
+    for rng in ("items=0-1", "bytes=0-1,5-6", "bytes=-"):
+        assert get(clip, headers={"Range": rng})[:3:2] == (200, data), rng
+    upload = _upload(s, mt.PNG, "image/png")[2]["path"]
+    status, headers, body = get(upload)
+    assert (status, headers["content-type"], body) == (200, "image/png", mt.PNG)
+
+
+def test_review_focus_1_non_ascii_story_round_trip(env):
+    """Review Focus 1: a narrative and a story.md edit with accents, CJK and emoji."""
+    s, ws = env["srv"], env["ws"]
+    narrative = "Ein Rōnin rettet ein Kind — 子供を救う 🔥"
+    preview = mt.api(s, "POST", "/api/preview", body=_compose(env, narrative=narrative))[2]
+    assert preview["argv"][2] == narrative
+    sdir = _make_story(ws, "ronin-rescue", "## Panel 1 — Café\n")
+    detail = mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)[2]
+    assert detail["story_md"]["text"] == "## Panel 1 — Café\n"
+    text = detail["story_md"]["text"] + "Image: 夜の市場、提灯 🏮\n"
+    payload = mt.api(s, "PUT", "/api/stories/ronin-rescue/story.md",
+                     body={"ws": ws, "text": text, "base_sha256": detail["story_md"]["sha256"]})[2]
+    with open(os.path.join(sdir, "story.md"), "rb") as f:
+        assert f.read() == text.encode("utf-8")
+    again = mt.api(s, "GET", "/api/stories/ronin-rescue?ws=" + ws)[2]["story_md"]
+    assert again == {"text": text, "sha256": payload["sha256"]}
+
+
+def test_review_focus_2_files_with_spaces_and_non_ascii_names(env):
+    """Review Focus 2: the page percent-encodes paths such as ".../My Movies/café still.png"."""
+    s = env["srv"]
+    ws = os.path.join(env["tmp"], "My Movies", "ws é")
+    shutil.copytree(env["ws"], ws, symlinks=True)
+    ws = os.path.realpath(ws)
+    sdir = _make_story(ws, "ronin-rescue", files=[("images/café still+1.png", mt.PNG)])
+
+    def enc(text):
+        return "".join(c if (c.isascii() and c.isalnum()) or c in "/-_." else "".join("%%%02X" % b for b in c.encode("utf-8"))
+                       for c in text)
+    path = os.path.join(sdir, "images", "café still+1.png")
+    status, headers, body = mt.api(s, "GET", "/files?ws=%s&path=%s" % (enc(ws), enc(path)))
+    assert (status, headers["content-type"], body) == (200, "image/png", mt.PNG)
+    assert mt.api(s, "GET", "/api/stories?ws=" + enc(ws))[2]["stories"][0]["id"] == "ronin-rescue"
