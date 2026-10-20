@@ -141,8 +141,13 @@ def resolve_ws(value):
         raise ApiError(400, "missing ws")
     if not os.path.isabs(value):
         raise ApiError(400, "ws must be an absolute path")
-    real = os.path.realpath(value)
-    if not (os.path.isdir(real) and os.path.isfile(os.path.join(real, "bin", "ltx-movie"))):
+    try:
+        real = os.path.realpath(value)
+        found = "\x00" not in value and os.path.isdir(real) and \
+            os.path.isfile(os.path.join(real, "bin", "ltx-movie"))
+    except ValueError:
+        found = False
+    if not found:
         raise ApiError(400, "not a harness workspace (no bin/ltx-movie): %s" % value)
     return real
 
@@ -207,6 +212,16 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
             return parser.snapshot(job, status, self.state)
 
 
+def _bad_constant(name):
+    raise ValueError("invalid JSON constant: %s" % name)
+
+
+def _printable(text):
+    """text with every control character shown as \\xNN and every non-ASCII character escaped (MU7)."""
+    text = "".join("\\x%02x" % ord(c) if (ord(c) < 0x20 or ord(c) == 0x7f) else c for c in text)
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def make_server(port, state, ui_ws, token):
     """A MovieUIServer on ("127.0.0.1", port); port 0 picks a free port (MU4). Raises OSError."""
     return MovieUIServer(port, MovieUIHandler, state, ui_ws, token)
@@ -231,6 +246,19 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._handle()
 
+    def __getattr__(self, name):
+        """Every HTTP method goes through the full check order (MU10)."""
+        if name.startswith("do_"):
+            return self._handle
+        raise AttributeError(name)
+
+    def send_error(self, code, message=None, explain=None):
+        if message is None:
+            message = self.responses.get(code, ("error",))[0]
+        if self.request_version == "HTTP/0.9":
+            self.request_version = "HTTP/1.0"   # a refused request line still gets a status line and headers
+        self.send_json(code, {"error": message})
+
     def log_message(self, fmt, *args):
         """Nothing: the default request log would print ?t=<token> (MU7)."""
 
@@ -242,7 +270,8 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return
         if status >= 500:
-            sys.stderr.write("movie-ui: %s %s -> %d\n" % (self.command, self.path.partition("?")[0], status))
+            sys.stderr.write(_printable("movie-ui: %s %s -> %d" % (
+                getattr(self, "command", None) or "", getattr(self, "path", "").partition("?")[0], status)) + "\n")
 
     # -- responses --------------------------------------------------------------------------
 
@@ -332,16 +361,16 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             return
         try:
             result = getattr(self, route[0])(route[1], query, body)
+            if result is not None:
+                self.send_json(result[0], result[1])
         except ApiError as e:
             self.send_json(e.status, e.body)
             return
         except Exception as e:
             self._logged_500 = True
-            sys.stderr.write("movie-ui: %s %s -> 500 (%s: %s)\n" % (self.command, path, type(e).__name__, e))
+            sys.stderr.write(_printable("movie-ui: %s %s -> 500 (%s: %s)" % (
+                self.command, path, type(e).__name__, e)) + "\n")
             self.send_json(500, {"error": "internal error"})
-            return
-        if result is not None:
-            self.send_json(result[0], result[1])
 
     def _read_body(self, path):
         """The parsed JSON object (or the raw bytes for POST /api/uploads), or None after an error
@@ -364,7 +393,8 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(415, {"error": "unsupported content type"})
             return None
         try:
-            obj = json.loads(self.rfile.read(n).decode("utf-8"))
+            obj = json.loads(self.rfile.read(n).decode("utf-8"), parse_constant=_bad_constant)
+            json.dumps(obj, ensure_ascii=False).encode("utf-8")
         except (UnicodeDecodeError, ValueError, RecursionError):
             self.send_json(400, {"error": "invalid JSON body"})
             return None
