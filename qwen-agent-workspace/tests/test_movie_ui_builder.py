@@ -251,7 +251,8 @@ def test_mut26_pipeline_files_are_unchanged():
     # intentionally advanced the pipeline; the movie-ui itself still made zero
     # pipeline changes (verified: git diff 22dc4a1..c275a0a over PIPELINE_FILES is
     # empty), and this invariant holds going forward from the new baseline.
-    BASELINE = "fb8b9a50e2c58a420979acff49548b7a46d10215"
+    # Re-based again to acf4c73 for the PR #1 fix (bin/ltx-movie autotune guard).
+    BASELINE = "acf4c732ac8bdb4ef8dccef086bd98646f26adf0"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
