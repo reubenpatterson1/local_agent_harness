@@ -216,8 +216,8 @@ def validate_description(d):
     if descriptor.endswith("."):
         descriptor = descriptor[:-1].strip()
     words = descriptor.split()
-    if not (8 <= len(words) <= 60):
-        raise ValueError("descriptor word count must be 8-60, got %d" % len(words))
+    if not (8 <= len(words) <= 70):
+        raise ValueError("descriptor word count must be 8-70, got %d" % len(words))
     # Normalise first letter to lowercase
     if descriptor and descriptor[0].isupper():
         descriptor = descriptor[0].lower() + descriptor[1:]
