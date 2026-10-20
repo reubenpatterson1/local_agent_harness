@@ -483,6 +483,10 @@ def delete_job(state, job_id):
     False when the job is not finished (MU68). Story outputs are never touched."""
     if job_state(state, job_id, read_queue(state)) not in FINISHED_STATES:
         return False
+    job = read_job(job_dir(state, job_id)) or {}
+    sdir = os.path.join(state, "smoke", job_id)
+    if job.get("kind") == "smoke" and os.path.lexists(sdir):
+        shutil.rmtree(sdir)
     shutil.rmtree(job_dir(state, job_id))
     return True
 
@@ -518,7 +522,7 @@ DEFAULT_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"     # bin/ltx-movie:318
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"          # bin/ltx-movie:319-323
 STILLS_BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"               # lora_catalog.py:29
 ZIMAGE_TEXT_ENCODER = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"   # z_image_skill.py:53
-ACTIONS = ("story", "regenerate", "movie", "redo")
+ACTIONS = ("story", "regenerate", "movie", "redo", "smoke")
 MODES = ("chained", "shots", "no_stills")
 LORA_KINDS = ("style", "motion", "physics")
 OPTION_DEFAULTS = {"panels": 15, "fps": 24, "frames": 145, "model": DEFAULT_MODEL,
@@ -864,6 +868,8 @@ def _rule_action(fields):
 
 def validate_fields(fields, ws_real, state):
     """V1: every failure line, in rule order; [] when the fields pass."""
+    if fields.get("action") == "smoke":
+        return _rule_models(fields) + _rule_loras(fields, "video") + _rule_flags(fields) + _rule_action(fields)
     errors = []
     story_id = fields.get("story_id")
     sid_ok = valid_story_id(story_id)
@@ -1456,6 +1462,8 @@ def run_checks(fields, ws_real, state, py=sys.executable):
     v1 = check("V1", "fields", "fail" if errors else "pass", "\n".join(errors))
     if errors:
         return [v1] + [check(i, n, "skip", "skipped: V1 failed") for i, n in V_GROUP_NAMES]
+    if fields["action"] == "smoke":
+        return [v1] + smoke_checks(fields, ws_real)
     cache = {}
     return ([v1] + host_checks(fields, ws_real, py) + model_checks(fields, ws_real)
             + lora_checks(fields, ws_real, cache) + compat_checks(fields, ws_real, cache)
@@ -1588,6 +1596,10 @@ class ProgressParser(object):
         started = parse_utc((status or {}).get("started"))
         current = time.time() if now is None else now
         elapsed = None if started is None else int(current - started)
+        if self.kind == "smoke":
+            clip = os.path.join(state, "smoke", job["id"], "clips", "panel_01.mp4")
+            return {"kind": "smoke", "elapsed_s": elapsed, "last_line": self.current_last_line(),
+                    "smoke": {"clip": clip, "clip_ok": os.path.isfile(clip) and os.path.getsize(clip) > 0}}
         if self.kind not in ("story", "movie"):
             return {"kind": self.kind, "elapsed_s": elapsed, "last_line": self.current_last_line(),
                     "face_problem": self.face_problem}
@@ -1606,3 +1618,50 @@ class ProgressParser(object):
                 "panels": dict((k, dict(v)) for k, v in sorted(self.panels.items(), key=lambda kv: int(kv[0]))),
                 "panels_done": sum(1 for v in self.panels.values() if v["state"] == "ok"),
                 "wrap_up": self.wrap_up, "stills": stills, "last_line": self.current_last_line()}
+
+
+# ---------------------------------------------------------------------------
+# V7 smoke render (MU52, Q4)
+# ---------------------------------------------------------------------------
+
+SMOKE_PANEL_TEXT = ("A slow camera pan across a quiet forest clearing at golden hour, leaves moving "
+                    "gently in the wind.")
+
+
+def smoke_dir(state, job_id):
+    return os.path.join(state, "smoke", job_id)
+
+
+def write_smoke_manifest(state, job_id):
+    """Create STATE/smoke/<id>/ (0700) and its manifest.json (MU52); returns the manifest path."""
+    sdir = smoke_dir(state, job_id)
+    make_dir(sdir)
+    path = os.path.join(sdir, "manifest.json")
+    write_json_atomic(path, {"schema_version": 3, "story_id": SMOKE_STORY_ID,
+                             "panels": [{"index": 1, "conditioning": "t2v", "image_path": None,
+                                         "panel_text": SMOKE_PANEL_TEXT}]})
+    return path
+
+
+def build_smoke_argv(fields, ws_real, state, job_id, py=sys.executable):
+    """The bin/ltx-mlx-render argv of a smoke job (MU52): 512x320, 9 frames."""
+    sdir = smoke_dir(state, job_id)
+    argv = [py, os.path.join(ws_real, "bin", "ltx-mlx-render"), os.path.join(sdir, "manifest.json"),
+            os.path.join(sdir, "smoke.mp4"), "--frames", "9", "--width", "512", "--height", "320",
+            "--frame-rate", "24", "--clips-dir", os.path.join(sdir, "clips"),
+            "--model", fields["model"] or DEFAULT_MODEL, "--gemma", fields["gemma"] or DEFAULT_GEMMA]
+    for item in ordered(fields["video_loras"]):
+        argv += ["--lora", lora_arg(item)]
+    if fields["no_low_ram"]:
+        argv.append("--no-low-ram")
+    return argv + ["--panel-timeout", "1800"]
+
+
+def smoke_checks(fields, ws_real):
+    """MU52: V2 render, V3 video model and gemma, V4 and V5 on video items only; every other record
+    is skip."""
+    cache = {}
+    host = [_from_pair("V2", "render", render_check()), not_needed("V2", "stills"),
+            not_needed("V2", "story server"), not_needed("V2", "judge key")]
+    return (host + model_checks(fields, ws_real) + lora_checks(fields, ws_real, cache, smoke=True)
+            + compat_checks(fields, ws_real, cache, smoke=True) + [not_needed("V6", "dry run")])

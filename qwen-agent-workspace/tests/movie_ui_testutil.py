@@ -522,3 +522,25 @@ class FakeDaemon(object):
     def close(self):
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# V7 smoke render host
+# ---------------------------------------------------------------------------
+
+def smoke_host(monkeypatch, tmp_path):
+    """A host where V2 render passes and V3 finds the default video model and gemma: stub
+    ffmpeg, ffprobe and ltx-2-mlx on PATH and LTX2_MLX_BIN, and an LTX HF cache holding both."""
+    tools = os.path.join(str(tmp_path), "tools")
+    os.makedirs(tools, exist_ok=True)
+    for name in ("ffmpeg", "ffprobe", "ltx-2-mlx"):
+        path = os.path.join(tools, name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+    monkeypatch.setenv("PATH", tools + os.pathsep + "/usr/bin:/bin")
+    monkeypatch.setenv("LTX2_MLX_BIN", os.path.join(tools, "ltx-2-mlx"))
+    cache = os.path.join(str(tmp_path), "ltxcache")
+    monkeypatch.setenv("LTX2_MLX_HF_HOME", cache)
+    for repo in (movie_ui_lib.DEFAULT_MODEL, movie_ui_lib.DEFAULT_GEMMA):
+        make_hf_cache(cache, repo, {"model.safetensors": b"\x01" * 8})

@@ -469,3 +469,22 @@ def test_v5_character_show_timeout_is_reported(env, monkeypatch):
     records = lib.compat_checks(mt.fields(ws, characters=["kyra"]), ws, {})
     assert records[-1] == lib.check("V5", "character kyra", "fail",
                                     "bin/character show kyra timed out after %d s" % lib.LIGHT_TIMEOUT)
+
+
+def test_v7_smoke_checks_subset(env, monkeypatch, tmp_path):
+    mt.smoke_host(monkeypatch, tmp_path)
+    ws = env["ws"]
+    fields = mt.fields(ws, action="smoke", story_id="", narrative="", characters=["kyra"],
+                       stills_loras=[{"id": None, "path": "relative", "strength": 9, "kind": None}])
+    assert lib.validate_fields(fields, ws, env["state"]) == []
+    assert lib.validate_fields(dict(fields, judge="x"), ws, env["state"]) == ["judge must be true or false"]
+    assert lib.validate_fields(dict(fields, video_loras=[{"id": None, "path": "rel", "strength": 1, "kind": None}]),
+                               ws, env["state"]) == ["video LoRA 1: path must be absolute"]
+    checks = lib.run_checks(fields, ws, env["state"])
+    assert [(c["id"], c["name"], c["status"]) for c in checks] == [
+        ("V1", "fields", "pass"), ("V2", "render", "pass"), ("V2", "stills", "skip"), ("V2", "story server", "skip"),
+        ("V2", "judge key", "skip"), ("V3", "video model %s" % lib.DEFAULT_MODEL, "pass"),
+        ("V3", "gemma %s" % lib.DEFAULT_GEMMA, "pass"), ("V3", "Z-Image %s" % lib.STILLS_BASE_MODEL, "skip"),
+        ("V3", "Z-Image text encoder %s" % lib.ZIMAGE_TEXT_ENCODER, "skip"), ("V4", "catalog verify", "skip"),
+        ("V5", "catalog compatibility", "skip"), ("V5", "characters", "skip"), ("V6", "dry run", "skip")]
+    assert not any(c["tool"] == "character" or c["sub"] == "--dry-run" for c in mt.stub_calls(ws))

@@ -421,6 +421,7 @@
     const mode = $("#c-mode").value;
     gate($("#c-run-all"), $("#c-run-all-reason"), mode === "no_stills" ? ["render"] : ["render", "stills"]);
     gate($("#c-write-story"), $("#c-write-story-reason"), ["story_server"]);
+    gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
   }
 
   async function uploadFile(file) {
@@ -521,6 +522,31 @@
         el("td", {text: m.intact ? "yes" : "no", cls: m.intact ? "ok" : "bad"}),
         el("td", {text: m.problems.join("; ")}), el("td", {text: sizeText(m.bytes)})]));
     });
+  }
+
+  // --- V7 smoke render (MU52, Q4) ------------------------------------------------------
+
+  async function pollSmoke() {
+    if (!S.smokeJob) { return; }
+    const res = await api("GET", "/api/jobs/" + S.smokeJob);
+    if (res.status !== 200) { return; }
+    const state = res.data.status.state;
+    const smoke = res.data.progress && res.data.progress.smoke;
+    let status = "running";
+    if (state === "done" && smoke && smoke.clip_ok) { status = "pass"; }
+    else if (["done", "failed", "cancelled", "lost"].indexOf(state) >= 0) { status = "fail"; }
+    const node = $("#c-smoke-check");
+    node.className = "check-" + status;
+    node.textContent = status + " V7 smoke render: job " + S.smokeJob + " " + state + (smoke ? " - " + smoke.clip : "");
+    show(node, true);
+  }
+
+  function setupSmoke() {
+    $("#c-smoke").addEventListener("click", async function () {
+      const res = await submit(composeFields("smoke"));
+      if (res.status === 201) { S.smokeJob = res.data.job.id; pollSmoke(); }
+    });
+    setInterval(pollSmoke, 2000);
   }
 
   // --- stories (MU81) ------------------------------------------------------------------
@@ -1204,6 +1230,7 @@
     $("#badge-refresh").addEventListener("click", function () { loadHost(true); });
     $("#banner-dismiss").addEventListener("click", function () { banner(""); });
     setupCompose();
+    setupSmoke();
     setupStories();
     setupCharacters();
     setupLoras();

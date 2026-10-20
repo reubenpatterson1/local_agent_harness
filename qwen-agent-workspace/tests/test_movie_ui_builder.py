@@ -165,3 +165,21 @@ def test_run_light_timeout_kills_grandchild(tmp_path):
 def test_run_light_nul_argv_returns_value_error_result(tmp_path):
     result = lib.run_light(["true", "a\x00b"], str(tmp_path))
     assert result["exit_code"] is None and result["stderr"].startswith("ValueError")
+
+
+def test_mut1_smoke_manifest_and_argv(monkeypatch, tmp_path):
+    state = mt.set_home(monkeypatch, tmp_path)
+    job_id = "20261019-142233-a1b2"
+    path = lib.write_smoke_manifest(state, job_id)
+    sdir = os.path.join(state, "smoke", job_id)
+    assert path == os.path.join(sdir, "manifest.json") and os.stat(sdir).st_mode & 0o777 == 0o700
+    assert lib.read_json(path) == {"schema_version": 3, "story_id": "movie-ui-smoke", "panels": [
+        {"index": 1, "conditioning": "t2v", "image_path": None,
+         "panel_text": "A slow camera pan across a quiet forest clearing at golden hour, leaves moving gently in the wind."}]}
+    fields = _f(action="smoke", model=None, no_low_ram=True, stills_loras=[{"id": "x"}],
+                video_loras=[_lora(None, "/l/free.safetensors", 0.5), _lora("motion", "/l/pan.safetensors", 1, "pan")])
+    assert lib.build_smoke_argv(fields, WS, state, job_id, py=PY) == [
+        PY, "/w/bin/ltx-mlx-render", path, os.path.join(sdir, "smoke.mp4"), "--frames", "9", "--width", "512",
+        "--height", "320", "--frame-rate", "24", "--clips-dir", os.path.join(sdir, "clips"),
+        "--model", lib.DEFAULT_MODEL, "--gemma", lib.DEFAULT_GEMMA, "--lora", "/l/pan.safetensors:1.0",
+        "--lora", "/l/free.safetensors:0.5", "--no-low-ram", "--panel-timeout", "1800"]

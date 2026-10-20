@@ -690,7 +690,7 @@ def _fields_body(body):
 
 def _preview(server, fields):
     errors = lib.validate_fields(fields, fields["ws"], server.state)
-    if errors:
+    if errors or fields["action"] == "smoke":
         return None, errors
     return lib.build_argv(fields, fields["ws"], server.state), errors
 
@@ -714,6 +714,10 @@ def create_compose_job(server, fields):
     state, real = server.state, fields["ws"]
     with STORE_LOCK:
         job_id = lib.new_job_id(state)
+        if fields["action"] == "smoke":
+            lib.write_smoke_manifest(state, job_id)
+            argv = lib.build_smoke_argv(fields, real, state, job_id)
+            return lib.create_job(state, job_id, "smoke", real, None, None, argv, fields)["id"]
         argv = lib.build_argv(fields, real, state)
         return lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"], None,
                               argv, fields)["id"]

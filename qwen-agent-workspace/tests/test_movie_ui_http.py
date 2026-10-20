@@ -1039,3 +1039,26 @@ def test_mut24_page_headers_and_asset_rules(env):
     css = mt.api(s, "GET", "/static/app.css", token=None)[2].decode("utf-8")
     assert "@media (prefers-color-scheme: dark)" in css
     assert mt.api(s, "POST", "/", body={}, token=None)[0] == 404
+
+
+def test_mut14_smoke_job_runs_the_stub_render_and_deletes_its_directory(env, monkeypatch, tmp_path):
+    mt.smoke_host(monkeypatch, tmp_path)
+    s, state = env["srv"], env["state"]
+    status, _h, payload = mt.api(s, "POST", "/api/jobs", body=_compose(env, action="smoke"))
+    assert status == 201, payload
+    job = payload["job"]
+    assert (job["kind"], job["story_id"], job["character"]) == ("smoke", None, None)
+    sdir = os.path.join(state, "smoke", job["id"])
+    assert os.path.isfile(os.path.join(sdir, "manifest.json"))
+    preview = mt.api(s, "POST", "/api/preview", body=_compose(env, action="smoke"))[2]
+    assert preview == {"argv": None, "command": None, "errors": []}
+    assert lib.dispatch_tick(state, mt.WS) == job["id"]
+    mt.wait_until(lambda: mt.status_of(state, job["id"]).get("state") == "done", 20)
+    detail = mt.api(s, "GET", "/api/jobs/%s" % job["id"])[2]
+    clip = os.path.join(sdir, "clips", "panel_01.mp4")
+    assert detail["progress"]["kind"] == "smoke"
+    assert detail["progress"]["smoke"] == {"clip": clip, "clip_ok": True}
+    call = [c for c in mt.stub_calls(env["ws"]) if c["tool"] == "ltx-mlx-render"][-1]
+    assert call["argv"][:2] == [os.path.join(sdir, "manifest.json"), os.path.join(sdir, "smoke.mp4")]
+    assert mt.api(s, "DELETE", "/api/jobs/%s" % job["id"])[:3:2] == (200, {"deleted": job["id"]})
+    assert not os.path.exists(sdir) and not os.path.exists(lib.job_dir(state, job["id"]))
