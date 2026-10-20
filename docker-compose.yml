@@ -22,7 +22,7 @@ services:
     build: ./agent
     environment:
       SKILL_ENDPOINT_RESEARCHER: "http://llm-proxy:8177/v1"
-      SKILL_MODEL_RESEARCHER: "qwen3.5:9b"
+      SKILL_MODEL_RESEARCHER: "mlx-community/Qwen3-VL-30B-A3B-Instruct-8bit"
     networks:
       - redteam-net
     depends_on:

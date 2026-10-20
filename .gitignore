@@ -1,2 +1,3 @@
 collector-data/*
 !collector-data/.gitkeep
+.DS_Store
