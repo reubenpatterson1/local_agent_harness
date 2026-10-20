@@ -126,7 +126,8 @@ def test_d1_spike_self_test_ported(tmp_path):
         "class_noun": "man",
         "descriptor": "An older man with grey hair and a beard wearing a brown coat"})[1] == (
         "an older man with grey hair and a beard wearing a brown coat")
-    _bad(cd.validate_description, {"class_noun": "woman", "descriptor": "a " + " ".join(["word"] * 60)})
+    # over the 70-word cap (1 "a" + 70 "word" = 71)
+    _bad(cd.validate_description, {"class_noun": "woman", "descriptor": "a " + " ".join(["word"] * 70)})
     _bad(cd.validate_description, {"class_noun": "woman"})
     assert cd.validate_description({"class_noun": "Woman ",
                                     "descriptor": good_desc["descriptor"]})[0] == "woman"

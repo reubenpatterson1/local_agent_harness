@@ -248,8 +248,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # this host serves), then to 8921fa9 (character_dataset.py's DESCRIBE_PROMPT
     # strengthened to capture makeup and habitual bearing). The movie-ui itself still
     # makes zero pipeline changes), then to c35b6bc (apparent age pinned in DESCRIBE_PROMPT
-    # and scored in CHECK_PROMPT, fixing age drift). This invariant holds from the new baseline.
-    BASELINE = "c35b6bcd4cb84ca5c8e4ab38d3f98369875b70de"
+    # and scored in CHECK_PROMPT, fixing age drift), then to 3b6b317 (descriptor word cap
+    # 60->70 for the richer prompt). This invariant holds from the new baseline.
+    BASELINE = "3b6b3175d3f03feb5d075f8725d54c7b9cb5f456"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
