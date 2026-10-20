@@ -738,3 +738,298 @@ def help_flags(ws_real):
 def supported_map(flags):
     """{field or action: bool} for MU47's "supported" (all False when flags is None)."""
     return dict((key, flags is not None and all(f in flags for f in needed)) for key, needed in FIELD_FLAGS)
+
+
+# ---------------------------------------------------------------------------
+# Check records, V1 fields and V2 host (MU42, MU43, V1, V2)
+# ---------------------------------------------------------------------------
+
+DETAIL_MAX = 20000
+NARRATIVE_MAX = 20000
+LORA_ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+STATE_LINE_RE = re.compile(r"^\s*state:\s*(.+?)\s*$")
+STILLS_PROBE = ("import torch; from diffusers import ZImagePipeline, ZImageTransformer2DModel; "
+                "from transformers import Qwen3Model")
+STILLS_PROBE_TIMEOUT = 60
+
+
+def check(check_id, name, status, detail=""):
+    """One check record (MU42); detail keeps its last DETAIL_MAX characters."""
+    return {"id": check_id, "name": name, "status": status, "detail": (detail or "")[-DETAIL_MAX:]}
+
+
+def checks_pass(checks):
+    return not any(c["status"] == "fail" for c in checks)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def story_dir(ws_real, story_id):
+    return os.path.join(ws_real, "generated", "stories", story_id)
+
+
+def valid_story_id(story_id):
+    """MU38: STORY_ID_RE and no "..". (movie-ui-smoke passes this; callers reserve it.)"""
+    return isinstance(story_id, str) and STORY_ID_RE.fullmatch(story_id) is not None and ".." not in story_id
+
+
+def resolved_panels(fields):
+    """P: panels, or round(length / (frames / fps)) when length is given; None when not computable."""
+    if _is_int(fields.get("panels")):
+        return fields["panels"]
+    length, frames, fps = fields.get("length"), fields.get("frames"), fields.get("fps")
+    if _is_number(length) and _is_int(frames) and _is_int(fps) and frames > 0 and fps > 0:
+        return int(round(length / (frames / float(fps))))
+    return None
+
+
+def _rule_models(fields):
+    """V1 rule 9."""
+    errors = []
+    for key in ("model", "gemma", "story_model"):
+        value = fields.get(key)
+        if value is None:
+            continue
+        if not (isinstance(value, str) and 1 <= len(value) <= 512 and not value.startswith("-")
+                and all(ord(ch) >= 0x20 for ch in value)):
+            errors.append("%s must be a model name or an absolute path" % key)
+    return errors
+
+
+def _rule_loras(fields, which):
+    """V1 rule 11 for one list (which is "video" or "stills")."""
+    value = fields.get(which + "_loras")
+    if not isinstance(value, list) or len(value) > 8:
+        return ["%s LoRAs must be a list of at most 8 items" % which]
+    errors, seen = [], set()
+    for k, item in enumerate(value, 1):
+        if not isinstance(item, dict):
+            errors.append("%s LoRA %d: must be an object" % (which, k))
+            continue
+        path, strength, lora_id, kind = item.get("path"), item.get("strength"), item.get("id"), item.get("kind")
+        if not (isinstance(path, str) and os.path.isabs(path)):
+            errors.append("%s LoRA %d: path must be absolute" % (which, k))
+        else:
+            real = os.path.realpath(path)
+            if real in seen:
+                errors.append("%s LoRA %s is listed twice" % (which, path))
+            seen.add(real)
+        if not (_is_number(strength) and 0 < strength <= 2):
+            errors.append("%s LoRA %d: strength must be in (0, 2]" % (which, k))
+        if lora_id is not None and not (isinstance(lora_id, str) and LORA_ID_RE.fullmatch(lora_id)):
+            errors.append("%s LoRA %d: bad catalog id" % (which, k))
+        if not (kind is None or kind in LORA_KINDS) or ((kind is None) != (lora_id is None)):
+            errors.append("%s LoRA %d: bad kind" % (which, k))
+    return errors
+
+
+def _rule_flags(fields):
+    """V1 rule 13."""
+    errors = []
+    for key in ("auto_lora", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
+        if not isinstance(fields.get(key), bool):
+            errors.append("%s must be true or false" % key)
+    timeout = fields.get("panel_timeout")
+    if timeout is not None and not (_is_int(timeout) and 60 <= timeout <= 86400):
+        errors.append("panel_timeout must be an integer from 60 to 86400")
+    return errors
+
+
+def _rule_action(fields):
+    """V1 rule 14."""
+    return [] if fields.get("action") in ACTIONS else ["unknown action"]
+
+
+def validate_fields(fields, ws_real, state):
+    """V1: every failure line, in rule order; [] when the fields pass."""
+    errors = []
+    story_id = fields.get("story_id")
+    sid_ok = valid_story_id(story_id)
+    if not sid_ok:                                                           # 1
+        errors.append("story id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ and must not contain '..'")
+    elif story_id == SMOKE_STORY_ID:
+        sid_ok = False
+        errors.append("story id movie-ui-smoke is reserved for smoke renders")
+    narrative = fields.get("narrative")                                      # 2
+    if not isinstance(narrative, str) or not narrative.strip():
+        errors.append("narrative is required")
+    elif len(narrative) > NARRATIVE_MAX:
+        errors.append("narrative must be at most 20000 characters")
+    elif narrative.strip().startswith("-"):
+        errors.append("narrative must not start with '-'")
+    goal = fields.get("goal")                                                # 3
+    if goal is not None:
+        text = goal_text(goal) if isinstance(goal, str) else ""
+        if not text or "\n" in text or "\r" in text or len(text) > 300:
+            errors.append("goal must be a single line of 1 to 300 characters")
+        elif text.startswith("-"):
+            errors.append("goal must not start with '-'")
+    panels, length = fields.get("panels"), fields.get("length")              # 4
+    fps, frames = fields.get("fps"), fields.get("frames")
+    fps_ok = _is_int(fps) and 1 <= fps <= 120
+    frames_ok = _is_int(frames) and (frames - 1) % 8 == 0 and frames >= 9
+    if (panels is None) == (length is None):
+        errors.append("give exactly one of panels or length")
+    elif panels is not None:
+        if not (_is_int(panels) and 1 <= panels <= 200):
+            errors.append("panels must be an integer from 1 to 200")
+    elif not (_is_number(length) and 0 < length <= 3600):
+        errors.append("length must be a number of seconds in (0, 3600]")
+    elif fps_ok and frames_ok:
+        n = int(round(length / (frames / float(fps))))
+        if n < 2:
+            errors.append("length resolves to %d panel(s); the minimum is 2" % n)
+    if not fps_ok:                                                           # 5
+        errors.append("fps must be an integer from 1 to 120")
+    if not frames_ok:                                                        # 6
+        errors.append("frames must satisfy (n-1)%8==0 and n>=9")
+    seed, width, height = fields.get("seed_upload"), fields.get("width"), fields.get("height")   # 7
+    if seed is not None and (width is not None or height is not None):
+        errors.append("give a seed image or a resolution, not both")
+    if not ((width is None and height is None)
+            or (_is_int(width) and _is_int(height) and width % 64 == 0 and height % 64 == 0
+                and width >= 64 and height >= 64)):
+        errors.append("width and height must both be multiples of 64 (at least 64)")
+    if seed is not None and not (isinstance(seed, str) and UPLOAD_ID_RE.fullmatch(seed)
+                                 and os.path.isfile(os.path.join(state, "uploads", seed))):
+        errors.append("seed image upload %s not found" % seed)
+    mode = fields.get("mode")                                                # 8
+    if mode not in MODES:
+        errors.append("mode must be chained, shots or no_stills")
+    elif seed is not None and mode == "no_stills":
+        errors.append("a seed image cannot be used with no-stills mode")
+    elif seed is not None and mode == "shots":
+        errors.append("a seed image cannot be used with shots mode")
+    errors += _rule_models(fields)                                           # 9
+    errors += _rule_loras(fields, "video") + _rule_loras(fields, "stills")  # 11
+    chars = fields.get("characters")                                         # 12
+    if not (isinstance(chars, list) and len(chars) <= 8 and len(set(map(repr, chars))) == len(chars)
+            and all(isinstance(c, str) and CHARACTER_NAME_RE.fullmatch(c) for c in chars)):
+        errors.append("characters must be distinct character names")
+    errors += _rule_flags(fields)                                            # 13
+    errors += _rule_action(fields)                                           # 14
+    if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
+                                               or goal is not None):     # 15
+        errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora or --goal")
+    action = fields.get("action")
+    sdir = story_dir(ws_real, story_id) if sid_ok else None
+    if action == "redo":                                                     # 16
+        redo = fields.get("redo")
+        if mode != "shots":
+            errors.append("redo needs shots mode")
+        if not (isinstance(redo, list) and redo and all(_is_int(n) for n in redo)):
+            errors.append("redo needs at least one panel number")
+        else:
+            total = resolved_panels(fields)
+            if total is not None:
+                for n in sorted(set(redo)):
+                    if not 1 <= n <= total:
+                        errors.append("redo panel %d is out of range (1..%d)" % (n, total))
+        if sdir is None or not os.path.isfile(os.path.join(sdir, "story.md")):
+            errors.append("redo needs an existing story.md")
+    if (action == "movie" and sdir is not None and fields.get("overwrite_movie") is False
+            and os.path.exists(os.path.join(sdir, "movie.mp4"))):           # 17
+        errors.append('movie.mp4 already exists; tick "Overwrite movie.mp4" (--force)')
+    if errors:
+        return errors
+    flags, error = help_flags(ws_real)                                       # 18
+    if flags is None:
+        return [error]
+    return ["this workspace's bin/ltx-movie does not support %s" % a
+            for a in build_argv(fields, ws_real, state) if a.startswith("--") and a not in flags]
+
+
+def ltx_bin():
+    """The ltx-2-mlx binary bin/ltx-mlx-render would run (ltx2_mlx_video_skill.py:44-46, :130-139)."""
+    path = os.environ.get("LTX2_MLX_BIN") or os.path.join(
+        os.environ.get("LTX2_MLX_DIR") or os.path.expanduser("~/ltx-2-mlx"), ".venv", "bin", "ltx-2-mlx")
+    if os.sep not in path:
+        path = shutil.which(path) or path
+    return path
+
+
+def render_check():
+    """(ok, detail) for V2 "render"."""
+    path = ltx_bin()
+    problems = []
+    if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+        problems.append("ltx-2-mlx binary not found or not executable: %s (set LTX2_MLX_BIN)" % path)
+    for tool in ("ffmpeg", "ffprobe"):
+        if shutil.which(tool) is None:
+            problems.append("%s not found on PATH" % tool)
+    return (False, "; ".join(problems)) if problems else (True, path)
+
+
+def stills_check(ws_real, py=sys.executable):
+    """(ok, detail) for V2 "stills": the imports of z_image_skill.py:46-48 in a child."""
+    run = run_light([py, "-c", STILLS_PROBE], ws_real, timeout=STILLS_PROBE_TIMEOUT)
+    if run["timed_out"]:
+        return False, "stills dependency probe timed out after %d s" % STILLS_PROBE_TIMEOUT
+    if run["exit_code"] == 0:
+        return True, "stills dependencies importable"
+    return False, "stills dependencies not importable: %s" % last_line(run["stderr"])
+
+
+def story_server_check(ws_real):
+    """(ok, detail) for V2 "story server": bin/story-server status (bash, run directly)."""
+    run = run_light([os.path.join(ws_real, "bin", "story-server"), "status"], ws_real)
+    state = None
+    for line in run["stdout"].splitlines():
+        match = STATE_LINE_RE.match(line)
+        if match:
+            state = match.group(1)
+            break
+    if run["exit_code"] != 0 or state is None:
+        code = "none" if run["exit_code"] is None else str(run["exit_code"])
+        return False, "bin/story-server status exited %s: %s" % (code, last_line(run["stderr"]) or "-")
+    if state.startswith("SERVING "):
+        return True, "story server: %s" % state
+    return False, "story server is %s; start it with bin/story-server vision (or text)" % state
+
+
+def judge_key_check():
+    """(ok, detail) for V2 "judge key"."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True, "ANTHROPIC_API_KEY is set"
+    return False, "--judge needs ANTHROPIC_API_KEY in movie-ui's environment"
+
+
+def _from_pair(check_id, name, pair):
+    return check(check_id, name, "pass" if pair[0] else "fail", pair[1])
+
+
+def not_needed(check_id, name):
+    return check(check_id, name, "skip", "not needed for this action")
+
+
+def render_needed(fields):
+    return fields["action"] in ("movie", "redo", "smoke")
+
+
+def stills_needed(fields):
+    return fields["action"] in ("movie", "redo") and fields["mode"] != "no_stills"
+
+
+def story_needed(fields, ws_real):
+    if fields["action"] in ("story", "regenerate"):
+        return True
+    return fields["action"] == "movie" and not os.path.isfile(
+        os.path.join(story_dir(ws_real, fields["story_id"]), "story.md"))
+
+
+def host_checks(fields, ws_real, py=sys.executable):
+    """V2's four records."""
+    out = [_from_pair("V2", "render", render_check()) if render_needed(fields) else not_needed("V2", "render"),
+           _from_pair("V2", "stills", stills_check(ws_real, py)) if stills_needed(fields)
+           else not_needed("V2", "stills"),
+           _from_pair("V2", "story server", story_server_check(ws_real)) if story_needed(fields, ws_real)
+           else not_needed("V2", "story server"),
+           _from_pair("V2", "judge key", judge_key_check()) if fields["judge"] is True
+           else not_needed("V2", "judge key")]
+    return out
