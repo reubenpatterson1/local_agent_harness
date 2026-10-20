@@ -493,7 +493,7 @@ def orphan_info(status):
     if not isinstance(status, dict) or status.get("state") != "lost":
         return None
     pgid = status.get("pgid")
-    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1:
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1 or pgid == os.getpgrp():
         return None
     return {"pgid": pgid, "alive": True} if group_alive(pgid) else None
 
@@ -503,7 +503,10 @@ def kill_orphan(state, job_id):
     info = orphan_info(read_status(job_dir(state, job_id)))
     if info is None:
         return None
-    _killpg_quiet(info["pgid"], signal.SIGKILL)
+    try:
+        os.killpg(info["pgid"], signal.SIGKILL)
+    except ProcessLookupError:
+        pass
     return info["pgid"]
 
 

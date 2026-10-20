@@ -479,3 +479,72 @@ def test_job_delete_failure_is_500_and_job_stays(env, monkeypatch):
     assert payload == {"error": "cannot delete job %s: Permission denied" % done}
     jobs = mt.api(s, "GET", "/api/jobs")[2]
     assert [j["id"] for j in jobs["history"]] == [done]
+
+
+def _live_orphan_job(env):
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    lost = mt.make_job(env["state"], ["true"], env["ws"], status={
+        "state": "lost", "dispatched": lib.utc_now(), "runner_pid": 1, "pgid": orphan.pid,
+        "started": lib.utc_now(), "exit_code": None, "ended": None, "detected": lib.utc_now()})
+    return orphan, lost
+
+
+def test_kill_orphan_permission_error_is_409(env, monkeypatch):
+    s = env["srv"]
+    orphan, lost = _live_orphan_job(env)
+    try:
+        real = os.killpg
+
+        def deny(group, sig):
+            if sig == 0:
+                return real(group, sig)
+            raise PermissionError(1, "Operation not permitted")
+        monkeypatch.setattr(lib.os, "killpg", deny)
+        status, _h, payload = mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % lost, body={"confirm": True})
+        assert status == 409
+        assert payload == {"error": "cannot kill process group %d: Operation not permitted" % orphan.pid}
+    finally:
+        orphan.kill()
+        orphan.wait(5)
+
+
+def test_delete_lost_job_with_live_orphan_needs_confirm(env):
+    s = env["srv"]
+    orphan, lost = _live_orphan_job(env)
+    try:
+        status, _h, payload = mt.api(s, "DELETE", "/api/jobs/%s" % lost)
+        assert status == 409
+        assert payload["error"] == ("job %s still has a live process group %d; kill it first, or delete "
+                                    "with confirm to unblock the queue anyway" % (lost, orphan.pid))
+        assert mt.api(s, "GET", "/api/jobs/%s" % lost)[0] == 200
+        assert mt.api(s, "DELETE", "/api/jobs/%s" % lost, body={"confirm": "yes"})[0] == 409
+        assert mt.api(s, "DELETE", "/api/jobs/%s" % lost, body={"confirm": True})[:3:2] == (200, {"deleted": lost})
+        assert mt.api(s, "GET", "/api/jobs/%s" % lost)[0] == 404
+    finally:
+        orphan.kill()
+        orphan.wait(5)
+
+
+def test_log_of_a_finished_job_returns_the_final_partial_bytes(env):
+    s, state = env["srv"], env["state"]
+    job_id = mt.make_job(state, ["true"], env["ws"], status={"state": "done", "exit_code": 0,
+                                                              "ended": lib.utc_now()})
+    with open(os.path.join(lib.job_dir(state, job_id), "log.txt"), "wb") as f:
+        f.write(b"caf\xc3")
+    chunk = mt.api(s, "GET", "/api/jobs/%s/log" % job_id)[2]
+    assert chunk["text"] == "caf�" and chunk["eof"] is True and chunk["next_offset"] == chunk["size"] == 4
+
+
+def test_job_actions_on_bad_input_and_unknown_ids(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    job_id = mt.make_job(state, ["true"], ws)
+    assert mt.api(s, "GET", "/api/jobs/%s/log?offset=abc" % job_id)[0] == 400
+    ghost = "20261019-000000-0000"
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % ghost, body={})[0] == 404
+    assert mt.api(s, "DELETE", "/api/jobs/%s" % ghost)[0] == 404
+    assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % ghost, body={"confirm": True})[0] == 404
+    assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % job_id, body={"confirm": True})[:3:2] == (
+        409, {"error": "job %s has no live orphan process group" % job_id})
+    assert mt.api(s, "GET", "/api/jobs/%s" % job_id)[0] == 200
+    shutil.rmtree(lib.job_dir(state, job_id))
+    assert mt.api(s, "GET", "/api/jobs/%s" % job_id)[0] == 404

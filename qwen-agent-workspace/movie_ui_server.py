@@ -350,7 +350,8 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(405 if matched else 404, {"error": "method not allowed" if matched else "not found"})
             return
         body = None
-        if self.command in ("POST", "PUT"):
+        if self.command in ("POST", "PUT") or (self.command == "DELETE" and
+                                                self.headers.get("Content-Length") is not None):
             body = self._read_body(path)
             if body is None:
                 return
@@ -749,7 +750,7 @@ def _h_jobs(self, groups, query, body):
 
 
 def _known_job(server, job_id):
-    job = server.job(job_id)
+    job = server.job(job_id) if os.path.isdir(lib.job_dir(server.state, job_id)) else None
     if job is None:
         raise ApiError(404, "unknown job %s" % job_id)
     return job
@@ -795,7 +796,10 @@ def _h_job_log(self, groups, query, body):
                 data = b""
             else:
                 f.seek(n)
-                data = utf8_cut(f.read(LOG_CHUNK))
+                data = f.read(min(LOG_CHUNK, size - n))
+                finished = lib.job_state(server.state, job_id, lib.read_queue(server.state)) in lib.FINISHED_STATES
+                if not (n + len(data) >= size and finished):
+                    data = utf8_cut(data)
     except OSError:
         raise ApiError(404, "unknown job %s" % job_id)
     nxt = size if n >= size else n + len(data)
@@ -831,17 +835,24 @@ def _h_queue_move(self, groups, query, body):
 def _h_job_delete(self, groups, query, body):
     job_id = groups[0]
     _known_job(self.server, job_id)
-    with STORE_LOCK:
-        try:
-            deleted = lib.delete_job(self.server.state, job_id)
-        except OSError as e:
-            raise ApiError(500, "cannot delete job %s: %s" % (job_id, e.strerror or e))
-    if not deleted:
-        raise ApiError(409, "job %s is not finished" % job_id)
-    self.server.job_cache.pop(job_id, None)
-    with self.server.parser_lock:
-        self.server.parsers.pop(job_id, None)
-    return 200, {"deleted": job_id}
+    state = self.server.state
+    try:
+        with STORE_LOCK:
+            info = lib.orphan_info(lib.read_status(lib.job_dir(state, job_id)))
+            if info is not None and (body or {}) != {"confirm": True}:
+                raise ApiError(409, "job %s still has a live process group %d; kill it first, or delete "
+                                    "with confirm to unblock the queue anyway" % (job_id, info["pgid"]))
+            try:
+                deleted = lib.delete_job(state, job_id)
+            except OSError as e:
+                raise ApiError(500, "cannot delete job %s: %s" % (job_id, e.strerror or e))
+        if not deleted:
+            raise ApiError(409, "job %s is not finished" % job_id)
+        return 200, {"deleted": job_id}
+    finally:
+        self.server.job_cache.pop(job_id, None)
+        with self.server.parser_lock:
+            self.server.parsers.pop(job_id, None)
 
 
 def _h_job_kill_orphan(self, groups, query, body):
@@ -850,7 +861,11 @@ def _h_job_kill_orphan(self, groups, query, body):
         raise ApiError(400, "confirm must be true")
     _known_job(self.server, job_id)
     with STORE_LOCK:
-        pgid = lib.kill_orphan(self.server.state, job_id)
+        try:
+            pgid = lib.kill_orphan(self.server.state, job_id)
+        except PermissionError as e:
+            info = lib.orphan_info(lib.read_status(lib.job_dir(self.server.state, job_id)))
+            raise ApiError(409, "cannot kill process group %s: %s" % (info["pgid"] if info else "?", e.strerror or e))
     if pgid is None:
         raise ApiError(409, "job %s has no live orphan process group" % job_id)
     return 200, {"killed": pgid}

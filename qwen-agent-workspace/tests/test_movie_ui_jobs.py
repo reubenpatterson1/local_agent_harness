@@ -416,3 +416,8 @@ def test_mut15_bin_movie_ui_lock_port_and_startup_lines(tmp_path):
         low = _start_ui(ui, home, bad)
         out, err = low.communicate(timeout=30)
         assert (low.returncode, err) == (2, "movie-ui: invalid --port %s (1024 to 65535)\n" % bad)
+
+
+def test_orphan_info_ignores_the_servers_own_group():
+    status = {"state": "lost", "pgid": os.getpgrp()}
+    assert lib.orphan_info(status) is None
