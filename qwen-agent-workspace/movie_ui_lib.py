@@ -1473,6 +1473,8 @@ OK_RE = re.compile(r"^panel (\d+) ok: ")
 REUSE_RE = re.compile(r"^panel (\d+): reusing ")
 FAILED_RE = re.compile(r"^panel (\d+) FAILED \(([^)]*)\):? ?(.*)$")
 SUMMARY_RE = re.compile(r"^=== render summary \(")
+RETRY_RE = re.compile(r"^=== inline retry: panel (\d+) \(")
+MOVIE_RE = re.compile(r"^MOVIE \d+/\d+ panels")
 FACE_RE = re.compile(
     r"^Error: (?:the vision model found no face in the seed image; pass --force to proceed anyway\."
     r"|the main character's face fills only \d+% of the seed image's height \(minimum 15%\); a small "
@@ -1515,9 +1517,23 @@ class ProgressParser(object):
         self.tail = lines.pop()
         for raw in lines:
             self._line(collapse(raw.decode("utf-8", "replace")))
+        if len(self.tail) > 65536:
+            i = self.tail.rstrip(b"\r").rfind(b"\r")
+            if i >= 0:
+                self.tail = self.tail[i:]
 
     def current_last_line(self):
-        tail = collapse(self.tail.decode("utf-8", "replace"))
+        raw = self.tail
+        for back in range(1, min(3, len(raw)) + 1):
+            byte = raw[-back]
+            if byte >= 0xC0:
+                need = 4 if byte >= 0xF0 else 3 if byte >= 0xE0 else 2
+                if need > back:
+                    raw = raw[:-back]
+                break
+            if byte < 0x80:
+                break
+        tail = collapse(raw.decode("utf-8", "replace"))
         return tail[:LINE_CLIP] if tail.strip() else self.last_line
 
     def _line(self, line):
@@ -1541,6 +1557,10 @@ class ProgressParser(object):
             self.panels_total = int(match.group(2))
             self.panels[match.group(1)] = {"state": "running"}
             return
+        match = RETRY_RE.match(line)
+        if match:
+            self.panels[match.group(1)] = {"state": "running"}
+            return
         match = OK_RE.match(line)
         if match:
             self.panels[match.group(1)] = {"state": "ok", "reused": False}
@@ -1554,7 +1574,7 @@ class ProgressParser(object):
             self.panels[match.group(1)] = {"state": "failed", "reason": match.group(2),
                                            "detail": match.group(3)[:LINE_CLIP]}
             return
-        if SUMMARY_RE.match(line):
+        if SUMMARY_RE.match(line) or MOVIE_RE.match(line):
             self.wrap_up = True
             return
         if FACE_RE.match(line):

@@ -38,6 +38,11 @@ def test_mut16_render_chained(tmp_path):
         "panels": {"1": {"state": "ok", "reused": False}, "2": {"state": "ok", "reused": False},
                    "3": {"state": "running"}},
         "panels_done": 2, "wrap_up": False, "stills": None, "last_line": "ltx-2-mlx: 60%"}
+    data = _read("render-chained.log")
+    cut = data.index(b"panel 2 ok")
+    mid = lib.ProgressParser("movie", fields)
+    mid.feed(data[:cut])
+    assert mid.panels["2"] == {"state": "running"}
     sliced = _parse("render-chained.log", "movie", fields, slices=7)
     assert sliced.snapshot(_job(tmp_path, "movie", fields), None, str(tmp_path)) == progress
     assert parser.offset == len(_read("render-chained.log"))
@@ -53,8 +58,9 @@ def test_mut16_shots_redo_failed_then_summary(tmp_path):
         "1": {"state": "ok", "reused": True}, "2": {"state": "ok", "reused": False},
         "3": {"state": "ok", "reused": True},
         "4": {"state": "failed", "reason": "timeout, rc=-9", "detail": "ltx-2-mlx exceeded --panel-timeout 7200s"}}
-    assert progress["panels_done"] == 3 and progress["panels_total"] == 4 and progress["wrap_up"] is True
-    assert progress["last_line"] == "Error: 1 panel(s) failed"
+    assert progress["panels_done"] == 3 and progress["panels_total"] == 4 and progress["wrap_up"] is False
+    assert progress["panels"]["4"]["detail"] == "ltx-2-mlx exceeded --panel-timeout 7200s"
+    assert progress["last_line"] == "Error: ltx-mlx-render exited 1"
 
 
 def test_mut16_story_only_rewrite_and_phases(tmp_path):
@@ -103,3 +109,30 @@ def test_mut16_cr_collapse_and_character_face(tmp_path):
     assert other.face_problem is True
     assert lib.ProgressParser("character-train", fields).snapshot(
         _job(tmp_path, "character-train", fields), None, str(tmp_path))["elapsed_s"] is None
+
+
+def test_mut16_movie_line_sets_wrap_up(tmp_path):
+    parser = lib.ProgressParser("movie", {"action": "movie", "mode": "chained"})
+    data = _read("render-done.log")
+    cut = data.index(b"MOVIE 3/3")
+    parser.feed(data[:cut])
+    assert parser.wrap_up is False
+    parser.feed(data[cut:cut + data[cut:].index(b"\n") + 1])
+    assert parser.wrap_up is True
+
+
+def test_mut16_tail_is_bounded():
+    parser = lib.ProgressParser("movie", {"action": "movie", "mode": "chained"})
+    chunk = b"x" * 100 + b"\r"
+    for _ in range(1048576 // len(chunk)):
+        parser.feed(chunk)
+    assert len(parser.tail) <= 65536 + 200
+    assert parser.current_last_line() == "x" * 100
+
+
+def test_mut16_partial_utf8_never_replaced():
+    parser = lib.ProgressParser("movie", {"action": "movie", "mode": "chained"})
+    for byte in "caf\u00e9\n=== Phase 2: stills \u2014 \u00e9 ===\n".encode("utf-8"):
+        parser.feed(bytes([byte]))
+        assert "\ufffd" not in parser.current_last_line()
+    assert parser.phase_title == "stills \u2014 \u00e9"

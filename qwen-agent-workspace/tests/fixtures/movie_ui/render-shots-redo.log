@@ -13,5 +13,6 @@ panel 2 ok: /ws/generated/stories/demo/clips/panel_02.mp4 (40.0s)
 panel 3: reusing /ws/generated/stories/demo/clips/panel_03.mp4 (--resume)
 === panel 4/4 (panel-4) ===
 panel 4 FAILED (timeout, rc=-9): ltx-2-mlx exceeded --panel-timeout 7200s
-=== render summary (1 failed) ===
-Error: 1 panel(s) failed
+STOPPED EARLY: 3/4 panels completed
+relaunch: ltx-movie /ws/story.md --resume --story-id demo
+Error: ltx-mlx-render exited 1

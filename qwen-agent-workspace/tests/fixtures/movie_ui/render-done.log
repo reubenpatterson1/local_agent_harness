@@ -1,0 +1,11 @@
+=== Phase 3: manifest + dry-run ===
+panels: 3
+=== Phase 4: render ===
+=== panel 1/3 (panel-1) ===
+panel 1 ok: /ws/generated/stories/demo/clips/panel_01.mp4 (61.2s)
+=== panel 2/3 (panel-2) ===
+panel 2 ok: /ws/generated/stories/demo/clips/panel_02.mp4 (58.0s)
+=== panel 3/3 (panel-3) ===
+panel 3 ok: /ws/generated/stories/demo/clips/panel_03.mp4 (59.9s)
+MOVIE 3/3 panels, 435 frames, 18.12s -> /x/movie.mp4 (2048KB)
+=== render summary (0 failed) ===
