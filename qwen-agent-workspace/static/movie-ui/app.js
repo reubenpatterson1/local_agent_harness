@@ -142,6 +142,36 @@
     return value === "" ? null : value;
   }
 
+  // Resolution presets: the dropdown drives #c-width/#c-height. A concrete preset
+  // (WxH) fills and locks the two number inputs; "custom" unlocks them for free entry.
+  function applyResPreset() {
+    const sel = $("#c-res-preset");
+    if (!sel) { return; }
+    const custom = sel.value === "custom";
+    if (!custom) {
+      const wh = sel.value.split("x");
+      $("#c-width").value = wh[0];
+      $("#c-height").value = wh[1];
+    }
+    $("#c-width").readOnly = !custom;
+    $("#c-height").readOnly = !custom;
+    $("#c-width").classList.toggle("preset-locked", !custom);
+    $("#c-height").classList.toggle("preset-locked", !custom);
+  }
+
+  // Point the dropdown at whatever width/height currently hold (default 1024x576 when
+  // empty), falling back to "custom" for any off-list pair, then lock accordingly.
+  function syncResPreset() {
+    const sel = $("#c-res-preset");
+    if (!sel) { return; }
+    if (!$("#c-width").value) { $("#c-width").value = 1024; }
+    if (!$("#c-height").value) { $("#c-height").value = 576; }
+    const key = $("#c-width").value + "x" + $("#c-height").value;
+    const known = Array.prototype.some.call(sel.options, function (o) { return o.value === key; });
+    sel.value = known ? key : "custom";
+    applyResPreset();
+  }
+
   // --- token, header, workspaces, capabilities (MU77, MU78) ---------------------------
 
   function readToken() {
@@ -462,8 +492,9 @@
     if (f.length !== null && f.length !== undefined) { $("#c-length").value = f.length; }
     $("#c-fps").value = f.fps || 24;
     $("#c-frames").value = f.frames || 145;
-    $("#c-width").value = f.width || "";
-    $("#c-height").value = f.height || "";
+    $("#c-width").value = f.width || 1024;
+    $("#c-height").value = f.height || 576;
+    syncResPreset();
     S.seedUpload = f.seed_upload || null;
     $("#c-res-seed").checked = Boolean(S.seedUpload);
     $("#c-res-size").checked = !S.seedUpload;
@@ -497,6 +528,8 @@
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);
+    $("#c-res-preset").addEventListener("change", applyResPreset);
+    syncResPreset();
     $("#c-copy").addEventListener("click", function () {
       navigator.clipboard.writeText($("#c-command").textContent);
     });

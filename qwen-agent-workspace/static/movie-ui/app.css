@@ -81,3 +81,6 @@ table.list th, table.list td { border-bottom: 1px solid var(--line); padding: 4p
 .dialog[hidden] { display: none; }
 .dialog-box { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px 20px; max-width: 480px; }
 [hidden] { display: none !important; }
+
+.preset-locked { opacity: .55; }
+#c-res-preset { margin: 0 .25rem; }

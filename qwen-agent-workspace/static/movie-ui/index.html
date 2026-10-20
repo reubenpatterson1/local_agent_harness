@@ -61,8 +61,19 @@
     <fieldset>
       <legend>Resolution</legend>
       <label data-field="resolution"><input id="c-res-size" type="radio" name="c-res" value="size" checked> Size
-        <input id="c-width" type="number" step="64" min="64" placeholder="704">
-        x <input id="c-height" type="number" step="64" min="64" placeholder="448"></label>
+        <select id="c-res-preset">
+          <option value="1024x576">1024 × 576 · 16:9 (host default)</option>
+          <option value="768x512">768 × 512 · 3:2</option>
+          <option value="704x448">704 × 448 · 14:9</option>
+          <option value="512x512">512 × 512 · 1:1</option>
+          <option value="640x896">640 × 896 · 5:7 portrait</option>
+          <option value="576x1024">576 × 1024 · 9:16 portrait</option>
+          <option value="1152x640">1152 × 640 · 16:9</option>
+          <option value="1280x704">1280 × 704 · 16:9 (heavy)</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="c-width" type="number" step="64" min="64" placeholder="704" value="1024">
+        x <input id="c-height" type="number" step="64" min="64" placeholder="448" value="576"></label>
       <label data-field="seed_upload"><input id="c-res-seed" type="radio" name="c-res" value="seed"> Seed image
         <input id="c-seed-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
       <span id="c-seed-status" class="muted"></span>
