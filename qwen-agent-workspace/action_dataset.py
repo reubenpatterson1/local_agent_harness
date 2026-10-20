@@ -222,6 +222,208 @@ def build_dataset(name, trigger, descriptor, clip_paths, performers, *,
     return data
 
 
+# ---------------------------------------------------------------------------
+# Training (Phase 3): ltx-2-mlx preprocess + train on the multi-frame clips.
+# Env var names match ltx2_mlx_video_skill's so overrides are shared.
+# ---------------------------------------------------------------------------
+LTX2_MLX_DIR = os.environ.get("LTX2_MLX_DIR", os.path.expanduser("~/ltx-2-mlx"))
+LTX2_MLX_BIN = os.environ.get("LTX2_MLX_BIN", os.path.join(LTX2_MLX_DIR, ".venv", "bin", "ltx-2-mlx"))
+LTX2_MLX_HF_HOME = os.environ.get("LTX2_MLX_HF_HOME", os.path.join(LTX2_MLX_DIR, "hf_cache"))
+GEMMA_MODEL_ID = os.environ.get("LTX2_MLX_GEMMA", "mlx-community/gemma-3-12b-it-4bit")
+# The transformer trained against: a dev/train checkpoint (LoRA training wants the
+# non-distilled transformer). The base RECORDED for lora-check/catalog is the
+# inference model the LoRA is applied against (same LTX-2.3 architecture).
+TRAIN_MODEL = os.environ.get("LTX2_MLX_TRAIN_MODEL",
+                             os.path.join(LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8-dev"))
+INFERENCE_MODEL = os.environ.get("LTX2_MLX_MODEL", "dgrauet/ltx-2.3-mlx-q8")
+ACTION_RANK = int(os.environ.get("ACTION_TRAIN_RANK", "32"))
+ACTION_STEPS = int(os.environ.get("ACTION_TRAIN_STEPS", "1000"))
+PREPROCESS_TIMEOUT_S = 1800
+TRAIN_TIMEOUT_S = 14400
+
+TRAIN_CONFIG_TEMPLATE = """model:
+  model_path: {model_path}
+  text_encoder_path: {gemma}
+  training_mode: lora
+
+lora:
+  rank: {rank}
+  alpha: {rank}
+  dropout: 0.0
+  target_modules:
+    - to_k
+    - to_q
+    - to_v
+    - to_out.0
+
+optimization:
+  learning_rate: 2.0e-4
+  steps: {steps}
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  scheduler_type: linear
+  scheduler_params:
+    start_factor: 1.0
+    end_factor: 0.1
+
+data:
+  preprocessed_data_root: {data_root}
+
+training_strategy:
+  name: text_to_video
+  generate_audio: false
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+
+validation:
+  prompts:
+    - {validation_prompt}
+  video_dims: [{width}, {height}, {frames}]
+  frame_rate: 24.0
+  inference_steps: 8
+  interval: {steps}
+  guidance_scale: 4.0
+  stg_scale: 0.0
+  seed: 42
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 250
+  keep_last_n: 10
+
+seed: 42
+output_dir: {output_dir}
+"""
+
+
+def train_config(data_root, validation_prompt, output_dir, width, height, frames,
+                 rank=None, steps=None):
+    return TRAIN_CONFIG_TEMPLATE.format(
+        model_path=json.dumps(TRAIN_MODEL), gemma=json.dumps(GEMMA_MODEL_ID),
+        data_root=json.dumps(data_root), validation_prompt=json.dumps(validation_prompt),
+        output_dir=json.dumps(output_dir), width=width, height=height, frames=frames,
+        rank=rank if rank is not None else ACTION_RANK,
+        steps=steps if steps is not None else ACTION_STEPS)
+
+
+def preprocess_argv(videos, captions, out_dir, width, height, frames):
+    return [LTX2_MLX_BIN, "preprocess", "--videos", videos, "--captions", captions,
+            "-o", out_dir, "-m", TRAIN_MODEL, "-H", str(height), "-W", str(width),
+            "--max-frames", str(frames)]
+
+
+def train_argv(config_path):
+    return [LTX2_MLX_BIN, "train", "--config", config_path, "--low-ram"]
+
+
+def final_ckpt_name(steps=None):
+    return "lora_weights_step_%05d.safetensors" % (steps if steps is not None else ACTION_STEPS)
+
+
+def _run_logged(cmd, log_path, cwd, env, timeout_s):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("$ " + shlex.join(cmd) + "\n\n")
+        f.flush()
+        try:
+            return subprocess.run(cmd, cwd=cwd, env=env, stdout=f,
+                                  stderr=subprocess.STDOUT, timeout=timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            f.write("\n[timed out after %ds]\n" % timeout_s)
+            return 124
+        except OSError as e:
+            f.write("\n[could not run: %s]\n" % e)
+            return 127
+
+
+def train_action(name):
+    """Preprocess the clips, train the motion LoRA, copy it into the library and
+    record it (status 'trained'). Returns (action.json dict, lora_path). Raises
+    DatasetError."""
+    lib = _load_action_lib()
+    data = lib.load_action(name)
+    if data["status"] == "trained" and data.get("lora"):
+        raise DatasetError("action %s is already trained; delete its loras/video to retrain" % name)
+    adir = lib.action_dir(name)
+    clips_dir = os.path.join(adir, "dataset", "clips")
+    captions_dir = os.path.join(adir, "dataset", "captions")
+    n_vid = len(glob.glob(os.path.join(clips_dir, "*.mp4")))
+    if n_vid < lib.MIN_CLIPS:
+        raise DatasetError("only %d clips in %s; training needs >= %d (bin/action create --regenerate)"
+                           % (n_vid, clips_dir, lib.MIN_CLIPS))
+    if not (os.path.isfile(LTX2_MLX_BIN) and os.access(LTX2_MLX_BIN, os.X_OK)):
+        raise DatasetError("ltx-2-mlx not found/executable at %s (set LTX2_MLX_BIN)" % LTX2_MLX_BIN)
+    if not os.path.isdir(TRAIN_MODEL):
+        raise DatasetError("training transformer not found at %s; a dev/train LTX-2.3 model is "
+                           "required (set LTX2_MLX_TRAIN_MODEL)" % TRAIN_MODEL)
+
+    ds = data.get("dataset") or {}
+    width = ds.get("width", DEFAULT_WIDTH)
+    height = ds.get("height", DEFAULT_HEIGHT)
+    frames = ds.get("frames", DEFAULT_FRAMES)
+    tdir = os.path.join(adir, "train", "video")
+    if os.path.exists(tdir):
+        shutil.rmtree(tdir)
+    os.makedirs(tdir)
+    env = dict(os.environ, HF_HOME=LTX2_MLX_HF_HOME)
+
+    pre_out = os.path.join(tdir, "preprocessed")
+    rc = _run_logged(preprocess_argv(clips_dir, captions_dir, pre_out, width, height, frames),
+                     os.path.join(adir, "logs", "preprocess.log"), LTX2_MLX_DIR, env, PREPROCESS_TIMEOUT_S)
+    if rc != 0:
+        raise DatasetError("preprocess failed (rc %d); log: %s"
+                           % (rc, os.path.join(adir, "logs", "preprocess.log")))
+    latents = os.path.join(pre_out, ".precomputed", "latents")
+    n_lat = len(os.listdir(latents)) if os.path.isdir(latents) else 0
+    if n_lat != n_vid:
+        raise DatasetError("preprocess wrote %d latents for %d clips; log: %s"
+                           % (n_lat, n_vid, os.path.join(adir, "logs", "preprocess.log")))
+
+    config_path = os.path.join(tdir, "train.yaml")
+    out_dir = os.path.join(tdir, "out")
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(train_config(pre_out, data["trigger"], out_dir, width, height, frames))
+    rc = _run_logged(train_argv(config_path), os.path.join(adir, "logs", "train.log"),
+                     LTX2_MLX_DIR, env, TRAIN_TIMEOUT_S)
+    final = os.path.join(out_dir, "checkpoints", final_ckpt_name())
+    if rc != 0 or not (os.path.isfile(final) and os.path.getsize(final) > 0):
+        raise DatasetError("train failed (rc %d) or no checkpoint at %s; log: %s"
+                           % (rc, final, os.path.join(adir, "logs", "train.log")))
+
+    lora_path = os.path.join(adir, "loras", "video", "%s.safetensors" % name)
+    os.makedirs(os.path.dirname(lora_path), exist_ok=True)
+    shutil.copy2(final, lora_path + ".tmp")
+    os.replace(lora_path + ".tmp", lora_path)
+    data["lora"] = {"path": lora_path, "sha256": _sha256(lora_path), "rank": ACTION_RANK,
+                    "alpha": ACTION_RANK, "base_model": INFERENCE_MODEL}
+    data["status"] = "trained"
+    lib.write_action(data)
+    return data, lora_path
+
+
+def train(args):
+    """bin/action train. Returns 0 or 2."""
+    lib = _load_action_lib()
+    try:
+        data, lora_path = train_action(args.name)
+    except (DatasetError, lib.ActionError) as e:
+        return _error(str(e))
+    print("action LoRA trained: %s (sha256 %s..., rank %d)"
+          % (lora_path, data["lora"]["sha256"][:12], ACTION_RANK))
+    print("register it in the catalog (runs the lora-check arch gate):")
+    print("  bin/lora-catalog add %s --id action-%s --kind motion --target video \\"
+          % (shlex.quote(lora_path), args.name))
+    print("    --base-model %s --trigger %s --description %s --use-when %s"
+          % (INFERENCE_MODEL, shlex.quote(data["trigger"]),
+             shlex.quote(data["descriptor"]), shlex.quote("cast with ltx-movie --action %s" % args.name)))
+    print("then cast it: bin/ltx-movie ... --action %s" % args.name)
+    return 0
+
+
 def create(args):
     """bin/action create. Returns 0, 2 (bad input) or 3 (fewer than MIN_CLIPS)."""
     lib = _load_action_lib()
@@ -274,14 +476,18 @@ def build_parser():
     c.add_argument("--fps", type=int, default=DEFAULT_FPS)
     c.add_argument("--force", action="store_true", help="proceed with < 3 performers (not identity-agnostic)")
     c.add_argument("--regenerate", action="store_true", help="rebuild an existing action's dataset")
+    t = sub.add_parser("train", help="train the motion LoRA from the clip dataset (ltx-2-mlx)")
+    t.add_argument("name")
     return p
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    args.fps = getattr(args, "fps", DEFAULT_FPS)
     if args.command == "create":
+        args.fps = getattr(args, "fps", DEFAULT_FPS)
         return create(args)
+    if args.command == "train":
+        return train(args)
     return 2
 
 

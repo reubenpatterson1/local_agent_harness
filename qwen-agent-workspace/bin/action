@@ -87,12 +87,10 @@ def main(argv=None):
         return cmd_list()
     if args.command == "show":
         return cmd_show(args.name)
-    if args.command == "train":
-        print("Error: bin/action train is Phase 3 (not yet implemented); the dataset is ready for "
-              "ltx-2-mlx train once wired.", file=sys.stderr)
-        return 2
-    # create -> action_dataset (heavy: PIL + ffmpeg)
+    # create / train -> action_dataset (heavy: PIL + ffmpeg / ltx-2-mlx)
     import action_dataset
+    if args.command == "train":
+        return action_dataset.train(args)
     # fill geometry defaults from action_dataset so the two stay in sync
     args.width = args.width if args.width is not None else action_dataset.DEFAULT_WIDTH
     args.height = args.height if args.height is not None else action_dataset.DEFAULT_HEIGHT
