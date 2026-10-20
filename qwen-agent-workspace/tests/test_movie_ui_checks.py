@@ -2,9 +2,7 @@
 Run from the workspace root: python3 -m pytest tests/test_movie_ui_checks.py -v
 Every test runs under a temporary HOME against a stub workspace."""
 
-import json
 import os
-import shutil
 
 import pytest
 
@@ -50,6 +48,14 @@ def test_mut4_every_v1_error_alone(env):
         ({"goal": "a\nb"}, "goal must be a single line of 1 to 300 characters"),
         ({"goal": "g" * 301}, "goal must be a single line of 1 to 300 characters"),
         ({"goal": "-x"}, "goal must not start with '-'"),
+        ({"goal": "a\ud800"}, "goal contains invalid characters"),
+        ({"narrative": "ok\x00"}, "narrative contains invalid characters"),
+        ({"story_id": "Movie-UI-Smoke"}, "story id movie-ui-smoke is reserved for smoke renders"),
+        ({"panels": 201}, "panels must be an integer from 1 to 200"),
+        ({"video_loras": [{"id": None, "path": "/a\x00b", "strength": 1, "kind": None}]},
+         "video LoRA 1: path contains invalid characters"),
+        ({"video_loras": [{"id": None, "path": "/a\ud800b", "strength": 1, "kind": None}]},
+         "video LoRA 1: path contains invalid characters"),
         ({"length": 30}, "give exactly one of panels or length"),
         ({"panels": None}, "give exactly one of panels or length"),
         ({"panels": 0}, "panels must be an integer from 1 to 200"),
@@ -103,6 +109,8 @@ def test_mut4_every_v1_error_alone(env):
         assert _errors(env, story_id=bad)[0].startswith("story id must match"), bad
     assert _errors(env, story_id="a.b-c_9") == []
     assert _errors(env, story_id="x" * 80) == []
+    assert _errors(env, panels=200) == []
+    assert _errors(env, narrative="x" * 20000) == []
 
 
 def test_mut3_v1_rule_18_against_an_old_workspace(env):

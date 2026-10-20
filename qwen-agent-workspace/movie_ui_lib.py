@@ -789,6 +789,17 @@ def resolved_panels(fields):
     return None
 
 
+def _argv_safe(value):
+    """A str that can be an argv element: no NUL and encodable as UTF-8 (no lone surrogates)."""
+    if not isinstance(value, str) or "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _rule_models(fields):
     """V1 rule 9."""
     errors = []
@@ -797,7 +808,7 @@ def _rule_models(fields):
         if value is None:
             continue
         if not (isinstance(value, str) and 1 <= len(value) <= 512 and not value.startswith("-")
-                and all(ord(ch) >= 0x20 for ch in value)):
+                and _argv_safe(value) and all(ord(ch) >= 0x20 for ch in value)):
             errors.append("%s must be a model name or an absolute path" % key)
     return errors
 
@@ -815,6 +826,8 @@ def _rule_loras(fields, which):
         path, strength, lora_id, kind = item.get("path"), item.get("strength"), item.get("id"), item.get("kind")
         if not (isinstance(path, str) and os.path.isabs(path)):
             errors.append("%s LoRA %d: path must be absolute" % (which, k))
+        elif not _argv_safe(path):
+            errors.append("%s LoRA %d: path contains invalid characters" % (which, k))
         else:
             real = os.path.realpath(path)
             if real in seen:
@@ -853,7 +866,7 @@ def validate_fields(fields, ws_real, state):
     sid_ok = valid_story_id(story_id)
     if not sid_ok:                                                           # 1
         errors.append("story id must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ and must not contain '..'")
-    elif story_id == SMOKE_STORY_ID:
+    elif story_id.lower() == SMOKE_STORY_ID:
         sid_ok = False
         errors.append("story id movie-ui-smoke is reserved for smoke renders")
     narrative = fields.get("narrative")                                      # 2
@@ -863,6 +876,8 @@ def validate_fields(fields, ws_real, state):
         errors.append("narrative must be at most 20000 characters")
     elif narrative.strip().startswith("-"):
         errors.append("narrative must not start with '-'")
+    elif not _argv_safe(narrative):
+        errors.append("narrative contains invalid characters")
     goal = fields.get("goal")                                                # 3
     if goal is not None:
         text = goal_text(goal) if isinstance(goal, str) else ""
@@ -870,6 +885,8 @@ def validate_fields(fields, ws_real, state):
             errors.append("goal must be a single line of 1 to 300 characters")
         elif text.startswith("-"):
             errors.append("goal must not start with '-'")
+        elif not _argv_safe(text):
+            errors.append("goal contains invalid characters")
     panels, length = fields.get("panels"), fields.get("length")              # 4
     fps, frames = fields.get("fps"), fields.get("frames")
     fps_ok = _is_int(fps) and 1 <= fps <= 120
@@ -979,6 +996,8 @@ def stills_check(ws_real, py=sys.executable):
 def story_server_check(ws_real):
     """(ok, detail) for V2 "story server": bin/story-server status (bash, run directly)."""
     run = run_light([os.path.join(ws_real, "bin", "story-server"), "status"], ws_real)
+    if run["timed_out"]:
+        return False, "bin/story-server status timed out after %d s" % LIGHT_TIMEOUT
     state = None
     for line in run["stdout"].splitlines():
         match = STATE_LINE_RE.match(line)
