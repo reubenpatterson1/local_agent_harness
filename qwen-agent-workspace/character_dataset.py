@@ -135,7 +135,7 @@ VLM_WAIT_S = 600
 AVAIL_WAIT_S = 600
 
 TRAIN_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8-dev")
-TEST_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.5-mlx-q8")
+TEST_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8")
 VIDEO_RANK = 32
 VIDEO_STEPS = 1000
 VIDEO_FINAL_CKPT = "lora_weights_step_01000.safetensors"
