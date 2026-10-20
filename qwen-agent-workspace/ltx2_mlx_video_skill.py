@@ -71,13 +71,15 @@ STDERR_TAIL_LINES = 40
 # only when QWEN_LTX_AUTOTUNE is truthy AND the caller did not pass the flag
 # itself. Tests never set the env, so they see the baseline unchanged.
 #
-# Geometry for the big tier was validated on an M1 Ultra / 128 GB host (see the
-# validation render in the setup notes); adjust AUTOTUNE_BIG if a host measures
-# a different safe ceiling.
+# Big-tier geometry picked from a measured resolution sweep on an M1 Ultra /
+# 128 GB host (241 frames, low_ram off): peak RAM stayed 28-47 GB across the whole
+# range (memory is never the limit), while render time has a sharp cliff --
+# 1344x768 ~12.6 min vs 1600x896 ~27.7 min. 1344x768 is the most resolution before
+# that cliff. Adjust AUTOTUNE_BIG if a host measures a different safe ceiling.
 AUTOTUNE_ENV = "QWEN_LTX_AUTOTUNE"
 AUTOTUNE_MEM_ENV = "QWEN_LTX_MEM_GIB"      # test/override seam for detected RAM
 AUTOTUNE_BIG_GIB = 96                      # >= this much unified memory -> big tier
-AUTOTUNE_BIG = {"low_ram": False, "width": 1216, "height": 704, "num_frames": 241}
+AUTOTUNE_BIG = {"low_ram": False, "width": 1344, "height": 768, "num_frames": 241}
 
 
 def detect_unified_memory_gib():
