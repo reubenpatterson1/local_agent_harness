@@ -1,0 +1,18 @@
+[movie-ui] started pid 4242: /usr/bin/python3 /ws/bin/ltx-movie 'A ronin rescues a child.' --story-id demo
+=== Phase 1: story ===
+story.md exists; re-checking it (no model call)
+=== Phase 1b: release the story server ===
+=== Phase 2: stills ===
+z_image: step 1/8z_image: step 4/8z_image: step 8/8
+=== Phase 3: manifest + dry-run ===
+panels: 3
+=== Phase 4: render ===
+=== panel 1/3 (panel-1) ===
+ltx-2-mlx: 10%ltx-2-mlx: 50%ltx-2-mlx: 100%
+panel 1 ok: /ws/generated/stories/demo/clips/panel_01.mp4 (61.2s)
+=== panel 2/3 (panel-2) ===
+panel 2 FAILED (verification): clip has 120 frames, expected 145
+=== panel 2/3 (panel-2) ===
+panel 2 ok: /ws/generated/stories/demo/clips/panel_02.mp4 (58.0s)
+=== panel 3/3 (panel-3) ===
+ltx-2-mlx: 30%ltx-2-mlx: 60%

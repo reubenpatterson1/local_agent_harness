@@ -1,0 +1,4 @@
+[movie-ui] started pid 77: /usr/bin/python3 /ws/bin/character create kyra --phrase 'the young woman'
+character kyra: checking the seed face with the vision model
+Error: the main character's face fills only 9% of the seed image's height (minimum 15%); a small face makes a weak identity reference. Use a closer crop of the character, or pass --force to proceed anyway.
+[movie-ui] exit 2 (failed)

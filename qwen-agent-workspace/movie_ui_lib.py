@@ -1457,3 +1457,129 @@ def run_checks(fields, ws_real, state, py=sys.executable):
     return ([v1] + host_checks(fields, ws_real, py) + model_checks(fields, ws_real)
             + lora_checks(fields, ws_real, cache) + compat_checks(fields, ws_real, cache)
             + [dry_run_check(fields, ws_real, state)])
+
+
+# ---------------------------------------------------------------------------
+# The progress parser (MU55, MU56)
+# ---------------------------------------------------------------------------
+
+LINE_CLIP = 300
+FEED_MAX = 1048576
+PHASE_RE = re.compile(r"^=== Phase (\d+b?): (.+?)(?: \(rewrite (\d+) of (\d+)\))? ===$")
+REDO_RE = re.compile(r"^=== Redo: panels (.+) ===$")
+TOTAL_RE = re.compile(r"^panels: (\d+)$")
+PANEL_HDR_RE = re.compile(r"^=== panel (\d+)/(\d+) \(")
+OK_RE = re.compile(r"^panel (\d+) ok: ")
+REUSE_RE = re.compile(r"^panel (\d+): reusing ")
+FAILED_RE = re.compile(r"^panel (\d+) FAILED \(([^)]*)\):? ?(.*)$")
+SUMMARY_RE = re.compile(r"^=== render summary \(")
+FACE_RE = re.compile(
+    r"^Error: (?:the vision model found no face in the seed image; pass --force to proceed anyway\."
+    r"|the main character's face fills only \d+% of the seed image's height \(minimum 15%\); a small "
+    r"face makes a weak identity reference\. Use a closer crop of the character, or pass --force to "
+    r"proceed anyway\.)$")
+STILL_NAME_RE = re.compile(r"^panel_\d{2}\.png$")
+
+
+def collapse(line):
+    """The text after the last carriage return of a line (pipeline_log.collapse_cr's rule)."""
+    return line.rstrip("\r").rsplit("\r", 1)[-1]
+
+
+def job_phases(kind, fields):
+    """MU56's "phases", mirroring bin/ltx-movie's _phase_sequence."""
+    seed = ["0"] if fields.get("seed_upload") else []
+    if kind == "story":
+        return seed + ["1"]
+    return (seed + ["1", "1b"] + (["redo"] if fields.get("action") == "redo" else [])
+            + ([] if fields.get("mode") == "no_stills" else ["2"]) + ["3", "4"])
+
+
+class ProgressParser(object):
+    """Incremental log.txt parser for one job (MU55). feed() takes raw bytes; a line split across
+    feeds is parsed once, whole."""
+
+    def __init__(self, kind, fields):
+        self.kind, self.fields = kind, fields
+        self.offset = 0
+        self.tail = b""
+        self.phase = self.phase_title = self.rewrite = self.redo = self.panels_total = None
+        self.panels = {}
+        self.wrap_up = False
+        self.face_problem = False
+        self.last_line = ""
+
+    def feed(self, data):
+        self.offset += len(data)
+        lines = (self.tail + data).split(b"\n")
+        self.tail = lines.pop()
+        for raw in lines:
+            self._line(collapse(raw.decode("utf-8", "replace")))
+
+    def current_last_line(self):
+        tail = collapse(self.tail.decode("utf-8", "replace"))
+        return tail[:LINE_CLIP] if tail.strip() else self.last_line
+
+    def _line(self, line):
+        if line.strip():
+            self.last_line = line[:LINE_CLIP]
+        match = PHASE_RE.match(line)
+        if match:
+            self.phase, self.phase_title = match.group(1), match.group(2)
+            self.rewrite = [int(match.group(3)), int(match.group(4))] if match.group(3) else None
+            return
+        match = REDO_RE.match(line)
+        if match:
+            self.phase, self.redo = "redo", match.group(1)
+            return
+        match = TOTAL_RE.match(line)
+        if match:
+            self.panels_total = int(match.group(1))
+            return
+        match = PANEL_HDR_RE.match(line)
+        if match:
+            self.panels_total = int(match.group(2))
+            self.panels[match.group(1)] = {"state": "running"}
+            return
+        match = OK_RE.match(line)
+        if match:
+            self.panels[match.group(1)] = {"state": "ok", "reused": False}
+            return
+        match = REUSE_RE.match(line)
+        if match:
+            self.panels[match.group(1)] = {"state": "ok", "reused": True}
+            return
+        match = FAILED_RE.match(line)
+        if match:
+            self.panels[match.group(1)] = {"state": "failed", "reason": match.group(2),
+                                           "detail": match.group(3)[:LINE_CLIP]}
+            return
+        if SUMMARY_RE.match(line):
+            self.wrap_up = True
+            return
+        if FACE_RE.match(line):
+            self.face_problem = True
+
+    def snapshot(self, job, status, state, now=None):
+        """The MU56 progress object for job (its job.json) and status (its status.json or None)."""
+        started = parse_utc((status or {}).get("started"))
+        current = time.time() if now is None else now
+        elapsed = None if started is None else int(current - started)
+        if self.kind not in ("story", "movie"):
+            return {"kind": self.kind, "elapsed_s": elapsed, "last_line": self.current_last_line(),
+                    "face_problem": self.face_problem}
+        stills = None
+        if self.phase == "2":
+            images = os.path.join(story_dir(job["workspace"], job["story_id"]), "images")
+            try:
+                count = sum(1 for n in os.listdir(images) if STILL_NAME_RE.fullmatch(n))
+            except OSError:
+                count = 0
+            expected = resolved_panels(self.fields) if self.fields.get("mode") == "shots" else 1
+            stills = {"expected": expected, "count": count}
+        return {"phase": self.phase, "phase_title": self.phase_title, "rewrite": self.rewrite,
+                "phases": job_phases(self.kind, self.fields), "redo": self.redo,
+                "panels_total": self.panels_total,
+                "panels": dict((k, dict(v)) for k, v in sorted(self.panels.items(), key=lambda kv: int(kv[0]))),
+                "panels_done": sum(1 for v in self.panels.values() if v["state"] == "ok"),
+                "wrap_up": self.wrap_up, "stills": stills, "last_line": self.current_last_line()}
