@@ -245,9 +245,10 @@ def test_mut26_pipeline_files_are_unchanged():
     # intentionally advanced the pipeline, then to 6bcb54b (character_dataset.py's
     # TEST_MODEL_DIR host-adapted ltx-2.5 -> ltx-2.3), then to 9f71234 (character_dataset.py's
     # VLM restart switched from the vLLM "vision" mode to "mlx-vision", the mlx_vlm path
-    # this host serves). The movie-ui itself still makes zero pipeline changes; this
-    # invariant holds going forward from the new baseline.
-    BASELINE = "9f71234406b60a8488c612ff18cbd11b9af4aee1"
+    # this host serves), then to 8921fa9 (character_dataset.py's DESCRIBE_PROMPT
+    # strengthened to capture makeup and habitual bearing). The movie-ui itself still
+    # makes zero pipeline changes; this invariant holds going forward from the new baseline.
+    BASELINE = "8921fa9b6295c14393e4aa2734ca7e7297391ca3"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
