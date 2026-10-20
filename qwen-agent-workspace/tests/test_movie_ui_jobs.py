@@ -172,3 +172,40 @@ def test_atomic_write_failure_reraises_and_leaves_no_tmp_file(state, monkeypatch
         lib.write_bytes_atomic(path, b"data")
     assert [n for n in os.listdir(state) if n.startswith("y.json.tmp-")] == []
     assert not os.path.exists(path)
+
+
+def test_mut11_cancel_reaches_a_grandchild_in_its_own_session(state, tmp_path, monkeypatch):
+    """D1: the render's ltx-2-mlx runs with start_new_session=True (ltx2_mlx_video_skill.py:341)."""
+    monkeypatch.setattr(lib, "CANCEL_GRACE_S", 1.0)
+    ready, grand = _ready_file(tmp_path, "ready"), _ready_file(tmp_path, "grand")
+    code = ("import subprocess, sys, time\n"
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+            "open(%r, 'w').write(str(g.pid))\n"
+            "open(%r, 'w').write('1')\n"
+            "time.sleep(60)\n" % (grand, ready))
+    job_id = mt.make_job(state, mt.py_argv(code), str(tmp_path))
+    mt.dispatch(state, job_id)
+    mt.wait_until(lambda: os.path.exists(ready), 10)
+    grand_pid = int(open(grand).read())
+    assert os.getpgid(grand_pid) == grand_pid
+    t0 = time.monotonic()
+    mt.cancel_marker(state, job_id)
+    status = _final(state, job_id)
+    assert status["state"] == "cancelled"
+    mt.wait_until(lambda: not mt.pid_alive(grand_pid), 5)
+    assert time.monotonic() - t0 < 16
+    log = mt.read_log(state, job_id)
+    assert "[movie-ui] cancel: SIGTERM to process group(s) %s" % " ".join(
+        str(g) for g in sorted((status["pgid"], grand_pid))) in log
+
+
+def test_descendant_groups_and_the_ps_fallback(monkeypatch, capsys):
+    table = [(10, 1, 10), (11, 10, 10), (12, 11, 12), (13, 12, 12), (14, 1, 14), (15, 14, 15)]
+    assert lib.descendant_groups(10, table) == [10, 12]
+    assert lib.descendant_groups(14, table) == [14, 15]
+    assert lib.descendant_groups(99, table) == [99]
+    rows = lib.process_table()
+    assert rows and (os.getpid(), os.getppid(), os.getpgid(0)) in rows
+    monkeypatch.setattr(lib, "process_table", lambda: None)
+    assert lib.cancel_groups(4242) == [4242]
+    assert capsys.readouterr().out == "[movie-ui] ps failed; signalling process group 4242 only\n"

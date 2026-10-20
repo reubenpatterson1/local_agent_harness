@@ -232,10 +232,46 @@ def group_alive(group):
     return True
 
 
+def process_table():
+    """[(pid, ppid, pgid)] from ps -A -o pid=,ppid=,pgid= (timeout 5 s), or None when ps fails."""
+    try:
+        proc = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid="], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    rows = []
+    for line in proc.stdout.decode("ascii", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2])))
+    return rows
+
+
+def descendant_groups(root_pid, table):
+    """Sorted {root_pid} | {pgid of every transitive descendant of root_pid} (MU23 step 1)."""
+    children = {}
+    for pid, ppid, pgid in table:
+        children.setdefault(ppid, []).append((pid, pgid))
+    groups, seen, stack = {root_pid}, set(), [root_pid]
+    while stack:
+        for pid, pgid in children.get(stack.pop(), []):
+            if pid not in seen:
+                seen.add(pid)
+                groups.add(pgid)
+                stack.append(pid)
+    return sorted(groups)
+
+
 def cancel_groups(child_pid):
-    """The process groups a cancel signals: the child's own group (MU23 step 1; the sweep of
-    its descendants' groups, D1, is added separately, Q1)."""
-    return [child_pid]
+    """The process groups a cancel signals: the child's group and every process group of its
+    descendants (MU23 step 1, D1, Q1)."""
+    table = process_table()
+    if table is None:
+        _say("ps failed; signalling process group %d only" % child_pid)
+        return [child_pid]
+    return descendant_groups(child_pid, table)
 
 
 def cancel_tree(child, grace):
