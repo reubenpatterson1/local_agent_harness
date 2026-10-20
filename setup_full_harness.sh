@@ -137,6 +137,17 @@ stage_video_mlx() {
   mkdir -p "$LTX2_HF"
   hf_to_cache "$LTX2_VIDEO" "$LTX2_HF" "$MLX_VENV" || warn "LTX-2 DiT download failed (repo may be gated/renamed — verify $LTX2_VIDEO)"
   hf_to_cache "$LTX2_GEMMA" "$LTX2_HF" "$MLX_VENV" || warn "gemma encoder download failed"
+  # Expose the pack's dev transformer (transformer-dev.safetensors, needed for LoRA
+  # training) at the path bin/action train / character train expect. It ships inside
+  # the q8 pack, so no extra download -- just a link to the cached snapshot.
+  SNAP=$(ls -d "$LTX2_HF"/hub/models--dgrauet--ltx-2.3-mlx-q8/snapshots/*/ 2>/dev/null | head -1)
+  if [ -n "$SNAP" ] && [ -f "$SNAP/transformer-dev.safetensors" ]; then
+    mkdir -p "$LTX2_DIR/models"
+    ln -sfn "$SNAP" "$LTX2_DIR/models/ltx-2.3-mlx-q8-dev"
+    say "dev training model linked: $LTX2_DIR/models/ltx-2.3-mlx-q8-dev"
+  else
+    warn "transformer-dev.safetensors not found in the q8 pack; LoRA training will need it"
+  fi
 }
 
 stage_video_torch() {
