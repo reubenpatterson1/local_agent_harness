@@ -351,7 +351,7 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             return
         body = None
         if self.command in ("POST", "PUT") or (self.command == "DELETE" and
-                                                self.headers.get("Content-Length") is not None):
+                                                (self.headers.get("Content-Length") or "0").strip() != "0"):
             body = self._read_body(path)
             if body is None:
                 return
@@ -839,7 +839,8 @@ def _h_job_delete(self, groups, query, body):
     try:
         with STORE_LOCK:
             info = lib.orphan_info(lib.read_status(lib.job_dir(state, job_id)))
-            if info is not None and (body or {}) != {"confirm": True}:
+            body = body or {}
+            if info is not None and not (set(body) == {"confirm"} and body["confirm"] is True):
                 raise ApiError(409, "job %s still has a live process group %d; kill it first, or delete "
                                     "with confirm to unblock the queue anyway" % (job_id, info["pgid"]))
             try:
@@ -850,9 +851,10 @@ def _h_job_delete(self, groups, query, body):
             raise ApiError(409, "job %s is not finished" % job_id)
         return 200, {"deleted": job_id}
     finally:
-        self.server.job_cache.pop(job_id, None)
-        with self.server.parser_lock:
-            self.server.parsers.pop(job_id, None)
+        if not os.path.isdir(lib.job_dir(state, job_id)):
+            self.server.job_cache.pop(job_id, None)
+            with self.server.parser_lock:
+                self.server.parsers.pop(job_id, None)
 
 
 def _h_job_kill_orphan(self, groups, query, body):

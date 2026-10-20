@@ -517,7 +517,9 @@ def test_delete_lost_job_with_live_orphan_needs_confirm(env):
         assert payload["error"] == ("job %s still has a live process group %d; kill it first, or delete "
                                     "with confirm to unblock the queue anyway" % (lost, orphan.pid))
         assert mt.api(s, "GET", "/api/jobs/%s" % lost)[0] == 200
-        assert mt.api(s, "DELETE", "/api/jobs/%s" % lost, body={"confirm": "yes"})[0] == 409
+        for bad in ({"confirm": "yes"}, {"confirm": 1}, {"confirm": 1.0}, {"confirm": True, "x": 1}):
+            assert mt.api(s, "DELETE", "/api/jobs/%s" % lost, body=bad)[0] == 409
+            assert mt.api(s, "GET", "/api/jobs/%s" % lost)[0] == 200
         assert mt.api(s, "DELETE", "/api/jobs/%s" % lost, body={"confirm": True})[:3:2] == (200, {"deleted": lost})
         assert mt.api(s, "GET", "/api/jobs/%s" % lost)[0] == 404
     finally:
@@ -548,3 +550,11 @@ def test_job_actions_on_bad_input_and_unknown_ids(env):
     assert mt.api(s, "GET", "/api/jobs/%s" % job_id)[0] == 200
     shutil.rmtree(lib.job_dir(state, job_id))
     assert mt.api(s, "GET", "/api/jobs/%s" % job_id)[0] == 404
+
+
+def test_delete_with_content_length_zero_is_an_absent_body(env):
+    s, state = env["srv"], env["state"]
+    done = mt.make_job(state, ["true"], env["ws"], status={"state": "done", "exit_code": 0,
+                                                            "ended": lib.utc_now()})
+    status, _h, payload = mt.api(s, "DELETE", "/api/jobs/%s" % done, headers={"Content-Length": "0"})
+    assert (status, payload) == (200, {"deleted": done})
