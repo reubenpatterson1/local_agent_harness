@@ -47,6 +47,10 @@ import character_lib  # noqa: E402
 import ltx2_mlx_video_skill as SKILL  # noqa: E402
 
 STORY_SERVER = os.path.join(WS, "bin", "story-server")
+# story-server mode used to (re)start the vision model after the generate phase frees
+# memory. This host serves the VLM via mlx_vlm ("mlx-vision"); the legacy "vision" mode
+# is vLLM-Metal, which isn't installed here. Override with CHARACTER_VLM_SERVE_MODE.
+VLM_SERVE_MODE = os.environ.get("CHARACTER_VLM_SERVE_MODE", "mlx-vision")
 
 VLM_URL      = os.environ.get("QWEN_AGENT_VLM_URL", "http://127.0.0.1:8177/v1/chat/completions")
 MODELS_URL   = os.environ.get("QWEN_AGENT_VLM_MODELS_URL", "http://127.0.0.1:8177/v1/models")
@@ -776,9 +780,9 @@ def _build_dataset(data, face_height):
                                "story server")
         run_zimage_child(spec, char_dir, "generate")
     finally:
-        rc = story_server("vision")
+        rc = story_server(VLM_SERVE_MODE)
         if rc != 0:
-            print("warning: story-server vision returned %d" % rc, file=sys.stderr)
+            print("warning: story-server %s returned %d" % (VLM_SERVE_MODE, rc), file=sys.stderr)
         if not wait_for_vlm(VLM_WAIT_S):
             raise DatasetError("timed out waiting for the vision server to come back")
 
@@ -964,7 +968,7 @@ def create(args):
             return _error("only %.1f GiB free at %s; create needs 2 GiB" % (free, lib))
         if not vlm_ready():
             return _error("the vision model %s is not being served at %s; start it with: "
-                          "bin/story-server vision" % (VLM_MODEL, MODELS_URL))
+                          "bin/story-server %s" % (VLM_MODEL, MODELS_URL, VLM_SERVE_MODE))
 
         if data is not None:
             return _regenerate(data)
