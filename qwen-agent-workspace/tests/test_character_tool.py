@@ -225,7 +225,7 @@ def test_k4_create_argument_errors(tmp_path, lib_dir, monkeypatch, capsys):
         (base + ["--descriptor", RONIN_DESCRIPTOR, "--class", "Man"],
          "Error: class noun must match [a-z]{3,12}, got 'Man'"),
         (base + ["--descriptor", "a short one", "--class", "man"],
-         "Error: --descriptor: descriptor word count must be 8-60, got 3"),
+         "Error: --descriptor: descriptor word count must be 8-70, got 3"),
         (base + ["--seed-image", missing], "Error: --seed-image not found: %s" % missing),
         (base + desc + ["--trigger", "AB"],
          "Error: trigger must match [a-z][a-z0-9]{3,15}, got 'AB'"),
@@ -300,7 +300,7 @@ def test_k6_create_preflights(lib_dir, monkeypatch, capsys):
           "Error: only 1.5 GiB free at %s; create needs 2 GiB" % lib_dir)
     _case(lambda m: m.setattr(character_dataset, "vlm_ready", lambda: False),
           "Error: the vision model qwen38-6bit is not being served at "
-          "http://127.0.0.1:8177/v1/models; start it with: bin/story-server vision")
+          "http://127.0.0.1:8177/v1/models; start it with: bin/story-server mlx-vision")
     assert not os.path.exists(lock)
 
 
@@ -358,7 +358,7 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
         character_dataset.verify_ffprobe(os.path.join(cdir, "dataset", "videos", name))
     with open(os.path.join(lib_dir, ".triggers")) as f:
         assert f.read() == "kyrawmn kyra\n"
-    assert fakes.server_calls == ["stop", "vision"]
+    assert fakes.server_calls == ["stop", "mlx-vision"]
     assert os.path.isfile(os.path.join(cdir, "seed.png"))
     with open(os.path.join(cdir, "dataset", "description.json")) as f:
         assert json.load(f)["class_noun"] == "woman"
@@ -440,7 +440,7 @@ def test_k13_generation_failure_restarts_the_vision_server(lib_dir, monkeypatch,
         "Z-Image child process exited 1; log: /x.log"))
     assert tool.main(_ronin_create()) == 1
     assert capsys.readouterr().err == "Error: Z-Image child process exited 1; log: /x.log\n"
-    assert fakes.server_calls == ["stop", "vision"]
+    assert fakes.server_calls == ["stop", "mlx-vision"]
     assert character_lib.load_character("ronin")["status"] == "dataset"
 
 

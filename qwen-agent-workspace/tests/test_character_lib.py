@@ -230,7 +230,7 @@ def test_c14_source(lib_dir):
 def test_c15_descriptor(lib_dir):
     data = make_character(lib_dir)
     for bad in (DESCRIPTOR + ".", "The" + DESCRIPTOR[1:], "a young woman with long black hair",
-                "a " + " ".join(["word"] * 60)):
+                "a " + " ".join(["word"] * 70)):
         broken = copy.deepcopy(data)
         broken["descriptor"] = bad
         assert _raises(character_lib.validate_character, broken).startswith("descriptor: ")
