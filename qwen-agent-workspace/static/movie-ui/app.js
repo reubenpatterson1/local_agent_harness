@@ -9,7 +9,7 @@
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
     characters: [], seedUpload: null, composeAction: "story", story: null, character: null, selectedJob: null, logOffset: 0,
-    logBuffer: "", logLines: [], trace: null, traceAgent: null, agents: [], recent: [], timers: {}
+    logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
 
   // --- helpers -------------------------------------------------------------------------
@@ -56,10 +56,19 @@
     return "/files?ws=" + enc(S.ws) + "&path=" + enc(path) + "&t=" + enc(S.token);
   }
 
-  function banner(text) {
+  function banner(text, kind) {
     const node = $("#banner");
-    node.textContent = text;
+    $("#banner-text").textContent = text;
+    S.bannerKind = text ? (kind || "error") : null;
     show(node, Boolean(text));
+  }
+
+  function stopPolling() {
+    S.stopped = true;
+    ["jobs", "log", "host"].forEach(function (name) {
+      if (S.timers[name]) { clearInterval(S.timers[name]); S.timers[name] = null; }
+    });
+    if (S.timers.traces) { clearTimeout(S.timers.traces); S.timers.traces = null; }
   }
 
   async function api(method, path, body, raw) {
@@ -76,12 +85,13 @@
     try {
       response = await fetch(path, init);
     } catch (err) {
-      banner("movie-ui is not reachable: " + err);
+      banner("movie-ui is not reachable: " + err, "unreachable");
       return {status: 0, data: {error: String(err)}};
     }
     if (response.status === 401) {
-      banner("The token was rejected. Open the URL that movie-ui printed in its terminal.");
-    } else if (S.token) {
+      banner("The token was rejected. Open the URL that movie-ui printed in its terminal.", "auth");
+      stopPolling();
+    } else if (S.bannerKind === "auth" || S.bannerKind === "unreachable") {
       banner("");
     }
     let data = null;
@@ -138,7 +148,7 @@
     }
     S.token = sessionStorage.getItem(TOKEN_KEY);
     if (!S.token) {
-      banner("The token was rejected. Open the URL that movie-ui printed in its terminal.");
+      banner("The token was rejected. Open the URL that movie-ui printed in its terminal.", "auth");
     }
   }
 
@@ -163,6 +173,7 @@
     const key = S.host && S.host.api_key_present;
     $("#badge-apikey").textContent = "ANTHROPIC_API_KEY: " + (key ? "set" : "not set");
     $("#c-judge").disabled = !key;
+    if (!key) { $("#c-judge").checked = false; }
     updateComposeButtons();
     updateCharacterButtons();
   }
@@ -205,7 +216,8 @@
       return;
     }
     const select = $("#ws-select");
-    select.appendChild(el("option", {value: typed, text: "typed path"}));
+    const known = Array.prototype.some.call(select.options, function (o) { return o.value === typed; });
+    if (!known) { select.appendChild(el("option", {value: typed, text: "typed path"})); }
     select.value = typed;
     await selectWorkspace(typed);
   }
@@ -839,13 +851,16 @@
   async function deleteJob(job) {
     if (!(await askConfirm("Delete job " + job.id + " and its log? Story outputs are kept."))) { return; }
     let res = await api("DELETE", "/api/jobs/" + job.id);
-    if (res.status === 409 && res.data && /still has a live process group/.test(res.data.error || "")) {
+    const live = function (r) { return r.status === 409 && r.data && /still has a live process group/.test(r.data.error || ""); };
+    if (live(res)) {
       if (await askConfirm("Its processes are still running and may hold GPU memory. Delete the record anyway and unblock the queue?")) {
         res = await api("DELETE", "/api/jobs/" + job.id, {confirm: true});
       }
     }
-    if (res.status >= 400 && !(res.status === 409 && res.data && /still has a live process group/.test(res.data.error || ""))) {
-      banner((res.data && res.data.error) || ("http " + res.status));
+    if (res.status >= 400) {
+      if (!live(res)) { banner((res.data && res.data.error) || ("http " + res.status)); }
+    } else if (S.selectedJob === job.id) {
+      selectJob(null);
     }
     await pollJobs();
   }
@@ -863,6 +878,20 @@
   }
 
   async function pollJobs() {
+    if (S.stopped) { return; }
+    if (S.timers.jobsBusy) { S.timers.jobsDirty = true; return; }
+    S.timers.jobsBusy = true;
+    try {
+      do {
+        S.timers.jobsDirty = false;
+        await pollJobsOnce();
+      } while (S.timers.jobsDirty && !S.stopped);
+    } finally {
+      S.timers.jobsBusy = false;
+    }
+  }
+
+  async function pollJobsOnce() {
     const res = await api("GET", "/api/jobs");
     if (res.status !== 200) { return; }
     const jobs = res.data;
@@ -940,7 +969,7 @@
   }
 
   async function pollLog() {
-    if (!S.selectedJob || S.timers.logBusy) { return; }
+    if (S.stopped || !S.selectedJob || S.timers.logBusy) { return; }
     S.timers.logBusy = true;
     try {
       const id = S.selectedJob;
@@ -1017,7 +1046,10 @@
   }
 
   async function loadRecent() {
+    S.recentSeq += 1;
+    const seq = S.recentSeq;
     const res = await api("GET", "/api/traces/recent?agent=all&n=100");
+    if (seq !== S.recentSeq) { return; }
     const errors = clear($("#t-errors"));
     if (res.status !== 200) { errors.appendChild(el("li", {text: (res.data && res.data.error) || "error"})); return; }
     S.recent = res.data.traces;
@@ -1127,6 +1159,15 @@
     });
   }
 
+  function scheduleTraces() {
+    if (S.stopped || !$("#t-auto").checked) { return; }
+    S.timers.traces = setTimeout(async function () {
+      S.timers.traces = null;
+      await loadRecent();
+      scheduleTraces();
+    }, 5000);
+  }
+
   function setupTraces() {
     $("#t-refresh").addEventListener("click", function () { loadTraceAgents(); loadRecent(); loadSaved(); });
     ["#t-agent", "#t-filter-status", "#t-filter-kind", "#t-filter-name"].forEach(function (sel) {
@@ -1134,8 +1175,8 @@
       $(sel).addEventListener("change", renderRecent);
     });
     $("#t-auto").addEventListener("change", function () {
-      if (S.timers.traces) { clearInterval(S.timers.traces); S.timers.traces = null; }
-      if ($("#t-auto").checked) { S.timers.traces = setInterval(loadRecent, 5000); }
+      if (S.timers.traces) { clearTimeout(S.timers.traces); S.timers.traces = null; }
+      scheduleTraces();
     });
     $("#t-save").addEventListener("click", async function () {
       const res = await api("POST", "/api/traces/" + S.trace.result.trace_id + "/save", {agent: S.traceAgent});
@@ -1161,6 +1202,7 @@
     $("#ws-select").addEventListener("change", function () { selectWorkspace($("#ws-select").value); });
     $("#ws-typed-use").addEventListener("click", useTypedPath);
     $("#badge-refresh").addEventListener("click", function () { loadHost(true); });
+    $("#banner-dismiss").addEventListener("click", function () { banner(""); });
     setupCompose();
     setupStories();
     setupCharacters();
@@ -1171,9 +1213,12 @@
     await loadWorkspaces();
     updateComposeButtons();
     await pollJobs();
-    setInterval(pollJobs, 2000);
-    setInterval(pollLog, 1000);
-    setInterval(function () { if (capability("render").ok === null) { loadHost(false); } }, 3000);
+    if (S.stopped) { return; }
+    S.timers.jobs = setInterval(pollJobs, 2000);
+    S.timers.log = setInterval(pollLog, 1000);
+    S.timers.host = setInterval(function () {
+      if (!S.stopped && capability("render").ok === null) { loadHost(false); }
+    }, 3000);
   }
 
   document.addEventListener("DOMContentLoaded", start);
