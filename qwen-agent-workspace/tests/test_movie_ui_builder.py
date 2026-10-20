@@ -247,8 +247,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # VLM restart switched from the vLLM "vision" mode to "mlx-vision", the mlx_vlm path
     # this host serves), then to 8921fa9 (character_dataset.py's DESCRIBE_PROMPT
     # strengthened to capture makeup and habitual bearing). The movie-ui itself still
-    # makes zero pipeline changes; this invariant holds going forward from the new baseline.
-    BASELINE = "8921fa9b6295c14393e4aa2734ca7e7297391ca3"
+    # makes zero pipeline changes), then to c35b6bc (apparent age pinned in DESCRIBE_PROMPT
+    # and scored in CHECK_PROMPT, fixing age drift). This invariant holds from the new baseline.
+    BASELINE = "c35b6bcd4cb84ca5c8e4ab38d3f98369875b70de"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")

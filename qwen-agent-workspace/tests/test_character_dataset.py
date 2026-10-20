@@ -170,26 +170,20 @@ def test_d2_copied_literals_match_the_spike():
 
 
 def test_d3_describe_prompt():
-    assert character_dataset.DESCRIBE_PROMPT == (
-        'Describe the main character in this image for an image generator that must redraw the same '
-        'person recognisably across many different poses and places. Reply with only a JSON object with '
-        'two keys. '
-        '"class_noun": one lowercase word for what they are (for example woman, man, girl, boy, person). '
-        '"descriptor": one noun phrase of 25 to 55 words that starts with "a" or "an" and captures only '
-        "the character's persistent identity -- the traits that stay the same wherever they appear: "
-        'apparent age group, apparent ethnicity when it is visible, build, skin tone; hair colour, length '
-        'and style with any ornaments; distinctive facial features and markings such as scars, moles or '
-        'freckles; any makeup or face paint and its colours, for example foundation, lip colour, eye and '
-        'brow styling; the clothing, fabrics, patterns and accessories they would wear anywhere; and a '
-        'few words on their habitual bearing or expression, for example serene and composed, stern, or '
-        'warm. Leave out anything that belongs to this one situation rather than to the person: the '
-        'specific pose or action, footwear, gear or props that are visible only because of what they are '
-        'doing here (for example riding boots while riding, or a tool they are using), anything they are '
-        'holding, and any animal or vehicle. Do not mention the background, the camera, the lighting or '
-        'the image style.')
-    for phrase in ("apparent ethnicity when it is visible", "any makeup or face paint",
-                   "habitual bearing or expression", "riding boots while riding"):
-        assert phrase in character_dataset.DESCRIBE_PROMPT
+    # Requirement-based (the prompt is iterated; pin the content it must request, not bytes).
+    p = character_dataset.DESCRIBE_PROMPT
+    assert p.startswith("Describe the main character in this image")
+    assert '"class_noun":' in p and '"descriptor":' in p
+    assert "noun phrase of 25 to 55 words" in p
+    # persistent-identity coverage the prompt must request
+    for phrase in ("apparent age in approximate years", "even if makeup makes them look younger",
+                   "apparent ethnicity when it is visible", "distinctive facial features and markings",
+                   "any makeup or face paint", "habitual bearing or expression"):
+        assert phrase in p, phrase
+    # situational things it must still exclude, so the dataset keeps pose variety
+    for phrase in ("the specific pose or action", "riding boots while riding",
+                   "anything they are holding", "Do not mention the background"):
+        assert phrase in p, phrase
 
 
 def test_d4_validate_face_values():
