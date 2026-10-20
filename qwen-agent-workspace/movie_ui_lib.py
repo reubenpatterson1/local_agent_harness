@@ -1253,7 +1253,20 @@ def list_models():
                            "intact": not problems, "problems": problems,
                            "bytes": _tree_bytes(os.path.join(repo_dir, "blobs"))})
     models.sort(key=lambda m: (m["hub"], m["repo"]))
-    return {"hubs": hubs, "models": models}
+    # The valid LoRA base models per target, for the UI's base-model dropdown: video
+    # LoRAs attach to an ltx-hub DiT pack (not the gemma text encoder), stills LoRAs to
+    # the Z-Image base (not its Qwen text encoder). The canonical default leads the list.
+    present = {m["repo"] for m in models}
+    ltx_repos = [m["repo"] for m in models if m["hub"] == "ltx" and m["repo"] != DEFAULT_GEMMA]
+    video_bases = ([DEFAULT_MODEL] if DEFAULT_MODEL in present else [])
+    video_bases += [r for r in ltx_repos if r != DEFAULT_MODEL]
+    stills_bases = [STILLS_BASE_MODEL] if STILLS_BASE_MODEL in present else []
+    if not video_bases:
+        video_bases = [DEFAULT_MODEL]
+    if not stills_bases:
+        stills_bases = [STILLS_BASE_MODEL]
+    return {"hubs": hubs, "models": models,
+            "lora_bases": {"video": video_bases, "stills": stills_bases}}
 
 
 # ---------------------------------------------------------------------------

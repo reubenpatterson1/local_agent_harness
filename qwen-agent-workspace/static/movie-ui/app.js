@@ -568,6 +568,7 @@
     const res = await api("GET", "/api/models" + wsQuery());
     if (res.status !== 200) { return; }
     S.models = res.data.models || [];
+    S.loraBases = res.data.lora_bases || null;
     const list = clear($("#c-model-list"));
     const body = clear($("#m-table tbody"));
     S.models.forEach(function (m) {
@@ -577,6 +578,7 @@
         el("td", {text: m.problems.join("; ")}), el("td", {text: sizeText(m.bytes)})]));
     });
     fillModelSelect();
+    fillLoraBaseModels();
   }
 
   // Video model is a dropdown of locally-available ltx-hub models. A value not present
@@ -847,8 +849,41 @@
 
   // --- LoRAs & Models (MU83) -----------------------------------------------------------
 
+  // Shell-quote an argv element so a displayed command is copy-pasteable (multi-word
+  // --use-when / --avoid-when / --description stay a single quoted argument).
+  function shQuote(s) {
+    s = String(s);
+    return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
+  }
+
   function runText(run) {
-    return "$ " + run.argv.join(" ") + "\nexit " + run.exit_code + "\n" + run.stdout + run.stderr;
+    return "$ " + run.argv.map(shQuote).join(" ") + "\nexit " + run.exit_code + "\n" + run.stdout + run.stderr;
+  }
+
+  // The LoRA base-model dropdown lists only hosted models, filtered by target:
+  // stills LoRAs attach to the Z-Image (zimage-hub) base, video LoRAs to the ltx-hub base.
+  function fillLoraBaseModels() {
+    const sel = $("#l-base-models");
+    if (!sel) { return; }
+    const target = $("#l-target").value;
+    // Prefer the backend's curated LoRA-base list (excludes text encoders); fall back
+    // to a hub filter if an older server didn't send it.
+    let repos = S.loraBases && S.loraBases[target];
+    if (!repos) {
+      const hub = target === "stills" ? "zimage" : "ltx";
+      repos = (S.models || []).filter(function (m) { return m.hub === hub; })
+        .map(function (m) { return m.repo; }).sort();
+    }
+    const prev = Array.prototype.filter.call(sel.options, function (o) { return o.selected; })
+      .map(function (o) { return o.value; });
+    clear(sel);
+    repos.forEach(function (repo) {
+      const opt = el("option", {value: repo, text: repo});
+      if (prev.indexOf(repo) >= 0) { opt.selected = true; }
+      sel.appendChild(opt);
+    });
+    // default to selecting the first hosted base when nothing carried over
+    if (sel.selectedOptions.length === 0 && sel.options.length) { sel.options[0].selected = true; }
   }
 
   async function loadCatalogTable(results) {
@@ -886,6 +921,7 @@
     $("#m-dl-go").addEventListener("click", function () {
       downloadModel($("#m-dl-repo").value, $("#m-dl-hub").value, $("#m-dl-status"));
     });
+    $("#l-target").addEventListener("change", fillLoraBaseModels);
     $("#l-verify-all").addEventListener("click", async function () {
       const res = await api("POST", "/api/loras/verify", {ws: S.ws, ids: []});
       if (res.data && res.data.run) {
@@ -897,7 +933,8 @@
     });
     $("#l-add").addEventListener("click", async function () {
       const body = {ws: S.ws, path: $("#l-path").value.trim(), id: $("#l-id").value.trim(),
-        kind: $("#l-kind").value, target: $("#l-target").value, base_models: splitList("#l-base-models"),
+        kind: $("#l-kind").value, target: $("#l-target").value,
+        base_models: Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; }),
         triggers: splitList("#l-triggers"), description: $("#l-description").value.trim(),
         use_when: $("#l-use-when").value.trim(), avoid_when: $("#l-avoid-when").value.trim(),
         default_strength: Number($("#l-default-strength").value),
