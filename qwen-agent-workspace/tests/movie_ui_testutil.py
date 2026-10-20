@@ -122,3 +122,164 @@ def kill_everything(state):
         except subprocess.TimeoutExpired:
             pass
     del movie_ui_lib.RUNNERS[:]
+
+
+# ---------------------------------------------------------------------------
+# The stub workspace
+# ---------------------------------------------------------------------------
+
+STUB_TOOLS = ("ltx-movie", "lora-catalog", "character", "ltx-mlx-render", "story-server")
+
+STUB_SOURCE = r'''
+import json
+import os
+import sys
+import time
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+FIXTURES = __FIXTURES__
+args = sys.argv[1:]
+if TOOL in ("ltx-movie", "ltx-mlx-render"):
+    sub = "--help" if "--help" in args else ("--dry-run" if "--dry-run" in args else "run")
+else:
+    sub = args[0] if args else ""
+with open(os.path.join(WS, "stub_calls.jsonl"), "a", encoding="utf-8") as f:
+    f.write(json.dumps({"tool": TOOL, "sub": sub, "argv": args, "cwd": os.getcwd(),
+                        "env": {k: os.environ.get(k) for k in ("STORY_PIPELINE_LOGGED", "PYTHONUNBUFFERED",
+                                                               "ANTHROPIC_API_KEY")}}) + "\n")
+try:
+    with open(os.path.join(WS, "stub_config.json"), encoding="utf-8") as f:
+        config = json.load(f)
+except (OSError, ValueError):
+    config = {}
+entry = config.get(" ".join([TOOL] + args), config.get(TOOL + " " + sub, config.get(TOOL)))
+
+
+def opt(name, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def emit(text, delay=0.0):
+    for line in text.splitlines(True):
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        if delay:
+            time.sleep(delay)
+
+
+def write_file(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+if entry is not None:
+    time.sleep(entry.get("sleep", 0))
+    for rel, text in entry.get("write", {}).items():
+        write_file(os.path.join(WS, rel), text.encode("utf-8"))
+    emit(entry.get("stdout", ""))
+    sys.stderr.write(entry.get("stderr", ""))
+    sys.exit(entry.get("exit", 0))
+if TOOL == "ltx-movie" and sub == "--help":
+    with open(os.path.join(FIXTURES, "ltx-movie-help-current.txt"), encoding="utf-8") as f:
+        emit(f.read())
+    sys.exit(0)
+if TOOL == "ltx-movie" and sub == "run":
+    sdir = os.path.join(WS, "generated", "stories", opt("--story-id", "story"))
+    panels = int(opt("--panels", "2"))
+    if "--story-only" in args:
+        emit("=== Phase 1: story ===\n", 0.05)
+        text = "".join("## Panel %d -- Shot %d\nImage: a quiet road.\nMotion: the camera drifts.\n\n" % (i, i)
+                       for i in range(1, panels + 1))
+        write_file(os.path.join(sdir, "story.md"), text.encode("utf-8"))
+        emit("story.md written: %s\n" % os.path.join(sdir, "story.md"))
+        sys.exit(0)
+    for phase in ("=== Phase 1: story ===", "=== Phase 1b: release the story server ===", "=== Phase 2: stills ==="):
+        emit(phase + "\n", 0.05)
+    write_file(os.path.join(sdir, "images", "panel_01.png"), b"\x89PNG\r\n\x1a\n")
+    emit("=== Phase 3: manifest + dry-run ===\npanels: %d\n=== Phase 4: render ===\n" % panels, 0.05)
+    for i in range(1, panels + 1):
+        emit("=== panel %d/%d (panel-%d) ===\n" % (i, panels, i), 0.1)
+        write_file(os.path.join(sdir, "clips", "panel_%02d.mp4" % i), b"\x00\x00\x00\x18ftypmp42")
+        emit("panel %d ok: %s (0.1s)\n" % (i, os.path.join(sdir, "clips", "panel_%02d.mp4" % i)), 0.05)
+    write_file(os.path.join(sdir, "movie.mp4"), b"\x00\x00\x00\x18ftypmp42")
+    emit("=== render summary (ok) ===\n")
+    sys.exit(0)
+if TOOL == "ltx-mlx-render" and sub == "run":
+    clips = opt("--clips-dir")
+    emit("=== panel 1/1 (panel-1) ===\n", 0.05)
+    write_file(os.path.join(clips, "panel_01.mp4"), b"\x00\x00\x00\x18ftypmp42")
+    emit("panel 1 ok: %s (0.1s)\n" % os.path.join(clips, "panel_01.mp4"))
+    sys.exit(0)
+if TOOL == "lora-catalog" and sub == "list":
+    emit(json.dumps({"catalog": os.path.join(WS, "generated", "loras", "catalog.json"), "entries": [],
+                     "characters": []}) + "\n")
+    sys.exit(0)
+if TOOL == "lora-catalog" and sub == "verify":
+    for entry_id in args[1:]:
+        emit("OK %s\n" % entry_id)
+    emit("verified %d entries: 0 problem(s)\n" % len(args[1:]))
+    sys.exit(0)
+if TOOL == "character" and sub == "list":
+    emit("no characters in %s\n" % os.path.join(WS, "generated", "characters"))
+    sys.exit(0)
+if TOOL == "story-server" and sub == "status":
+    emit("story-server status  2026-10-19T00:00:00Z\n  state:          SERVING vision\n")
+    sys.exit(0)
+sys.exit(0)
+'''
+
+
+def _write_exec(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def make_stub_workspace(tmp):
+    """<tmp>/ws with executable stubs of ltx-movie, lora-catalog, character, ltx-mlx-render (Python)
+    and story-server (sh, running bin/.story-server.py); returns the workspace realpath.
+
+    Each stub appends {"tool", "sub", "argv", "cwd", "env"} as one JSON line to
+    <ws>/stub_calls.jsonl and obeys <ws>/stub_config.json: {key: {"exit", "stdout", "stderr",
+    "sleep", "write": {relpath: text}}}, where the first key found of "<tool> <every argument>",
+    "<tool> <sub>" and "<tool>" applies. sub is the first argument, or for ltx-movie and
+    ltx-mlx-render "--help", "--dry-run" or "run". Without a
+    config entry: ltx-movie --help prints the current help fixture; ltx-movie runs write story.md
+    (--story-only) or stills, clips and movie.mp4 with the real progress markers; lora-catalog list
+    prints an empty catalog; story-server status reports SERVING vision; everything else exits 0.
+    """
+    ws = os.path.join(str(tmp), "ws")
+    os.makedirs(os.path.join(ws, "bin"), exist_ok=True)
+    os.makedirs(os.path.join(ws, "generated", "stories"), exist_ok=True)
+    body = STUB_SOURCE.replace("__FIXTURES__", repr(FIXTURES))
+    for tool in STUB_TOOLS:
+        source = "#!%s\nTOOL = %r\n%s" % (sys.executable, tool, body)
+        if tool == "story-server":
+            _write_exec(os.path.join(ws, "bin", ".story-server.py"), source)
+            _write_exec(os.path.join(ws, "bin", "story-server"),
+                        "#!/bin/sh\nexec '%s' \"$(dirname \"$0\")/.story-server.py\" \"$@\"\n" % sys.executable)
+        else:
+            _write_exec(os.path.join(ws, "bin", tool), source)
+    return os.path.realpath(ws)
+
+
+def stub_config(ws, config):
+    with open(os.path.join(ws, "stub_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f)
+
+
+def stub_calls(ws):
+    try:
+        with open(os.path.join(ws, "stub_calls.jsonl"), encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def fields(ws, **overrides):
+    """A valid MU36 field object for ws (action story) with overrides applied."""
+    out = movie_ui_lib.compose_fields({"ws": ws, "story_id": "ronin-rescue",
+                                       "narrative": "A ronin rescues a child from a burning village."})
+    out.update(overrides)
+    return out

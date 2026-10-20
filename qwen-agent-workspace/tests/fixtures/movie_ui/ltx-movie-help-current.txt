@@ -1,0 +1,186 @@
+usage: ltx-movie [-h] --story-id STORY_ID [--seed-image SEED_IMAGE]
+                 [--panels PANELS] [--length LENGTH] [--fps FPS]
+                 [--frames FRAMES] [--image-seed IMAGE_SEED]
+                 [--video-width VIDEO_WIDTH] [--video-height VIDEO_HEIGHT]
+                 [--model MODEL] [--gemma GEMMA] [--lora LORA_PATH]
+                 [--stills-lora STILLS_LORA_PATH] [--character NAME]
+                 [--cast PHRASE=NAME]
+                 [--character-strength CHARACTER_STRENGTH] [--list-characters]
+                 [--shots] [--redo N[,M...]] [--story-model STORY_MODEL]
+                 [--story-context-window STORY_CONTEXT_WINDOW] [--no-low-ram]
+                 [--tile-frames TILE_FRAMES] [--tile-spatial TILE_SPATIAL]
+                 [--panel-timeout PANEL_TIMEOUT] [--no-stills] [--no-review]
+                 [--force-story] [--story-prompt-override PATH] [--force]
+                 [--min-avail-gib MIN_AVAIL_GIB]
+                 [--avail-timeout AVAIL_TIMEOUT]
+                 [--story-server-stop-after-story | --no-story-server-stop-after-story]
+                 [--story-only] [--dry-run] [--story-legacy] [--no-auto-lora]
+                 [--judge] [--goal TEXT]
+                 [narrative]
+
+End-to-end orchestrator for the narrative-to-movie pipeline: story authoring
+(bin/qwen-agent), panel 1's still (bin/ltx-story-images --only 1), manifest +
+render dry-run (bin/ltx-story-manifest --chain, bin/ltx-mlx-render --dry-run),
+and the chained render (bin/ltx-mlx-render), in which every clip after the
+first continues from the previous clip's last frame. The wrapped phase tools
+remain individually usable.
+
+positional arguments:
+  narrative             the story narrative to adapt into panels; omit only
+                        when --story-prompt-override is given
+
+options:
+  -h, --help            show this help message and exit
+  --story-id STORY_ID
+  --seed-image SEED_IMAGE
+                        image that becomes the movie's literal first frame:
+                        Phase 0 derives the video width/height from its aspect
+                        ratio (1:3 to 3:1) and attaches a scaled copy to the
+                        Phase 1 story prompt; Phase 2 fits the ORIGINAL
+                        (scaled, never cropped) into panel_01.png at twice the
+                        video size, same as z_image, so ltx-2-mlx's own
+                        downscale keeps more real detail. Incompatible with
+                        --no-stills and with --video-width/--video-height.
+  --panels PANELS       number of chained clips; panel 1 also gets the movie's
+                        one still image; mutually exclusive with --length
+  --length LENGTH       total movie length in seconds; mutually exclusive with
+                        --panels. Resolved as round(length / (frames / fps))
+                        -- 6.04s per panel at the defaults.
+  --fps FPS
+  --frames FRAMES       flat per-panel frame count; must satisfy (n-1)%8==0
+                        and n>=9. 145 frames @ 24 fps = 6.04s per clip.
+  --image-seed IMAGE_SEED
+  --video-width VIDEO_WIDTH
+  --video-height VIDEO_HEIGHT
+  --model MODEL
+  --gemma GEMMA         Gemma model for text encoding, passed through to
+                        ltx-2-mlx's own --gemma. Override this to swap the
+                        text encoder (e.g. a smaller variant on a memory-
+                        constrained host); the DiT pack selected by --model is
+                        unaffected.
+  --lora LORA_PATH      global LoRA for the video DiT (ltx-2-mlx): repeatable;
+                        PATH or PATH:STRENGTH (0 < STRENGTH <= 2, default
+                        1.0). Every global LoRA applies to every panel, ahead
+                        of that panel's cast-character LoRAs, at its own
+                        strength (never reduced automatically). See --stills-
+                        lora for the stills side.
+  --stills-lora STILLS_LORA_PATH
+                        global LoRA for the Phase 2 stills (z_image_skill):
+                        repeatable; PATH or PATH:STRENGTH (0 < STRENGTH <= 2,
+                        default 1.0). Every global LoRA applies to every
+                        panel, ahead of that panel's cast-character LoRAs, at
+                        its own strength (never reduced automatically). Never
+                        used by --seed-image panels (there is no generation to
+                        apply it to).
+  --character NAME      cast a trained character from generated/characters/
+                        (repeatable). For a new story, Phase 1's prompt gets a
+                        Cast block with the character's fixed referring phrase
+                        and description; every panel whose prompt names that
+                        phrase renders with the character's LoRAs. See
+                        docs/superpowers/specs/2026-10-05-character-library-
+                        design.md.
+  --cast PHRASE=NAME    cast a trained character under PHRASE in an EXISTING
+                        story.md (repeatable); PHRASE must occur in story.md
+  --character-strength CHARACTER_STRENGTH
+                        LoRA strength for each cast character in a panel that
+                        names two or more of them (default 0.8, provisional);
+                        a panel that names one cast character uses 1.0, except
+                        with --shots, where every cast character uses this
+                        strength
+  --list-characters     print the character library table (the same as
+                        bin/character list) and exit; must be the only
+                        argument
+  --shots               shots mode: every panel is its own shot with its own
+                        Image: still and is rendered from that still (no
+                        chaining; cuts between panels). Phase 1 uses the shots
+                        story template and enforces the shot rules (one action
+                        per Motion:, at most two cast characters per shot),
+                        Phase 2 renders a still for every panel, and every
+                        cast character LoRA defaults to 0.8. See
+                        docs/superpowers/specs/2026-10-06-shots-mode-
+                        design.md.
+  --redo N[,M...]       with --shots and an existing story.md: move panels
+                        N,M...'s stills and clips (and movie.mp4) aside into
+                        <story>/redo/<stamp>-<pid>/ and re-render only those
+                        panels; every other panel is reused
+  --story-model STORY_MODEL
+                        model name to declare to bin/qwen-agent's --model for
+                        Phase 1 story generation; must match whatever the
+                        story/vision server actually reports as its model
+                        (e.g. mlx_lm.server's own --model value) -- a mismatch
+                        can make the server reject the request outright, not
+                        just ignore the field (confirmed 2026-09-27). Omitted
+                        by default: bin/qwen-agent's own default (matched to
+                        the standard bin/story-server vLLM-Metal path) governs
+                        unless set.
+  --story-context-window STORY_CONTEXT_WINDOW
+                        tokens to declare to bin/qwen-agent's --context-window
+                        for Phase 1 story generation, overriding its own
+                        /v1/models discovery. Needed when the story server
+                        doesn't report a context-length field: bin/qwen-agent
+                        then assumes a conservative 16384, which -- since
+                        --max-tokens scales up with --panels and is subtracted
+                        from the same window -- can make longer stories fail
+                        with status=context_budget even though the real model
+                        supports far more (confirmed 2026-09-27:
+                        andrevp/Qwen3.5-9B-...-MLX-VLM-8bit's real window is
+                        262144, 16x the wrongly-assumed default). Omitted by
+                        default: bin/qwen-agent's own discovery/default
+                        governs.
+  --no-low-ram          ltx-2-mlx --low-ram is ON by default on this 48 GiB
+                        host; this opts out. --low-ram is a weight-residency
+                        change, not an algorithmic one: it costs wall-clock
+                        and nothing else.
+  --tile-frames TILE_FRAMES
+                        escape hatch only: modality tiling denoises tiles
+                        independently and blends them back, which CHANGES the
+                        output and can produce seams.
+  --tile-spatial TILE_SPATIAL
+                        escape hatch only; see --tile-frames.
+  --panel-timeout PANEL_TIMEOUT
+  --no-stills           text-to-video mode: skip Phase 2 entirely (no anchor
+                        stills are generated), author story.md with a
+                        collapsed Prompt: field, and render every panel as
+                        plain text-to-video with no conditioning image. Hard
+                        cuts between panels; no continuity, no chaining.
+  --no-review
+  --force-story
+  --story-prompt-override PATH
+                        use the content of PATH verbatim as the Phase 1 story
+                        prompt instead of building it from the narrative; it
+                        is still persisted to story_prompt.txt. Only takes
+                        effect when Phase 1 actually runs (story.md absent, or
+                        --force-story).
+  --force
+  --min-avail-gib MIN_AVAIL_GIB
+  --avail-timeout AVAIL_TIMEOUT
+  --story-server-stop-after-story, --no-story-server-stop-after-story
+                        after Phase 1 (story), run bin/story-server stop and
+                        wait for --min-avail-gib, so Phases 2-4 get the story
+                        LLM's memory back. ON by default: chained panels (2+)
+                        reuse the previous clip's last frame via ffmpeg, never
+                        the story server, so it is never needed past Phase 1.
+                        Use --no-story-server-stop-after-story to keep it
+                        resident (e.g. for rapid successive runs).
+  --story-only          run Phase 0 (if --seed-image) and Phase 1 only, then
+                        stop. Skips phase_release_story_server as well as
+                        Phases 2-4, so a caller that regenerates story.md
+                        repeatedly (e.g. bin/iterate-story) keeps the story
+                        server resident across calls, with no need to also
+                        pass --no-story-server-stop-after-story.
+  --dry-run
+  --story-legacy        Phase 1 uses the single-prompt story path (one
+                        bin/qwen-agent call that writes story.md), exactly as
+                        before the robust story engine. See
+                        docs/superpowers/specs/2026-10-17-robust-story-lora-
+                        catalog-design.md.
+  --no-auto-lora        the story plan picks no catalog LoRAs
+                        (generated/loras/catalog.json); --lora/--stills-lora
+                        still apply
+  --judge               after the local critic rounds, run bin/judge-story
+                        --patches (Claude; needs ANTHROPIC_API_KEY) as a final
+                        gate; a minimum score below 7 applies its patches and
+                        runs one more critic round
+  --goal TEXT           the target output goal given to the story planner, the
+                        critic and the judge, worded to complete 'The target
+                        output goal is TEXT.'

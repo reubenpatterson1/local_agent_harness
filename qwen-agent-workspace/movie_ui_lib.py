@@ -505,3 +505,225 @@ def kill_orphan(state, job_id):
         return None
     _killpg_quiet(info["pgid"], signal.SIGKILL)
     return info["pgid"]
+
+
+# ---------------------------------------------------------------------------
+# Compose fields, the command builder and light subprocesses (MU36-MU41, MU59)
+# ---------------------------------------------------------------------------
+
+DEFAULT_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"     # bin/ltx-movie:318
+DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"          # bin/ltx-movie:319-323
+STILLS_BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"               # lora_catalog.py:29
+ZIMAGE_TEXT_ENCODER = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"   # z_image_skill.py:53
+ACTIONS = ("story", "regenerate", "movie", "redo")
+MODES = ("chained", "shots", "no_stills")
+LORA_KINDS = ("style", "motion", "physics")
+OPTION_DEFAULTS = {"panels": 15, "fps": 24, "frames": 145, "model": DEFAULT_MODEL,
+                   "gemma": DEFAULT_GEMMA, "panel_timeout": 7200}   # MU47
+DEFAULT_FIELDS = {
+    "ws": None, "action": "story",
+    "story_id": "", "narrative": "", "goal": None,
+    "panels": 15, "length": None, "fps": 24, "frames": 145,
+    "width": None, "height": None, "seed_upload": None,
+    "mode": "chained",
+    "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
+    "story_model": None,
+    "auto_lora": True,
+    "video_loras": [], "stills_loras": [],
+    "characters": [],
+    "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
+    "overwrite_movie": False, "redo": [],
+}
+LIGHT_TIMEOUT = 60
+# MU37: the flags each compose field or action needs; "supported" (MU47) is all-present.
+FIELD_FLAGS = (
+    ("story_id", ("--story-id",)), ("panels", ("--panels",)), ("length", ("--length",)),
+    ("fps", ("--fps",)), ("frames", ("--frames",)),
+    ("resolution", ("--video-width", "--video-height")), ("seed_upload", ("--seed-image",)),
+    ("model", ("--model",)), ("gemma", ("--gemma",)), ("story_model", ("--story-model",)),
+    ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
+    ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
+    ("characters", ("--character",)), ("auto_lora", ("--no-auto-lora",)),
+    ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
+    ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
+    ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
+    ("no_review", ("--no-review",)),
+)
+
+
+def compose_fields(body):
+    """The MU36 field object: every DEFAULT_FIELDS key, taken from body when present (unknown
+    keys are ignored). Values are not validated here (V1 does that)."""
+    fields = {}
+    for key, default in DEFAULT_FIELDS.items():
+        value = body.get(key, default) if isinstance(body, dict) else default
+        fields[key] = list(value) if isinstance(value, list) else value
+    return fields
+
+
+def goal_text(goal):
+    """--goal's text as bin/ltx-movie's _parse_goal leaves it: stripped, one trailing "." removed
+    and right-stripped (V1 rule 3)."""
+    text = goal.strip()
+    if text.endswith("."):
+        text = text[:-1].rstrip()
+    return text
+
+
+def ordered(loras):
+    """motion and physics items first, then every other item, each in submitted order (MU39)."""
+    return ([item for item in loras if item.get("kind") in ("motion", "physics")]
+            + [item for item in loras if item.get("kind") not in ("motion", "physics")])
+
+
+def lora_arg(item):
+    """PATH:STRENGTH for one LoRA item, the strength as repr(float(s)) (MU40 step 8)."""
+    return "%s:%s" % (item["path"], repr(float(item["strength"])))
+
+
+def build_argv(fields, ws_real, state, py=sys.executable):
+    """The bin/ltx-movie argv for actions story, regenerate, movie and redo (MU40). Pure; the
+    fields have passed V1."""
+    action = fields["action"]
+    argv = [py, os.path.join(ws_real, "bin", "ltx-movie"), fields["narrative"].strip(),
+            "--story-id", fields["story_id"]]
+    if fields["panels"] is not None:
+        argv += ["--panels", str(fields["panels"])]
+    else:
+        argv += ["--length", repr(float(fields["length"]))]
+    argv += ["--fps", str(fields["fps"]), "--frames", str(fields["frames"])]
+    if fields["seed_upload"]:
+        argv += ["--seed-image", os.path.join(state, "uploads", fields["seed_upload"])]
+    elif fields["width"] is not None and fields["height"] is not None:
+        argv += ["--video-width", str(fields["width"]), "--video-height", str(fields["height"])]
+    for key, flag in (("model", "--model"), ("gemma", "--gemma"), ("story_model", "--story-model")):
+        if fields[key] is not None:
+            argv += [flag, fields[key]]
+    if fields["goal"] is not None:
+        argv += ["--goal", goal_text(fields["goal"])]
+    if fields["mode"] == "shots":
+        argv.append("--shots")
+    elif fields["mode"] == "no_stills":
+        argv.append("--no-stills")
+    for item in ordered(fields["video_loras"]):
+        argv += ["--lora", lora_arg(item)]
+    for item in ordered(fields["stills_loras"]):
+        argv += ["--stills-lora", lora_arg(item)]
+    for name in fields["characters"]:
+        argv += ["--character", name]
+    if fields["auto_lora"] is False:
+        argv.append("--no-auto-lora")
+    for key, flag in (("story_legacy", "--story-legacy"), ("judge", "--judge"), ("no_low_ram", "--no-low-ram")):
+        if fields[key]:
+            argv.append(flag)
+    if fields["panel_timeout"] is not None:
+        argv += ["--panel-timeout", str(fields["panel_timeout"])]
+    if fields["overwrite_movie"]:
+        argv.append("--force")
+    if action == "regenerate":
+        argv.append("--force-story")
+    if action == "redo":
+        argv += ["--redo", ",".join(str(n) for n in sorted(set(fields["redo"])))]
+    if action in ("story", "regenerate"):
+        argv.append("--story-only")
+    argv.append("--no-review")
+    return argv
+
+
+def character_argv(kind, fields, ws_real, state, py=sys.executable):
+    """The bin/character argv of a character-create, -regenerate or -train job (MU41)."""
+    argv = [py, os.path.join(ws_real, "bin", "character")]
+    if kind == "character-regenerate":
+        return argv + ["create", fields["name"], "--regenerate"]
+    if kind == "character-train":
+        return (argv + ["train", fields["name"]] + (["--video"] if fields.get("video") else [])
+                + (["--stills"] if fields.get("stills") else []) + (["--force"] if fields.get("force") else []))
+    argv += ["create", fields["name"], "--phrase", fields["phrase"]]
+    if fields.get("seed_upload"):
+        argv += ["--seed-image", os.path.join(state, "uploads", fields["seed_upload"])]
+    else:
+        argv += ["--descriptor", fields["descriptor"]]
+    if fields.get("class_noun"):
+        argv += ["--class", fields["class_noun"]]
+    if fields.get("trigger"):
+        argv += ["--trigger", fields["trigger"]]
+    if fields.get("seed") is not None:
+        argv += ["--seed", str(fields["seed"])]
+    if fields.get("force"):
+        argv.append("--force")
+    return argv
+
+
+def run_light(argv, cwd, env=None, timeout=None):
+    """One light subprocess (MU59): {"argv", "exit_code", "stdout", "stderr", "timed_out"}."""
+    limit = LIGHT_TIMEOUT if timeout is None else timeout
+    result = {"argv": list(argv), "exit_code": None, "stdout": "", "stderr": "", "timed_out": False}
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env or dict(os.environ), stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=limit)
+    except subprocess.TimeoutExpired as e:
+        result["timed_out"] = True
+        result["stdout"] = (e.stdout or b"").decode("utf-8", "replace")
+        result["stderr"] = (e.stderr or b"").decode("utf-8", "replace")
+        return result
+    except OSError as e:
+        result["stderr"] = "%s: %s" % (type(e).__name__, e.strerror or e)
+        return result
+    result["exit_code"] = proc.returncode
+    result["stdout"] = proc.stdout.decode("utf-8", "replace")
+    result["stderr"] = proc.stderr.decode("utf-8", "replace")
+    return result
+
+
+def tool_argv(ws_real, tool, *args):
+    """[sys.executable, <ws>/bin/<tool>, args...] (MU59)."""
+    return [sys.executable, os.path.join(ws_real, "bin", tool)] + list(args)
+
+
+def last_line(text):
+    """The last non-empty line of text, stripped, or ""."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+_HELP_CACHE = {}
+_HELP_LOCK = threading.Lock()
+
+
+def parse_help_flags(text):
+    """Every --flag on the option lines (starting with two spaces and "-") of argparse --help
+    output (MU37)."""
+    flags = set()
+    for line in text.splitlines():
+        if line.startswith("  -"):
+            head = re.split(r"\s{2,}", line[2:], maxsplit=1)[0]
+            flags.update(re.findall(r"--[a-z][a-z0-9-]*", head))
+    return flags
+
+
+def help_flags(ws_real):
+    """(flags, error) for <ws>/bin/ltx-movie --help, cached by (ws, mtime_ns of bin/ltx-movie)
+    (MU37). flags is a frozenset, or None with error "cannot read bin/ltx-movie --help (exit N):
+    <last stderr line>"."""
+    path = os.path.join(ws_real, "bin", "ltx-movie")
+    try:
+        key = (ws_real, os.stat(path).st_mtime_ns)
+    except OSError as e:
+        return None, "cannot read bin/ltx-movie --help (exit none): %s" % (e.strerror or e)
+    with _HELP_LOCK:
+        if key in _HELP_CACHE:
+            return _HELP_CACHE[key]
+    run = run_light(tool_argv(ws_real, "ltx-movie", "--help"), ws_real)
+    if run["exit_code"] == 0:
+        value = (frozenset(parse_help_flags(run["stdout"])), None)
+    else:
+        code = "none" if run["exit_code"] is None else str(run["exit_code"])
+        value = (None, "cannot read bin/ltx-movie --help (exit %s): %s" % (code, last_line(run["stderr"])))
+    with _HELP_LOCK:
+        _HELP_CACHE[key] = value
+    return value
+
+
+def supported_map(flags):
+    """{field or action: bool} for MU47's "supported" (all False when flags is None)."""
+    return dict((key, flags is not None and all(f in flags for f in needed)) for key, needed in FIELD_FLAGS)
