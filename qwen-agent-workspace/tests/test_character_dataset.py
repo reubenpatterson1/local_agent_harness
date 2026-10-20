@@ -389,12 +389,15 @@ def test_d40_child_zimage_img2img_job(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "z_image_skill", fake_zimage)
     monkeypatch.setitem(sys.modules, "content_safety", fake_safety)
+    (tmp_path / "anchor.png").write_bytes(b"x")       # the anchor exists on disk
     report_path = str(tmp_path / "report.json")
     spec = {"jobs": [
         {"prompt": "t2i", "output_path": str(tmp_path / "a.png"), "seed": 1,
          "width": 512, "height": 512},
         {"prompt": "i2i", "output_path": str(tmp_path / "b.png"), "seed": 2,
          "image": str(tmp_path / "anchor.png"), "strength": 0.6},
+        {"prompt": "i2i_missing", "output_path": str(tmp_path / "c.png"), "seed": 3,
+         "image": str(tmp_path / "missing.png"), "strength": 0.6},
     ], "loras": None, "report_path": report_path}
     spec_path = str(tmp_path / "spec.json")
     with open(spec_path, "w") as f:
@@ -402,12 +405,36 @@ def test_d40_child_zimage_img2img_job(tmp_path, monkeypatch):
     assert character_dataset.main(["zimage", "--spec", spec_path]) == 0
     with open(report_path) as f:
         report = json.load(f)
-    assert [j["status"] for j in report["jobs"]] == ["ok", "ok"]
+    # t2i ok, present-anchor img2img ok, missing-anchor img2img blocked (not a crash)
+    assert [j["status"] for j in report["jobs"]] == ["ok", "ok", "blocked"]
     assert len(t2i) == 1 and t2i[0][0] == "t2i"       # text2img job went to generate_image
-    assert len(i2i) == 1                               # img2img job went to generate_variation
+    assert len(i2i) == 1                               # only the present-anchor img2img ran
     assert i2i[0][0] == str(tmp_path / "anchor.png")  # seed image
     assert i2i[0][1] == "i2i"                          # prompt
     assert i2i[0][2].get("strength") == 0.6           # strength forwarded
+
+
+def test_d41_dataset_plan(monkeypatch):
+    """Default plan is the 24 text2img VARIANTS; two-source plan is text2img anchors
+    each followed by an img2img still per setting."""
+    monkeypatch.delenv(character_dataset.TWO_SOURCE_ENV, raising=False)
+    plan = character_dataset._dataset_plan("a person")
+    assert len(plan) == 24
+    assert all(e["anchor_n"] is None for e in plan)
+    assert [e["n"] for e in plan] == list(range(1, 25))
+
+    monkeypatch.setenv(character_dataset.TWO_SOURCE_ENV, "1")
+    tp = character_dataset._dataset_plan("a person")
+    na = len(character_dataset.TWO_SOURCE_ANCHORS)
+    ns = len(character_dataset.TWO_SOURCE_SETTINGS)
+    assert len(tp) == na * (1 + ns) >= 12             # clears the MIN_KEEP floor
+    anchors = [e for e in tp if e["anchor_n"] is None]
+    variants = [e for e in tp if e["anchor_n"] is not None]
+    assert len(anchors) == na and len(variants) == na * ns
+    assert anchors[0]["n"] == 1
+    assert [e["n"] for e in variants if e["anchor_n"] == 1] == [2, 3, 4]
+    assert all(e["strength"] == character_dataset.TWO_SOURCE_STRENGTH for e in variants)
+    assert [e["n"] for e in tp] == list(range(1, na * (1 + ns) + 1))   # contiguous numbering
 
 
 def test_d36_child_failure_names_the_log(tmp_path, monkeypatch):

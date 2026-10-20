@@ -641,6 +641,59 @@ def write_contact_sheet(items, stills_dir, out_path):
     sheet.save(out_path, format="JPEG", quality=90)
 
 
+# Two-source dataset mode (opt-in via the CHARACTER_TWO_SOURCE env var; survives
+# --regenerate, which rebuilds from character.json). Instead of 24 independent
+# text2img VARIANTS -- where identity drifts shot to shot -- it generates a few
+# text2img POSE ANCHORS (text2img is what actually realizes a pose) and then
+# img2img each anchor across settings (img2img pixel-anchors identity and fine
+# detail while varying the background). Validated to give pose-diverse,
+# identity-consistent stills that single-seed img2img cannot. The default path
+# (VARIANTS) is unchanged when the env var is unset.
+TWO_SOURCE_ENV = "CHARACTER_TWO_SOURCE"
+TWO_SOURCE_ANCHORS = [
+    ("close-up",        "facing the camera with a neutral expression"),
+    ("close-up",        "in three-quarter view looking to the left"),
+    ("close-up",        "in profile facing right"),
+    ("medium close-up", "looking slightly upward"),
+    ("medium shot",     "standing with arms relaxed"),
+]
+TWO_SOURCE_ANCHOR_SETTING = "a studio with a plain grey backdrop"
+TWO_SOURCE_SETTINGS = ["a dim interior room", "an overcast outdoor setting", "a stone courtyard"]
+TWO_SOURCE_STRENGTH = 0.6
+
+
+def two_source_enabled():
+    return os.environ.get(TWO_SOURCE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dataset_plan(descriptor):
+    """The per-still plan (excluding the seed copy char_00). Each entry is
+    {n, shot, pose, setting, prompt, anchor_n, strength}; anchor_n is None for a
+    text2img still, else the n of the anchor this img2img still is built from, at
+    `strength`. Default: the 24 text2img VARIANTS. Two-source (CHARACTER_TWO_SOURCE):
+    each anchor is one text2img still followed by an img2img still per setting."""
+    plan = []
+    if two_source_enabled():
+        n = 0
+        for shot, pose in TWO_SOURCE_ANCHORS:
+            n += 1
+            anchor_n = n
+            plan.append({"n": n, "shot": shot, "pose": pose, "setting": TWO_SOURCE_ANCHOR_SETTING,
+                         "prompt": gen_prompt(shot, pose, TWO_SOURCE_ANCHOR_SETTING, descriptor),
+                         "anchor_n": None, "strength": None})
+            for setting in TWO_SOURCE_SETTINGS:
+                n += 1
+                plan.append({"n": n, "shot": shot, "pose": pose, "setting": setting,
+                             "prompt": gen_prompt(shot, pose, setting, descriptor),
+                             "anchor_n": anchor_n, "strength": TWO_SOURCE_STRENGTH})
+    else:
+        for i, (shot, pose, setting) in enumerate(VARIANTS, 1):
+            plan.append({"n": i, "shot": shot, "pose": pose, "setting": setting,
+                         "prompt": gen_prompt(shot, pose, setting, descriptor),
+                         "anchor_n": None, "strength": None})
+    return plan
+
+
 def build_dataset(data, face_height):
     """Generate, score, caption and wrap the dataset for character.json data; write
     dataset/manifest.json, dataset/contact_sheet.jpg and the updated character.json.
@@ -666,11 +719,19 @@ def _build_dataset(data, face_height):
         with Image.open(os.path.join(char_dir, "seed.png")) as img:
             ImageOps.fit(img.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS,
                          centering=(0.5, 0.5)).save(os.path.join(stills_dir, "char_00.png"))
-    spec = {"jobs": [{"prompt": gen_prompt(shot, pose, setting, data["descriptor"]),
-                      "output_path": os.path.join(stills_dir, "char_%02d.png" % i),
-                      "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
-                     for i, (shot, pose, setting) in enumerate(VARIANTS, 1)],
-            "loras": None}
+    plan = _dataset_plan(data["descriptor"])
+    jobs = []
+    for entry in plan:
+        job = {"prompt": entry["prompt"],
+               "output_path": os.path.join(stills_dir, "char_%02d.png" % entry["n"]),
+               "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
+        if entry["anchor_n"] is not None:
+            # img2img from the anchor still (emitted earlier in the list, so it
+            # exists on disk by the time this job runs); geometry comes from it.
+            job["image"] = os.path.join(stills_dir, "char_%02d.png" % entry["anchor_n"])
+            job["strength"] = entry["strength"]
+        jobs.append(job)
+    spec = {"jobs": jobs, "loras": None}
 
     print("=== generate ===")
     rc = story_server("stop")
@@ -696,13 +757,12 @@ def _build_dataset(data, face_height):
                            % (ref_n, json_path, name))
 
     print("=== score ===")
+    gen_prompts = {entry["n"]: entry["prompt"] for entry in plan}
+    score_ns = ([0] if seed_mode else []) + [entry["n"] for entry in plan]
     items = []
-    for n in (range(0, 25) if seed_mode else range(1, 25)):
+    for n in score_ns:
         png = os.path.join(stills_dir, "char_%02d.png" % n)
-        gen_prompt_str = None
-        if n > 0:
-            shot, pose, setting = VARIANTS[n - 1]
-            gen_prompt_str = gen_prompt(shot, pose, setting, data["descriptor"])
+        gen_prompt_str = gen_prompts.get(n)
         if not os.path.isfile(png):
             items.append({"n": n, "gen_prompt": gen_prompt_str, "identity_score": 0, "shot": "",
                           "pose": "", "setting": "", "kept": False,
@@ -1397,16 +1457,22 @@ def child_zimage(spec_path):
             if job.get("image"):
                 # img2img job: pixel-anchor on job["image"] so identity and fine
                 # details (scars, jewelry) carry through; the seed image fixes the
-                # geometry, so width/height are taken from it, not the job.
-                z_image_skill.generate_variation(
-                    job["image"], job["prompt"], output_path=job["output_path"],
-                    strength=job.get("strength", 0.6),
-                    generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
+                # geometry, so width/height are taken from it, not the job. If the
+                # anchor was itself screened out (no file), this variant is blocked
+                # too -- treat it as such rather than crashing on a missing file.
+                if not os.path.exists(job["image"]):
+                    status = "blocked"
+                else:
+                    z_image_skill.generate_variation(
+                        job["image"], job["prompt"], output_path=job["output_path"],
+                        strength=job.get("strength", 0.6),
+                        generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
+                    status = "ok"
             else:
                 z_image_skill.generate_image(job["prompt"], output_path=job["output_path"],
                                              width=job["width"], height=job["height"],
                                              generator=torch.Generator("cpu").manual_seed(job["seed"]), **kwargs)
-            status = "ok"
+                status = "ok"
         except ContentSafetyError:
             status = "blocked"
         jobs.append({"output_path": job["output_path"], "status": status,

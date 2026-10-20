@@ -19,6 +19,11 @@ fewer than 12 stills.
 
 list/show import character_lib only (stdlib); create/train import character_dataset, which
 needs PIL and psutil. See docs/superpowers/specs/2026-10-05-character-library-design.md.
+
+Environment: set CHARACTER_TWO_SOURCE=1 for the two-source dataset mode -- create (and
+--regenerate) then builds a few text2img pose anchors and img2img each anchor across
+settings, giving pose-diverse, identity-consistent stills (scars/jewelry carried by the
+img2img pixel anchor). Unset, the default 24-VARIANT text2img dataset is built.
 """
 
 import argparse
