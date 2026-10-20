@@ -327,3 +327,59 @@ def fake_safetensors(path, header=None, n=None):
     with open(path, "wb") as f:
         f.write((len(raw) if n is None else n).to_bytes(8, "little") + raw)
     return path
+
+
+# ---------------------------------------------------------------------------
+# In-process HTTP
+# ---------------------------------------------------------------------------
+
+TOKEN = "test-token-not-a-secret"
+
+
+class Running(object):
+    """A movie-ui server on 127.0.0.1:<free port>, serving on a thread."""
+
+    def __init__(self, state, ui_ws=WS):
+        import movie_ui_server
+        self.server = movie_ui_server.make_server(0, state, ui_ws, TOKEN)
+        self.port = self.server.port
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def api(server, method, path, body=None, token=TOKEN, headers=None, raw=None):
+    """One http.client request to a Running server; returns (status, headers dict, parsed JSON
+    or bytes). body is sent as JSON; raw is sent as-is."""
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=60)
+    hdrs = {"Host": "127.0.0.1:%d" % server.port}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    if raw is not None:
+        data = raw
+    if token is not None:
+        hdrs["X-Movie-UI-Token"] = token
+    hdrs.update(headers or {})
+    try:
+        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        for key, value in hdrs.items():
+            if value is not None:
+                conn.putheader(key, value)
+        if data is not None and "Content-Length" not in hdrs:
+            conn.putheader("Content-Length", str(len(data)))
+        conn.endheaders()
+        if data is not None:
+            conn.send(data)
+        resp = conn.getresponse()
+        payload = resp.read()
+        result_headers = dict((k.lower(), v) for k, v in resp.getheaders())
+        if result_headers.get("content-type", "").startswith("application/json"):
+            payload = json.loads(payload.decode("utf-8"))
+        return resp.status, result_headers, payload
+    finally:
+        conn.close()
