@@ -1000,3 +1000,42 @@ def test_t14_fix_story_symlink_escapes(env):
                       body={"ws": ws, "text": "pwn", "base_sha256": base})[0] == 404
     with open(target, "rb") as f:
         assert f.read() == b"secret"
+
+
+PAGE_HEADERS = {
+    "content-security-policy": ("default-src 'self'; img-src 'self' blob:; media-src 'self'; object-src 'none'; "
+                                "base-uri 'none'; frame-ancestors 'none'; form-action 'self'"),
+    "x-frame-options": "DENY", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+    "cache-control": "no-store"}
+
+
+def test_mut24_page_headers_and_asset_rules(env):
+    s = env["srv"]
+    static = os.path.join(mt.WS, "static", "movie-ui")
+    for path, name, ctype in (("/", "index.html", "text/html; charset=utf-8"),
+                              ("/static/app.js", "app.js", "text/javascript; charset=utf-8"),
+                              ("/static/app.css", "app.css", "text/css; charset=utf-8")):
+        status, headers, body = mt.api(s, "GET", path, token=None)
+        assert status == 200 and headers["content-type"] == ctype
+        for key, value in PAGE_HEADERS.items():
+            assert headers[key] == value, (path, key)
+        with open(os.path.join(static, name), "rb") as f:
+            assert body == f.read()
+        text = body.decode("utf-8")
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
+                        r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    html = mt.api(s, "GET", "/", token=None)[2].decode("utf-8")
+    assert re.findall(r"<script[^>]*>", html) == ['<script src="/static/app.js" defer>']
+    assert "<script src=\"/static/app.js\" defer></script>" in html
+    assert html.count('<link rel="stylesheet" href="/static/app.css">') == 1
+    for element in ("banner", "ws-select", "ws-typed", "ws-typed-use", "badge-render", "badge-stills", "badge-story",
+                    "badge-reasons", "badge-refresh", "badge-apikey", "header-job", "header-queue", "confirm",
+                    "confirm-text", "confirm-yes", "confirm-no", "c-command", "c-errors", "c-checks", "s-editor",
+                    "j-log", "t-waterfall"):
+        assert 'id="%s"' % element in html, element
+    for tab in ("compose", "stories", "characters", "loras", "jobs", "traces"):
+        assert 'id="tab-%s"' % tab in html and 'id="panel-%s"' % tab in html
+    css = mt.api(s, "GET", "/static/app.css", token=None)[2].decode("utf-8")
+    assert "@media (prefers-color-scheme: dark)" in css
+    assert mt.api(s, "POST", "/", body={}, token=None)[0] == 404

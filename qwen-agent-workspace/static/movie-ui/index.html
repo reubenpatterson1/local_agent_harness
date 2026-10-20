@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>movie-ui</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<div id="banner" class="banner" hidden></div>
+
+<header>
+  <div class="row">
+    <h1>movie-ui</h1>
+    <label>Workspace <select id="ws-select"></select></label>
+    <input id="ws-typed" type="text" size="40" placeholder="/absolute/path/to/qwen-agent-workspace">
+    <button id="ws-typed-use" type="button">Use path</button>
+  </div>
+  <div class="row">
+    <span id="badge-render" class="badge">render: probing</span>
+    <span id="badge-stills" class="badge">stills: probing</span>
+    <span id="badge-story" class="badge">story server: probing</span>
+    <button id="badge-refresh" type="button">Re-check</button>
+    <span id="badge-apikey" class="badge">ANTHROPIC_API_KEY: not set</span>
+    <span id="header-job" class="muted">no job running</span>
+    <span id="header-queue" class="muted">queue: 0</span>
+  </div>
+  <div id="badge-reasons" class="reasons"></div>
+</header>
+
+<nav>
+  <button id="tab-compose" type="button" class="tab active">Compose</button>
+  <button id="tab-stories" type="button" class="tab">Stories</button>
+  <button id="tab-characters" type="button" class="tab">Characters</button>
+  <button id="tab-loras" type="button" class="tab">LoRAs &amp; Models</button>
+  <button id="tab-jobs" type="button" class="tab">Jobs</button>
+  <button id="tab-traces" type="button" class="tab">Traces</button>
+</nav>
+
+<main>
+<section id="panel-compose" class="panel">
+  <div class="grid">
+    <label data-field="story_id">Story ID <input id="c-story-id" type="text" size="30"></label>
+    <label class="wide">Narrative <textarea id="c-narrative" rows="5"></textarea></label>
+    <label data-field="goal" class="wide">Goal (optional) <input id="c-goal" type="text" size="60"></label>
+    <fieldset>
+      <legend>Size</legend>
+      <label data-field="panels"><input id="c-size-panels" type="radio" name="c-size" value="panels" checked> Panels
+        <input id="c-panels" type="number" min="1" max="200" value="15"></label>
+      <label data-field="length"><input id="c-size-length" type="radio" name="c-size" value="length"> Seconds
+        <input id="c-length" type="number" min="1" max="3600" step="0.5" value="60"></label>
+    </fieldset>
+    <fieldset>
+      <legend>Frames</legend>
+      <label data-field="fps">FPS <input id="c-fps" type="number" min="1" max="120" value="24"></label>
+      <label data-field="frames">Frames per panel <input id="c-frames" type="number" min="9" step="8" value="145"></label>
+      <span id="c-frames-check" class="muted"></span>
+      <span id="c-seconds-per-panel" class="muted"></span>
+    </fieldset>
+    <fieldset>
+      <legend>Resolution</legend>
+      <label data-field="resolution"><input id="c-res-size" type="radio" name="c-res" value="size" checked> Size
+        <input id="c-width" type="number" step="64" min="64" placeholder="704">
+        x <input id="c-height" type="number" step="64" min="64" placeholder="448"></label>
+      <label data-field="seed_upload"><input id="c-res-seed" type="radio" name="c-res" value="seed"> Seed image
+        <input id="c-seed-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+      <span id="c-seed-status" class="muted"></span>
+    </fieldset>
+    <label>Mode <select id="c-mode">
+      <option value="chained">chained</option>
+      <option value="shots" data-field="shots">shots</option>
+      <option value="no_stills" data-field="no_stills">no stills</option>
+    </select></label>
+    <label data-field="model">Video model <input id="c-model" type="text" size="50" list="c-model-list"></label>
+    <label data-field="gemma">Gemma <input id="c-gemma" type="text" size="50" list="c-model-list"></label>
+    <datalist id="c-model-list"></datalist>
+    <label data-field="story_model">Story model <input id="c-story-model" type="text" size="30" placeholder="(qwen-agent default)"></label>
+    <label data-field="auto_lora"><input id="c-auto-lora" type="checkbox" checked> Auto-pick catalog LoRAs</label>
+    <div class="wide" data-field="video_loras">
+      <h3>Video LoRAs <button id="c-add-video-lora" type="button">Add</button></h3>
+      <div id="c-video-loras"></div>
+    </div>
+    <div class="wide" data-field="stills_loras">
+      <h3>Stills LoRAs <button id="c-add-stills-lora" type="button">Add</button></h3>
+      <div id="c-stills-loras"></div>
+    </div>
+    <div class="wide muted">LoRA order: <span id="c-lora-order"></span></div>
+    <label data-field="characters">Cast <select id="c-characters" multiple size="4"></select></label>
+    <details class="wide">
+      <summary>Advanced</summary>
+      <label data-field="story_legacy"><input id="c-story-legacy" type="checkbox"> Legacy story engine</label>
+      <label data-field="judge"><input id="c-judge" type="checkbox"> Judge with Claude</label>
+      <label data-field="no_low_ram"><input id="c-no-low-ram" type="checkbox"> No low-RAM mode</label>
+      <label data-field="panel_timeout">Panel timeout (s) <input id="c-panel-timeout" type="number" min="60" max="86400" placeholder="7200"></label>
+      <label data-field="overwrite_movie"><input id="c-overwrite" type="checkbox"> Overwrite movie.mp4</label>
+    </details>
+  </div>
+  <h3>Command <span id="c-command-for" class="muted"></span></h3>
+  <pre id="c-command" class="command"></pre>
+  <button id="c-copy" type="button">Copy</button>
+  <ul id="c-errors" class="errors"></ul>
+  <div class="row">
+    <button id="c-validate" type="button">Validate</button>
+    <button id="c-write-story" type="button">Write story</button> <span id="c-write-story-reason" class="muted"></span>
+    <button id="c-run-all" type="button">Run all</button> <span id="c-run-all-reason" class="muted"></span>
+  </div>
+  <ul id="c-checks" class="checks"></ul>
+</section>
+
+<section id="panel-stories" class="panel" hidden>
+  <table id="s-list" class="list"><thead><tr><th>Story</th><th>story.md</th><th>Checks</th><th>Stills</th><th>Clips</th><th>Movie</th><th>Modified</th></tr></thead><tbody></tbody></table>
+  <div id="s-detail" hidden>
+    <h2 id="s-title"></h2>
+    <textarea id="s-editor" rows="20" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="s-save" type="button">Save story.md</button>
+      <button id="s-reload" type="button" hidden>Reload</button>
+      <span id="s-save-status" class="muted"></span>
+    </div>
+    <div class="row">
+      <button id="s-render" type="button">Render</button>
+      <button id="s-regenerate" type="button">Regenerate story</button>
+      <span id="s-redo-box" hidden><input id="s-redo-panels" type="text" size="12" placeholder="2,5"> <button id="s-redo" type="button">Redo panels</button></span>
+      <span id="s-action-status" class="muted"></span>
+    </div>
+    <h3>Checks</h3>
+    <div id="s-checks"></div>
+    <h3>LoRA picks</h3>
+    <pre id="s-picks"></pre>
+    <h3>Gallery</h3>
+    <div id="s-gallery" class="gallery"></div>
+  </div>
+</section>
+
+<section id="panel-characters" class="panel" hidden>
+  <table id="ch-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Video</th><th>Stills</th><th>Phrase</th></tr></thead><tbody></tbody></table>
+  <h3>New character</h3>
+  <div class="grid">
+    <label>Name <input id="ch-name" type="text" size="24"></label>
+    <label>Referring phrase <input id="ch-phrase" type="text" size="40"></label>
+    <label>Class noun <input id="ch-class" type="text" size="12"></label>
+    <label class="wide">Descriptor <input id="ch-descriptor" type="text" size="60"></label>
+    <label>Trigger <input id="ch-trigger" type="text" size="16"></label>
+    <label>Seed <input id="ch-seed" type="number" min="0"></label>
+    <label>Seed image <input id="ch-seed-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+  </div>
+  <div class="row"><button id="ch-create" type="button">Create</button> <span id="ch-create-status" class="muted"></span></div>
+  <div id="ch-detail" hidden>
+    <h2 id="ch-title"></h2>
+    <div id="ch-gallery" class="gallery"></div>
+    <div class="row">
+      <button id="ch-accept" type="button">Accept dataset</button>
+      <button id="ch-regenerate" type="button">Regenerate dataset</button>
+      <button id="ch-force" type="button" hidden>Create anyway (--force)</button>
+      <span id="ch-status" class="muted"></span>
+    </div>
+    <div id="ch-train-form" hidden>
+      <label><input id="ch-train-video" type="checkbox" checked> Video LoRA</label>
+      <label><input id="ch-train-stills" type="checkbox" checked> Stills LoRA</label>
+      <label><input id="ch-train-force" type="checkbox"> Force</label>
+      <button id="ch-train" type="button">Train</button> <span id="ch-train-reason" class="muted"></span>
+    </div>
+  </div>
+</section>
+
+<section id="panel-loras" class="panel" hidden>
+  <h3>Catalog <button id="l-verify-all" type="button">Verify all</button></h3>
+  <table id="l-table" class="list"><thead><tr><th>ID</th><th>Kind</th><th>Target</th><th>Strength</th><th>Triggers</th><th>Base models</th><th>Verify</th><th></th></tr></thead><tbody></tbody></table>
+  <h3>Add a LoRA</h3>
+  <div class="grid">
+    <label class="wide">Path <input id="l-path" type="text" size="60" placeholder="/absolute/path/to/file.safetensors"></label>
+    <label>ID <input id="l-id" type="text" size="20"></label>
+    <label>Kind <select id="l-kind"><option>style</option><option>motion</option><option>physics</option></select></label>
+    <label>Target <select id="l-target"><option>video</option><option>stills</option></select></label>
+    <label class="wide">Base models <input id="l-base-models" type="text" size="60" placeholder="comma separated"></label>
+    <label>Triggers <input id="l-triggers" type="text" size="30" placeholder="comma separated"></label>
+    <label class="wide">Description <input id="l-description" type="text" size="60"></label>
+    <label class="wide">Use when <input id="l-use-when" type="text" size="60"></label>
+    <label class="wide">Avoid when <input id="l-avoid-when" type="text" size="60"></label>
+    <label>Default strength <input id="l-default-strength" type="number" step="0.05" value="1.0"></label>
+    <label>Range <input id="l-range-lo" type="number" step="0.05" value="0.5"> to <input id="l-range-hi" type="number" step="0.05" value="1.0"></label>
+    <label>Rank <input id="l-rank" type="number" min="1"></label>
+    <label>Alpha <input id="l-alpha" type="number" min="1"></label>
+  </div>
+  <button id="l-add" type="button">Add to catalog</button>
+  <pre id="l-output"></pre>
+  <h3>Models</h3>
+  <table id="m-table" class="list"><thead><tr><th>Hub</th><th>Repo</th><th>Intact</th><th>Problems</th><th>Size</th></tr></thead><tbody></tbody></table>
+</section>
+
+<section id="panel-jobs" class="panel" hidden>
+  <h3>Running</h3>
+  <div id="j-running" class="muted">no job running</div>
+  <div id="j-progress"></div>
+  <button id="j-cancel" type="button" hidden>Cancel</button>
+  <h3>Log <span id="j-log-title" class="muted"></span></h3>
+  <pre id="j-log" class="log"></pre>
+  <h3>Queue</h3>
+  <p id="j-blocked" class="warning" hidden></p>
+  <table id="j-queue" class="list"><thead><tr><th>#</th><th>Job</th><th>Kind</th><th>Story / character</th><th></th></tr></thead><tbody></tbody></table>
+  <h3>History</h3>
+  <table id="j-history" class="list"><thead><tr><th>Job</th><th>Kind</th><th>State</th><th>Duration</th><th>Exit</th><th>Story / character</th><th></th></tr></thead><tbody></tbody></table>
+  <h3>Traces during the selected job</h3>
+  <ul id="j-traces"></ul>
+</section>
+
+<section id="panel-traces" class="panel" hidden>
+  <div class="row">
+    <label>Agent <select id="t-agent"><option value="all">all</option></select></label>
+    <label>Status <input id="t-filter-status" type="text" size="8"></label>
+    <label>Kind <select id="t-filter-kind"><option value="">any</option></select></label>
+    <label>Name <input id="t-filter-name" type="text" size="16"></label>
+    <button id="t-refresh" type="button">Refresh</button>
+    <label><input id="t-auto" type="checkbox"> Auto-refresh (5 s)</label>
+  </div>
+  <ul id="t-errors" class="errors"></ul>
+  <table id="t-recent" class="list"><thead><tr><th>Start</th><th>Root span</th><th>Agents</th><th>Duration</th><th>Status</th><th>Spans</th></tr></thead><tbody></tbody></table>
+  <div id="t-view" hidden>
+    <h2 id="t-header"></h2>
+    <div id="t-meta" class="muted"></div>
+    <div id="t-waterfall" class="waterfall"></div>
+    <pre id="t-attrs"></pre>
+    <div class="row">
+      <button id="t-save" type="button">Save</button>
+      <button id="t-download" type="button">Download JSON</button>
+      <span id="t-status" class="muted"></span>
+    </div>
+    <pre id="t-text"></pre>
+  </div>
+  <h3>Saved traces</h3>
+  <ul id="t-saved"></ul>
+</section>
+</main>
+
+<div id="confirm" class="dialog" hidden>
+  <div class="dialog-box">
+    <p id="confirm-text"></p>
+    <button id="confirm-yes" type="button">Yes</button>
+    <button id="confirm-no" type="button">No</button>
+  </div>
+</div>
+</body>
+</html>
