@@ -69,6 +69,7 @@ ROUTES = [
     ("POST", r"/api/loras/remove", "h_lora_remove", "/api/loras/remove"),
     ("POST", r"/api/loras/verify", "h_lora_verify", "/api/loras/verify"),
     ("GET", r"/api/models", "h_models", "/api/models"),
+    ("POST", r"/api/models/download", "h_model_download", "/api/models/download"),
     ("GET", r"/api/characters", "h_characters", "/api/characters"),
     ("POST", r"/api/characters", "h_character_create", "/api/characters"),
     ("GET", r"/api/characters/" + _NAME, "h_character", "/api/characters/kyra"),
@@ -1061,6 +1062,28 @@ def _h_models(self, groups, query, body):
     return 200, lib.list_models()
 
 
+REPO_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _h_model_download(self, groups, query, body):
+    """Queue a background job that fetches a HF repo into a cache hub (MU63b)."""
+    real = self.ws(body.get("ws"))
+    repo = body.get("repo")
+    if not (isinstance(repo, str) and re.fullmatch(REPO_ID_RE, repo)):
+        raise ApiError(400, "repo must be a Hugging Face id of the form org/name")
+    hub = body.get("hub") or "ltx"
+    if hub not in lib.DOWNLOAD_HUBS:
+        raise ApiError(400, "hub must be one of %s" % ", ".join(lib.DOWNLOAD_HUBS))
+    state = self.server.state
+    with STORE_LOCK:
+        job_id = lib.new_job_id(state)
+        argv = lib.build_download_argv(repo, hub, real)
+        fields = lib.compose_fields({})
+        fields["repo"], fields["hub"] = repo, hub
+        lib.create_job(state, job_id, "download", real, None, None, argv, fields)
+    return 201, {"job": job_summary(self.server, job_id, lib.read_queue(state))}
+
+
 LIST_ROW_RE = re.compile(r"^(\S+)\s+(\S+)\s+(dataset|untrained|trained)\s+(yes|no)\s+(yes|no)\s+(.+)$")
 INVALID_ROW_RE = re.compile(r"^(\S+)\s+\(invalid: (.*)\)$")
 FILE_LINE_RE = re.compile(r"^  (ok|MISSING)\s+(.+)$")
@@ -1229,6 +1252,7 @@ MovieUIHandler.h_lora_add = _h_lora_add
 MovieUIHandler.h_lora_remove = _h_lora_remove
 MovieUIHandler.h_lora_verify = _h_lora_verify
 MovieUIHandler.h_models = _h_models
+MovieUIHandler.h_model_download = _h_model_download
 MovieUIHandler.h_characters = _h_characters
 MovieUIHandler.h_character = _h_character
 MovieUIHandler.h_character_create = _h_character_create

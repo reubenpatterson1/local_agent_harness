@@ -275,7 +275,7 @@
     });
     if (!res.data.help_ok) { banner(res.data.help_error); }
     const d = res.data.defaults;
-    if (!$("#c-model").value) { $("#c-model").value = d.model; }
+    fillModelSelect();
     if (!$("#c-gemma").value) { $("#c-gemma").value = d.gemma; }
   }
 
@@ -374,7 +374,8 @@
       width: bySeed ? null : numberOrNull("#c-width"), height: bySeed ? null : numberOrNull("#c-height"),
       seed_upload: bySeed ? S.seedUpload : null,
       mode: $("#c-mode").value,
-      model: textOrNull("#c-model"), gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
+      model: $("#c-model").value === "__download__" ? null : textOrNull("#c-model"),
+      gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
       story_model: textOrNull("#c-story-model"),
       auto_lora: $("#c-auto-lora").checked,
       video_loras: collectLoras("video"), stills_loras: collectLoras("stills"),
@@ -499,7 +500,7 @@
     $("#c-res-seed").checked = Boolean(S.seedUpload);
     $("#c-res-size").checked = !S.seedUpload;
     $("#c-mode").value = f.mode || "chained";
-    $("#c-model").value = f.model || "";
+    fillModelSelect(f.model || "");
     $("#c-gemma").value = f.gemma || "";
     $("#c-story-model").value = f.story_model || "";
     $("#c-auto-lora").checked = f.auto_lora !== false;
@@ -530,6 +531,20 @@
     $("#c-seed-file").addEventListener("change", onSeedFile);
     $("#c-res-preset").addEventListener("change", applyResPreset);
     syncResPreset();
+    $("#c-model").addEventListener("change", function () {
+      const sel = $("#c-model");
+      if (sel.value === "__download__") {
+        show($("#c-model-dl"), true);
+        sel.value = sel.dataset.selected || "";
+        $("#c-model-dl-repo").focus();
+      } else {
+        sel.dataset.selected = sel.value;
+        show($("#c-model-dl"), false);
+      }
+    });
+    $("#c-model-dl-go").addEventListener("click", function () {
+      downloadModel($("#c-model-dl-repo").value, $("#c-model-dl-hub").value, $("#c-model-dl-status"));
+    });
     $("#c-copy").addEventListener("click", function () {
       navigator.clipboard.writeText($("#c-command").textContent);
     });
@@ -552,14 +567,61 @@
     if (!S.ws) { return; }
     const res = await api("GET", "/api/models" + wsQuery());
     if (res.status !== 200) { return; }
+    S.models = res.data.models || [];
     const list = clear($("#c-model-list"));
     const body = clear($("#m-table tbody"));
-    res.data.models.forEach(function (m) {
+    S.models.forEach(function (m) {
       if (m.hub === "ltx") { list.appendChild(el("option", {value: m.repo})); }
       body.appendChild(el("tr", {}, [el("td", {text: m.hub}), el("td", {text: m.repo}),
         el("td", {text: m.intact ? "yes" : "no", cls: m.intact ? "ok" : "bad"}),
         el("td", {text: m.problems.join("; ")}), el("td", {text: sizeText(m.bytes)})]));
     });
+    fillModelSelect();
+  }
+
+  // Video model is a dropdown of locally-available ltx-hub models. A value not present
+  // locally (a draft's model) is still listed, flagged; "__download__" is the escape to
+  // the inline fetch control.
+  function fillModelSelect(preferred) {
+    const sel = $("#c-model");
+    if (!sel || sel.tagName !== "SELECT") { return; }
+    const local = (S.models || []).filter(function (m) { return m.hub === "ltx"; })
+      .map(function (m) { return m.repo; });
+    const defaultModel = (S.options && S.options.defaults && S.options.defaults.model) || "";
+    const want = preferred || sel.dataset.selected || defaultModel || "";
+    const options = local.slice();
+    if (want && options.indexOf(want) < 0) { options.push(want); }
+    options.sort();
+    clear(sel);
+    options.forEach(function (repo) {
+      const missing = local.indexOf(repo) < 0;
+      sel.appendChild(el("option", {value: repo, text: repo + (missing ? " — not downloaded" : "")}));
+    });
+    sel.appendChild(el("option", {value: "__download__", text: "＋ Download a model…"}));
+    sel.value = (want && options.indexOf(want) >= 0) ? want : (options[0] || "__download__");
+    sel.dataset.selected = sel.value;
+  }
+
+  async function downloadModel(repo, hub, statusEl) {
+    repo = (repo || "").trim();
+    if (!repo) { if (statusEl) { statusEl.textContent = "enter an org/repo id"; } return; }
+    if (statusEl) { statusEl.textContent = "queuing…"; }
+    const res = await api("POST", "/api/models/download", {ws: S.ws, repo: repo, hub: hub || "ltx"});
+    if (res.status !== 201) {
+      if (statusEl) { statusEl.textContent = "error: " + ((res.data && res.data.error) || res.status); }
+      return;
+    }
+    const jobId = res.data.job.id;
+    if (statusEl) { statusEl.textContent = "downloading… job " + jobId + " (watch in Jobs)"; }
+    const timer = setInterval(async function () {
+      const jr = await api("GET", "/api/jobs/" + jobId);
+      if (jr.status !== 200) { return; }
+      const st = jr.data.status ? jr.data.status.state : jr.data.state;
+      if (["done", "failed", "cancelled", "lost"].indexOf(st) < 0) { return; }
+      clearInterval(timer);
+      if (statusEl) { statusEl.textContent = "job " + jobId + " " + st; }
+      if (st === "done") { await loadModels(); fillModelSelect(repo); show($("#c-model-dl"), false); }
+    }, 2000);
   }
 
   // --- V7 smoke render (MU52, Q4) ------------------------------------------------------
@@ -821,6 +883,9 @@
   }
 
   function setupLoras() {
+    $("#m-dl-go").addEventListener("click", function () {
+      downloadModel($("#m-dl-repo").value, $("#m-dl-hub").value, $("#m-dl-status"));
+    });
     $("#l-verify-all").addEventListener("click", async function () {
       const res = await api("POST", "/api/loras/verify", {ws: S.ws, ids: []});
       if (res.data && res.data.run) {

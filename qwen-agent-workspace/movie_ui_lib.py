@@ -518,7 +518,7 @@ def kill_orphan(state, job_id):
 # Compose fields, the command builder and light subprocesses (MU36-MU41, MU59)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"     # bin/ltx-movie:318
+DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"                     # bin/ltx-movie:318
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"          # bin/ltx-movie:319-323
 STILLS_BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"               # lora_catalog.py:29
 ZIMAGE_TEXT_ENCODER = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"   # z_image_skill.py:53
@@ -1129,9 +1129,16 @@ def intact_scan(snapshot, repo_dir=None):
     visited = 0
     if repo_dir is not None:
         try:
-            partial = [n for n in os.listdir(os.path.join(repo_dir, "blobs")) if n.endswith(".incomplete")]
+            names = os.listdir(os.path.join(repo_dir, "blobs"))
         except OSError:
-            partial = []
+            names = []
+        present = set(names)
+        # An `.incomplete` is named "<sha256>.<etag>.incomplete"; it counts as a real
+        # partial download only when the finished blob "<sha256>" is absent. HF/Xet can
+        # leave a stale `.incomplete` sidecar beside a blob that later completed (the
+        # finished blob being a symlink into the Xet store) -- that is not a problem.
+        partial = [n for n in names
+                   if n.endswith(".incomplete") and n.split(".", 1)[0] not in present]
         if partial:
             problems.append("download incomplete: %d partial blob(s)" % len(partial))
     safetensors, indexes = 0, []
@@ -1499,8 +1506,19 @@ def collapse(line):
     return line.rstrip("\r").rsplit("\r", 1)[-1]
 
 
+DOWNLOAD_HUBS = ("ltx", "zimage", "hf")
+
+
+def build_download_argv(repo, hub, ws_real, py=sys.executable):
+    """The bin/model-download argv that fetches `repo` into the named cache `hub`
+    ("ltx"|"zimage"|"hf"). Pure; the caller validates repo/hub."""
+    return [py, os.path.join(ws_real, "bin", "model-download"), "--hub", hub, repo]
+
+
 def job_phases(kind, fields):
     """MU56's "phases", mirroring bin/ltx-movie's _phase_sequence."""
+    if kind == "download":
+        return []
     seed = ["0"] if fields.get("seed_upload") else []
     if kind == "story":
         return seed + ["1"]

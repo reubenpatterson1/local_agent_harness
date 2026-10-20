@@ -83,7 +83,13 @@
       <option value="shots" data-field="shots">shots</option>
       <option value="no_stills" data-field="no_stills">no stills</option>
     </select></label>
-    <label data-field="model">Video model <input id="c-model" type="text" size="50" list="c-model-list"></label>
+    <label data-field="model">Video model <select id="c-model"></select></label>
+    <span id="c-model-dl" class="row" hidden>
+      <input id="c-model-dl-repo" type="text" size="34" placeholder="org/repo">
+      <select id="c-model-dl-hub"><option value="ltx">ltx</option><option value="zimage">zimage</option><option value="hf">hf</option></select>
+      <button id="c-model-dl-go" type="button">Download</button>
+      <span id="c-model-dl-status" class="muted"></span>
+    </span>
     <label data-field="gemma">Gemma <input id="c-gemma" type="text" size="50" list="c-model-list"></label>
     <datalist id="c-model-list"></datalist>
     <label data-field="story_model">Story model <input id="c-story-model" type="text" size="30" placeholder="(qwen-agent default)"></label>
@@ -200,6 +206,13 @@
   <pre id="l-output"></pre>
   <h3>Models</h3>
   <table id="m-table" class="list"><thead><tr><th>Hub</th><th>Repo</th><th>Intact</th><th>Problems</th><th>Size</th></tr></thead><tbody></tbody></table>
+  <h3>Download a model</h3>
+  <div class="row">
+    <input id="m-dl-repo" type="text" size="40" placeholder="org/repo (e.g. dgrauet/ltx-2.3-mlx-q8)">
+    <label>Hub <select id="m-dl-hub"><option value="ltx">ltx (video / gemma)</option><option value="zimage">zimage (stills)</option><option value="hf">hf (default)</option></select></label>
+    <button id="m-dl-go" type="button">Download</button>
+    <span id="m-dl-status" class="muted"></span>
+  </div>
 </section>
 
 <section id="panel-jobs" class="panel" hidden>
