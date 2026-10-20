@@ -362,3 +362,57 @@ def test_dispatch_tick_waits_for_a_fresh_starting_job(state, tmp_path):
     assert lib.dispatch_tick(state, mt.WS) is None
     assert lib.read_queue(state) == [queued]
     assert mt.status_of(state, fresh)["state"] == "starting"
+
+
+def _start_ui(ui, home, port):
+    env = dict(os.environ, HOME=home, PYTHONUNBUFFERED="1")
+    env.pop("ANTHROPIC_API_KEY", None)
+    return subprocess.Popen([sys.executable, os.path.join(ui, "bin", "movie-ui"), "--port", str(port)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, text=True)
+
+
+def test_mut15_bin_movie_ui_lock_port_and_startup_lines(tmp_path):
+    home = os.path.join(str(tmp_path), "home")
+    os.makedirs(home)
+    ui = mt.copy_ui(tmp_path)
+    port = mt.free_port()
+    first = _start_ui(ui, home, port)
+    try:
+        line1 = first.stdout.readline()
+        line2 = first.stdout.readline()
+        state = os.path.join(home, ".local", "share", "qwen-agent", "movie-ui")
+        m = re.fullmatch(r"movie-ui: http://127\.0\.0\.1:%d/\?t=([A-Za-z0-9_-]{43})\n" % port, line1)
+        assert m, line1
+        assert line2 == "movie-ui: state %s; Ctrl-C stops the server (running jobs keep running)\n" % state
+        token = m.group(1)
+        for name in ("jobs", "uploads", "traces", "smoke"):
+            assert stat.S_IMODE(os.stat(os.path.join(state, name)).st_mode) == 0o700
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", "/api/host", headers={"X-Movie-UI-Token": token})
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        assert resp.status == 200 and body["port"] == port and body["ui_workspace"] == os.path.realpath(ui)
+        second = _start_ui(ui, home, mt.free_port())
+        out, err = second.communicate(timeout=30)
+        assert second.returncode == 2 and out == ""
+        assert err == ("movie-ui: another movie-ui is already running on this host (lock held: %s)\n"
+                       % os.path.join(state, "server.lock"))
+    finally:
+        first.send_signal(signal.SIGTERM)
+        out, err = first.communicate(timeout=30)
+    assert first.returncode == 0 and out == "movie-ui: stopped\n" and err == ""
+    held = socket.socket()
+    held.bind(("127.0.0.1", 0))
+    held.listen(1)
+    busy_port = held.getsockname()[1]
+    try:
+        busy = _start_ui(ui, home, busy_port)
+        out, err = busy.communicate(timeout=30)
+    finally:
+        held.close()
+    assert (busy.returncode, err) == (2, "movie-ui: port %d on 127.0.0.1 is in use; pass --port N\n" % busy_port)
+    for bad in ("80", "65536", "x"):
+        low = _start_ui(ui, home, bad)
+        out, err = low.communicate(timeout=30)
+        assert (low.returncode, err) == (2, "movie-ui: invalid --port %s (1024 to 65535)\n" % bad)

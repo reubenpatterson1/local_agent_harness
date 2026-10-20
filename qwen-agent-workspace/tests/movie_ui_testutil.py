@@ -383,3 +383,81 @@ def api(server, method, path, body=None, token=TOKEN, headers=None, raw=None):
         return resp.status, result_headers, payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Agents, registries and a copy of the UI
+# ---------------------------------------------------------------------------
+
+def registry(host_ids, port):
+    """A valid fleet registry naming host_ids, every host at port."""
+    hosts = {}
+    for host_id in host_ids:
+        hosts[host_id] = {"role": "agent", "address": "127.0.0.1", "port": port,
+                          "model_server": {"type": "vllm", "url": "http://127.0.0.1:9/v1"},
+                          "model": "m", "skills": []}
+    return {"protocol": 1, "fleet_id": "0123456789abcdef", "hosts": hosts}
+
+
+def make_agents_home(home, agents):
+    """With HOME already set to home, build ~/agents/<id> for each agents item
+    {id: {"current": tag or None, "releases": {tag: {"data": bool, "bytes": n}}, "state": dict or None,
+    "port": int or None, "ports": [int, ...] (one registry file each), "fleet_env": bool (an empty
+    fleet.env, so an agent without current is on disk), "default": bool (the ~/.local/bin/qwen-agent
+    wrapper names it)}}. Returns {id: deploy root}."""
+    roots = {}
+    for agent, spec in agents.items():
+        a = os.path.join(str(home), "agents", agent)
+        roots[agent] = a
+        os.makedirs(os.path.join(a, "releases"), exist_ok=True)
+        for tag, rel in spec.get("releases", {}).items():
+            ws = os.path.join(a, "releases", tag, fleet_lib.WS_SUBDIR)
+            os.makedirs(os.path.join(ws, "bin"), exist_ok=True)
+            with open(os.path.join(ws, "bin", "ltx-movie"), "w") as f:
+                f.write("#!/bin/sh\n")
+            if rel.get("data"):
+                story = os.path.join(ws, "generated", "stories", "old-story")
+                os.makedirs(story, exist_ok=True)
+                with open(os.path.join(story, "story.md"), "wb") as f:
+                    f.write(b"x" * rel.get("bytes", 10))
+            fleets = os.path.join(ws, "fleets")
+            os.makedirs(fleets, exist_ok=True)
+            ports = spec.get("ports") or ([spec["port"]] if spec.get("port") else [])
+            for i, port in enumerate(ports):
+                with open(os.path.join(fleets, "f%d.json" % i), "w") as f:
+                    json.dump(registry([agent], port), f)
+        if spec.get("current"):
+            os.symlink(os.path.join("releases", spec["current"]), os.path.join(a, "current"))
+        if spec.get("fleet_env"):
+            open(os.path.join(a, "fleet.env"), "w").close()
+        if spec.get("state") is not None:
+            with open(os.path.join(a, "update-state.json"), "w") as f:
+                json.dump(spec["state"], f)
+        if spec.get("default"):
+            bindir = os.path.join(str(home), ".local", "bin")
+            os.makedirs(bindir, exist_ok=True)
+            with open(os.path.join(bindir, "qwen-agent"), "wb") as f:
+                f.write(fleet_lib.wrapper_bytes(agent, spec.get("port") or fleet_lib.DEFAULT_PORT))
+    return roots
+
+
+def free_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def copy_ui(tmp):
+    """A copy of the movie-ui files (bin/movie-ui, bin/movie-ui-job, movie_ui_lib.py,
+    movie_ui_server.py, fleet_lib.py, static/movie-ui) plus the stub tools, so a subprocess
+    bin/movie-ui probes stubs instead of this checkout's real bin/story-server. Returns its root."""
+    root = make_stub_workspace(os.path.join(str(tmp), "ui"))
+    for rel in ("bin/movie-ui", "bin/movie-ui-job", "movie_ui_lib.py", "movie_ui_server.py", "fleet_lib.py"):
+        shutil.copy2(os.path.join(WS, rel), os.path.join(root, rel))
+    static = os.path.join(WS, "static", "movie-ui")
+    if os.path.isdir(static):
+        shutil.copytree(static, os.path.join(root, "static", "movie-ui"))
+    return root

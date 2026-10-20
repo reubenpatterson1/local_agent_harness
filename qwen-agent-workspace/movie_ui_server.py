@@ -420,3 +420,239 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
         if not lib.valid_story_id(value):
             raise ApiError(404, "not found")
         return value
+
+
+# ---------------------------------------------------------------------------
+# Workspaces, versions, host and options (MU33-MU35, MU45-MU47, MU60)
+# ---------------------------------------------------------------------------
+
+def default_agent():
+    """MU35: the default command's wrapper agent when it is on disk, else the only agent, else None."""
+    ids = fleet_lib.agent_ids_on_disk()
+    kind, found = fleet_lib.classify_command_path(fleet_lib.default_command_path())
+    if kind == "wrapper" and found in ids:
+        return found
+    return ids[0] if len(ids) == 1 else None
+
+
+def _has_ltx_movie(ws_path):
+    return os.path.isfile(os.path.join(ws_path, "bin", "ltx-movie"))
+
+
+def default_workspace(ui_ws):
+    """MU34: an installed UI defaults to its agent's current workspace, else the UI workspace."""
+    ui = os.path.realpath(ui_ws)
+    root = os.path.realpath(os.path.expanduser("~/agents"))
+    parts = os.path.relpath(ui, root).split(os.sep)
+    if len(parts) == 4 and parts[0] not in ("", "..") and parts[1] == "releases" and parts[3] == fleet_lib.WS_SUBDIR:
+        try:
+            current = os.path.join(fleet_lib.deploy_root(default_agent() or parts[0]), "current",
+                                   fleet_lib.WS_SUBDIR)
+        except ValueError:
+            return ui
+        if _has_ltx_movie(current):
+            return current
+    return ui
+
+
+def _git_commit(path):
+    try:
+        proc = subprocess.run(["git", "-C", path, "rev-parse", "--short", "HEAD"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    text = proc.stdout.decode("utf-8", "replace").strip()
+    return text if proc.returncode == 0 and text else None
+
+
+def _story_count(real):
+    try:
+        names = os.listdir(os.path.join(real, "generated", "stories"))
+    except OSError:
+        return 0
+    return sum(1 for n in names if lib.valid_story_id(n) and n != lib.SMOKE_STORY_ID
+               and os.path.isdir(os.path.join(real, "generated", "stories", n)))
+
+
+def list_workspaces(ui_ws):
+    """MU33: installed current and release workspaces of every agent, then the UI's own."""
+    entries, by_real = [], {}
+
+    def add(entry):
+        real = entry["realpath"]
+        if real in by_real:
+            by_real[real]["is_current"] = by_real[real]["is_current"] or entry["is_current"]
+            by_real[real]["is_ui"] = by_real[real]["is_ui"] or entry["is_ui"]
+            return
+        by_real[real] = entry
+        entries.append(entry)
+
+    for agent in fleet_lib.agent_ids_on_disk():
+        a = fleet_lib.deploy_root(agent)
+        releases = os.path.join(a, "releases")
+        current_real = None
+        cur_ws = os.path.join(a, "current", fleet_lib.WS_SUBDIR)
+        cur_tag = os.path.basename(os.path.realpath(os.path.join(a, "current")))
+        if _has_ltx_movie(cur_ws):
+            current_real = os.path.realpath(cur_ws)
+            tag = cur_tag if fleet_lib.tag_key(cur_tag) is not None else None
+            add({"path": cur_ws, "realpath": current_real, "agent": agent, "tag": tag, "commit": None,
+                 "is_current": True, "is_ui": False, "kind": "current"})
+        try:
+            present = os.listdir(releases)
+        except OSError:
+            present = []
+        state = fleet_lib.read_state(os.path.join(a, "update-state.json"))
+        doomed = set(fleet_lib.releases_to_prune(present, cur_tag, state))
+        for name in sorted((n for n in present if fleet_lib.tag_key(n) is not None), key=fleet_lib.tag_key,
+                           reverse=True):
+            rel_ws = os.path.join(releases, name, fleet_lib.WS_SUBDIR)
+            if not _has_ltx_movie(rel_ws):
+                continue
+            real = os.path.realpath(rel_ws)
+            if name in doomed:
+                prune = ("kept_for_data" if fleet_lib.release_holds_data(os.path.join(releases, name))
+                         else "would_prune")
+            else:
+                prune = "kept"
+            add({"path": rel_ws, "realpath": real, "agent": agent, "tag": name, "commit": None,
+                 "is_current": real == current_real, "is_ui": False, "kind": "release", "prune": prune,
+                 "data_bytes": lib._tree_bytes(os.path.join(real, "generated"))})
+    ui = os.path.realpath(ui_ws)
+    if ui in by_real:
+        by_real[ui]["is_ui"] = True
+    else:
+        add({"path": ui, "realpath": ui, "agent": None, "tag": None, "commit": _git_commit(ui),
+             "is_current": False, "is_ui": True, "kind": "ui"})
+    out = []
+    for e in entries:
+        kind = e.pop("kind")
+        if kind == "current":
+            label = "%s current (%s)" % (e["agent"], e["tag"] or "unknown tag")
+        elif kind == "release":
+            label = "%s %s" % (e["agent"], e["tag"])
+        else:
+            label = "this checkout (%s)" % (e["commit"] or "unknown commit")
+        e["label"] = label
+        e.setdefault("prune", None)
+        e.setdefault("data_bytes", None)
+        e["stories"] = _story_count(e["realpath"])
+        out.append(dict((k, e[k]) for k in ("path", "realpath", "label", "agent", "tag", "commit",
+                                            "is_current", "is_ui", "stories", "prune", "data_bytes")))
+    return out
+
+
+def _running_job(state):
+    for job_id in lib.active_job_ids(state):
+        return job_id
+    return None
+
+
+def _h_host(self, groups, query, body):
+    if query.get("refresh") == "1":
+        self.server.refresh_capabilities()
+    state = self.server.state
+    return 200, {"host": socket.gethostname(), "platform": sys.platform, "python": platform.python_version(),
+                 "port": self.server.port, "state_dir": state, "ui_workspace": self.server.ui_ws,
+                 "default_workspace": default_workspace(self.server.ui_ws), "default_agent": default_agent(),
+                 "api_key_present": bool(os.environ.get("ANTHROPIC_API_KEY")),
+                 "capabilities": self.server.capability_snapshot(),
+                 "running_job": _running_job(state), "queue_length": len(lib.read_queue(state))}
+
+
+def _h_workspaces(self, groups, query, body):
+    return 200, {"default": default_workspace(self.server.ui_ws), "workspaces": list_workspaces(self.server.ui_ws)}
+
+
+def _h_options(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    flags, error = lib.help_flags(real)
+    return 200, {"workspace": real, "help_ok": flags is not None, "help_error": error,
+                 "flags": sorted(flags or ()), "supported": lib.supported_map(flags),
+                 "defaults": dict(lib.OPTION_DEFAULTS)}
+
+
+MovieUIHandler.h_host = _h_host
+MovieUIHandler.h_workspaces = _h_workspaces
+MovieUIHandler.h_options = _h_options
+
+
+def _dispatcher_loop(server, stop):
+    """MU30: one dispatch tick per second under STORE_LOCK; errors are logged, never fatal."""
+    while not stop.wait(1.0):
+        try:
+            with STORE_LOCK:
+                lib.dispatch_tick(server.state, server.ui_ws)
+        except Exception as e:
+            sys.stderr.write("movie-ui: dispatcher: %s: %s\n" % (type(e).__name__, e))
+
+
+def _probe_once(server):
+    try:
+        server.refresh_capabilities()
+    except Exception as e:
+        sys.stderr.write("movie-ui: capability probe: %s: %s\n" % (type(e).__name__, e))
+
+
+def start_threads(server):
+    """Start the dispatcher (MU30) and capability-probe (MU60) threads, both daemon; returns the
+    Event that stops the dispatcher."""
+    stop = threading.Event()
+    threading.Thread(target=_dispatcher_loop, args=(server, stop), name="dispatcher", daemon=True).start()
+    threading.Thread(target=_probe_once, args=(server,), name="probe", daemon=True).start()
+    return stop
+
+
+_LOCK_FD = []
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def main(argv):
+    """bin/movie-ui (MU1-MU7). Returns the exit code."""
+    parser = argparse.ArgumentParser(prog="movie-ui", description="The locally hosted movie page.")
+    parser.add_argument("--port", default="8999", help="TCP port on 127.0.0.1 (default 8999)")
+    args = parser.parse_args(argv)
+    if not (re.fullmatch(r"[0-9]{1,5}", args.port) and 1024 <= int(args.port) <= 65535):
+        sys.stderr.write("movie-ui: invalid --port %s (1024 to 65535)\n" % args.port)
+        return 2
+    port = int(args.port)
+    state = lib.state_dir()
+    lib.ensure_state(state)
+    lock_path = os.path.join(state, "server.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        sys.stderr.write("movie-ui: another movie-ui is already running on this host (lock held: %s)\n"
+                         % lock_path)
+        return 2
+    _LOCK_FD.append(fd)
+    token = secrets.token_urlsafe(32)
+    try:
+        server = make_server(port, state, UI_WS, token)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            sys.stderr.write("movie-ui: port %d on 127.0.0.1 is in use; pass --port N\n" % port)
+        else:
+            sys.stderr.write("movie-ui: cannot listen on 127.0.0.1:%d: %s\n" % (port, e.strerror or e))
+        return 2
+    with STORE_LOCK:
+        lib.startup_recovery(state)
+    stop = start_threads(server)
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    sys.stdout.write("movie-ui: http://127.0.0.1:%d/?t=%s\n" % (server.port, token))
+    sys.stdout.write("movie-ui: state %s; Ctrl-C stops the server (running jobs keep running)\n" % state)
+    sys.stdout.flush()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    server.server_close()
+    sys.stdout.write("movie-ui: stopped\n")
+    sys.stdout.flush()
+    return 0

@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""movie-ui -- the locally hosted movie page (movie-ui spec, piece F).
+
+Usage: bin/movie-ui [--port N]
+
+Serves http://127.0.0.1:<port>/ (default 8999) with a per-launch token, runs heavy jobs one at a
+time as detached runners whose state lives in ~/.local/share/qwen-agent/movie-ui, and stops on
+Ctrl-C without touching running jobs. See docs/superpowers/specs/2026-10-19-movie-ui-design.md.
+"""
+
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+import movie_ui_server  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(movie_ui_server.main(sys.argv[1:]))

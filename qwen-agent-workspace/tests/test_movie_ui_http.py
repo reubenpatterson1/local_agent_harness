@@ -210,3 +210,95 @@ def test_fix_logged_line_escapes_control_characters(env, capfd):
     err = capfd.readouterr().err
     assert "\x1b" not in err
     assert err == "movie-ui: GET /api/boom\\x1b[31m -> 500 (RuntimeError: kaput)\n"
+
+
+def test_mu14_ws_parameter_errors_and_options(env):
+    s = env["srv"]
+    assert mt.api(s, "GET", "/api/options")[2] == {"error": "missing ws"}
+    assert mt.api(s, "GET", "/api/options?ws=relative")[2] == {"error": "ws must be an absolute path"}
+    assert mt.api(s, "GET", "/api/options?ws=%ff")[:3:2] == (400, {"error": "invalid query string"})
+    status, _h, payload = mt.api(s, "GET", "/api/options?ws=" + env["ws"])
+    assert status == 200
+    assert payload["workspace"] == env["ws"] and payload["help_ok"] is True and payload["help_error"] is None
+    assert payload["flags"] == sorted(payload["flags"]) and "--judge" in payload["flags"]
+    assert all(payload["supported"].values()) and len(payload["supported"]) == 26
+    assert payload["defaults"] == {"panels": 15, "fps": 24, "frames": 145, "model": lib.DEFAULT_MODEL,
+                                   "gemma": lib.DEFAULT_GEMMA, "panel_timeout": 7200}
+    with open(os.path.join(mt.FIXTURES, "ltx-movie-help-old.txt"), encoding="utf-8") as f:
+        mt.stub_config(env["ws"], {"ltx-movie --help": {"stdout": f.read()}})
+    os.utime(os.path.join(env["ws"], "bin", "ltx-movie"), ns=(10 ** 9, 10 ** 9))
+    payload = mt.api(s, "GET", "/api/options?ws=" + env["ws"])[2]
+    assert payload["supported"]["judge"] is False and payload["supported"]["goal"] is False
+    assert payload["supported"]["panels"] is True
+
+
+def test_mut9_host_and_refresh(env, monkeypatch):
+    s = env["srv"]
+    server = s.server
+    server.probe_ws = env["ws"]
+    good_py = os.path.join(env["tmp"], "good-python")
+    with open(good_py, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(good_py, 0o755)
+    server.stills_py = good_py
+    monkeypatch.setenv("LTX2_MLX_BIN", os.path.join(env["tmp"], "missing-ltx"))
+    payload = mt.api(s, "GET", "/api/host")[2]
+    assert payload["capabilities"]["render"] == {"ok": None, "reason": "probing", "checked": None}
+    assert payload["port"] == s.port and payload["state_dir"] == env["state"]
+    assert payload["ui_workspace"] == mt.WS and payload["default_workspace"] == mt.WS
+    assert payload["default_agent"] is None and payload["api_key_present"] is False
+    assert payload["running_job"] is None and payload["queue_length"] == 0
+    assert set(payload) == {"host", "platform", "python", "port", "state_dir", "ui_workspace", "default_workspace",
+                            "default_agent", "api_key_present", "capabilities", "running_job", "queue_length"}
+    payload = mt.api(s, "GET", "/api/host?refresh=1")[2]
+    caps = payload["capabilities"]
+    assert caps["render"]["ok"] is False and caps["render"]["reason"].startswith("ltx-2-mlx binary not found")
+    assert caps["stills"] == {"ok": True, "reason": None, "checked": caps["stills"]["checked"]}
+    assert caps["story_server"]["ok"] is True and caps["story_server"]["reason"] == "story server: SERVING vision"
+    mt.stub_config(env["ws"], {"story-server status": {"stdout": "  state:          STOPPED\n"}})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    payload = mt.api(s, "GET", "/api/host?refresh=1")[2]
+    assert payload["capabilities"]["story_server"]["ok"] is False and payload["api_key_present"] is True
+
+
+def test_mut23_workspaces_labels_default_and_prune(env, monkeypatch):
+    home = env["home"]
+    state = {"from": "v2026.10.02", "to": "v2026.10.05", "status": "ok", "attempts": 0, "bad_tags": []}
+    mt.make_agents_home(home, {
+        "mac-local": {"current": "v2026.10.05", "default": True, "port": 8190, "state": state,
+                      "releases": {"v2026.10.01": {"data": True, "bytes": 1234}, "v2026.10.02": {},
+                                   "v2026.09.30": {}, "v2026.10.03": {}, "v2026.10.04": {}, "v2026.10.05": {},
+                                   "notes": {}}},
+        "spare": {"releases": {"v2026.10.01": {}}, "fleet_env": True},
+        "ghost": {"releases": {"v2026.10.01": {}}}})
+    s = env["srv"]
+    payload = mt.api(s, "GET", "/api/workspaces")[2]
+    a = os.path.join(home, "agents", "mac-local")
+    entries = payload["workspaces"]
+    assert [e["label"] for e in entries] == [
+        "mac-local current (v2026.10.05)", "mac-local v2026.10.04", "mac-local v2026.10.03", "mac-local v2026.10.02",
+        "mac-local v2026.10.01", "mac-local v2026.09.30", "spare v2026.10.01",
+        "this checkout (%s)" % entries[-1]["commit"] if entries[-1]["commit"] else "this checkout (unknown commit)"]
+    by_tag = dict((e["label"], e) for e in entries)
+    cur = by_tag["mac-local current (v2026.10.05)"]
+    assert cur["path"] == os.path.join(a, "current", "qwen-agent-workspace") and cur["is_current"] is True
+    assert cur["prune"] is None and cur["data_bytes"] is None and cur["agent"] == "mac-local"
+    assert by_tag["mac-local v2026.10.04"]["prune"] == "kept"
+    assert by_tag["mac-local v2026.10.02"]["prune"] == "kept"
+    assert by_tag["mac-local v2026.10.01"]["prune"] == "kept_for_data"
+    assert by_tag["mac-local v2026.10.01"]["data_bytes"] == 1234
+    assert by_tag["mac-local v2026.10.01"]["stories"] == 1
+    assert by_tag["mac-local v2026.09.30"]["prune"] == "would_prune"
+    assert by_tag["mac-local v2026.09.30"]["data_bytes"] == 0 and by_tag["mac-local v2026.09.30"]["is_current"] is False
+    assert entries[-1]["is_ui"] is True and entries[-1]["agent"] is None and entries[-1]["prune"] is None
+    assert set(cur) == {"path", "realpath", "label", "agent", "tag", "commit", "is_current", "is_ui", "stories",
+                        "prune", "data_bytes"}
+    assert payload["default"] == mt.WS
+    assert srv.default_agent() == "mac-local"
+    ui_copy = os.path.join(a, "releases", "v2026.10.03", "qwen-agent-workspace")
+    assert srv.default_workspace(ui_copy) == os.path.join(a, "current", "qwen-agent-workspace")
+    assert srv.default_workspace("/somewhere/else") == "/somewhere/else"
+    os.unlink(os.path.join(home, ".local", "bin", "qwen-agent"))
+    assert srv.default_agent() is None
+    typed = mt.api(s, "GET", "/api/options?ws=" + os.path.join(env["tmp"]))
+    assert typed[:3:2] == (400, {"error": "not a harness workspace (no bin/ltx-movie): %s" % env["tmp"]})
