@@ -919,6 +919,8 @@ def _h_upload(self, groups, query, body):
 def _h_loras(self, groups, query, body):
     real = self.ws(query.get("ws"))
     model = query.get("model")
+    if model:
+        _check_arg("model", model)
     args = ["list", "--json"] + (["--model", model] if model else [])
     run = tool_result("lora-catalog", lib.run_light(lib.tool_argv(real, "lora-catalog", *args), real))
     try:
@@ -929,6 +931,14 @@ def _h_loras(self, groups, query, body):
         raise ApiError(502, "lora-catalog printed unparsable output", run=run)
     obj["model"] = model or None
     return 200, obj
+
+
+def _check_arg(key, value):
+    """400 unless value can be a safe, non-flag-like argv element."""
+    if not lib._argv_safe(value):
+        raise ApiError(400, "%s contains invalid characters" % key)
+    if value.startswith("-"):
+        raise ApiError(400, "%s must not start with '-'" % key)
 
 
 def _lora_action(real, args):
@@ -999,7 +1009,9 @@ def _h_lora_add(self, groups, query, body):
 
 def _h_lora_remove(self, groups, query, body):
     real = self.ws(body.get("ws"))
-    return 200, {"run": _lora_action(real, ["remove", _typed(body, "id", "str", "a string")])}
+    entry_id = _typed(body, "id", "str", "a string")
+    _check_arg("id", entry_id)
+    return 200, {"run": _lora_action(real, ["remove", entry_id])}
 
 
 VERIFY_LINE_RE = re.compile(r"^(OK|FAIL) (\S+?)(?:: (.*))?$")
@@ -1024,9 +1036,13 @@ def parse_verify(stdout):
 
 def _h_lora_verify(self, groups, query, body):
     real = self.ws(body.get("ws"))
-    ids = body.get("ids") or []
+    ids = body.get("ids")
+    if ids is None:
+        ids = []
     if not (isinstance(ids, list) and all(isinstance(i, str) for i in ids)):
         raise ApiError(400, "ids must be a list of strings")
+    for item in ids:
+        _check_arg("ids", item)
     run = _lora_action(real, ["verify"] + ids)
     return 200, {"run": run, "results": parse_verify(run["stdout"])}
 
@@ -1039,7 +1055,7 @@ def _h_models(self, groups, query, body):
 LIST_ROW_RE = re.compile(r"^(\S+)\s+(\S+)\s+(dataset|untrained|trained)\s+(yes|no)\s+(yes|no)\s+(.+)$")
 INVALID_ROW_RE = re.compile(r"^(\S+)\s+\(invalid: (.*)\)$")
 FILE_LINE_RE = re.compile(r"^  (ok|MISSING)\s+(.+)$")
-STILL_FILE_RE = re.compile(r"^char_\d{2}\.png$")
+STILL_FILE_RE = re.compile(r"^char_[0-9]{2}\.png$")
 
 
 def parse_character_list(stdout):
@@ -1090,7 +1106,8 @@ def _h_character(self, groups, query, body):
     if isinstance(sheet, str):
         stills_dir = os.path.join(os.path.dirname(sheet), "stills")
         try:
-            stills = sorted(os.path.join(stills_dir, _fs_text(n)) for n in os.listdir(stills_dir) if STILL_FILE_RE.fullmatch(n))
+            stills = sorted(os.path.join(stills_dir, n) for n in os.listdir(stills_dir)
+                            if STILL_FILE_RE.fullmatch(n) and os.path.isfile(os.path.join(stills_dir, n)))
         except OSError:
             stills = []
         dataset = {"contact_sheet": sheet, "stills": stills}
@@ -1115,7 +1132,10 @@ def character_create_errors(body, state):
     """MU65's field rules for POST /api/characters; [] when they pass."""
     errors = []
     name, phrase = body.get("name"), body.get("phrase")
-    seed, descriptor, class_noun = body.get("seed_upload"), body.get("descriptor"), body.get("class_noun")
+    seed = body.get("seed_upload")
+    if seed == "":
+        seed = None
+    descriptor, class_noun = body.get("descriptor"), body.get("class_noun")
     trigger, seed_n, force = body.get("trigger"), body.get("seed"), body.get("force", False)
     if not (isinstance(name, str) and lib.CHARACTER_NAME_RE.fullmatch(name)):
         errors.append("character name must match [a-z][a-z0-9-]{1,23}")
@@ -1165,7 +1185,7 @@ def _h_character_create(self, groups, query, body):
         raise ApiError(400, "invalid fields", errors=errors)
     fields = dict((k, body.get(k)) for k in ("name", "phrase", "class_noun", "descriptor", "trigger", "seed",
                                               "seed_upload"))
-    for key in ("class_noun", "descriptor", "trigger"):
+    for key in ("class_noun", "descriptor", "trigger", "seed_upload"):
         if fields[key] == "":
             fields[key] = None
     fields["force"] = body.get("force", False)

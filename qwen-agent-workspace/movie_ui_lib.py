@@ -664,8 +664,8 @@ def run_light(argv, cwd, env=None, timeout=None):
     try:
         proc = subprocess.Popen(argv, cwd=cwd, env=env or dict(os.environ), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    except OSError as e:
-        result["stderr"] = "%s: %s" % (type(e).__name__, e.strerror or e)
+    except (OSError, ValueError) as e:
+        result["stderr"] = "%s: %s" % (type(e).__name__, getattr(e, "strerror", None) or e)
         return result
     try:
         out, err = proc.communicate(timeout=limit)

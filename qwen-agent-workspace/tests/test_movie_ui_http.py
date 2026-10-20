@@ -714,3 +714,45 @@ def test_mu65_character_create_errors_flaglike_and_unsafe(env):
                           (dict(descriptor="-tall"), "descriptor must not start with '-'"),
                           (dict(descriptor="a\x00b"), "descriptor contains invalid characters")):
         assert srv.character_create_errors(dict(base, **change), state) == [error]
+
+
+def test_fix13_lora_values_nul_and_flag_like(env):
+    s, ws = env["srv"], env["ws"]
+    got = lambda *a, **k: mt.api(s, *a, **k)[:3:2]
+    assert got("POST", "/api/loras/remove", body={"ws": ws, "id": "a\x00b"}) == (
+        400, {"error": "id contains invalid characters"})
+    assert got("POST", "/api/loras/remove", body={"ws": ws, "id": "-x"}) == (400, {"error": "id must not start with '-'"})
+    assert got("POST", "/api/loras/verify", body={"ws": ws, "ids": ["ok", "a\x00b"]}) == (
+        400, {"error": "ids contains invalid characters"})
+    assert got("POST", "/api/loras/verify", body={"ws": ws, "ids": ["-x"]}) == (
+        400, {"error": "ids must not start with '-'"})
+    assert got("POST", "/api/loras/verify", body={"ws": ws, "ids": ""}) == (
+        400, {"error": "ids must be a list of strings"})
+    assert got("GET", "/api/loras?ws=%s&model=a%%00b" % ws) == (400, {"error": "model contains invalid characters"})
+    assert got("GET", "/api/loras?ws=%s&model=-x" % ws) == (400, {"error": "model must not start with '-'"})
+
+
+def test_fix13_upload_wave_riff_refused_and_reupload_keeps_file(env):
+    s, state = env["srv"], env["state"]
+    wave = b"RIFF\x00\x00\x00\x00WAVEfmt " + b"\x00" * 24
+    assert _upload(s, wave, "image/webp")[:3:2] == (400, {"error": "file content is not image/webp"})
+    status, _h, payload = _upload(s, mt.PNG, "image/png")
+    assert status == 201
+    os.utime(payload["path"], (1000000, 1000000))
+    status, _h, again = _upload(s, mt.PNG, "image/png")
+    assert (status, again) == (201, payload)
+    assert os.stat(payload["path"]).st_mtime == 1000000
+
+
+def test_fix13_lora_action_timeout_is_504(env, monkeypatch):
+    def fake(argv, cwd, env=None, timeout=None):
+        return {"argv": argv, "exit_code": None, "stdout": "", "stderr": "", "timed_out": True}
+    monkeypatch.setattr(lib, "run_light", fake)
+    status, _h, payload = mt.api(env["srv"], "POST", "/api/loras/remove", body={"ws": env["ws"], "id": "pan"})
+    assert status == 504 and payload["error"].startswith("lora-catalog timed out")
+
+
+def test_fix13_character_empty_seed_upload_is_none(env):
+    base = {"name": "kyra", "phrase": "the woman", "class_noun": "woman", "descriptor": "tall", "trigger": None,
+            "seed": None, "seed_upload": "", "force": False}
+    assert srv.character_create_errors(base, env["state"]) == []

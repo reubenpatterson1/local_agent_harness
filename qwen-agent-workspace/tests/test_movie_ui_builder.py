@@ -160,3 +160,8 @@ def test_run_light_timeout_kills_grandchild(tmp_path):
                 os.kill(grand, 9)
             except OSError:
                 pass
+
+
+def test_run_light_nul_argv_returns_value_error_result(tmp_path):
+    result = lib.run_light(["true", "a\x00b"], str(tmp_path))
+    assert result["exit_code"] is None and result["stderr"].startswith("ValueError")
