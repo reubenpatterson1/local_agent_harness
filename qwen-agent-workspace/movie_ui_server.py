@@ -12,6 +12,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
 import http.server
 import json
 import os
@@ -1470,3 +1471,229 @@ MovieUIHandler.h_stories = _h_stories
 MovieUIHandler.h_story = _h_story
 MovieUIHandler.h_story_save = _h_story_save
 MovieUIHandler.h_files = _h_files
+
+
+# ---------------------------------------------------------------------------
+# Traces (MU20, MU71-MU74)
+# ---------------------------------------------------------------------------
+
+def trace_agents(ui_ws):
+    """MU71: one entry per agent on disk, with its loopback daemon URL from the registry."""
+    out = []
+    for agent in fleet_lib.agent_ids_on_disk():
+        a = fleet_lib.deploy_root(agent)
+        current = os.path.join(a, "current")
+        fleets = (os.path.join(current, fleet_lib.WS_SUBDIR, "fleets") if os.path.exists(current)
+                  else os.path.join(ui_ws, "fleets"))
+        port, files = fleet_lib.agent_port(fleets, agent)
+        entry = {"id": agent, "port": port, "port_source": "registry", "url": None, "error": None}
+        if not files:
+            entry["port"], entry["port_source"] = fleet_lib.DEFAULT_PORT, "default"
+        elif port is None:
+            entry["port_source"] = None
+            entry["error"] = "agent '%s' has different ports in %s in %s" % (agent, ", ".join(files), fleets)
+        if entry["port"] is not None:
+            entry["url"] = "http://127.0.0.1:%d" % entry["port"]
+        out.append(entry)
+    return out
+
+
+def trace_error_text(message):
+    """D9: fleet_lib's "daemon not reachable at" is shown as qwen-agentd status words it."""
+    prefix = "daemon not reachable at "
+    return "daemon: not reachable at " + message[len(prefix):] if message.startswith(prefix) else message
+
+
+def _strict_loads(raw):
+    """The strictly parsed JSON in raw (bytes), or None when it is not valid strict JSON."""
+    try:
+        return json.loads(raw.decode("utf-8"), parse_constant=_bad_constant)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _daemon_get(daemon_url, path, timeout, check):
+    """(obj, None) or (None, message): one loopback GET over http.client (Host 127.0.0.1:<port>, no Origin),
+    the read capped at TRACE_CLIENT_MAX_BYTES + 1 and the body parsed as strict JSON."""
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", int(daemon_url.rpartition(":")[2]), timeout=timeout)
+        try:
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            status, raw = resp.status, resp.read(fleet_lib.TRACE_CLIENT_MAX_BYTES + 1)
+        finally:
+            conn.close()
+    except Exception:
+        return None, trace_error_text("daemon not reachable at %s" % daemon_url)
+    if status in (401, 404):
+        return None, "the daemon at %s has no trace support (http %d)" % (daemon_url, status)
+    if status != 200:
+        return None, "the daemon at %s answered http %d" % (daemon_url, status)
+    obj = _strict_loads(raw) if len(raw) <= fleet_lib.TRACE_CLIENT_MAX_BYTES else None
+    if not check(obj):
+        return None, "the daemon at %s returned an unrecognized trace response" % daemon_url
+    return obj, None
+
+
+def _fetch_recent(daemon_url, n):
+    return _daemon_get(daemon_url, "/traces/recent?n=%d" % n, fleet_lib.TRACE_RECENT_TIMEOUT,
+                       fleet_lib.valid_recent_result)
+
+
+def _fetch_trace(daemon_url, trace_id):
+    return _daemon_get(daemon_url, "/trace?id=" + trace_id, fleet_lib.TRACE_QUERY_TIMEOUT,
+                       lambda obj: fleet_lib.valid_trace_result(obj, trace_id))
+
+
+def trace_skew(result):
+    """span_id of every record whose parent is present and starts after it (MU73)."""
+    starts = dict((r["span_id"], r["start"]) for r in result["records"])
+    return [r["span_id"] for r in result["records"]
+            if r["parent_span_id"] in starts and r["start"] < starts[r["parent_span_id"]]]
+
+
+def trace_view(agent, result, with_text):
+    view = {"agent": agent, "result": result, "skew": trace_skew(result)}
+    if with_text:
+        view["text"] = "\n".join(fleet_lib.render_trace(result)) + "\n"
+    return view
+
+
+def _h_trace_agents(self, groups, query, body):
+    return 200, {"default": default_agent(), "agents": trace_agents(self.server.ui_ws)}
+
+
+def _h_traces_recent(self, groups, query, body):
+    n_text = query.get("n", str(fleet_lib.TRACE_RECENT_DEFAULT))
+    if not (N_RE.fullmatch(n_text) and 1 <= int(n_text) <= fleet_lib.TRACE_RECENT_MAX):
+        raise ApiError(400, "n must be 1 to 100")
+    n = int(n_text)
+    agents = trace_agents(self.server.ui_ws)
+    wanted = query.get("agent", "all")
+    if wanted != "all":
+        agents = [a for a in agents if a["id"] == wanted]
+        if not agents:
+            raise ApiError(404, "unknown agent")
+    best, seen, errors = {}, {}, []
+    for agent in agents:
+        if agent["url"] is None:
+            errors.append({"agent": agent["id"], "error": agent["error"]})
+            continue
+        result, error = _fetch_recent(agent["url"], n)
+        if error is not None:
+            errors.append({"agent": agent["id"], "error": error})
+            continue
+        for item in result["traces"]:
+            tid = item["trace_id"]
+            seen.setdefault(tid, set()).add(agent["id"])
+            old = best.get(tid)
+            if old is None or (item["start"], agent["id"]) < (old[0]["start"], old[1]):
+                best[tid] = (item, agent["id"])
+    traces = []
+    for tid, (item, _agent) in best.items():
+        entry = dict(item)
+        entry["seen_on"] = sorted(seen[tid])
+        entry["agents"] = sorted(set(seen[tid]) | set(h.rpartition("@")[2] for h in item["delegated"]))
+        traces.append(entry)
+    traces.sort(key=lambda t: (-t["start"], t["trace_id"]))
+    return 200, {"traces": traces[:n], "errors": errors}
+
+
+def _agent_url(self, query):
+    agents = dict((a["id"], a) for a in trace_agents(self.server.ui_ws))
+    agent = query.get("agent") or default_agent()
+    if agent is None or agent not in agents:
+        raise ApiError(404, "unknown agent")
+    if agents[agent]["url"] is None:
+        raise ApiError(502, agents[agent]["error"])
+    return agent, agents[agent]["url"]
+
+
+def _fetch(self, groups, query):
+    agent, url = _agent_url(self, query)
+    result, error = _fetch_trace(url, groups[0])
+    if error is not None:
+        raise ApiError(502, error)
+    return agent, result
+
+
+def _h_trace(self, groups, query, body):
+    agent, result = _fetch(self, groups, query)
+    return 200, trace_view(agent, result, query.get("format") == "text")
+
+
+def _saved_path(server, trace_id):
+    if not fleet_lib.valid_trace_id(trace_id):
+        raise ApiError(404, "no saved trace")
+    return os.path.join(server.state, "traces", trace_id + ".json")
+
+
+def _h_trace_save(self, groups, query, body):
+    agent, result = _fetch(self, groups, {"agent": body.get("agent")})
+    path = _saved_path(self.server, groups[0])
+    lib.write_json_atomic(path, {"schema": lib.SAVED_TRACE_SCHEMA, "trace_id": groups[0], "agent": agent,
+                                 "saved_at": lib.utc_now(), "result": result})
+    return 200, {"saved": groups[0], "path": path}
+
+
+def load_saved(path, trace_id):
+    """(envelope, valid) for one saved trace file; envelope is None when it does not parse strictly."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(fleet_lib.TRACE_CLIENT_MAX_BYTES + 1)
+    except OSError:
+        return None, False
+    obj = _strict_loads(raw) if len(raw) <= fleet_lib.TRACE_CLIENT_MAX_BYTES else None
+    if not isinstance(obj, dict):
+        return None, False
+    valid = (obj.get("schema") == lib.SAVED_TRACE_SCHEMA and obj.get("trace_id") == trace_id
+             and fleet_lib.valid_trace_result(obj.get("result"), trace_id))
+    return obj, valid
+
+
+def _h_traces_saved(self, groups, query, body):
+    root = os.path.join(self.server.state, "traces")
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        names = []
+    out = []
+    for name in names:
+        trace_id = name[:-5]
+        if not (name.endswith(".json") and fleet_lib.valid_trace_id(trace_id)):
+            continue
+        obj, valid = load_saved(os.path.join(root, name), trace_id)
+        records = obj["result"]["records"] if valid else []
+        out.append({"trace_id": trace_id, "agent": (obj or {}).get("agent") if valid else None,
+                    "saved_at": (obj or {}).get("saved_at") if valid else None, "spans": len(records),
+                    "start": min(r["start"] for r in records) if records else None, "invalid": not valid})
+    out.sort(key=lambda s: (s["saved_at"] or "", s["trace_id"]), reverse=True)
+    return 200, {"saved": out}
+
+
+def _h_trace_saved(self, groups, query, body):
+    path = _saved_path(self.server, groups[0])
+    if not os.path.isfile(path):
+        raise ApiError(404, "no saved trace %s" % groups[0])
+    obj, valid = load_saved(path, groups[0])
+    if not valid:
+        raise ApiError(422, "saved trace is invalid")
+    return 200, trace_view(obj.get("agent"), obj["result"], True)
+
+
+def _h_trace_saved_delete(self, groups, query, body):
+    path = _saved_path(self.server, groups[0])
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        raise ApiError(404, "no saved trace %s" % groups[0])
+    return 200, {"deleted": groups[0]}
+
+
+MovieUIHandler.h_trace_agents = _h_trace_agents
+MovieUIHandler.h_traces_recent = _h_traces_recent
+MovieUIHandler.h_trace = _h_trace
+MovieUIHandler.h_trace_save = _h_trace_save
+MovieUIHandler.h_traces_saved = _h_traces_saved
+MovieUIHandler.h_trace_saved = _h_trace_saved
+MovieUIHandler.h_trace_saved_delete = _h_trace_saved_delete

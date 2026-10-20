@@ -470,3 +470,55 @@ def copy_ui(tmp):
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
 WEBP = b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 24
+
+
+# ---------------------------------------------------------------------------
+# Trace records and a fake daemon
+# ---------------------------------------------------------------------------
+
+def trace_record(trace_id, span_id, parent, agent, start, kind="turn", name="planner", dur_ms=1000,
+                 status="ok"):
+    attrs = {"turn": {"rounds": 1, "tool_calls": 0},
+             "run": {"skill": "planner", "request_id": "r1", "http": 200, "images": 0, "image_bytes": 0}}[kind]
+    return {"v": 1, "trace_id": trace_id, "span_id": span_id, "parent_span_id": parent, "agent": agent,
+            "kind": kind, "name": name, "start": start, "dur_ms": dur_ms, "status": status, "attrs": attrs}
+
+
+class FakeDaemon(object):
+    """http.server on 127.0.0.1:<free port> answering GET /traces/recent?n= and GET /trace?id= with
+    canned bodies (recent: a dict, traces: {trace_id: result dict}); records each request's headers."""
+
+    def __init__(self, agent, recent=None, traces=None, status=200):
+        self.agent, self.recent, self.traces, self.status = agent, recent, traces or {}, status
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                outer.requests.append({"path": self.path, "headers": dict(self.headers.items())})
+                if self.path.startswith("/traces/recent"):
+                    obj = outer.recent if outer.recent is not None else {
+                        "schema": fleet_lib.RECENT_SCHEMA, "agent": outer.agent, "traces": []}
+                elif self.path.startswith("/trace?id="):
+                    obj = outer.traces.get(self.path[len("/trace?id="):])
+                else:
+                    obj = None
+                code = outer.status if obj is not None else 404
+                data = json.dumps(obj if obj is not None else {"error": "not found"}).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
