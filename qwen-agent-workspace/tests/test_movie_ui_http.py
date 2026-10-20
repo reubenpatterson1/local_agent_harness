@@ -302,3 +302,180 @@ def test_mut23_workspaces_labels_default_and_prune(env, monkeypatch):
     assert srv.default_agent() is None
     typed = mt.api(s, "GET", "/api/options?ws=" + os.path.join(env["tmp"]))
     assert typed[:3:2] == (400, {"error": "not a harness workspace (no bin/ltx-movie): %s" % env["tmp"]})
+
+
+def _compose(env, **overrides):
+    return mt.fields(env["ws"], **overrides)
+
+
+def test_mut2_preview_argv_is_the_job_argv(env):
+    s = env["srv"]
+    free = mt.fake_safetensors(os.path.join(env["tmp"], "free.safetensors"))
+    sets = [_compose(env),
+            _compose(env, action="regenerate", goal="Keep it tense."),
+            _compose(env, panels=None, length=30, mode="shots", story_model="qwen38",
+                     stills_loras=[{"id": None, "path": free, "strength": 0.7, "kind": None}])]
+    for body in sets:
+        status, _h, preview = mt.api(s, "POST", "/api/preview", body=body)
+        assert status == 200 and preview["errors"] == []
+        assert preview["command"] == shlex.join(preview["argv"])
+        status, _h, created = mt.api(s, "POST", "/api/jobs", body=body)
+        assert status == 201, created
+        assert all(c["status"] != "fail" for c in created["checks"])
+        job = lib.read_job(lib.job_dir(env["state"], created["job"]["id"]))
+        assert job["argv"] == preview["argv"]
+        assert job["fields"]["ws"] == env["ws"] and job["workspace"] == env["ws"]
+        assert job["kind"] == "story" and job["story_id"] == "ronin-rescue" and job["character"] is None
+        assert created["job"]["state"] == "queued" and created["job"]["progress"] is None
+    status, _h, bad = mt.api(s, "POST", "/api/preview", body=_compose(env, panels=0))
+    assert (status, bad["argv"], bad["command"]) == (200, None, None)
+    assert bad["errors"] == ["panels must be an integer from 1 to 200"]
+    status, _h, refused = mt.api(s, "POST", "/api/jobs", body=_compose(env, panels=0))
+    assert status == 409 and refused["error"] == "validation failed" and refused["checks"][0]["status"] == "fail"
+    status, _h, valid = mt.api(s, "POST", "/api/validate", body=_compose(env))
+    assert status == 200 and valid["ok"] is True and valid["argv"] == mt.api(s, "POST", "/api/preview",
+                                                                             body=_compose(env))[2]["argv"]
+    jobs = mt.api(s, "GET", "/api/jobs")[2]
+    assert jobs["running"] is None and jobs["history"] == []
+    assert [j["queue_position"] for j in jobs["queued"]] == [1, 2, 3]
+    assert set(jobs["queued"][0]) == {"id", "kind", "state", "workspace", "story_id", "character", "created",
+                                      "started", "ended", "exit_code", "error", "queue_position", "command",
+                                      "progress"}
+
+
+def test_mut13_mut14_job_actions_over_http(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    a, b = mt.make_job(state, ["true"], ws), mt.make_job(state, ["true"], ws)
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": b, "direction": "up"})[:3:2] == (200, {"queued": [b, a]})
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": b, "direction": "sideways"})[0] == 400
+    status, _h, payload = mt.api(s, "POST", "/api/jobs/%s/cancel" % a, body={})
+    assert (status, payload) == (200, {"state": "cancelled"})
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % a, body={})[:3:2] == (
+        409, {"error": "job %s is not queued or running" % a})
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": a, "direction": "up"})[:3:2] == (
+        409, {"error": "job %s is not queued" % a})
+    assert mt.api(s, "DELETE", "/api/jobs/%s" % b)[:3:2] == (409, {"error": "job %s is not finished" % b})
+    assert mt.api(s, "DELETE", "/api/jobs/%s" % a)[:3:2] == (200, {"deleted": a})
+    assert mt.api(s, "GET", "/api/jobs/%s" % a)[0] == 404
+    assert mt.api(s, "GET", "/api/jobs/20261019-000000-0000")[0] == 404
+    detail = mt.api(s, "GET", "/api/jobs/%s" % b)[2]
+    assert detail["status"] == {"state": "queued"} and detail["progress"] is None and detail["orphan"] is None
+    assert detail["window"] == {"start": None, "end": None} and detail["job"]["id"] == b
+    running = mt.make_job(state, ["true"], ws, status={"state": "running", "dispatched": lib.utc_now(),
+                                                         "runner_pid": 1, "pgid": None, "started": lib.utc_now()})
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % running, body={})[:3:2] == (202, {"state": "cancelling"})
+    assert os.path.exists(os.path.join(lib.job_dir(state, running), "cancel"))
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        lost = mt.make_job(state, ["true"], ws, status={
+            "state": "lost", "dispatched": lib.utc_now(), "runner_pid": 1, "pgid": orphan.pid,
+            "started": lib.utc_now(), "exit_code": None, "ended": None, "detected": lib.utc_now()})
+        assert mt.api(s, "GET", "/api/jobs/%s" % lost)[2]["orphan"] == {"pgid": orphan.pid, "alive": True}
+        assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % lost, body={})[:3:2] == (
+            400, {"error": "confirm must be true"})
+        assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % lost, body={"confirm": "yes"})[0] == 400
+        assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % lost, body={"confirm": True})[:3:2] == (
+            200, {"killed": orphan.pid})
+        orphan.wait(5)
+        assert mt.api(s, "POST", "/api/jobs/%s/kill-orphan" % lost, body={"confirm": True})[:3:2] == (
+            409, {"error": "job %s has no live orphan process group" % lost})
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+    jobs = mt.api(s, "GET", "/api/jobs")[2]
+    assert jobs["running"]["id"] == running and jobs["running"]["progress"]["phase"] is None
+    assert [j["id"] for j in jobs["queued"]] == [b]
+    assert [j["id"] for j in jobs["history"]] == [lost]
+
+
+def test_mut17_log_offsets_chain_on_character_boundaries(env):
+    s, state = env["srv"], env["state"]
+    job_id = mt.make_job(state, ["true"], env["ws"])
+    data = b"a" * 262143 + "€".encode("utf-8") + b"b" * (300 * 1024 - 262146)
+    with open(os.path.join(lib.job_dir(state, job_id), "log.txt"), "wb") as f:
+        f.write(data)
+    first = mt.api(s, "GET", "/api/jobs/%s/log" % job_id)[2]
+    assert (first["offset"], first["next_offset"], first["size"], first["eof"]) == (0, 262143, len(data), False)
+    assert first["text"] == "a" * 262143
+    text, offset, rounds = first["text"], first["next_offset"], 1
+    while True:
+        chunk = mt.api(s, "GET", "/api/jobs/%s/log?offset=%d" % (job_id, offset))[2]
+        text += chunk["text"]
+        offset = chunk["next_offset"]
+        rounds += 1
+        if chunk["eof"]:
+            break
+    assert text == data.decode("utf-8") and offset == len(data) and rounds == 2
+    tail = mt.api(s, "GET", "/api/jobs/%s/log?offset=%d" % (job_id, len(data) + 50))[2]
+    assert (tail["text"], tail["next_offset"], tail["eof"]) == ("", len(data), True)
+    assert mt.api(s, "GET", "/api/jobs/%s/log?offset=-1" % job_id)[:3:2] == (400, {"error": "invalid offset"})
+    assert mt.api(s, "GET", "/api/jobs/%s/log?offset=1234567890123456" % job_id)[0] == 400
+    assert srv.utf8_cut("a€".encode()[:-1]) == b"a" and srv.utf8_cut("a€".encode()) == "a€".encode()
+    assert srv.utf8_cut("😀".encode()[:3]) == b"" and srv.utf8_cut("😀".encode()) == "😀".encode()
+
+
+def test_review_focus_4_two_tabs_submit_at_once(env):
+    """Review Focus 4: two browser tabs (or a double click) submit jobs at the same moment."""
+    s = env["srv"]
+    results = []
+
+    def submit(i):
+        results.append(mt.api(s, "POST", "/api/jobs", body=_compose(env, story_id="story-%d" % i)))
+    threads = [threading.Thread(target=submit, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert sorted(r[0] for r in results) == [201] * 8
+    ids = [r[2]["job"]["id"] for r in results]
+    assert len(set(ids)) == 8
+    assert sorted(lib.read_queue(env["state"])) == sorted(ids)
+    assert sorted(lib.list_job_ids(env["state"])) == sorted(ids)
+
+
+def test_review_focus_5_undecodable_bytes_in_a_running_log(env):
+    """Review Focus 5: ffmpeg or a model prints bytes that are not UTF-8 while the page polls."""
+    s, state = env["srv"], env["state"]
+    job_id = mt.make_job(state, ["true"], env["ws"], status={"state": "running", "dispatched": lib.utc_now(),
+                                                               "runner_pid": 1, "pgid": None, "started": lib.utc_now()})
+    log = os.path.join(lib.job_dir(state, job_id), "log.txt")
+    with open(log, "wb") as f:
+        f.write(b"\xff\xfe\x00junk\n=== Phase 4: render ===\n=== panel 1/2 (a) ===\npanel 1 ok: caf\xc3")
+    progress = mt.api(s, "GET", "/api/jobs/%s" % job_id)[2]["progress"]
+    assert progress["phase"] == "4" and progress["panels"] == {"1": {"state": "running"}}
+    assert progress["last_line"] == "panel 1 ok: caf"
+    with open(log, "ab") as f:
+        f.write(b"\xa9.mp4 (1.0s)\n")
+    progress = mt.api(s, "GET", "/api/jobs")[2]["running"]["progress"]
+    assert progress["panels"] == {"1": {"state": "ok", "reused": False}}
+    assert progress["last_line"] == "panel 1 ok: café.mp4 (1.0s)"
+    chunk = mt.api(s, "GET", "/api/jobs/%s/log" % job_id)[2]
+    assert chunk["text"].startswith("��\x00junk\n") and chunk["eof"] is True
+
+
+def test_jobs_blocked_by_live_orphan(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    assert mt.api(s, "GET", "/api/jobs")[2]["blocked_by"] is None
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        lost = mt.make_job(state, ["true"], ws, status={
+            "state": "lost", "dispatched": lib.utc_now(), "runner_pid": 1, "pgid": orphan.pid,
+            "started": lib.utc_now(), "exit_code": None, "ended": None, "detected": lib.utc_now()})
+        assert mt.api(s, "GET", "/api/jobs")[2]["blocked_by"] == {"job": lost, "pgid": orphan.pid}
+    finally:
+        orphan.kill()
+        orphan.wait(5)
+
+
+def test_job_delete_failure_is_500_and_job_stays(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    done = mt.make_job(state, ["true"], ws, status={"state": "done", "exit_code": 0, "ended": lib.utc_now()})
+
+    def boom(path, *a, **k):
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(lib.shutil, "rmtree", boom)
+    status, _h, payload = mt.api(s, "DELETE", "/api/jobs/%s" % done)
+    assert status == 500
+    assert payload == {"error": "cannot delete job %s: Permission denied" % done}
+    jobs = mt.api(s, "GET", "/api/jobs")[2]
+    assert [j["id"] for j in jobs["history"]] == [done]

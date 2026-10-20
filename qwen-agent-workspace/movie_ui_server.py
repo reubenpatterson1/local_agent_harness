@@ -656,3 +656,213 @@ def main(argv):
     sys.stdout.write("movie-ui: stopped\n")
     sys.stdout.flush()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Compose and jobs (MU44, MU58, MU66-MU68)
+# ---------------------------------------------------------------------------
+
+COMPOSE_KINDS = {"story": "story", "regenerate": "story", "movie": "movie", "redo": "movie"}
+
+
+def job_summary(server, job_id, queue):
+    """MU67's summary object for one job, or None when job.json is unreadable."""
+    job = server.job(job_id)
+    if job is None:
+        return None
+    status = lib.read_status(lib.job_dir(server.state, job_id)) or {}
+    state = lib.job_state(server.state, job_id, queue)
+    return {"id": job_id, "kind": job["kind"], "state": state, "workspace": job["workspace"],
+            "story_id": job["story_id"], "character": job["character"], "created": job["created"],
+            "started": status.get("started"), "ended": status.get("ended"), "exit_code": status.get("exit_code"),
+            "error": status.get("error"), "queue_position": queue.index(job_id) + 1 if state == "queued" else None,
+            "command": shlex.join(job["argv"]),
+            "progress": server.progress(job_id, job, status) if state in lib.ACTIVE_STATES else None}
+
+
+def _fields_body(body):
+    fields = lib.compose_fields(body)
+    fields["ws"] = resolve_ws(body.get("ws"))
+    return fields
+
+
+def _preview(server, fields):
+    errors = lib.validate_fields(fields, fields["ws"], server.state)
+    if errors:
+        return None, errors
+    return lib.build_argv(fields, fields["ws"], server.state), errors
+
+
+def _h_preview(self, groups, query, body):
+    fields = _fields_body(body)
+    argv, errors = _preview(self.server, fields)
+    return 200, {"argv": argv, "command": shlex.join(argv) if argv else None, "errors": errors}
+
+
+def _h_validate(self, groups, query, body):
+    fields = _fields_body(body)
+    checks = lib.run_checks(fields, fields["ws"], self.server.state)
+    argv, _errors = _preview(self.server, fields)
+    return 200, {"ok": lib.checks_pass(checks), "checks": checks, "argv": argv,
+                 "command": shlex.join(argv) if argv else None}
+
+
+def create_compose_job(server, fields):
+    """Create the queued job of a validated compose submission; returns its ID."""
+    state, real = server.state, fields["ws"]
+    with STORE_LOCK:
+        job_id = lib.new_job_id(state)
+        argv = lib.build_argv(fields, real, state)
+        return lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"], None,
+                              argv, fields)["id"]
+
+
+def _h_job_create(self, groups, query, body):
+    fields = _fields_body(body)
+    checks = lib.run_checks(fields, fields["ws"], self.server.state)
+    if not lib.checks_pass(checks):
+        raise ApiError(409, "validation failed", checks=checks)
+    job_id = create_compose_job(self.server, fields)
+    return 201, {"job": job_summary(self.server, job_id, lib.read_queue(self.server.state)), "checks": checks}
+
+
+def _h_jobs(self, groups, query, body):
+    server = self.server
+    queue = lib.read_queue(server.state)
+    running, history = None, []
+    for job_id in sorted(lib.list_job_ids(server.state), reverse=True):
+        summary = job_summary(server, job_id, queue)
+        if summary is None:
+            continue
+        if summary["state"] in lib.ACTIVE_STATES and running is None:
+            running = summary
+        elif summary["state"] in lib.FINISHED_STATES and len(history) < HISTORY_MAX:
+            history.append(summary)
+    queued = [s for s in (job_summary(server, i, queue) for i in queue) if s is not None]
+    blocked_by = None
+    for job_id in lib.list_job_ids(server.state):
+        info = lib.orphan_info(lib.read_status(lib.job_dir(server.state, job_id)))
+        if info is not None:
+            blocked_by = {"job": job_id, "pgid": info["pgid"]}
+            break
+    return 200, {"running": running, "queued": queued, "history": history, "blocked_by": blocked_by}
+
+
+def _known_job(server, job_id):
+    job = server.job(job_id)
+    if job is None:
+        raise ApiError(404, "unknown job %s" % job_id)
+    return job
+
+
+def _h_job(self, groups, query, body):
+    server, job_id = self.server, groups[0]
+    job = _known_job(server, job_id)
+    status = lib.read_status(lib.job_dir(server.state, job_id))
+    if status is None:
+        shown = {"state": lib.job_state(server.state, job_id, lib.read_queue(server.state))}
+    else:
+        shown = status
+    return 200, {"job": job, "status": shown,
+                 "progress": server.progress(job_id, job, status) if status is not None else None,
+                 "orphan": lib.orphan_info(status),
+                 "window": {"start": (status or {}).get("started"), "end": (status or {}).get("ended")}}
+
+
+def utf8_cut(data):
+    """data without a trailing incomplete UTF-8 sequence (at most 3 bytes are dropped; MU58)."""
+    for back in range(1, min(3, len(data)) + 1):
+        byte = data[-back]
+        if byte & 0xC0 == 0x80:
+            continue
+        need = 2 if byte & 0xE0 == 0xC0 else 3 if byte & 0xF0 == 0xE0 else 4 if byte & 0xF8 == 0xF0 else 1
+        return data[:-back] if need > back else data
+    return data
+
+
+def _h_job_log(self, groups, query, body):
+    server, job_id = self.server, groups[0]
+    offset = query.get("offset", "0")
+    if not OFFSET_RE.fullmatch(offset):
+        raise ApiError(400, "invalid offset")
+    _known_job(server, job_id)
+    n = int(offset)
+    path = os.path.join(lib.job_dir(server.state, job_id), "log.txt")
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            if n >= size:
+                data = b""
+            else:
+                f.seek(n)
+                data = utf8_cut(f.read(LOG_CHUNK))
+    except OSError:
+        raise ApiError(404, "unknown job %s" % job_id)
+    nxt = size if n >= size else n + len(data)
+    return 200, {"offset": n, "next_offset": nxt, "size": size, "eof": nxt >= size,
+                 "text": data.decode("utf-8", "replace")}
+
+
+def _h_job_cancel(self, groups, query, body):
+    job_id = groups[0]
+    _known_job(self.server, job_id)
+    with STORE_LOCK:
+        result = lib.cancel_job(self.server.state, job_id)
+    if result == "cancelled":
+        return 200, {"state": "cancelled"}
+    if result == "cancelling":
+        return 202, {"state": "cancelling"}
+    raise ApiError(409, "job %s is not queued or running" % job_id)
+
+
+def _h_queue_move(self, groups, query, body):
+    job_id, direction = body.get("id"), body.get("direction")
+    if direction not in ("up", "down"):
+        raise ApiError(400, "direction must be up or down")
+    if not (isinstance(job_id, str) and lib.JOB_ID_RE.fullmatch(job_id)):
+        raise ApiError(409, "job %s is not queued" % (job_id,))
+    with STORE_LOCK:
+        queue = lib.move_job(self.server.state, job_id, direction)
+    if queue is None:
+        raise ApiError(409, "job %s is not queued" % job_id)
+    return 200, {"queued": queue}
+
+
+def _h_job_delete(self, groups, query, body):
+    job_id = groups[0]
+    _known_job(self.server, job_id)
+    with STORE_LOCK:
+        try:
+            deleted = lib.delete_job(self.server.state, job_id)
+        except OSError as e:
+            raise ApiError(500, "cannot delete job %s: %s" % (job_id, e.strerror or e))
+    if not deleted:
+        raise ApiError(409, "job %s is not finished" % job_id)
+    self.server.job_cache.pop(job_id, None)
+    with self.server.parser_lock:
+        self.server.parsers.pop(job_id, None)
+    return 200, {"deleted": job_id}
+
+
+def _h_job_kill_orphan(self, groups, query, body):
+    job_id = groups[0]
+    if body.get("confirm") is not True:
+        raise ApiError(400, "confirm must be true")
+    _known_job(self.server, job_id)
+    with STORE_LOCK:
+        pgid = lib.kill_orphan(self.server.state, job_id)
+    if pgid is None:
+        raise ApiError(409, "job %s has no live orphan process group" % job_id)
+    return 200, {"killed": pgid}
+
+
+MovieUIHandler.h_preview = _h_preview
+MovieUIHandler.h_validate = _h_validate
+MovieUIHandler.h_job_create = _h_job_create
+MovieUIHandler.h_jobs = _h_jobs
+MovieUIHandler.h_job = _h_job
+MovieUIHandler.h_job_log = _h_job_log
+MovieUIHandler.h_job_cancel = _h_job_cancel
+MovieUIHandler.h_queue_move = _h_queue_move
+MovieUIHandler.h_job_delete = _h_job_delete
+MovieUIHandler.h_job_kill_orphan = _h_job_kill_orphan
