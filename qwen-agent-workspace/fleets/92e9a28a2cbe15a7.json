@@ -1,0 +1,35 @@
+{
+  "protocol": 1,
+  "fleet_id": "92e9a28a2cbe15a7",
+  "hosts": {
+    "orchestrator": {
+      "role": "orchestrator",
+      "address": "192.168.1.170",
+      "model_server": {"type": "vllm", "url": "http://127.0.0.1:8000/v1"},
+      "model": "PLACEHOLDER-70B",
+      "skills": []
+    },
+    "ollama-168": {
+      "role": "agent",
+      "address": "192.168.1.168",
+      "model_server": {"type": "ollama", "url": "http://127.0.0.1:11434/v1"},
+      "model": "qwen3.5:9b",
+      "skills": ["researcher"]
+    },
+    "mac-local": {
+      "role": "agent",
+      "address": "192.168.1.199",
+      "model_server": {"type": "vllm", "url": "http://127.0.0.1:8177/v1"},
+      "model": "qwen38-6bit",
+      "skills": ["investigator", "analyst", "planner"]
+    },
+    "vision-185": {
+      "role": "agent",
+      "address": "192.168.1.185",
+      "port": 8190,
+      "model_server": {"type": "vllm", "url": "http://127.0.0.1:8177/v1"},
+      "model": "DreamFast/Qwen3-VL-4b-Heretic",
+      "skills": ["vision"]
+    }
+  }
+}
