@@ -1091,7 +1091,7 @@ def choose_snapshot(repo_dir):
         with open(os.path.join(repo_dir, "refs", "main"), "r", encoding="utf-8") as f:
             rev = f.read().strip()
         return os.path.join(repo_dir, "snapshots", rev), None
-    except OSError:
+    except (OSError, ValueError):
         pass
     try:
         snaps = sorted(n for n in os.listdir(os.path.join(repo_dir, "snapshots"))
@@ -1108,10 +1108,16 @@ def _nonempty_file(path):
     return os.path.isfile(real) and os.path.getsize(real) > 0
 
 
-def intact_problems(snapshot, repo_dir=None):
-    """V3's intact rules (b)-(e) on one snapshot (or an absolute model directory when repo_dir is
-    None). The config.json clause of the brief is not applied (D3, Q3)."""
-    problems = []
+MAX_MODEL_WALK_ENTRIES = 20000
+
+
+def intact_scan(snapshot, repo_dir=None):
+    """(problems, notes): V3's intact rules (b)-(e) on one snapshot (or an absolute model directory
+    when repo_dir is None; that walk is capped at MAX_MODEL_WALK_ENTRIES). The config.json clause of
+    the brief is not applied (D3, Q3). An index listing none of the present shards is stale: ignored
+    with a note, as mlx_lm loads by glob."""
+    problems, notes = [], []
+    visited = 0
     if repo_dir is not None:
         try:
             partial = [n for n in os.listdir(os.path.join(repo_dir, "blobs")) if n.endswith(".incomplete")]
@@ -1122,6 +1128,9 @@ def intact_problems(snapshot, repo_dir=None):
     safetensors, indexes = 0, []
     for dirpath, dirnames, filenames in os.walk(snapshot, followlinks=False):
         dirnames.sort()
+        visited += len(dirnames) + len(filenames)
+        if repo_dir is None and visited > MAX_MODEL_WALK_ENTRIES:
+            return ["too many files under %s (more than %d)" % (snapshot, MAX_MODEL_WALK_ENTRIES)], notes
         for name in sorted(filenames):
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, snapshot)
@@ -1143,11 +1152,19 @@ def intact_problems(snapshot, repo_dir=None):
         if not (isinstance(data, dict) and isinstance(data.get("weight_map"), dict)):
             problems.append("unreadable index: %s" % rel)
             continue
-        for shard in sorted(set(v for v in data["weight_map"].values() if isinstance(v, str))):
+        shards = sorted(set(v for v in data["weight_map"].values() if isinstance(v, str)))
+        if safetensors and not any(os.path.lexists(os.path.join(os.path.dirname(index), v)) for v in shards):
+            notes.append("index lists none of the present shards; ignored")
+            continue
+        for shard in shards:
             path = os.path.join(os.path.dirname(index), shard)
             if not _nonempty_file(path):
                 problems.append("missing shard: %s" % os.path.relpath(path, snapshot))
-    return problems
+    return problems, notes
+
+
+def intact_problems(snapshot, repo_dir=None):
+    return intact_scan(snapshot, repo_dir)[0]
 
 
 def model_check(model_id, hub):
@@ -1155,16 +1172,16 @@ def model_check(model_id, hub):
     if os.path.isabs(model_id):
         if not os.path.isdir(model_id):
             return False, "%s is not a directory" % model_id
-        problems = intact_problems(model_id)
-        return (False, "; ".join(problems)) if problems else (True, model_id)
+        problems, notes = intact_scan(model_id)
+        return (False, "; ".join(problems)) if problems else (True, "; ".join([model_id] + notes))
     repo_dir = os.path.join(hub, repo_dir_name(model_id))
     if not os.path.isdir(repo_dir):
         return False, "%s is not in %s" % (model_id, hub)
     snapshot, reason = choose_snapshot(repo_dir)
     if snapshot is None:
         return False, "cannot choose a snapshot of %s (%s)" % (model_id, reason)
-    problems = intact_problems(snapshot, repo_dir)
-    return (False, "; ".join(problems)) if problems else (True, snapshot)
+    problems, notes = intact_scan(snapshot, repo_dir)
+    return (False, "; ".join(problems)) if problems else (True, "; ".join([snapshot] + notes))
 
 
 def model_checks(fields, ws_real):

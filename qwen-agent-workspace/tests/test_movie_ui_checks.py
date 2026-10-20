@@ -252,3 +252,31 @@ def test_mu63_list_models(env, monkeypatch):
     assert rows == [("hf", "Tongyi-MAI/Z-Image-Turbo", True, [], 18),
                     ("ltx", "org/a--model", False, ["download incomplete: 1 partial blob(s)"], 19),
                     ("ltx", "org/b-model", True, [], 18)]
+
+
+def test_mut5_v3_stale_index_refs_and_walk_cap(env, monkeypatch):
+    tmp = env["tmp"]
+    ltx = os.path.join(tmp, "ltxcache")
+    monkeypatch.setenv("LTX2_MLX_HF_HOME", ltx)
+    hub = os.path.join(ltx, "hub")
+    five = json.dumps({"weight_map": {"k%d" % i: "model-0000%d-of-00005.safetensors" % i for i in range(5)}}).encode()
+    stale = {"model.safetensors.index.json": five, "a.safetensors": b"\x01", "b.safetensors": b"\x02"}
+    repo = mt.make_hf_cache(ltx, "org/stale", stale)
+    snap = os.path.join(repo, "snapshots", "0123456789abcdef0123456789abcdef01234567")
+    assert lib.model_check("org/stale", hub) == (True, snap + "; index lists none of the present shards; ignored")
+    some = dict(stale, **{"model-00000-of-00005.safetensors": b"\x01"})
+    mt.make_hf_cache(ltx, "org/some", some)
+    ok, detail = lib.model_check("org/some", hub)
+    assert not ok and "missing shard: model-00001-of-00005.safetensors" in detail
+    # an undecodable refs/main is treated as unreadable (single snapshot still chosen)
+    with open(os.path.join(repo, "refs", "main"), "wb") as f:
+        f.write(b"\xff\xfe")
+    assert lib.model_check("org/stale", hub)[0] is True
+    # absolute-path walk cap
+    local = os.path.join(tmp, "big-model")
+    os.makedirs(local)
+    for i in range(5):
+        with open(os.path.join(local, "f%d.safetensors" % i), "wb") as f:
+            f.write(b"\x01")
+    monkeypatch.setattr(lib, "MAX_MODEL_WALK_ENTRIES", 3)
+    assert lib.model_check(local, hub) == (False, "too many files under %s (more than 3)" % local)
