@@ -497,7 +497,7 @@ def orphan_info(status):
     if not isinstance(status, dict) or status.get("state") != "lost":
         return None
     pgid = status.get("pgid")
-    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1 or pgid == os.getpgrp():
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1 or pgid >= 2 ** 31 or pgid == os.getpgrp():
         return None
     return {"pgid": pgid, "alive": True} if group_alive(pgid) else None
 

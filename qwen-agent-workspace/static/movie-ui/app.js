@@ -99,12 +99,13 @@
     return {status: response.status, data: data};
   }
 
+  let pendingConfirm = null;
   function askConfirm(text) {
+    if (pendingConfirm) { pendingConfirm(false); }
     return new Promise(function (resolve) {
       const dialog = $("#confirm");
-      $("#confirm-text").textContent = text;
-      show(dialog, true);
       function done(answer) {
+        pendingConfirm = null;
         show(dialog, false);
         $("#confirm-yes").removeEventListener("click", yes);
         $("#confirm-no").removeEventListener("click", no);
@@ -112,8 +113,12 @@
       }
       function yes() { done(true); }
       function no() { done(false); }
+      pendingConfirm = done;
+      $("#confirm-text").textContent = text;
+      show(dialog, true);
       $("#confirm-yes").addEventListener("click", yes);
       $("#confirm-no").addEventListener("click", no);
+      $("#confirm-no").focus();
     });
   }
 

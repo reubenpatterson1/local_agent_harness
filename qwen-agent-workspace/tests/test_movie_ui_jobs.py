@@ -421,3 +421,16 @@ def test_mut15_bin_movie_ui_lock_port_and_startup_lines(tmp_path):
 def test_orphan_info_ignores_the_servers_own_group():
     status = {"state": "lost", "pgid": os.getpgrp()}
     assert lib.orphan_info(status) is None
+
+
+def test_final2_oversized_orphan_pgid_is_ignored(state, tmp_path):
+    lost = mt.make_job(state, ["true"], str(tmp_path),
+                       status={"state": "lost", "exit_code": None, "ended": None, "pgid": 2 ** 31,
+                               "detected": lib.utc_now()})
+    queued = mt.make_job(state, ["true"], str(tmp_path))
+    try:
+        assert lib.orphan_info(mt.status_of(state, lost)) is None
+        assert lib.dispatch_tick(state, mt.WS) == queued
+    finally:
+        # mt.kill_everything would os.killpg the oversized pgid and overflow
+        lib.write_status(lib.job_dir(state, lost), {"state": "lost", "pgid": None})

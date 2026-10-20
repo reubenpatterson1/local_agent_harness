@@ -1062,3 +1062,49 @@ def test_mut14_smoke_job_runs_the_stub_render_and_deletes_its_directory(env, mon
     assert call["argv"][:2] == [os.path.join(sdir, "manifest.json"), os.path.join(sdir, "smoke.mp4")]
     assert mt.api(s, "DELETE", "/api/jobs/%s" % job["id"])[:3:2] == (200, {"deleted": job["id"]})
     assert not os.path.exists(sdir) and not os.path.exists(lib.job_dir(state, job["id"]))
+
+
+def test_final1_story_save_unreadable_story_is_409(env):
+    if os.geteuid() == 0:
+        pytest.skip("root can read mode-000 files")
+    s, ws = env["srv"], env["ws"]
+    sdir = _make_story(ws, "ronin-rescue", "ORIGINAL")
+    path = os.path.join(sdir, "story.md")
+    os.chmod(path, 0)
+    try:
+        status, _h, payload = mt.api(s, "PUT", "/api/stories/ronin-rescue/story.md",
+                                     body={"ws": ws, "text": "NEW", "base_sha256": None})
+    finally:
+        os.chmod(path, 0o644)
+    assert status == 409
+    assert payload == {"error": "story.md exists but cannot be read; fix its permissions and reload", "sha256": None}
+    with open(path, "rb") as f:
+        assert f.read() == b"ORIGINAL"
+    assert not [n for n in os.listdir(sdir) if n.startswith("story.md.bak-")]
+
+
+def test_final3_unencodable_api_error_message_is_replaced(env, monkeypatch):
+    def boom(self, groups, query, body):
+        raise srv.ApiError(502, "bad \udcff", run={"argv": ["\udcff"]})
+    monkeypatch.setattr(srv.MovieUIHandler, "h_models", boom)
+    status, _h, payload = mt.api(env["srv"], "GET", "/api/models?ws=" + env["ws"])
+    assert (status, payload) == (502, {"error": "bad ?"})
+
+
+def test_final4_lora_action_timeouts(env, monkeypatch):
+    seen = []
+
+    def fake(argv, cwd, env=None, timeout=None):
+        seen.append(timeout)
+        return {"argv": argv, "exit_code": None, "stdout": "", "stderr": "", "timed_out": True}
+    monkeypatch.setattr(lib, "run_light", fake)
+    s, ws = env["srv"], env["ws"]
+    status, _h, payload = mt.api(s, "POST", "/api/loras/verify", body={"ws": ws, "ids": ["pan"]})
+    assert status == 504 and payload["error"] == "lora-catalog timed out after 300 s"
+    status = mt.api(s, "POST", "/api/loras/remove", body={"ws": ws, "id": "pan"})[0]
+    assert status == 504
+    body = {"ws": ws, "path": "/x.safetensors", "id": "pan", "kind": "style", "target": "video",
+            "base_models": ["m"], "triggers": [], "description": "d", "use_when": "u",
+            "default_strength": 0.8, "strength_range": [0.2, 1.0]}
+    assert mt.api(s, "POST", "/api/loras", body=body)[0] == 504
+    assert seen == [lib.VERIFY_TIMEOUT, lib.LIGHT_TIMEOUT, lib.VERIFY_TIMEOUT]

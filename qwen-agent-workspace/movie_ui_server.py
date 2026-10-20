@@ -366,7 +366,10 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             if result is not None:
                 self.send_json(result[0], result[1])
         except ApiError as e:
-            self.send_json(e.status, e.body)
+            try:
+                self.send_json(e.status, e.body)
+            except ValueError:
+                self.send_json(e.status, {"error": e.body["error"].encode("utf-8", "replace").decode("utf-8")})
             return
         except Exception as e:
             self._logged_500 = True
@@ -946,10 +949,11 @@ def _check_arg(key, value):
         raise ApiError(400, "%s must not start with '-'" % key)
 
 
-def _lora_action(real, args):
-    run = lib.run_light(lib.tool_argv(real, "lora-catalog", *args), real)
+def _lora_action(real, args, timeout=None):
+    limit = lib.LIGHT_TIMEOUT if timeout is None else timeout
+    run = lib.run_light(lib.tool_argv(real, "lora-catalog", *args), real, timeout=limit)
     if run["timed_out"]:
-        raise ApiError(504, "lora-catalog timed out after %d s" % lib.LIGHT_TIMEOUT, run=run)
+        raise ApiError(504, "lora-catalog timed out after %d s" % limit, run=run)
     return run
 
 
@@ -1009,7 +1013,7 @@ def _h_lora_add(self, groups, query, body):
         args += ["--rank", str(rank)]
     if alpha is not None:
         args += ["--alpha", str(alpha)]
-    return 200, {"run": _lora_action(real, args)}
+    return 200, {"run": _lora_action(real, args, timeout=lib.VERIFY_TIMEOUT)}
 
 
 def _h_lora_remove(self, groups, query, body):
@@ -1048,7 +1052,7 @@ def _h_lora_verify(self, groups, query, body):
         raise ApiError(400, "ids must be a list of strings")
     for item in ids:
         _check_arg("ids", item)
-    run = _lora_action(real, ["verify"] + ids)
+    run = _lora_action(real, ["verify"] + ids, timeout=lib.VERIFY_TIMEOUT)
     return 200, {"run": run, "results": parse_verify(run["stdout"])}
 
 
@@ -1377,6 +1381,8 @@ def _h_story_save(self, groups, query, body):
             if job is not None and job["workspace"] == real and job["story_id"] == story_id:
                 raise ApiError(409, "story %s is in use by job %s" % (story_id, job_id))
         raw = _read_bytes(path, sdir)
+        if raw is None and os.path.lexists(path):
+            raise ApiError(409, "story.md exists but cannot be read; fix its permissions and reload", sha256=None)
         current = None if raw is None else hashlib.sha256(raw).hexdigest()
         if current != base:
             raise ApiError(409, "story.md changed since it was loaded; reload it", sha256=current)
