@@ -132,3 +132,29 @@ def test_mut22_one_trace_text_skew_save_list_load_delete(env):
     assert mt.api(s, "GET", "/api/traces/saved/%s" % T3)[0] == 404
     assert mt.api(s, "DELETE", "/api/traces/saved/%s" % T1)[:3:2] == (200, {"deleted": T1})
     assert mt.api(s, "DELETE", "/api/traces/saved/%s" % T1)[0] == 404
+
+
+def test_mut22_nan_daemon_response_save_agent_type_and_damaged_saved_file(env):
+    records = [mt.trace_record(T1, "a" * 16, None, "alpha", 100.0)]
+    result = _result(T1, records)
+    bad = dict(result, x=float("nan"))
+    a = mt.FakeDaemon("alpha", traces={T1: bad})
+    env["daemons"].append(a)
+    _agents(env, {"alpha": a.port})
+    s = env["srv"]
+    url = "http://127.0.0.1:%d" % a.port
+    assert mt.api(s, "GET", "/api/traces/%s?agent=alpha" % T1)[:3:2] == (
+        502, {"error": "the daemon at %s returned an unrecognized trace response" % url})
+    assert mt.api(s, "POST", "/api/traces/%s/save" % T1, body={"agent": ["alpha"]})[:3:2] == (
+        404, {"error": "unknown agent"})
+    traces = os.path.join(env["state"], "traces")
+    lib.write_json_atomic(os.path.join(traces, T1 + ".json"), {
+        "schema": lib.SAVED_TRACE_SCHEMA, "trace_id": T1, "agent": "alpha", "saved_at": "2026-10-20T00:00:00Z",
+        "result": result})
+    lib.write_json_atomic(os.path.join(traces, T2 + ".json"), {
+        "schema": lib.SAVED_TRACE_SCHEMA, "trace_id": T2, "agent": "alpha", "saved_at": 5,
+        "result": _result(T2, [mt.trace_record(T2, "d" * 16, None, "alpha", 50.0)])})
+    status, _h, payload = mt.api(s, "GET", "/api/traces/saved")
+    assert status == 200
+    assert [(e["trace_id"], e["saved_at"], e["invalid"]) for e in payload["saved"]] == [
+        (T1, "2026-10-20T00:00:00Z", False), (T2, None, False)]
