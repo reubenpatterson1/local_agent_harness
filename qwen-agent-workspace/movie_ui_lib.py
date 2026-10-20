@@ -313,9 +313,15 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
     job = read_job(jdir)
     log = open(os.path.join(jdir, "log.txt"), "ab")
     try:
-        child = subprocess.Popen(job["argv"], cwd=job["workspace"], env=dict(os.environ, PYTHONUNBUFFERED="1"),
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True, close_fds=True)
+        # Default the VLM model id to "auto" so the character/story pipeline resolves the
+        # single *loaded* model the story-server reports (mlx_vlm serves it by path on this
+        # host, not under the author's "qwen38-6bit" alias). An explicit env still wins.
+        child = subprocess.Popen(
+            job["argv"], cwd=job["workspace"],
+            env=dict(os.environ, PYTHONUNBUFFERED="1",
+                     QWEN_AGENT_VLM_MODEL=os.environ.get("QWEN_AGENT_VLM_MODEL") or "auto"),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True)
     except OSError as e:
         error = "cannot start: %s" % (e.strerror or e)
         write_status(jdir, {"state": "failed", "dispatched": status.get("dispatched"),
@@ -1018,7 +1024,7 @@ def story_server_check(ws_real):
         return False, "bin/story-server status exited %s: %s" % (code, last_line(run["stderr"]) or "-")
     if state.startswith("SERVING "):
         return True, "story server: %s" % state
-    return False, "story server is %s; start it with bin/story-server vision (or text)" % state
+    return False, "story server is %s; start it with bin/story-server mlx-vision" % state
 
 
 def judge_key_check():

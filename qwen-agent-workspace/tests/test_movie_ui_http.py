@@ -1108,3 +1108,20 @@ def test_final4_lora_action_timeouts(env, monkeypatch):
             "default_strength": 0.8, "strength_range": [0.2, 1.0]}
     assert mt.api(s, "POST", "/api/loras", body=body)[0] == 504
     assert seen == [lib.VERIFY_TIMEOUT, lib.LIGHT_TIMEOUT, lib.VERIFY_TIMEOUT]
+
+
+def test_choose_token_env_override():
+    # unset -> fresh random, no note
+    tok, note = srv.choose_token({})
+    assert note is None and re.fullmatch(r"[A-Za-z0-9_-]{16,}", tok)
+    # valid MOVIE_UI_TOKEN -> reused verbatim (stable URL across restarts)
+    tok, note = srv.choose_token({"MOVIE_UI_TOKEN": "my-stable-range-token-123"})
+    assert tok == "my-stable-range-token-123" and note is None
+    # set-but-invalid -> ignored (random) with a note
+    tok, note = srv.choose_token({"MOVIE_UI_TOKEN": "short"})
+    assert tok != "short" and note and "MOVIE_UI_TOKEN" in note
+    # whitespace/empty -> treated as unset
+    tok, note = srv.choose_token({"MOVIE_UI_TOKEN": "   "})
+    assert note is None and re.fullmatch(r"[A-Za-z0-9_-]{16,}", tok)
+    # two random tokens differ
+    assert srv.choose_token({})[0] != srv.choose_token({})[0]

@@ -229,6 +229,24 @@ def make_server(port, state, ui_ws, token):
     return MovieUIServer(port, MovieUIHandler, state, ui_ws, token)
 
 
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{16,}")
+
+
+def choose_token(environ=None):
+    """The server token. MOVIE_UI_TOKEN, when set to a URL-safe secret (>=16 chars of
+    [A-Za-z0-9_-]), is reused so the UI URL is stable/bookmarkable across restarts; a set-
+    but-invalid value is reported and ignored. Otherwise a fresh random per-launch token
+    (the secure default). Returns (token, note) where note is a warning string or None."""
+    env = (environ if environ is not None else os.environ).get("MOVIE_UI_TOKEN")
+    if env is not None and env.strip():
+        env = env.strip()
+        if re.fullmatch(TOKEN_RE, env):
+            return env, None
+        return (secrets.token_urlsafe(32),
+                "ignoring MOVIE_UI_TOKEN: must be >=16 URL-safe chars ([A-Za-z0-9_-])")
+    return secrets.token_urlsafe(32), None
+
+
 class MovieUIHandler(http.server.BaseHTTPRequestHandler):
     """MU9-MU14: Host, Origin, static, token, route, body, dispatch."""
 
@@ -637,7 +655,9 @@ def main(argv):
                          % lock_path)
         return 2
     _LOCK_FD.append(fd)
-    token = secrets.token_urlsafe(32)
+    token, token_note = choose_token()
+    if token_note:
+        sys.stderr.write("movie-ui: %s\n" % token_note)
     try:
         server = make_server(port, state, UI_WS, token)
     except OSError as e:

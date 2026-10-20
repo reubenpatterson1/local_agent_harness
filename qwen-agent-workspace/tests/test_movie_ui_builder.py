@@ -240,11 +240,12 @@ def test_mut25_source_scan_of_new_python_files():
 def test_mut26_pipeline_files_are_unchanged():
     # MUK3: the movie-ui must not modify any pipeline file. Baseline re-based from
     # 22dc4a1 (pre-movie-ui) to fb8b9a5 when the action-LoRA / pipeline PR
-    # intentionally advanced the pipeline, then to 6bcb54b when character_dataset.py's
-    # TEST_MODEL_DIR was host-adapted from ltx-2.5 to ltx-2.3 (this host has no 2.5
-    # pack). The movie-ui itself still makes zero pipeline changes; this invariant
-    # holds going forward from the new baseline.
-    BASELINE = "6bcb54bcc7ea7bb49ba32676a309b25e22fe14dd"
+    # intentionally advanced the pipeline, then to 6bcb54b (character_dataset.py's
+    # TEST_MODEL_DIR host-adapted ltx-2.5 -> ltx-2.3), then to 9f71234 (character_dataset.py's
+    # VLM restart switched from the vLLM "vision" mode to "mlx-vision", the mlx_vlm path
+    # this host serves). The movie-ui itself still makes zero pipeline changes; this
+    # invariant holds going forward from the new baseline.
+    BASELINE = "9f71234406b60a8488c612ff18cbd11b9af4aee1"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")

@@ -162,7 +162,7 @@ def test_mut9_v2_host_checks(env, monkeypatch):
     assert lib.story_server_check(env["ws"]) == (True, "story server: SERVING vision")
     mt.stub_config(env["ws"], {"story-server status": {"stdout": "  state:          STOPPED\n"}})
     assert lib.story_server_check(env["ws"]) == (
-        False, "story server is STOPPED; start it with bin/story-server vision (or text)")
+        False, "story server is STOPPED; start it with bin/story-server mlx-vision")
     mt.stub_config(env["ws"], {"story-server status": {"exit": 4, "stderr": "story-server: /usr/sbin/lsof missing\n"}})
     assert lib.story_server_check(env["ws"]) == (
         False, "bin/story-server status exited 4: story-server: /usr/sbin/lsof missing")
