@@ -368,7 +368,7 @@ def test_rst14_plan_checks(ws):
          ["plan: P3 cast entry: c2's phrase 'the very old bald monk' has 5 words; at most 4"]),
         (cast2(phrase="The Courier"), ["plan: P3 cast entry: c2's phrase 'The Courier' is also c1's"]),
         (cast2(descriptor="an old man"),
-         ["plan: P3 cast entry: c2's descriptor: must be 8-60 words, got 3"]),
+         ["plan: P3 cast entry: c2's descriptor: must be 8-70 words, got 3"]),
         (cast2(phrase="the monk!"),
          ["plan: P3 cast entry: c2's phrase word 'monk!' may contain only letters, digits, "
           "apostrophes and hyphens (phrase 'the monk!')"]),
@@ -376,7 +376,7 @@ def test_rst14_plan_checks(ws):
                  "under grey light."),
          ['plan: P4 setting sentence: l1\'s setting does not start with "The setting is"']),
         (setting("The setting is a harbour."),
-         ["plan: P4 setting sentence: l1's setting is 5 words; it must be 12-45"]),
+         ["plan: P4 setting sentence: l1's setting is 5 words; aim for 12-45"]),
         (setting("The setting is a rainy harbour town in Japan. Boats rock behind under grey "
                  "light all afternoon."),
          ["plan: P4 setting sentence: l1's setting is more than one sentence"]),
@@ -683,6 +683,28 @@ def _story_checks(ws, mode, n=3, **kw):
     return hard + advisory
 
 
+def test_rst20b_narration_speaker(ws):
+    # A Narration: line spoken on camera starts with an on-screen character's referring phrase
+    # and a colon; an off-screen speaker is hard (N16), an unknown prefix is read as voice-over.
+    def narration(text):
+        return lambda parts: parts[1].update(narration=text)
+
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low.")) == [], mode
+        assert _story_checks(ws, mode, part_mut=narration("The courier: Keep moving, stay low.")) == [], mode
+    assert _story_checks(ws, "chained", part_mut=narration("the old monk: Wait for me.")) == [
+        "panel 2: N16 speaker: Narration: is spoken by 'the old monk', who is not in this shot; "
+        "only a character on screen can speak, so make it voice-over (no prefix) or put "
+        "'the old monk' in the shot"]
+    assert _story_checks(ws, "chained", part_mut=narration("Dawn: the city wakes slowly.")) == [
+        "panel 2: N16 speaker: Narration: starts with 'Dawn:', which is no character's referring "
+        "phrase, so it is read as voice-over; start a spoken line with the speaker's referring "
+        "phrase, or drop the colon"]
+    # N14 counts the spoken words only: "the courier:" does not push 29 words over 30.
+    words29 = " ".join(["go"] * 28) + " now."
+    assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == []
+
+
 def test_rst16_panel_prompt(ws):
     def fixture(raw):
         raw["cast"][0]["descriptor"] = DESC30
@@ -715,7 +737,7 @@ def test_rst16_panel_prompt(ws):
         for line in lines:
             assert "\n" + line in prompt, (mode, k, line)
         assert "\ntitle: a short title for the panel, 2 to 6 words.\n" in prompt
-        assert prompt.count("\nnarration: one sentence of voice-over narration, 3 to 30 words.\n") == 1
+        assert prompt.count("\n" + se.KEY_LINE_TEMPLATES["narration"] + "\n") == 1
         assert ("The previous panel's Motion: " in prompt) == (mode == "chained" and k >= 2)
         assert ("It IS this movie's first frame" in prompt) == (mode == "chained" and k == 1)
         assert ("\nRules:\n" + rules + "\n\n" in prompt) == (mode == "no_stills")
@@ -868,10 +890,12 @@ def test_rst20_panel_checks(ws):
     def part(k, **changes):
         return lambda parts: parts[k - 1].update(changes)
 
-    forty = " ".join(["The courier pedals onward"] * 10)
+    forty = " ".join(["The courier pedals onward"] * 10)  # within N1's 25% tolerance
+    fifty_two = " ".join(["The courier pedals onward"] * 13)
     cases = [
-        ("chained", {"part_mut": part(2, motion=forty)},
-         ["panel 2: N1 word count: Motion: is 40 words; it must be 15-35"]),
+        ("chained", {"part_mut": part(2, motion=forty)}, []),
+        ("chained", {"part_mut": part(2, motion=fifty_two)},
+         ["panel 2: N1 word count: Motion: is 52 words; aim for 15-35"]),
         ("chained", {"part_mut": part(2, motion="The courier waves at the woman beside the crates "
                                                 "and keeps pedalling forward in the rain.")},
          ["panel 2: N2 referring phrase: Motion: names 'woman' outside every referring phrase; "
@@ -927,7 +951,7 @@ def test_rst20_panel_checks(ws):
     shots_long = _story_checks(ws, "shots", part_mut=part(2, motion=forty))
     assert not [v for v in shots_long if " N1 " in v]
     assert [v for v in shots_long if " S4 " in v] == [
-        "panel 2: S4 motion length: Motion: is 46 words; it must be 10-25"]
+        "panel 2: S4 motion length: Motion: is 46 words; aim for 10-25"]
     offscreen = _story_checks(ws, "shots", part_mut=part(2, motion="The courier turns toward "
                                                                    "a noise off-screen."))
     assert offscreen == ["panel 2: S11 off-screen wording: Motion: says 'off-screen'; use left "
@@ -1227,9 +1251,9 @@ def test_rst28_location_setting_patch(ws):
                    "cobblestones underfoot, cranes behind, under blue evening light.")
     new, applied, rejected, _r = se.apply_patches(ctx, state, [
         _patch("plan", 1, "location.setting", new_setting[:-1]),
-        _patch("plan", 2, "location.setting", "The setting is short")])
+        _patch("plan", 2, "location.setting", "A short harbour")])
     assert len(applied) == 1
-    assert _reasons(rejected) == ["the new setting is 4 words; it must be 12-45"]
+    assert _reasons(rejected) == ['the new setting does not start with "The setting is"']
     text = se.assemble(ctx, new["plan"], new["parts"])
     assert text.count(new_setting) == 3
     assert seu.HARBOUR not in text

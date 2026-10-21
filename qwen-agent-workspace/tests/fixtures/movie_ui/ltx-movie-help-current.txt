@@ -14,8 +14,8 @@ usage: ltx-movie [-h] --story-id STORY_ID [--seed-image SEED_IMAGE]
                  [--min-avail-gib MIN_AVAIL_GIB]
                  [--avail-timeout AVAIL_TIMEOUT]
                  [--story-server-stop-after-story | --no-story-server-stop-after-story]
-                 [--story-only] [--dry-run] [--story-legacy] [--no-auto-lora]
-                 [--judge] [--goal TEXT]
+                 [--story-only] [--dry-run] [--story-legacy] [--no-narration]
+                 [--no-auto-lora] [--judge] [--goal TEXT]
                  [narrative]
 
 End-to-end orchestrator for the narrative-to-movie pipeline: story authoring
@@ -174,6 +174,9 @@ options:
                         before the robust story engine. See
                         docs/superpowers/specs/2026-10-17-robust-story-lora-
                         catalog-design.md.
+  --no-narration        the story has no Narration: fields (no voice-over and
+                        no spoken lines); panels share the length equally.
+                        Needs the default story engine.
   --no-auto-lora        the story plan picks no catalog LoRAs
                         (generated/loras/catalog.json); --lora/--stills-lora
                         still apply

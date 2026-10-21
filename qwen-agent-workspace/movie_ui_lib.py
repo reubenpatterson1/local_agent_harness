@@ -541,7 +541,7 @@ DEFAULT_FIELDS = {
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
-    "auto_lora": True,
+    "auto_lora": True, "narration": True,
     "video_loras": [], "stills_loras": [],
     "characters": [],
     "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
@@ -557,6 +557,7 @@ FIELD_FLAGS = (
     ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
     ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
     ("characters", ("--character",)), ("auto_lora", ("--no-auto-lora",)),
+    ("narration", ("--no-narration",)),
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
@@ -626,6 +627,8 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         argv += ["--character", name]
     if fields["auto_lora"] is False:
         argv.append("--no-auto-lora")
+    if fields["narration"] is False:
+        argv.append("--no-narration")
     for key, flag in (("story_legacy", "--story-legacy"), ("judge", "--judge"), ("no_low_ram", "--no-low-ram")):
         if fields[key]:
             argv.append(flag)
@@ -862,7 +865,7 @@ def _rule_loras(fields, which):
 def _rule_flags(fields):
     """V1 rule 13."""
     errors = []
-    for key in ("auto_lora", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
+    for key in ("auto_lora", "narration", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
         if not isinstance(fields.get(key), bool):
             errors.append("%s must be true or false" % key)
     timeout = fields.get("panel_timeout")
@@ -951,8 +954,10 @@ def validate_fields(fields, ws_real, state):
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
+                                               or fields.get("narration") is False
                                                or goal is not None):     # 15
-        errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora or --goal")
+        errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora, "
+                      "--no-narration or --goal")
     action = fields.get("action")
     sdir = story_dir(ws_real, story_id) if sid_ok else None
     if action == "redo":                                                     # 16

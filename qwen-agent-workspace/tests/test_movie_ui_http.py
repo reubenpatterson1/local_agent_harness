@@ -221,7 +221,7 @@ def test_mu14_ws_parameter_errors_and_options(env):
     assert status == 200
     assert payload["workspace"] == env["ws"] and payload["help_ok"] is True and payload["help_error"] is None
     assert payload["flags"] == sorted(payload["flags"]) and "--judge" in payload["flags"]
-    assert all(payload["supported"].values()) and len(payload["supported"]) == 26
+    assert all(payload["supported"].values()) and len(payload["supported"]) == 27
     assert payload["defaults"] == {"panels": 15, "fps": 24, "frames": 145, "model": lib.DEFAULT_MODEL,
                                    "gemma": lib.DEFAULT_GEMMA, "panel_timeout": 7200}
     with open(os.path.join(mt.FIXTURES, "ltx-movie-help-old.txt"), encoding="utf-8") as f:

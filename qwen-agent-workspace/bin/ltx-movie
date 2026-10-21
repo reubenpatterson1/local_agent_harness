@@ -452,6 +452,10 @@ def build_parser():
                          help="Phase 1 uses the single-prompt story path (one bin/qwen-agent call that "
                               "writes story.md), exactly as before the robust story engine. See "
                               "docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md.")
+    parser.add_argument("--no-narration", dest="no_narration", action="store_true", default=False,
+                         help="the story has no Narration: fields (no voice-over and no spoken "
+                              "lines); panels share the length equally. Needs the default story "
+                              "engine.")
     parser.add_argument("--no-auto-lora", dest="no_auto_lora", action="store_true", default=False,
                          help="the story plan picks no catalog LoRAs (generated/loras/catalog.json); "
                               "--lora/--stills-lora still apply")
@@ -618,7 +622,7 @@ def _lock_state(lock_path):
 # story.md validation
 # ---------------------------------------------------------------------------
 
-def _validate_story_md(story_md_path, expected_panels, no_stills=False):
+def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narration=False):
     """Load bin/ltx-story-manifest via SourceFileLoader and validate
     story_md_path against it. Returns a list of violation strings (empty list ==
     valid).
@@ -631,6 +635,7 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False):
     _chain_image_warnings reports it.
     --no-stills: every panel has non-empty Prompt:/Narration: fields and neither
     Image: nor Motion:.
+    no_narration (--no-narration): Narration: is not required.
     """
     violations = []
     manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
@@ -650,7 +655,8 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False):
     for idx, p in enumerate(panels):
         num = p["number"]
         if no_stills:
-            for label, key in (("Prompt", "prompt"), ("Narration", "narration")):
+            for label, key in (("Prompt", "prompt"),) + (
+                    () if no_narration else (("Narration", "narration"),)):
                 if not p[key].strip():
                     violations.append("panel %d: missing/empty %s: field" % (num, label))
             if p["prompt"].strip() and (p["image"].strip() or p["motion"].strip()):
@@ -663,7 +669,7 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False):
                 required = (("Image", "image"), ("Motion", "motion"), ("Narration", "narration"))
             else:
                 required = (("Motion", "motion"), ("Narration", "narration"))
-            for label, key in required:
+            for label, key in required[:-1] if no_narration else required:
                 if not p[key].strip():
                     violations.append("panel %d: missing/empty %s: field" % (num, label))
             if p["prompt"].strip():
@@ -1013,7 +1019,8 @@ def _resolve_story_engine(args):
     reason = "--story-legacy" if args.story_legacy else "--story-prompt-override"
     if legacy:
         for flag, given in (("--judge", args.judge), ("--no-auto-lora", args.no_auto_lora),
-                            ("--goal", args.goal is not None)):
+                            ("--goal", args.goal is not None),
+                            ("--no-narration", args.no_narration)):
             if given:
                 print("Error: %s needs the default story engine; it cannot be combined with %s"
                       % (flag, reason), file=sys.stderr)
@@ -1400,7 +1407,7 @@ def _story_context(args, dry_run=False):
         seed_agent_image=agent_image, story_model=args.story_model,
         context_window=args.story_context_window, video_model=args.model,
         auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
-        stills_pinned=stills, judge=args.judge)
+        stills_pinned=stills, judge=args.judge, narration=not args.no_narration)
 
 
 def _no_stills_rules():
@@ -1565,7 +1572,9 @@ def _phase1_robust(args):
     if os.path.exists(story_md) and not args.force_story:
         print("note: %s already exists; re-checking it instead of regenerating it (pass "
               "--force-story to regenerate)" % story_md)
-        rc, advisories = engine.recheck(ctx, _validate_story_md)
+        rc, advisories = engine.recheck(
+            ctx, lambda path, panels, no_stills=False: _validate_story_md(
+                path, panels, no_stills, no_narration=args.no_narration))
     else:
         print("=== Phase 1: story ===")
         prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
@@ -1979,6 +1988,8 @@ def phase3_manifest(args):
                      "--min-frames", str(args.frames),
                      "--max-frames", str(args.frames),
                      "--force"]
+    if getattr(args, "no_narration", False):
+        cmd_manifest += ["--pace", "equal"]
     cmd_manifest += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args)
     if error:
@@ -2315,6 +2326,8 @@ def _print_dry_run_plan(args):
                              "--target-seconds", str(_target_seconds(args)),
                              "--min-frames", str(args.frames),
                              "--max-frames", str(args.frames), "--force"]
+    if getattr(args, "no_narration", False):
+        phase3_manifest_cmd += ["--pace", "equal"]
     phase3_manifest_cmd += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args, dry_run=True)
     if error:

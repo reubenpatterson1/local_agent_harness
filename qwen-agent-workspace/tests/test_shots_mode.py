@@ -279,8 +279,14 @@ def test_s7_motion_problems_fail():
     nine = "The ronin slowly lowers his katana toward the ground."
     twenty_six = TWENTY_FIVE_WORDS.replace("his curved", "his long curved")
     assert len(nine.split()) == 9 and len(twenty_six.split()) == 26
-    assert problems(nine) == [("S4 motion length", "Motion: is 9 words; it must be 10-25")]
-    assert problems(twenty_six) == [("S4 motion length", "Motion: is 26 words; it must be 10-25")]
+    # S4 (word count) is advisory and has a 25% tolerance: 9 and 26 words pass, 7 and 32 warn.
+    assert problems(nine) == [] and problems(twenty_six) == []
+    assert character_lib.motion_length_advisory(nine) is None
+    assert character_lib.motion_length_advisory(twenty_six) is None
+    assert (character_lib.motion_length_advisory("The ronin lowers his katana toward it.")
+            == "Motion: is 7 words; aim for 10-25")
+    assert (character_lib.motion_length_advisory(" ".join(["The ronin lowers it"] * 8))
+            == "Motion: is 32 words; aim for 10-25")
     assert problems("The ronin draws his sword. The ronin strikes the bearded robber hard.") == [
         ("S5 one action", "Motion: has 2 action sentences; it must have exactly one, optionally "
                           "followed by a camera sentence")]
@@ -1025,8 +1031,7 @@ def test_s34_resolve_casting_in_shots_mode(movie_ws, lib_dir, monkeypatch, capsy
 # --- S35-S41: shots-mode Phase 1 and the one rewrite (spec 5.4) --------------------------
 BAD = _variant("Motion: The bearded robber lunges forward out of the ferns with his short knife "
                "raised. The camera stays static.", "Motion: The bearded robber lunges then slashes.")
-BAD_VIOLATIONS = ["panel 2: S4 motion length: Motion: is 6 words; it must be 10-25",
-                  "panel 2: S5 one action: Motion: chains actions with 'then'"]
+BAD_VIOLATIONS = ["panel 2: S5 one action: Motion: chains actions with 'then'"]
 PARAPHRASED = _variant("grey kimono, standing in the centre", "grey robe, standing in the centre")
 WIDE = _variant("A medium shot of the woman in grey", "A wide shot of the woman in grey")
 WIDE_WARNING = ("Warning: panel 1: shows cast character(s) kyra but its Image: shot type is wide "
@@ -1110,7 +1115,7 @@ def test_s36_one_rewrite(monkeypatch, movie_ws, lib_dir, capsys):
                    if line.startswith("Warning: the story model's draft broke the shot rules; "
                                       "moving it to %s and asking for rewrite 1 of 2:"
                                       % rejected[0]))
-    assert lines[warning + 1:warning + 3] == ["  - " + v for v in BAD_VIOLATIONS]
+    assert lines[warning + 1:warning + 1 + len(BAD_VIOLATIONS)] == ["  - " + v for v in BAD_VIOLATIONS]
 
 
 def test_s37_third_failure_exits_2(monkeypatch, movie_ws, lib_dir, capsys):
@@ -1146,7 +1151,7 @@ def test_s38_existing_story_is_never_rewritten(monkeypatch, movie_ws, lib_dir, c
     assert _rejected(directory) == []
     assert err.startswith("Error: story.md breaks the shot rules:\n")
     assert "pass --force-story" in err
-    assert err.splitlines()[1:3] == ["  - " + v for v in BAD_VIOLATIONS]
+    assert err.splitlines()[1:1 + len(BAD_VIOLATIONS)] == ["  - " + v for v in BAD_VIOLATIONS]
     (directory / "story.md").write_text(S7_BAD, encoding="utf-8")
     assert ltx_movie.phase1_story(_shots_args(*(SHOTS_ARGV[:-2] + ["4", "--no-review"]))) == 2
     err = capsys.readouterr().err

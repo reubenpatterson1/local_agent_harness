@@ -547,3 +547,18 @@ def test_c41_stdlib_only_imports():
         elif isinstance(node, ast.ImportFrom):
             roots.append((node.module or "").split(".")[0])
     assert roots and set(roots) <= {"collections", "datetime", "json", "os", "re", "uuid"}
+
+
+def test_spoken_narration_helpers():
+    lib = character_lib
+    phrases = ["the quarterback", "the old monk"]
+    assert lib.split_speaker("the quarterback: All you need is Fubo TV.", phrases) == (
+        "the quarterback", "All you need is Fubo TV.")
+    assert lib.split_speaker('The Quarterback: "Win."', phrases) == ("the quarterback", "Win.")
+    assert lib.split_speaker("Morning: the city wakes.", phrases) == (
+        None, "Morning: the city wakes.")
+    assert lib.split_speaker("Every champion starts somewhere.", phrases) == (
+        None, "Every champion starts somewhere.")
+    assert lib.split_speaker("the old monk:   ", phrases) == (None, "the old monk:")
+    assert lib.speaker_prefix("a b c d e f g: too long a prefix") is None
+    assert lib.speech_sentence("the quarterback", "Go") == 'The quarterback says: "Go."'

@@ -93,8 +93,8 @@ def test_mut4_every_v1_error_alone(env):
         ({"judge": "yes"}, "judge must be true or false"),
         ({"panel_timeout": 59}, "panel_timeout must be an integer from 60 to 86400"),
         ({"action": "render"}, "unknown action"),
-        ({"story_legacy": True, "judge": True}, "--story-legacy cannot be combined with --judge, --no-auto-lora or --goal"),
-        ({"story_legacy": True, "goal": "tense"}, "--story-legacy cannot be combined with --judge, --no-auto-lora or --goal"),
+        ({"story_legacy": True, "judge": True}, "--story-legacy cannot be combined with --judge, --no-auto-lora, --no-narration or --goal"),
+        ({"story_legacy": True, "goal": "tense"}, "--story-legacy cannot be combined with --judge, --no-auto-lora, --no-narration or --goal"),
     ]
     for overrides, message in table:
         assert _errors(env, **overrides) == [message], overrides

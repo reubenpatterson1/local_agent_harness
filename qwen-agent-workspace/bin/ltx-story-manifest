@@ -70,7 +70,15 @@ empty) of {"name", "phrase", "trigger", "video_lora", "strength"} entries, sorte
 name: strength is 1.0 when the panel names exactly one cast character, else the
 character's own character.json strength or --character-strength (default 0.8).
 schema_version stays 3, because the key is optional. character_lib.py is loaded by path
-only when --cast is given.
+only when --cast is given or a Narration: line has a colon.
+
+Spoken narration: a Narration: line is voice-over (not sent to the video model) unless it
+starts with a known referring phrase and a colon -- "the courier: Keep moving." The known
+phrases are the --cast phrases, a shots story's "## Characters" phrases and the story's
+plan.json cast phrases. A spoken panel gets optional "speaker" and "speech" keys, and
+'<Speaker> says: "<speech>"' is appended to its motion_prompt before the cast triggers are
+inserted, so the video model voices the line on camera. narration_words and the
+proportional pace count the spoken words only.
 
 --shots (bin/ltx-movie --shots) writes schema_version 3 with every panel conditioning
 "still": one --image per panel, in order; panel_text is the Image: text and
@@ -353,6 +361,36 @@ def _parse_prompts_md(path):
     return narrative, panels
 
 
+def _known_phrases(args, members):
+    """The referring phrases a Narration: speaker prefix may name: the --cast phrases, a shots
+    story's "## Characters" phrases and the story's plan.json cast phrases."""
+    lib = _character_lib()
+    phrases = [m.phrase for m in members]
+    try:
+        with open(args.prompts_md, encoding="utf-8") as handle:
+            phrases += [p for p, _ in lib.parse_character_roster(handle.read())[0]]
+    except (OSError, TypeError):
+        pass
+    plan_path = os.path.join(WS, "generated", "stories", args.story_id, "plan.json")
+    try:
+        with open(plan_path, encoding="utf-8") as handle:
+            cast = json.load(handle).get("cast") or []
+        phrases += [c["phrase"] for c in cast if isinstance(c, dict) and isinstance(c.get("phrase"), str)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return phrases
+
+
+def _spoken_narration(args, prompt_texts, members):
+    """[(speaker phrase or None, spoken text or the narration)] per prompts panel; character_lib
+    is loaded only when some Narration: has a colon."""
+    narrations = [pt["narration"] for pt in (prompt_texts or [])]
+    if not any(":" in n for n in narrations):
+        return [(None, n) for n in narrations]
+    lib, phrases = _character_lib(), _known_phrases(args, members)
+    return [lib.split_speaker(n, phrases) if ":" in n else (None, n) for n in narrations]
+
+
 def _prompt_length_warning(unit_index, prompt):
     words = len(prompt.split())
     if words > MAX_PROMPT_WORDS:
@@ -562,6 +600,8 @@ def main(argv=None):
             print("Error: %s" % e, file=sys.stderr)
             return 2
 
+    spoken = _spoken_narration(args, prompt_texts, members)
+
     n_panels = len(prompt_texts) if (args.no_images or args.chain) else len(matched)
 
     # --- frame allocation: either an explicit --frames override, or
@@ -596,6 +636,8 @@ def main(argv=None):
                     print("Error: --pace proportional requires every panel to have a "
                           "non-empty Narration field; panel %d has none" % i, file=sys.stderr)
                     return 2
+                if i <= len(spoken) and spoken[i - 1][0] is not None:
+                    narration = spoken[i - 1][1]
                 weights.append(max(len(narration.split()), 1))
         else:
             weights = [1] * n_panels
@@ -664,13 +706,17 @@ def main(argv=None):
                 motion_prompt = None
                 narration = ""
         num_frames = frame_counts[i - 1]
+        speaker, speech = spoken[i - 1] if i <= len(spoken) else (None, narration)
+        if speaker is not None and motion_prompt is not None:
+            motion_prompt = (motion_prompt.rstrip() + " "
+                             + _character_lib().speech_sentence(speaker, speech)).strip()
         panel = {
             "index": i,
             "image_path": None if image_path is None else os.path.abspath(image_path),
             "title": title,
             "panel_text": panel_text,
             "narration": narration,
-            "narration_words": len(narration.split()),
+            "narration_words": len((speech if speaker is not None else narration).split()),
             "num_frames": num_frames,
             "duration_s": round(num_frames / args.fps, 3),
             "motion_prompt": motion_prompt,
@@ -678,6 +724,8 @@ def main(argv=None):
         }
         if conditioning is not None:
             panel["conditioning"] = conditioning
+        if speaker is not None:
+            panel["speaker"], panel["speech"] = speaker, speech
         panels.append(panel)
 
     if members:
