@@ -29,6 +29,17 @@ CATALOG_LORAS_SCHEMA = "ltx-movie.catalog-loras.v1"
 ONESHOT_SCHEMA = "qwen-agent.oneshot.v1"
 SHOT_TYPES = ("extreme wide shot", "wide shot", "medium shot", "medium close-up", "close-up",
               "extreme close-up")
+# --speech-only: characters speak on screen, so a framed beat stays medium to close-up.
+SPEECH_SHOT_TYPES = ("medium shot", "medium close-up", "close-up")
+SPEECH_SHOT_NOTE = (" (characters speak on screen in this movie, so only these framings keep "
+                    "the speaker's lips readable)")
+SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each character within "
+                          "medium to close-up range of the camera, and never have them shrink "
+                          "into the distance or leave the frame.")
+
+
+def shot_types(narration):
+    return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
 CAMERA_SENTENCES = (
     ("static", "The camera stays static."),
     ("slow push-in", "The camera slowly pushes in."),
@@ -523,7 +534,8 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@SEED_PARAGRAPH@@", SEED_PARAGRAPH if ctx.seed_agent_image else ""),
         ("@@CAST_FIXED@@", cast_fixed),
         ("@@ARC_RULE@@", _arc_rule(ctx.panels)),
-        ("@@SHOT_LIST@@", ", ".join(SHOT_TYPES)),
+        ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
+         + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
@@ -858,6 +870,10 @@ def plan_checks(ctx, plan, shape=()):
         if beat["shot"] and beat["shot"] not in SHOT_TYPES:
             hard.append("beat %d: P7 shot type: %s is not one of: %s"
                         % (k, _q(beat["shot"]), ", ".join(SHOT_TYPES)))
+        elif (beat["shot"] and beat["shot"] not in shot_types(ctx.narration)
+              and (ctx.mode != "chained" or k == 1)):
+            hard.append("beat %d: P7 shot type: %s is too wide for on-screen speech; use one of: %s"
+                        % (k, _q(beat["shot"]), ", ".join(shot_types(ctx.narration))))
         if beat["camera"] and beat["camera"] not in CAMERA_KEYS:
             hard.append("beat %d: P8 camera: %s is not one of: %s"
                         % (k, _q(beat["camera"]), ", ".join(CAMERA_KEYS)))
@@ -1581,6 +1597,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
                                       "chained_motion1" if k == 1 else "chained_motion"]
         else:
             line = KEY_LINE_TEMPLATES["%s_%s" % (ctx.mode, key)]
+        if key in ("image", "motion", "prompt") and ctx.narration == "speech":
+            line += SPEECH_FRAMING_SENTENCE
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         key_lines.append(line)
@@ -1682,7 +1700,7 @@ def critic_field_lines(mode, catalog_lines, narration=True):
         '- target "plan", field "beat.action", index = the beat number: replacement is the beat\'s '
         "new action, one sentence of 6 to 40 words; the pipeline rewrites that panel from it.",
         '- target "plan", field "beat.shot", index = the beat number@@ONLY1@@: replacement is '
-        "exactly one of: " + ", ".join(SHOT_TYPES) + ".",
+        "exactly one of: " + ", ".join(shot_types(narration)) + ".",
         '- target "plan", field "beat.camera", index = the beat number@@ONLY1@@: replacement is '
         "exactly one of: " + ", ".join(CAMERA_KEYS) + ".",
         '- target "plan", field "location.setting", index = the place\'s position in the plan\'s '
@@ -1879,7 +1897,7 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
             regenerate.append(index)
         elif field in ("beat.shot", "beat.camera"):
             value = _collapse(patch["replacement"]).lower()
-            allowed = SHOT_TYPES if field == "beat.shot" else CAMERA_KEYS
+            allowed = shot_types(ctx.narration) if field == "beat.shot" else CAMERA_KEYS
             if value not in allowed:
                 rejected.append({"patch": patch, "reason": "%s is not one of: %s"
                                  % (_q(value), ", ".join(allowed))})

@@ -711,6 +711,31 @@ def test_rst20d_speaking_shot(ws):
     assert _story_checks(ws, "chained", part_mut=voice_over) == []
 
 
+def test_rst20e_speech_only_framing(ws):
+    # --speech-only: framed beats are medium shot to close-up (P7 hard), the plan and critic
+    # list only those, and the Image/Motion/Prompt key lines carry the framing sentence.
+    speech = {"narration": "speech"}
+    shots = seu.make_ctx(se, ws, mode="shots", panels=3, **speech)
+    assert _checks(shots, seu.plan_json("shots", 3)) == [
+        "beat 2: P7 shot type: 'wide shot' is too wide for on-screen speech; use one of: "
+        "medium shot, medium close-up, close-up"]
+    chained = seu.make_ctx(se, ws, mode="chained", panels=3, **speech)
+    assert _checks(chained, seu.plan_json("chained", 3)) == []   # only beat 1's shot is used
+    assert _checks(seu.make_ctx(se, ws, mode="shots", panels=3), seu.plan_json("shots", 3)) == []
+    prompt = se.build_plan_prompt(shots, [], [])
+    assert "shot is exactly one of: medium shot, medium close-up, close-up" + se.SPEECH_SHOT_NOTE \
+        in prompt and "wide shot" not in prompt
+    assert "close-up, extreme close-up" in se.build_plan_prompt(
+        seu.make_ctx(se, ws, mode="shots", panels=3), [], [])
+    assert "exactly one of: medium shot, medium close-up, close-up." in se.critic_field_lines(
+        "shots", None, "speech")
+    for mode in ("chained", "no_stills", "shots"):
+        ctx, plan, parts, _text, _path = _story(ws, mode, 3, ctx_kw=speech, plan_mut=MEDIUM)
+        assert se.SPEECH_FRAMING_SENTENCE in se.build_panel_prompt(ctx, plan, parts, 1), mode
+        ctx, plan, parts, _text, _path = _story(ws, mode, 3, plan_mut=MEDIUM)
+        assert se.SPEECH_FRAMING_SENTENCE not in se.build_panel_prompt(ctx, plan, parts, 1), mode
+
+
 def test_rst20b_narration_speaker(ws):
     # A Narration: line spoken on camera starts with an on-screen character's referring phrase
     # and a colon; an off-screen speaker is hard (N16), an unknown prefix is read as voice-over.
