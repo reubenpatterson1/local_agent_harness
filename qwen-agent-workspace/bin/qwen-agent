@@ -2749,7 +2749,21 @@ def _autostart_local_server(base_url):
     return True
 
 
+def default_served_model(ids, loaded):
+    """The model to use when --model was not given: DEFAULT_MODEL when the server lists it,
+    else the single model the server reports (mlx_lm/mlx_vlm servers list every cached
+    model and flag the active one "loaded": true, and name it by its path, as story-server's
+    mlx-vision mode does), else DEFAULT_MODEL so the "not served" error names it."""
+    if DEFAULT_MODEL in ids:
+        return DEFAULT_MODEL
+    candidates = loaded if loaded else ids
+    return candidates[0] if len(candidates) == 1 else DEFAULT_MODEL
+
+
 def preflight(base_url, model, api_key, skip_tool_probe=False):
+    """Checks A (server up, model listed) and B (tool calling works); exits 2 on failure.
+    model None means --model was not given and is resolved by default_served_model.
+    Returns the model id in use."""
     auth_headers = {"Authorization": "Bearer %s" % api_key} if api_key else {}
 
     # Check A: server reachable and model present.
@@ -2784,8 +2798,12 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
     try:
         data = json.loads(body)
         ids = [item["id"] for item in data.get("data", [])]
-    except (ValueError, KeyError, TypeError):
-        ids = []
+        loaded = [item["id"] for item in data.get("data", []) if item.get("loaded")]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        ids, loaded = [], []
+
+    if model is None:
+        model = default_served_model(ids, loaded)
 
     if model not in ids:
         sys.stderr.write(
@@ -2799,7 +2817,7 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
     # information, and delegations nest. Check A above still runs: it is ~2 ms and it
     # catches a server that died between parent and child.
     if skip_tool_probe:
-        return
+        return model
 
     # Check B: tool calling is enabled.
     probe_body = {
@@ -2879,6 +2897,7 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
             % (base_url, type(e).__name__, e, TOOL_HARNESS_SPEC)
         )
         sys.exit(2)
+    return model
 
 
 def searxng_probe():
@@ -3649,8 +3668,10 @@ def setup(args_ns):
     # warning on the parent's stderr.
     is_delegate_child = os.environ.get("QWEN_AGENT_PREFLIGHT_DONE") == "1"
     no_tools = _skill_has_no_tools(args_ns)
-    preflight(args_ns.base_url, args_ns.model, args_ns.api_key,
-              skip_tool_probe=is_delegate_child or no_tools)
+    # A delegate child is given --model=<the parent's resolved id>, so it never re-resolves.
+    requested = args_ns.model if getattr(args_ns, "model_explicit", True) else None
+    args_ns.model = preflight(args_ns.base_url, requested, args_ns.api_key,
+                              skip_tool_probe=is_delegate_child or no_tools) or args_ns.model
     if not is_delegate_child and not no_tools:
         searxng_probe()
 
@@ -4160,7 +4181,8 @@ def parse_args(argv):
     parser.add_argument("--workspace", type=str, default=DEFAULT_WORKSPACE)
     parser.add_argument("--think", action="store_true", default=False)
     parser.add_argument("--base-url", type=str, default=DEFAULT_BASE_URL)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    # Not given: preflight uses DEFAULT_MODEL if served, else the server's one loaded model.
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--request-timeout", type=int, default=DEFAULT_REQ_TIMEOUT)
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
@@ -4187,7 +4209,11 @@ def parse_args(argv):
                              "overwriting an existing file. bash and run_python are not "
                              "sandboxed. Bypassed calls are traced with [danger-auto]. "
                              "For unattended runs only.")
-    return parser.parse_args(argv)
+    args_ns = parser.parse_args(argv)
+    args_ns.model_explicit = args_ns.model is not None
+    if args_ns.model is None:
+        args_ns.model = DEFAULT_MODEL
+    return args_ns
 
 
 def main():
