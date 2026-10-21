@@ -65,6 +65,9 @@ def test_mut1_golden_argv():
                  "--goal", "Make it tense", "--no-auto-lora", "--judge", "--no-low-ram", "--panel-timeout", "900",
                  "--force", "--no-review"]),
         (_f(story_legacy=True), base + ["--panels", "15"] + defaults + ["--story-legacy", "--story-only", "--no-review"]),
+        (_f(action="movie", narration="speech"), base + ["--panels", "15"] + defaults + ["--speech-only", "--no-review"]),
+        (_f(action="movie", narration="none"), base + ["--panels", "15"] + defaults + ["--no-narration", "--no-review"]),
+        (_f(action="movie", narration="full"), base + ["--panels", "15"] + defaults + ["--no-review"]),
     ]
     for fields, expected in cases:
         assert lib.build_argv(fields, WS, STATE, py=PY) == expected
@@ -95,13 +98,16 @@ def test_mu36_compose_fields_defaults_and_unknown_keys():
     fields = lib.compose_fields({"story_id": "x", "bogus": 1, "video_loras": [{"id": None}]})
     assert set(fields) == set(lib.DEFAULT_FIELDS)
     assert fields["story_id"] == "x" and fields["panels"] == 15 and fields["mode"] == "chained"
-    assert fields["model"] == lib.DEFAULT_MODEL and fields["redo"] == []
+    assert fields["model"] == lib.DEFAULT_MODEL and fields["redo"] == [] and fields["narration"] == "full"
+    # Jobs saved with the earlier boolean narration field still load.
+    assert lib.compose_fields({"narration": False})["narration"] == "none"
+    assert lib.compose_fields({"narration": True})["narration"] == "full"
     assert lib.ordered([_lora(None, "/a"), _lora("motion", "/b")]) == [_lora("motion", "/b"), _lora(None, "/a")]
 
 
 ALL_MU37_FLAGS = {"--story-id", "--panels", "--length", "--fps", "--frames", "--video-width", "--video-height",
                   "--seed-image", "--model", "--gemma", "--story-model", "--goal", "--shots", "--no-stills",
-                  "--lora", "--stills-lora", "--character", "--no-auto-lora", "--no-narration", "--story-legacy", "--judge",
+                  "--lora", "--stills-lora", "--character", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
                   "--no-low-ram", "--panel-timeout", "--force", "--force-story", "--redo", "--story-only",
                   "--no-review"}
 
@@ -115,7 +121,7 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
     assert ALL_MU37_FLAGS <= current
     assert {"--story-server-stop-after-story", "--no-story-server-stop-after-story", "--help"} <= current
     assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma",
-                             "--no-narration"}
+                             "--no-narration", "--speech-only"}
     real, error = lib.help_flags(mt.WS)
     assert error is None and ALL_MU37_FLAGS <= real
     supported = lib.supported_map(old)

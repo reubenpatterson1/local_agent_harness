@@ -705,6 +705,38 @@ def test_rst20b_narration_speaker(ws):
     assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == []
 
 
+def test_rst20c_narration_modes(ws):
+    # --speech-only: Narration: may be empty; a voice-over line is hard N16. --no-narration:
+    # no Narration: field at all and no narration check.
+    def narration(text):   # panel 2 says text; the other panels have no narration
+        return lambda parts: [p.update(narration=text if k == 1 else "")
+                              for k, p in enumerate(parts)]
+
+    speech = {"narration": "speech"}
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech) == [], mode
+        assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low."),
+                             ctx_kw=speech) == [], mode
+    assert _story_checks(ws, "chained", part_mut=narration("Rain falls on the harbour town."),
+                         ctx_kw=speech) == [
+        "panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; start it "
+        "with the referring phrase of the character in the shot who says it and a colon, or "
+        "leave it empty"]
+    ctx, plan, parts, text, _path = _story(ws, "chained", 3, part_mut=narration(""), ctx_kw=speech)
+    assert "Narration:" not in text
+    reply = dict(seu.panel_json("chained", 2, plan["cast"][0]["phrase"]), narration="")
+    assert se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))["narration"] == ""
+    assert se.KEY_LINE_TEMPLATES["narration_speech"] in se.build_panel_prompt(ctx, plan, parts, 2)
+    off = {"narration": False}
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode, ctx_kw=off) == [], mode
+        ctx, plan, parts, text, _path = _story(ws, mode, 3, ctx_kw=off)
+        assert "Narration:" not in text and "narration" not in se.writer_keys(mode, 1, False)
+        prompt = se.build_panel_prompt(ctx, plan, parts, 1)
+        assert se.KEY_LINE_TEMPLATES["narration"] not in prompt
+        assert se.KEY_LINE_TEMPLATES["narration_speech"] not in prompt
+
+
 def test_rst16_panel_prompt(ws):
     def fixture(raw):
         raw["cast"][0]["descriptor"] = DESC30

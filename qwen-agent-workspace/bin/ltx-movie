@@ -456,6 +456,10 @@ def build_parser():
                          help="the story has no Narration: fields (no voice-over and no spoken "
                               "lines); panels share the length equally. Needs the default story "
                               "engine.")
+    parser.add_argument("--speech-only", dest="speech_only", action="store_true", default=False,
+                         help="Narration: is only ever a character's spoken line (\"the courier: "
+                              "...\"), never voice-over, and may be empty; panels share the "
+                              "length equally. Needs the default story engine.")
     parser.add_argument("--no-auto-lora", dest="no_auto_lora", action="store_true", default=False,
                          help="the story plan picks no catalog LoRAs (generated/loras/catalog.json); "
                               "--lora/--stills-lora still apply")
@@ -635,7 +639,7 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narra
     _chain_image_warnings reports it.
     --no-stills: every panel has non-empty Prompt:/Narration: fields and neither
     Image: nor Motion:.
-    no_narration (--no-narration): Narration: is not required.
+    no_narration (--no-narration, --speech-only): Narration: is not required.
     """
     violations = []
     manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
@@ -1015,12 +1019,16 @@ def _resolve_story_engine(args):
     """Select Phase 1's story engine (robust story spec RS2): sets args.story_engine to "robust" or
     "legacy" and args.story_catalog to the loaded LoRA catalog (the empty catalog with
     --no-auto-lora, None on the legacy engine). Returns 0, or 2 after one Error: line."""
+    if args.no_narration and args.speech_only:
+        print("Error: --speech-only and --no-narration cannot be combined", file=sys.stderr)
+        return 2
     legacy = args.story_legacy or args.story_prompt_override is not None
     reason = "--story-legacy" if args.story_legacy else "--story-prompt-override"
     if legacy:
         for flag, given in (("--judge", args.judge), ("--no-auto-lora", args.no_auto_lora),
                             ("--goal", args.goal is not None),
-                            ("--no-narration", args.no_narration)):
+                            ("--no-narration", args.no_narration),
+                            ("--speech-only", args.speech_only)):
             if given:
                 print("Error: %s needs the default story engine; it cannot be combined with %s"
                       % (flag, reason), file=sys.stderr)
@@ -1407,7 +1415,8 @@ def _story_context(args, dry_run=False):
         seed_agent_image=agent_image, story_model=args.story_model,
         context_window=args.story_context_window, video_model=args.model,
         auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
-        stills_pinned=stills, judge=args.judge, narration=not args.no_narration)
+        stills_pinned=stills, judge=args.judge,
+        narration=False if args.no_narration else "speech" if args.speech_only else True)
 
 
 def _no_stills_rules():
@@ -1574,7 +1583,7 @@ def _phase1_robust(args):
               "--force-story to regenerate)" % story_md)
         rc, advisories = engine.recheck(
             ctx, lambda path, panels, no_stills=False: _validate_story_md(
-                path, panels, no_stills, no_narration=args.no_narration))
+                path, panels, no_stills, no_narration=args.no_narration or args.speech_only))
     else:
         print("=== Phase 1: story ===")
         prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
@@ -1988,7 +1997,7 @@ def phase3_manifest(args):
                      "--min-frames", str(args.frames),
                      "--max-frames", str(args.frames),
                      "--force"]
-    if getattr(args, "no_narration", False):
+    if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
         cmd_manifest += ["--pace", "equal"]
     cmd_manifest += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args)
@@ -2326,7 +2335,7 @@ def _print_dry_run_plan(args):
                              "--target-seconds", str(_target_seconds(args)),
                              "--min-frames", str(args.frames),
                              "--max-frames", str(args.frames), "--force"]
-    if getattr(args, "no_narration", False):
+    if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
         phase3_manifest_cmd += ["--pace", "equal"]
     phase3_manifest_cmd += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args, dry_run=True)

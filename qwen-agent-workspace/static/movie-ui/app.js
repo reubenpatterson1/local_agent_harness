@@ -378,7 +378,7 @@
       gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
       story_model: textOrNull("#c-story-model"),
       auto_lora: $("#c-auto-lora").checked,
-      narration: $("#c-narration").checked,
+      narration: $("#c-narration").value,
       video_loras: collectLoras("video"), stills_loras: collectLoras("stills"),
       characters: Array.prototype.map.call($("#c-characters").selectedOptions, function (o) { return o.value; }),
       story_legacy: $("#c-story-legacy").checked, judge: $("#c-judge").checked,
@@ -505,7 +505,8 @@
     $("#c-gemma").value = f.gemma || "";
     $("#c-story-model").value = f.story_model || "";
     $("#c-auto-lora").checked = f.auto_lora !== false;
-    $("#c-narration").checked = f.narration !== false;
+    $("#c-narration").value = f.narration === false ? "none"
+      : (f.narration === "speech" || f.narration === "none") ? f.narration : "full";
     clear($("#c-video-loras"));
     clear($("#c-stills-loras"));
     (f.video_loras || []).forEach(function (item) { loraRow("video", item); });

@@ -541,12 +541,13 @@ DEFAULT_FIELDS = {
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
-    "auto_lora": True, "narration": True,
+    "auto_lora": True, "narration": "full",
     "video_loras": [], "stills_loras": [],
     "characters": [],
     "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
     "overwrite_movie": False, "redo": [],
 }
+NARRATION_MODES = ("full", "speech", "none")   # voice-over and speech / speech only / none
 LIGHT_TIMEOUT = 60
 # MU37: the flags each compose field or action needs; "supported" (MU47) is all-present.
 FIELD_FLAGS = (
@@ -557,7 +558,7 @@ FIELD_FLAGS = (
     ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
     ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
     ("characters", ("--character",)), ("auto_lora", ("--no-auto-lora",)),
-    ("narration", ("--no-narration",)),
+    ("narration", ("--no-narration", "--speech-only")),
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
@@ -572,6 +573,8 @@ def compose_fields(body):
     for key, default in DEFAULT_FIELDS.items():
         value = body.get(key, default) if isinstance(body, dict) else default
         fields[key] = list(value) if isinstance(value, list) else value
+    if isinstance(fields["narration"], bool):   # jobs saved before the three-way setting
+        fields["narration"] = "full" if fields["narration"] else "none"
     return fields
 
 
@@ -627,8 +630,10 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         argv += ["--character", name]
     if fields["auto_lora"] is False:
         argv.append("--no-auto-lora")
-    if fields["narration"] is False:
+    if fields["narration"] == "none":
         argv.append("--no-narration")
+    elif fields["narration"] == "speech":
+        argv.append("--speech-only")
     for key, flag in (("story_legacy", "--story-legacy"), ("judge", "--judge"), ("no_low_ram", "--no-low-ram")):
         if fields[key]:
             argv.append(flag)
@@ -865,9 +870,11 @@ def _rule_loras(fields, which):
 def _rule_flags(fields):
     """V1 rule 13."""
     errors = []
-    for key in ("auto_lora", "narration", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
+    for key in ("auto_lora", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
         if not isinstance(fields.get(key), bool):
             errors.append("%s must be true or false" % key)
+    if fields.get("narration") not in NARRATION_MODES:
+        errors.append("narration must be one of %s" % ", ".join(NARRATION_MODES))
     timeout = fields.get("panel_timeout")
     if timeout is not None and not (_is_int(timeout) and 60 <= timeout <= 86400):
         errors.append("panel_timeout must be an integer from 60 to 86400")
@@ -954,10 +961,10 @@ def validate_fields(fields, ws_real, state):
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
-                                               or fields.get("narration") is False
+                                               or fields.get("narration") in ("speech", "none")
                                                or goal is not None):     # 15
         errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora, "
-                      "--no-narration or --goal")
+                      "--no-narration, --speech-only or --goal")
     action = fields.get("action")
     sdir = story_dir(ws_real, story_id) if sid_ok else None
     if action == "redo":                                                     # 16

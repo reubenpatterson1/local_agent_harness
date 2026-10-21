@@ -72,8 +72,9 @@ StoryContext = collections.namedtuple("StoryContext", [
     "ws", "story_id", "story_dir", "mode", "panels", "seconds", "narrative", "goal", "members",
     "seed_image", "seed_agent_image", "story_model", "context_window", "video_model",
     "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration"], defaults=(True,))
-# narration False (bin/ltx-movie --no-narration): panels have no Narration: field and no
-# narration check runs.
+# narration True: Narration: is voice-over or a character's spoken line. "speech"
+# (bin/ltx-movie --speech-only): Narration: is optional and, when present, a character's spoken
+# line. False (--no-narration): panels have no Narration: field and no narration check runs.
 
 # Injectable seams (tests replace them with monkeypatch.setattr).
 _now = time.monotonic
@@ -1137,6 +1138,11 @@ KEY_LINE_TEMPLATES = {
         "actions with then, while, meanwhile, simultaneously, afterwards, followed by or a comma "
         "before and, and never use a semicolon. Do not mention the camera: the pipeline adds the "
         "camera sentence."),
+    "narration_speech": ("narration: leave it empty unless a character in this shot says something "
+                         "aloud; then one sentence of 3 to 30 words: that character's referring "
+                         "phrase, word for word, and a colon, followed by their words with no "
+                         "quotation marks. This movie has no voice-over, and every spoken line "
+                         "belongs here, never in another field."),
     "narration": ("narration: one sentence of 3 to 30 words. It is voice-over unless a character "
                   "in this shot says it aloud: then begin with that character's referring phrase, "
                   "word for word, and a colon, followed by their words with no quotation marks. "
@@ -1216,7 +1222,7 @@ def parse_panel_reply(ctx, plan, k, answer):
         if key == "title":
             continue
         value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
-        if not value:
+        if not value and not (key == "narration" and ctx.narration == "speech"):
             return None
         parts[key] = value
     title = clean_writer(lib, obj.get("title"))
@@ -1241,7 +1247,7 @@ def panel_fields(ctx, plan, parts, k):
         fields.append(("Prompt", join([p.get("prompt", "")] + pasted["prompt"])))
     else:
         fields.append(("Motion", join([p.get("motion", "")] + pasted["motion"])))
-    if ctx.narration:
+    if ctx.narration is True or (ctx.narration and p.get("narration", "").strip()):
         fields.append(("Narration", _sentence(p.get("narration", ""))))
     return fields
 
@@ -1382,7 +1388,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(writer)), None)
             if copied:
                 add(hard, "N10", "copied example", label, "contains template text %s" % _q(copied))
-        if "N11" in ids and label == "Narration" and not text.strip():
+        if "N11" in ids and label == "Narration" and not text.strip() and ctx.narration is True:
             hard.append("%s N11 narration: Narration: is empty" % prefix)
     if "N15" in ids and undeclared:
         masks = _undeclared_masks(lib, ctx, plan, undeclared)
@@ -1402,7 +1408,14 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
     narration = dict(fields).get("Narration", "")
     if "N16" in ids and beat is not None:
         found = lib.speaker_prefix(narration)
-        if found:
+        speech_only = ctx.narration == "speech"
+        if speech_only and narration.strip() and (
+                not found or lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[0]
+                is None):
+            add(hard, "N16", "speaker", "Narration",
+                "is voice-over, but this story is speech-only; start it with the referring "
+                "phrase of the character in the shot who says it and a colon, or leave it empty")
+        elif found:
             on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
             known = [c["phrase"] for c in plan["cast"]]
             if lib.split_speaker(narration, on_screen)[0] is not None:
@@ -1496,7 +1509,7 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
-        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration)
+        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration is True)
         advisory += lib.shots_advisories(panels, ctx.members)
     return hard, advisory
 
@@ -1534,7 +1547,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     key_lines = []
     for key in writer_keys(ctx.mode, k, ctx.narration):
         if key == "title" or key == "narration":
-            line = KEY_LINE_TEMPLATES[key]
+            line = KEY_LINE_TEMPLATES["narration_speech" if key == "narration"
+                                      and ctx.narration == "speech" else key]
         elif ctx.mode == "chained":
             line = KEY_LINE_TEMPLATES["chained_image" if key == "image" else
                                       "chained_motion1" if k == 1 else "chained_motion"]
@@ -2482,7 +2496,7 @@ def recheck(ctx, legacy_validate):
             advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
             if ctx.mode == "shots":
                 hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                            ctx.narration)
+                                            ctx.narration is True)
                 advisory += lib.shots_advisories(parsed, ctx.members)
             if ctx.auto_lora:
                 compatible = dict((e["id"], e) for e in compatible_entries(ctx))
@@ -2522,7 +2536,7 @@ def recheck(ctx, legacy_validate):
     try:
         text, parsed = _read_story(ctx, story_md)
         violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                               ctx.narration)
+                                               ctx.narration is True)
         advisories = lib.shots_advisories(parsed, ctx.members)
     except OSError as e:
         violations, advisories = ["story: cannot read story.md: %s" % e], []
