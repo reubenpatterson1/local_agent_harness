@@ -250,8 +250,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # makes zero pipeline changes), then to c35b6bc (apparent age pinned in DESCRIBE_PROMPT
     # and scored in CHECK_PROMPT, fixing age drift), then to 3b6b317 (descriptor word cap
     # 60->70 for the richer prompt), then to d7e9036 (character_lib.py's matching descriptor
-    # word cap 60->70). This invariant holds from the new baseline.
-    BASELINE = "d7e90363c597557c265c612d8b62a8b7a9f6c22c"
+    # word cap 60->70), then to 69460eb (bin/qwen-agent's --model default resolves to the
+    # served model). This invariant holds from the new baseline.
+    BASELINE = "69460ebf606e061f43e6aadeb89f9679233051f7"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
