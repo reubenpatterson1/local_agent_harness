@@ -548,6 +548,7 @@ def build_clip_provenance(unit, args, *, strict=False):
         "chain_source_sha256": (file_sha256(unit["chain_source"]) if conditioning == "chain"
                                 else None),
         "chain_frame_index": args.frames - 1 if conditioning == "chain" else None,
+        "image_crf": SKILL.IMAGE_CRF if conditioning in ("still", "chain") else None,
         "seed": unit["seed"], "width": args.width, "height": args.height,
         "frames": args.frames, "fps": args.frame_rate, "low_ram": not args.no_low_ram,
         "tile_frames": args.tile_frames, "tile_spatial": args.tile_spatial,

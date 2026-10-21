@@ -49,6 +49,12 @@ LTX2_MLX_HF_HOME = os.environ.get("LTX2_MLX_HF_HOME",
 
 MODEL_ID = "dgrauet/ltx-2.3-mlx-q8"
 GEMMA_MODEL_ID = "mlx-community/gemma-3-12b-it-4bit"
+# H.264 CRF the conditioning image is round-tripped through before encoding (ltx-2-mlx
+# --image PATH IDX STRENGTH CRF). The LTX-2.3 default, 33, visibly softens the first frame
+# and the frames after it; measured on fubo_quaterback_promo panel 1, CRF 0 (no round-trip)
+# gave a ~43% sharper frame 0 (Laplacian variance 802 vs 561), sharper frames 1-4 (707 vs 493)
+# and no extra jump at frame 0->1 (PSNR 28.7 vs 28.8 dB).
+IMAGE_CRF = 0
 DEFAULT_WIDTH = 704            # 704 % 32 == 0
 DEFAULT_HEIGHT = 448           # 448 % 64 == 0; distilled two-stage snaps H down to a multiple of 64
 DEFAULT_NUM_FRAMES = 241       # (241 - 1) % 8 == 0; 240 / 24 == 10.000 s
@@ -230,9 +236,9 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
     --distilled is unconditional: the pack ships no dev transformer, and
     `generate` refuses to run without exactly one pipeline-mode flag.
     --frame-rate is unconditional because the parser marks it required=True.
-    The explicit three-argument `--image PATH 0 1.0` form is preferred over
-    bare PATH so the anchor index and strength show up in the logged command
-    instead of depending on ImageAction's legacy defaulting; frame_idx 0
+    The explicit four-argument `--image PATH 0 1.0 CRF` form is preferred over
+    bare PATH so the anchor index, strength and IMAGE_CRF show up in the logged
+    command instead of depending on ImageAction's legacy defaulting; frame_idx 0
     selects VideoConditionByLatentIndex, which replaces latent frame 0 --
     the single-anchor I2V semantics this pipeline relies on. lora_path is
     prep for future fine-tuning: omitted unless explicitly set, always
@@ -252,7 +258,7 @@ def build_command(*, prompt, output_path, image_path=None, width, height,
            "--prompt", str(prompt),
            "--output", str(output_path)]
     if image_path is not None:
-        cmd += ["--image", str(image_path), "0", "1.0"]
+        cmd += ["--image", str(image_path), "0", "1.0", str(IMAGE_CRF)]
     cmd += ["-H", str(height),
             "-W", str(width),
             "-f", str(num_frames),
