@@ -356,6 +356,91 @@ def test_warning_and_source_guards():
           "--danger-auto-approve" not in inspect.getsource(qwen_agent.exec_delegate_to_skill))
 
 
+def test_paths_unconfined_only_with_flag():
+    outside = os.path.realpath(tempfile.mkdtemp(prefix="qwen-agent-daa-outside-"))
+    target = os.path.join(outside, "note.txt")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("D34 outside text")
+    with _sandbox() as (tmp, calls), contextlib.redirect_stderr(io.StringIO()):
+        rec = qwen_agent.dispatch(_tc("read_file", {"path": target}), 1, 1, _ns(False), [])
+        check("D34 read_file outside the workspace rejected, flag off",
+              rec["outcome"] == "rejected" and "outside the workspace" in rec["result"])
+
+        rec = qwen_agent.dispatch(_tc("read_file", {"path": target}), 1, 1, _ns(True), [])
+        check("D35 read_file outside the workspace allowed, flag on",
+              rec["outcome"] == "approved" and "D34 outside text" in rec["result"] and not calls)
+
+        new = os.path.join(outside, "sub", "new.txt")
+        rec = qwen_agent.dispatch(_tc("write_file", {"path": new, "content": "D36"}), 1, 1, _ns(True), [])
+        check("D36 write_file outside the workspace allowed, flag on",
+              rec["outcome"] == "approved" and open(new, encoding="utf-8").read() == "D36")
+
+        rec = qwen_agent.dispatch(_tc("write_file", {"path": "rel.txt", "content": "D36b"}), 1, 1,
+                                  _ns(True), [])
+        check("D36b relative paths still resolve inside the workspace, flag on",
+              rec["outcome"] == "approved" and os.path.isfile(os.path.join(tmp, "rel.txt")))
+
+        store = qwen_agent.memory_root()
+        os.makedirs(store, exist_ok=True)
+        lt = os.path.join(store, qwen_agent.MEMORY_LONG_TERM_NAME)
+
+        def _lt():   # earlier tests may already have created long_term.md
+            try:
+                with open(lt, "rb") as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
+
+        before = _lt()
+        rec = qwen_agent.dispatch(_tc("write_file", {"path": lt, "content": "D37 forged"}), 1, 1,
+                                  _ns(True), [])
+        check("D37 memory store still rejected, flag on",
+              rec["outcome"] == "rejected" and "session-memory store" in rec["result"]
+              and _lt() == before)
+
+        os.symlink(store, os.path.join(tmp, "mem"))
+        rec = qwen_agent.dispatch(_tc("write_file", {"path": "mem/long_term.md", "content": "D37b"}),
+                                  1, 1, _ns(True), [])
+        check("D37b memory store rejected through a workspace symlink, flag on",
+              rec["outcome"] == "rejected" and _lt() == before)
+
+        rec = qwen_agent.dispatch(_tc("read_file", {"path": store}), 1, 1, _ns(True), [])
+        check("D37c memory store unreadable by read_file, flag on", rec["outcome"] == "rejected")
+
+
+def test_prompts_and_tool_text_follow_the_flag():
+    ws = "/tmp/ws"
+    plain = qwen_agent.build_system_message(ws)["content"]
+    loose = qwen_agent.build_system_message(ws, unconfined=True)["content"]
+    check("D38 default system message keeps the workspace rule",
+          qwen_agent._CONFINED_RULES_1_2.format(workspace=ws) in plain)
+    check("D38b unconfined system message replaces rules 1 and 2",
+          qwen_agent._UNCONFINED_RULES_1_2.format(workspace=ws) in loose
+          and "only work inside the workspace" not in loose
+          and "requires their explicit approval" not in loose)
+    loose_mem = qwen_agent.build_system_message(ws, memory=True, unconfined=True)["content"]
+    check("D38c unconfined applies with memory on too",
+          qwen_agent._UNCONFINED_RULES_1_2.format(workspace=ws) in loose_mem)
+    for skill, text in qwen_agent.SKILL_SYSTEM_PROMPTS.items():
+        if qwen_agent._CONFINED_SKILL_RULE not in text:
+            continue
+        msg = qwen_agent.build_skill_system_message(skill, ws, unconfined=True)["content"]
+        check("D39 %s skill prompt unconfined" % skill,
+              qwen_agent._UNCONFINED_SKILL_RULE.format(workspace=ws) in msg
+              and "only works inside the workspace" not in msg)
+        check("D39b %s skill prompt unchanged by default" % skill,
+              qwen_agent.build_skill_system_message(skill, ws)["content"] == text.format(workspace=ws))
+
+    base = json.dumps(qwen_agent._BASE_TOOLS, sort_keys=True)
+    tools = qwen_agent.unconfine_file_tools(qwen_agent.build_tools_for_context(None))
+    by_name = {t["function"]["name"]: t["function"] for t in tools}
+    check("D40 unconfined tool text for read_file and write_file",
+          "anywhere on the machine" in by_name["read_file"]["description"]
+          and "anywhere on the machine" in by_name["write_file"]["description"]
+          and "anywhere on the machine" in by_name["read_file"]["parameters"]["properties"]["path"]["description"])
+    check("D40b _BASE_TOOLS not mutated", json.dumps(qwen_agent._BASE_TOOLS, sort_keys=True) == base)
+
+
 if __name__ == "__main__":
     test_flag_default_and_parse()
     test_gate_function_unchanged()
@@ -365,6 +450,8 @@ if __name__ == "__main__":
     test_trace_labels()
     test_auto_key_covers_bash_and_run_python()
     test_warning_and_source_guards()
+    test_paths_unconfined_only_with_flag()
+    test_prompts_and_tool_text_follow_the_flag()
 
     print("OK %d/%d" % (TOTAL - FAILED, TOTAL))
     sys.exit(0 if FAILED == 0 else 1)
