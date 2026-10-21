@@ -1037,6 +1037,10 @@ APPEARANCE_WORDS = frozenset("""
     camera lens zoom zooms dolly framing close-up""".split())
 _APPEARANCE_RE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(
     re.escape(w) for w in sorted(APPEARANCE_WORDS, key=lambda w: (-len(w), w))), re.IGNORECASE)
+# N3: "camera"/"lens" as the target of an action ("holds it up to the camera") is a direction,
+# not a camera description, so it is blanked before the appearance search.
+_CAMERA_TARGET_RE = re.compile(r"\b(?:to|toward|towards|into|at|from|past)\s+(?:the\s+)?(?:camera|lens)\b",
+                               re.IGNORECASE)
 # N17: a speaking character needs a visible, moving mouth.
 WIDE_SHOTS = ("extreme wide shot", "wide shot")
 HELD_EXPRESSION_RE = re.compile(r"\b(?:broad\s+|wide\s+|big\s+)?(?:smil(?:e|es|ing)|grin(?:s|ning)?|"
@@ -1333,6 +1337,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             if "N3" in ids:
                 blanked = lib._blank(text, lib._passage_spans(
                     text, list(phrases) + [p["name"] for p in plan["props"] if p["name"]]))
+                blanked = _CAMERA_TARGET_RE.sub(lambda m: " " * len(m.group(0)), blanked)
                 word = _first(_APPEARANCE_RE, blanked)
                 if word:
                     add(hard, "N3", "appearance", label,

@@ -964,6 +964,12 @@ def test_rst20_panel_checks(ws):
                                                 "pedals forward along the road past the boats.")},
          ["panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
           "appearance, clothing, setting, lighting, colour, style or camera"]),
+        ("chained", {"part_mut": part(2, motion="The courier holds the parcel up to the camera and "
+                                                "pedals forward along the road past the boats.")}, []),
+        ("chained", {"part_mut": part(2, motion="The courier pedals forward along the road as the "
+                                                "camera slowly pans left past the boats.")},
+         ["panel 2: N3 appearance: Motion: says 'camera'; panels after the first never re-describe "
+          "appearance, clothing, setting, lighting, colour, style or camera"]),
         ("chained", {"part_mut": part(2, motion="The courier pedals past the old monk beside the "
                                                 "crates and on toward the end of the quay.")},
          ["panel 2: N4 stray cast: Motion: names 'the old monk', who is not in beat 2's cast"]),
