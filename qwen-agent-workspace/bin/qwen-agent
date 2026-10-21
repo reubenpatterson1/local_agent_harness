@@ -62,8 +62,10 @@ FETCH_USER_AGENT = "qwen-agent/1.0"
 # held back from the budget on every request: the estimator below models neither the
 # chat template's per-message control tokens nor a tokenizer's disagreement with a
 # character heuristic, and 1024 tokens is ~6% of a 16384-token window -- cheap enough
-# to give away, large enough to cover both plus the forced-summary prompt.
-DEFAULT_CONTEXT_WINDOW = 16384
+# to give away, large enough to cover both plus the forced-summary prompt. The fallback
+# is 120000: mlx_vlm (story-server mlx-vision) reports no window, and its Qwen3-VL has a
+# 262144-token native one, so 16384 was evicting long sessions far too early.
+DEFAULT_CONTEXT_WINDOW = 120000
 CONTEXT_FLOOR = 1024
 # Flat, deliberately conservative cost charged for ONE attached image, used by
 # estimate_tokens instead of char-counting its base64 payload (which would read as
