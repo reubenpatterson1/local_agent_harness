@@ -663,10 +663,22 @@ def split_speaker(narration, phrases):
 
 
 def speech_sentence(phrase, speech):
-    """The video-prompt sentence for a spoken line: <Phrase> says: "<speech>"."""
+    """The video-prompt sentence for a spoken line: <Phrase> says: "<speech>". Kept plain on
+    purpose: on fubo_quaterback_promo, descriptive variants ("speaks aloud, lips clearly forming
+    each word", "speaks once, ...") made LTX-2.3 repeat a short line or voice the unquoted
+    prompt words; visible lip movement comes from the shot (N17) and the action text instead."""
     if speech[-1:] not in ".!?":
         speech += "."
     return '%s says: "%s"' % (phrase[:1].upper() + phrase[1:], speech)
+
+
+def insert_speech(text, sentence):
+    """text with sentence added: before a trailing camera sentence (_is_camera_sentence) when
+    there is one, else at the end, so the line belongs to the action, not to the camera."""
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+    if len(sentences) > 1 and _is_camera_sentence(sentences[-1]):
+        return " ".join(sentences[:-1] + [sentence, sentences[-1]])
+    return (text.rstrip() + " " + sentence).strip()
 
 
 def panel_strengths(names, members, character_strength, shots=False):

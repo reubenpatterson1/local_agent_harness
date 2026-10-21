@@ -76,9 +76,10 @@ Spoken narration: a Narration: line is voice-over (not sent to the video model) 
 starts with a known referring phrase and a colon -- "the courier: Keep moving." The known
 phrases are the --cast phrases, a shots story's "## Characters" phrases and the story's
 plan.json cast phrases. A spoken panel gets optional "speaker" and "speech" keys, and
-'<Speaker> says: "<speech>"' is appended to its motion_prompt before the cast triggers are
-inserted, so the video model voices the line on camera. narration_words and the
-proportional pace count the spoken words only.
+character_lib.speech_sentence ('<Speaker> says: "<speech>"') goes into its motion_prompt
+before a trailing camera sentence, ahead of the cast trigger insertion, so the video model
+voices the line on camera. narration_words and the proportional pace count the spoken words
+only.
 
 --shots (bin/ltx-movie --shots) writes schema_version 3 with every panel conditioning
 "still": one --image per panel, in order; panel_text is the Image: text and
@@ -708,8 +709,8 @@ def main(argv=None):
         num_frames = frame_counts[i - 1]
         speaker, speech = spoken[i - 1] if i <= len(spoken) else (None, narration)
         if speaker is not None and motion_prompt is not None:
-            motion_prompt = (motion_prompt.rstrip() + " "
-                             + _character_lib().speech_sentence(speaker, speech)).strip()
+            lib_ = _character_lib()
+            motion_prompt = lib_.insert_speech(motion_prompt, lib_.speech_sentence(speaker, speech))
         panel = {
             "index": i,
             "image_path": None if image_path is None else os.path.abspath(image_path),

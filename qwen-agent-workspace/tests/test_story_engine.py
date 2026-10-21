@@ -683,6 +683,34 @@ def _story_checks(ws, mode, n=3, **kw):
     return hard + advisory
 
 
+def MEDIUM(raw):   # every beat a medium shot, so N17 (speaking in a wide shot) stays quiet
+    for beat in raw["beats"]:
+        beat["shot"] = "medium shot"
+
+
+def test_rst20d_speaking_shot(ws):
+    # N17 (advisory): a speaker in a wide shot, or held to a fixed smile, plays as voice-over.
+    def speak(k, text, **changes):
+        return lambda parts: parts[k - 1].update(narration=text, **changes)
+
+    line = "the courier: Keep moving, stay low."
+    SMILING = ("The courier pedals his bicycle steadily along the wet cobblestones of the harbour "
+               "road, leaning into the rain with a broad smile on his face as he rides past the "
+               "stacked wooden crates toward the old stone pier.")
+    assert _story_checks(ws, "shots", part_mut=speak(2, line)) == [
+        "panel 2: N17 speaking shot: Narration: 'the courier' speaks in a wide shot, too small to "
+        "read the lips, so it plays as voice-over; use a medium shot or closer"]
+    assert _story_checks(ws, "shots", part_mut=speak(1, line)) == []          # beat 1: medium shot
+    assert _story_checks(ws, "chained", part_mut=speak(2, line)) == []        # shot is panel 1's only
+    smiling = speak(1, line, motion=SMILING)
+    assert _story_checks(ws, "chained", part_mut=smiling) == [
+        "panel 1: N17 speaking shot: Narration: 'the courier' speaks, but the panel holds the "
+        "expression 'broad smile', which freezes the mouth; describe the speaking instead"]
+    voice_over = speak(1, "Rain falls on the harbour town.",
+                       motion=SMILING)
+    assert _story_checks(ws, "chained", part_mut=voice_over) == []
+
+
 def test_rst20b_narration_speaker(ws):
     # A Narration: line spoken on camera starts with an on-screen character's referring phrase
     # and a colon; an off-screen speaker is hard (N16), an unknown prefix is read as voice-over.
@@ -690,8 +718,8 @@ def test_rst20b_narration_speaker(ws):
         return lambda parts: parts[1].update(narration=text)
 
     for mode in ("chained", "no_stills", "shots"):
-        assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low.")) == [], mode
-        assert _story_checks(ws, mode, part_mut=narration("The courier: Keep moving, stay low.")) == [], mode
+        for line in ("the courier: Keep moving, stay low.", "The courier: Keep moving, stay low."):
+            assert _story_checks(ws, mode, part_mut=narration(line), plan_mut=MEDIUM) == [], mode
     assert _story_checks(ws, "chained", part_mut=narration("the old monk: Wait for me.")) == [
         "panel 2: N16 speaker: Narration: is spoken by 'the old monk', who is not in this shot; "
         "only a character on screen can speak, so make it voice-over (no prefix) or put "
@@ -716,7 +744,7 @@ def test_rst20c_narration_modes(ws):
     for mode in ("chained", "no_stills", "shots"):
         assert _story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech) == [], mode
         assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low."),
-                             ctx_kw=speech) == [], mode
+                             ctx_kw=speech, plan_mut=MEDIUM) == [], mode
     assert _story_checks(ws, "chained", part_mut=narration("Rain falls on the harbour town."),
                          ctx_kw=speech) == [
         "panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; start it "

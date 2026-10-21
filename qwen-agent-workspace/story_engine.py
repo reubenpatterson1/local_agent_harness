@@ -1037,6 +1037,10 @@ APPEARANCE_WORDS = frozenset("""
     camera lens zoom zooms dolly framing close-up""".split())
 _APPEARANCE_RE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(
     re.escape(w) for w in sorted(APPEARANCE_WORDS, key=lambda w: (-len(w), w))), re.IGNORECASE)
+# N17: a speaking character needs a visible, moving mouth.
+WIDE_SHOTS = ("extreme wide shot", "wide shot")
+HELD_EXPRESSION_RE = re.compile(r"\b(?:broad\s+|wide\s+|big\s+)?(?:smil(?:e|es|ing)|grin(?:s|ning)?|"
+                                r"beam(?:s|ing)|smirk(?:s|ing)?)\b", re.IGNORECASE)
 DIALOGUE_RE = re.compile(
     r"\b(?:say|says|said|saying|shout|shouts|shouted|shouting|whisper|whispers|whispered|"
     r"whispering|yell|yells|yelled|yelling|ask|asks|asked|asking|reply|replies|replied|replying|"
@@ -1142,11 +1146,15 @@ KEY_LINE_TEMPLATES = {
                          "aloud; then one sentence of 3 to 30 words: that character's referring "
                          "phrase, word for word, and a colon, followed by their words with no "
                          "quotation marks. This movie has no voice-over, and every spoken line "
-                         "belongs here, never in another field."),
+                         "belongs here, never in another field. A character who speaks needs a "
+                         "medium shot or closer and no fixed smile or grin, so their lips can "
+                         "move."),
     "narration": ("narration: one sentence of 3 to 30 words. It is voice-over unless a character "
                   "in this shot says it aloud: then begin with that character's referring phrase, "
                   "word for word, and a colon, followed by their words with no quotation marks. "
-                  "Every spoken line belongs here, never in another field."),
+                  "Every spoken line belongs here, never in another field. A character who speaks "
+                  "needs a medium shot or closer and no fixed smile or grin, so their lips can "
+                  "move."),
 }
 
 
@@ -1430,6 +1438,20 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     "starts with %s, which is no character's referring phrase, so it is read as "
                     "voice-over; start a spoken line with the speaker's referring phrase, or drop "
                     "the colon" % _q(found[0] + ":"))
+    if "N17" in ids and beat is not None and narration.strip():
+        on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
+        speaker = lib.split_speaker(narration, on_screen)[0]
+        shot_applies = ctx.mode != "chained" or k == 1
+        if speaker and shot_applies and beat["shot"] in WIDE_SHOTS:
+            add(advisory, "N17", "speaking shot", "Narration",
+                "%s speaks in a %s, too small to read the lips, so it plays as voice-over; use "
+                "a medium shot or closer" % (_q(speaker), beat["shot"]))
+        held = speaker and next((w for w in (_first(HELD_EXPRESSION_RE, writers.get(label, ""))
+                                             for label in action_fields) if w), None)
+        if held:
+            add(advisory, "N17", "speaking shot", "Narration",
+                "%s speaks, but the panel holds the expression %s, which freezes the mouth; "
+                "describe the speaking instead" % (_q(speaker), _q(held)))
     if "N14" in ids:
         if plan:
             narration = lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[1]
@@ -1485,12 +1507,12 @@ def plan_copied_examples(plan):
 
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15", "N16")
+                     "N14", "N15", "N16", "N17")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
     """(hard, advisory) of an assembled story (RS15): plan-scope N10, then per panel N2-N11 and
-    N15 (hard), N16 (hard or advisory) and N1, N12-N14 (advisory), then (shots)
+    N15 (hard), N16 (hard or advisory) and N1, N12-N14, N17 (advisory), then (shots)
     character_lib.shots_violations and shots_advisories. story_md_path holds text (written by
     the caller) and is parsed with bin/ltx-story-manifest's _parse_prompts_md."""
     lib = _character_lib(ctx.ws)
@@ -1515,8 +1537,8 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
 
 
 def _order_by_panel(lines):
-    """Panel advisories sorted by panel, then N12, N13, N14, N16 (stable)."""
-    order = {"N12": 0, "N13": 1, "N14": 2, "N16": 3}
+    """Panel advisories sorted by panel, then N12, N13, N14, N16, N17 (stable)."""
+    order = {"N12": 0, "N13": 1, "N14": 2, "N16": 3, "N17": 4}
     return sorted(lines, key=lambda l: (int(l.split(":", 1)[0].split()[1]),
                                         order.get(l.split()[2], 3)))
 
@@ -2383,7 +2405,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16")
+               "N16", "N17")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 

@@ -562,3 +562,7 @@ def test_spoken_narration_helpers():
     assert lib.split_speaker("the old monk:   ", phrases) == (None, "the old monk:")
     assert lib.speaker_prefix("a b c d e f g: too long a prefix") is None
     assert lib.speech_sentence("the quarterback", "Go") == 'The quarterback says: "Go."'
+    said = 'He says: "Go."'
+    assert lib.insert_speech("He runs. The camera tracks alongside the movement.", said) == (
+        'He runs. He says: "Go." The camera tracks alongside the movement.')
+    assert lib.insert_speech("He runs. He jumps.", said) == 'He runs. He jumps. He says: "Go."'
