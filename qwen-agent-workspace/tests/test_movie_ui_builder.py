@@ -260,8 +260,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # 60->70 for the richer prompt), then to d7e9036 (character_lib.py's matching descriptor
     # word cap 60->70), then to 69460eb (bin/qwen-agent's --model default resolves to the
     # served model), then to d3796bf (bin/qwen-agent's 120000 fallback context window and
-    # --danger-auto-approve reaching any path). This invariant holds from the new baseline.
-    BASELINE = "5436c9ab169db1b784f2beb0179a2fbfa0e1806d"
+    # --danger-auto-approve reaching any path), then to 8df5fdb (ltx-movie seed geometry under
+    # host autotune). This invariant holds from the new baseline.
+    BASELINE = "8df5fdb63e6d3cd8a54c08519cef07285e862446"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
