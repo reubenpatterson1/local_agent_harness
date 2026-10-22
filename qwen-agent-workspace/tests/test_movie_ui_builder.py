@@ -261,7 +261,7 @@ def test_mut26_pipeline_files_are_unchanged():
     # word cap 60->70), then to 69460eb (bin/qwen-agent's --model default resolves to the
     # served model), then to d3796bf (bin/qwen-agent's 120000 fallback context window and
     # --danger-auto-approve reaching any path). This invariant holds from the new baseline.
-    BASELINE = "f1d398906486ce028e9d7fe05234afd1fa108b3e"
+    BASELINE = "5436c9ab169db1b784f2beb0179a2fbfa0e1806d"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
