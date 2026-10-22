@@ -11,12 +11,20 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SS="$DIR/story-server"
 
+# story-server-restore starts the VLM in its own session, so a movie-ui Cancel (which kills
+# every process group of this job) cannot take the restarted server down with it. On a signal
+# it returns at once (the start continues detached) so the job exits inside the cancel grace.
 restart_vlm() {
   echo "character-train-vlm: restarting the VLM (story-server mlx-vision)" >&2
-  "$SS" mlx-vision >/dev/null 2>&1 \
+  "$DIR/story-server-restore" mlx-vision --wait >/dev/null 2>&1 \
     || echo "character-train-vlm: WARNING: VLM restart failed; run 'bin/story-server mlx-vision'" >&2
 }
-on_signal() { trap - EXIT INT TERM; echo "character-train-vlm: interrupted" >&2; restart_vlm; exit 130; }
+on_signal() {
+  trap - EXIT INT TERM
+  echo "character-train-vlm: interrupted; restarting the VLM in the background" >&2
+  "$DIR/story-server-restore" mlx-vision >/dev/null 2>&1
+  exit 130
+}
 trap restart_vlm EXIT
 trap on_signal INT TERM
 

@@ -33,6 +33,7 @@
   <button id="tab-compose" type="button" class="tab active">Compose</button>
   <button id="tab-stories" type="button" class="tab">Stories</button>
   <button id="tab-characters" type="button" class="tab">Characters</button>
+  <button id="tab-actions" type="button" class="tab">Actions</button>
   <button id="tab-loras" type="button" class="tab">LoRAs &amp; Models</button>
   <button id="tab-jobs" type="button" class="tab">Jobs</button>
   <button id="tab-traces" type="button" class="tab">Traces</button>
@@ -109,6 +110,8 @@
     </div>
     <div class="wide muted">LoRA order: <span id="c-lora-order"></span></div>
     <label data-field="characters">Cast <select id="c-characters" multiple size="4"></select></label>
+    <label data-field="action_loras" title="Trained action (motion) LoRAs, fused into every panel so the cast performs the move">Actions <select id="c-actions" multiple size="4"></select>
+      Strength <input id="c-action-strength" type="number" min="0.05" max="2" step="0.05" placeholder="default"></label>
     <details class="wide">
       <summary>Advanced</summary>
       <label data-field="story_legacy"><input id="c-story-legacy" type="checkbox"> Legacy story engine</label>
@@ -184,6 +187,31 @@
       <label><input id="ch-train-stills" type="checkbox" checked> Stills LoRA</label>
       <label><input id="ch-train-force" type="checkbox"> Force</label>
       <button id="ch-train" type="button">Train</button> <span id="ch-train-reason" class="muted"></span>
+    </div>
+  </div>
+</section>
+
+<section id="panel-actions" class="panel" hidden>
+  <table id="a-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Clips</th><th>Trigger</th></tr></thead><tbody></tbody></table>
+  <h3>New action</h3>
+  <p class="muted">One named move per action (e.g. a roundhouse kick), from at least 8 reference clips by at least 3 different performers, so the LoRA learns the motion and not a face.</p>
+  <div class="grid">
+    <label>Name <input id="a-name" type="text" size="24" placeholder="roundhouse-kick"></label>
+    <label>Trigger <input id="a-trigger" type="text" size="40" placeholder="performs a roundhouse kick"></label>
+    <label class="wide">Descriptor <input id="a-descriptor" type="text" size="60" placeholder="8-60 words, the motion only: no gender, skin, hair or clothing"></label>
+    <label class="wide">Clips <textarea id="a-clips" rows="6" cols="70" spellcheck="false" placeholder="one absolute path per line: /Users/me/clips/kick_01.mp4"></textarea></label>
+    <label>Performers <input id="a-performers" type="number" min="0" value="3"></label>
+    <label><input id="a-force" type="checkbox"> Force (fewer than 3 performers)</label>
+  </div>
+  <div class="row"><button id="a-create" type="button">Create dataset</button> <span id="a-create-status" class="muted"></span></div>
+  <div id="a-detail" hidden>
+    <h2 id="a-title"></h2>
+    <pre id="a-summary"></pre>
+    <div id="a-gallery" class="gallery"></div>
+    <div class="row">
+      <button id="a-regenerate" type="button">Rebuild dataset</button>
+      <button id="a-train" type="button">Train</button> <span id="a-train-reason" class="muted"></span>
+      <span id="a-status" class="muted"></span>
     </div>
   </div>
 </section>

@@ -3,14 +3,16 @@
 
   bin/action create NAME --trigger PHRASE --descriptor TEXT --clip PATH [--clip PATH ...]
                    [--performers N] [--width W] [--height H] [--frames F] [--force] [--regenerate]
+  bin/action train NAME
   bin/action list
   bin/action show NAME
 
 create normalizes operator-supplied reference clips of one action (by varied
 performers) into a training dataset and stops for review (dataset/contact_sheet.jpg);
-it needs ffmpeg. Training (bin/action train) is Phase 3 and not yet implemented.
-list/show read the library only (stdlib). An action LoRA is cast into a movie with
-bin/ltx-movie --action NAME (Phase 4).
+it needs ffmpeg. train trains the motion LoRA from that dataset with ltx-2-mlx; it
+refuses while a render or training runs or the story server is up. list/show read
+the library only (stdlib). An action LoRA is cast into a movie with
+bin/ltx-movie --action NAME.
 
 Exit codes: 0 success, 2 argument or precondition, 3 fewer than MIN_CLIPS clips.
 Spec: docs/superpowers/specs/2026-10-20-action-lora-motion-library-design.md.
@@ -45,7 +47,7 @@ def build_parser():
     c.add_argument("--fps", type=int, default=None)
     c.add_argument("--force", action="store_true", help="proceed with < 3 performers (not identity-agnostic)")
     c.add_argument("--regenerate", action="store_true", help="rebuild an existing action's dataset")
-    t = sub.add_parser("train", help="(Phase 3) train the motion LoRA -- not yet implemented")
+    t = sub.add_parser("train", help="train the motion LoRA from the reviewed dataset")
     t.add_argument("name")
     sub.add_parser("list", help="list every action")
     s = sub.add_parser("show", help="print one action's record")
@@ -99,5 +101,21 @@ def main(argv=None):
     return action_dataset.create(args)
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    # A kill or a movie-ui Cancel (SIGTERM) and a closed terminal (SIGHUP) take the same path
+    # as Ctrl-C, so the image child is killed and the story server restored
+    # (docs/superpowers/specs/2026-10-21-clean-stop-design.md).
+    import signal
+    # SIGINT too: a job started in the background by a script inherits SIGINT ignored, and
+    # Python then never installs its own Ctrl-C handler.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("action: interrupted", file=sys.stderr)
+        sys.exit(130)

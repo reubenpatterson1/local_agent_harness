@@ -35,6 +35,7 @@ JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
 UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp)$")
 STORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 CHARACTER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
+ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")   # action_lib.NAME_RE
 SMOKE_STORY_ID = "movie-ui-smoke"
 CANCEL_GRACE_S = 15.0       # MU21; tests set it lower
 STARTING_GRACE_S = 10.0     # MU29: a dispatched runner has this long to take its lock
@@ -543,7 +544,7 @@ DEFAULT_FIELDS = {
     "story_model": None,
     "auto_lora": True, "narration": "full",
     "video_loras": [], "stills_loras": [],
-    "characters": [],
+    "characters": [], "action_loras": [],
     "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
     "overwrite_movie": False, "redo": [],
 }
@@ -557,8 +558,8 @@ FIELD_FLAGS = (
     ("model", ("--model",)), ("gemma", ("--gemma",)), ("story_model", ("--story-model",)),
     ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
     ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
-    ("characters", ("--character",)), ("auto_lora", ("--no-auto-lora",)),
-    ("narration", ("--no-narration", "--speech-only")),
+    ("characters", ("--character",)), ("action_loras", ("--action",)),
+    ("auto_lora", ("--no-auto-lora",)), ("narration", ("--no-narration", "--speech-only")),
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
@@ -598,6 +599,13 @@ def lora_arg(item):
     return "%s:%s" % (item["path"], repr(float(item["strength"])))
 
 
+def action_arg(item):
+    """NAME or NAME:STRENGTH for one action item (bin/ltx-movie --action)."""
+    if item.get("strength") is None:
+        return item["name"]
+    return "%s:%s" % (item["name"], repr(float(item["strength"])))
+
+
 def build_argv(fields, ws_real, state, py=sys.executable):
     """The bin/ltx-movie argv for actions story, regenerate, movie and redo (MU40). Pure; the
     fields have passed V1."""
@@ -628,6 +636,8 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         argv += ["--stills-lora", lora_arg(item)]
     for name in fields["characters"]:
         argv += ["--character", name]
+    for item in fields["action_loras"]:
+        argv += ["--action", action_arg(item)]
     if fields["auto_lora"] is False:
         argv.append("--no-auto-lora")
     if fields["narration"] == "none":
@@ -651,11 +661,51 @@ def build_argv(fields, ws_real, state, py=sys.executable):
     return argv
 
 
+def _rule_actions(fields):
+    """action_loras: at most 8 distinct trained-action names, each with a strength of None
+    (the action's default) or 0 < s <= 2."""
+    items = fields.get("action_loras")
+    if not (isinstance(items, list) and len(items) <= 8):
+        return ["action_loras must be a list of at most 8 actions"]
+    errors, names = [], []
+    for k, item in enumerate(items, start=1):
+        name = item.get("name") if isinstance(item, dict) else None
+        strength = item.get("strength") if isinstance(item, dict) else None
+        if not (isinstance(name, str) and ACTION_NAME_RE.fullmatch(name)):
+            errors.append("action %d: name must match [a-z][a-z0-9-]{1,31}" % k)
+            continue
+        names.append(name)
+        if strength is not None and not (isinstance(strength, (int, float)) and not isinstance(strength, bool)
+                                         and 0 < strength <= 2):
+            errors.append("action %s: strength must satisfy 0 < s <= 2" % name)
+    if len(set(names)) != len(names):
+        errors.append("actions must be distinct")
+    return errors
+
+
+def action_argv(kind, fields, ws_real, py=sys.executable):
+    """The bin/action argv of an action-create or action-train job."""
+    if kind == "action-train":
+        # Like character-train-vlm: stop the VLM for training's memory, always restart it.
+        return [os.path.join(ws_real, "bin", "action-train-vlm"), py, fields["name"]]
+    argv = [py, os.path.join(ws_real, "bin", "action"), "create", fields["name"],
+            "--trigger", fields["trigger"], "--descriptor", fields["descriptor"]]
+    for path in fields["clips"]:
+        argv += ["--clip", path]
+    argv += ["--performers", str(fields["performers"])]
+    if fields.get("force"):
+        argv.append("--force")
+    if fields.get("regenerate"):
+        argv.append("--regenerate")
+    return argv
+
+
 def character_argv(kind, fields, ws_real, state, py=sys.executable):
     """The bin/character argv of a character-create, -regenerate or -train job (MU41)."""
     argv = [py, os.path.join(ws_real, "bin", "character")]
     if kind == "character-regenerate":
-        return argv + ["create", fields["name"], "--regenerate"]
+        # Jobs have no terminal: skip the seed-image preview stop (seed-edit spec E10).
+        return argv + ["create", fields["name"], "--regenerate", "--no-review"]
     if kind == "character-train":
         # Route through character-train-vlm, which stops the VLM (freeing its memory for
         # training) and always restarts it afterward -- so the UI Train button needs no
@@ -676,7 +726,7 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
         argv += ["--seed", str(fields["seed"])]
     if fields.get("force"):
         argv.append("--force")
-    return argv
+    return argv + ["--no-review"]
 
 
 def run_light(argv, cwd, env=None, timeout=None):
@@ -958,6 +1008,7 @@ def validate_fields(fields, ws_real, state):
     if not (isinstance(chars, list) and len(chars) <= 8 and len(set(map(repr, chars))) == len(chars)
             and all(isinstance(c, str) and CHARACTER_NAME_RE.fullmatch(c) for c in chars)):
         errors.append("characters must be distinct character names")
+    errors += _rule_actions(fields)                                          # 12b
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
@@ -1482,6 +1533,30 @@ def compat_checks(fields, ws_real, cache, smoke=False):
                 out.append(check("V5", "character %s video base model" % name, "skip",
                                  "video LoRA trained on %s; bin/ltx-movie does not check this against --model %s"
                                  % (base, m)))
+    return out + action_checks(fields, ws_real)
+
+
+def action_checks(fields, ws_real):
+    """V5's per-action records (none when no action is chosen): each action is trained."""
+    out = []
+    for item in fields["action_loras"]:
+        name = item["name"]
+        run = run_light(tool_argv(ws_real, "action", "show", name), ws_real)
+        try:
+            data = json.loads(run["stdout"]) if run["exit_code"] == 0 else None
+        except ValueError:
+            data = None
+        if run["timed_out"]:
+            out.append(check("V5", "action %s" % name, "fail",
+                             "bin/action show %s timed out after %d s" % (name, LIGHT_TIMEOUT)))
+        elif not isinstance(data, dict):
+            out.append(check("V5", "action %s" % name, "fail",
+                             run["stderr"].strip() or "cannot parse bin/action show %s" % name))
+        elif data.get("status") != "trained":
+            out.append(check("V5", "action %s" % name, "fail",
+                             "action %s is not trained (status %s)" % (name, data.get("status"))))
+        else:
+            out.append(check("V5", "action %s" % name, "pass", "trained"))
     return out
 
 

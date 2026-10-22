@@ -40,7 +40,7 @@ def test_mu13_query_parsing():
 
 def test_mut18_every_api_route_needs_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 36
+    assert len(srv.ROUTES) == 40
     for method, regex, name, sample in srv.ROUTES:
         assert re.fullmatch(regex, sample), sample
         body = {} if method in ("POST", "PUT") else None
@@ -221,7 +221,7 @@ def test_mu14_ws_parameter_errors_and_options(env):
     assert status == 200
     assert payload["workspace"] == env["ws"] and payload["help_ok"] is True and payload["help_error"] is None
     assert payload["flags"] == sorted(payload["flags"]) and "--judge" in payload["flags"]
-    assert all(payload["supported"].values()) and len(payload["supported"]) == 27
+    assert all(payload["supported"].values()) and len(payload["supported"]) == 28
     assert payload["defaults"] == {"panels": 15, "fps": 24, "frames": 145, "model": lib.DEFAULT_MODEL,
                                    "gemma": lib.DEFAULT_GEMMA, "panel_timeout": 7200}
     with open(os.path.join(mt.FIXTURES, "ltx-movie-help-old.txt"), encoding="utf-8") as f:
@@ -665,7 +665,7 @@ def test_mu64_mu65_character_endpoints(env):
     assert status == 201 and payload["job"]["kind"] == "character-create" and payload["job"]["character"] == "kyra"
     job = lib.read_job(lib.job_dir(state, payload["job"]["id"]))
     assert job["argv"][2:] == ["create", "kyra", "--phrase", "the young woman", "--seed-image",
-                               os.path.join(state, "uploads", seed)]
+                               os.path.join(state, "uploads", seed), "--no-review"]
     with open(os.path.join(lib.job_dir(state, job["id"]), "log.txt"), "wb") as f:
         f.write(b"Error: the vision model found no face in the seed image; pass --force to proceed anyway.\n")
     detail = mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[2]
@@ -685,7 +685,7 @@ def test_mu64_mu65_character_endpoints(env):
     assert train_argv[2:] == ["kyra", "--video", "--force"]
     status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/regenerate", body={"ws": ws})
     assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
-        "create", "kyra", "--regenerate"]
+        "create", "kyra", "--regenerate", "--no-review"]
     assert payload["job"]["kind"] == "character-regenerate" and payload["job"]["queue_position"] == 3
     mt.stub_config(ws, {"character show kyra": {"exit": 2, "stderr": "Error: no character kyra\n"}})
     assert mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[:3:2][0] == 502

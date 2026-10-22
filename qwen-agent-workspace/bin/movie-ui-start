@@ -1,0 +1,33 @@
+#!/bin/bash
+# movie-ui-start -- start the movie-ui server detached, with the login shell's PATH (so its jobs
+# find ffmpeg/ffprobe from Homebrew), and print its URL. A no-op that reprints the URL when it is
+# already running. Arguments are passed to bin/movie-ui (e.g. --port N).
+# Log: ~/.local/share/qwen-agent/movie-ui/server.log. Stop it with bin/movie-ui-stop.
+# Spec: docs/superpowers/specs/2026-10-21-clean-stop-design.md.
+set -u
+DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG="$HOME/.local/share/qwen-agent/movie-ui/server.log"
+mkdir -p "$(dirname "$LOG")"
+
+url() { grep -o 'http://127\.0\.0\.1:[0-9]*/?t=[A-Za-z0-9_-]*' "$LOG" 2>/dev/null | tail -1; }
+
+if pgrep -f "$DIR/movie-ui( |\$)|bin/movie-ui( |\$)" >/dev/null; then
+  echo "movie-ui-start: already running: $(url)"
+  exit 0
+fi
+
+LOGIN_PATH="$(/bin/zsh -lic 'echo $PATH' 2>/dev/null | tail -1)"
+export PATH="${LOGIN_PATH:-$PATH}:/opt/homebrew/bin:/usr/local/bin"
+command -v ffmpeg >/dev/null || echo "movie-ui-start: WARNING: ffmpeg is not on PATH; renders will fail" >&2
+
+: > "$LOG"
+cd "$DIR/.." && nohup "$DIR/movie-ui" "$@" >>"$LOG" 2>&1 </dev/null &
+pid=$!
+for _ in $(seq 1 40); do
+  u="$(url)"
+  if [ -n "$u" ]; then echo "movie-ui-start: pid $pid, $u"; exit 0; fi
+  kill -0 "$pid" 2>/dev/null || { echo "movie-ui-start: movie-ui exited; last lines of $LOG:" >&2; tail -5 "$LOG" >&2; exit 1; }
+  sleep 0.5
+done
+echo "movie-ui-start: started (pid $pid) but printed no URL yet; see $LOG" >&2
+exit 1

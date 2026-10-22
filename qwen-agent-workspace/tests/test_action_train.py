@@ -64,6 +64,8 @@ def _install_stub(tmp_path, monkeypatch):
     monkeypatch.setattr(ad, "TRAIN_MODEL", str(model))
     monkeypatch.setattr(ad, "LTX2_MLX_DIR", str(tmp_path))
     monkeypatch.setattr(ad, "LTX2_MLX_HF_HOME", str(tmp_path / "hf"))
+    monkeypatch.setattr(ad, "busy_process", lambda: None)
+    monkeypatch.setattr(ad, "story_server_state", lambda: "STOPPED")
 
 
 # ---- pure builders -------------------------------------------------------------
@@ -112,3 +114,17 @@ def test_train_refuses_missing_train_model(tmp_path, monkeypatch):
     monkeypatch.setattr(ad, "TRAIN_MODEL", str(tmp_path / "does-not-exist"))
     with pytest.raises(ad.DatasetError):
         ad.train_action(name)
+
+
+def test_train_refuses_while_busy_or_story_server_up(tmp_path, monkeypatch):
+    # spec 4.3 (A7): never train concurrently with a render or with the story server loaded.
+    name = _seed_action(tmp_path / "lib")
+    _install_stub(tmp_path, monkeypatch)
+    monkeypatch.setattr(ad, "busy_process", lambda: (4242, "bin/ltx-mlx-render --manifest m"))
+    with pytest.raises(ad.DatasetError, match="pid 4242"):
+        ad.train_action(name)
+    monkeypatch.setattr(ad, "busy_process", lambda: None)
+    monkeypatch.setattr(ad, "story_server_state", lambda: "SERVING mlx-vision")
+    with pytest.raises(ad.DatasetError, match="story server is SERVING mlx-vision"):
+        ad.train_action(name)
+    assert al.load_action(name)["status"] != "trained"

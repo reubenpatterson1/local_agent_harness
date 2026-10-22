@@ -1,0 +1,15 @@
+#!/bin/bash
+# movie-ui-stop -- stop the movie-ui server (SIGTERM, then SIGKILL after 10 s). Running jobs keep
+# running, as with Ctrl-C (movie-ui spec); stop those with bin/pipeline-stop.
+# Spec: docs/superpowers/specs/2026-10-21-clean-stop-design.md.
+set -u
+pids="$(pgrep -f 'bin/movie-ui( |$)')"
+[ -n "$pids" ] || { echo "movie-ui-stop: movie-ui is not running"; exit 0; }
+kill -TERM $pids 2>/dev/null
+for _ in $(seq 1 20); do
+  left=""; for p in $pids; do kill -0 "$p" 2>/dev/null && left="$left $p"; done
+  [ -z "$left" ] && { echo "movie-ui-stop: stopped (pid$(printf ' %s' $pids))"; exit 0; }
+  sleep 0.5
+done
+kill -KILL $left 2>/dev/null
+echo "movie-ui-stop: SIGKILL to$left"

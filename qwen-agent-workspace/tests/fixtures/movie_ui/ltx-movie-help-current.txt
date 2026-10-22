@@ -5,8 +5,9 @@ usage: ltx-movie [-h] --story-id STORY_ID [--seed-image SEED_IMAGE]
                  [--model MODEL] [--gemma GEMMA] [--lora LORA_PATH]
                  [--stills-lora STILLS_LORA_PATH] [--character NAME]
                  [--cast PHRASE=NAME]
-                 [--character-strength CHARACTER_STRENGTH] [--list-characters]
-                 [--shots] [--redo N[,M...]] [--story-model STORY_MODEL]
+                 [--character-strength CHARACTER_STRENGTH]
+                 [--action NAME[:STRENGTH]] [--list-characters] [--shots]
+                 [--redo N[,M...]] [--story-model STORY_MODEL]
                  [--story-context-window STORY_CONTEXT_WINDOW] [--no-low-ram]
                  [--tile-frames TILE_FRAMES] [--tile-spatial TILE_SPATIAL]
                  [--panel-timeout PANEL_TIMEOUT] [--no-stills] [--no-review]
@@ -87,6 +88,16 @@ options:
                         a panel that names one cast character uses 1.0, except
                         with --shots, where every cast character uses this
                         strength
+  --action NAME[:STRENGTH]
+                        apply a trained action (motion) LoRA from
+                        generated/actions/ to every panel (repeatable); NAME
+                        or NAME:STRENGTH (0 < STRENGTH <= 2, default the
+                        action's default_strength). It is fused with the
+                        panel's cast-character LoRAs, so the cast performs the
+                        action. Each action LoRA is checked against the video
+                        base (bin/lora-check) first. See
+                        docs/superpowers/specs/2026-10-20-action-lora-motion-
+                        library-design.md.
   --list-characters     print the character library table (the same as
                         bin/character list) and exit; must be the only
                         argument
@@ -177,10 +188,10 @@ options:
   --no-narration        the story has no Narration: fields (no voice-over and
                         no spoken lines); panels share the length equally.
                         Needs the default story engine.
-  --speech-only         Narration: is only ever a character's spoken line ("the
-                        courier: ..."), never voice-over, and may be empty;
-                        panels share the length equally. Needs the default
-                        story engine.
+  --speech-only         Narration: is only ever a character's spoken line
+                        ("the courier: ..."), never voice-over, and may be
+                        empty; panels share the length equally. Needs the
+                        default story engine.
   --no-auto-lora        the story plan picks no catalog LoRAs
                         (generated/loras/catalog.json); --lora/--stills-lora
                         still apply

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""story-server-restore -- bring the story server back after a pipeline phase, safely during a
+stop.
+
+  bin/story-server-restore [MODE] [--wait]
+
+Runs `bin/story-server MODE` (default mlx-vision) in a NEW SESSION, so a cancel or kill sweep of
+the job that asked for it (movie-ui Cancel signals every process group of the job, then SIGKILLs
+them) cannot take the restarted server down with the job. Without --wait it returns at once and
+the start continues in the background, logging to
+~/.local/share/qwen-agent/story-server-restore.log; with --wait it waits for the start to finish
+and returns its exit code.
+
+Does nothing (exit 0) when the server already serves MODE; when another `story-server MODE`
+start is in progress it starts nothing, and with --wait waits for that start to finish. Stdlib
+only. Spec: docs/superpowers/specs/2026-10-21-clean-stop-design.md.
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+BIN = os.path.dirname(os.path.realpath(__file__))
+STORY_SERVER = os.environ.get("STORY_SERVER_RESTORE_BIN", os.path.join(BIN, "story-server"))
+LOG = os.path.expanduser("~/.local/share/qwen-agent/story-server-restore.log")
+
+
+def serving(mode):
+    """True when `story-server status` reports SERVING <mode>."""
+    try:
+        out = subprocess.run([STORY_SERVER, "status"], capture_output=True, text=True,
+                             timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(line.split() == ["state:", "SERVING", mode] for line in out.splitlines())
+
+
+def start_in_progress(mode):
+    """True when another `story-server <mode>` start is running."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                             text=True).stdout
+    except OSError:
+        return False
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        words = command.split()
+        if (int(pid) != os.getpid() and len(words) >= 2 and words[-1] == mode
+                and os.path.basename(words[-2]) == "story-server"):
+            return True
+    return False
+
+
+def main(argv):
+    wait = "--wait" in argv
+    args = [a for a in argv if a != "--wait"]
+    if len(args) > 1 or any(a.startswith("-") for a in args):
+        print("usage: story-server-restore [MODE] [--wait]", file=sys.stderr)
+        return 2
+    mode = args[0] if args else "mlx-vision"
+    if serving(mode):
+        print("story-server-restore: already serving %s" % mode)
+        return 0
+    if start_in_progress(mode):
+        print("story-server-restore: a story-server %s start is already in progress" % mode,
+              flush=True)
+        if not wait:
+            return 0
+        while start_in_progress(mode):
+            time.sleep(2)
+        return 0 if serving(mode) else 1
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "ab") as log:
+        proc = subprocess.Popen([STORY_SERVER, mode], stdin=subprocess.DEVNULL, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    print("story-server-restore: starting story-server %s (pid %d, own session); log: %s"
+          % (mode, proc.pid, LOG), flush=True)
+    return proc.wait() if wait else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

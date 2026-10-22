@@ -8,7 +8,7 @@
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], seedUpload: null, composeAction: "story", story: null, character: null, selectedJob: null, logOffset: 0,
+    characters: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
 
@@ -260,7 +260,7 @@
   async function selectWorkspace(path) {
     S.ws = path;
     await loadOptions();
-    await Promise.all([loadCatalog(), loadCharacters(), loadStories(), loadModels()]);
+    await Promise.all([loadCatalog(), loadCharacters(), loadActions(), loadStories(), loadModels()]);
     preview();
   }
 
@@ -281,7 +281,7 @@
 
   // --- tabs (MU79) ---------------------------------------------------------------------
 
-  const TABS = ["compose", "stories", "characters", "loras", "jobs", "traces"];
+  const TABS = ["compose", "stories", "characters", "actions", "loras", "jobs", "traces"];
 
   function showTab(name) {
     TABS.forEach(function (tab) {
@@ -290,6 +290,7 @@
     });
     if (name === "stories") { loadStories(); }
     if (name === "characters") { loadCharacters(); }
+    if (name === "actions") { loadActions(); }
     if (name === "traces") { loadTraceAgents(); loadRecent(); loadSaved(); }
     if (name === "loras") { loadCatalogTable(); loadModels(); }
   }
@@ -381,6 +382,9 @@
       narration: $("#c-narration").value,
       video_loras: collectLoras("video"), stills_loras: collectLoras("stills"),
       characters: Array.prototype.map.call($("#c-characters").selectedOptions, function (o) { return o.value; }),
+      action_loras: Array.prototype.map.call($("#c-actions").selectedOptions, function (o) {
+        return {name: o.value, strength: numberOrNull("#c-action-strength")};
+      }),
       story_legacy: $("#c-story-legacy").checked, judge: $("#c-judge").checked,
       no_low_ram: $("#c-no-low-ram").checked, panel_timeout: numberOrNull("#c-panel-timeout"),
       overwrite_movie: $("#c-overwrite").checked, redo: []
@@ -514,6 +518,12 @@
     Array.prototype.forEach.call($("#c-characters").options, function (o) {
       o.selected = (f.characters || []).indexOf(o.value) >= 0;
     });
+    const actionNames = (f.action_loras || []).map(function (a) { return a.name; });
+    Array.prototype.forEach.call($("#c-actions").options, function (o) {
+      o.selected = actionNames.indexOf(o.value) >= 0;
+    });
+    const actionStrength = (f.action_loras || []).length ? f.action_loras[0].strength : null;
+    $("#c-action-strength").value = actionStrength === null || actionStrength === undefined ? "" : actionStrength;
     $("#c-story-legacy").checked = Boolean(f.story_legacy);
     $("#c-judge").checked = Boolean(f.judge);
     $("#c-no-low-ram").checked = Boolean(f.no_low_ram);
@@ -847,6 +857,93 @@
                              force: $("#ch-train-force").checked});
       $("#ch-train-reason").textContent = res.status === 201 ? "queued job " + res.data.job.id :
         ((res.data && (res.data.errors || [res.data.error]).join("; ")) || "");
+    });
+  }
+
+  // --- actions (motion LoRAs, bin/action) ----------------------------------------------
+
+  async function loadActions() {
+    if (!S.ws) { return; }
+    const res = await api("GET", "/api/actions" + wsQuery());
+    const actions = res.status === 200 ? res.data.actions : [];
+    const body = clear($("#a-list tbody"));
+    const pick = $("#c-actions");
+    const chosen = Array.prototype.map.call(pick.selectedOptions, function (o) { return o.value; });
+    clear(pick);
+    actions.forEach(function (a) {
+      const row = el("tr", {data: {action: a.name}, cls: "clickable"}, a.invalid ?
+        [el("td", {text: a.name}), el("td", {text: "invalid: " + a.invalid}), el("td"), el("td")] :
+        [el("td", {text: a.name}), el("td", {text: a.status}),
+         el("td", {text: a.clips === null ? "-" : String(a.clips)}), el("td", {text: a.trigger})]);
+      row.addEventListener("click", function () { openAction(a.name); });
+      body.appendChild(row);
+      if (a.status === "trained") {
+        const option = el("option", {value: a.name, text: a.name + " (" + a.trigger + ")"});
+        option.selected = chosen.indexOf(a.name) >= 0;
+        pick.appendChild(option);
+      }
+    });
+  }
+
+  async function openAction(name) {
+    const res = await api("GET", "/api/actions/" + enc(name) + wsQuery());
+    if (res.status !== 200) { $("#a-status").textContent = (res.data && res.data.error) || "error"; return; }
+    S.action = res.data;
+    const a = res.data.action;
+    show($("#a-detail"), true);
+    $("#a-title").textContent = name + " (" + a.status + ")";
+    $("#a-summary").textContent = "trigger: " + a.trigger + "\ndescriptor: " + a.descriptor
+      + "\nidentity agnostic: " + a.identity_agnostic + "\ndefault strength: " + a.default_strength
+      + (a.lora ? "\nLoRA: " + a.lora.path : "");
+    const gallery = clear($("#a-gallery"));
+    if (res.data.contact_sheet) {
+      gallery.appendChild(el("img", {src: fileUrl(res.data.contact_sheet), alt: "contact sheet", cls: "sheet"}));
+    }
+    res.data.clips.forEach(function (p) { gallery.appendChild(el("video", {src: fileUrl(p), controls: "", preload: "metadata"})); });
+    $("#a-status").textContent = "";
+    show($("#a-regenerate"), Boolean(res.data.last_create_fields) && a.status !== "trained");
+    gate($("#a-train"), $("#a-train-reason"), ["render"]);
+    if (a.status === "trained") {
+      $("#a-train").disabled = true;
+      $("#a-train-reason").textContent = "already trained";
+    } else if ((a.dataset || {}).clips < 8) {
+      $("#a-train").disabled = true;
+      $("#a-train-reason").textContent = "fewer than 8 clips; add clips and rebuild the dataset";
+    }
+  }
+
+  async function submitAction(body, status) {
+    body.ws = S.ws;
+    const res = await api("POST", "/api/actions", body);
+    if (res.status === 201) {
+      status.textContent = "queued job " + res.data.job.id;
+      pollJobs();
+    } else {
+      status.textContent = (res.data && (res.data.errors || [res.data.error]).join("; ")) || ("http " + res.status);
+    }
+  }
+
+  function setupActions() {
+    $("#a-create").addEventListener("click", function () {
+      const clips = $("#a-clips").value.split("\n").map(function (l) { return l.trim(); })
+        .filter(function (l) { return l; });
+      submitAction({name: $("#a-name").value.trim(), trigger: $("#a-trigger").value.trim(),
+                    descriptor: $("#a-descriptor").value.trim(), clips: clips,
+                    performers: numberOrNull("#a-performers") || 0, force: $("#a-force").checked,
+                    regenerate: false}, $("#a-create-status"));
+    });
+    $("#a-regenerate").addEventListener("click", async function () {
+      const name = S.action.action.name;
+      if (!(await askConfirm("Rebuild the dataset of " + name + " from its last clips?"))) { return; }
+      submitAction(Object.assign({}, S.action.last_create_fields, {regenerate: true}), $("#a-status"));
+    });
+    $("#a-train").addEventListener("click", async function () {
+      const name = S.action.action.name;
+      if (!(await askConfirm("Train " + name + "? The story server is stopped for training and restarted after."))) { return; }
+      const res = await api("POST", "/api/actions/" + enc(name) + "/train", {ws: S.ws});
+      $("#a-train-reason").textContent = res.status === 201 ? "queued job " + res.data.job.id :
+        ((res.data && (res.data.errors || [res.data.error]).join("; ")) || "");
+      if (res.status === 201) { pollJobs(); }
     });
   }
 
@@ -1376,6 +1473,7 @@
     setupSmoke();
     setupStories();
     setupCharacters();
+    setupActions();
     setupLoras();
     setupJobs();
     setupTraces();

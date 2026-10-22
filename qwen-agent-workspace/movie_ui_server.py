@@ -55,6 +55,7 @@ FILE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", 
 _ID = r"([0-9]{8}-[0-9]{6}-[0-9a-f]{4})"
 _STORY = r"([A-Za-z0-9][A-Za-z0-9._-]{0,79})"
 _NAME = r"([a-z][a-z0-9-]{1,23})"
+_ACTION = r"([a-z][a-z0-9-]{1,31})"
 _TRACE = r"([0-9a-f]{32})"
 _SAMPLE_ID = "20261019-142233-a1b2"
 _SAMPLE_TRACE = "0123456789abcdef0123456789abcdef"
@@ -76,6 +77,10 @@ ROUTES = [
     ("POST", r"/api/characters/" + _NAME + r"/train", "h_character_train", "/api/characters/kyra/train"),
     ("POST", r"/api/characters/" + _NAME + r"/regenerate", "h_character_regenerate",
      "/api/characters/kyra/regenerate"),
+    ("GET", r"/api/actions", "h_actions", "/api/actions"),
+    ("POST", r"/api/actions", "h_action_create", "/api/actions"),
+    ("GET", r"/api/actions/" + _ACTION, "h_action", "/api/actions/roundhouse-kick"),
+    ("POST", r"/api/actions/" + _ACTION + r"/train", "h_action_train", "/api/actions/roundhouse-kick/train"),
     ("POST", r"/api/uploads", "h_upload", "/api/uploads"),
     ("POST", r"/api/preview", "h_preview", "/api/preview"),
     ("POST", r"/api/validate", "h_validate", "/api/validate"),
@@ -1278,6 +1283,125 @@ MovieUIHandler.h_character = _h_character
 MovieUIHandler.h_character_create = _h_character_create
 MovieUIHandler.h_character_regenerate = _h_character_regenerate
 MovieUIHandler.h_character_train = _h_character_train
+
+
+# ---------------------------------------------------------------------------
+# Actions: identity-agnostic motion LoRAs (bin/action)
+# ---------------------------------------------------------------------------
+
+ACTION_ROW_RE = re.compile(r"^(\S+)\s+(dataset|untrained|trained)\s+(\S+)\s+(.+)$")
+ACTION_INVALID_RE = re.compile(r"^(\S+)\s+INVALID: (.*)$")
+ACTION_TRIGGER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _'-]{0,39}")   # action_lib.TRIGGER_RE
+ACTION_CLIP_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")
+ACTION_MAX_CLIPS = 64
+
+
+def parse_action_list(stdout):
+    """Rows of bin/action list."""
+    out = []
+    for line in stdout.splitlines():
+        if line.startswith("name ") or line.startswith("(no actions)") or not line.strip():
+            continue
+        m = ACTION_INVALID_RE.match(line)
+        if m:
+            out.append({"name": m.group(1), "invalid": m.group(2)})
+            continue
+        m = ACTION_ROW_RE.match(line)
+        if m:
+            clips = m.group(3)
+            out.append({"name": m.group(1), "status": m.group(2),
+                        "clips": int(clips) if clips.isdigit() else None,
+                        "trigger": m.group(4).strip(), "invalid": None})
+    return out
+
+
+def _h_actions(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    run = tool_result("action", lib.run_light(lib.tool_argv(real, "action", "list"), real))
+    return 200, {"actions": parse_action_list(run["stdout"])}
+
+
+def _h_action(self, groups, query, body):
+    real, name = self.ws(query.get("ws")), groups[0]
+    run = tool_result("action", lib.run_light(lib.tool_argv(real, "action", "show", name), real))
+    try:
+        data = json.loads(run["stdout"])
+    except ValueError:
+        raise ApiError(502, "action printed unparsable output", run=run)
+    dataset = data.get("dataset") if isinstance(data, dict) else None
+    sheet = dataset.get("contact_sheet") if isinstance(dataset, dict) else None
+    clips = []
+    if isinstance(sheet, str):
+        clips_dir = os.path.join(os.path.dirname(sheet), "clips")
+        try:
+            clips = sorted(os.path.join(clips_dir, n) for n in os.listdir(clips_dir) if n.endswith(".mp4"))
+        except OSError:
+            clips = []
+    job = newest_job(self.server, ("action-create",), real, "character", name)
+    return 200, {"action": data, "contact_sheet": sheet if isinstance(sheet, str) else None, "clips": clips,
+                 "last_create_fields": job["fields"] if job is not None else None}
+
+
+def action_create_errors(body):
+    """The field rules for POST /api/actions; [] when they pass."""
+    errors = []
+    name, trigger, descriptor = body.get("name"), body.get("trigger"), body.get("descriptor")
+    clips, performers = body.get("clips"), body.get("performers")
+    if not (isinstance(name, str) and lib.ACTION_NAME_RE.fullmatch(name)):
+        errors.append("action name must match [a-z][a-z0-9-]{1,31}")
+    if not (isinstance(trigger, str) and ACTION_TRIGGER_RE.fullmatch(trigger.strip())):
+        errors.append("trigger must be a Motion: phrase of 1-40 letters, digits, spaces, _ ' or -")
+    if not (isinstance(descriptor, str) and 8 <= len(descriptor.split()) <= 60):
+        errors.append("descriptor must be 8 to 60 words")
+    elif not lib._argv_safe(descriptor) or descriptor.strip().startswith("-") or "\n" in descriptor:
+        errors.append("descriptor contains invalid characters")
+    if not (isinstance(clips, list) and 1 <= len(clips) <= ACTION_MAX_CLIPS):
+        errors.append("give 1 to %d clip paths" % ACTION_MAX_CLIPS)
+    else:
+        for path in clips:
+            if not (isinstance(path, str) and os.path.isabs(path) and lib._argv_safe(path)):
+                errors.append("clip %s must be an absolute path" % (_fs_text(path) if isinstance(path, str) else path,))
+            elif not path.lower().endswith(ACTION_CLIP_EXTS):
+                errors.append("clip %s is not a video (%s)" % (_fs_text(path), ", ".join(ACTION_CLIP_EXTS)))
+            elif not os.path.isfile(path):
+                errors.append("clip %s not found" % _fs_text(path))
+    if not (isinstance(performers, int) and not isinstance(performers, bool) and 0 <= performers <= 1000):
+        errors.append("performers must be an integer >= 0")
+    for key in ("force", "regenerate"):
+        if not isinstance(body.get(key, False), bool):
+            errors.append("%s must be true or false" % key)
+    return errors
+
+
+def create_action_job(server, kind, real, fields):
+    with STORE_LOCK:
+        job_id = lib.new_job_id(server.state)
+        argv = lib.action_argv(kind, fields, real)
+        lib.create_job(server.state, job_id, kind, real, None, fields["name"], argv, fields)
+    return 201, {"job": job_summary(server, job_id, lib.read_queue(server.state))}
+
+
+def _h_action_create(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    errors = action_create_errors(body)
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    fields = {"ws": real, "name": body["name"], "trigger": " ".join(body["trigger"].split()),
+              "descriptor": " ".join(body["descriptor"].split()), "clips": list(body["clips"]),
+              "performers": body["performers"], "force": body.get("force", False),
+              "regenerate": body.get("regenerate", False)}
+    return create_action_job(self.server, "action-create", real, fields)
+
+
+def _h_action_train(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    return create_action_job(self.server, "action-train", real, {"ws": real, "name": groups[0]})
+
+
+MovieUIHandler.h_actions = _h_actions
+MovieUIHandler.h_action = _h_action
+MovieUIHandler.h_action_create = _h_action_create
+MovieUIHandler.h_action_train = _h_action_train
 
 
 # ---------------------------------------------------------------------------

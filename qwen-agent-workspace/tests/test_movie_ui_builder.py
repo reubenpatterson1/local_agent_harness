@@ -79,13 +79,14 @@ def test_mut1_character_argv():
     create = {"name": "kyra", "phrase": "the young woman", "seed_upload": "ab.jpg", "descriptor": None,
               "class_noun": None, "trigger": None, "seed": None, "force": False}
     assert lib.character_argv("character-create", create, WS, STATE, py=PY) == c + [
-        "create", "kyra", "--phrase", "the young woman", "--seed-image", "/s/uploads/ab.jpg"]
+        "create", "kyra", "--phrase", "the young woman", "--seed-image", "/s/uploads/ab.jpg",
+        "--no-review"]
     create.update(seed_upload=None, descriptor="a tall woman", class_noun="woman", trigger="kyrax", seed=0, force=True)
     assert lib.character_argv("character-create", create, WS, STATE, py=PY) == c + [
         "create", "kyra", "--phrase", "the young woman", "--descriptor", "a tall woman", "--class", "woman",
-        "--trigger", "kyrax", "--seed", "0", "--force"]
+        "--trigger", "kyrax", "--seed", "0", "--force", "--no-review"]
     assert lib.character_argv("character-regenerate", {"name": "kyra"}, WS, STATE, py=PY) == c + [
-        "create", "kyra", "--regenerate"]
+        "create", "kyra", "--regenerate", "--no-review"]
     # character-train routes through the VLM-managing wrapper: [wrapper, py, name, flags].
     tw = ["/w/bin/character-train-vlm", PY]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": False, "force": False},
@@ -107,7 +108,7 @@ def test_mu36_compose_fields_defaults_and_unknown_keys():
 
 ALL_MU37_FLAGS = {"--story-id", "--panels", "--length", "--fps", "--frames", "--video-width", "--video-height",
                   "--seed-image", "--model", "--gemma", "--story-model", "--goal", "--shots", "--no-stills",
-                  "--lora", "--stills-lora", "--character", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
+                  "--lora", "--stills-lora", "--character", "--action", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
                   "--no-low-ram", "--panel-timeout", "--force", "--force-story", "--redo", "--story-only",
                   "--no-review"}
 
@@ -121,12 +122,12 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
     assert ALL_MU37_FLAGS <= current
     assert {"--story-server-stop-after-story", "--no-story-server-stop-after-story", "--help"} <= current
     assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma",
-                             "--no-narration", "--speech-only"}
+                             "--no-narration", "--speech-only", "--action"}
     real, error = lib.help_flags(mt.WS)
     assert error is None and ALL_MU37_FLAGS <= real
     supported = lib.supported_map(old)
     assert supported["judge"] is False and supported["story_only"] is False and supported["panels"] is True
-    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 27
+    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 28
     assert lib.supported_map(None)["panels"] is False
     ws = mt.make_stub_workspace(tmp_path)
     flags, error = lib.help_flags(ws)

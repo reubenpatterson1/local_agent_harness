@@ -6,7 +6,7 @@ Ingests operator-supplied reference clips of ONE action by varied performers,
 normalizes each to the training geometry/fps/frame-lattice with ffmpeg, writes an
 appearance-free caption per clip, builds a review contact sheet, enforces the
 identity-agnostic performer-count check, and writes action.json (status
-"dataset"). Training (ltx-2-mlx) is Phase 3.
+"dataset"), and trains the motion LoRA with ltx-2-mlx (bin/action train).
 
 Top-level imports are stdlib + PIL; ffmpeg/ffprobe are invoked as subprocesses
 (the host already ships them, like judge-clips and wrap_still). Parallels
@@ -241,6 +241,22 @@ ACTION_STEPS = int(os.environ.get("ACTION_TRAIN_STEPS", "1000"))
 PREPROCESS_TIMEOUT_S = 1800
 TRAIN_TIMEOUT_S = 14400
 
+
+def _character_dataset():
+    """character_dataset.py, loaded by path inside the call (it imports psutil)."""
+    return importlib.machinery.SourceFileLoader(
+        "character_dataset", os.path.join(WS, "character_dataset.py")).load_module()
+
+
+def busy_process():
+    """(pid, command) of a running render or training process, else None (spec 4.3, A7)."""
+    return _character_dataset().busy_process()
+
+
+def story_server_state():
+    """bin/story-server status's state; training needs STOPPED (its memory goes to training)."""
+    return _character_dataset().story_server_state()
+
 TRAIN_CONFIG_TEMPLATE = """model:
   model_path: {model_path}
   text_encoder_path: {gemma}
@@ -360,6 +376,14 @@ def train_action(name):
     if not os.path.isdir(TRAIN_MODEL):
         raise DatasetError("training transformer not found at %s; a dev/train LTX-2.3 model is "
                            "required (set LTX2_MLX_TRAIN_MODEL)" % TRAIN_MODEL)
+    busy = busy_process()
+    if busy is not None:
+        raise DatasetError("a render or training process is running (pid %d: %s); bin/action "
+                           "never trains concurrently with a render" % busy)
+    state = story_server_state()
+    if state != "STOPPED":
+        raise DatasetError("the story server is %s; stop it first with bin/story-server stop"
+                           % state)
 
     ds = data.get("dataset") or {}
     width = ds.get("width", DEFAULT_WIDTH)
