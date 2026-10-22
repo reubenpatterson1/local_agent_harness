@@ -1128,8 +1128,23 @@ def _cast_flags(args):
     return flags + ["--character-strength", repr(float(args.character_strength))]
 
 
+def _seed_cell_budget():
+    """(max_area_cells, max_edge_cells) for seed geometry when host autotune is on and
+    its tier sets a size (QWEN_LTX_AUTOTUNE, e.g. 1024x576 -> 144 cells, 16-cell edge),
+    else None: ltx_image_fit's measured 704x448 default applies."""
+    skill = _ltx2_skill()
+    if not skill.autotune_enabled():
+        return None
+    o = skill.autotune_overrides()
+    if "width" not in o or "height" not in o:
+        return None
+    w, h = o["width"] // 64, o["height"] // 64
+    return w * h, max(_image_fit().MAX_CELLS, w, h)
+
+
 def _seed_geometry(seed_path):
-    """Validate seed_path and derive the video geometry from it. Writes nothing.
+    """Validate seed_path and derive the video geometry from it, within the autotune
+    tier's area when that is on (_seed_cell_budget). Writes nothing.
 
     Returns (violations, geometry, img): ([], (W, H, pad_px), the EXIF-oriented RGB
     image) on success, or ([one violation], None, None) at the first problem."""
@@ -1147,7 +1162,7 @@ def _seed_geometry(seed_path):
         return (["--seed-image is degenerate: %dx%d (each edge must be at least %d px)"
                  % (img.size[0], img.size[1], SEED_MIN_EDGE)], None, None)
     try:
-        geometry = fit.derive_video_dims(*img.size)
+        geometry = fit.derive_video_dims(*img.size, *(_seed_cell_budget() or ()))
     except ValueError as e:
         return [str(e)], None, None
     return [], geometry, img
@@ -2392,12 +2407,12 @@ def main(argv=None):
         return _list_characters(raw_argv)
     parser = build_parser()
     args = parser.parse_args(argv)
-    _autotuned = _ltx2_skill().maybe_autotune_apply(
-        args, raw_argv,
-        [("width", "video_width", ["--video-width"], int),
-         ("height", "video_height", ["--video-height"], int),
-         ("num_frames", "frames", ["--frames"], int),
-         ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)])
+    _autotune_fields = [("num_frames", "frames", ["--frames"], int),
+                        ("low_ram", "no_low_ram", ["--no-low-ram"], lambda v: not v)]
+    if not getattr(args, "seed_image", None):    # a seed image derives geometry itself
+        _autotune_fields = [("width", "video_width", ["--video-width"], int),
+                            ("height", "video_height", ["--video-height"], int)] + _autotune_fields
+    _autotuned = _ltx2_skill().maybe_autotune_apply(args, raw_argv, _autotune_fields)
     if _autotuned:
         print("autotune (QWEN_LTX_AUTOTUNE): %s" % ", ".join(_autotuned), file=sys.stderr)
     if args.list_characters:                 # an abbreviation (--list-char) got past the pre-scan

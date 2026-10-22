@@ -133,6 +133,18 @@ def test_max_area_cells_override():
             os.environ["LTX_MAX_AREA_CELLS"] = saved
 
 
+def test_explicit_cell_budget():
+    check("F3e a 144-cell / 16-edge budget fits a 16:9 seed at 1024x576",
+          fit.derive_video_dims(2048, 1152, 144, 16) == (1024, 576, 0),
+          "got %r" % (fit.derive_video_dims(2048, 1152, 144, 16),))
+    check("F3f without a budget the same seed stays inside the 77-cell default",
+          fit.derive_video_dims(2048, 1152) == (576, 320, 7),
+          "got %r" % (fit.derive_video_dims(2048, 1152),))
+    check("F3g a 3:1 seed is still accepted under the wider edge budget",
+          fit.derive_video_dims(3000, 1000, 144, 16)[2] <= fit.PAD_TOLERANCE_PX,
+          "got %r" % (fit.derive_video_dims(3000, 1000, 144, 16),))
+
+
 def test_ratio_sweep():
     bad = []
     lo, hi = math.log(1 / 3.0), math.log(3.0)
@@ -261,6 +273,7 @@ if __name__ == "__main__":
     test_golden_table()
     test_range_errors()
     test_max_area_cells_override()
+    test_explicit_cell_budget()
     test_ratio_sweep()
     test_fit_letterbox()
     test_load_oriented_rgb()
