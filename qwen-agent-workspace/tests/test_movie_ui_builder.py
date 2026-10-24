@@ -65,6 +65,9 @@ def test_mut1_golden_argv():
                  "--goal", "Make it tense", "--no-auto-lora", "--judge", "--no-low-ram", "--panel-timeout", "900",
                  "--force", "--no-review"]),
         (_f(story_legacy=True), base + ["--panels", "15"] + defaults + ["--story-legacy", "--story-only", "--no-review"]),
+        (_f(action="movie", narration="speech"), base + ["--panels", "15"] + defaults + ["--speech-only", "--no-review"]),
+        (_f(action="movie", narration="none"), base + ["--panels", "15"] + defaults + ["--no-narration", "--no-review"]),
+        (_f(action="movie", narration="full"), base + ["--panels", "15"] + defaults + ["--no-review"]),
     ]
     for fields, expected in cases:
         assert lib.build_argv(fields, WS, STATE, py=PY) == expected
@@ -76,30 +79,36 @@ def test_mut1_character_argv():
     create = {"name": "kyra", "phrase": "the young woman", "seed_upload": "ab.jpg", "descriptor": None,
               "class_noun": None, "trigger": None, "seed": None, "force": False}
     assert lib.character_argv("character-create", create, WS, STATE, py=PY) == c + [
-        "create", "kyra", "--phrase", "the young woman", "--seed-image", "/s/uploads/ab.jpg"]
+        "create", "kyra", "--phrase", "the young woman", "--seed-image", "/s/uploads/ab.jpg",
+        "--no-review"]
     create.update(seed_upload=None, descriptor="a tall woman", class_noun="woman", trigger="kyrax", seed=0, force=True)
     assert lib.character_argv("character-create", create, WS, STATE, py=PY) == c + [
         "create", "kyra", "--phrase", "the young woman", "--descriptor", "a tall woman", "--class", "woman",
-        "--trigger", "kyrax", "--seed", "0", "--force"]
+        "--trigger", "kyrax", "--seed", "0", "--force", "--no-review"]
     assert lib.character_argv("character-regenerate", {"name": "kyra"}, WS, STATE, py=PY) == c + [
-        "create", "kyra", "--regenerate"]
+        "create", "kyra", "--regenerate", "--no-review"]
+    # character-train routes through the VLM-managing wrapper: [wrapper, py, name, flags].
+    tw = ["/w/bin/character-train-vlm", PY]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": False, "force": False},
-                              WS, STATE, py=PY) == c + ["train", "kyra", "--video"]
+                              WS, STATE, py=PY) == tw + ["kyra", "--video"]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": True, "force": True},
-                              WS, STATE, py=PY) == c + ["train", "kyra", "--video", "--stills", "--force"]
+                              WS, STATE, py=PY) == tw + ["kyra", "--video", "--stills", "--force"]
 
 
 def test_mu36_compose_fields_defaults_and_unknown_keys():
     fields = lib.compose_fields({"story_id": "x", "bogus": 1, "video_loras": [{"id": None}]})
     assert set(fields) == set(lib.DEFAULT_FIELDS)
     assert fields["story_id"] == "x" and fields["panels"] == 15 and fields["mode"] == "chained"
-    assert fields["model"] == lib.DEFAULT_MODEL and fields["redo"] == []
+    assert fields["model"] == lib.DEFAULT_MODEL and fields["redo"] == [] and fields["narration"] == "full"
+    # Jobs saved with the earlier boolean narration field still load.
+    assert lib.compose_fields({"narration": False})["narration"] == "none"
+    assert lib.compose_fields({"narration": True})["narration"] == "full"
     assert lib.ordered([_lora(None, "/a"), _lora("motion", "/b")]) == [_lora("motion", "/b"), _lora(None, "/a")]
 
 
 ALL_MU37_FLAGS = {"--story-id", "--panels", "--length", "--fps", "--frames", "--video-width", "--video-height",
                   "--seed-image", "--model", "--gemma", "--story-model", "--goal", "--shots", "--no-stills",
-                  "--lora", "--stills-lora", "--character", "--no-auto-lora", "--story-legacy", "--judge",
+                  "--lora", "--stills-lora", "--character", "--action", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
                   "--no-low-ram", "--panel-timeout", "--force", "--force-story", "--redo", "--story-only",
                   "--no-review"}
 
@@ -112,12 +121,13 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
         old = lib.parse_help_flags(f.read())
     assert ALL_MU37_FLAGS <= current
     assert {"--story-server-stop-after-story", "--no-story-server-stop-after-story", "--help"} <= current
-    assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma"}
+    assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma",
+                             "--no-narration", "--speech-only", "--action"}
     real, error = lib.help_flags(mt.WS)
     assert error is None and ALL_MU37_FLAGS <= real
     supported = lib.supported_map(old)
     assert supported["judge"] is False and supported["story_only"] is False and supported["panels"] is True
-    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 26
+    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 28
     assert lib.supported_map(None)["panels"] is False
     ws = mt.make_stub_workspace(tmp_path)
     flags, error = lib.help_flags(ws)
@@ -248,11 +258,19 @@ def test_mut25_source_scan_of_new_python_files():
 def test_mut26_pipeline_files_are_unchanged():
     # MUK3: the movie-ui must not modify any pipeline file. Baseline re-based from
     # 22dc4a1 (pre-movie-ui) to fb8b9a5 when the action-LoRA / pipeline PR
-    # intentionally advanced the pipeline; the movie-ui itself still made zero
-    # pipeline changes (verified: git diff 22dc4a1..c275a0a over PIPELINE_FILES is
-    # empty), and this invariant holds going forward from the new baseline.
-    # Re-based again to acf4c73 for the PR #1 fix (bin/ltx-movie autotune guard).
-    BASELINE = "acf4c732ac8bdb4ef8dccef086bd98646f26adf0"
+    # intentionally advanced the pipeline, then to 6bcb54b (character_dataset.py's
+    # TEST_MODEL_DIR host-adapted ltx-2.5 -> ltx-2.3), then to 9f71234 (character_dataset.py's
+    # VLM restart switched from the vLLM "vision" mode to "mlx-vision", the mlx_vlm path
+    # this host serves), then to 8921fa9 (character_dataset.py's DESCRIBE_PROMPT
+    # strengthened to capture makeup and habitual bearing). The movie-ui itself still
+    # makes zero pipeline changes), then to c35b6bc (apparent age pinned in DESCRIBE_PROMPT
+    # and scored in CHECK_PROMPT, fixing age drift), then to 3b6b317 (descriptor word cap
+    # 60->70 for the richer prompt), then to d7e9036 (character_lib.py's matching descriptor
+    # word cap 60->70), then to 69460eb (bin/qwen-agent's --model default resolves to the
+    # served model), then to d3796bf (bin/qwen-agent's 120000 fallback context window and
+    # --danger-auto-approve reaching any path), then to 8df5fdb (ltx-movie seed geometry under
+    # host autotune). This invariant holds from the new baseline.
+    BASELINE = "8df5fdb63e6d3cd8a54c08519cef07285e862446"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")

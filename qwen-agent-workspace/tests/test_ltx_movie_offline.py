@@ -1308,6 +1308,25 @@ def test_seed_with_explicit_video_dims_rejected():
               "derived from --seed-image" in r.stderr, "stderr=%r" % r.stderr)
 
 
+def test_seed_with_autotune_keeps_derived_geometry():
+    from PIL import Image
+    seed = os.path.join(tempfile.mkdtemp(), "seed.png")
+    Image.new("RGB", (1024, 576), (90, 90, 90)).save(seed)
+    env = dict(os.environ, QWEN_LTX_AUTOTUNE="1", QWEN_LTX_MEM_GIB="128")
+    r = subprocess.run([sys.executable, _SCRIPT_PATH, "n", "--story-id", "unittest-seed-autotune",
+                        "--seed-image", seed, "--dry-run"],
+                       capture_output=True, text=True, cwd=WS, env=env)
+    check("L48c big-tier autotune with --seed-image does not trip the explicit-geometry guard",
+          r.returncode == 0 and "derived from --seed-image" not in r.stderr,
+          "rc=%r stderr=%r" % (r.returncode, r.stderr[-800:]))
+    check("L48d autotune leaves video_width/video_height to the seed image",
+          "video_width=" not in r.stderr and "video_height=" not in r.stderr,
+          "stderr=%r" % r.stderr[-800:])
+    check("L48e the seed geometry uses the autotune tier's 1024x576 area",
+          "video geometry 1024x576" in r.stdout and "--width 1024 --height 576" in r.stdout,
+          "stdout=%r" % r.stdout[:1500])
+
+
 def test_video_dims_must_be_64_multiples():
     def _run(extra):
         return subprocess.run([sys.executable, _SCRIPT_PATH, "n", "--story-id",
@@ -1652,6 +1671,7 @@ if __name__ == "__main__":
     test_dry_run_story_server_block_with_no_stills()
     test_story_server_source_guards()
     test_seed_with_explicit_video_dims_rejected()
+    test_seed_with_autotune_keeps_derived_geometry()
     test_video_dims_must_be_64_multiples()
     test_out_of_range_seed_fails_before_phase1()
     test_phase4_flags_policy_by_mode()

@@ -91,10 +91,13 @@ def test_mut4_every_v1_error_alone(env):
         ({"characters": ["kyra", "kyra"]}, "characters must be distinct character names"),
         ({"characters": ["Kyra"]}, "characters must be distinct character names"),
         ({"judge": "yes"}, "judge must be true or false"),
+        ({"narration": "loud"}, "narration must be one of full, speech, none"),
+        ({"story_legacy": True, "narration": "speech"},
+         "--story-legacy cannot be combined with --judge, --no-auto-lora, --no-narration, --speech-only or --goal"),
         ({"panel_timeout": 59}, "panel_timeout must be an integer from 60 to 86400"),
         ({"action": "render"}, "unknown action"),
-        ({"story_legacy": True, "judge": True}, "--story-legacy cannot be combined with --judge, --no-auto-lora or --goal"),
-        ({"story_legacy": True, "goal": "tense"}, "--story-legacy cannot be combined with --judge, --no-auto-lora or --goal"),
+        ({"story_legacy": True, "judge": True}, "--story-legacy cannot be combined with --judge, --no-auto-lora, --no-narration, --speech-only or --goal"),
+        ({"story_legacy": True, "goal": "tense"}, "--story-legacy cannot be combined with --judge, --no-auto-lora, --no-narration, --speech-only or --goal"),
     ]
     for overrides, message in table:
         assert _errors(env, **overrides) == [message], overrides
@@ -162,7 +165,7 @@ def test_mut9_v2_host_checks(env, monkeypatch):
     assert lib.story_server_check(env["ws"]) == (True, "story server: SERVING vision")
     mt.stub_config(env["ws"], {"story-server status": {"stdout": "  state:          STOPPED\n"}})
     assert lib.story_server_check(env["ws"]) == (
-        False, "story server is STOPPED; start it with bin/story-server vision (or text)")
+        False, "story server is STOPPED; start it with bin/story-server mlx-vision")
     mt.stub_config(env["ws"], {"story-server status": {"exit": 4, "stderr": "story-server: /usr/sbin/lsof missing\n"}})
     assert lib.story_server_check(env["ws"]) == (
         False, "bin/story-server status exited 4: story-server: /usr/sbin/lsof missing")

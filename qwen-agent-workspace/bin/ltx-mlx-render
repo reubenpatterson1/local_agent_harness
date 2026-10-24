@@ -37,6 +37,7 @@ import re
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -465,6 +466,68 @@ def lora_sha256(path):
     return _LORA_SHA256_CACHE[key]
 
 
+# Character video LoRAs are trained on 1-frame clips with no audio loss, but their q/k/v targets
+# also hit the audio-stream attention, which drifts and garbles the generated audio. Renders use a
+# copy without those modules (audio_to_video_attn writes into the video stream and is kept).
+VIDEO_ONLY_LORA_DIR = os.path.expanduser("~/.cache/qwen-agent/video-only-loras")
+
+
+def _audio_stream_key(name):
+    parts = name.split(".")
+    return ("video_to_audio_attn" in parts
+            or any(p.startswith("audio_") and p != "audio_to_video_attn" for p in parts))
+
+
+def video_only_lora(path):
+    """path, or a cached copy of the safetensors file at path without its audio-stream modules
+    (_audio_stream_key) when it has any. An unreadable or non-safetensors file is returned as is."""
+    try:
+        with open(path, "rb") as handle:
+            size = struct.unpack("<Q", handle.read(8))[0]
+            if size > min(os.path.getsize(path) - 8, 100 * 1024 * 1024):
+                return path
+            header = json.loads(handle.read(size))
+    except (OSError, ValueError, struct.error):
+        return path
+    if not isinstance(header, dict):
+        return path
+    names = [k for k in header if k != "__metadata__"]
+    keep = [k for k in names if not _audio_stream_key(k)]
+    if len(keep) == len(names):
+        return path
+    out = os.path.join(VIDEO_ONLY_LORA_DIR, lora_sha256(path) + ".safetensors")
+    if os.path.isfile(out):
+        return out
+    os.makedirs(VIDEO_ONLY_LORA_DIR, exist_ok=True)
+    new_header, offset = {}, 0
+    if "__metadata__" in header:
+        new_header["__metadata__"] = header["__metadata__"]
+    for k in keep:
+        begin, end = header[k]["data_offsets"]
+        new_header[k] = dict(header[k], data_offsets=[offset, offset + end - begin])
+        offset += end - begin
+    blob = json.dumps(new_header).encode("utf-8")
+    blob += b" " * (-len(blob) % 8)
+    tmp = out + ".tmp-%d" % os.getpid()
+    with open(path, "rb") as src, open(tmp, "wb") as dst:
+        dst.write(struct.pack("<Q", len(blob)))
+        dst.write(blob)
+        for k in keep:
+            begin, end = header[k]["data_offsets"]
+            src.seek(8 + size + begin)
+            dst.write(src.read(end - begin))
+    os.replace(tmp, out)
+    return out
+
+
+def use_video_only_character_loras(units):
+    """Point every character LoRA of units at its video_only_lora copy (in place)."""
+    for unit in units:
+        for lora in unit.get("loras") or ():
+            if lora["kind"] == "character":
+                lora["path"] = video_only_lora(lora["path"])
+
+
 def build_clip_provenance(unit, args, *, strict=False):
     """The exact generation identity a reusable clip must match. schema_version 2: every
     pre-redesign clip is deliberately non-reusable (it was conditioned on the old,
@@ -485,6 +548,7 @@ def build_clip_provenance(unit, args, *, strict=False):
         "chain_source_sha256": (file_sha256(unit["chain_source"]) if conditioning == "chain"
                                 else None),
         "chain_frame_index": args.frames - 1 if conditioning == "chain" else None,
+        "image_crf": SKILL.IMAGE_CRF if conditioning in ("still", "chain") else None,
         "seed": unit["seed"], "width": args.width, "height": args.height,
         "frames": args.frames, "fps": args.frame_rate, "low_ram": not args.no_low_ram,
         "tile_frames": args.tile_frames, "tile_spatial": args.tile_spatial,
@@ -1279,6 +1343,7 @@ def main(argv=None):
     print("clips dir: %s" % clips_dir)
 
     units = build_units(panels, args.seed, clips_dir, run_root, global_loras=args.global_loras)
+    use_video_only_character_loras(units)
 
     # ORDER-SAFE: keyed on unit index, never appended in loop order, because
     # the retry pass fills these in out of order (only failed panels, in

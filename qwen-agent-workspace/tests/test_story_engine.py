@@ -368,7 +368,7 @@ def test_rst14_plan_checks(ws):
          ["plan: P3 cast entry: c2's phrase 'the very old bald monk' has 5 words; at most 4"]),
         (cast2(phrase="The Courier"), ["plan: P3 cast entry: c2's phrase 'The Courier' is also c1's"]),
         (cast2(descriptor="an old man"),
-         ["plan: P3 cast entry: c2's descriptor: must be 8-60 words, got 3"]),
+         ["plan: P3 cast entry: c2's descriptor: must be 8-70 words, got 3"]),
         (cast2(phrase="the monk!"),
          ["plan: P3 cast entry: c2's phrase word 'monk!' may contain only letters, digits, "
           "apostrophes and hyphens (phrase 'the monk!')"]),
@@ -376,7 +376,7 @@ def test_rst14_plan_checks(ws):
                  "under grey light."),
          ['plan: P4 setting sentence: l1\'s setting does not start with "The setting is"']),
         (setting("The setting is a harbour."),
-         ["plan: P4 setting sentence: l1's setting is 5 words; it must be 12-45"]),
+         ["plan: P4 setting sentence: l1's setting is 5 words; aim for 12-45"]),
         (setting("The setting is a rainy harbour town in Japan. Boats rock behind under grey "
                  "light all afternoon."),
          ["plan: P4 setting sentence: l1's setting is more than one sentence"]),
@@ -683,6 +683,113 @@ def _story_checks(ws, mode, n=3, **kw):
     return hard + advisory
 
 
+def MEDIUM(raw):   # every beat a medium shot, so N17 (speaking in a wide shot) stays quiet
+    for beat in raw["beats"]:
+        beat["shot"] = "medium shot"
+
+
+def test_rst20d_speaking_shot(ws):
+    # N17 (advisory): a speaker in a wide shot, or held to a fixed smile, plays as voice-over.
+    def speak(k, text, **changes):
+        return lambda parts: parts[k - 1].update(narration=text, **changes)
+
+    line = "the courier: Keep moving, stay low."
+    SMILING = ("The courier pedals his bicycle steadily along the wet cobblestones of the harbour "
+               "road, leaning into the rain with a broad smile on his face as he rides past the "
+               "stacked wooden crates toward the old stone pier.")
+    assert _story_checks(ws, "shots", part_mut=speak(2, line)) == [
+        "panel 2: N17 speaking shot: Narration: 'the courier' speaks in a wide shot, too small to "
+        "read the lips, so it plays as voice-over; use a medium shot or closer"]
+    assert _story_checks(ws, "shots", part_mut=speak(1, line)) == []          # beat 1: medium shot
+    assert _story_checks(ws, "chained", part_mut=speak(2, line)) == []        # shot is panel 1's only
+    smiling = speak(1, line, motion=SMILING)
+    assert _story_checks(ws, "chained", part_mut=smiling) == [
+        "panel 1: N17 speaking shot: Narration: 'the courier' speaks, but the panel holds the "
+        "expression 'broad smile', which freezes the mouth; describe the speaking instead"]
+    voice_over = speak(1, "Rain falls on the harbour town.",
+                       motion=SMILING)
+    assert _story_checks(ws, "chained", part_mut=voice_over) == []
+
+
+def test_rst20e_speech_only_framing(ws):
+    # --speech-only: framed beats are medium shot to close-up (P7 hard), the plan and critic
+    # list only those, and the Image/Motion/Prompt key lines carry the framing sentence.
+    speech = {"narration": "speech"}
+    shots = seu.make_ctx(se, ws, mode="shots", panels=3, **speech)
+    assert _checks(shots, seu.plan_json("shots", 3)) == [
+        "beat 2: P7 shot type: 'wide shot' is too wide for on-screen speech; use one of: "
+        "medium shot, medium close-up, close-up"]
+    chained = seu.make_ctx(se, ws, mode="chained", panels=3, **speech)
+    assert _checks(chained, seu.plan_json("chained", 3)) == []   # only beat 1's shot is used
+    assert _checks(seu.make_ctx(se, ws, mode="shots", panels=3), seu.plan_json("shots", 3)) == []
+    prompt = se.build_plan_prompt(shots, [], [])
+    assert "shot is exactly one of: medium shot, medium close-up, close-up" + se.SPEECH_SHOT_NOTE \
+        in prompt and "wide shot" not in prompt
+    assert "close-up, extreme close-up" in se.build_plan_prompt(
+        seu.make_ctx(se, ws, mode="shots", panels=3), [], [])
+    assert "exactly one of: medium shot, medium close-up, close-up." in se.critic_field_lines(
+        "shots", None, "speech")
+    for mode in ("chained", "no_stills", "shots"):
+        ctx, plan, parts, _text, _path = _story(ws, mode, 3, ctx_kw=speech, plan_mut=MEDIUM)
+        assert se.SPEECH_FRAMING_SENTENCE in se.build_panel_prompt(ctx, plan, parts, 1), mode
+        ctx, plan, parts, _text, _path = _story(ws, mode, 3, plan_mut=MEDIUM)
+        assert se.SPEECH_FRAMING_SENTENCE not in se.build_panel_prompt(ctx, plan, parts, 1), mode
+
+
+def test_rst20b_narration_speaker(ws):
+    # A Narration: line spoken on camera starts with an on-screen character's referring phrase
+    # and a colon; an off-screen speaker is hard (N16), an unknown prefix is read as voice-over.
+    def narration(text):
+        return lambda parts: parts[1].update(narration=text)
+
+    for mode in ("chained", "no_stills", "shots"):
+        for line in ("the courier: Keep moving, stay low.", "The courier: Keep moving, stay low."):
+            assert _story_checks(ws, mode, part_mut=narration(line), plan_mut=MEDIUM) == [], mode
+    assert _story_checks(ws, "chained", part_mut=narration("the old monk: Wait for me.")) == [
+        "panel 2: N16 speaker: Narration: is spoken by 'the old monk', who is not in this shot; "
+        "only a character on screen can speak, so make it voice-over (no prefix) or put "
+        "'the old monk' in the shot"]
+    assert _story_checks(ws, "chained", part_mut=narration("Dawn: the city wakes slowly.")) == [
+        "panel 2: N16 speaker: Narration: starts with 'Dawn:', which is no character's referring "
+        "phrase, so it is read as voice-over; start a spoken line with the speaker's referring "
+        "phrase, or drop the colon"]
+    # N14 counts the spoken words only: "the courier:" does not push 29 words over 30.
+    words29 = " ".join(["go"] * 28) + " now."
+    assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == []
+
+
+def test_rst20c_narration_modes(ws):
+    # --speech-only: Narration: may be empty; a voice-over line is hard N16. --no-narration:
+    # no Narration: field at all and no narration check.
+    def narration(text):   # panel 2 says text; the other panels have no narration
+        return lambda parts: [p.update(narration=text if k == 1 else "")
+                              for k, p in enumerate(parts)]
+
+    speech = {"narration": "speech"}
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech) == [], mode
+        assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low."),
+                             ctx_kw=speech, plan_mut=MEDIUM) == [], mode
+    assert _story_checks(ws, "chained", part_mut=narration("Rain falls on the harbour town."),
+                         ctx_kw=speech) == [
+        "panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; start it "
+        "with the referring phrase of the character in the shot who says it and a colon, or "
+        "leave it empty"]
+    ctx, plan, parts, text, _path = _story(ws, "chained", 3, part_mut=narration(""), ctx_kw=speech)
+    assert "Narration:" not in text
+    reply = dict(seu.panel_json("chained", 2, plan["cast"][0]["phrase"]), narration="")
+    assert se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))["narration"] == ""
+    assert se.KEY_LINE_TEMPLATES["narration_speech"] in se.build_panel_prompt(ctx, plan, parts, 2)
+    off = {"narration": False}
+    for mode in ("chained", "no_stills", "shots"):
+        assert _story_checks(ws, mode, ctx_kw=off) == [], mode
+        ctx, plan, parts, text, _path = _story(ws, mode, 3, ctx_kw=off)
+        assert "Narration:" not in text and "narration" not in se.writer_keys(mode, 1, False)
+        prompt = se.build_panel_prompt(ctx, plan, parts, 1)
+        assert se.KEY_LINE_TEMPLATES["narration"] not in prompt
+        assert se.KEY_LINE_TEMPLATES["narration_speech"] not in prompt
+
+
 def test_rst16_panel_prompt(ws):
     def fixture(raw):
         raw["cast"][0]["descriptor"] = DESC30
@@ -715,7 +822,7 @@ def test_rst16_panel_prompt(ws):
         for line in lines:
             assert "\n" + line in prompt, (mode, k, line)
         assert "\ntitle: a short title for the panel, 2 to 6 words.\n" in prompt
-        assert prompt.count("\nnarration: one sentence of voice-over narration, 3 to 30 words.\n") == 1
+        assert prompt.count("\n" + se.KEY_LINE_TEMPLATES["narration"] + "\n") == 1
         assert ("The previous panel's Motion: " in prompt) == (mode == "chained" and k >= 2)
         assert ("It IS this movie's first frame" in prompt) == (mode == "chained" and k == 1)
         assert ("\nRules:\n" + rules + "\n\n" in prompt) == (mode == "no_stills")
@@ -868,10 +975,12 @@ def test_rst20_panel_checks(ws):
     def part(k, **changes):
         return lambda parts: parts[k - 1].update(changes)
 
-    forty = " ".join(["The courier pedals onward"] * 10)
+    forty = " ".join(["The courier pedals onward"] * 10)  # within N1's 25% tolerance
+    fifty_two = " ".join(["The courier pedals onward"] * 13)
     cases = [
-        ("chained", {"part_mut": part(2, motion=forty)},
-         ["panel 2: N1 word count: Motion: is 40 words; it must be 15-35"]),
+        ("chained", {"part_mut": part(2, motion=forty)}, []),
+        ("chained", {"part_mut": part(2, motion=fifty_two)},
+         ["panel 2: N1 word count: Motion: is 52 words; aim for 15-35"]),
         ("chained", {"part_mut": part(2, motion="The courier waves at the woman beside the crates "
                                                 "and keeps pedalling forward in the rain.")},
          ["panel 2: N2 referring phrase: Motion: names 'woman' outside every referring phrase; "
@@ -879,6 +988,12 @@ def test_rst20_panel_checks(ws):
         ("chained", {"part_mut": part(2, motion="The courier pulls the grey hood tighter and "
                                                 "pedals forward along the road past the boats.")},
          ["panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
+          "appearance, clothing, setting, lighting, colour, style or camera"]),
+        ("chained", {"part_mut": part(2, motion="The courier holds the parcel up to the camera and "
+                                                "pedals forward along the road past the boats.")}, []),
+        ("chained", {"part_mut": part(2, motion="The courier pedals forward along the road as the "
+                                                "camera slowly pans left past the boats.")},
+         ["panel 2: N3 appearance: Motion: says 'camera'; panels after the first never re-describe "
           "appearance, clothing, setting, lighting, colour, style or camera"]),
         ("chained", {"part_mut": part(2, motion="The courier pedals past the old monk beside the "
                                                 "crates and on toward the end of the quay.")},
@@ -927,7 +1042,7 @@ def test_rst20_panel_checks(ws):
     shots_long = _story_checks(ws, "shots", part_mut=part(2, motion=forty))
     assert not [v for v in shots_long if " N1 " in v]
     assert [v for v in shots_long if " S4 " in v] == [
-        "panel 2: S4 motion length: Motion: is 46 words; it must be 10-25"]
+        "panel 2: S4 motion length: Motion: is 46 words; aim for 10-25"]
     offscreen = _story_checks(ws, "shots", part_mut=part(2, motion="The courier turns toward "
                                                                    "a noise off-screen."))
     assert offscreen == ["panel 2: S11 off-screen wording: Motion: says 'off-screen'; use left "
@@ -1227,9 +1342,9 @@ def test_rst28_location_setting_patch(ws):
                    "cobblestones underfoot, cranes behind, under blue evening light.")
     new, applied, rejected, _r = se.apply_patches(ctx, state, [
         _patch("plan", 1, "location.setting", new_setting[:-1]),
-        _patch("plan", 2, "location.setting", "The setting is short")])
+        _patch("plan", 2, "location.setting", "A short harbour")])
     assert len(applied) == 1
-    assert _reasons(rejected) == ["the new setting is 4 words; it must be 12-45"]
+    assert _reasons(rejected) == ['the new setting does not start with "The setting is"']
     text = se.assemble(ctx, new["plan"], new["parts"])
     assert text.count(new_setting) == 3
     assert seu.HARBOUR not in text

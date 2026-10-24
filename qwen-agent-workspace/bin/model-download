@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""model-download -- fetch a Hugging Face repo into the cache hub the pipeline reads.
+
+The three hubs mirror movie_ui_lib's own resolution (so a download lands exactly where
+model_checks/list_models look for it): `ltx` is the ltx-2-mlx DiT/gemma cache
+(LTX2_MLX_HF_HOME or ~/ltx-2-mlx/hf_cache), `zimage` the Z-Image cache (~/hf_home), and
+`hf` the default HF cache (~/.cache/huggingface). snapshot_download writes
+<hub>/models--<org>--<name>/..., which is the layout the loaders expect.
+
+Run by the movie-ui job runner as `<python> bin/model-download --hub <hub> <repo>`; its
+stdout/stderr (tqdm progress included) stream to the job's log.txt.
+"""
+import argparse
+import os
+import sys
+
+# The script lives at <ws>/bin/model-download; put <ws> on sys.path so movie_ui_lib,
+# which owns the canonical hub paths, is importable regardless of the cwd.
+WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if WS not in sys.path:
+    sys.path.insert(0, WS)
+
+import movie_ui_lib as lib  # noqa: E402
+
+HUBS = {"ltx": lib.ltx_hub, "zimage": lib.zimage_hub, "hf": lib.hf_hub}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="model-download")
+    parser.add_argument("repo", help="a Hugging Face repo id, e.g. dgrauet/ltx-2.3-mlx-q8")
+    parser.add_argument("--hub", choices=sorted(HUBS), default="ltx",
+                        help="which cache hub to download into (default: ltx)")
+    parser.add_argument("--revision", default=None, help="optional git revision/tag")
+    args = parser.parse_args(argv)
+
+    hub = HUBS[args.hub]()
+    os.makedirs(hub, exist_ok=True)
+    print("[model-download] fetching %s (hub=%s) into %s" % (args.repo, args.hub, hub), flush=True)
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        print("[model-download] huggingface_hub is not importable: %s" % exc, flush=True)
+        return 4
+    try:
+        path = snapshot_download(repo_id=args.repo, revision=args.revision, cache_dir=hub)
+    except Exception as exc:  # network/auth/not-found -- report, don't traceback-spam the log
+        print("[model-download] FAILED: %s: %s" % (type(exc).__name__, exc), flush=True)
+        return 1
+    print("[model-download] done: %s" % path, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

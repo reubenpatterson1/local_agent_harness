@@ -5,11 +5,13 @@ child process behind bin/character.
 Spec: docs/superpowers/specs/2026-10-05-character-library-design.md, Section 4.
 
 Top-level imports are stdlib, PIL and psutil, plus character_lib and
-ltx2_mlx_video_skill (as SKILL). torch, z_image_skill and content_safety are imported
-ONLY inside child_zimage(), which runs in a child process
-(python3 character_dataset.py zimage --spec SPEC): z_image_skill allows one LoRA set per
-process, and `create` must release Z-Image's memory before it restarts the vision
-server.
+ltx2_mlx_video_skill (as SKILL). torch, z_image_skill, diffusers and content_safety are
+imported ONLY inside child_zimage() and child_qwenedit(), which run in a child process
+(python3 character_dataset.py zimage|qwenedit --spec SPEC): z_image_skill allows one LoRA
+set per process, and `create` must release the image model's memory before it restarts
+the vision server. Seed-image datasets are edits of the seed (qwenedit, spec
+docs/superpowers/specs/2026-10-21-character-seed-edit-design.md); descriptor datasets are
+Z-Image text2img (zimage).
 
 The prompts, VARIANTS and the VLM helpers below are copied verbatim from the spike tool
 generated/charlora/tools/make_dataset_seed.py (spec 4.1). CHARACTER_MFLUX_TRAIN is test
@@ -47,13 +49,17 @@ import character_lib  # noqa: E402
 import ltx2_mlx_video_skill as SKILL  # noqa: E402
 
 STORY_SERVER = os.path.join(WS, "bin", "story-server")
+# story-server mode used to (re)start the vision model after the generate phase frees
+# memory. This host serves the VLM via mlx_vlm ("mlx-vision"); the legacy "vision" mode
+# is vLLM-Metal, which isn't installed here. Override with CHARACTER_VLM_SERVE_MODE.
+VLM_SERVE_MODE = os.environ.get("CHARACTER_VLM_SERVE_MODE", "mlx-vision")
 
 VLM_URL      = os.environ.get("QWEN_AGENT_VLM_URL", "http://127.0.0.1:8177/v1/chat/completions")
 MODELS_URL   = os.environ.get("QWEN_AGENT_VLM_MODELS_URL", "http://127.0.0.1:8177/v1/models")
-# Model id sent to the VLM. "auto" (via QWEN_AGENT_VLM_MODEL=auto) resolves to the
-# single model the server reports -- so mlx_vlm.server, which has no served-name
-# alias and reports the model by its path, works without a matching hardcoded name.
-VLM_MODEL    = os.environ.get("QWEN_AGENT_VLM_MODEL", "qwen38-6bit")
+# Model id sent to the VLM. "auto" (the default) resolves to the single loaded model the
+# server reports -- so mlx_vlm.server, which has no served-name alias and reports the
+# model by its path, works without a matching hardcoded name.
+VLM_MODEL    = os.environ.get("QWEN_AGENT_VLM_MODEL", "auto")
 WIDTH, HEIGHT = 1024, 640
 STYLE = "photorealistic live-action film still, natural light"
 SHOTS = [
@@ -95,16 +101,40 @@ VARIANTS = [
 
 DESCRIBE_PROMPT = (
     'Describe the main character in this image for an image generator that must redraw the same '
-    'person in many different poses and places. Reply with only a JSON object with two keys. '
+    'person recognisably across many different poses and places. Reply with only a JSON object with '
+    'two keys. '
     '"class_noun": one lowercase word for what they are (for example woman, man, girl, boy, person). '
-    '"descriptor": one noun phrase of at most 45 words that starts with "a" or "an" and covers only '
-    'what is visible about the character themselves: apparent age group, apparent ethnicity when it '
-    'is visible, build, skin tone, hair colour, length and style, notable facial features, and the '
-    'clothing and accessories they would wear anywhere. Leave out anything that belongs to this one '
-    'situation rather than to the person: footwear, gear or props that are visible only because of '
-    'what they are doing here (for example riding boots while riding, or a tool they are using), '
-    'anything they are holding, and any animal or vehicle. Do not mention the background, the pose, '
-    'the action, the camera, the lighting or the image style.'
+    '"descriptor": one noun phrase of 25 to 55 words that starts with "a" or "an" and captures only '
+    "the character's persistent identity -- the traits that stay the same wherever they appear: "
+    'apparent age in approximate years (for example late thirties or mid-forties), staying true to how '
+    'old the person looks even if makeup makes them look younger; apparent ethnicity when it is '
+    'visible, build, skin tone; hair colour, length '
+    'and style with any ornaments; distinctive facial features and markings such as scars, moles or '
+    'freckles; any makeup or face paint and its colours, for example foundation, lip colour, eye and '
+    'brow styling; the clothing, fabrics, patterns and accessories they would wear anywhere; and a '
+    'few words on their habitual bearing or expression, for example serene and composed, stern, or '
+    'warm. Leave out anything that belongs to this one situation rather than to the person: the '
+    'specific pose or action, footwear, gear or props that are visible only because of what they are '
+    'doing here (for example riding boots while riding, or a tool they are using), anything they are '
+    'holding, and any animal or vehicle. Do not mention the background, the camera, the lighting or '
+    'the image style.'
+)
+
+DESCRIBE_ATTEMPTS = 3
+# A too-long descriptor is shortened by a text-only request: re-describing from the image with
+# a word limit kept overshooting (88 and 124 words on the fubohockey seed), shortening did not.
+DESCRIBE_SHORTEN = (
+    'Shorten this character description to one noun phrase of 30 to 50 words that starts with '
+    '"a" or "an". Keep apparent age, build, skin tone, hair, distinctive facial features and the '
+    'clothing with its colours; drop repetition and the least distinctive details; use commas, '
+    'not semicolons, and no full sentences. Reply with only a JSON object with two keys: '
+    '"class_noun": "%s", and "descriptor": the shortened phrase.\n\nDescription: %s'
+)
+DESCRIBE_RETRY = (
+    'Your previous reply was rejected: %s. Previous reply: %s\n'
+    'Reply again with only the JSON object. Keep "descriptor" one noun phrase of 25 to 55 words '
+    'starting with "a" or "an": keep the most distinctive identity traits, merge or drop the '
+    'rest, and use commas, not semicolons.'
 )
 
 FACE_PROMPT = (
@@ -118,13 +148,47 @@ CHECK_PROMPT = (
     'The first image shows the reference character. The second image is a candidate picture. '
     'Reply with only a JSON object with four keys. '
     '"identity_score": an integer from 1 to 10 for how clearly the candidate shows the same character '
-    'as the reference (face, hair and clothing), where 10 is unmistakably the same and 1 is a different '
-    'person. '
+    'as the reference (face, hair, clothing and apparent age), where 10 is unmistakably the same and 1 '
+    'is a different '
+    'person. Compare the clothing closely: different garment colours, numbers or logos, or a missing '
+    'item, instrument or piece of equipment the reference carries, mean at most 5. '
     '"shot": exactly one of extreme wide shot, wide shot, medium shot, medium close-up, close-up, '
     'extreme close-up, describing the candidate. '
     '"pose": at most 12 words describing the candidate\'s pose or action, without pronouns. '
     '"setting": at most 8 words naming the candidate\'s surroundings.'
 )
+
+# Seed-image datasets (docs/superpowers/specs/2026-10-21-character-seed-edit-design.md): every
+# VARIANT is an instruction edit of the seed itself, so identity and carried equipment come
+# from its pixels rather than from a text description.
+EDIT_MODEL = "Qwen/Qwen-Image-Edit-2511"
+EDIT_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+EDIT_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
+EDIT_STEPS = 8
+EDIT_TRUE_CFG = 1.0
+EDIT_PROMPT = (
+    "Show this exact same person: keep their face, hair, clothing, colours, logos, accessories "
+    "and anything they carry identical. Re-shoot them as a %s, %s, in %s. Change the camera "
+    "angle, pose and background to match; the body position must clearly differ from the "
+    "original photo. Photorealistic live-action film still, natural light."
+)
+# VARIANTS numbers edited first and shown for review: every shot size, a profile, walking,
+# sitting and a wide action shot.
+EDIT_PREVIEW = (1, 3, 8, 10, 12, 21)
+EDIT_REVIEW_PROMPT = ("Review the preview stills in %s. Enter to edit the remaining %d, Ctrl-C to "
+                      "abort: ")
+EDIT_MIN_AVAIL_GIB = 64.0
+EDIT_CHILD_TIMEOUT_S = 7200
+
+CHECK_ATTEMPTS = 3
+CHECK_RETRY = (
+    'Your previous reply was rejected: %s. Previous reply: %s\n'
+    'Reply again with only the JSON object: "shot" exactly one of the listed shot names, "pose" '
+    'at most 12 words and "setting" at most 8 words.'
+)
+# Shot names the scorer uses that mean one of SHOTS.
+SHOT_ALIASES = {"full shot": "wide shot", "long shot": "wide shot", "full-length shot": "wide shot",
+                "closeup": "close-up", "close up": "close-up"}
 
 FACE_MIN_HEIGHT = 0.15
 CREATE_MIN_FREE_GIB = 2.0
@@ -135,7 +199,7 @@ VLM_WAIT_S = 600
 AVAIL_WAIT_S = 600
 
 TRAIN_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8-dev")
-TEST_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.5-mlx-q8")
+TEST_MODEL_DIR = os.path.join(SKILL.LTX2_MLX_DIR, "models", "ltx-2.3-mlx-q8")
 VIDEO_RANK = 32
 VIDEO_STEPS = 1000
 VIDEO_FINAL_CKPT = "lora_weights_step_01000.safetensors"
@@ -204,8 +268,8 @@ def validate_description(d):
     if descriptor.endswith("."):
         descriptor = descriptor[:-1].strip()
     words = descriptor.split()
-    if not (8 <= len(words) <= 60):
-        raise ValueError("descriptor word count must be 8-60, got %d" % len(words))
+    if not (8 <= len(words) <= 70):
+        raise ValueError("descriptor word count must be 8-70, got %d" % len(words))
     # Normalise first letter to lowercase
     if descriptor and descriptor[0].isupper():
         descriptor = descriptor[0].lower() + descriptor[1:]
@@ -231,6 +295,7 @@ def validate_check(d):
     if not isinstance(shot, str):
         raise ValueError("shot must be a string")
     shot = shot.lower().strip()
+    shot = SHOT_ALIASES.get(shot, shot)
     if shot not in SHOTS:
         raise ValueError("shot %r not in SHOTS" % shot)
     if "pose" not in d:
@@ -271,11 +336,19 @@ def gen_prompt(shot, pose, setting, descriptor):
     return "%s of %s, %s, in %s. %s." % (shot_cap, descriptor, pose, setting, STYLE)
 
 
+def edit_prompt(shot, pose, setting):
+    """Build the instruction that re-poses the seed image for one VARIANT."""
+    return EDIT_PROMPT % (shot, pose, setting)
+
+
 def caption(trigger, class_noun, check):
-    """Build a training caption string."""
-    return "%s %s, %s, %s, in %s, %s." % (
-        trigger, class_noun, check["shot"], check["pose"], check["setting"], STYLE
-    )
+    """Build a training caption string. Empty check fields (an unparseable check of the
+    always-kept reference still) are left out rather than written as blanks."""
+    parts = ["%s %s" % (trigger, class_noun)]
+    parts += [check[k] for k in ("shot", "pose") if check[k]]
+    if check["setting"]:
+        parts.append("in %s" % check["setting"])
+    return "%s, %s." % (", ".join(parts), STYLE)
 
 
 def image_data_url(path, max_side=768):
@@ -409,6 +482,17 @@ def story_server(cmd):
     return result.returncode
 
 
+def restore_story_server():
+    """Start the vision server through bin/story-server-restore: in its own session, without
+    waiting (clean-stop spec S1, S3)."""
+    try:
+        subprocess.run([os.path.join(WS, "bin", "story-server-restore"), VLM_SERVE_MODE],
+                       timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("warning: story-server-restore failed: %s; run bin/story-server %s"
+              % (e, VLM_SERVE_MODE), file=sys.stderr)
+
+
 def story_server_state():
     """The value of bin/story-server status's "state:" line (SERVING <mode>, FOREIGN pid N,
     LOADING <mode> or STOPPED), or "UNKNOWN" on any failure, which callers treat as not
@@ -447,8 +531,9 @@ def wait_for_avail(min_gib, timeout_s):
 
 
 def busy_process():
-    """(pid, first 120 characters of its command line) for the first render, training or
-    Z-Image process found, else None. Fail-closed by design (spec 4.12, G17)."""
+    """(pid, first 120 characters of its command line) for the first render, training,
+    Z-Image or Qwen-Image-Edit process found, else None. Fail-closed by design (spec 4.12,
+    G17)."""
     skip = {os.getpid(), os.getppid()}
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
@@ -463,7 +548,8 @@ def busy_process():
              and any(t in cmdline for t in ("generate", "train", "preprocess")))
                 or any(marker in joined for marker in (
                     "mflux-train", "bin/ltx-movie", "bin/ltx-mlx-render",
-                    "bin/ltx-story-images", "character_dataset.py zimage"))):
+                    "bin/ltx-story-images", "character_dataset.py zimage",
+                    "character_dataset.py qwenedit"))):
             return pid, joined[:120]
     return None
 
@@ -589,28 +675,64 @@ def _sha256(path):
 # VLM analysis (spec 4.4 helpers, 4.5)
 # ---------------------------------------------------------------------------
 
-def face_height(seed_path):
+def face_box(seed_path):
+    """The main character's face box [x1, y1, x2, y2] (0-1000 coordinates), or None when no
+    face is visible."""
     content_parts = [{"type": "text", "text": FACE_PROMPT},
                      {"type": "image_url", "image_url": {"url": image_data_url(seed_path)}}]
     reply, error = None, None
     for _attempt in range(2):
         reply = vlm_call(content_parts)
         try:
-            return validate_face(extract_json(reply))
+            d = extract_json(reply)
+            validate_face(d)
+            return d["face_box"]
         except ValueError as e:
             error = e
     raise DatasetError("face check failed: %s; last reply: %r" % (error, reply))
+
+
+def seed_still(img, box):
+    """The seed cropped to WIDTHxHEIGHT for char_00 (the reference still): centred on the face
+    box with the face centre 40% down the frame, so a portrait seed keeps the head; without a
+    box, horizontally centred and a quarter of the way down."""
+    w, h = img.size
+    cx, cy = (0.5, 0.25) if box is None else ((box[0] + box[2]) / 2000.0,
+                                               (box[1] + box[3]) / 2000.0)
+    if w * HEIGHT > h * WIDTH:  # wider than the target: crop the width
+        crop_w = h * WIDTH / float(HEIGHT)
+        centering = (min(max((cx * w - crop_w / 2) / (w - crop_w), 0.0), 1.0), 0.5)
+    elif w * HEIGHT < h * WIDTH:  # taller: crop the height
+        crop_h = w * HEIGHT / float(WIDTH)
+        centering = (0.5, min(max((cy * h - 0.4 * crop_h) / (h - crop_h), 0.0), 1.0))
+    else:
+        centering = (0.5, 0.5)
+    return ImageOps.fit(img.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS, centering=centering)
 
 
 def describe(seed_path):
     """(class_noun, descriptor, raw reply) for the seed image's main character."""
     content_parts = [{"type": "text", "text": DESCRIBE_PROMPT},
                      {"type": "image_url", "image_url": {"url": image_data_url(seed_path)}}]
-    reply, error = None, None
-    for _attempt in range(2):
-        reply = vlm_call(content_parts)
+    reply, error, too_long = None, None, None
+    for _attempt in range(DESCRIBE_ATTEMPTS):
+        # The call is at temperature 0, so a bare retry repeats the same reply: a too-long
+        # descriptor is sent back to be shortened, any other rejection is quoted in the retry.
+        if too_long is not None:
+            parts = [{"type": "text", "text": DESCRIBE_SHORTEN % too_long}]
+        elif error is not None:
+            parts = content_parts + [{"type": "text", "text": DESCRIBE_RETRY % (error, reply)}]
+        else:
+            parts = content_parts
+        reply = vlm_call(parts)
+        too_long = None
         try:
-            class_noun, descriptor = validate_description(extract_json(reply))
+            d = extract_json(reply)
+            text, noun = d.get("descriptor"), d.get("class_noun")
+            if isinstance(text, str) and len(text.split()) > 70:
+                too_long = (noun.lower().strip() if isinstance(noun, str) and noun.strip()
+                            else "person", text.strip())
+            class_noun, descriptor = validate_description(d)
             character_lib.validate_descriptor(descriptor)
             return class_noun, descriptor, reply
         except (ValueError, character_lib.CharacterError) as e:
@@ -620,13 +742,16 @@ def describe(seed_path):
 
 def score_still(ref_path, cand_path):
     """(normalized check dict, None), or the zero-score dict and an "unparseable: ..." reason
-    after two unparseable replies. A RuntimeError from the VLM call propagates."""
+    after CHECK_ATTEMPTS unparseable replies. A RuntimeError from the VLM call propagates."""
     content_parts = [{"type": "text", "text": CHECK_PROMPT},
                      {"type": "image_url", "image_url": {"url": image_data_url(ref_path)}},
                      {"type": "image_url", "image_url": {"url": image_data_url(cand_path)}}]
-    error = None
-    for _attempt in range(2):
-        reply = vlm_call(content_parts)
+    reply, error = None, None
+    for _attempt in range(CHECK_ATTEMPTS):
+        # At temperature 0 a bare retry repeats the rejected reply, so each retry carries it.
+        parts = content_parts if error is None else content_parts + [
+            {"type": "text", "text": CHECK_RETRY % (error, reply)}]
+        reply = vlm_call(parts)
         try:
             return validate_check(extract_json(reply)), None
         except ValueError as e:
@@ -655,23 +780,66 @@ def wrap_still(png, mp4):
         raise DatasetError("ffmpeg could not be run to wrap %s: %s" % (png, e))
 
 
-def write_contact_sheet(items, stills_dir, out_path):
+def _write_sheet(cells, stills_dir, out_path):
+    """cells: (n, label, flagged) per thumbnail; a flagged cell gets a red outline."""
     cols, tw, th, lh = 5, 256, 160, 20
-    rows = (len(items) + cols - 1) // cols
+    rows = (len(cells) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * tw, rows * (th + lh)), (0, 0, 0))
     draw = ImageDraw.Draw(sheet)
-    for k, item in enumerate(items):
+    for k, (n, label, flagged) in enumerate(cells):
         x, y = (k % cols) * tw, (k // cols) * (th + lh)
-        path = os.path.join(stills_dir, "char_%02d.png" % item["n"])
+        path = os.path.join(stills_dir, "char_%02d.png" % n)
         if os.path.isfile(path):
             with Image.open(path) as img:
                 sheet.paste(img.convert("RGB").resize((tw, th), Image.LANCZOS), (x, y))
-        if not item["kept"]:
+        if flagged:
             draw.rectangle([x, y, x + tw - 1, y + th - 1], outline=(255, 0, 0), width=4)
-        draw.text((x + 4, y + th + 3), "%02d  score %d  %s"
-                  % (item["n"], item["identity_score"], "kept" if item["kept"] else "DROPPED"),
-                  fill=(255, 255, 255))
+        draw.text((x + 4, y + th + 3), label, fill=(255, 255, 255))
     sheet.save(out_path, format="JPEG", quality=90)
+
+
+def write_contact_sheet(items, stills_dir, out_path):
+    _write_sheet([(item["n"], "%02d  score %d  %s"
+                   % (item["n"], item["identity_score"], "kept" if item["kept"] else "DROPPED"),
+                   not item["kept"]) for item in items], stills_dir, out_path)
+
+
+def write_preview_sheet(entries, stills_dir, out_path):
+    """The unscored sheet of the edited preview stills (seed-edit spec E4); a still the
+    content screen blocked is outlined and labelled BLOCKED."""
+    cells = []
+    for entry in entries:
+        missing = not os.path.isfile(os.path.join(stills_dir, "char_%02d.png" % entry["n"]))
+        cells.append((entry["n"], "%02d  %s%s" % (entry["n"], entry["shot"],
+                                                  "  BLOCKED" if missing else ""), missing))
+    _write_sheet(cells, stills_dir, out_path)
+
+
+def edit_plan():
+    """The seed-edit plan (excluding the seed copy char_00): one entry per VARIANT,
+    {n, shot, pose, setting, prompt}, the EDIT_PREVIEW stills first, then the rest in
+    VARIANTS order."""
+    entries = [{"n": i, "shot": shot, "pose": pose, "setting": setting,
+                "prompt": edit_prompt(shot, pose, setting)}
+               for i, (shot, pose, setting) in enumerate(VARIANTS, 1)]
+    return ([e for e in entries if e["n"] in EDIT_PREVIEW]
+            + [e for e in entries if e["n"] not in EDIT_PREVIEW])
+
+
+def edit_models_missing():
+    """The Hugging Face repo ids among EDIT_MODEL and EDIT_LORA_REPO/EDIT_LORA_FILE that are
+    not in the local cache (seed-edit spec E7); [] when both are there."""
+    from huggingface_hub import hf_hub_download, snapshot_download
+    missing = []
+    try:
+        snapshot_download(EDIT_MODEL, local_files_only=True)
+    except Exception:
+        missing.append(EDIT_MODEL)
+    try:
+        hf_hub_download(EDIT_LORA_REPO, EDIT_LORA_FILE, local_files_only=True)
+    except Exception:
+        missing.append("%s %s" % (EDIT_LORA_REPO, EDIT_LORA_FILE))
+    return missing
 
 
 # Two-source dataset mode (opt-in via the CHARACTER_TWO_SOURCE env var; survives
@@ -727,19 +895,54 @@ def _dataset_plan(descriptor):
     return plan
 
 
-def build_dataset(data, face_height):
+def build_dataset(data, face_height, review=False):
     """Generate, score, caption and wrap the dataset for character.json data; write
-    dataset/manifest.json, dataset/contact_sheet.jpg and the updated character.json.
-    Returns 0, 1 (a DatasetError or RuntimeError, printed; status stays "dataset") or 3
-    (fewer than MIN_KEEP stills kept)."""
+    dataset/manifest.json, dataset/contact_sheet.jpg and the updated character.json. With
+    review, a seed-image dataset stops after its preview stills (seed-edit spec E4).
+    Returns 0, 1 (a DatasetError or RuntimeError, printed, or an abort at the review stop;
+    status stays "dataset") or 3 (fewer than MIN_KEEP stills kept)."""
     try:
-        return _build_dataset(data, face_height)
+        return _build_dataset(data, face_height, review)
     except (DatasetError, RuntimeError) as e:
         print("Error: %s" % e, file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, EOFError):
+        print("\nError: aborted; the stills made so far are kept in %s; run bin/character create "
+              "%s --regenerate to start again"
+              % (os.path.join(character_lib.character_dir(data["name"]), "dataset"), data["name"]),
+              file=sys.stderr)
+        return 1
 
 
-def _build_dataset(data, face_height):
+def _generate_edits(data, plan, char_dir, stills_dir, review):
+    """Edit the seed into every plan entry in a qwenedit child; with review, edit the
+    EDIT_PREVIEW entries first, write dataset/preview_sheet.jpg and wait for Enter."""
+    def spec_for(entries):
+        return {"image": os.path.join(char_dir, "seed.png"), "model": EDIT_MODEL,
+                "lora_repo": EDIT_LORA_REPO, "lora_file": EDIT_LORA_FILE, "steps": EDIT_STEPS,
+                "true_cfg": EDIT_TRUE_CFG,
+                "jobs": [{"prompt": e["prompt"],
+                          "output_path": os.path.join(stills_dir, "char_%02d.png" % e["n"]),
+                          "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
+                         for e in entries]}
+
+    if not review:
+        print("=== edit: %d stills ===" % len(plan), flush=True)
+        run_edit_child(spec_for(plan), char_dir, "edit")
+        return
+    preview = plan[:len(EDIT_PREVIEW)]
+    rest = plan[len(EDIT_PREVIEW):]
+    print("=== edit preview: %d stills ===" % len(preview), flush=True)
+    run_edit_child(spec_for(preview), char_dir, "edit-preview")
+    sheet = os.path.join(os.path.dirname(stills_dir), "preview_sheet.jpg")
+    write_preview_sheet(preview, stills_dir, sheet)
+    print("preview sheet: %s" % sheet)
+    input(EDIT_REVIEW_PROMPT % (sheet, len(rest)))
+    print("=== edit: %d stills ===" % len(rest), flush=True)
+    run_edit_child(spec_for(rest), char_dir, "edit")
+
+
+def _build_dataset(data, face_height, review=False):
     name = data["name"]
     char_dir = character_lib.character_dir(name)
     json_path = character_lib.character_json_path(name)
@@ -749,38 +952,58 @@ def _build_dataset(data, face_height):
     videos_dir = os.path.join(dataset_dir, "videos")
     seed_mode = data["source"]["type"] == "seed_image"
     if seed_mode:
+        box = None
+        face_json = os.path.join(char_dir, "seed_face.json")
+        if os.path.isfile(face_json):
+            with open(face_json, encoding="utf-8") as f:
+                box = json.load(f)["face_box"]
         with Image.open(os.path.join(char_dir, "seed.png")) as img:
-            ImageOps.fit(img.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS,
-                         centering=(0.5, 0.5)).save(os.path.join(stills_dir, "char_00.png"))
-    plan = _dataset_plan(data["descriptor"])
-    jobs = []
-    for entry in plan:
-        job = {"prompt": entry["prompt"],
-               "output_path": os.path.join(stills_dir, "char_%02d.png" % entry["n"]),
-               "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
-        if entry["anchor_n"] is not None:
-            # img2img from the anchor still (emitted earlier in the list, so it
-            # exists on disk by the time this job runs); geometry comes from it.
-            job["image"] = os.path.join(stills_dir, "char_%02d.png" % entry["anchor_n"])
-            job["strength"] = entry["strength"]
-        jobs.append(job)
-    spec = {"jobs": jobs, "loras": None}
+            seed_still(img, box).save(os.path.join(stills_dir, "char_00.png"))
+        plan = edit_plan()
+    else:
+        plan = _dataset_plan(data["descriptor"])
+        jobs = []
+        for entry in plan:
+            job = {"prompt": entry["prompt"],
+                   "output_path": os.path.join(stills_dir, "char_%02d.png" % entry["n"]),
+                   "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
+            if entry["anchor_n"] is not None:
+                # img2img from the anchor still (emitted earlier in the list, so it
+                # exists on disk by the time this job runs); geometry comes from it.
+                job["image"] = os.path.join(stills_dir, "char_%02d.png" % entry["anchor_n"])
+                job["strength"] = entry["strength"]
+            jobs.append(job)
+        spec = {"jobs": jobs, "loras": None}
 
     print("=== generate ===")
+    interrupted = False
     rc = story_server("stop")
     if rc != 0:
         print("warning: story-server stop returned %d" % rc, file=sys.stderr)
     try:
-        if not wait_for_avail(GENERATE_MIN_AVAIL_GIB, AVAIL_WAIT_S):
-            raise DatasetError("timed out waiting for 20 GiB available memory after stopping the "
-                               "story server")
-        run_zimage_child(spec, char_dir, "generate")
+        min_gib = EDIT_MIN_AVAIL_GIB if seed_mode else GENERATE_MIN_AVAIL_GIB
+        if not wait_for_avail(min_gib, AVAIL_WAIT_S):
+            raise DatasetError("timed out waiting for %d GiB available memory after stopping the "
+                               "story server" % min_gib)
+        if seed_mode:
+            _generate_edits(data, plan, char_dir, stills_dir, review)
+        else:
+            run_zimage_child(spec, char_dir, "generate")
+    except (KeyboardInterrupt, EOFError):
+        interrupted = True
+        raise
     finally:
-        rc = story_server("vision")
-        if rc != 0:
-            print("warning: story-server vision returned %d" % rc, file=sys.stderr)
-        if not wait_for_vlm(VLM_WAIT_S):
-            raise DatasetError("timed out waiting for the vision server to come back")
+        if interrupted:
+            # Stopping (Ctrl-C, kill, movie-ui Cancel): restore detached and return at once, so
+            # the job exits inside the cancel grace and its kill sweep cannot reach the server.
+            restore_story_server()
+        else:
+            rc = story_server(VLM_SERVE_MODE)
+            if rc != 0:
+                print("warning: story-server %s returned %d" % (VLM_SERVE_MODE, rc),
+                      file=sys.stderr)
+            if not wait_for_vlm(VLM_WAIT_S):
+                raise DatasetError("timed out waiting for the vision server to come back")
 
     ref_n = 0 if seed_mode else 1
     ref_png = os.path.join(stills_dir, "char_%02d.png" % ref_n)
@@ -791,7 +1014,7 @@ def _build_dataset(data, face_height):
 
     print("=== score ===")
     gen_prompts = {entry["n"]: entry["prompt"] for entry in plan}
-    score_ns = ([0] if seed_mode else []) + [entry["n"] for entry in plan]
+    score_ns = ([0] if seed_mode else []) + sorted(entry["n"] for entry in plan)
     items = []
     for n in score_ns:
         png = os.path.join(stills_dir, "char_%02d.png" % n)
@@ -826,7 +1049,10 @@ def _build_dataset(data, face_height):
     manifest = {"seed_image": data["source"].get("path"), "trigger": data["trigger"],
                 "class_noun": data["class_noun"], "descriptor": data["descriptor"],
                 "seed": data["seed"], "min_score": character_lib.MIN_SCORE,
-                "reference": "char_%02d" % ref_n, "face_height": face_height, "items": items}
+                "reference": "char_%02d" % ref_n, "face_height": face_height,
+                "generator": ("%s + %s, %d steps" % (EDIT_MODEL, EDIT_LORA_FILE, EDIT_STEPS)
+                              if seed_mode else "Z-Image"),
+                "items": items}
     with open(os.path.join(dataset_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     sheet = os.path.join(dataset_dir, "contact_sheet.jpg")
@@ -849,15 +1075,23 @@ def _build_dataset(data, face_height):
     print("dataset: %d/%d stills kept (minimum %d) in %s"
           % (kept_count, total, character_lib.MIN_KEEP, dataset_dir))
     print("contact sheet: %s" % sheet)
+    # A seed dataset is edited from seed.png: "descriptor" only feeds stories (seed-edit E9).
+    field = "seed" if seed_mode else "descriptor"
     if kept_count < character_lib.MIN_KEEP:
-        print('Error: only %d/%d stills kept (need %d); the dataset is kept in %s; edit '
-              '"descriptor" in %s and run bin/character create %s --regenerate'
-              % (kept_count, total, character_lib.MIN_KEEP, dataset_dir, json_path, name),
+        print('Error: only %d/%d stills kept (need %d); the dataset is kept in %s; %s '
+              '"%s" in %s and run bin/character create %s --regenerate'
+              % (kept_count, total, character_lib.MIN_KEEP, dataset_dir,
+                 "change" if seed_mode else "edit", field, json_path, name),
               file=sys.stderr)
         return 3
-    print('next: review the contact sheet. To change the look, edit "descriptor" in %s and run '
-          'bin/character create %s --regenerate; otherwise run bin/character train %s'
-          % (json_path, name, name))
+    if seed_mode:
+        print('next: review the contact sheet. For different stills, change "seed" in %s and run '
+              'bin/character create %s --regenerate; otherwise run bin/character train %s'
+              % (json_path, name, name))
+    else:
+        print('next: review the contact sheet. To change the look, edit "descriptor" in %s and '
+              'run bin/character create %s --regenerate; otherwise run bin/character train %s'
+              % (json_path, name, name))
     return 0
 
 
@@ -897,6 +1131,7 @@ def create(args):
         if data["status"] == "trained":
             return _error("character %s is trained; regenerating its dataset would orphan its "
                           "LoRAs. Create a new character instead" % name)
+        seed_mode = data["source"]["type"] == "seed_image"
     else:
         if os.path.exists(char_dir):
             return _error("character %s already exists (%s); use --regenerate to rebuild its "
@@ -907,15 +1142,17 @@ def create(args):
             phrase = character_lib.normalize_phrase(args.phrase)
         except character_lib.CharacterError as e:
             return _error("--phrase: %s" % e)
-        if (args.seed_image is None) == (args.descriptor is None):
-            return _error("create needs exactly one of --seed-image or --descriptor")
+        if args.seed_image is None and args.descriptor is None:
+            return _error("create needs --seed-image or --descriptor")
         if args.class_noun is not None:
             try:
                 character_lib.validate_class_noun(args.class_noun)
             except character_lib.CharacterError as e:
                 return _error(e)
         elif args.descriptor is not None:
-            return _error("--descriptor needs --class NOUN (there is no image to take it from)")
+            return _error("--descriptor needs --class NOUN (%s)"
+                          % ("the seed image is not described when --descriptor is given"
+                             if args.seed_image is not None else "there is no image to take it from"))
         seed_path = descriptor = None
         if args.descriptor is not None:
             try:
@@ -924,7 +1161,7 @@ def create(args):
                 character_lib.validate_descriptor(descriptor)
             except (ValueError, character_lib.CharacterError) as e:
                 return _error("--descriptor: %s" % e)
-        else:
+        if args.seed_image is not None:
             seed_path = os.path.abspath(args.seed_image)
             if not os.path.isfile(seed_path):
                 return _error("--seed-image not found: %s" % seed_path)
@@ -948,6 +1185,18 @@ def create(args):
                     or args.trigger == args.class_noun):
                 return _error("trigger %s must not be a word of the phrase or the class noun"
                               % args.trigger)
+        seed_mode = seed_path is not None
+
+    review = seed_mode and not getattr(args, "no_review", False)
+    if review and not sys.stdin.isatty():
+        return _error("the seed-image preview review needs an interactive terminal; run this "
+                      "interactively, or pass --no-review for unattended operation")
+    if seed_mode:
+        missing = edit_models_missing()
+        if missing:
+            return _error("the seed-image editor is not downloaded: %s; download it with: %s"
+                          % (", ".join(missing),
+                             "; ".join("hf download %s" % m for m in missing)))
 
     with contextlib.ExitStack() as stack:
         try:
@@ -964,21 +1213,24 @@ def create(args):
             return _error("only %.1f GiB free at %s; create needs 2 GiB" % (free, lib))
         if not vlm_ready():
             return _error("the vision model %s is not being served at %s; start it with: "
-                          "bin/story-server vision" % (VLM_MODEL, MODELS_URL))
+                          "bin/story-server %s" % (VLM_MODEL, MODELS_URL, VLM_SERVE_MODE))
 
         if data is not None:
-            return _regenerate(data)
+            return _regenerate(data, review)
 
-        fh = raw = cls_vlm = None
+        fh = raw = cls_vlm = box = None
         try:
             if seed_path is not None:
-                fh = face_height(seed_path)
+                box = face_box(seed_path)
+                fh = None if box is None else (box[3] - box[1]) / 1000.0
                 if fh is None or fh < FACE_MIN_HEIGHT:
                     error_text, warning_text = _face_problem(fh)
                     if not args.force:
                         return _error(error_text)
                     print("Warning: %s" % warning_text, file=sys.stderr)
-                cls_vlm, descriptor, raw = describe(seed_path)
+                if descriptor is None:
+                    # The descriptor only feeds stories: the dataset edits the seed (E2).
+                    cls_vlm, descriptor, raw = describe(seed_path)
                 cls = args.class_noun or cls_vlm
             else:
                 cls = args.class_noun
@@ -996,10 +1248,14 @@ def create(args):
         if seed_path is not None:
             ltx_image_fit.load_oriented_rgb(seed_path).save(os.path.join(char_dir, "seed.png"),
                                                             format="PNG")
-            with open(os.path.join(char_dir, "dataset", "description.json"), "w",
-                      encoding="utf-8") as f:
-                json.dump({"class_noun": cls_vlm, "descriptor": descriptor, "raw": raw}, f,
-                          indent=2)
+            # Kept for char_00's face-centred crop, which --regenerate redoes without a face check.
+            with open(os.path.join(char_dir, "seed_face.json"), "w", encoding="utf-8") as f:
+                json.dump({"face_box": box}, f)
+            if raw is not None:
+                with open(os.path.join(char_dir, "dataset", "description.json"), "w",
+                          encoding="utf-8") as f:
+                    json.dump({"class_noun": cls_vlm, "descriptor": descriptor, "raw": raw}, f,
+                              indent=2)
         character_lib.register_trigger(trigger, name)
         data = {"schema_version": character_lib.SCHEMA_VERSION, "name": name, "trigger": trigger,
                 "class_noun": cls, "referring_phrase": phrase, "descriptor": descriptor,
@@ -1010,10 +1266,10 @@ def create(args):
                 "dataset": None, "loras": {"video": None, "stills": None},
                 "stills_skip_reason": None}
         character_lib.write_character(data)
-        return build_dataset(data, fh)
+        return build_dataset(data, fh, review)
 
 
-def _regenerate(data):
+def _regenerate(data, review=False):
     """create --regenerate after its preflights: wipe and rebuild dataset/ from character.json,
     keeping face_height and dataset/description.json; no face check, no describe."""
     prev_fh = data["dataset"]["face_height"] if data["dataset"] else None
@@ -1033,7 +1289,7 @@ def _regenerate(data):
     data["status"] = "dataset"
     data["dataset"] = None
     character_lib.write_character(data)
-    return build_dataset(data, prev_fh)
+    return build_dataset(data, prev_fh, review)
 
 
 # ---------------------------------------------------------------------------
@@ -1473,9 +1729,83 @@ def run_zimage_child(spec, char_dir, step):
         return json.load(f)
 
 
+def run_edit_child(spec, char_dir, step):
+    """Run the seed edits in spec through Qwen-Image-Edit in a child process and return its
+    report: {"jobs": [{"output_path", "status", "seconds"}]}."""
+    log = step_log_path(char_dir, step)
+    stem = log[:-len(".log")]
+    spec_path = stem + ".spec.json"
+    report_path = stem + ".report.json"
+    with open(spec_path, "w", encoding="utf-8") as f:
+        json.dump(dict(spec, report_path=report_path), f, indent=2)
+    rc = run_logged([sys.executable, os.path.join(WS, "character_dataset.py"), "qwenedit",
+                     "--spec", spec_path], log, WS, dict(os.environ), EDIT_CHILD_TIMEOUT_S)
+    if rc != 0:
+        error = DatasetError("Qwen-Image-Edit child process exited %d; log: %s" % (rc, log))
+        error.log_path = log
+        raise error
+    with open(report_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def exit_with_parent(poll_s=2.0):
+    """Exit (status 3) soon after the parent dies: run_logged gives the image child its own
+    session, so a SIGKILLed parent would otherwise leave it holding the GPU (clean-stop S5)."""
+    parent = os.getppid()
+
+    def _watch():
+        while True:
+            time.sleep(poll_s)
+            if os.getppid() != parent:
+                os._exit(3)
+
+    threading.Thread(target=_watch, daemon=True).start()
+
+
+def child_qwenedit(spec_path):
+    """The child side of run_edit_child: load the editor and its Lightning LoRA from the local
+    cache, edit spec["image"] into every job, screen each result, write the report."""
+    exit_with_parent()
+    import torch
+    from diffusers import QwenImageEditPlusPipeline
+    from huggingface_hub import hf_hub_download
+    import content_safety
+
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    pipe = QwenImageEditPlusPipeline.from_pretrained(spec["model"], torch_dtype=torch.bfloat16,
+                                                     local_files_only=True).to(device)
+    pipe.load_lora_weights(hf_hub_download(spec["lora_repo"], spec["lora_file"],
+                                           local_files_only=True))
+    pipe.set_progress_bar_config(disable=True)
+    with Image.open(spec["image"]) as img:
+        source = img.convert("RGB")
+    jobs = []
+    for job in spec["jobs"]:
+        started = time.monotonic()
+        image = pipe(image=[source], prompt=job["prompt"], negative_prompt=" ",
+                     true_cfg_scale=spec["true_cfg"], guidance_scale=1.0,
+                     num_inference_steps=spec["steps"], width=job["width"], height=job["height"],
+                     generator=torch.Generator("cpu").manual_seed(job["seed"])).images[0]
+        try:
+            content_safety.assert_image_safe(image, skill="character_edit", prompt=job["prompt"])
+            image.save(job["output_path"])
+            status = "ok"
+        except content_safety.ContentSafetyError:
+            status = "blocked"
+        seconds = round(time.monotonic() - started, 1)
+        jobs.append({"output_path": job["output_path"], "status": status, "seconds": seconds})
+        print("%s %s %.1fs" % (os.path.basename(job["output_path"]), status, seconds), flush=True)
+    with open(spec["report_path"], "w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, indent=2)
+    return 0
+
+
 def child_zimage(spec_path):
     """The child side: render every job, count the injected LoRA modules, write the report.
     Imports the heavy stack here and only here."""
+    exit_with_parent()
     import torch
     import z_image_skill
     from content_safety import ContentSafetyError
@@ -1523,12 +1853,17 @@ def child_zimage(spec_path):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="character_dataset.py",
-        description="bin/character's internal helper: the Z-Image child process.")
+        description="bin/character's internal helper: the Z-Image and Qwen-Image-Edit child "
+                    "processes.")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
     z = sub.add_parser("zimage", help="render a spec file's jobs with z_image_skill")
     z.add_argument("--spec", required=True, metavar="PATH")
+    q = sub.add_parser("qwenedit", help="edit a spec file's seed image into its jobs")
+    q.add_argument("--spec", required=True, metavar="PATH")
     args = parser.parse_args(argv)
+    if args.command == "qwenedit":
+        return child_qwenedit(args.spec)
     return child_zimage(args.spec)
 
 

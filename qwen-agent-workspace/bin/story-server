@@ -32,14 +32,14 @@ set -u
 
 STORY_SERVER_VERSION="1"
 
-WS="${STORY_SERVER_WS:-/Users/reubenpatterson/local_model_harness/qwen-agent-workspace}"
+WS="${STORY_SERVER_WS:-/Users/ailab1/local_agent_harness/qwen-agent-workspace}"
 MODEL_ID="${STORY_SERVER_MODEL_ID:-qwen38-6bit}"
 PORT="${STORY_SERVER_PORT:-8177}"
 HEALTH_URL="http://127.0.0.1:${PORT}/v1/models"
 CHAT_URL="http://127.0.0.1:${PORT}/v1/chat/completions"
 
-VISION_MODEL_DIR="${STORY_SERVER_VISION_MODEL_DIR:-/Users/reubenpatterson/mlx_models/qwen3-vl}"
-VLLM_BIN="${STORY_SERVER_VLLM_BIN:-/Users/reubenpatterson/.venv-vllm-metal/bin/vllm}"
+VISION_MODEL_DIR="${STORY_SERVER_VISION_MODEL_DIR:-/Users/ailab1/mlx_models/qwen3-vl}"
+VLLM_BIN="${STORY_SERVER_VLLM_BIN:-/Users/ailab1/.venv-vllm-metal/bin/vllm}"
 VISION_LOG="$WS/generated/vllm_vl_serve.log"
 # Measured 2026-09-17: with vLLM-Metal's default the 32B left 1.91 GiB available and stills
 # pushed swap past the supervisor's absolute 3.0 GiB gate; 0.70 is qwen-serve-guard's
@@ -60,8 +60,8 @@ VISION_MAX_MODEL_LEN="${STORY_SERVER_VISION_MAX_MODEL_LEN:-24576}"
 # from mlx_lm, which cannot process images at all -- confirmed 2026-09-27). No
 # --served-model-name equivalent exists, so MODEL_ID itself is overridden to this
 # value for this mode (see the CMD dispatch below) rather than aliased.
-MLX_VISION_MODEL_ID="${STORY_SERVER_MLX_VISION_MODEL_ID:-andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit}"
-MLX_VLM_PYTHON="${STORY_SERVER_MLX_VLM_PYTHON:-python3}"
+MLX_VISION_MODEL_ID="${STORY_SERVER_MLX_VISION_MODEL_ID:-/Users/ailab1/mlx_models/qwen3-vl}"
+MLX_VLM_PYTHON="${STORY_SERVER_MLX_VLM_PYTHON:-/Users/ailab1/mlx-serve/bin/python}"
 MLX_VISION_LOG="$WS/generated/mlx_vlm_serve.log"
 MLX_VISION_MAX_TOKENS="${STORY_SERVER_MLX_VISION_MAX_TOKENS:-16384}"
 
@@ -74,7 +74,7 @@ TEXT_LOG="$WS/generated/mtplx_serve.log"
 # (qwen-serve-guard:480 rotate_if_needed) is deliberately not reimplemented here --
 # truncate by hand if needed.
 
-STATE_DIR="${STORY_SERVER_STATE_DIR:-/Users/reubenpatterson/.qwen-serve-guard}"
+STATE_DIR="${STORY_SERVER_STATE_DIR:-/Users/ailab1/.qwen-serve-guard}"
 MODE_FILE="$STATE_DIR/story-server-mode"
 STANDDOWN="$STATE_DIR/stand-down"
 

@@ -29,6 +29,17 @@ CATALOG_LORAS_SCHEMA = "ltx-movie.catalog-loras.v1"
 ONESHOT_SCHEMA = "qwen-agent.oneshot.v1"
 SHOT_TYPES = ("extreme wide shot", "wide shot", "medium shot", "medium close-up", "close-up",
               "extreme close-up")
+# --speech-only: characters speak on screen, so a framed beat stays medium to close-up.
+SPEECH_SHOT_TYPES = ("medium shot", "medium close-up", "close-up")
+SPEECH_SHOT_NOTE = (" (characters speak on screen in this movie, so only these framings keep "
+                    "the speaker's lips readable)")
+SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each character within "
+                          "medium to close-up range of the camera, and never have them shrink "
+                          "into the distance or leave the frame.")
+
+
+def shot_types(narration):
+    return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
 CAMERA_SENTENCES = (
     ("static", "The camera stays static."),
     ("slow push-in", "The camera slowly pushes in."),
@@ -46,6 +57,9 @@ WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (25, 50), "motion": 
                "shots": {"image": (80, 170), "motion": (10, 25)}}
 NARRATION_WORDS = (3, 30)
 MIN_WRITER_WORDS = {"image": 20, "prompt": 20, "motion": 5}
+# Word counts are advisory: a count is flagged only when it is more than this fraction outside
+# its range (the writer prompts still ask for the exact range).
+WORD_TOLERANCE = 0.25
 MAX_CAST = {"chained": 4, "no_stills": 4, "shots": 2}
 PLAN_MAX_CALLS = 2
 PANEL_MAX_CALLS = 2
@@ -68,7 +82,10 @@ SCORE_KEYS = ("continuity", "story", "renderability")
 StoryContext = collections.namedtuple("StoryContext", [
     "ws", "story_id", "story_dir", "mode", "panels", "seconds", "narrative", "goal", "members",
     "seed_image", "seed_agent_image", "story_model", "context_window", "video_model",
-    "auto_lora", "catalog", "pinned", "stills_pinned", "judge"])
+    "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration"], defaults=(True,))
+# narration True: Narration: is voice-over or a character's spoken line. "speech"
+# (bin/ltx-movie --speech-only): Narration: is optional and, when present, a character's spoken
+# line. False (--no-narration): panels have no Narration: field and no narration check runs.
 
 # Injectable seams (tests replace them with monkeypatch.setattr).
 _now = time.monotonic
@@ -517,7 +534,8 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@SEED_PARAGRAPH@@", SEED_PARAGRAPH if ctx.seed_agent_image else ""),
         ("@@CAST_FIXED@@", cast_fixed),
         ("@@ARC_RULE@@", _arc_rule(ctx.panels)),
-        ("@@SHOT_LIST@@", ", ".join(SHOT_TYPES)),
+        ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
+         + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
@@ -681,14 +699,23 @@ def _q(text):
     return "'%s'" % text
 
 
+def outside_range(words, lo, hi):
+    """True when a word count is outside lo-hi by more than WORD_TOLERANCE."""
+    return words < lo * (1 - WORD_TOLERANCE) or words > hi * (1 + WORD_TOLERANCE)
+
+
+def _setting_length(setting):
+    """The advisory P4 detail for a setting sentence's word count, or None."""
+    words = _words(setting)
+    return "is %d words; aim for 12-45" % words if outside_range(words, 12, 45) else None
+
+
 def _setting_problems(setting):
-    """The P4 details for one setting sentence (start, word count, one sentence)."""
+    """The hard P4 details for one setting sentence (start, one sentence); its word count is
+    advisory (_setting_length)."""
     problems = []
     if not setting.startswith("The setting is "):
         problems.append('does not start with "The setting is"')
-    words = _words(setting)
-    if not 12 <= words <= 45:
-        problems.append("is %d words; it must be 12-45" % words)
     if len([s for s in _SENTENCE_SPLIT_RE.split(setting.strip()) if s.strip()]) != 1:
         problems.append("is more than one sentence")
     return problems
@@ -815,6 +842,9 @@ def plan_checks(ctx, plan, shape=()):
     for lid, entry in valid["locations"].items():
         for problem in _setting_problems(entry["setting"]):
             hard.append("plan: P4 setting sentence: %s's setting %s" % (lid, problem))
+        length = _setting_length(entry["setting"])
+        if length:
+            advisory.append("plan: P4 setting sentence: %s's setting %s" % (lid, length))
     arcs = [beat["arc"] if beat["arc"] in ARC_ROLES else None for beat in beats]
     for k, beat in enumerate(beats, start=1):
         if beat["arc"] and beat["arc"] not in ARC_ROLES:
@@ -840,6 +870,10 @@ def plan_checks(ctx, plan, shape=()):
         if beat["shot"] and beat["shot"] not in SHOT_TYPES:
             hard.append("beat %d: P7 shot type: %s is not one of: %s"
                         % (k, _q(beat["shot"]), ", ".join(SHOT_TYPES)))
+        elif (beat["shot"] and beat["shot"] not in shot_types(ctx.narration)
+              and (ctx.mode != "chained" or k == 1)):
+            hard.append("beat %d: P7 shot type: %s is too wide for on-screen speech; use one of: %s"
+                        % (k, _q(beat["shot"]), ", ".join(shot_types(ctx.narration))))
         if beat["camera"] and beat["camera"] not in CAMERA_KEYS:
             hard.append("beat %d: P8 camera: %s is not one of: %s"
                         % (k, _q(beat["camera"]), ", ".join(CAMERA_KEYS)))
@@ -855,7 +889,7 @@ def plan_checks(ctx, plan, shape=()):
                 kind, (lo, hi) = spec
                 used = _words(" ".join(pasted))
                 if hi - used < MIN_WRITER_WORDS[kind]:
-                    hard.append("beat %d: P10 word budget: %s: the pasted sentences take %d of its "
+                    advisory.append("beat %d: P10 word budget: %s: the pasted sentences take %d of its "
                                 "%d-%d words, leaving fewer than %d for the writer"
                                 % (k, field.capitalize(), used, lo, hi, MIN_WRITER_WORDS[kind]))
     if ctx.mode == "chained":
@@ -1019,6 +1053,14 @@ APPEARANCE_WORDS = frozenset("""
     camera lens zoom zooms dolly framing close-up""".split())
 _APPEARANCE_RE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(
     re.escape(w) for w in sorted(APPEARANCE_WORDS, key=lambda w: (-len(w), w))), re.IGNORECASE)
+# N3: "camera"/"lens" as the target of an action ("holds it up to the camera") is a direction,
+# not a camera description, so it is blanked before the appearance search.
+_CAMERA_TARGET_RE = re.compile(r"\b(?:to|toward|towards|into|at|from|past)\s+(?:the\s+)?(?:camera|lens)\b",
+                               re.IGNORECASE)
+# N17: a speaking character needs a visible, moving mouth.
+WIDE_SHOTS = ("extreme wide shot", "wide shot")
+HELD_EXPRESSION_RE = re.compile(r"\b(?:broad\s+|wide\s+|big\s+)?(?:smil(?:e|es|ing)|grin(?:s|ning)?|"
+                                r"beam(?:s|ing)|smirk(?:s|ing)?)\b", re.IGNORECASE)
 DIALOGUE_RE = re.compile(
     r"\b(?:say|says|said|saying|shout|shouts|shouted|shouting|whisper|whispers|whispered|"
     r"whispering|yell|yells|yelled|yelling|ask|asks|asked|asking|reply|replies|replied|replying|"
@@ -1120,18 +1162,33 @@ KEY_LINE_TEMPLATES = {
         "actions with then, while, meanwhile, simultaneously, afterwards, followed by or a comma "
         "before and, and never use a semicolon. Do not mention the camera: the pipeline adds the "
         "camera sentence."),
-    "narration": "narration: one sentence of voice-over narration, 3 to 30 words.",
+    "narration_speech": ("narration: leave it empty unless a character in this shot says something "
+                         "aloud; then one sentence of 3 to 30 words: that character's referring "
+                         "phrase, word for word, and a colon, followed by their words with no "
+                         "quotation marks. This movie has no voice-over, and every spoken line "
+                         "belongs here, never in another field. A character who speaks needs a "
+                         "medium shot or closer and no fixed smile or grin, so their lips can "
+                         "move."),
+    "narration": ("narration: one sentence of 3 to 30 words. It is voice-over unless a character "
+                  "in this shot says it aloud: then begin with that character's referring phrase, "
+                  "word for word, and a colon, followed by their words with no quotation marks. "
+                  "Every spoken line belongs here, never in another field. A character who speaks "
+                  "needs a medium shot or closer and no fixed smile or grin, so their lips can "
+                  "move."),
 }
 
 
-def writer_keys(mode, k):
-    """The writer parts of panel k (Section 2.3), in order."""
+def writer_keys(mode, k, narration=True):
+    """The writer parts of panel k (Section 2.3), in order; no "narration" when narration is
+    False."""
     if mode == "chained":
-        return ("title", "image", "motion", "narration") if k == 1 else (
+        keys = ("title", "image", "motion", "narration") if k == 1 else (
             "title", "motion", "narration")
-    if mode == "no_stills":
-        return ("title", "prompt", "narration")
-    return ("title", "image", "motion", "narration")
+    elif mode == "no_stills":
+        keys = ("title", "prompt", "narration")
+    else:
+        keys = ("title", "image", "motion", "narration")
+    return keys if narration else keys[:-1]
 
 
 def writer_targets(ctx, plan, k):
@@ -1189,11 +1246,11 @@ def parse_panel_reply(ctx, plan, k, answer):
     lib = _character_lib(ctx.ws)
     pasted = pasted_pieces(ctx, plan, k)
     parts = {}
-    for key in writer_keys(ctx.mode, k):
+    for key in writer_keys(ctx.mode, k, ctx.narration):
         if key == "title":
             continue
         value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
-        if not value:
+        if not value and not (key == "narration" and ctx.narration == "speech"):
             return None
         parts[key] = value
     title = clean_writer(lib, obj.get("title"))
@@ -1218,7 +1275,8 @@ def panel_fields(ctx, plan, parts, k):
         fields.append(("Prompt", join([p.get("prompt", "")] + pasted["prompt"])))
     else:
         fields.append(("Motion", join([p.get("motion", "")] + pasted["motion"])))
-    fields.append(("Narration", _sentence(p.get("narration", ""))))
+    if ctx.narration is True or (ctx.narration and p.get("narration", "").strip()):
+        fields.append(("Narration", _sentence(p.get("narration", ""))))
     return fields
 
 
@@ -1277,9 +1335,9 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             spec = field_range(ctx, k, key)
             if spec:
                 lo, hi = spec[1]
-                if not lo <= _words(text) <= hi:
-                    add(hard, "N1", "word count", label,
-                        "is %d words; it must be %d-%d" % (_words(text), lo, hi))
+                if outside_range(_words(text), lo, hi):
+                    add(advisory, "N1", "word count", label,
+                        "is %d words; aim for %d-%d" % (_words(text), lo, hi))
         if ctx.mode == "chained" and k >= 2 and label == "Motion" and plan:
             humans = [p for p in phrases if not lib.is_animal_phrase(p)]
             animals = [p for p in phrases if lib.is_animal_phrase(p)]
@@ -1295,6 +1353,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             if "N3" in ids:
                 blanked = lib._blank(text, lib._passage_spans(
                     text, list(phrases) + [p["name"] for p in plan["props"] if p["name"]]))
+                blanked = _CAMERA_TARGET_RE.sub(lambda m: " " * len(m.group(0)), blanked)
                 word = _first(_APPEARANCE_RE, blanked)
                 if word:
                     add(hard, "N3", "appearance", label,
@@ -1358,7 +1417,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(writer)), None)
             if copied:
                 add(hard, "N10", "copied example", label, "contains template text %s" % _q(copied))
-        if "N11" in ids and label == "Narration" and not text.strip():
+        if "N11" in ids and label == "Narration" and not text.strip() and ctx.narration is True:
             hard.append("%s N11 narration: Narration: is empty" % prefix)
     if "N15" in ids and undeclared:
         masks = _undeclared_masks(lib, ctx, plan, undeclared)
@@ -1375,8 +1434,48 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             chain = ", and"
         if chain:
             add(advisory, "N12", "one action", "Motion", "chains actions with %s" % _q(chain))
+    narration = dict(fields).get("Narration", "")
+    if "N16" in ids and beat is not None:
+        found = lib.speaker_prefix(narration)
+        speech_only = ctx.narration == "speech"
+        if speech_only and narration.strip() and (
+                not found or lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[0]
+                is None):
+            add(hard, "N16", "speaker", "Narration",
+                "is voice-over, but this story is speech-only; start it with the referring "
+                "phrase of the character in the shot who says it and a colon, or leave it empty")
+        elif found:
+            on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
+            known = [c["phrase"] for c in plan["cast"]]
+            if lib.split_speaker(narration, on_screen)[0] is not None:
+                pass
+            elif lib.split_speaker(narration, known)[0] is not None:
+                add(hard, "N16", "speaker", "Narration",
+                    "is spoken by %s, who is not in this shot; only a character on screen can "
+                    "speak, so make it voice-over (no prefix) or put %s in the shot"
+                    % (_q(found[0]), _q(found[0])))
+            else:
+                add(advisory, "N16", "speaker", "Narration",
+                    "starts with %s, which is no character's referring phrase, so it is read as "
+                    "voice-over; start a spoken line with the speaker's referring phrase, or drop "
+                    "the colon" % _q(found[0] + ":"))
+    if "N17" in ids and beat is not None and narration.strip():
+        on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
+        speaker = lib.split_speaker(narration, on_screen)[0]
+        shot_applies = ctx.mode != "chained" or k == 1
+        if speaker and shot_applies and beat["shot"] in WIDE_SHOTS:
+            add(advisory, "N17", "speaking shot", "Narration",
+                "%s speaks in a %s, too small to read the lips, so it plays as voice-over; use "
+                "a medium shot or closer" % (_q(speaker), beat["shot"]))
+        held = speaker and next((w for w in (_first(HELD_EXPRESSION_RE, writers.get(label, ""))
+                                             for label in action_fields) if w), None)
+        if held:
+            add(advisory, "N17", "speaking shot", "Narration",
+                "%s speaks, but the panel holds the expression %s, which freezes the mouth; "
+                "describe the speaking instead" % (_q(speaker), _q(held)))
     if "N14" in ids:
-        narration = dict(fields).get("Narration", "")
+        if plan:
+            narration = lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[1]
         if narration.strip():
             sentences = [s for s in lib._SENTENCE_SPLIT_RE.split(narration.strip()) if s.strip()]
             lo, hi = NARRATION_WORDS
@@ -1429,21 +1528,21 @@ def plan_copied_examples(plan):
 
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15")
+                     "N14", "N15", "N16", "N17")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
-    """(hard, advisory) of an assembled story (RS15): plan-scope N10, then per panel N1-N11 and
-    N15 (hard) and N12-N14 (advisory), then (shots) character_lib.shots_violations and
-    shots_advisories. story_md_path holds text (written by the caller) and is parsed with
-    bin/ltx-story-manifest's _parse_prompts_md."""
+    """(hard, advisory) of an assembled story (RS15): plan-scope N10, then per panel N2-N11 and
+    N15 (hard), N16 (hard or advisory) and N1, N12-N14, N17 (advisory), then (shots)
+    character_lib.shots_violations and shots_advisories. story_md_path holds text (written by
+    the caller) and is parsed with bin/ltx-story-manifest's _parse_prompts_md."""
     lib = _character_lib(ctx.ws)
     undeclared = undeclared_characters(ctx)
     hard, advisory = plan_copied_examples(plan), []
     writers_by_panel = []
     for k in range(1, len(parts) + 1):
         fields = panel_fields(ctx, plan, parts, k)
-        writers = {LABELS[key]: parts[k - 1].get(key, "") for key in writer_keys(ctx.mode, k)
+        writers = {LABELS[key]: parts[k - 1].get(key, "") for key in writer_keys(ctx.mode, k, ctx.narration)
                    if key != "title"}
         writers_by_panel.append(writers)
         h, a = _field_checks(ctx, lib, plan, k, parts[k - 1]["title"], fields, writers,
@@ -1453,14 +1552,14 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
-        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members)
+        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration is True)
         advisory += lib.shots_advisories(panels, ctx.members)
     return hard, advisory
 
 
 def _order_by_panel(lines):
-    """Panel advisories sorted by panel, then N12, N13, N14 (stable)."""
-    order = {"N12": 0, "N13": 1, "N14": 2}
+    """Panel advisories sorted by panel, then N12, N13, N14, N16, N17 (stable)."""
+    order = {"N12": 0, "N13": 1, "N14": 2, "N16": 3, "N17": 4}
     return sorted(lines, key=lambda l: (int(l.split(":", 1)[0].split()[1]),
                                         order.get(l.split()[2], 3)))
 
@@ -1489,20 +1588,23 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
                     + dict(panel_fields(ctx, plan, parts, k - 1))["Motion"] + "\n")
     seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
     key_lines = []
-    for key in writer_keys(ctx.mode, k):
+    for key in writer_keys(ctx.mode, k, ctx.narration):
         if key == "title" or key == "narration":
-            line = KEY_LINE_TEMPLATES[key]
+            line = KEY_LINE_TEMPLATES["narration_speech" if key == "narration"
+                                      and ctx.narration == "speech" else key]
         elif ctx.mode == "chained":
             line = KEY_LINE_TEMPLATES["chained_image" if key == "image" else
                                       "chained_motion1" if k == 1 else "chained_motion"]
         else:
             line = KEY_LINE_TEMPLATES["%s_%s" % (ctx.mode, key)]
+        if key in ("image", "motion", "prompt") and ctx.narration == "speech":
+            line += SPEECH_FRAMING_SENTENCE
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         key_lines.append(line)
     fix_block = ""
     if fix is not None:
-        keys = writer_keys(ctx.mode, k)
+        keys = writer_keys(ctx.mode, k, ctx.narration)
         current = parts[k - 1] if k <= len(parts) and parts[k - 1] else {}
         fix_block = ("Your previous version of this panel was rejected. Problems:\n"
                      + "\n".join("- " + m for m in fix[:MAX_LISTED])
@@ -1527,9 +1629,9 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     return _fill(PANEL_PROMPT_TEMPLATE, fragments, scalars, ctx.narrative)
 
 
-def unparseable_panel_problem(mode, k):
+def unparseable_panel_problem(mode, k, narration=True):
     return ("the reply is not one JSON object with the keys %s"
-            % ", ".join(writer_keys(mode, k)))
+            % ", ".join(writer_keys(mode, k, narration)))
 
 
 # ---------------------------------------------------------------------------
@@ -1593,12 +1695,12 @@ def listed(lines):
     return list(lines[:MAX_LISTED]) + ["- ... and %d more" % (len(lines) - MAX_LISTED)]
 
 
-def critic_field_lines(mode, catalog_lines):
+def critic_field_lines(mode, catalog_lines, narration=True):
     lines = [
         '- target "plan", field "beat.action", index = the beat number: replacement is the beat\'s '
         "new action, one sentence of 6 to 40 words; the pipeline rewrites that panel from it.",
         '- target "plan", field "beat.shot", index = the beat number@@ONLY1@@: replacement is '
-        "exactly one of: " + ", ".join(SHOT_TYPES) + ".",
+        "exactly one of: " + ", ".join(shot_types(narration)) + ".",
         '- target "plan", field "beat.camera", index = the beat number@@ONLY1@@: replacement is '
         "exactly one of: " + ", ".join(CAMERA_KEYS) + ".",
         '- target "plan", field "location.setting", index = the place\'s position in the plan\'s '
@@ -1618,14 +1720,18 @@ def critic_field_lines(mode, catalog_lines):
     else:
         lines.append('- target "panel", field "prompt", index = the panel number: replacement is '
                      "the new writer text of that panel's Prompt: field.")
-    lines.append('- target "panel", field "narration", index = the panel number: replacement is '
-                 "the panel's new narration sentence.")
+    if narration:
+        lines.append('- target "panel", field "narration", index = the panel number: replacement '
+                     "is the panel's new narration sentence (prefixed with the speaker's referring "
+                     "phrase and a colon when a character in the shot says it).")
     return "\n".join(lines)
 
 
-def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for_judge=False):
+def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for_judge=False,
+                        narration=True):
     """The exact critic prompt of RS17. violations is (hard, advisory) of the judged state;
-    mode, panels, seconds, narrative, goal and story_id come from the plan."""
+    mode, panels, seconds, narrative, goal and story_id come from the plan; narration False
+    leaves out the narration patch target."""
     hard, advisory = violations
     lines = listed(["- [hard] " + m for m in hard] + ["- [advisory] " + m for m in advisory])
     plan_json = json.dumps({k: plan[k] for k in ("title", "logline", "cast", "locations", "props",
@@ -1635,7 +1741,7 @@ def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[plan["mode"]]),
         ("@@VIOLATIONS@@", "\n".join(lines) if lines else "- none"),
         ("@@GOAL_CLAUSE@@", " and serve the target output goal" if plan["goal"] else ""),
-        ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines)),
+        ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines, narration)),
         ("@@ONLY1@@", ONLY1 if plan["mode"] == "chained" else ""),
         ("@@REPLY_PARAGRAPH@@", JUDGE_REPLY_PARAGRAPH if for_judge else CRITIC_REPLY_PARAGRAPH),
     ]
@@ -1720,7 +1826,7 @@ def patch_ranges(ctx, plan, lora_allowed):
             ("panel", "image"): first_only if mode != "no_stills" else None,
             ("panel", "motion"): (1, n) if mode != "no_stills" else None,
             ("panel", "prompt"): (1, n) if mode == "no_stills" else None,
-            ("panel", "narration"): (1, n)}
+            ("panel", "narration"): (1, n) if ctx.narration else None}
 
 
 def _patch_problem(ranges, patch):
@@ -1783,7 +1889,7 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
         if field == "beat.action":
             action = clean_writer(lib, patch["replacement"])
             words = _words(action)
-            if not 6 <= words <= 40:
+            if outside_range(words, 6, 40):
                 rejected.append({"patch": patch, "reason": "the new action is %d words; it must "
                                                            "be 6 to 40" % words})
                 continue
@@ -1791,7 +1897,7 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
             regenerate.append(index)
         elif field in ("beat.shot", "beat.camera"):
             value = _collapse(patch["replacement"]).lower()
-            allowed = SHOT_TYPES if field == "beat.shot" else CAMERA_KEYS
+            allowed = shot_types(ctx.narration) if field == "beat.shot" else CAMERA_KEYS
             if value not in allowed:
                 rejected.append({"patch": patch, "reason": "%s is not one of: %s"
                                  % (_q(value), ", ".join(allowed))})
@@ -2070,7 +2176,8 @@ class _Run(object):
                  "advisory": pa + la + na, "scores": None, "verdict": None, "dir": rdir}
         _write_json(os.path.join(rdir, "plan.json"), plan)
         _write_json(os.path.join(rdir, "parts.json"), {"panels": [
-            dict([("index", k)] + [(key, p.get(key, "")) for key in writer_keys(ctx.mode, k)])
+            dict([("index", k)] + [(key, p.get(key, ""))
+                                   for key in writer_keys(ctx.mode, k, ctx.narration)])
             for k, p in enumerate(parts, start=1)]})
         _write_json(os.path.join(rdir, "story_checks.json"), _checks_doc(ctx, state))
         print("round %d: %d hard, %d advisory" % (rnd, len(state["hard"]), len(state["advisory"])))
@@ -2086,7 +2193,7 @@ class _Run(object):
         prev = self.states[judged]
         rdir = os.path.join(self.rounds_dir, "round_%d" % k)
         base = build_critic_prompt(prev["plan"], prev["text"], (prev["hard"], prev["advisory"]),
-                                   self.catalog_lines)
+                                   self.catalog_lines, narration=self.ctx.narration)
         prompt, reply, route, calls = base, None, None, 0
         for attempt in range(1, CRITIC_CALLS_PER_ROUND + 1):
             if self.expired():
@@ -2233,7 +2340,7 @@ class _Run(object):
                 if self.expired():
                     return self.round0_timeout()
                 new = self.panel_call(plan, parts, k, 0,
-                                      [unparseable_panel_problem(ctx.mode, k)])
+                                      [unparseable_panel_problem(ctx.mode, k, ctx.narration)])
             if new is not None:
                 parts[k - 1] = new
                 valid += 1
@@ -2320,7 +2427,8 @@ def run_judge(ctx, round_dir):
 # Re-check of an existing story.md (RS28) and the plan-free yardstick (RS28, 7.2)
 # ---------------------------------------------------------------------------
 
-RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15")
+RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
+               "N16", "N17")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
@@ -2339,14 +2447,16 @@ def load_plan(ctx):
     return plan
 
 
-def story_fields(mode, k, panel):
-    """[(Label, text)] of a parsed story.md panel, the fields RS3 assembles for mode/panel k."""
+def story_fields(mode, k, panel, narration=True):
+    """[(Label, text)] of a parsed story.md panel, the fields RS3 assembles for mode/panel k
+    (no Narration when narration is False)."""
     if mode == "no_stills":
         labels = ("Prompt", "Narration")
     elif mode == "chained" and k >= 2:
         labels = ("Motion", "Narration")
     else:
         labels = ("Image", "Motion", "Narration")
+    labels = labels if narration else labels[:-1]
     return [(label, panel[label.lower()]) for label in labels]
 
 
@@ -2421,7 +2531,7 @@ def recheck(ctx, legacy_validate):
             undeclared = undeclared_characters(ctx)
             writers_by_panel = []
             for k, panel in enumerate(parsed, start=1):
-                fields = story_fields(ctx.mode, k, panel)
+                fields = story_fields(ctx.mode, k, panel, ctx.narration)
                 writers = _recheck_writers(ctx, lib, plan, k, fields)
                 writers_by_panel.append(writers)
                 h, a = _field_checks(ctx, lib, plan, k, panel["title"], fields, writers,
@@ -2430,7 +2540,8 @@ def recheck(ctx, legacy_validate):
                 advisory += a
             advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
             if ctx.mode == "shots":
-                hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+                hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members,
+                                            ctx.narration is True)
                 advisory += lib.shots_advisories(parsed, ctx.members)
             if ctx.auto_lora:
                 compatible = dict((e["id"], e) for e in compatible_entries(ctx))
@@ -2469,7 +2580,8 @@ def recheck(ctx, legacy_validate):
         return _undeclared_gate(ctx, story_md, legacy_validate, (0, []))
     try:
         text, parsed = _read_story(ctx, story_md)
-        violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members)
+        violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members,
+                                               ctx.narration is True)
         advisories = lib.shots_advisories(parsed, ctx.members)
     except OSError as e:
         violations, advisories = ["story: cannot read story.md: %s" % e], []

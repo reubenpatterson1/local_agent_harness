@@ -23,7 +23,7 @@ import types
 import zipfile
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
@@ -126,7 +126,8 @@ def test_d1_spike_self_test_ported(tmp_path):
         "class_noun": "man",
         "descriptor": "An older man with grey hair and a beard wearing a brown coat"})[1] == (
         "an older man with grey hair and a beard wearing a brown coat")
-    _bad(cd.validate_description, {"class_noun": "woman", "descriptor": "a " + " ".join(["word"] * 60)})
+    # over the 70-word cap (1 "a" + 70 "word" = 71)
+    _bad(cd.validate_description, {"class_noun": "woman", "descriptor": "a " + " ".join(["word"] * 70)})
     _bad(cd.validate_description, {"class_noun": "woman"})
     assert cd.validate_description({"class_noun": "Woman ",
                                     "descriptor": good_desc["descriptor"]})[0] == "woman"
@@ -139,7 +140,7 @@ def test_d1_spike_self_test_ported(tmp_path):
                              "setting": "a park"})
     _bad(cd.validate_check, {"identity_score": 11, "shot": "medium shot", "pose": "standing",
                              "setting": "a park"})
-    _bad(cd.validate_check, {"identity_score": 7, "shot": "full shot", "pose": "standing",
+    _bad(cd.validate_check, {"identity_score": 7, "shot": "drone shot", "pose": "standing",
                              "setting": "a park"})
     assert cd.validate_check({"identity_score": 7, "shot": "medium shot", "pose": "standing",
                               "setting": "in a park."})["setting"] == "a park"
@@ -170,21 +171,20 @@ def test_d2_copied_literals_match_the_spike():
 
 
 def test_d3_describe_prompt():
-    assert character_dataset.DESCRIBE_PROMPT == (
-        'Describe the main character in this image for an image generator that must redraw the same '
-        'person in many different poses and places. Reply with only a JSON object with two keys. '
-        '"class_noun": one lowercase word for what they are (for example woman, man, girl, boy, person). '
-        '"descriptor": one noun phrase of at most 45 words that starts with "a" or "an" and covers only '
-        'what is visible about the character themselves: apparent age group, apparent ethnicity when it '
-        'is visible, build, skin tone, hair colour, length and style, notable facial features, and the '
-        'clothing and accessories they would wear anywhere. Leave out anything that belongs to this one '
-        'situation rather than to the person: footwear, gear or props that are visible only because of '
-        'what they are doing here (for example riding boots while riding, or a tool they are using), '
-        'anything they are holding, and any animal or vehicle. Do not mention the background, the pose, '
-        'the action, the camera, the lighting or the image style.')
-    for phrase in ("apparent ethnicity when it is visible", "riding boots while riding",
-                   "anything they are holding"):
-        assert phrase in character_dataset.DESCRIBE_PROMPT
+    # Requirement-based (the prompt is iterated; pin the content it must request, not bytes).
+    p = character_dataset.DESCRIBE_PROMPT
+    assert p.startswith("Describe the main character in this image")
+    assert '"class_noun":' in p and '"descriptor":' in p
+    assert "noun phrase of 25 to 55 words" in p
+    # persistent-identity coverage the prompt must request
+    for phrase in ("apparent age in approximate years", "even if makeup makes them look younger",
+                   "apparent ethnicity when it is visible", "distinctive facial features and markings",
+                   "any makeup or face paint", "habitual bearing or expression"):
+        assert phrase in p, phrase
+    # situational things it must still exclude, so the dataset keeps pose variety
+    for phrase in ("the specific pose or action", "riding boots while riding",
+                   "anything they are holding", "Do not mention the background"):
+        assert phrase in p, phrase
 
 
 def test_d4_validate_face_values():
@@ -260,7 +260,8 @@ def test_d17_busy_process(monkeypatch):
                 ["python3", "bin/ltx-mlx-render", "m.json", "o.mp4"],
                 ["/x/mflux-train", "--config", "c"],
                 ["vim", "notes-ltx-2-mlx.txt"],
-                ["python3", "character_dataset.py", "zimage", "--spec", "s"]]
+                ["python3", "character_dataset.py", "zimage", "--spec", "s"],
+                ["python3", "/w/character_dataset.py", "qwenedit", "--spec", "s"]]
     results = []
     for cmdline in cmdlines:
         monkeypatch.setattr(character_dataset.psutil, "process_iter",
@@ -271,6 +272,7 @@ def test_d17_busy_process(monkeypatch):
     assert results[2] == (4242, "/x/mflux-train --config c")
     assert results[3] is None
     assert results[4] == (4242, "python3 character_dataset.py zimage --spec s")
+    assert results[5] == (4242, "python3 /w/character_dataset.py qwenedit --spec s")
 
 
 def test_d18_library_lock(lib_dir):
@@ -1104,3 +1106,218 @@ def test_d41_stills_constants():
     assert character_dataset.STILLS_TARGET_STEPS == 672
     assert character_dataset.STILLS_MAX_RESOLUTION == 512
     assert character_dataset.STILLS_TRAIN_TIMEOUT_S == 10800
+
+
+def test_d3b_describe_shortens_a_too_long_descriptor(monkeypatch):
+    # The describe call runs at temperature 0, so a bare retry repeats itself: a 124-word
+    # descriptor (the fubohockey seed) is sent back to be shortened, and the 30-word result
+    # passes.
+    long = "a man " + " ".join(["tall"] * 122)
+    short = "a man in his late twenties with a lean athletic build, olive skin, short dark " \
+            "brown hair, a small mole below his left eye and an orange hockey jersey"
+    replies = [json.dumps({"class_noun": "man", "descriptor": long}),
+               json.dumps({"class_noun": "man", "descriptor": short})]
+    seen = []
+
+    def fake(parts, max_tokens=600):
+        seen.append(parts)
+        return replies.pop(0)
+    monkeypatch.setattr(character_dataset, "vlm_call", fake)
+    monkeypatch.setattr(character_dataset, "image_data_url", lambda path: "data:image/png;base64,")
+    class_noun, descriptor, _reply = character_dataset.describe("/seed.png")
+    assert (class_noun, descriptor) == ("man", short)
+    assert len(seen[0]) == 2 and seen[0][0]["text"] == character_dataset.DESCRIBE_PROMPT
+    # Too long: the retry is a text-only request to shorten the rejected descriptor.
+    assert len(seen[1]) == 1
+    assert seen[1][0]["text"] == character_dataset.DESCRIBE_SHORTEN % ("man", long)
+
+
+def test_d3c_describe_retry_quotes_other_rejections(monkeypatch):
+    short = "a man in his late twenties with a lean athletic build, olive skin, short dark " \
+            "brown hair, a small mole below his left eye and an orange hockey jersey"
+    replies = [json.dumps({"class_noun": "man", "descriptor": "The tall man " + short[6:]}),
+               json.dumps({"class_noun": "man", "descriptor": short})]
+    seen = []
+
+    def fake(parts, max_tokens=600):
+        seen.append(parts)
+        return replies.pop(0)
+    monkeypatch.setattr(character_dataset, "vlm_call", fake)
+    monkeypatch.setattr(character_dataset, "image_data_url", lambda path: "data:image/png;base64,")
+    assert character_dataset.describe("/seed.png")[1] == short
+    retry = seen[1][-1]["text"]
+    assert len(seen[1]) == 3 and "must start with" in retry and "25 to 55 words" in retry
+
+
+# --- D43-D45: seed-image edits (seed-edit spec E1, E3-E6) --------------------------------
+def test_d43_edit_plan_and_prompt():
+    plan = character_dataset.edit_plan()
+    assert [e["n"] for e in plan][:6] == [1, 3, 8, 10, 12, 21]
+    assert sorted(e["n"] for e in plan) == list(range(1, 25))
+    entry = next(e for e in plan if e["n"] == 21)
+    assert (entry["shot"], entry["pose"], entry["setting"]) == ("wide shot", "running", "a beach")
+    assert entry["prompt"] == (
+        "Show this exact same person: keep their face, hair, clothing, colours, logos, accessories "
+        "and anything they carry identical. Re-shoot them as a wide shot, running, in a beach. "
+        "Change the camera angle, pose and background to match; the body position must clearly "
+        "differ from the original photo. Photorealistic live-action film still, natural light.")
+
+
+def test_d44_child_qwenedit(tmp_path, monkeypatch):
+    seed = str(tmp_path / "seed.png")
+    Image.new("RGB", (300, 200), (10, 20, 30)).save(seed)
+    calls = {"pipe": [], "lora": None, "from": None}
+
+    class _Blocked(Exception):
+        pass
+
+    class _Generator(object):
+        def __init__(self, device):
+            pass
+
+        def manual_seed(self, seed):
+            self.seed = seed
+            return self
+
+    class _Pipe(object):
+        def to(self, device):
+            calls["device"] = device
+            return self
+
+        def load_lora_weights(self, path):
+            calls["lora"] = path
+
+        def set_progress_bar_config(self, **kwargs):
+            pass
+
+        def __call__(self, **kwargs):
+            calls["pipe"].append(kwargs)
+            colour = (255, 0, 0) if "blocked" in kwargs["prompt"] else (0, 255, 0)
+            return types.SimpleNamespace(images=[Image.new("RGB", (kwargs["width"],
+                                                                  kwargs["height"]), colour)])
+
+    def _from_pretrained(model, **kwargs):
+        calls["from"] = (model, kwargs)
+        return _Pipe()
+
+    def _assert_safe(image, skill, prompt):
+        assert skill == "character_edit"
+        if image.getpixel((0, 0)) == (255, 0, 0):
+            raise _Blocked()
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.Generator = _Generator
+    fake_torch.bfloat16 = "bf16"
+    fake_torch.backends = types.SimpleNamespace(mps=types.SimpleNamespace(is_available=lambda: True))
+    fake_diffusers = types.ModuleType("diffusers")
+    fake_diffusers.QwenImageEditPlusPipeline = types.SimpleNamespace(
+        from_pretrained=_from_pretrained)
+    fake_hub = types.ModuleType("huggingface_hub")
+    fake_hub.hf_hub_download = lambda repo, name, local_files_only: "/cache/%s/%s" % (repo, name)
+    fake_safety = types.ModuleType("content_safety")
+    fake_safety.ContentSafetyError = _Blocked
+    fake_safety.assert_image_safe = _assert_safe
+    for name, module in (("torch", fake_torch), ("diffusers", fake_diffusers),
+                         ("huggingface_hub", fake_hub), ("content_safety", fake_safety)):
+        monkeypatch.setitem(sys.modules, name, module)
+    out_ok, out_blocked = str(tmp_path / "char_01.png"), str(tmp_path / "char_03.png")
+    spec = {"image": seed, "model": "M", "lora_repo": "R", "lora_file": "F.safetensors",
+            "steps": 8, "true_cfg": 1.0, "report_path": str(tmp_path / "report.json"),
+            "jobs": [{"prompt": "pose one", "output_path": out_ok, "seed": 3, "width": 64,
+                      "height": 40},
+                     {"prompt": "blocked pose", "output_path": out_blocked, "seed": 3,
+                      "width": 64, "height": 40}]}
+    spec_path = str(tmp_path / "spec.json")
+    with open(spec_path, "w") as f:
+        json.dump(spec, f)
+    assert character_dataset.main(["qwenedit", "--spec", spec_path]) == 0
+    assert calls["from"] == ("M", {"torch_dtype": "bf16", "local_files_only": True})
+    assert calls["lora"] == "/cache/R/F.safetensors" and calls["device"] == "mps"
+    first = calls["pipe"][0]
+    assert first["image"][0].size == (300, 200)
+    assert (first["num_inference_steps"], first["true_cfg_scale"], first["width"],
+            first["height"], first["generator"].seed) == (8, 1.0, 64, 40, 3)
+    with open(spec["report_path"]) as f:
+        report = json.load(f)
+    assert [j["status"] for j in report["jobs"]] == ["ok", "blocked"]
+    assert os.path.isfile(out_ok) and not os.path.exists(out_blocked)
+
+
+def test_d45_preview_sheet_marks_blocked_stills(tmp_path):
+    Image.new("RGB", (1024, 640), (0, 200, 0)).save(str(tmp_path / "char_01.png"))
+    out = str(tmp_path / "preview.jpg")
+    entries = [e for e in character_dataset.edit_plan()][:2]
+    character_dataset.write_preview_sheet(entries, str(tmp_path), out)
+    with Image.open(out) as sheet:
+        assert sheet.size == (5 * 256, 180)
+        assert sheet.getpixel((128, 80))[1] > 150
+        assert sheet.getpixel((256 + 1, 1))[0] > 200
+
+
+def test_d46_seed_still_keeps_the_face():
+    # A 1440x2160 portrait with a red "face" in its upper third: a centre crop to 16:10 would
+    # cut it off; the face-box crop keeps it 40% down the frame.
+    img = Image.new("RGB", (1440, 2160), (0, 0, 0))
+    img.paste((255, 0, 0), (684, 354, 984, 782))
+    box = [475, 164, 685, 362]
+    still = character_dataset.seed_still(img, box)
+    assert still.size == (1024, 640)
+    assert still.getpixel((590, 256)) == (255, 0, 0)
+    centre = ImageOps.fit(img, (1024, 640), Image.LANCZOS, centering=(0.5, 0.5))
+    assert centre.getpixel((590, 256)) != (255, 0, 0)
+    wide = character_dataset.seed_still(Image.new("RGB", (2048, 1152)), [800, 100, 900, 300])
+    assert wide.size == (1024, 640)
+    assert character_dataset.seed_still(Image.new("RGB", (1600, 1000)), None).size == (1024, 640)
+
+
+def test_d47_image_child_exits_with_its_parent(tmp_path):
+    # parent.py starts child.py (which arms exit_with_parent and sleeps), prints the child's
+    # pid and sleeps; SIGKILLing the parent must end the child within a few polls.
+    child = tmp_path / "child.py"
+    child.write_text("import sys, time\nsys.path.insert(0, %r)\nimport character_dataset\n"
+                     "character_dataset.exit_with_parent(poll_s=0.2)\ntime.sleep(60)\n" % WS)
+    parent = tmp_path / "parent.py"
+    parent.write_text("import subprocess, sys, time\n"
+                      "p = subprocess.Popen([sys.executable, %r], start_new_session=True)\n"
+                      "print(p.pid, flush=True)\ntime.sleep(60)\n" % str(child))
+    proc = subprocess.Popen([sys.executable, str(parent)], stdout=subprocess.PIPE, text=True)
+    child_pid = int(proc.stdout.readline())
+    time.sleep(1.5)
+    proc.kill()
+    proc.wait()
+    for _ in range(50):
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child_pid, 9)
+        raise AssertionError("the image child outlived its parent")
+
+
+def test_d48_check_retry_alias_and_empty_caption(monkeypatch, tmp_path):
+    ref, cand = str(tmp_path / "a.png"), str(tmp_path / "b.png")
+    for path in (ref, cand):
+        Image.new("RGB", (64, 40)).save(path)
+    replies = [json.dumps({"identity_score": 8, "shot": "medium shot", "pose": "standing",
+                           "setting": "a very long setting with far too many words in it"}),
+               json.dumps({"identity_score": 8, "shot": "full shot", "pose": "standing",
+                           "setting": "a park"})]
+    seen = []
+
+    def _vlm(parts, max_tokens=600):
+        seen.append(parts)
+        return replies.pop(0)
+
+    monkeypatch.setattr(character_dataset, "vlm_call", _vlm)
+    check, reason = character_dataset.score_still(ref, cand)
+    assert reason is None and check["shot"] == "wide shot" and check["setting"] == "a park"
+    assert seen[0][0]["text"] == character_dataset.CHECK_PROMPT and len(seen[0]) == 3
+    assert "setting word count must be 1-8, got 11" in seen[1][-1]["text"]
+    assert character_dataset.caption("trg", "man", {"shot": "", "pose": "", "setting": ""}) == (
+        "trg man, photorealistic live-action film still, natural light.")
+    assert character_dataset.caption("trg", "man", {"shot": "close-up", "pose": "smiling",
+                                                    "setting": "a park"}) == (
+        "trg man, close-up, smiling, in a park, photorealistic live-action film still, natural "
+        "light.")

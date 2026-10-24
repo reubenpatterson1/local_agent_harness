@@ -2,14 +2,21 @@
 """character -- build, train and inspect the character LoRA library
 (generated/characters/).
 
-  bin/character create NAME --phrase PHRASE (--seed-image PATH | --descriptor TEXT --class NOUN)
-                        [--trigger WORD] [--seed N] [--force]
-  bin/character create NAME --regenerate
+  bin/character create NAME --phrase PHRASE --seed-image PATH [--descriptor TEXT --class NOUN]
+                        [--trigger WORD] [--seed N] [--force] [--no-review]
+  bin/character create NAME --phrase PHRASE --descriptor TEXT --class NOUN
+                        [--trigger WORD] [--seed N]
+  bin/character create NAME --regenerate [--no-review]
   bin/character train NAME [--video] [--stills] [--force]
   bin/character list
   bin/character show NAME
 
-create builds the training dataset and stops for review (dataset/contact_sheet.jpg); train
+create builds the training dataset and stops for review (dataset/contact_sheet.jpg). A
+--seed-image create poses the seed itself with Qwen-Image-Edit-2511 (Lightning 8-step), editing 6
+preview stills first and stopping at dataset/preview_sheet.jpg before the other 18; --no-review
+skips that stop (an unattended create needs it). The vision model still writes the story
+descriptor from the seed unless --descriptor is given. See
+docs/superpowers/specs/2026-10-21-character-seed-edit-design.md. train
 trains the video LoRA (ltx-2-mlx) and, when mflux is installed and its adapter passes the
 compat gate, the stills LoRA. list and show read the library only. A trained character is
 cast into a movie with bin/ltx-movie --character NAME or --cast "PHRASE=NAME".
@@ -18,12 +25,14 @@ Exit codes: 0 success, 1 runtime failure, 2 argument or precondition failure, 3 
 fewer than 12 stills.
 
 list/show import character_lib only (stdlib); create/train import character_dataset, which
-needs PIL and psutil. See docs/superpowers/specs/2026-10-05-character-library-design.md.
+needs PIL and psutil: without them bin/character re-executes itself under $CHARACTER_PYTHON
+(default ~/img-gen/bin/python). See docs/superpowers/specs/2026-10-05-character-library-design.md.
 
 Environment: set CHARACTER_TWO_SOURCE=1 for the two-source dataset mode -- create (and
 --regenerate) then builds a few text2img pose anchors and img2img each anchor across
 settings, giving pose-diverse, identity-consistent stills (scars/jewelry carried by the
-img2img pixel anchor). Unset, the default 24-VARIANT text2img dataset is built.
+img2img pixel anchor). Unset, the default 24-VARIANT text2img dataset is built. Both apply to
+--descriptor creates only; a --seed-image create always edits the seed.
 """
 
 import argparse
@@ -56,6 +65,8 @@ def build_parser():
                    help="proceed although the seed image's face is small or not found")
     p.add_argument("--regenerate", action="store_true",
                    help="rebuild an existing, untrained character's dataset from its character.json")
+    p.add_argument("--no-review", dest="no_review", action="store_true",
+                   help="do not stop after the 6 preview stills of a seed-image dataset")
     t = sub.add_parser("train", help="train the video LoRA and/or the stills LoRA")
     t.add_argument("name", metavar="NAME")
     t.add_argument("--video", action="store_true")
@@ -101,11 +112,39 @@ def main(argv=None):
         return cmd_list()
     if args.command == "show":
         return cmd_show(args.name)
+    try:
+        import PIL  # noqa: F401
+        import psutil  # noqa: F401
+    except ImportError:
+        # A venv's python is a symlink to its base interpreter, so the marker (not a path
+        # comparison) is what stops a second re-exec.
+        py = os.environ.get("CHARACTER_PYTHON", os.path.expanduser("~/img-gen/bin/python"))
+        if os.access(py, os.X_OK) and not os.environ.get("CHARACTER_REEXEC"):
+            os.environ["CHARACTER_REEXEC"] = "1"
+            os.execv(py, [py, os.path.realpath(__file__)]
+                     + (sys.argv[1:] if argv is None else list(argv)))
+        raise
     import character_dataset
     if args.command == "create":
         return character_dataset.create(args)
     return character_dataset.train(args)
 
 
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    # A kill or a movie-ui Cancel (SIGTERM) and a closed terminal (SIGHUP) take the same path
+    # as Ctrl-C, so the image child is killed and the story server restored
+    # (docs/superpowers/specs/2026-10-21-clean-stop-design.md).
+    import signal
+    # SIGINT too: a job started in the background by a script inherits SIGINT ignored, and
+    # Python then never installs its own Ctrl-C handler.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("character: interrupted", file=sys.stderr)
+        sys.exit(130)

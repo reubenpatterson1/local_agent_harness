@@ -70,12 +70,14 @@ def fit_pad_px(src_w, src_h, width, height):
     return new_w, new_h, (width - new_w) + (height - new_h)
 
 
-def derive_video_dims(src_w, src_h):
+def derive_video_dims(src_w, src_h, max_area_cells=None, max_edge_cells=None):
     """(W, H, pad_px): the video geometry for a src_w x src_h seed. Pure and
     deterministic given the current $LTX_MAX_AREA_CELLS (see _max_area_cells()).
+    max_area_cells / max_edge_cells, when given, replace that cap and MAX_CELLS: the
+    caller's measured budget for a bigger host (bin/ltx-movie's autotune tier).
 
-    Candidates are every (a, b) cell pair with MIN_CELLS <= a, b <= MAX_CELLS and
-    MIN_AREA_CELLS <= a*b <= the current max area cells, at W = a*GRID_PX,
+    Candidates are every (a, b) cell pair with MIN_CELLS <= a, b <= max edge cells and
+    MIN_AREA_CELLS <= a*b <= the max area cells, at W = a*GRID_PX,
     H = b*GRID_PX. If any candidate leaves at most PAD_TOLERANCE_PX of residual pad,
     the largest area wins (ties: smaller pad, then larger a). Otherwise the smallest
     pad wins (ties: larger area, then larger a). Raises ValueError for a seed outside
@@ -86,10 +88,13 @@ def derive_video_dims(src_w, src_h):
             "seed image is %dx%d (aspect ratio %.3f:1), outside the supported range 1:3 to "
             "3:1; supply a seed image whose width/height ratio is between 0.333 and 3.0"
             % (src_w, src_h, src_w / src_h))
-    max_area_cells = _max_area_cells()
+    if max_area_cells is None:
+        max_area_cells = _max_area_cells()
+    if max_edge_cells is None:
+        max_edge_cells = MAX_CELLS
     candidates = []
-    for a in range(MIN_CELLS, MAX_CELLS + 1):
-        for b in range(MIN_CELLS, MAX_CELLS + 1):
+    for a in range(MIN_CELLS, max_edge_cells + 1):
+        for b in range(MIN_CELLS, max_edge_cells + 1):
             if MIN_AREA_CELLS <= a * b <= max_area_cells:
                 width, height = a * GRID_PX, b * GRID_PX
                 pad = fit_pad_px(src_w, src_h, width, height)[2]

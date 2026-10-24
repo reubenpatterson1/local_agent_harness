@@ -126,6 +126,10 @@ class _Fakes(object):
 
         monkeypatch.setattr(character_dataset, "vlm_call", _vlm)
         monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
+        monkeypatch.setattr(character_dataset, "run_edit_child", _child)
+        monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: [])
+        monkeypatch.setattr(character_dataset, "restore_story_server",
+                            lambda: fakes.server_calls.append("restore"))
         monkeypatch.setattr(character_dataset, "story_server",
                             lambda cmd: fakes.server_calls.append(cmd) or 0)
         monkeypatch.setattr(character_dataset, "wait_for_vlm", lambda timeout_s: True)
@@ -217,15 +221,17 @@ def test_k4_create_argument_errors(tmp_path, lib_dir, monkeypatch, capsys):
         (["create", "nova"] + desc, "Error: create needs --phrase"),
         (["create", "nova", "--phrase", "the"] + desc,
          "Error: --phrase: phrase must not be a lone article: 'the'"),
-        (base, "Error: create needs exactly one of --seed-image or --descriptor"),
-        (base + desc + ["--seed-image", missing],
-         "Error: create needs exactly one of --seed-image or --descriptor"),
+        (base, "Error: create needs --seed-image or --descriptor"),
+        (base + desc + ["--seed-image", missing], "Error: --seed-image not found: %s" % missing),
+        (base + ["--descriptor", RONIN_DESCRIPTOR, "--seed-image", missing],
+         "Error: --descriptor needs --class NOUN (the seed image is not described when "
+         "--descriptor is given)"),
         (base + ["--descriptor", RONIN_DESCRIPTOR],
          "Error: --descriptor needs --class NOUN (there is no image to take it from)"),
         (base + ["--descriptor", RONIN_DESCRIPTOR, "--class", "Man"],
          "Error: class noun must match [a-z]{3,12}, got 'Man'"),
         (base + ["--descriptor", "a short one", "--class", "man"],
-         "Error: --descriptor: descriptor word count must be 8-60, got 3"),
+         "Error: --descriptor: descriptor word count must be 8-70, got 3"),
         (base + ["--seed-image", missing], "Error: --seed-image not found: %s" % missing),
         (base + desc + ["--trigger", "AB"],
          "Error: trigger must match [a-z][a-z0-9]{3,15}, got 'AB'"),
@@ -299,15 +305,15 @@ def test_k6_create_preflights(lib_dir, monkeypatch, capsys):
     _case(lambda m: m.setattr(character_dataset, "free_gib", lambda path: 1.5),
           "Error: only 1.5 GiB free at %s; create needs 2 GiB" % lib_dir)
     _case(lambda m: m.setattr(character_dataset, "vlm_ready", lambda: False),
-          "Error: the vision model qwen38-6bit is not being served at "
-          "http://127.0.0.1:8177/v1/models; start it with: bin/story-server vision")
+          "Error: the vision model auto is not being served at "
+          "http://127.0.0.1:8177/v1/models; start it with: bin/story-server mlx-vision")
     assert not os.path.exists(lock)
 
 
 def test_k7_small_face_refused(tmp_path, lib_dir, monkeypatch, capsys):
     fakes = _Fakes(monkeypatch, face=[400, 100, 600, 220])
     assert tool.main(["create", "kyra", "--phrase", "the woman in grey", "--seed-image",
-                      _seed_image(tmp_path)]) == 2
+                      _seed_image(tmp_path), "--no-review"]) == 2
     assert capsys.readouterr().err == (
         "Error: the main character's face fills only 12% of the seed image's height (minimum "
         "15%); a small face makes a weak identity reference. Use a closer crop of the character, "
@@ -324,7 +330,7 @@ KYRA_DESCRIBE = {"class_noun": "woman",
 def test_k8_small_face_with_force(tmp_path, lib_dir, monkeypatch, capsys):
     _Fakes(monkeypatch, face=[400, 100, 600, 220], describe=KYRA_DESCRIBE, scores=[9] * 25)
     assert tool.main(["create", "kyra", "--phrase", "the woman in grey", "--seed-image",
-                      _seed_image(tmp_path), "--force"]) == 0
+                      _seed_image(tmp_path), "--force", "--no-review"]) == 0
     assert ("Warning: the main character's face fills only 12% of the seed image's height "
             "(minimum 15%); a small face makes a weak identity reference; proceeding (--force)"
             in capsys.readouterr().err)
@@ -339,7 +345,7 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
     fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=scores)
     seed = _seed_image(tmp_path)
     assert tool.main(["create", "kyra", "--phrase", "the woman in grey",
-                      "--seed-image", seed]) == 0
+                      "--seed-image", seed, "--no-review"]) == 0
     cdir = os.path.join(lib_dir, "kyra")
     data = character_lib.load_character("kyra")
     assert data["status"] == "untrained"
@@ -358,8 +364,10 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
         character_dataset.verify_ffprobe(os.path.join(cdir, "dataset", "videos", name))
     with open(os.path.join(lib_dir, ".triggers")) as f:
         assert f.read() == "kyrawmn kyra\n"
-    assert fakes.server_calls == ["stop", "vision"]
+    assert fakes.server_calls == ["stop", "mlx-vision"]
     assert os.path.isfile(os.path.join(cdir, "seed.png"))
+    with open(os.path.join(cdir, "seed_face.json")) as f:
+        assert json.load(f) == {"face_box": [350, 100, 650, 500]}
     with open(os.path.join(cdir, "dataset", "description.json")) as f:
         assert json.load(f)["class_noun"] == "woman"
     with open(os.path.join(cdir, "dataset", "manifest.json")) as f:
@@ -370,7 +378,7 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
     assert capsys.readouterr().out.splitlines()[-3:] == [
         "dataset: 24/25 stills kept (minimum 12) in %s" % os.path.join(cdir, "dataset"),
         "contact sheet: %s" % os.path.join(cdir, "dataset", "contact_sheet.jpg"),
-        'next: review the contact sheet. To change the look, edit "descriptor" in %s and run '
+        'next: review the contact sheet. For different stills, change "seed" in %s and run '
         'bin/character create kyra --regenerate; otherwise run bin/character train kyra'
         % json_path]
 
@@ -440,7 +448,7 @@ def test_k13_generation_failure_restarts_the_vision_server(lib_dir, monkeypatch,
         "Z-Image child process exited 1; log: /x.log"))
     assert tool.main(_ronin_create()) == 1
     assert capsys.readouterr().err == "Error: Z-Image child process exited 1; log: /x.log\n"
-    assert fakes.server_calls == ["stop", "vision"]
+    assert fakes.server_calls == ["stop", "mlx-vision"]
     assert character_lib.load_character("ronin")["status"] == "dataset"
 
 
@@ -491,3 +499,112 @@ def test_k18_list_imports_neither_pil_psutil_nor_character_dataset(lib_dir):
                           env=dict(os.environ, CHARACTER_LIBRARY_DIR=lib_dir))
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines()[-1] == "[]"
+
+
+# --- K19-K24: seed-image datasets edit the seed (seed-edit spec E1-E10) -------------------
+def _kyra_seed_create(tmp_path, *extra):
+    return ["create", "kyra", "--phrase", "the woman in grey", "--seed-image",
+            _seed_image(tmp_path)] + list(extra)
+
+
+def test_k19_seed_create_edits_the_seed(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE,
+                   scores=[9] * 25)
+    zimage = []
+    monkeypatch.setattr(character_dataset, "run_zimage_child",
+                        lambda spec, char_dir, step: zimage.append(step))
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 0
+    assert zimage == []
+    assert [step for _, step in fakes.child_specs] == ["edit"]
+    spec = fakes.child_specs[0][0]
+    cdir = os.path.join(lib_dir, "kyra")
+    assert spec["image"] == os.path.join(cdir, "seed.png")
+    assert (spec["model"], spec["lora_repo"], spec["lora_file"], spec["steps"], spec["true_cfg"]) == (
+        "Qwen/Qwen-Image-Edit-2511", "lightx2v/Qwen-Image-Edit-2511-Lightning",
+        "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors", 8, 1.0)
+    order = [int(os.path.basename(j["output_path"])[5:7]) for j in spec["jobs"]]
+    assert order == [1, 3, 8, 10, 12, 21] + [n for n in range(1, 25)
+                                             if n not in (1, 3, 8, 10, 12, 21)]
+    shot, pose, setting = character_dataset.VARIANTS[0]
+    assert spec["jobs"][0]["prompt"] == character_dataset.edit_prompt(shot, pose, setting)
+    assert all(KYRA_DESCRIBE["descriptor"].lower()[2:] not in j["prompt"] for j in spec["jobs"])
+    assert fakes.vlm_calls == ["face", "describe"] + ["check"] * 25
+    with open(os.path.join(cdir, "dataset", "manifest.json")) as f:
+        manifest = json.load(f)
+    assert manifest["generator"].startswith("Qwen/Qwen-Image-Edit-2511 + ")
+    assert [item["n"] for item in manifest["items"]] == list(range(25))
+    assert "=== edit: 24 stills ===" in capsys.readouterr().out
+
+
+def test_k20_preview_stop(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE,
+                   scores=[9] * 25)
+    prompts = []
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt="": prompts.append(prompt) or "")
+    assert tool.main(_kyra_seed_create(tmp_path)) == 0
+    assert [(step, len(spec["jobs"])) for spec, step in fakes.child_specs] == [
+        ("edit-preview", 6), ("edit", 18)]
+    sheet = os.path.join(lib_dir, "kyra", "dataset", "preview_sheet.jpg")
+    assert os.path.isfile(sheet)
+    assert prompts == ["Review the preview stills in %s. Enter to edit the remaining 18, Ctrl-C "
+                       "to abort: " % sheet]
+    assert fakes.server_calls == ["stop", "mlx-vision"]
+    assert character_lib.load_character("kyra")["status"] == "untrained"
+
+
+def test_k21_ctrl_c_at_the_preview_stop(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+    def _interrupt(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _interrupt)
+    assert tool.main(_kyra_seed_create(tmp_path)) == 1
+    assert [step for _, step in fakes.child_specs] == ["edit-preview"]
+    # An interrupt restores the server detached instead of waiting for it (clean-stop S3).
+    assert fakes.server_calls == ["stop", "restore"]
+    assert "check" not in fakes.vlm_calls
+    assert capsys.readouterr().err.endswith(
+        "Error: aborted; the stills made so far are kept in %s; run bin/character create kyra "
+        "--regenerate to start again\n" % os.path.join(lib_dir, "kyra", "dataset"))
+    assert character_lib.load_character("kyra")["status"] == "dataset"
+
+
+def test_k22_review_needs_a_terminal(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False, raising=False)
+    message = ("Error: the seed-image preview review needs an interactive terminal; run this "
+               "interactively, or pass --no-review for unattended operation\n")
+    assert tool.main(_kyra_seed_create(tmp_path)) == 2
+    assert capsys.readouterr().err == message
+    assert fakes.vlm_calls == [] and not os.path.exists(os.path.join(lib_dir, "kyra"))
+    make_character(lib_dir, status="untrained")
+    assert tool.main(["create", "kyra", "--regenerate"]) == 2
+    assert capsys.readouterr().err == message
+    # A descriptor character has no preview stop, so it needs no terminal.
+    fakes.scores = [9] * 24
+    assert tool.main(_ronin_create()) == 0
+
+
+def test_k23_missing_editor_is_refused(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE)
+    monkeypatch.setattr(character_dataset, "edit_models_missing",
+                        lambda: ["Qwen/Qwen-Image-Edit-2511"])
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 2
+    assert capsys.readouterr().err == (
+        "Error: the seed-image editor is not downloaded: Qwen/Qwen-Image-Edit-2511; download it "
+        "with: hf download Qwen/Qwen-Image-Edit-2511\n")
+    assert fakes.vlm_calls == []
+
+
+def test_k24_seed_image_with_a_given_descriptor(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], scores=[9] * 25)
+    assert tool.main(_kyra_seed_create(tmp_path, "--descriptor", DESCRIPTOR, "--class", "woman",
+                                       "--no-review")) == 0
+    assert fakes.vlm_calls == ["face"] + ["check"] * 25
+    data = character_lib.load_character("kyra")
+    assert (data["descriptor"], data["class_noun"]) == (DESCRIPTOR, "woman")
+    assert data["source"]["type"] == "seed_image"
+    assert not os.path.exists(os.path.join(lib_dir, "kyra", "dataset", "description.json"))

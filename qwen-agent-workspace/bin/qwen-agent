@@ -8,8 +8,10 @@ traced with an [auto] line. Web lookups go through search, which queries a local
 SearXNG instance. An exact repeat of a call that already failed in the same
 turn is refused without running. --danger-auto-approve drops the confirmation
 prompt for every tool call except promote (bash, run_python, and generate_image
-included, none of them sandboxed under it), tracing bypassed calls with
-[danger-auto] instead of [auto]; it is meant for unattended runs only.
+included, none of them sandboxed under it), lets read_file and write_file reach
+any path rather than only the workspace (the session-memory store excepted), and
+traces bypassed calls with [danger-auto] instead of [auto]; it is meant for
+unattended runs only.
 See docs/specs/2026-08-21-qwen-agent-tool-harness-design.md,
 docs/specs/2026-08-21-qwen-agent-tiered-approval-design.md, and
 docs/specs/2026-08-21-qwen-agent-search-grounding-design.md.
@@ -62,8 +64,10 @@ FETCH_USER_AGENT = "qwen-agent/1.0"
 # held back from the budget on every request: the estimator below models neither the
 # chat template's per-message control tokens nor a tokenizer's disagreement with a
 # character heuristic, and 1024 tokens is ~6% of a 16384-token window -- cheap enough
-# to give away, large enough to cover both plus the forced-summary prompt.
-DEFAULT_CONTEXT_WINDOW = 16384
+# to give away, large enough to cover both plus the forced-summary prompt. The fallback
+# is 120000: mlx_vlm (story-server mlx-vision) reports no window, and its Qwen3-VL has a
+# 262144-token native one, so 16384 was evicting long sessions far too early.
+DEFAULT_CONTEXT_WINDOW = 120000
 CONTEXT_FLOOR = 1024
 # Flat, deliberately conservative cost charged for ONE attached image, used by
 # estimate_tokens instead of char-counting its base64 payload (which would read as
@@ -88,7 +92,8 @@ EVICTED_PREFIX = "[result evicted to free context:"   # marks an already-evicted
 # cannot reach these files at all. The only writes are the remember tool (one
 # short line, no path argument), the promote tool (never auto-approved), and the
 # human's own /remember. No new check was needed to get that; the existing
-# workspace guard does it.
+# workspace guard does it. --danger-auto-approve lifts the workspace guard, so
+# resolve_in_workspace(unconfined=True) rejects the store explicitly instead.
 MEMORY_DIRNAME = os.path.join(".qwen-agent", "memory")   # relative to the user's home
 MEMORY_DIR_MODE = 0o700
 MEMORY_LONG_TERM_NAME = "long_term.md"
@@ -659,6 +664,32 @@ def build_tools_for_context(skill, delegate_targets=None):
     return tools
 
 
+_UNCONFINED_FILE_TOOL_TEXT = {
+    "read_file": ("Read a UTF-8 text file anywhere on the machine and return its contents. "
+                  "Long files are truncated."),
+    "write_file": ("Write UTF-8 text to a file anywhere on the machine, creating parent "
+                   "directories as needed and overwriting the file if it already exists. "
+                   "Always write the complete intended file content; there is no append "
+                   "or patch mode."),
+}
+_UNCONFINED_PATH_TEXT = ("Path to the file: relative to the workspace directory, or an "
+                         "absolute or ~ path anywhere on the machine.")
+
+
+def unconfine_file_tools(tools):
+    """tools with read_file/write_file described as reaching any path (--danger-auto-approve).
+    Returns new dicts for those two; the shared _BASE_TOOLS entries are never mutated."""
+    out = []
+    for tool in tools:
+        name = tool["function"]["name"]
+        if name in _UNCONFINED_FILE_TOOL_TEXT:
+            tool = json.loads(json.dumps(tool))     # deep copy; the tool dicts are plain JSON
+            tool["function"]["description"] = _UNCONFINED_FILE_TOOL_TEXT[name]
+            tool["function"]["parameters"]["properties"]["path"]["description"] = _UNCONFINED_PATH_TEXT
+        out.append(tool)
+    return out
+
+
 TOOLS = None
 TOOL_BY_NAME = None
 FLEET = None
@@ -691,8 +722,13 @@ def _load_fleet_lib():
 # Section 8: workspace confinement
 # ---------------------------------------------------------------------------
 
-def resolve_in_workspace(raw):
-    """Return (resolved_path, None) on success, or (None, reason_string) on rejection."""
+def resolve_in_workspace(raw, unconfined=False):
+    """Return (resolved_path, None) on success, or (None, reason_string) on rejection.
+
+    unconfined=True (--danger-auto-approve) accepts a path anywhere on disk; relative
+    paths still resolve against the workspace. Even then the session-memory store stays
+    unreachable, so write_file can never stand in for the human-approved promote.
+    """
     if not isinstance(raw, str) or raw == "":
         return None, "the path is empty"
     if "\x00" in raw:
@@ -701,6 +737,12 @@ def resolve_in_workspace(raw):
     if not p.is_absolute():
         p = WORKSPACE / p
     resolved = Path(os.path.realpath(str(p)))   # resolves symlinks; tolerates non-existent paths
+    if unconfined:
+        store = Path(os.path.realpath(memory_root()))
+        if resolved == store or store in resolved.parents:
+            return None, ("it resolves to '%s', inside the session-memory store '%s', which "
+                          "only remember and promote may write" % (resolved, store))
+        return resolved, None
     if resolved != WORKSPACE and WORKSPACE not in resolved.parents:
         return None, ("it resolves to '%s', which is outside the workspace '%s'"
                       % (resolved, WORKSPACE))
@@ -1843,7 +1885,19 @@ def dispatch(tc, i, n, args_ns, history):
 
     # Section 8: resolve paths for read_file / write_file before any prompt.
     resolved_paths = {}
-    if name == "read_file":
+    unconfined = args_ns.danger_auto_approve
+    if name in ("read_file", "write_file") and unconfined:
+        raw_path = args["path"]
+        resolved, reason = resolve_in_workspace(raw_path, unconfined=True)
+        if resolved is None:
+            sys.stderr.write("[rejected] %s: path '%s' -- %s -- not executed, not prompted.\n"
+                             % (name, raw_path, reason))
+            result = ("ERROR: rejected path '%s': %s. This call was blocked automatically "
+                       "and was never shown to the user for approval." % (raw_path, reason))
+            return _record(name, args, raw_arguments, "rejected", result, history)
+        resolved_paths["path"] = resolved
+
+    elif name == "read_file":
         raw_path = args["path"]
         resolved, reason = resolve_in_workspace(raw_path)
         if resolved is None:
@@ -2204,13 +2258,14 @@ def assistant_echo(msg, tool_calls, round_num):
 # Section 11.3: system message
 # ---------------------------------------------------------------------------
 
-def build_system_message(workspace, memory=False):
+def build_system_message(workspace, memory=False, unconfined=False):
     """The top-level system message.
 
     memory=True is passed ONLY by repl(), and only when session memory is enabled.
     It changes the tool-count sentence and adds rules 9 and 10. Every other caller
     -- oneshot(), delegate_to_skill children, the offline tests -- takes the
-    default and gets today's text byte for byte.
+    default and gets today's text byte for byte. unconfined=True (--danger-auto-approve)
+    rewrites rules 1 and 2: no approval prompts, and file paths may be anywhere.
     """
     if memory:
         opening = (
@@ -2270,7 +2325,27 @@ def build_system_message(workspace, memory=False):
             "about the task itself. It always requires the human's explicit approval, so "
             "ask rarely, and say plainly why the principle is durable."
         )
+    if unconfined:
+        content = content.replace(_CONFINED_RULES_1_2, _UNCONFINED_RULES_1_2)
     return {"role": "system", "content": content.format(workspace=workspace)}
+
+
+_CONFINED_RULES_1_2 = (
+    "1. Every tool call is shown to the human and requires their explicit approval "
+    "before it runs. Expect denials and handle them gracefully.\n"
+    "2. read_file and write_file only work inside the workspace directory "
+    "{workspace}. Paths outside it are rejected automatically. Prefer relative "
+    "paths, which resolve inside the workspace.\n")
+_UNCONFINED_RULES_1_2 = (
+    "1. Tool calls run without asking the human first (except promote), so nobody "
+    "stops a bad call before it happens. Check each call yourself before you make it.\n"
+    "2. read_file and write_file work on any path on the machine. Relative paths "
+    "resolve inside the workspace directory {workspace}; use an absolute or ~ path for "
+    "anything else. Only the session-memory store is off limits.\n")
+_CONFINED_SKILL_RULE = ("read_file only works inside the workspace directory {workspace}. "
+                        "Paths outside it are rejected automatically.")
+_UNCONFINED_SKILL_RULE = ("read_file works on any path on the machine; relative paths "
+                          "resolve inside the workspace directory {workspace}.")
 
 
 SKILL_SYSTEM_PROMPTS = {
@@ -2405,9 +2480,11 @@ SKILL_SYSTEM_PROMPTS = {
 }
 
 
-def build_skill_system_message(skill, workspace):
-    content = SKILL_SYSTEM_PROMPTS[skill].format(workspace=workspace)
-    return {"role": "system", "content": content}
+def build_skill_system_message(skill, workspace, unconfined=False):
+    content = SKILL_SYSTEM_PROMPTS[skill]
+    if unconfined:
+        content = content.replace(_CONFINED_SKILL_RULE, _UNCONFINED_SKILL_RULE)
+    return {"role": "system", "content": content.format(workspace=workspace)}
 
 
 # ---------------------------------------------------------------------------
@@ -2431,7 +2508,8 @@ Commands:
 
   (approval)  bash, run_python, generate_image, promote and overwriting an existing
               file ask first, unless --danger-auto-approve was passed -- then only
-              promote asks.
+              promote asks, and read_file/write_file may use any path outside the
+              session-memory store.
 
 Tools:
 """
@@ -2749,7 +2827,21 @@ def _autostart_local_server(base_url):
     return True
 
 
+def default_served_model(ids, loaded):
+    """The model to use when --model was not given: DEFAULT_MODEL when the server lists it,
+    else the single model the server reports (mlx_lm/mlx_vlm servers list every cached
+    model and flag the active one "loaded": true, and name it by its path, as story-server's
+    mlx-vision mode does), else DEFAULT_MODEL so the "not served" error names it."""
+    if DEFAULT_MODEL in ids:
+        return DEFAULT_MODEL
+    candidates = loaded if loaded else ids
+    return candidates[0] if len(candidates) == 1 else DEFAULT_MODEL
+
+
 def preflight(base_url, model, api_key, skip_tool_probe=False):
+    """Checks A (server up, model listed) and B (tool calling works); exits 2 on failure.
+    model None means --model was not given and is resolved by default_served_model.
+    Returns the model id in use."""
     auth_headers = {"Authorization": "Bearer %s" % api_key} if api_key else {}
 
     # Check A: server reachable and model present.
@@ -2784,8 +2876,12 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
     try:
         data = json.loads(body)
         ids = [item["id"] for item in data.get("data", [])]
-    except (ValueError, KeyError, TypeError):
-        ids = []
+        loaded = [item["id"] for item in data.get("data", []) if item.get("loaded")]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        ids, loaded = [], []
+
+    if model is None:
+        model = default_served_model(ids, loaded)
 
     if model not in ids:
         sys.stderr.write(
@@ -2799,7 +2895,7 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
     # information, and delegations nest. Check A above still runs: it is ~2 ms and it
     # catches a server that died between parent and child.
     if skip_tool_probe:
-        return
+        return model
 
     # Check B: tool calling is enabled.
     probe_body = {
@@ -2879,6 +2975,7 @@ def preflight(base_url, model, api_key, skip_tool_probe=False):
             % (base_url, type(e).__name__, e, TOOL_HARNESS_SPEC)
         )
         sys.exit(2)
+    return model
 
 
 def searxng_probe():
@@ -2937,6 +3034,8 @@ def print_danger_auto_warning():
     print("Every tool call runs WITHOUT asking you first -- bash, run_python,", file=out)
     print("generate_image, and overwriting existing files included. bash and", file=out)
     print("run_python are NOT sandboxed and run as you, with your permissions.", file=out)
+    print("read_file and write_file reach ANY path, not just the workspace", file=out)
+    print("(only the session-memory store stays off limits).", file=out)
     print("Bypassed calls are traced with [danger-auto] instead of [auto].", file=out)
     print("promote (long-term memory) is the only tool still asking. Nothing else", file=out)
     print("will stop a bad call before it happens.", file=out)
@@ -3649,8 +3748,10 @@ def setup(args_ns):
     # warning on the parent's stderr.
     is_delegate_child = os.environ.get("QWEN_AGENT_PREFLIGHT_DONE") == "1"
     no_tools = _skill_has_no_tools(args_ns)
-    preflight(args_ns.base_url, args_ns.model, args_ns.api_key,
-              skip_tool_probe=is_delegate_child or no_tools)
+    # A delegate child is given --model=<the parent's resolved id>, so it never re-resolves.
+    requested = args_ns.model if getattr(args_ns, "model_explicit", True) else None
+    args_ns.model = preflight(args_ns.base_url, requested, args_ns.api_key,
+                              skip_tool_probe=is_delegate_child or no_tools) or args_ns.model
     if not is_delegate_child and not no_tools:
         searxng_probe()
 
@@ -3973,7 +4074,8 @@ def repl(args_ns):
     if args_ns.danger_auto_approve:
         print_danger_auto_warning()
 
-    system_message = build_system_message(WORKSPACE, memory=MEMORY_ENABLED)
+    system_message = build_system_message(WORKSPACE, memory=MEMORY_ENABLED,
+                                          unconfined=args_ns.danger_auto_approve)
     if memory_block:
         system_message = {"role": "system",
                           "content": system_message["content"] + memory_block}
@@ -4114,9 +4216,10 @@ def oneshot(args_ns):
     setup(args_ns)
 
     if args_ns.skill is not None:
-        system_msg = build_skill_system_message(args_ns.skill, WORKSPACE)
+        system_msg = build_skill_system_message(args_ns.skill, WORKSPACE,
+                                                unconfined=args_ns.danger_auto_approve)
     else:
-        system_msg = build_system_message(WORKSPACE)
+        system_msg = build_system_message(WORKSPACE, unconfined=args_ns.danger_auto_approve)
     if args_ns.system_prompt is not None:
         system_msg = {"role": "system", "content": system_msg["content"] + "\n\n" + args_ns.system_prompt}
     messages = [system_msg, _oneshot_user_message(args_ns)]
@@ -4160,7 +4263,8 @@ def parse_args(argv):
     parser.add_argument("--workspace", type=str, default=DEFAULT_WORKSPACE)
     parser.add_argument("--think", action="store_true", default=False)
     parser.add_argument("--base-url", type=str, default=DEFAULT_BASE_URL)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
+    # Not given: preflight uses DEFAULT_MODEL if served, else the server's one loaded model.
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     parser.add_argument("--request-timeout", type=int, default=DEFAULT_REQ_TIMEOUT)
     parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
@@ -4185,9 +4289,15 @@ def parse_args(argv):
                         help="Skip the confirmation prompt for EVERY tool call except "
                              "promote, including bash, run_python, generate_image, and "
                              "overwriting an existing file. bash and run_python are not "
-                             "sandboxed. Bypassed calls are traced with [danger-auto]. "
+                             "sandboxed, and read_file/write_file accept any path, not "
+                             "just the workspace (the session-memory store excepted). "
+                             "Bypassed calls are traced with [danger-auto]. "
                              "For unattended runs only.")
-    return parser.parse_args(argv)
+    args_ns = parser.parse_args(argv)
+    args_ns.model_explicit = args_ns.model is not None
+    if args_ns.model is None:
+        args_ns.model = DEFAULT_MODEL
+    return args_ns
 
 
 def main():
@@ -4207,6 +4317,8 @@ def main():
     if view is not None and args_ns.skill in DELEGATE_TARGETS:
         delegate_targets = FLEET.delegate_enum(DELEGATE_TARGETS[args_ns.skill], view)
     TOOLS = build_tools_for_context(args_ns.skill, delegate_targets)
+    if args_ns.danger_auto_approve:
+        TOOLS = unconfine_file_tools(TOOLS)
     TOOL_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
     if view is not None and args_ns.user_prompt is None:
         sys.stderr.write("[fleet: qwen-agentd at %s; %d live peer(s); delegate targets: %s]\n"

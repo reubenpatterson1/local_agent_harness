@@ -75,9 +75,17 @@ _PREFIXES = ("base_model.", "model.", "transformer.", "diffusion_model.",
              "net.", "unet.")
 _QUANT_SUFFIXES = (".scales", ".biases", ".zeros", ".qweight", ".qzeros")
 
+# ComfyUI/diffusers module names -> ltx-2-mlx names, the renames ltx-2-mlx applies when
+# it loads a LoRA (LTXV_LORA_COMFY_RENAMING_MAP, ltx_core_mlx/loader/sd_ops.py). Applied to
+# both sides, so a LoRA's attn*.to_out.0 matches the mlx base's attn*.to_out.
+_RENAMES = ((".to_out.0.", ".to_out."), (".ff.net.0.proj.", ".ff.proj_in."),
+            (".ff.net.2.", ".ff.proj_out."), (".linear_1.", ".linear1."),
+            (".linear_2.", ".linear2."), ("audio_ff.net.0.proj.", "audio_ff.proj_in."),
+            ("audio_ff.net.2.", "audio_ff.proj_out."))
+
 
 def _core(name):
-    """A normalized module path: '.weight' dropped, known prefixes peeled."""
+    """A normalized module path: '.weight' dropped, known prefixes peeled, ComfyUI names renamed."""
     n = name[:-7] if name.endswith(".weight") else name
     changed = True
     while changed:
@@ -85,7 +93,10 @@ def _core(name):
         for p in _PREFIXES:
             if n.startswith(p):
                 n, changed = n[len(p):], True
-    return n
+    n += "."
+    for old, new in _RENAMES:
+        n = n.replace(old, new)
+    return n[:-1]
 
 
 def _shape(header, key):

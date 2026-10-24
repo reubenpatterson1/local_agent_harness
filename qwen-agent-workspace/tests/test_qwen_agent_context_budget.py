@@ -130,7 +130,7 @@ def test_import_is_side_effect_free():
         check("C0 TOOLS None at import", _TOOLS_AT_IMPORT is None)
         check("C0 WORKSPACE None at import", _WORKSPACE_AT_IMPORT is None)
         check("C0 CONTEXT_WINDOW defaults",
-              _CONTEXT_WINDOW_AT_IMPORT == qwen_agent.DEFAULT_CONTEXT_WINDOW == 16384)
+              _CONTEXT_WINDOW_AT_IMPORT == qwen_agent.DEFAULT_CONTEXT_WINDOW == 120000)
     finally:
         qwen_agent.CONTEXT_WINDOW = qwen_agent.DEFAULT_CONTEXT_WINDOW
 
@@ -403,7 +403,7 @@ def test_window_discovery():
         payload = {"data": [{"id": "qwen38-6bit"}]}
         urllib.request.urlopen = lambda *a, **kw: _FakeResponse(json.dumps(payload))
         check("C6 no field -> default",
-              qwen_agent.discover_context_window("http://x/v1", "qwen38-6bit", None) == 16384)
+              qwen_agent.discover_context_window("http://x/v1", "qwen38-6bit", None) == qwen_agent.DEFAULT_CONTEXT_WINDOW)
 
         def raise_urlerror(*a, **kw):
             raise urllib.error.URLError("refused")
@@ -412,12 +412,12 @@ def test_window_discovery():
         with contextlib.redirect_stderr(stderr):
             value = qwen_agent.discover_context_window("http://x/v1", "qwen38-6bit", None)
         check("C6 urlopen failure -> default, no exception",
-              value == 16384 and "could not read the context window" in stderr.getvalue())
+              value == qwen_agent.DEFAULT_CONTEXT_WINDOW and "could not read the context window" in stderr.getvalue())
 
         payload = {"data": []}
         urllib.request.urlopen = lambda *a, **kw: _FakeResponse(json.dumps(payload))
         check("C6 empty data -> default",
-              qwen_agent.discover_context_window("http://x/v1", "qwen38-6bit", None) == 16384)
+              qwen_agent.discover_context_window("http://x/v1", "qwen38-6bit", None) == qwen_agent.DEFAULT_CONTEXT_WINDOW)
     finally:
         urllib.request.urlopen = orig_urlopen
         qwen_agent.CONTEXT_WINDOW = qwen_agent.DEFAULT_CONTEXT_WINDOW

@@ -35,6 +35,7 @@ JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
 UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp)$")
 STORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 CHARACTER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
+ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")   # action_lib.NAME_RE
 SMOKE_STORY_ID = "movie-ui-smoke"
 CANCEL_GRACE_S = 15.0       # MU21; tests set it lower
 STARTING_GRACE_S = 10.0     # MU29: a dispatched runner has this long to take its lock
@@ -313,9 +314,15 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
     job = read_job(jdir)
     log = open(os.path.join(jdir, "log.txt"), "ab")
     try:
-        child = subprocess.Popen(job["argv"], cwd=job["workspace"], env=dict(os.environ, PYTHONUNBUFFERED="1"),
-                                 stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                                 start_new_session=True, close_fds=True)
+        # Default the VLM model id to "auto" so the character/story pipeline resolves the
+        # single *loaded* model the story-server reports (mlx_vlm serves it by path on this
+        # host, not under the author's "qwen38-6bit" alias). An explicit env still wins.
+        child = subprocess.Popen(
+            job["argv"], cwd=job["workspace"],
+            env=dict(os.environ, PYTHONUNBUFFERED="1",
+                     QWEN_AGENT_VLM_MODEL=os.environ.get("QWEN_AGENT_VLM_MODEL") or "auto"),
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True)
     except OSError as e:
         error = "cannot start: %s" % (e.strerror or e)
         write_status(jdir, {"state": "failed", "dispatched": status.get("dispatched"),
@@ -518,7 +525,7 @@ def kill_orphan(state, job_id):
 # Compose fields, the command builder and light subprocesses (MU36-MU41, MU59)
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"                     # bin/ltx-movie:318, ltx2_mlx_video_skill.py:50
+DEFAULT_MODEL = "dgrauet/ltx-2.3-mlx-q8"                     # bin/ltx-movie:318
 DEFAULT_GEMMA = "mlx-community/gemma-3-12b-it-4bit"          # bin/ltx-movie:319-323
 STILLS_BASE_MODEL = "Tongyi-MAI/Z-Image-Turbo"               # lora_catalog.py:29
 ZIMAGE_TEXT_ENCODER = "BennyDaBall/Qwen3-4b-Z-Image-Turbo-AbliteratedV1"   # z_image_skill.py:53
@@ -535,12 +542,13 @@ DEFAULT_FIELDS = {
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
-    "auto_lora": True,
+    "auto_lora": True, "narration": "full",
     "video_loras": [], "stills_loras": [],
-    "characters": [],
+    "characters": [], "action_loras": [],
     "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
     "overwrite_movie": False, "redo": [],
 }
+NARRATION_MODES = ("full", "speech", "none")   # voice-over and speech / speech only / none
 LIGHT_TIMEOUT = 60
 # MU37: the flags each compose field or action needs; "supported" (MU47) is all-present.
 FIELD_FLAGS = (
@@ -550,7 +558,8 @@ FIELD_FLAGS = (
     ("model", ("--model",)), ("gemma", ("--gemma",)), ("story_model", ("--story-model",)),
     ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
     ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
-    ("characters", ("--character",)), ("auto_lora", ("--no-auto-lora",)),
+    ("characters", ("--character",)), ("action_loras", ("--action",)),
+    ("auto_lora", ("--no-auto-lora",)), ("narration", ("--no-narration", "--speech-only")),
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
@@ -565,6 +574,8 @@ def compose_fields(body):
     for key, default in DEFAULT_FIELDS.items():
         value = body.get(key, default) if isinstance(body, dict) else default
         fields[key] = list(value) if isinstance(value, list) else value
+    if isinstance(fields["narration"], bool):   # jobs saved before the three-way setting
+        fields["narration"] = "full" if fields["narration"] else "none"
     return fields
 
 
@@ -586,6 +597,13 @@ def ordered(loras):
 def lora_arg(item):
     """PATH:STRENGTH for one LoRA item, the strength as repr(float(s)) (MU40 step 8)."""
     return "%s:%s" % (item["path"], repr(float(item["strength"])))
+
+
+def action_arg(item):
+    """NAME or NAME:STRENGTH for one action item (bin/ltx-movie --action)."""
+    if item.get("strength") is None:
+        return item["name"]
+    return "%s:%s" % (item["name"], repr(float(item["strength"])))
 
 
 def build_argv(fields, ws_real, state, py=sys.executable):
@@ -618,8 +636,14 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         argv += ["--stills-lora", lora_arg(item)]
     for name in fields["characters"]:
         argv += ["--character", name]
+    for item in fields["action_loras"]:
+        argv += ["--action", action_arg(item)]
     if fields["auto_lora"] is False:
         argv.append("--no-auto-lora")
+    if fields["narration"] == "none":
+        argv.append("--no-narration")
+    elif fields["narration"] == "speech":
+        argv.append("--speech-only")
     for key, flag in (("story_legacy", "--story-legacy"), ("judge", "--judge"), ("no_low_ram", "--no-low-ram")):
         if fields[key]:
             argv.append(flag)
@@ -637,13 +661,57 @@ def build_argv(fields, ws_real, state, py=sys.executable):
     return argv
 
 
+def _rule_actions(fields):
+    """action_loras: at most 8 distinct trained-action names, each with a strength of None
+    (the action's default) or 0 < s <= 2."""
+    items = fields.get("action_loras")
+    if not (isinstance(items, list) and len(items) <= 8):
+        return ["action_loras must be a list of at most 8 actions"]
+    errors, names = [], []
+    for k, item in enumerate(items, start=1):
+        name = item.get("name") if isinstance(item, dict) else None
+        strength = item.get("strength") if isinstance(item, dict) else None
+        if not (isinstance(name, str) and ACTION_NAME_RE.fullmatch(name)):
+            errors.append("action %d: name must match [a-z][a-z0-9-]{1,31}" % k)
+            continue
+        names.append(name)
+        if strength is not None and not (isinstance(strength, (int, float)) and not isinstance(strength, bool)
+                                         and 0 < strength <= 2):
+            errors.append("action %s: strength must satisfy 0 < s <= 2" % name)
+    if len(set(names)) != len(names):
+        errors.append("actions must be distinct")
+    return errors
+
+
+def action_argv(kind, fields, ws_real, py=sys.executable):
+    """The bin/action argv of an action-create or action-train job."""
+    if kind == "action-train":
+        # Like character-train-vlm: stop the VLM for training's memory, always restart it.
+        return [os.path.join(ws_real, "bin", "action-train-vlm"), py, fields["name"]]
+    argv = [py, os.path.join(ws_real, "bin", "action"), "create", fields["name"],
+            "--trigger", fields["trigger"], "--descriptor", fields["descriptor"]]
+    for path in fields["clips"]:
+        argv += ["--clip", path]
+    argv += ["--performers", str(fields["performers"])]
+    if fields.get("force"):
+        argv.append("--force")
+    if fields.get("regenerate"):
+        argv.append("--regenerate")
+    return argv
+
+
 def character_argv(kind, fields, ws_real, state, py=sys.executable):
     """The bin/character argv of a character-create, -regenerate or -train job (MU41)."""
     argv = [py, os.path.join(ws_real, "bin", "character")]
     if kind == "character-regenerate":
-        return argv + ["create", fields["name"], "--regenerate"]
+        # Jobs have no terminal: skip the seed-image preview stop (seed-edit spec E10).
+        return argv + ["create", fields["name"], "--regenerate", "--no-review"]
     if kind == "character-train":
-        return (argv + ["train", fields["name"]] + (["--video"] if fields.get("video") else [])
+        # Route through character-train-vlm, which stops the VLM (freeing its memory for
+        # training) and always restarts it afterward -- so the UI Train button needs no
+        # manual story-server stop/start. Wrapper args: <python> <name> [flags].
+        wrapper = os.path.join(ws_real, "bin", "character-train-vlm")
+        return ([wrapper, py, fields["name"]] + (["--video"] if fields.get("video") else [])
                 + (["--stills"] if fields.get("stills") else []) + (["--force"] if fields.get("force") else []))
     argv += ["create", fields["name"], "--phrase", fields["phrase"]]
     if fields.get("seed_upload"):
@@ -658,7 +726,7 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
         argv += ["--seed", str(fields["seed"])]
     if fields.get("force"):
         argv.append("--force")
-    return argv
+    return argv + ["--no-review"]
 
 
 def run_light(argv, cwd, env=None, timeout=None):
@@ -855,6 +923,8 @@ def _rule_flags(fields):
     for key in ("auto_lora", "story_legacy", "judge", "no_low_ram", "overwrite_movie"):
         if not isinstance(fields.get(key), bool):
             errors.append("%s must be true or false" % key)
+    if fields.get("narration") not in NARRATION_MODES:
+        errors.append("narration must be one of %s" % ", ".join(NARRATION_MODES))
     timeout = fields.get("panel_timeout")
     if timeout is not None and not (_is_int(timeout) and 60 <= timeout <= 86400):
         errors.append("panel_timeout must be an integer from 60 to 86400")
@@ -938,11 +1008,14 @@ def validate_fields(fields, ws_real, state):
     if not (isinstance(chars, list) and len(chars) <= 8 and len(set(map(repr, chars))) == len(chars)
             and all(isinstance(c, str) and CHARACTER_NAME_RE.fullmatch(c) for c in chars)):
         errors.append("characters must be distinct character names")
+    errors += _rule_actions(fields)                                          # 12b
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
+                                               or fields.get("narration") in ("speech", "none")
                                                or goal is not None):     # 15
-        errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora or --goal")
+        errors.append("--story-legacy cannot be combined with --judge, --no-auto-lora, "
+                      "--no-narration, --speech-only or --goal")
     action = fields.get("action")
     sdir = story_dir(ws_real, story_id) if sid_ok else None
     if action == "redo":                                                     # 16
@@ -1018,7 +1091,7 @@ def story_server_check(ws_real):
         return False, "bin/story-server status exited %s: %s" % (code, last_line(run["stderr"]) or "-")
     if state.startswith("SERVING "):
         return True, "story server: %s" % state
-    return False, "story server is %s; start it with bin/story-server vision (or text)" % state
+    return False, "story server is %s; start it with bin/story-server mlx-vision" % state
 
 
 def judge_key_check():
@@ -1129,9 +1202,16 @@ def intact_scan(snapshot, repo_dir=None):
     visited = 0
     if repo_dir is not None:
         try:
-            partial = [n for n in os.listdir(os.path.join(repo_dir, "blobs")) if n.endswith(".incomplete")]
+            names = os.listdir(os.path.join(repo_dir, "blobs"))
         except OSError:
-            partial = []
+            names = []
+        present = set(names)
+        # An `.incomplete` is named "<sha256>.<etag>.incomplete"; it counts as a real
+        # partial download only when the finished blob "<sha256>" is absent. HF/Xet can
+        # leave a stale `.incomplete` sidecar beside a blob that later completed (the
+        # finished blob being a symlink into the Xet store) -- that is not a problem.
+        partial = [n for n in names
+                   if n.endswith(".incomplete") and n.split(".", 1)[0] not in present]
         if partial:
             problems.append("download incomplete: %d partial blob(s)" % len(partial))
     safetensors, indexes = 0, []
@@ -1246,7 +1326,20 @@ def list_models():
                            "intact": not problems, "problems": problems,
                            "bytes": _tree_bytes(os.path.join(repo_dir, "blobs"))})
     models.sort(key=lambda m: (m["hub"], m["repo"]))
-    return {"hubs": hubs, "models": models}
+    # The valid LoRA base models per target, for the UI's base-model dropdown: video
+    # LoRAs attach to an ltx-hub DiT pack (not the gemma text encoder), stills LoRAs to
+    # the Z-Image base (not its Qwen text encoder). The canonical default leads the list.
+    present = {m["repo"] for m in models}
+    ltx_repos = [m["repo"] for m in models if m["hub"] == "ltx" and m["repo"] != DEFAULT_GEMMA]
+    video_bases = ([DEFAULT_MODEL] if DEFAULT_MODEL in present else [])
+    video_bases += [r for r in ltx_repos if r != DEFAULT_MODEL]
+    stills_bases = [STILLS_BASE_MODEL] if STILLS_BASE_MODEL in present else []
+    if not video_bases:
+        video_bases = [DEFAULT_MODEL]
+    if not stills_bases:
+        stills_bases = [STILLS_BASE_MODEL]
+    return {"hubs": hubs, "models": models,
+            "lora_bases": {"video": video_bases, "stills": stills_bases}}
 
 
 # ---------------------------------------------------------------------------
@@ -1440,6 +1533,30 @@ def compat_checks(fields, ws_real, cache, smoke=False):
                 out.append(check("V5", "character %s video base model" % name, "skip",
                                  "video LoRA trained on %s; bin/ltx-movie does not check this against --model %s"
                                  % (base, m)))
+    return out + action_checks(fields, ws_real)
+
+
+def action_checks(fields, ws_real):
+    """V5's per-action records (none when no action is chosen): each action is trained."""
+    out = []
+    for item in fields["action_loras"]:
+        name = item["name"]
+        run = run_light(tool_argv(ws_real, "action", "show", name), ws_real)
+        try:
+            data = json.loads(run["stdout"]) if run["exit_code"] == 0 else None
+        except ValueError:
+            data = None
+        if run["timed_out"]:
+            out.append(check("V5", "action %s" % name, "fail",
+                             "bin/action show %s timed out after %d s" % (name, LIGHT_TIMEOUT)))
+        elif not isinstance(data, dict):
+            out.append(check("V5", "action %s" % name, "fail",
+                             run["stderr"].strip() or "cannot parse bin/action show %s" % name))
+        elif data.get("status") != "trained":
+            out.append(check("V5", "action %s" % name, "fail",
+                             "action %s is not trained (status %s)" % (name, data.get("status"))))
+        else:
+            out.append(check("V5", "action %s" % name, "pass", "trained"))
     return out
 
 
@@ -1499,8 +1616,19 @@ def collapse(line):
     return line.rstrip("\r").rsplit("\r", 1)[-1]
 
 
+DOWNLOAD_HUBS = ("ltx", "zimage", "hf")
+
+
+def build_download_argv(repo, hub, ws_real, py=sys.executable):
+    """The bin/model-download argv that fetches `repo` into the named cache `hub`
+    ("ltx"|"zimage"|"hf"). Pure; the caller validates repo/hub."""
+    return [py, os.path.join(ws_real, "bin", "model-download"), "--hub", hub, repo]
+
+
 def job_phases(kind, fields):
     """MU56's "phases", mirroring bin/ltx-movie's _phase_sequence."""
+    if kind == "download":
+        return []
     seed = ["0"] if fields.get("seed_upload") else []
     if kind == "story":
         return seed + ["1"]

@@ -42,6 +42,7 @@ SINGLE_CHARACTER_STRENGTH = 1.0
 SHOTS_CHARACTER_STRENGTH = 0.8
 SHOTS_MOTION_MIN_WORDS = 10
 SHOTS_MOTION_MAX_WORDS = 25
+SHOTS_MOTION_WORD_TOLERANCE = 0.25
 SHOTS_MAX_CAST_PER_PANEL = 2
 SHOTS_REWRITE_MAX_LISTED = 40
 SHOTS_CLOSE_SHOT_TYPES = ("medium shot", "medium close-up", "close-up", "extreme close-up")
@@ -312,8 +313,8 @@ def validate_descriptor(text):
     if text != text.strip():
         raise CharacterError("descriptor: must not have leading or trailing whitespace")
     words = len(text.split())
-    if not 8 <= words <= 60:
-        raise CharacterError("descriptor: must be 8-60 words, got %d" % words)
+    if not 8 <= words <= 70:
+        raise CharacterError("descriptor: must be 8-70 words, got %d" % words)
     if not (text.startswith("a ") or text.startswith("an ")):
         raise CharacterError('descriptor: must start with "a " or "an ", got %r' % (text[:30],))
     if text.endswith("."):
@@ -631,6 +632,55 @@ def cast_text(text, members, insert=None):
                         if insert is None or member.name in insert})
 
 
+# Spoken narration: a Narration: line is voice-over unless it starts with an on-screen character's
+# referring phrase and a colon ("the courier: Keep moving."); then that character says it on
+# camera and the words go into the video prompt as dialogue.
+_SPEAKER_PREFIX_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9' -]*?)\s*:\s*(\S.*)$", re.DOTALL)
+_QUOTES = "\"\u201c\u201d"
+
+
+def speaker_prefix(narration):
+    """(prefix, rest) when narration starts with a phrase-shaped prefix (at most MAX_PHRASE_WORDS
+    words of letters, digits, spaces, apostrophes and hyphens) and a colon, else None."""
+    match = _SPEAKER_PREFIX_RE.match(narration or "")
+    if not match or len(match.group(1).split()) > MAX_PHRASE_WORDS:
+        return None
+    return match.group(1), match.group(2).strip()
+
+
+def split_speaker(narration, phrases):
+    """(phrase, speech) when narration is spoken by one of phrases (the speaker_prefix matches one
+    of them, case-insensitively; phrase is returned as given), else (None, narration stripped).
+    Quotes around the speech are removed."""
+    found = speaker_prefix(narration)
+    if found:
+        by_lower = {p.lower(): p for p in phrases}
+        phrase = by_lower.get(found[0].lower())
+        speech = found[1].strip().strip(_QUOTES).strip()
+        if phrase is not None and speech:
+            return phrase, speech
+    return None, (narration or "").strip()
+
+
+def speech_sentence(phrase, speech):
+    """The video-prompt sentence for a spoken line: <Phrase> says: "<speech>". Kept plain on
+    purpose: on fubo_quaterback_promo, descriptive variants ("speaks aloud, lips clearly forming
+    each word", "speaks once, ...") made LTX-2.3 repeat a short line or voice the unquoted
+    prompt words; visible lip movement comes from the shot (N17) and the action text instead."""
+    if speech[-1:] not in ".!?":
+        speech += "."
+    return '%s says: "%s"' % (phrase[:1].upper() + phrase[1:], speech)
+
+
+def insert_speech(text, sentence):
+    """text with sentence added: before a trailing camera sentence (_is_camera_sentence) when
+    there is one, else at the end, so the line belongs to the action, not to the camera."""
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+    if len(sentences) > 1 and _is_camera_sentence(sentences[-1]):
+        return " ".join(sentences[:-1] + [sentence, sentences[-1]])
+    return (text.rstrip() + " " + sentence).strip()
+
+
 def panel_strengths(names, members, character_strength, shots=False):
     """{name: strength} for one panel: 1.0 when exactly one cast character is named (continuous
     mode only); else -- and always in shots mode -- each character's own character.json strength
@@ -853,13 +903,10 @@ def _appositive_nouns(sentence, members):
 
 
 def motion_problems(motion):
-    """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S4, S5). A camera sentence
+    """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S5; S4 is advisory,
+    motion_length_advisory). A camera sentence
     (_is_camera_sentence) is not an action sentence."""
     problems = []
-    words = len(motion.split())
-    if not SHOTS_MOTION_MIN_WORDS <= words <= SHOTS_MOTION_MAX_WORDS:
-        problems.append(("S4 motion length", "Motion: is %d words; it must be %d-%d"
-                         % (words, SHOTS_MOTION_MIN_WORDS, SHOTS_MOTION_MAX_WORDS)))
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(motion.strip()) if s.strip()]
     actions = [s for s in sentences if not _is_camera_sentence(s)]
     if len(actions) != 1:
@@ -876,13 +923,13 @@ def motion_problems(motion):
     return problems
 
 
-def shots_violations(text, panels, expected_panels, members):
+def shots_violations(text, panels, expected_panels, members, narration=True):
     """Every shot-rule violation of a shots-mode story.md (shots spec 4.3; shots rules v2 spec 4),
-    in this order: S1, S2, then per panel S3, S4, S5, S6, S7, S8 (Motion:, then Image:), S9, S10,
+    in this order: S1, S2, then per panel S3, S5, S6, S7, S8 (Motion:, then Image:), S9, S10,
     S11 (Image:, then Motion:), S12. text is the whole file; panels are bin/ltx-story-manifest
     _parse_prompts_md dicts; members are CastMember (may be empty: then S2, S6, S7, S9 and S10
     are skipped). The roster is read even without members, so S8 knows an uncast story's
-    extras and animals."""
+    extras and animals. narration False (--no-narration) drops the Narration: requirement."""
     out = []
     if len(panels) != expected_panels:
         out.append("story: S1 panel count: expected exactly %d panels, found %d"
@@ -903,7 +950,8 @@ def shots_violations(text, panels, expected_panels, members):
     descriptions = [d for _, d in roster] + [m.descriptor for m in members]
     for p in panels:
         num = p["number"]
-        for label, key in (("Image", "image"), ("Motion", "motion"), ("Narration", "narration")):
+        labels = (("Image", "image"), ("Motion", "motion"), ("Narration", "narration"))
+        for label, key in labels if narration else labels[:2]:
             if not p[key].strip():
                 out.append("panel %d: S3 fields: missing/empty %s: field" % (num, label))
         if p["prompt"].strip():
@@ -975,11 +1023,27 @@ def shots_violations(text, panels, expected_panels, members):
     return out
 
 
+def motion_length_advisory(motion):
+    """The S4 detail when a shots-mode Motion: is more than SHOTS_MOTION_WORD_TOLERANCE outside
+    its word range, else None (word counts are advisory)."""
+    words = len(motion.split())
+    lo, hi = SHOTS_MOTION_MIN_WORDS, SHOTS_MOTION_MAX_WORDS
+    if (words < lo * (1 - SHOTS_MOTION_WORD_TOLERANCE)
+            or words > hi * (1 + SHOTS_MOTION_WORD_TOLERANCE)):
+        return "Motion: is %d words; aim for %d-%d" % (words, lo, hi)
+    return None
+
+
 def shots_advisories(panels, members):
     """Non-fatal shots-mode warnings (shots spec 4.4; its W1 is the fatal S9 since shots rules v2),
-    per panel in order: W2 when the shot names a cast character but its Image: states no shot
-    type, or a wide one. [] when members is empty."""
+    per panel in order: S4 when Motion: is well outside its word range, then W2 when the shot
+    names a cast character but its Image: states no shot type, or a wide one (W2 only with
+    members)."""
     out = []
+    for p in panels:
+        length = motion_length_advisory(p["motion"]) if p["motion"].strip() else None
+        if length:
+            out.append("panel %d: S4 motion length: %s" % (p["number"], length))
     if not members:
         return out
     for p in panels:

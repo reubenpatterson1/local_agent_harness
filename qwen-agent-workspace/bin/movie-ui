@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Users/ailab1/img-gen/bin/python
 """movie-ui -- the locally hosted movie page (movie-ui spec, piece F).
 
 Usage: bin/movie-ui [--port N]

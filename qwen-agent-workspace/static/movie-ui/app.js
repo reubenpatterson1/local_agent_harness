@@ -8,7 +8,7 @@
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], seedUpload: null, composeAction: "story", story: null, character: null, selectedJob: null, logOffset: 0,
+    characters: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
 
@@ -142,6 +142,36 @@
     return value === "" ? null : value;
   }
 
+  // Resolution presets: the dropdown drives #c-width/#c-height. A concrete preset
+  // (WxH) fills and locks the two number inputs; "custom" unlocks them for free entry.
+  function applyResPreset() {
+    const sel = $("#c-res-preset");
+    if (!sel) { return; }
+    const custom = sel.value === "custom";
+    if (!custom) {
+      const wh = sel.value.split("x");
+      $("#c-width").value = wh[0];
+      $("#c-height").value = wh[1];
+    }
+    $("#c-width").readOnly = !custom;
+    $("#c-height").readOnly = !custom;
+    $("#c-width").classList.toggle("preset-locked", !custom);
+    $("#c-height").classList.toggle("preset-locked", !custom);
+  }
+
+  // Point the dropdown at whatever width/height currently hold (default 1024x576 when
+  // empty), falling back to "custom" for any off-list pair, then lock accordingly.
+  function syncResPreset() {
+    const sel = $("#c-res-preset");
+    if (!sel) { return; }
+    if (!$("#c-width").value) { $("#c-width").value = 1024; }
+    if (!$("#c-height").value) { $("#c-height").value = 576; }
+    const key = $("#c-width").value + "x" + $("#c-height").value;
+    const known = Array.prototype.some.call(sel.options, function (o) { return o.value === key; });
+    sel.value = known ? key : "custom";
+    applyResPreset();
+  }
+
   // --- token, header, workspaces, capabilities (MU77, MU78) ---------------------------
 
   function readToken() {
@@ -230,7 +260,7 @@
   async function selectWorkspace(path) {
     S.ws = path;
     await loadOptions();
-    await Promise.all([loadCatalog(), loadCharacters(), loadStories(), loadModels()]);
+    await Promise.all([loadCatalog(), loadCharacters(), loadActions(), loadStories(), loadModels()]);
     preview();
   }
 
@@ -245,13 +275,13 @@
     });
     if (!res.data.help_ok) { banner(res.data.help_error); }
     const d = res.data.defaults;
-    if (!$("#c-model").value) { $("#c-model").value = d.model; }
+    fillModelSelect();
     if (!$("#c-gemma").value) { $("#c-gemma").value = d.gemma; }
   }
 
   // --- tabs (MU79) ---------------------------------------------------------------------
 
-  const TABS = ["compose", "stories", "characters", "loras", "jobs", "traces"];
+  const TABS = ["compose", "stories", "characters", "actions", "loras", "jobs", "traces"];
 
   function showTab(name) {
     TABS.forEach(function (tab) {
@@ -260,6 +290,7 @@
     });
     if (name === "stories") { loadStories(); }
     if (name === "characters") { loadCharacters(); }
+    if (name === "actions") { loadActions(); }
     if (name === "traces") { loadTraceAgents(); loadRecent(); loadSaved(); }
     if (name === "loras") { loadCatalogTable(); loadModels(); }
   }
@@ -344,11 +375,16 @@
       width: bySeed ? null : numberOrNull("#c-width"), height: bySeed ? null : numberOrNull("#c-height"),
       seed_upload: bySeed ? S.seedUpload : null,
       mode: $("#c-mode").value,
-      model: textOrNull("#c-model"), gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
+      model: $("#c-model").value === "__download__" ? null : textOrNull("#c-model"),
+      gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
       story_model: textOrNull("#c-story-model"),
       auto_lora: $("#c-auto-lora").checked,
+      narration: $("#c-narration").value,
       video_loras: collectLoras("video"), stills_loras: collectLoras("stills"),
       characters: Array.prototype.map.call($("#c-characters").selectedOptions, function (o) { return o.value; }),
+      action_loras: Array.prototype.map.call($("#c-actions").selectedOptions, function (o) {
+        return {name: o.value, strength: numberOrNull("#c-action-strength")};
+      }),
       story_legacy: $("#c-story-legacy").checked, judge: $("#c-judge").checked,
       no_low_ram: $("#c-no-low-ram").checked, panel_timeout: numberOrNull("#c-panel-timeout"),
       overwrite_movie: $("#c-overwrite").checked, redo: []
@@ -462,16 +498,19 @@
     if (f.length !== null && f.length !== undefined) { $("#c-length").value = f.length; }
     $("#c-fps").value = f.fps || 24;
     $("#c-frames").value = f.frames || 145;
-    $("#c-width").value = f.width || "";
-    $("#c-height").value = f.height || "";
+    $("#c-width").value = f.width || 1024;
+    $("#c-height").value = f.height || 576;
+    syncResPreset();
     S.seedUpload = f.seed_upload || null;
     $("#c-res-seed").checked = Boolean(S.seedUpload);
     $("#c-res-size").checked = !S.seedUpload;
     $("#c-mode").value = f.mode || "chained";
-    $("#c-model").value = f.model || "";
+    fillModelSelect(f.model || "");
     $("#c-gemma").value = f.gemma || "";
     $("#c-story-model").value = f.story_model || "";
     $("#c-auto-lora").checked = f.auto_lora !== false;
+    $("#c-narration").value = f.narration === false ? "none"
+      : (f.narration === "speech" || f.narration === "none") ? f.narration : "full";
     clear($("#c-video-loras"));
     clear($("#c-stills-loras"));
     (f.video_loras || []).forEach(function (item) { loraRow("video", item); });
@@ -479,6 +518,12 @@
     Array.prototype.forEach.call($("#c-characters").options, function (o) {
       o.selected = (f.characters || []).indexOf(o.value) >= 0;
     });
+    const actionNames = (f.action_loras || []).map(function (a) { return a.name; });
+    Array.prototype.forEach.call($("#c-actions").options, function (o) {
+      o.selected = actionNames.indexOf(o.value) >= 0;
+    });
+    const actionStrength = (f.action_loras || []).length ? f.action_loras[0].strength : null;
+    $("#c-action-strength").value = actionStrength === null || actionStrength === undefined ? "" : actionStrength;
     $("#c-story-legacy").checked = Boolean(f.story_legacy);
     $("#c-judge").checked = Boolean(f.judge);
     $("#c-no-low-ram").checked = Boolean(f.no_low_ram);
@@ -497,6 +542,22 @@
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);
+    $("#c-res-preset").addEventListener("change", applyResPreset);
+    syncResPreset();
+    $("#c-model").addEventListener("change", function () {
+      const sel = $("#c-model");
+      if (sel.value === "__download__") {
+        show($("#c-model-dl"), true);
+        sel.value = sel.dataset.selected || "";
+        $("#c-model-dl-repo").focus();
+      } else {
+        sel.dataset.selected = sel.value;
+        show($("#c-model-dl"), false);
+      }
+    });
+    $("#c-model-dl-go").addEventListener("click", function () {
+      downloadModel($("#c-model-dl-repo").value, $("#c-model-dl-hub").value, $("#c-model-dl-status"));
+    });
     $("#c-copy").addEventListener("click", function () {
       navigator.clipboard.writeText($("#c-command").textContent);
     });
@@ -519,14 +580,63 @@
     if (!S.ws) { return; }
     const res = await api("GET", "/api/models" + wsQuery());
     if (res.status !== 200) { return; }
+    S.models = res.data.models || [];
+    S.loraBases = res.data.lora_bases || null;
     const list = clear($("#c-model-list"));
     const body = clear($("#m-table tbody"));
-    res.data.models.forEach(function (m) {
+    S.models.forEach(function (m) {
       if (m.hub === "ltx") { list.appendChild(el("option", {value: m.repo})); }
       body.appendChild(el("tr", {}, [el("td", {text: m.hub}), el("td", {text: m.repo}),
         el("td", {text: m.intact ? "yes" : "no", cls: m.intact ? "ok" : "bad"}),
         el("td", {text: m.problems.join("; ")}), el("td", {text: sizeText(m.bytes)})]));
     });
+    fillModelSelect();
+    fillLoraBaseModels();
+  }
+
+  // Video model is a dropdown of locally-available ltx-hub models. A value not present
+  // locally (a draft's model) is still listed, flagged; "__download__" is the escape to
+  // the inline fetch control.
+  function fillModelSelect(preferred) {
+    const sel = $("#c-model");
+    if (!sel || sel.tagName !== "SELECT") { return; }
+    const local = (S.models || []).filter(function (m) { return m.hub === "ltx"; })
+      .map(function (m) { return m.repo; });
+    const defaultModel = (S.options && S.options.defaults && S.options.defaults.model) || "";
+    const want = preferred || sel.dataset.selected || defaultModel || "";
+    const options = local.slice();
+    if (want && options.indexOf(want) < 0) { options.push(want); }
+    options.sort();
+    clear(sel);
+    options.forEach(function (repo) {
+      const missing = local.indexOf(repo) < 0;
+      sel.appendChild(el("option", {value: repo, text: repo + (missing ? " — not downloaded" : "")}));
+    });
+    sel.appendChild(el("option", {value: "__download__", text: "＋ Download a model…"}));
+    sel.value = (want && options.indexOf(want) >= 0) ? want : (options[0] || "__download__");
+    sel.dataset.selected = sel.value;
+  }
+
+  async function downloadModel(repo, hub, statusEl) {
+    repo = (repo || "").trim();
+    if (!repo) { if (statusEl) { statusEl.textContent = "enter an org/repo id"; } return; }
+    if (statusEl) { statusEl.textContent = "queuing…"; }
+    const res = await api("POST", "/api/models/download", {ws: S.ws, repo: repo, hub: hub || "ltx"});
+    if (res.status !== 201) {
+      if (statusEl) { statusEl.textContent = "error: " + ((res.data && res.data.error) || res.status); }
+      return;
+    }
+    const jobId = res.data.job.id;
+    if (statusEl) { statusEl.textContent = "downloading… job " + jobId + " (watch in Jobs)"; }
+    const timer = setInterval(async function () {
+      const jr = await api("GET", "/api/jobs/" + jobId);
+      if (jr.status !== 200) { return; }
+      const st = jr.data.status ? jr.data.status.state : jr.data.state;
+      if (["done", "failed", "cancelled", "lost"].indexOf(st) < 0) { return; }
+      clearInterval(timer);
+      if (statusEl) { statusEl.textContent = "job " + jobId + " " + st; }
+      if (st === "done") { await loadModels(); fillModelSelect(repo); show($("#c-model-dl"), false); }
+    }, 2000);
   }
 
   // --- V7 smoke render (MU52, Q4) ------------------------------------------------------
@@ -750,10 +860,130 @@
     });
   }
 
+  // --- actions (motion LoRAs, bin/action) ----------------------------------------------
+
+  async function loadActions() {
+    if (!S.ws) { return; }
+    const res = await api("GET", "/api/actions" + wsQuery());
+    const actions = res.status === 200 ? res.data.actions : [];
+    const body = clear($("#a-list tbody"));
+    const pick = $("#c-actions");
+    const chosen = Array.prototype.map.call(pick.selectedOptions, function (o) { return o.value; });
+    clear(pick);
+    actions.forEach(function (a) {
+      const row = el("tr", {data: {action: a.name}, cls: "clickable"}, a.invalid ?
+        [el("td", {text: a.name}), el("td", {text: "invalid: " + a.invalid}), el("td"), el("td")] :
+        [el("td", {text: a.name}), el("td", {text: a.status}),
+         el("td", {text: a.clips === null ? "-" : String(a.clips)}), el("td", {text: a.trigger})]);
+      row.addEventListener("click", function () { openAction(a.name); });
+      body.appendChild(row);
+      if (a.status === "trained") {
+        const option = el("option", {value: a.name, text: a.name + " (" + a.trigger + ")"});
+        option.selected = chosen.indexOf(a.name) >= 0;
+        pick.appendChild(option);
+      }
+    });
+  }
+
+  async function openAction(name) {
+    const res = await api("GET", "/api/actions/" + enc(name) + wsQuery());
+    if (res.status !== 200) { $("#a-status").textContent = (res.data && res.data.error) || "error"; return; }
+    S.action = res.data;
+    const a = res.data.action;
+    show($("#a-detail"), true);
+    $("#a-title").textContent = name + " (" + a.status + ")";
+    $("#a-summary").textContent = "trigger: " + a.trigger + "\ndescriptor: " + a.descriptor
+      + "\nidentity agnostic: " + a.identity_agnostic + "\ndefault strength: " + a.default_strength
+      + (a.lora ? "\nLoRA: " + a.lora.path : "");
+    const gallery = clear($("#a-gallery"));
+    if (res.data.contact_sheet) {
+      gallery.appendChild(el("img", {src: fileUrl(res.data.contact_sheet), alt: "contact sheet", cls: "sheet"}));
+    }
+    res.data.clips.forEach(function (p) { gallery.appendChild(el("video", {src: fileUrl(p), controls: "", preload: "metadata"})); });
+    $("#a-status").textContent = "";
+    show($("#a-regenerate"), Boolean(res.data.last_create_fields) && a.status !== "trained");
+    gate($("#a-train"), $("#a-train-reason"), ["render"]);
+    if (a.status === "trained") {
+      $("#a-train").disabled = true;
+      $("#a-train-reason").textContent = "already trained";
+    } else if ((a.dataset || {}).clips < 8) {
+      $("#a-train").disabled = true;
+      $("#a-train-reason").textContent = "fewer than 8 clips; add clips and rebuild the dataset";
+    }
+  }
+
+  async function submitAction(body, status) {
+    body.ws = S.ws;
+    const res = await api("POST", "/api/actions", body);
+    if (res.status === 201) {
+      status.textContent = "queued job " + res.data.job.id;
+      pollJobs();
+    } else {
+      status.textContent = (res.data && (res.data.errors || [res.data.error]).join("; ")) || ("http " + res.status);
+    }
+  }
+
+  function setupActions() {
+    $("#a-create").addEventListener("click", function () {
+      const clips = $("#a-clips").value.split("\n").map(function (l) { return l.trim(); })
+        .filter(function (l) { return l; });
+      submitAction({name: $("#a-name").value.trim(), trigger: $("#a-trigger").value.trim(),
+                    descriptor: $("#a-descriptor").value.trim(), clips: clips,
+                    performers: numberOrNull("#a-performers") || 0, force: $("#a-force").checked,
+                    regenerate: false}, $("#a-create-status"));
+    });
+    $("#a-regenerate").addEventListener("click", async function () {
+      const name = S.action.action.name;
+      if (!(await askConfirm("Rebuild the dataset of " + name + " from its last clips?"))) { return; }
+      submitAction(Object.assign({}, S.action.last_create_fields, {regenerate: true}), $("#a-status"));
+    });
+    $("#a-train").addEventListener("click", async function () {
+      const name = S.action.action.name;
+      if (!(await askConfirm("Train " + name + "? The story server is stopped for training and restarted after."))) { return; }
+      const res = await api("POST", "/api/actions/" + enc(name) + "/train", {ws: S.ws});
+      $("#a-train-reason").textContent = res.status === 201 ? "queued job " + res.data.job.id :
+        ((res.data && (res.data.errors || [res.data.error]).join("; ")) || "");
+      if (res.status === 201) { pollJobs(); }
+    });
+  }
+
   // --- LoRAs & Models (MU83) -----------------------------------------------------------
 
+  // Shell-quote an argv element so a displayed command is copy-pasteable (multi-word
+  // --use-when / --avoid-when / --description stay a single quoted argument).
+  function shQuote(s) {
+    s = String(s);
+    return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : "'" + s.replace(/'/g, "'\\''") + "'";
+  }
+
   function runText(run) {
-    return "$ " + run.argv.join(" ") + "\nexit " + run.exit_code + "\n" + run.stdout + run.stderr;
+    return "$ " + run.argv.map(shQuote).join(" ") + "\nexit " + run.exit_code + "\n" + run.stdout + run.stderr;
+  }
+
+  // The LoRA base-model dropdown lists only hosted models, filtered by target:
+  // stills LoRAs attach to the Z-Image (zimage-hub) base, video LoRAs to the ltx-hub base.
+  function fillLoraBaseModels() {
+    const sel = $("#l-base-models");
+    if (!sel) { return; }
+    const target = $("#l-target").value;
+    // Prefer the backend's curated LoRA-base list (excludes text encoders); fall back
+    // to a hub filter if an older server didn't send it.
+    let repos = S.loraBases && S.loraBases[target];
+    if (!repos) {
+      const hub = target === "stills" ? "zimage" : "ltx";
+      repos = (S.models || []).filter(function (m) { return m.hub === hub; })
+        .map(function (m) { return m.repo; }).sort();
+    }
+    const prev = Array.prototype.filter.call(sel.options, function (o) { return o.selected; })
+      .map(function (o) { return o.value; });
+    clear(sel);
+    repos.forEach(function (repo) {
+      const opt = el("option", {value: repo, text: repo});
+      if (prev.indexOf(repo) >= 0) { opt.selected = true; }
+      sel.appendChild(opt);
+    });
+    // default to selecting the first hosted base when nothing carried over
+    if (sel.selectedOptions.length === 0 && sel.options.length) { sel.options[0].selected = true; }
   }
 
   async function loadCatalogTable(results) {
@@ -788,6 +1018,10 @@
   }
 
   function setupLoras() {
+    $("#m-dl-go").addEventListener("click", function () {
+      downloadModel($("#m-dl-repo").value, $("#m-dl-hub").value, $("#m-dl-status"));
+    });
+    $("#l-target").addEventListener("change", fillLoraBaseModels);
     $("#l-verify-all").addEventListener("click", async function () {
       const res = await api("POST", "/api/loras/verify", {ws: S.ws, ids: []});
       if (res.data && res.data.run) {
@@ -799,7 +1033,8 @@
     });
     $("#l-add").addEventListener("click", async function () {
       const body = {ws: S.ws, path: $("#l-path").value.trim(), id: $("#l-id").value.trim(),
-        kind: $("#l-kind").value, target: $("#l-target").value, base_models: splitList("#l-base-models"),
+        kind: $("#l-kind").value, target: $("#l-target").value,
+        base_models: Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; }),
         triggers: splitList("#l-triggers"), description: $("#l-description").value.trim(),
         use_when: $("#l-use-when").value.trim(), avoid_when: $("#l-avoid-when").value.trim(),
         default_strength: Number($("#l-default-strength").value),
@@ -1238,6 +1473,7 @@
     setupSmoke();
     setupStories();
     setupCharacters();
+    setupActions();
     setupLoras();
     setupJobs();
     setupTraces();

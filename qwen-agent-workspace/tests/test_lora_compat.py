@@ -106,6 +106,28 @@ def test_wrong_architecture_module_absent_fails(tmp_path):
     assert any("absent from the base" in p for p in problems)
 
 
+def test_comfyui_names_match_mlx_base(tmp_path):
+    # ComfyUI LoRAs name attn*.to_out.0 and ff.net.0.proj / ff.net.2; the mlx base has
+    # to_out / ff.proj_in / ff.proj_out (ltx-2-mlx renames them at load, sd_ops.py).
+    chk = _load_checker()
+    base = str(tmp_path / "base"); os.makedirs(base)
+    write_safetensors(os.path.join(base, "model.safetensors"), {
+        "transformer.transformer_blocks.0.attn1.to_out.weight": ("BF16", [128, 128]),
+        "transformer.transformer_blocks.0.ff.proj_in.weight": ("BF16", [512, 128]),
+        "transformer.transformer_blocks.0.ff.proj_out.weight": ("BF16", [128, 512])})
+    lora = str(tmp_path / "comfy.safetensors")
+    write_safetensors(lora, {
+        "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_A.weight": ("F32", [8, 128]),
+        "diffusion_model.transformer_blocks.0.attn1.to_out.0.lora_B.weight": ("F32", [128, 8]),
+        "diffusion_model.transformer_blocks.0.ff.net.0.proj.lora_A.weight": ("F32", [8, 128]),
+        "diffusion_model.transformer_blocks.0.ff.net.0.proj.lora_B.weight": ("F32", [512, 8]),
+        "diffusion_model.transformer_blocks.0.ff.net.2.lora_A.weight": ("F32", [8, 512]),
+        "diffusion_model.transformer_blocks.0.ff.net.2.lora_B.weight": ("F32", [128, 8])},
+        metadata={"lora_alpha": 8})
+    status, problems = chk.static_check(lora, base)
+    assert status == "PASS", (status, problems)
+
+
 def test_alpha_not_equal_rank_fails(tmp_path):
     chk = _load_checker()
     base = str(tmp_path / "base"); _bf16_base(base)
