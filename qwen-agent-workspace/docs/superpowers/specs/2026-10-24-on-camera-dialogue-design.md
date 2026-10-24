@@ -1,10 +1,15 @@
 # On-camera dialogue: Dialogue: field, beat-mapped speech in the LTX motion prompt
 
-Date: 2026-10-24 (rev 2, after design review: approve-with-fixes)
+Date: 2026-10-24 (rev 3: design-review fixes, plus the user decisions on Section 11 and Q5)
 
-Status: design spec for user decisions D1-D6 (Section 0.1). This is revision 2. It applies every fix from the design review and records the answers to Q1-Q4 (Section 14.2). One item, Q5, is still open. Section 11 (casting attachment, chained) is a **PROPOSAL pending user approval**. It is not part of the merge gate and must not be built until the user approves it. Every value the decisions left open is marked **[spec choice]**; Section 13 collects them. The implementer makes no design decisions.
+Status: design spec for user decisions D1-D6 (Section 0.1) and D7-D8 (below). Revision 2 applied every fix from the design review. Revision 3 records the user's later decisions:
+- **D7.** Section 11, casting attachment in chained mode, is approved and normative.
+- **D8 (was Q5).** Chained mode gets no beat-1 coercion. The speaking-shot rules apply to the speaking panel only.
+- The legacy shots rewrite loop stays strict (confirmed).
 
-Repository: `/Users/reubenpatterson/local_agent_harness`, branch `qwen-agent-redteam`. `WS` is `qwen-agent-workspace/`. Every relative path is relative to `WS`. Line numbers cite HEAD `289254d`, and each citation was checked in that tree.
+Q1-Q5 are all resolved (Section 14.2). Every value the decisions left open is marked **[spec choice]**; Section 13 collects them. The implementer makes no design decisions.
+
+Repository: `/Users/reubenpatterson/local_agent_harness`, branch `qwen-agent-redteam`. `WS` is `qwen-agent-workspace/`. Every relative path is relative to `WS`. Line numbers cite the code at `289254d`, and each citation was checked there. HEAD `9f1d5c1` adds only this spec file, so the code is identical.
 
 Specs this one builds on, cited by tag:
 - **[ROBUST]** `docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md` (RS1-RS37, critic, patches, round controller, 7.1 premises).
@@ -92,7 +97,8 @@ Binding user decisions:
 | G7 | `bin/judge-stills` | `PANEL_LABEL_RE` and field dict gain `Dialogue` (stays a verbatim copy) |
 | G8 | `tests/test_dialogue.py` (new) | DLG1-DLG34, DLG-H, DLG-K1 (Section 9.1) |
 | G9 | existing tests | the edits of Section 9.2 only |
-| G10 | `tests/test_movie_ui_builder.py::test_mut26` | `BASELINE` re-baseline, in a **separate test-only follow-up commit** after G1-G9 land |
+| G10 | `tests/test_movie_ui_builder.py::test_mut26` | `BASELINE` re-baseline, in a **separate test-only follow-up commit** after G1-G9 and G11 land |
+| G11 | `character_lib.py`, `bin/ltx-story-manifest`, `story_engine.py`, `bin/ltx-movie` (docstring) | casting attachment, chained (Section 11): plan-based attachment, name and trigger matching, trigger prefix, N19, constant strength |
 
 **Cut from this spec:** the movie-ui `speech_delivery` Compose field. A/B testing is done from the CLI only. No change is made to `movie_ui_lib.py`, `static/movie-ui/*`, the movie-ui help fixtures or `test_movie_ui_builder.py:118-131`.
 
@@ -107,13 +113,13 @@ Binding user decisions:
 - The legacy engine's checks and shots rewrite loop.
 - Multi-speaker panels and off-screen speakers.
 - The stale manifest T5 warning (R9).
-- Section 11 until it is approved.
+- Plan-based casting attachment in shots or no_stills mode. Section 11 covers `--chain` only; shots keeps its text-based attachment, because S9 already makes every Image: name its cast.
 
 ### 0.5 Success criteria
 
 | ID | Criterion | Verified by |
 |---|---|---|
-| DK1 | `python3 -m pytest tests/ -q -rA` from `WS` gives the pass count recorded just before implementation, plus every DLG test, plus the Section 9.2 edits, with no lost pass. `python3 tests/test_ltx_movie_offline.py` prints `OK n/n` with the baseline `n`. Measured **after** the G10 follow-up commit. | full run |
+| DK1 | `python3 -m pytest tests/ -q -rA` from `WS` gives the pass count recorded just before implementation, plus every DLG and CA test, plus the Section 9.2 and 11.8 edits, with no lost pass. `python3 tests/test_ltx_movie_offline.py` prints `OK n/n` with the baseline `n`. Measured **after** the G10 follow-up commit. | full run |
 | DK2 | `/usr/bin/python3` (3.9) and `python3` both `py_compile` every changed file. | `test_rst61` |
 | DK3 | Import sets are unchanged (`test_rst62`, `test_character_lib.py:540-550`, `test_s20`). | those tests |
 | DK4 | **Merge gate (D6 invariants, offline).** DLG21-DLG24 and DLG-H pass. DLG-H runs 6 hand-written cases (3 modes × speaking/non-speaking) containing camera directions, descriptive sentences and, when speaking, Dialogue. Each case asserts 0 blocking violations at round 0, stop `passed`, no critic call, and every authored sentence and the Dialogue line byte-identical in the output story.md. | DLG21-DLG24, DLG-H |
@@ -123,7 +129,7 @@ Binding user decisions:
 
 ### 0.6 Must-have and nice-to-have
 
-Sections 2-8 are must-haves. Section 11 is a proposal, built only on approval. Nothing else is built.
+Sections 2-8 and Section 11 are must-haves. Nothing else is built.
 
 ---
 
@@ -360,15 +366,17 @@ Set `raw = _clean_str(item.get("speaker"))`. Every beat gets a `"speaker"` key. 
    - If `beat["cast"] != [raw]`, note `"beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker is alone on screen" % (k, ", ".join(cast), raw)` and set `cast = [raw]`.
    - If `shot_applies(k)` and the shot is not `"medium close-up"` or `"close-up"`, change it to `"close-up"` if it was `"extreme close-up"`, else to `"medium close-up"`. Note `"beat %d: P14 speaking beat: shot %s changed to %s so the speaker's face stays readable"`.
    - If `shot_applies(k)` and the camera is not `"static"` or `"slow push-in"`, change it to `"static"`. Note `"beat %d: P14 speaking beat: camera %s changed to 'static' so the speaker's face stays readable"`.
-5. Chained mode only: if any beat `k >= 2` speaks, beat 1's shot and camera are coerced the same way. The note ends `"... because beat %d speaks later in this continuous take"` instead of `"... so the speaker's face stays readable"`, where `%d` is the first such beat. **(Q5 is open: whether to keep this.)**
+**The speaking-shot rules apply to the speaking panel only (D8).** No other beat is ever coerced because some beat speaks. In particular, chained mode gets **no beat-1 coercion**.
+
+For a chained speaking beat `k >= 2`, `shot_applies(k)` is false. That panel's framing is the continued take's framing, and it is neither coerced nor checked. What it does get is the cast coercion of step 4, the pasted facing sentence and `SPEAKING_CAMERA` (SP4), and the speaking key-line sentences (Section 8.2). The N17 wide-shot advisory keeps its existing `shot_applies` rule, so it never fires for a chained `k >= 2` panel.
 
 The notes are stored, in order, in `plan["speech_notes"]`. `plan_checks` appends them to the advisory list after the P13 advisories.
 
 **Side effects of the cast coercion in step 4, documented and accepted:**
 - (i) The removed members' identity sentences are not pasted into that panel.
-- (ii) With today's text-based attachment, a removed member's character LoRA is not attached to that panel unless the writer names them (Section 11 proposes plan-based attachment).
+- (ii) Plan-based casting attachment (Section 11) follows the coerced cast, so a removed member gets no character LoRA in that panel unless the writer names them in Motion (CA2's text union).
 - (iii) If the writer names a removed member anyway, N4 stray cast is advisory.
-- (iv) In chained mode a removed member is still physically present in the continued frame. The speaking shot depends on the camera framing, not on that member leaving.
+- (iv) In chained mode a removed member is still physically present in the continued frame, and the framing is inherited (D8). How readable a chained `k >= 2` speaking panel's lips are depends on the take the earlier panels set up (R3).
 - (v) plan.json stores the coerced values, so the critic, re-check and manifest see the coerced plan.
 
 ### SP3. "Declared cast member"
@@ -779,7 +787,7 @@ Stdlib plus pytest. Modules are loaded by path, as in `tests/test_story_engine.p
 | DLG8 | the alias: `speech_source "narration"`; plain equals the pre-change string |
 | DLG9 | manifest errors: unknown speaker; over the cap (exact message); alias over the cap gives a WARNING and rc 0; proportional pace with Dialogue and empty Narration passes; a panel with neither gives the new error |
 | DLG10 | a panel with both Dialogue and a prefixed Narration: Dialogue wins and the Narration is voice-over |
-| DLG11 | coercion: cast, shot and camera with exact P14 notes; invalid speaker; `narration=False`; chained beat 3 speaking coerces beat 1; plan.json carries the new keys |
+| DLG11 | coercion: cast, shot and camera with exact P14 notes; invalid speaker; `narration=False`; a chained beat 3 speaker leaves beat 1's shot and camera untouched and adds no beat-1 note (D8), and beat 3's own shot and camera are not coerced (`shot_applies(3)` is false); plan.json carries the new keys |
 | DLG12 | plan prompt `@@SPEAKER_RULE@@` text for True, `"speech"` and False; "no dialogue" is absent |
 | DLG13 | `writer_keys(..., speaks)` for every mode and narration value; speaking key lines, including `no_stills_prompt_speaking` and the cap; no template contains "Do not mention the camera" or "camera or lens" |
 | DLG14 | `parse_panel_reply` on a speaking panel |
@@ -907,42 +915,135 @@ Legacy shots Motions are often 6-7 sentences long, which the robust shots writer
 
 ---
 
-## 11. Casting attachment (chained): PROPOSED, pending user approval
+## 11. Casting attachment, chained (CA; user-approved, D7)
 
-**Status:** proposal. Not part of DK1-DK7 or the merge gate. Build only after user approval, in its own commit, with its tests (CA-T1 to CA-T5) and an enumeration of the casting tests it re-baselines. That enumeration is done on approval.
+### 11.1 Problem (verified)
 
-**Problem.** In chained mode, a character LoRA and its trigger are attached only when `cast_text` finds the referring phrase in the panel's Motion text (`bin/ltx-story-manifest:736`, `character_lib.py:592-632`). A panel that refers to a cast member by pronoun ("she turns") or by name gets no LoRA, and its identity drifts at the seam. Strength also changes from panel to panel: 1.0 when exactly one cast character is named, otherwise the member's strength or 0.8 (`character_lib.py:40-41`, `:684-693`). Consecutive chained clips can therefore swing between 1.0 and 0.8 for the same character.
+In chained mode a character's video LoRA and trigger are attached to a panel only when `cast_text` finds the referring phrase in that panel's `motion_prompt` (`bin/ltx-story-manifest:735-747`; `character_lib.py:592-632`). A panel that refers to a cast member by pronoun ("She turns her head") or by name ("Kyra turns") gets no LoRA, and identity drifts at the seam.
 
-- **CA1. Plan-based attachment.** When `generated/stories/<id>/plan.json` loads (the manifest already reads it in `_known_phrases`), panel k's attached members are the members `m` with a plan cast entry in `beats[k-1].cast` whose `cast_name == m.name`, or whose phrase matches `m.phrase` case-insensitively, together with the members found by text (CA2). Without a valid plan, attachment stays text-only, as today.
-- **CA2. Name and trigger matching.** `cast_text` also matches:
-  - the member's **name** as a whole word that starts with an uppercase letter and is not preceded by `a`, `an` or `the` (so "the ronin" the phrase and "a ronin" the extra do not collide); the trigger is inserted before the name;
-  - the bare **trigger**, which is counted with no insertion.
+Strength also changes from panel to panel. A video clip that names exactly one cast character uses `SINGLE_CHARACTER_STRENGTH` 1.0; otherwise each character uses its own `character.json` strength or `--character-strength`, default `DEFAULT_CHARACTER_STRENGTH` 0.8 (`character_lib.py:40-41`, `panel_strengths` `:684-693`). Consecutive chained clips can therefore swing between 1.0 and 0.8 for the same character.
 
-  The phrase stays the longest-first primary match. `skip_quoted` applies.
-- **CA3. Pronoun-only reference.** An attached member with no phrase, name or trigger match in `motion_prompt` gets their trigger prefixed in LC18 format (`"t1, t2. " + prompt`, the `lora_catalog.prefix_triggers` semantics; the manifest loads `lora_catalog.py` by path only in this case). The story engine adds advisory **N19 cast reference**: `panel %d: N19 cast reference: Motion: refers to %s only by pronoun; the pipeline attaches their LoRA from the plan and prefixes their trigger` when `_PRONOUN_RE` matches the writer text, else `... Motion: never mentions %s; ...`. It runs in chained mode, for members with a `cast_name`.
-- **CA4. Constant strength across panels (proposed rule).**
-  - In chained mode, when the story declares exactly one cast member, that member's strength is `SINGLE_CHARACTER_STRENGTH` (1.0) in **every** panel, whether or not they are named.
-  - With two or more cast members, each member's strength is constant across all panels: their `character.json` strength if set, else `--character-strength` (default `DEFAULT_CHARACTER_STRENGTH` 0.8).
-  - Shots mode is unchanged (already constant).
+Scope: `--chain` manifests only (0.4). Shots and stills attachment are unchanged.
 
-  Rationale: a chained clip is conditioned on the previous clip's last frame, so a strength change at a seam is an identity change at the one point the take must hide.
-- **CA tests (on approval):**
-  - CA-T1: pronoun-only panel → LoRA attached and trigger prefixed.
-  - CA-T2: name match → trigger inserted before the name; lowercase "a ronin" not matched.
-  - CA-T3: no plan.json → behaviour unchanged.
-  - CA-T4: strengths constant across panels for 1 and 2 cast members.
-  - CA-T5: N19 messages.
-- **Expected re-baselines:** the casting tests that pin the 1.0-when-named-alone rule, such as `tests/test_casting_pipeline.py` and `tests/test_ltx_story_manifest_chain.py` cast cases, to be enumerated on approval.
+### 11.2 Which members attach to chained panel k (CA1)
+
+`attached(k) = text_names(k) ∪ plan_names(k)`, sorted by member name.
+
+- `text_names(k)` comes from the text pass (CA2) over panel k's `motion_prompt`, after speech insertion. The speech sentence is skipped inside quotes.
+- `plan_names(k)` comes from `_casting_plan(args, n_panels)`, a new function in `bin/ltx-story-manifest`. It reads `os.path.join(WS, "generated", "stories", args.story_id, "plan.json")`, the same path `_known_phrases` reads.
+  - **Usable plan:** the file parses as a JSON object; `schema == "ltx-movie.plan.v1"`; `cast` is a list of objects; `beats` is a list of exactly `n_panels` objects, and each beat's `cast` is a list of strings.
+  - For beat `k`, each id `c` in `beats[k-1]["cast"]` is looked up in the plan's `cast` list (an id that is not found is skipped). That entry `e` attaches the member `m` with `e.get("cast_name") == m.name`. If `e["cast_name"]` is null, it attaches the member with `e.get("phrase", "").lower() == m.phrase.lower()`.
+  - **No plan.json file** (a legacy-engine story, or no Phase 1 plan) → `plan_names(k) = set()`, silently. This is today's text-only behaviour.
+  - **A plan.json that is not usable** → `plan_names(k) = set()`, and one stdout line: `"note: plan.json is not usable for casting (%s); characters attach from the Motion: text only"`. The reason is the first of: `"it is unreadable or not a JSON object"`, `"its schema is not ltx-movie.plan.v1"`, `"it has %d beats for %d panels"`, `"beat %d has no cast list"`.
+- The plan only ever **adds** members; it never removes a text match. **[spec choice: a stale plan can over-attach but can never silently drop a character the text names.]**
+
+### 11.3 Text matching (CA2)
+
+`cast_text(text, members, insert=None, skip_quoted=False, match_names=False)`. The manifest's `--chain` call passes `skip_quoted=True, match_names=True`. Its `--shots` call passes `skip_quoted=True` only. `bin/ltx-story-images` is unchanged.
+
+Spans are claimed in three passes. Within each pass, members are taken in today's order `(-len(phrase), phrase.lower(), name)`. A match that overlaps an already-claimed span is ignored. With `skip_quoted`, a match lying entirely inside a `"[^"]*"` span is ignored.
+
+1. **Phrase** (today): `_phrase_regex(m.phrase, m.trigger)`. The trigger is inserted unless it is already present, exactly as today.
+2. **Name** (only when `match_names`): `re.compile(r"(?<![\w-])" + re.escape(m.name) + r"(?![\w-])", re.IGNORECASE)`. A match counts only when (a) its first character is uppercase and (b) the word immediately before it (`re.search(r"([A-Za-z']+)\s+$", text[:start])`), lowercased, is not in `ARTICLES`. On a counted match, `m.trigger + " "` is inserted before it, unless `text[:start]` already ends, case-insensitively, with `m.trigger + " "`.
+   - So "Kyra turns." becomes "kyrawmn Kyra turns.".
+   - "the ronin" was already claimed by pass 1.
+   - "a ronin waits" and "the old ronin" are not matched.
+3. **Trigger** (only when `match_names`): `re.compile(r"(?<![\w-])" + re.escape(m.trigger) + r"(?![\w-])", re.IGNORECASE)`. It is counted with no insertion.
+
+The returned names are the members with at least one counted match, filtered by `insert` as today.
+
+`member_referenced(text, member)`, new in `character_lib`, returns True when pass 1, 2 or 3 would count a match for that single member (with `skip_quoted=True`). The story engine (CA4) uses it.
+
+### 11.4 Pronoun-only or unnamed reference (CA3)
+
+For chained panel k, `prefixed = sorted(plan_names(k) - text_names(k))`. When it is non-empty:
+- `motion_prompt = character_lib.prefix_character_triggers(motion_prompt, [by_name[n].trigger for n in prefixed])`.
+- stdout gets `"cast: panel %d: %s attached from plan.json (Motion: does not name them); trigger prefixed" % (k, ", ".join(prefixed))`.
+
+`prefix_character_triggers(prompt, triggers)` is new in `character_lib`. It has exactly the semantics of `lora_catalog.prefix_triggers` (`lora_catalog.py:355-368`): the triggers are de-duplicated case-insensitively; those already present as whole words are skipped; the result is `", ".join(missing) + ". " + prompt`, or `prompt` unchanged when nothing is missing. It is duplicated rather than imported so the chained cast pass does not load `lora_catalog.py`. A later catalog trigger prefix composes in front of it (`"cattrig. kyrawmn. She turns ..."`).
+
+The cast pass in the manifest now runs in this order for each panel:
+1. text pass;
+2. plan pass;
+3. trigger prefix;
+4. `characters` list from `attached(k)`.
+
+The existing `WARNING: cast phrase %r ... occurs in no panel's Motion: text; that character gets no LoRA` fires only for members in no panel's `attached(k)`. Its text is unchanged.
+
+### 11.5 Constant LoRA strength (CA5)
+
+**Rule:** in a `--chain` manifest, each cast character has **one strength for the whole story**. It is the character's `character.json` strength when set, else `--character-strength`, whose default for the chained flow is `DEFAULT_CHARACTER_STRENGTH` 0.8 (`bin/ltx-movie:838-840`). The value is the same in every panel, whether the character is alone or shares the panel. The manifest computes it with `character_lib.story_strength(member, character_strength)`, a new function that returns `member.strength if member.strength is not None else character_strength`, instead of `panel_strengths`.
+
+`panel_strengths` and `SINGLE_CHARACTER_STRENGTH` stay, unchanged, for `--shots` (already constant) and for `bin/ltx-story-images`, where a chained story has only one still and constancy across panels is moot.
+
+**[spec choice: 0.8, not 1.0.]**
+- (a) A constant must be safe in the hardest panel. When two characters share a panel, `ltx-2-mlx` fuses their deltas with no alpha/rank scaling (`delta = sum(B_i @ A_i * strength_i)`, `packages/ltx-core-mlx/src/ltx_core_mlx/loader/fuse_loras.py:87-110`). Two LoRAs at 1.0 roughly double the weight perturbation, which is exactly why pairs drop to 0.8 today.
+- (b) Today's 1.0/0.8 split changes a character's strength at the seam where the next clip is conditioned on the previous clip's last frame. That is the one place a continuous take must not change identity.
+- (c) Shots mode already uses a constant 0.8 (`SHOTS_CHARACTER_STRENGTH`, `character_lib.py:42`).
+- (d) The cost: a single-character story renders at 0.8 instead of 1.0 (R12). `--character-strength 1.0` restores full strength for the whole story, and it stays constant, so the seam argument still holds.
+
+### 11.6 Pronoun-only advisory (CA4: rule N19)
+
+**N19 cast reference** (advisory, chained mode only). It is computed in `_field_checks` when `"N19" in ids`, `ctx.mode == "chained"` and a plan exists. For each cast id `c` in `beat["cast"]` whose plan entry has a non-null `cast_name` naming a member `m` of `ctx.members`, take the assembled `Motion` field text. If `character_lib.member_referenced(text, m)` is false:
+
+- If `_PRONOUN_RE` matches the Motion writer text: `"panel %d: N19 cast reference: Motion: refers to %s only by pronoun; the pipeline attaches %s's LoRA from the plan and prefixes the trigger" % (k, _q(m.phrase), m.name)`.
+- Otherwise: `"panel %d: N19 cast reference: Motion: never names %s; the pipeline attaches %s's LoRA from the plan and prefixes the trigger" % (k, _q(m.phrase), m.name)`.
+
+`"N19"` is added to `GENERATION_CHECKS` and `RECHECK_IDS`. It is not in `PLAN_FREE_IDS`. It is never hard, never patched and never in `REPAIR_IDS`. `_order_by_panel` gives it the default rank.
+
+### 11.7 Code touch points
+
+| File | Change |
+|---|---|
+| `character_lib.py` | `cast_text` gains `match_names` (11.3) next to `skip_quoted` (DG6); new `member_referenced`, `prefix_character_triggers`, `story_strength`; `panel_strengths` and its constants unchanged |
+| `bin/ltx-story-manifest` | new `_casting_plan`; the cast pass (`:735-747`): text pass with `skip_quoted=True, match_names=args.chain`, then the plan pass, trigger prefix and `characters` (chained), with strength from `story_strength` under `--chain` and from `panel_strengths(..., shots=True)` under `--shots`, as today; docstring `:64-73` and `--cast`/`--character-strength` help `:162-173` (11.9) |
+| `story_engine.py` | N19 in `_field_checks`; `GENERATION_CHECKS`, `RECHECK_IDS` |
+| `bin/ltx-movie` | docstring `:80-82` and `--character-strength` help `:350-355` (11.9) |
+
+### 11.8 Tests
+
+New tests in `tests/test_dialogue.py`, chained manifests built like `tests/test_casting_pipeline.py::_manifest_env`, with a plan.json written into the temporary `WS`:
+
+| ID | Covers |
+|---|---|
+| CA1 | plan attach, pronoun only: beat 2 cast `["c1"]` (cast_name kyra); Motion 2 `"She turns her head toward the harbour."` → panel 2 `characters == [kyra@0.8]`; `motion_prompt == "kyrawmn. She turns her head toward the harbour."`; the `cast: panel 2: kyra attached from plan.json ...` line |
+| CA2 | name/trigger: `"Kyra turns."` → `"kyrawmn Kyra turns."`; `"kyrawmn Kyra turns."` is not re-inserted; `"A ronin waits."` does not attach member ronin; a bare `"kyrawmn"` attaches with no insertion; `"Kyra"` inside quotes does not attach |
+| CA3 | legacy: no plan.json → a pronoun-only panel gets no characters and no prefix, and no note is printed; each unusable-plan reason prints its exact note and falls back to text |
+| CA4 | union: plan `[kyra]`, Motion names the ronin → `[kyra, ronin]`; plan `[]`, Motion names kyra → `[kyra]` |
+| CA5 | constant strength: two members, panel 1 kyra alone, panel 2 both → kyra 0.8 in both panels; ronin with `character.json` strength 0.5 → 0.5 in every panel; `--character-strength 1.0` → kyra 1.0 in both panels; a shots manifest keeps `panel_strengths` results |
+| CA6 | N19 messages A and B (exact); advisory only; absent in shots and no_stills; absent when Motion names the phrase, the name or the trigger |
+| CA7 | `cast_text` with default arguments is byte-identical to today for every `test_p20` string |
+| CA8 | prefix order with catalog LoRAs: `"cattrig. kyrawmn. She turns ..."` |
+| CA9 | `member_referenced` and `prefix_character_triggers` unit cases (de-duplication, already present, empty list) |
+
+Existing tests that change (strength rule):
+- `test_casting_pipeline.py::test_p20` (`:713-738`): `[("kyra", 1.0)]` → `[("kyra", 0.8)]`; `"strength": 1.0` → `0.8` in the `kyra` dict; `"cast: panel 1: kyra@1.0"` → `"cast: panel 1: kyra@0.8"`.
+- `test_casting_pipeline.py::test_p21` (`:739-748`): panel 1 `[("kyra", 1.0)]` → `[("kyra", 0.6)]`.
+- `test_shots_mode.py::test_s62_shots_strength_overrides` (the chained case at `:598-602`): `[("kyra", 1.0)]` → `[("kyra", 0.8)]`.
+
+Must pass unchanged:
+- `test_character_lib.py::test_c36`/`test_c37` (`:414-424`) and `test_shots_mode.py::test_s2` (`:169-179`), because `panel_strengths` is unchanged;
+- `test_casting_pipeline.py::test_p6`/`test_p9` (the renderer copies manifest strengths) and `::test_p22`;
+- `test_casting_regression.py` B1 (`--story-legacy` dry run), B2 (uncast manifest, `characters` null) and B3 (build command);
+- `bin/ltx-story-images` tests.
+
+### 11.9 Help and docstring text (exact)
+
+- `bin/ltx-movie` docstring `:80-82`: replace `"(1.0 for one character, --character-strength, default 0.8, for two or more)"` with `"(in the chained flow each character keeps one strength in every clip: its character.json strength, else --character-strength, default 0.8; a panel whose Motion: only refers to a character by pronoun still gets its LoRA from plan.json)"`.
+- `bin/ltx-movie` `--character-strength` help: `"LoRA strength for each cast character without its own character.json strength (default 0.8, provisional): the same in every clip of the story, alone or with others; a panel still of exactly one character uses 1.0"`.
+- `bin/ltx-story-manifest` docstring: replace `"strength is 1.0 when the panel names exactly one cast character, else the character's own character.json strength or --character-strength (default 0.8)."` with `"under --chain, strength is the character's own character.json strength or --character-strength (default 0.8) in every panel, and a panel also carries every character plan.json puts in its beat (their trigger is prefixed when Motion: does not name them); under --shots it is the character's own strength or --character-strength."`
+- `bin/ltx-story-manifest` `--character-strength` help: `"LoRA strength for each cast character without its own character.json strength (default 0.8, provisional), the same in every panel"`.
+- `bin/ltx-story-manifest` `--cast` help: append `"; under --chain a panel also gets every character its plan.json beat lists"` before the closing quote.
 
 ---
 
 ## 12. Rollout
 
 1. Implement G1-G7 and the tests G8-G9 in one feature commit. Run the merge gate (DK2-DK5) and the full suite.
-2. Opus design review of the diff against this spec.
-3. Make the test-only follow-up commit G10 (the `test_mut26` re-baseline), then measure DK1.
-4. Post-merge: record the corpus and run DLG-K1 with `DIALOGUE_KPI_ENFORCE=1` (DK6). Run the live KPI (DK7) and the A/B. A DK7 miss triggers the rollback rule.
-5. Section 11 only after user approval.
+2. Implement G11 (Section 11) and its tests (11.8) in a second feature commit.
+3. Opus design review of both diffs against this spec.
+4. Make the test-only follow-up commit G10 (the `test_mut26` re-baseline, set to the second feature commit), then measure DK1.
+5. Post-merge: record the corpus and run DLG-K1 with `DIALOGUE_KPI_ENFORCE=1` (DK6). Run the live KPI (DK7) and the A/B. A DK7 miss triggers the rollback rule.
 
 ---
 
@@ -956,7 +1057,7 @@ Legacy shots Motions are often 6-7 sentences long, which the robust shots writer
 6. One flag, `--speech-delivery`, on `bin/ltx-movie` and the manifest; it is CLI only.
 7. Inner quotes become `'` (DG3).
 8. An alias line over the cap only warns.
-9. D4 is enforced by plan coercion (SP2); chained beat-1 coercion is Q5.
+9. D4 is enforced by plan coercion (SP2), on the speaking beat only; no beat-1 coercion in chained mode (D8).
 10. The facing sentence is pasted.
 11. `--speech-only` has no narration key.
 12. Composition happens at render time.
@@ -974,6 +1075,7 @@ Legacy shots Motions are often 6-7 sentences long, which the robust shots writer
 24. P13/N15 are advisory.
 25. A no_stills speaking-panel prompt variant.
 26. The merge gate is DLG21-DLG24 + DLG-H; the 24-case corpus is post-merge calibration; the live run is the KPI.
+27. Casting (Section 11): chained only; plan and text union; name matching needs an initial capital and no article before it; a pronoun-only character gets a trigger prefix; N19 is advisory; one strength per character for the whole story (0.8 default).
 
 ---
 
@@ -983,7 +1085,7 @@ Legacy shots Motions are often 6-7 sentences long, which the robust shots writer
 
 - **R1.** The acoustic sentence is the longest unquoted block, the pattern macstudio rejected. Mitigation: it comes last, has no speaker or lip words, and `beats-no-acoustic` and `plain` are flags. Only the A/B gives evidence.
 - **R2.** "After a breath," followed by a quote may read to LTX as stage direction to voice. The A/B "unquoted word voiced" column measures this.
-- **R3.** Chained stories with dialogue become one static close take (SP2 step 5; Q5).
+- **R3.** With no beat-1 coercion (D8), a chained speaking panel `k >= 2` inherits whatever framing the take has reached. In a wide take the speaker's lips may be too small to lip-sync. Nothing checks this: framing is not known for chained `k >= 2`, and N17's wide-shot advisory only reads beat 1's shot. The panel still gets a static camera, the facing sentence and the speaking instructions.
 - **R4.** The T-rule constants were calibrated on legacy outputs. DK7's rollback rule covers this.
 - **R5.** Weaker enforcement means silent quality loss: S8 contact, N4, S9, P13/N15 and L2-L4 now render. Advisories are only as useful as the reader.
 - **R6.** Naive sentence splitting ("Mr. Smith").
@@ -991,15 +1093,21 @@ Legacy shots Motions are often 6-7 sentences long, which the robust shots writer
 - **R8.** Controller-test churn (Section 9.2 A). Do not weaken assertions beyond the stated reasons.
 - **R9.** The manifest's 150-word "T5 may truncate at 256 tokens" warning is stale (Gemma tokenizes up to 1024 tokens) and will fire on long no_stills prompts. It is harmless but misleading; out of scope.
 - **R10.** Quote-free Motion now rests only on writer instructions (CM7). Quoted words in Motion would be voiced, outside the T1 cap.
-- **R11.** SP2's cast coercion drops other characters' identity sentences and, until Section 11, their LoRAs in speaking panels (SP2 side effects).
+- **R11.** SP2's cast coercion drops other characters' identity sentences and plan-attached LoRAs in speaking panels (SP2 side effects).
+- **R12.** Single-character chained stories drop from 1.0 to 0.8 (11.5), so likeness may weaken. `--character-strength 1.0` restores it, constant across the whole story.
+- **R13.** A stale plan.json (story.md hand-edited after the run, with the same panel count) can attach a character the edited panel no longer shows. Accepted: the plan only adds, `--force-story` rewrites the plan, and the legacy engine moves a stale plan aside (`test_rst42`).
+- **R14.** A prefixed trigger (`"kyrawmn. She turns ..."`) is a weaker identity cue than a trigger placed in front of the phrase. The 10.2 live runs show whether pronoun-only panels hold identity.
 
-### 14.2 Resolutions recorded (design review)
+### 14.2 Resolutions recorded (design review and user decisions)
 
 - **Q1.** P13/N15 are advisory. Agreed, with fix 6: `plan_free_report` returns `(hard, advisory)` and `_undeclared_gate` warns only.
-- **Q2.** The legacy `--story-legacy` shots rewrite loop (`_phase1_shots_finish`, `SHOTS_REWRITE_TEMPLATE`) **stays strict and unchanged**. D6 does not apply to `--story-legacy`.
+- **Q2.** The legacy `--story-legacy` shots rewrite loop (`_phase1_shots_finish`, `SHOTS_REWRITE_TEMPLATE`) **stays strict and unchanged** (confirmed by the user). D6 does not apply to `--story-legacy`.
 - **Q3.** `--judge` is report-only, and `passed_only` is deleted.
 - **Q4.** L2-L4 are advisory, and L5 is split: outside (0, 2] is hard-structural; outside the entry's range is advisory.
 
+- **Q5.** No beat-1 coercion in chained mode (user decision D8). The speaking-shot rules apply to the speaking panel only (SP2); R3 records the consequence.
+- **Section 11** (casting attachment, chained) is approved and normative (D7).
+
 ### 14.3 Open
 
-- **Q5.** Chained beat-1 coercion (SP2 step 5). When any later beat speaks, the whole continuous take opens as a medium close-up or close-up with a static camera or a slow push-in. Assumed: keep it, so the speaking panel's inherited framing is close. Alternative: no beat-1 coercion, and only a P14 advisory (`"beat %d speaks, but the take opens as %s"`), which accepts that speaking panels in a wide take may not lip-sync.
+None.
