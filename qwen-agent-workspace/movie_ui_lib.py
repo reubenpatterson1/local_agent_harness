@@ -512,6 +512,112 @@ def vlm_health(tools, port, status_timeout=VLM_STATUS_TIMEOUT_S, http_timeout=VL
     return True, "%s on 127.0.0.1:%d" % (model, port)
 
 
+def _stop_tool(proc):
+    """SIGTERM a preflight tool, SIGKILL it after VLM_TOOL_KILL_WAIT_S, reap it (VR3). A waiting
+    story-server-restore leaves its detached load running (VRS3)."""
+    proc.terminate()
+    try:
+        proc.wait(VLM_TOOL_KILL_WAIT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _vlm_step(argv, cancel, deadline, timeout):
+    """Run one preflight tool as a child of the runner (its output goes to the runner's stdout and
+    stderr, log.txt): ("exit", rc), ("cancelled", None) when the cancel marker appears, or
+    ("failed", error) when it cannot start or the preflight deadline passes (VR3)."""
+    _say("vlm: running: %s" % shlex.join(argv))
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, close_fds=True)
+    except OSError as e:
+        return "failed", "VLM preflight failed: cannot run %s: %s" % (argv[0], e.strerror or e)
+    while True:
+        try:
+            proc.wait(timeout=1)
+            return "exit", proc.returncode
+        except subprocess.TimeoutExpired:
+            if os.path.exists(cancel):
+                _stop_tool(proc)
+                return "cancelled", None
+            if time.monotonic() >= deadline:
+                _stop_tool(proc)
+                return "failed", "VLM preflight timed out after %d s" % timeout
+
+
+def _vlm_other_mode(tools):
+    """"vision" or "text" when bin/story-server status reports SERVING or LOADING in that mode,
+    else None (also on a timeout, a non-zero exit or no state line)."""
+    run = run_light([os.path.join(tools, "story-server"), "status"], tools, timeout=VLM_STATUS_TIMEOUT_S)
+    if run["timed_out"] or run["exit_code"] != 0:
+        return None
+    for line in run["stdout"].splitlines():
+        match = STATE_LINE_RE.match(line)
+        if match:
+            other = re.fullmatch(r"(SERVING|LOADING) (vision|text)", match.group(1))
+            return other.group(2) if other else None
+    return None
+
+
+def vlm_preflight(job, cancel, tools=None, port=None, health=None, timeout=VLM_PREFLIGHT_TIMEOUT_S):
+    """Bring the VLM into the state the job needs before its child starts (VR2): "required" runs
+    story-server-restore --wait and the health check, restarting the VLM once on a failure;
+    "forbidden" runs story-server stop; "any" does nothing. Returns ("ok", None), ("failed",
+    error) or ("cancelled", None)."""
+    tools = vlm_tools_dir() if tools is None else tools
+    port = vlm_port() if port is None else port
+    health = vlm_health if health is None else health
+    policy = effective_vlm(job)
+    recorded = job.get("vlm")
+    if job.get("kind") == "movie" and recorded in VLM_POLICIES and recorded != policy:
+        _say("vlm: job.json says vlm=%s; story.md %s now, so vlm=%s"
+             % (recorded, "exists" if policy == "forbidden" else "is missing", policy))
+    deadline = time.monotonic() + timeout
+    restore = [os.path.join(tools, "story-server-restore"), VLM_MODE, "--wait"]
+    stop = [os.path.join(tools, "story-server"), "stop"]
+    if policy == "any":
+        _say("vlm: preflight: vlm=any; the VLM is left as it is")
+        return "ok", None
+    if policy == "forbidden":
+        _say("vlm: preflight: this job runs without the VLM (vlm=forbidden)")
+        outcome, value = _vlm_step(stop, cancel, deadline, timeout)
+        if outcome != "exit":
+            return outcome, value
+        if value != 0:
+            return "failed", ("VLM preflight failed: bin/story-server stop exited %d; the log above "
+                              "shows why" % value)
+        _say("vlm: stopped for this job")
+        return "ok", None
+    _say("vlm: preflight: this job needs the VLM (vlm=required)")
+    for attempt in (1, 2):
+        outcome, value = _vlm_step(restore, cancel, deadline, timeout)
+        if outcome != "exit":
+            return outcome, value
+        if value != 0:
+            problem = ("bin/story-server-restore %s --wait exited %d (see %s)"
+                       % (VLM_MODE, value, VLM_RESTORE_LOG_TEXT))
+        else:
+            ok, problem = health(tools, port)
+            if os.path.exists(cancel):
+                return "cancelled", None
+            if ok:
+                _say("vlm: healthy: %s" % problem)
+                return "ok", None
+        if attempt == 2:
+            return "failed", "VLM preflight failed after one restart: %s" % problem
+        other = _vlm_other_mode(tools)
+        if other is not None:
+            return "failed", ("VLM preflight failed: the story server runs in %s mode, not %s; "
+                              "stop it with bin/story-server stop and resubmit" % (other, VLM_MODE))
+        _say("vlm: unhealthy: %s; restarting it once" % problem)
+        outcome, value = _vlm_step(stop, cancel, deadline, timeout)
+        if outcome != "exit":
+            return outcome, value
+        if value != 0:
+            return "failed", ("VLM preflight failed: bin/story-server stop exited %d; the log above "
+                              "shows why" % value)
+
+
 # ---------------------------------------------------------------------------
 # Liveness, the dispatcher, startup recovery and job actions (MU26, MU29-MU31, MU68).
 # Every function here that reads or writes queue.json or a status is called with STORE_LOCK

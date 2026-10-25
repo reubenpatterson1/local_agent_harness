@@ -472,3 +472,151 @@ def test_review_focus_4_models_reply_not_utf8_or_oversized(tmp_path):
             assert [r[0] for r in fake.requests] == ["GET"]
         finally:
             fake.close()
+
+
+# --- VL3, VL9-VL16, VL28, Review Focus 5: the preflight (VR2, VR3) -----------------------------
+
+REQUIRED = {"kind": "story", "vlm": "required"}
+RESTORE_EXIT_1 = ("bin/story-server-restore mlx-vision --wait exited 1 "
+                  "(see ~/.local/share/qwen-agent/story-server-restore.log)")
+
+
+def _say_lines(capsys):
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith("[movie-ui] ")]
+
+
+def _preflight(tmp_path, job, tools, port, **kw):
+    return lib.vlm_preflight(job, str(tmp_path / "cancel"), tools=tools, port=port, **kw)
+
+
+def test_vl3_preflight_reports_a_recomputed_movie_policy(tmp_path, vlm, capsys):
+    ws = str(tmp_path / "ws")
+    tools = make_fake_tools(tmp_path, MODEL)
+    movie = {"kind": "movie", "workspace": ws, "story_id": "s1", "fields": {"action": "movie"},
+             "vlm": "required"}
+    _write_story(ws, "s1")
+    assert _preflight(tmp_path, movie, tools, vlm.port) == ("ok", None)
+    assert _say_lines(capsys)[0] == ("[movie-ui] vlm: job.json says vlm=required; story.md exists now, "
+                                     "so vlm=forbidden")
+    assert call_names(tools) == ["stop"]
+    os.unlink(os.path.join(lib.story_dir(ws, "s1"), "story.md"))
+    movie["vlm"] = "forbidden"
+    assert _preflight(tmp_path, movie, tools, vlm.port) == ("ok", None)
+    assert _say_lines(capsys)[0] == ("[movie-ui] vlm: job.json says vlm=forbidden; story.md is missing "
+                                     "now, so vlm=required")
+    movie["vlm"] = "required"
+    assert _preflight(tmp_path, movie, tools, vlm.port) == ("ok", None)
+    assert "job.json says" not in " ".join(_say_lines(capsys))
+
+
+def test_vl9_preflight_required_and_healthy(tmp_path, vlm, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == ("ok", None)
+    assert call_names(tools) == ["restore --wait"]
+    assert call_names(tools, include_status=True) == ["restore --wait", "status"]
+    assert _say_lines(capsys) == [
+        "[movie-ui] vlm: preflight: this job needs the VLM (vlm=required)",
+        "[movie-ui] vlm: running: %s mlx-vision --wait" % os.path.join(tools, "story-server-restore"),
+        "[movie-ui] vlm: healthy: %s on 127.0.0.1:%d" % (MODEL, vlm.port)]
+
+
+def test_vl10_preflight_unhealthy_then_healthy(tmp_path, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    fake = FakeVLM([{"id": MODEL, "loaded": True}], completion_status=[500, 200])
+    try:
+        assert _preflight(tmp_path, REQUIRED, tools, fake.port) == ("ok", None)
+    finally:
+        fake.close()
+    assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
+    lines = _say_lines(capsys)
+    assert "[movie-ui] vlm: unhealthy: completion failed: HTTP 500; restarting it once" in lines
+    assert lines[-1] == "[movie-ui] vlm: healthy: %s on 127.0.0.1:%d" % (MODEL, fake.port)
+
+
+def test_vl11_preflight_unhealthy_twice(tmp_path):
+    tools = make_fake_tools(tmp_path, MODEL)
+    fake = FakeVLM([{"id": MODEL, "loaded": True}], completion_status=500)
+    try:
+        assert _preflight(tmp_path, REQUIRED, tools, fake.port) == (
+            "failed", "VLM preflight failed after one restart: completion failed: HTTP 500")
+    finally:
+        fake.close()
+    assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
+
+
+def test_vl12_preflight_restore_fails_twice(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL, restore_rc=1)
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == (
+        "failed", "VLM preflight failed after one restart: " + RESTORE_EXIT_1)
+    assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
+    # The one status call is _vlm_other_mode's; no health check ran.
+    assert call_names(tools, include_status=True) == ["restore --wait", "status", "stop",
+                                                      "restore --wait"]
+    assert vlm.requests == []
+
+
+def test_vl13_preflight_forbidden(tmp_path, vlm, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    job = {"kind": "smoke", "vlm": "forbidden"}
+    assert _preflight(tmp_path, job, tools, vlm.port) == ("ok", None)
+    assert call_names(tools, include_status=True) == ["stop"]
+    assert _say_lines(capsys) == [
+        "[movie-ui] vlm: preflight: this job runs without the VLM (vlm=forbidden)",
+        "[movie-ui] vlm: running: %s stop" % os.path.join(tools, "story-server"),
+        "[movie-ui] vlm: stopped for this job"]
+    failing = make_fake_tools(tmp_path / "rc3", MODEL, stop_rc=3)
+    assert _preflight(tmp_path, job, failing, vlm.port) == (
+        "failed", "VLM preflight failed: bin/story-server stop exited 3; the log above shows why")
+
+
+def test_vl14_preflight_any(tmp_path, vlm, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    assert _preflight(tmp_path, {"kind": "download", "vlm": "any"}, tools, vlm.port) == ("ok", None)
+    assert _preflight(tmp_path, {"kind": "download"}, tools, vlm.port) == ("ok", None)
+    assert tool_calls(tools, include_status=True) == []
+    assert _say_lines(capsys) == ["[movie-ui] vlm: preflight: vlm=any; the VLM is left as it is"] * 2
+
+
+def test_vl15_cancel_during_preflight(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL, restore_sleep=30)
+    cancel = tmp_path / "cancel"
+    threading.Timer(1.0, cancel.touch).start()
+    started = time.monotonic()
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == ("cancelled", None)
+    assert time.monotonic() - started < 8
+    row = tool_calls(tools)[0]
+    assert row["tool"] == "story-server-restore"
+    assert not mt.pid_alive(row["pid"])
+
+
+def test_vl16_preflight_timeout(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL, restore_sleep=30)
+    started = time.monotonic()
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port, timeout=2) == (
+        "failed", "VLM preflight timed out after 2 s")
+    assert time.monotonic() - started < 10
+    assert not mt.pid_alive(tool_calls(tools)[0]["pid"])
+
+
+def test_vl28_another_mode_fails_without_a_stop(tmp_path, vlm):
+    for i, state_text, mode in ((0, "SERVING vision", "vision"), (1, "LOADING text", "text")):
+        tools = make_fake_tools(tmp_path / str(i), MODEL, restore_rc=1, serve_on_restore=False)
+        set_vlm_state(tools, state_text)
+        assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == (
+            "failed", "VLM preflight failed: the story server runs in %s mode, not mlx-vision; stop "
+                      "it with bin/story-server stop and resubmit" % mode)
+        assert call_names(tools, include_status=True) == ["restore --wait", "status"]
+    tools = make_fake_tools(tmp_path / "foreign", MODEL, restore_rc=1, serve_on_restore=False)
+    set_vlm_state(tools, "FOREIGN pid 5")
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == (
+        "failed", "VLM preflight failed after one restart: " + RESTORE_EXIT_1)
+    assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
+
+
+def test_review_focus_5_tools_path_with_a_space(tmp_path, vlm, capsys):
+    tools = make_fake_tools(tmp_path / "my ui ws", MODEL)
+    assert " " in tools
+    assert _preflight(tmp_path, REQUIRED, tools, vlm.port) == ("ok", None)
+    restore = os.path.join(tools, "story-server-restore")
+    assert _say_lines(capsys)[1] == "[movie-ui] vlm: running: '%s' mlx-vision --wait" % restore
+    assert call_names(tools) == ["restore --wait"]
