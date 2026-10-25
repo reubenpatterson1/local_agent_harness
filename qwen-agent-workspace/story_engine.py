@@ -865,7 +865,9 @@ def field_range(ctx, k, field):
 
 def plan_checks(ctx, plan, shape=()):
     """(hard, advisory) violation strings for a normalized plan (RS10). shape holds
-    normalize_plan's container-shape P2 violations, reported first."""
+    normalize_plan's container-shape P2 violations, reported first. Hard: P1, P2 and P3's
+    normalize and duplicate-phrase messages; every other P message is advisory (dialogue spec
+    6.3)."""
     hard, advisory = list(shape), []
     n = ctx.panels
     beats = plan["beats"]
@@ -922,7 +924,7 @@ def plan_checks(ctx, plan, shape=()):
             continue
         words = _words(entry["phrase"])
         if entry["cast_name"] is None and words > 4:
-            hard.append("plan: P3 cast entry: %s's phrase %s has %d words; at most 4"
+            advisory.append("plan: P3 cast entry: %s's phrase %s has %d words; at most 4"
                         % (cid, _q(entry["phrase"]), words))
         other = phrases.get(entry["phrase"].lower())
         if other is not None:
@@ -933,23 +935,23 @@ def plan_checks(ctx, plan, shape=()):
         try:
             lib.validate_descriptor(entry["descriptor"])
         except lib.CharacterError as e:
-            hard.append("plan: P3 cast entry: %s's %s" % (cid, e))
+            advisory.append("plan: P3 cast entry: %s's %s" % (cid, e))
     for lid, entry in valid["locations"].items():
         for problem in _setting_problems(entry["setting"]):
-            hard.append("plan: P4 setting sentence: %s's setting %s" % (lid, problem))
+            advisory.append("plan: P4 setting sentence: %s's setting %s" % (lid, problem))
         length = _setting_length(entry["setting"])
         if length:
             advisory.append("plan: P4 setting sentence: %s's setting %s" % (lid, length))
     arcs = [beat["arc"] if beat["arc"] in ARC_ROLES else None for beat in beats]
     for k, beat in enumerate(beats, start=1):
         if beat["arc"] and beat["arc"] not in ARC_ROLES:
-            hard.append("beat %d: P5 arc: %s is not one of %s"
+            advisory.append("beat %d: P5 arc: %s is not one of %s"
                         % (k, _q(beat["arc"]), ", ".join(ARC_ROLES)))
     required = (() if n == 1 else ("introduction", "resolution") if n == 2
                 else ("introduction", "climax", "resolution"))
     for role in required:
         if role not in arcs:
-            hard.append("plan: P5 arc: no beat has arc %s" % _q(role))
+            advisory.append("plan: P5 arc: no beat has arc %s" % _q(role))
     for k in range(2, len(arcs) + 1):
         a, b = arcs[k - 2], arcs[k - 1]
         if a and b and ARC_ROLES.index(b) < ARC_ROLES.index(a):
@@ -963,17 +965,17 @@ def plan_checks(ctx, plan, shape=()):
                             % _q(arcs[-1]))
     for k, beat in enumerate(beats, start=1):
         if beat["shot"] and beat["shot"] not in SHOT_TYPES:
-            hard.append("beat %d: P7 shot type: %s is not one of: %s"
+            advisory.append("beat %d: P7 shot type: %s is not one of: %s"
                         % (k, _q(beat["shot"]), ", ".join(SHOT_TYPES)))
         elif (beat["shot"] and beat["shot"] not in shot_types(ctx.narration)
               and (ctx.mode != "chained" or k == 1)):
-            hard.append("beat %d: P7 shot type: %s is too wide for on-screen speech; use one of: %s"
+            advisory.append("beat %d: P7 shot type: %s is too wide for on-screen speech; use one of: %s"
                         % (k, _q(beat["shot"]), ", ".join(shot_types(ctx.narration))))
         if beat["camera"] and beat["camera"] not in CAMERA_KEYS:
-            hard.append("beat %d: P8 camera: %s is not one of: %s"
+            advisory.append("beat %d: P8 camera: %s is not one of: %s"
                         % (k, _q(beat["camera"]), ", ".join(CAMERA_KEYS)))
         if len(beat["cast"]) > MAX_CAST[ctx.mode]:
-            hard.append("beat %d: P9 cast count: %d characters on screen; at most %d in this mode"
+            advisory.append("beat %d: P9 cast count: %d characters on screen; at most %d in this mode"
                         % (k, len(beat["cast"]), MAX_CAST[ctx.mode]))
         if k <= n:
             for field, pasted in pasted_pieces(ctx, plan, k).items():
@@ -1015,7 +1017,7 @@ def plan_checks(ctx, plan, shape=()):
         for where, text, exact in texts:
             for hit in undeclared_references(lib, text, undeclared, exact_phrase=exact,
                                         masks=masks):
-                hard.append(undeclared_message("plan: P13 undeclared character:", where, hit))
+                advisory.append(undeclared_message("plan: P13 undeclared character:", where, hit))
     advisory += plan["speech_notes"]
     return hard, advisory
 
@@ -1027,7 +1029,9 @@ def _is_pick(pick):
 
 
 def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
-    """(hard, advisory) LoRA violations of a plan (RS11, LC12). Not run without auto LoRA."""
+    """(hard, advisory) LoRA violations of a plan (RS11, LC12). Not run without auto LoRA. Hard:
+    L1, L6, L7 and a strength outside (0, 2], which the renderer refuses; L2-L4 and a strength
+    outside the entry's own range are advisory (dialogue spec 6.3, Q4)."""
     hard, advisory = [], []
     if not ctx.auto_lora:
         return hard, advisory
@@ -1061,8 +1065,11 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
             hard.append("%s: L1 catalog id: %s is not in the catalog" % (scope, _q(pick["id"])))
             return None
         lo, hi = entry["strength_range"]
-        if not lo <= pick["strength"] <= hi:
-            hard.append("plan: L5 strength: %s strength %s is outside its range %s to %s"
+        if not 0 < pick["strength"] <= 2:
+            hard.append("plan: L5 strength: %s strength %s is outside (0, 2], which the renderer "
+                        "refuses" % (_q(pick["id"]), repr(float(pick["strength"]))))
+        elif not lo <= pick["strength"] <= hi:
+            advisory.append("plan: L5 strength: %s strength %s is outside its range %s to %s"
                         % (_q(pick["id"]), repr(float(pick["strength"])), repr(float(lo)),
                            repr(float(hi))))
         return dict(entry, strength=pick["strength"])
@@ -1085,12 +1092,12 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     styles = ([pin_label(p) for p in pins if p.get("kind") == "style"]
               + [e["id"] for e in global_picks if e["kind"] == "style"])
     if len(styles) > 1:
-        hard.append("plan: L2 style: %d style LoRAs for every panel (%s); at most 1"
+        advisory.append("plan: L2 style: %d style LoRAs for every panel (%s); at most 1"
                     % (len(styles), ", ".join(styles)))
     for k in sorted(per_beat):
         for e in per_beat[k]:
             if e["kind"] == "style":
-                hard.append("beat %d: L2 style: style LoRA %s can only be a global pick"
+                advisory.append("beat %d: L2 style: style LoRA %s can only be a global pick"
                             % (k, _q(e["id"])))
     by_cast = {c["id"]: c for c in plan["cast"]}
     reported_dupes = set()
@@ -1104,12 +1111,12 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
                       for c in beat["cast"] if c in by_cast and by_cast[c]["cast_name"]])
         motion = [label for label, kind, _i, _p in loras_k if kind in ("motion", "physics")]
         if len(motion) > 1:
-            hard.append("beat %d: L3 motion: %d motion or physics LoRAs on this panel (%s); at "
+            advisory.append("beat %d: L3 motion: %d motion or physics LoRAs on this panel (%s); at "
                         "most 1" % (k, len(motion), ", ".join(motion)))
         if len(loras_k) > LORA_PANEL_LIMIT:
             message = ("beat %d: L4 LoRA count: %d LoRAs on this panel (%s); at most %d"
                        % (k, len(loras_k), ", ".join(l[0] for l in loras_k), LORA_PANEL_LIMIT))
-            (hard if (global_picks or per_beat.get(k)) else advisory).append(message)
+            advisory.append(message)
         ids = [i for _l, _k, i, _p in loras_k if i]
         for dup in sorted(set(i for i in ids if ids.count(i) > 1)):
             if dup not in reported_dupes:
@@ -1525,7 +1532,9 @@ def _valid_phrases(lib, plan):
 
 
 def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
-    """(hard, advisory) of one panel: the RS15 checks named in ids, plus N15 when in ids.
+    """(hard, advisory) of one panel: the RS15 checks named in ids, plus N15 when in ids. Hard:
+    N11 (Narration: empty with no Dialogue:), N18, T1, T2, T3; every other N rule is advisory
+    (dialogue spec 6.3, D6).
     fields: [(Label, assembled text)]; writers: {Label: writer text}; plan may be None (then
     every check that needs the plan is skipped)."""
     hard, advisory = [], []
@@ -1557,7 +1566,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     refs = [r for r in lib._person_refs(sentence, humans, animals, [])
                             if r[2] in lib.SHOTS_PERSON_NOUNS]
                     if refs:
-                        add(hard, "N2", "referring phrase", label,
+                        add(advisory, "N2", "referring phrase", label,
                             "names %s outside every referring phrase; name each character by "
                             "their exact phrase" % _q(refs[0][2]))
                         break
@@ -1566,13 +1575,13 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     text, list(phrases) + [p["name"] for p in plan["props"] if p["name"]]))
                 word = _first(_APPEARANCE_RE, blanked)
                 if word:
-                    add(hard, "N3", "appearance", label,
+                    add(advisory, "N3", "appearance", label,
                         "says %s; panels after the first never re-describe appearance, clothing, "
                         "setting, lighting, colour or style" % _q(word))
         if "N4" in ids and label not in ("Narration", "Dialogue") and beat is not None:
             for phrase in lib.find_phrases(writer, list(phrases)):
                 if phrases[phrase] not in beat["cast"]:
-                    add(hard, "N4", "stray cast", label,
+                    add(advisory, "N4", "stray cast", label,
                         "names %s, who is not in beat %d's cast" % (_q(phrase), k))
                     break
         pasted_field = ((ctx.mode == "chained" and k == 1 and label == "Image")
@@ -1583,14 +1592,14 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             if "N5" in ids and beat["location"] in by_location:
                 own = by_location[beat["location"]]
                 if _norm_text(own["setting"]) not in norm:
-                    add(hard, "N5", "setting sentence", label,
+                    add(advisory, "N5", "setting sentence", label,
                         "lacks %s's setting sentence word for word" % own["id"])
                 else:
                     for other in plan["locations"]:
                         if (other["id"] != own["id"] and other["setting"]
                                 and _norm_text(other["setting"]) != _norm_text(own["setting"])
                                 and _norm_text(other["setting"]) in norm):
-                            add(hard, "N5", "setting sentence", label,
+                            add(advisory, "N5", "setting sentence", label,
                                 "contains %s's setting sentence; beat %d is at %s"
                                 % (other["id"], k, own["id"]))
                             break
@@ -1600,40 +1609,41 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     if entry is None or (ctx.mode == "shots" and entry["cast_name"]):
                         continue
                     if _norm_text(entry["descriptor"]) not in norm:
-                        add(hard, "N6", "description", label,
+                        add(advisory, "N6", "description", label,
                             "lacks %s's description word for word" % cid)
                         break
         if label in action_fields:
             if "N7" in ids:
                 if any(q in writer for q in ('"', "“", "”")):
-                    add(hard, "N7", "dialogue and text", label, "contains a double quote")
+                    add(advisory, "N7", "dialogue and text", label, "contains a double quote")
                 else:
                     word = _first(DIALOGUE_RE, writer) or _first(ONSCREEN_TEXT_RE, writer)
                     if word:
-                        add(hard, "N7", "dialogue and text", label, "says %s" % _q(word))
+                        add(advisory, "N7", "dialogue and text", label, "says %s" % _q(word))
             if "N8" in ids and ctx.mode != "shots":
                 word = _first(lib._OFFSCREEN_RE, writer)
                 if word:
-                    add(hard, "N8", "off-screen", label,
+                    add(advisory, "N8", "off-screen", label,
                         "says %s; describe only what is in the frame" % _q(word))
             if "N9" in ids:
                 word = _first(CUT_RE, writer)
                 if word:
-                    add(hard, "N9", "cut wording", label,
+                    add(advisory, "N9", "cut wording", label,
                         "says %s; one panel is one continuous shot" % _q(word))
         if "N10" in ids and label != "Dialogue":
             found = PLACEHOLDER_RE.search(writer)
             copied = found.group(0) if found else next(
                 (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(writer)), None)
             if copied:
-                add(hard, "N10", "copied example", label, "contains template text %s" % _q(copied))
-        if "N11" in ids and label == "Narration" and not text.strip() and ctx.narration is True:
+                add(advisory, "N10", "copied example", label, "contains template text %s" % _q(copied))
+        if ("N11" in ids and label == "Narration" and not text.strip() and ctx.narration is True
+                and not dict(fields).get("Dialogue", "").strip()):
             hard.append("%s N11 narration: Narration: is empty" % prefix)
     if "N15" in ids and undeclared:
         masks = _undeclared_masks(lib, ctx, plan, undeclared)
         for label, text in [("Title", title)] + list(fields):
             for hit in undeclared_references(lib, text, undeclared, masks=masks):
-                hard.append(undeclared_message("%s N15 undeclared character:" % prefix,
+                advisory.append(undeclared_message("%s N15 undeclared character:" % prefix,
                                                label + ":", hit))
     known = cast_phrases(ctx, plan)
     dialogue = dict(fields).get("Dialogue", "")
@@ -1694,14 +1704,14 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     "line to a panel that shows them" % (_q(spoken_by), _q(spoken_by)))
         elif speech_only and narration.strip() and (
                 not found or lib.split_speaker(narration, known)[0] is None):
-            add(hard, "N16", "speaker", "Narration",
+            add(advisory, "N16", "speaker", "Narration",
                 "is voice-over, but this story is speech-only; start it with the referring "
                 "phrase of the character in the shot who says it and a colon, or leave it empty")
         elif found:
             if lib.split_speaker(narration, on_screen)[0] is not None:
                 pass
             elif lib.split_speaker(narration, known)[0] is not None:
-                add(hard, "N16", "speaker", "Narration",
+                add(advisory, "N16", "speaker", "Narration",
                     "is spoken by %s, who is not in this shot; only a character on screen can "
                     "speak, so make it voice-over (no prefix) or put %s in the shot"
                     % (_q(found[0]), _q(found[0])))
@@ -1801,13 +1811,14 @@ GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10"
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
-    """(hard, advisory) of an assembled story (RS15): plan-scope N10, then per panel N2-N11 and
-    N15 (hard), N16 (hard or advisory) and N1, N12-N14, N17 (advisory), then (shots)
-    character_lib.shots_violations and shots_advisories. story_md_path holds text (written by
-    the caller) and is parsed with bin/ltx-story-manifest's _parse_prompts_md."""
+    """(hard, advisory) of an assembled story (RS15; dialogue spec 6.3): per panel the
+    _field_checks classes; plan-scope N10 is advisory; in shots mode S1 and S3 are hard and every
+    other character_lib.shots_violations rule joins shots_advisories in advisory. story_md_path
+    holds text (written by the caller) and is parsed with bin/ltx-story-manifest's
+    _parse_prompts_md."""
     lib = _character_lib(ctx.ws)
     undeclared = undeclared_characters(ctx)
-    hard, advisory = plan_copied_examples(plan), []
+    hard, advisory = [], []
     writers_by_panel = []
     for k in range(1, len(parts) + 1):
         fields = panel_fields(ctx, plan, parts, k)
@@ -1818,12 +1829,14 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
                              GENERATION_CHECKS, undeclared)
         hard += h
         advisory += a
-    advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
+    advisory = plan_copied_examples(plan) + _order_by_panel(
+        advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
-        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration is True,
-                                     ignore_facing=True)
-        advisory += lib.shots_advisories(panels, ctx.members)
+        shots_hard, shots_other = split_shots(lib.shots_violations(
+            text, panels, ctx.panels, ctx.members, ctx.narration is True, ignore_facing=True))
+        hard += shots_hard
+        advisory += shots_other + lib.shots_advisories(panels, ctx.members)
     return hard, advisory
 
 
@@ -1832,6 +1845,16 @@ def _order_by_panel(lines):
     order = {"N12": 0, "N13": 1, "N14": 2, "N16": 3, "N17": 4}
     return sorted(lines, key=lambda l: (int(l.split(":", 1)[0].split()[1]),
                                         order.get(l.split()[2], 3)))
+
+
+SHOTS_HARD_RULES = ("S1", "S3")
+
+
+def split_shots(violations):
+    """(the S1/S3 violations, the other S rules) of a character_lib.shots_violations list: in the
+    robust engine only S1 and S3 are hard (dialogue spec 6.3)."""
+    return ([v for v in violations if parse_violation(v)["id"] in SHOTS_HARD_RULES],
+            [v for v in violations if parse_violation(v)["id"] not in SHOTS_HARD_RULES])
 
 
 def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
@@ -2180,7 +2203,7 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
         if patch["target"] != "plan":
             continue
         index = patch["index"]
-        before = lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+        before = sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
         saved = copy.deepcopy(plan["loras"])
         if index == 0:
             plan["loras"]["global"] = patch["replacement"]
@@ -2188,7 +2211,7 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
             plan["loras"]["per_beat"][str(index)] = patch["replacement"]
         else:
             plan["loras"]["per_beat"].pop(str(index), None)
-        broken = [h for h in lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+        broken = [h for h in sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
                   if h not in before]
         if broken:
             plan["loras"] = saved
@@ -2824,9 +2847,10 @@ def _read_story(ctx, story_md):
 
 
 def plan_free_report(story_md, mode, panels, members, legacy_validate, ws=None):
-    """The hard violations a re-check computes without a plan (RS28; the 7.2 yardstick for both
-    engines). ws (default: this file's directory) locates the character library and the
-    manifest parser. Prints nothing, writes nothing."""
+    """(hard, advisory) of a re-check without a plan (RS28; the 7.2 yardstick for both engines;
+    dialogue spec 6.4): hard is legacy_validate (not shots), the hard part of _field_checks and
+    S1/S3 (shots); advisory is the rest, N15 included. ws (default: this file's directory)
+    locates the character library and the manifest parser. Prints nothing, writes nothing."""
     ws = ws or os.path.dirname(os.path.realpath(__file__))
     ctx = StoryContext(ws=ws, story_id="", story_dir=os.path.dirname(story_md), mode=mode,
                        panels=panels, seconds="6", narrative="", goal=None, members=members,
@@ -2836,33 +2860,37 @@ def plan_free_report(story_md, mode, panels, members, legacy_validate, ws=None):
                        judge=False)
     lib = _character_lib(ws)
     hard = [] if mode == "shots" else list(legacy_validate(story_md, panels, mode == "no_stills"))
+    advisory = []
     text, parsed = _read_story(ctx, story_md)
     undeclared = undeclared_characters(ctx)
     for k, panel in enumerate(parsed, start=1):
         fields = story_fields(mode, k, panel)
-        hard += _field_checks(ctx, lib, None, k, panel["title"], fields, dict(fields),
-                              PLAN_FREE_IDS, undeclared)[0]
+        h, a = _field_checks(ctx, lib, None, k, panel["title"], fields, dict(fields),
+                             PLAN_FREE_IDS, undeclared)
+        hard += h
+        advisory += a
     if mode == "shots":
-        hard += lib.shots_violations(text, parsed, panels, members, ignore_facing=True)
-    return hard
+        shots_hard, shots_other = split_shots(lib.shots_violations(text, parsed, panels, members,
+                                                                    ignore_facing=True))
+        hard += shots_hard
+        advisory += shots_other
+    return hard, advisory
 
 
 def _undeclared_gate(ctx, story_md, legacy_validate, passed):
-    """passed, unless story.md names a library character that was not declared (RS37)."""
-    n15 = [v for v in plan_free_report(story_md, ctx.mode, ctx.panels, ctx.members,
-                                       legacy_validate, ws=ctx.ws) if " N15 " in v]
-    if not n15:
-        return passed
-    for v in n15:
-        print("  - %s" % v, file=sys.stderr)
-    print("ltx-movie: story.md names library characters that were not declared with --character; "
-          "fix story.md and re-run", file=sys.stderr)
-    return 2, []
+    """passed, after a Warning line for every N15 of plan_free_report (a library character
+    story.md names but --character did not declare; advisory, RS37 and dialogue spec Q1)."""
+    for v in plan_free_report(story_md, ctx.mode, ctx.panels, ctx.members, legacy_validate,
+                              ws=ctx.ws)[1]:
+        if " N15 " in v:
+            print("Warning: %s" % v)
+    return passed
 
 
 def recheck(ctx, legacy_validate):
-    """Re-check an existing story.md instead of regenerating it (RS28). Returns (exit code,
-    advisories). legacy_validate is bin/ltx-movie's _validate_story_md."""
+    """Re-check an existing story.md instead of regenerating it (RS28; dialogue spec 6.7).
+    Returns (exit code, advisories): 2 only when a blocking violation remains (unresolved T2/T3
+    only warn). legacy_validate is bin/ltx-movie's _validate_story_md."""
     story_md = os.path.join(ctx.story_dir, "story.md")
     for warning in catalog_warnings(ctx):
         print(warning)
@@ -2886,29 +2914,36 @@ def recheck(ctx, legacy_validate):
                 advisory += a
             advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
             if ctx.mode == "shots":
-                hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                            ctx.narration is True, ignore_facing=True)
-                advisory += lib.shots_advisories(parsed, ctx.members)
+                shots_hard, shots_other = split_shots(lib.shots_violations(
+                    text, parsed, ctx.panels, ctx.members, ctx.narration is True,
+                    ignore_facing=True))
+                hard += shots_hard
+                advisory += shots_other + lib.shots_advisories(parsed, ctx.members)
             if ctx.auto_lora:
                 compatible = dict((e["id"], e) for e in compatible_entries(ctx))
                 catalog = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
                 lh, la = lora_checks(ctx, plan, compatible, catalog)
                 hard += lh
                 advisory += la
-            _write_json(os.path.join(ctx.story_dir, "story_checks.json"),
-                        _checks_doc(ctx, {"hard": hard, "advisory": advisory}, source="recheck"))
-            if hard:
+            blocking_list, unresolved_list = blocking(hard), unresolved(hard)
+            doc = _checks_doc(ctx, {"hard": blocking_list, "advisory": advisory},
+                              source="recheck")
+            doc["unresolved"] = [parse_violation(m) for m in unresolved_list]
+            _write_json(os.path.join(ctx.story_dir, "story_checks.json"), doc)
+            if blocking_list:
                 print("Error: story.md fails the story checks:", file=sys.stderr)
-                for message in hard:
+                for message in blocking_list:
                     print("  - %s" % message, file=sys.stderr)
                 print("Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
                       "regenerate it." % story_md, file=sys.stderr)
-                if any(parse_violation(m)["id"].startswith("L") for m in hard):
+                if any(parse_violation(m)["id"].startswith("L") for m in blocking_list):
                     print("The L violations come from plan.json's catalog LoRA picks, not from "
                           "story.md: restore or re-add the LoRA files (bin/lora-catalog verify), "
                           "rerun with --no-auto-lora, or pass --force-story to regenerate.",
                           file=sys.stderr)
                 return 2, advisory
+            for message in unresolved_list:
+                print("Warning: unresolved: %s" % message)
             return 0, advisory
         except (KeyError, TypeError, AttributeError, ValueError, IndexError):
             print("note: %s is malformed; re-checking story.md without it"
@@ -2926,9 +2961,10 @@ def recheck(ctx, legacy_validate):
         return _undeclared_gate(ctx, story_md, legacy_validate, (0, []))
     try:
         text, parsed = _read_story(ctx, story_md)
-        violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                               ctx.narration is True, ignore_facing=True)
-        advisories = lib.shots_advisories(parsed, ctx.members)
+        violations, others = split_shots(lib.shots_violations(text, parsed, ctx.panels,
+                                                              ctx.members, ctx.narration is True,
+                                                              ignore_facing=True))
+        advisories = others + lib.shots_advisories(parsed, ctx.members)
     except OSError as e:
         violations, advisories = ["story: cannot read story.md: %s" % e], []
     if violations:

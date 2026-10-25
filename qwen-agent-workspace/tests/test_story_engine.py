@@ -457,6 +457,8 @@ def _pins(*specs):
 
 
 def test_rst15_lora_checks(ws, tmp_path, story_env):
+    # L1, L6, L7 and an L5 strength outside (0, 2] are hard; L2-L4 and an L5 strength outside
+    # the entry's range are advisory (dialogue spec 6.3, Q4).
     ctx = _lora_ctx(ws, tmp_path)
     paths = {e["id"]: e["path"] for e in ctx.catalog["entries"]}
     model = seu.VIDEO_MODEL
@@ -469,44 +471,47 @@ def test_rst15_lora_checks(ws, tmp_path, story_env):
 
     assert lv({"global": [pick("film-grain"), pick("fast-motion")],
                "per_beat": {"2": [pick("rain-physics")]}, "stills": [pick("ink-stills")]}) == (
-        ["beat 2: L3 motion: 2 motion or physics LoRAs on this panel (fast-motion, "
-         "rain-physics); at most 1"], [])
+        [], ["beat 2: L3 motion: 2 motion or physics LoRAs on this panel (fast-motion, "
+             "rain-physics); at most 1"])
     assert lv({"global": [pick("film-grain")], "per_beat": {"2": [pick("rain-physics")]},
                "stills": [pick("ink-stills")]}) == ([], [])
     cases = [
-        ({"global": [pick("nope")]}, ["plan: L1 catalog id: 'nope' is not in the catalog"]),
+        ({"global": [pick("nope")]}, ["plan: L1 catalog id: 'nope' is not in the catalog"], []),
         ({"global": [pick("other-model")]},
-         ["plan: L1 catalog id: 'other-model' does not support model %s" % model]),
+         ["plan: L1 catalog id: 'other-model' does not support model %s" % model], []),
         ({"global": [pick("ink-stills")]},
          ["plan: L1 catalog id: 'ink-stills' is a stills LoRA; global and per-beat picks must "
-          "be video LoRAs"]),
+          "be video LoRAs"], []),
         ({"stills": [pick("fast-motion")]},
          ["plan: L1 catalog id: 'fast-motion' is a video LoRA; a stills pick must be a stills "
-          "LoRA"]),
+          "LoRA"], []),
         ({"per_beat": {"9": [pick("fast-motion")]}},
-         ["plan: L1 catalog id: per_beat key '9' is not a beat number from 1 to 3"]),
+         ["plan: L1 catalog id: per_beat key '9' is not a beat number from 1 to 3"], []),
         ({"per_beat": {"2": [{"id": "fast-motion", "strength": "high"}]}},
          ['beat 2: L1 catalog id: pick {"id": "fast-motion", "strength": "high"} is not an '
-          'object with an id and a numeric strength']),
-        ({"global": [pick("film-grain"), pick("big-style")]},
+          'object with an id and a numeric strength'], []),
+        ({"global": [pick("film-grain"), pick("big-style")]}, [],
          ["plan: L2 style: 2 style LoRAs for every panel (film-grain, big-style); at most 1"]),
-        ({"per_beat": {"2": [pick("film-grain")]}},
+        ({"per_beat": {"2": [pick("film-grain")]}}, [],
          ["beat 2: L2 style: style LoRA 'film-grain' can only be a global pick"]),
-        ({"global": [pick("fast-motion", 1.4)]},
+        ({"global": [pick("fast-motion", 1.4)]}, [],
          ["plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"]),
+        ({"global": [pick("fast-motion", 2.5)]},
+         ["plan: L5 strength: 'fast-motion' strength 2.5 is outside (0, 2], which the renderer "
+          "refuses"], []),
         ({"stills": [pick("ink-stills"), pick("ink-stills")]},
-         ["plan: L7 stills: 2 stills LoRAs; at most 1"]),
+         ["plan: L7 stills: 2 stills LoRAs; at most 1"], []),
     ]
-    for loras, expected in cases:
+    for loras, hard, advisory in cases:
         full = {"global": [], "per_beat": {}, "stills": []}
         full.update(loras)
-        assert lv(full) == (expected, []), expected
+        assert lv(full) == (hard, advisory), (hard, advisory)
     pins3 = _pins(("/p/1.safetensors", 1.0, None, None), ("/p/2.safetensors", 1.0, None, None),
                   ("/p/3.safetensors", 1.0, None, None))
     assert lv({"global": [pick("film-grain")], "per_beat": {"2": [pick("fast-motion")]}},
               ctx=ctx._replace(pinned=pins3)) == (
-        ["beat 2: L4 LoRA count: 5 LoRAs on this panel (pinned LoRA, pinned LoRA, pinned LoRA, "
-         "film-grain, fast-motion); at most 4"], [])
+        [], ["beat 2: L4 LoRA count: 5 LoRAs on this panel (pinned LoRA, pinned LoRA, pinned LoRA, "
+             "film-grain, fast-motion); at most 4"])
     members = _cast_members(story_env, "kyra", "ronin")
     cast_ctx = ctx._replace(pinned=pins3, members=members, mode="shots")
     fixed = [{"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K},
@@ -526,7 +531,7 @@ def test_rst15_lora_checks(ws, tmp_path, story_env):
         ["plan: L7 stills: 'ink-stills' is also passed with --stills-lora"], [])
     style_pin = _pins((paths["big-style"], 1.9, "big-style", "style"))
     assert lv({"global": [pick("film-grain")]}, ctx=ctx._replace(pinned=style_pin)) == (
-        ["plan: L2 style: 2 style LoRAs for every panel (big-style, film-grain); at most 1"], [])
+        [], ["plan: L2 style: 2 style LoRAs for every panel (big-style, film-grain); at most 1"])
     assert lv({}, ctx=ctx._replace(pinned=style_pin)) == ([], [])
     off = ctx._replace(auto_lora=False)
     assert lv({"global": [pick("nope")]}, ctx=off) == ([], [])
@@ -792,8 +797,8 @@ def test_rst20c_narration_modes(ws, monkeypatch, capsys):
                   "start it with the referring phrase of the character in the shot who says it "
                   "and a colon, or leave it empty")
     assert se.recheck(saved, lambda path, panels, no_stills=False: ltx_movie._validate_story_md(
-        path, panels, no_stills, no_narration=True)) == (2, [])
-    assert "  - %s\n" % voice_over in capsys.readouterr().err
+        path, panels, no_stills, no_narration=True)) == (0, [voice_over])
+    assert capsys.readouterr().err == ""
     off = {"narration": False}
     for mode in ("chained", "no_stills", "shots"):
         assert _story_checks(ws, mode, ctx_kw=off) == [], mode
@@ -1065,9 +1070,9 @@ def test_rst20_panel_checks(ws):
     ctx, plan, parts, _text, _path = _story(ws, "chained", 3)
     lib = se._character_lib(WS)
     fields = [("Image", "The courier stands."), ("Motion", "x"), ("Narration", "y")]
-    assert se._field_checks(ctx, lib, plan, 1, "T", fields, {}, ("N5", "N6"), []) == (
-        ["panel 1: N5 setting sentence: Image: lacks l1's setting sentence word for word",
-         "panel 1: N6 description: Image: lacks c1's description word for word"], [])
+    assert se._field_checks(ctx, lib, plan, 1, "T", fields, {}, ("N5", "N6"), []) == ([], [
+        "panel 1: N5 setting sentence: Image: lacks l1's setting sentence word for word",
+        "panel 1: N6 description: Image: lacks c1's description word for word"])
     shots_ctx = ctx._replace(mode="shots")
     plan["cast"][0]["cast_name"] = "kyra"
     assert se._field_checks(shots_ctx, lib, plan, 1, "T", fields, {}, ("N6",), []) == ([], [])
@@ -1804,15 +1809,14 @@ def test_rst43_exit_2_message(ws, tmp_path, monkeypatch, capsys):
 
 
 def test_rst55b_p13_forces_plan_call_2(ws, tmp_path, monkeypatch, story_env):
+    # P13 is advisory (dialogue spec Q1): the plan is used as written, with the P13 advisory.
     seu.ronin(story_env["lib"])
     bad = seu.plan_json("chained", 3)
     bad["cast"][1]["phrase"] = "the ronin"
-    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[
-        seu.answer(bad), seu.answer(seu.plan_json("chained", 3))],
-        critic=[seu.answer(seu.critic_json())])
-    assert rc == 0 and [r["stage"] for r in log][:2] == ["plan", "plan"]
-    assert ("- plan: P13 undeclared character: c2's phrase names library character ronin by its "
-            "referring phrase 'the ronin'") in log[1]["argv"][-1]
+    rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[seu.answer(bad)])
+    assert rc == 0 and [r["stage"] for r in log][:2] == ["plan", "panel"]
+    assert ("plan: P13 undeclared character: c2's phrase names library character ronin by its "
+            "referring phrase 'the ronin'; " + _p13()) in advisories
 
 
 def test_rst58_a_patch_that_names_an_undeclared_character_loses(ws, tmp_path, monkeypatch,
@@ -1979,24 +1983,27 @@ def test_rst44_recheck_with_plan(ws, monkeypatch, tmp_path, capsys):
     assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert (checks["source"], checks["round"], checks["stop_reason"], checks["rounds"],
-            checks["hard"]) == ("recheck", None, None, [], [])
+            checks["hard"], checks["unresolved"]) == ("recheck", None, None, [], [], [])
     motion = seu.panel_json("chained", 2)["motion"]
     _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
     story_md = os.path.join(ctx.story_dir, "story.md")
-    assert se.recheck(ctx, ltx_movie._validate_story_md) == (2, [])
-    assert capsys.readouterr().err == (
-        "Error: story.md fails the story checks:\n"
-        "  - panel 2: N7 dialogue and text: Motion: says 'yells'\n"
-        "Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
-        "regenerate it.\n" % story_md)
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (
+        0, ["panel 2: N7 dialogue and text: Motion: says 'yells'"])
+    assert capsys.readouterr().err == ""
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
-    assert checks["source"] == "recheck" and [h["id"] for h in checks["hard"]] == ["N7"]
+    assert checks["source"] == "recheck" and checks["hard"] == []
+    assert [a["id"] for a in checks["advisory"]] == ["N7"]
     assert seu.agent_log(log) == []
     _edit_story(ctx, "Narration: Every street led down to the water.\n", "Narration:\n")
-    se.recheck(ctx, ltx_movie._validate_story_md)
+    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    assert capsys.readouterr().err == (
+        "Error: story.md fails the story checks:\n"
+        "  - panel 2: missing/empty Narration: field\n"
+        "  - panel 2: N11 narration: Narration: is empty\n"
+        "Hand-edit %s to fix the violations above and rerun, or pass --force-story to "
+        "regenerate it.\n" % story_md)
     hard = [h["message"] for h in _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["hard"]]
     assert hard == ["panel 2: missing/empty Narration: field",
-                    "panel 2: N7 dialogue and text: Motion: says 'yells'",
                     "panel 2: N11 narration: Narration: is empty"]
 
 
@@ -2020,13 +2027,9 @@ def test_rst45_recheck_without_plan(ws, monkeypatch, capsys, story_env):
     os.remove(os.path.join(shots.story_dir, "plan.json"))
     _edit_story(shots, "Motion: The courier steps forward onto the wet stones.",
                 "Motion: The courier steps forward then turns.")
-    assert se.recheck(shots, ltx_movie._validate_story_md) == (2, [])
-    err = capsys.readouterr().err
-    assert err.startswith("Error: story.md breaks the shot rules:\n")
-    assert "  - panel 3: S5 one action: Motion: chains actions with 'then'\n" in err
-    assert err.endswith("Hand-edit %s to fix the violations above and rerun, or pass "
-                        "--force-story to have the story model write a new one.\n"
-                        % os.path.join(shots.story_dir, "story.md"))
+    rc, advisories = se.recheck(shots, ltx_movie._validate_story_md)
+    assert rc == 0 and advisories[0] == "panel 3: S5 one action: Motion: chains actions with 'then'"
+    assert "breaks the shot rules" not in capsys.readouterr().err
 
 
 def test_rst56b_n15_in_recheck_and_plan_free_report(ws, monkeypatch, capsys, story_env):
@@ -2034,22 +2037,24 @@ def test_rst56b_n15_in_recheck_and_plan_free_report(ws, monkeypatch, capsys, sto
     ctx, text = _saved_story(ws, monkeypatch, mode="shots")
     _edit_story(ctx, "Narration: He knew the letter could not wait.",
                 "Narration: Ronin knew the letter could not wait.")
-    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
+    rc, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
     message = ("panel 3: N15 undeclared character: Narration: names library character ronin by "
                "its name 'Ronin'; library characters appear only when declared with --character "
                "ronin")
-    assert "  - %s\n" % message in capsys.readouterr().err
+    assert rc == 0 and message in advisories
+    assert message not in capsys.readouterr().err
     story_md = os.path.join(ctx.story_dir, "story.md")
     assert se.plan_free_report(story_md, "shots", 3, [], ltx_movie._validate_story_md,
-                               ws=ws) == [message]
+                               ws=ws) == ([], [message])
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     report = se.plan_free_report(story_md, "shots", 3, members, ltx_movie._validate_story_md, ws=ws)
-    assert message not in report
+    assert message not in report[0] + report[1]
     chained, _t = _saved_story(ws, monkeypatch, ctx_kw={"story_id": "s7"})
     path = os.path.join(chained.story_dir, "story.md")
-    assert se.plan_free_report(path, "chained", 3, [], ltx_movie._validate_story_md, ws=ws) == []
-    assert se.plan_free_report(path, "chained", 4, [], ltx_movie._validate_story_md, ws=ws) == [
-        "expected exactly 4 panels, found 3"]
+    assert se.plan_free_report(path, "chained", 3, [], ltx_movie._validate_story_md,
+                               ws=ws) == ([], [])
+    assert se.plan_free_report(path, "chained", 4, [], ltx_movie._validate_story_md,
+                               ws=ws) == (["expected exactly 4 panels, found 3"], [])
 
 
 def _plan_path(ctx):
@@ -2066,8 +2071,9 @@ def test_rst44b_recheck_stale_plan_cast_does_not_mask(ws, monkeypatch, capsys, s
         json.dump(plan, f)
     _edit_story(ctx, "Narration: He knew the letter could not wait.",
                 "Narration: The ronin knew the letter could not wait.")
-    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
-    assert " N15 " in capsys.readouterr().err
+    rc, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
+    assert rc == 0 and [a for a in advisories if " N15 " in a]
+    assert " N15 " not in capsys.readouterr().err
 
 
 def test_rst44c_recheck_malformed_plan_falls_back(ws, monkeypatch, capsys, story_env):
@@ -2109,11 +2115,11 @@ def test_rst44d_recheck_no_plan_enforces_n15(ws, monkeypatch, capsys, story_env)
     os.remove(_plan_path(ctx))
     _edit_story(ctx, "Narration: The rain had not stopped since dawn.\n",
                 "Narration: The ronin watched the rain.\n")
-    assert se.recheck(ctx, ltx_movie._validate_story_md) == (2, [])
-    err = capsys.readouterr().err
-    assert " N15 " in err
-    assert err.endswith("ltx-movie: story.md names library characters that were not declared "
-                        "with --character; fix story.md and re-run\n")
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert ("Warning: panel 1: N15 undeclared character: Narration: names library character "
+            "ronin") in out
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     declared = seu.make_ctx(se, ws, mode="chained", panels=3, members=members)
     assert se.recheck(declared, ltx_movie._validate_story_md) == (0, [])
@@ -2130,8 +2136,8 @@ def test_rst44e_recheck_judges_writer_text_like_generation(ws, monkeypatch, caps
     assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
     motion = seu.panel_json("chained", 2)["motion"]
     _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
-    assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
-    assert "  - panel 2: N7 dialogue and text: Motion: says 'yells'\n" in capsys.readouterr().err
+    rc, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
+    assert rc == 0 and "panel 2: N7 dialogue and text: Motion: says 'yells'" in advisories
 
 
 def test_rst44f_recheck_lora_violations_point_at_plan_json(ws, monkeypatch, capsys):

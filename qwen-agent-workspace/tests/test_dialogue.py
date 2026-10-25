@@ -1268,3 +1268,230 @@ def test_dlg22_the_critic_rewrites_one_sentence(ws, tmp_path, monkeypatch):
     assert applied == [] and [r["reason"] for r in rejected] == [
         "the patch changes 2 sentences; it may change at most 1 contiguous sentence(s) and must "
         "keep every other sentence word for word"]
+
+
+# --- DLG18, DLG21, DLG25: the D6 classes and the re-check (6.3, 6.4, 6.7) -------------------
+
+NARRATIVE = "A courier carries a sealed letter across a rainy harbour town."
+STRIKE = "The courier strikes the old monk with a heavy staff."
+
+
+def _ids(messages):
+    return set(se.parse_violation(m if isinstance(m, str) else m["message"])["id"]
+               for m in messages)
+
+
+def _saved(ws, monkeypatch, mode="chained", n=3, story_id="s1", plan_mut=None, replies=None):
+    """A story.md and plan.json saved in <story_dir> as a run would leave them."""
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    ctx, plan, _parts, text, _path = _story(ws, mode, n, plan_mut=plan_mut, replies=replies,
+                                            ctx_kw={"story_id": story_id})
+    with open(os.path.join(ctx.story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(text)
+    with open(os.path.join(ctx.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    return ctx, text
+
+
+def _edit(ctx, old, new):
+    path = os.path.join(ctx.story_dir, "story.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    assert text.count(old) == 1, old
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.replace(old, new))
+
+
+def _two_people(raw):
+    raw["beats"][1]["cast"] = ["c1", "c2"]
+
+
+def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
+    def advisory_only(mode, rule, replies):
+        hard, advisory = _checks(ws, mode, replies=replies)
+        assert hard == [] and _only(advisory, rule), (rule, hard, advisory)
+
+    advisory_only("chained", "N2", {2: {"motion": "The courier waves at the woman beside the "
+                                                  "crates and keeps pedalling forward in the rain."}})
+    advisory_only("chained", "N3", {2: {"motion": "The courier pulls the grey hood tighter and "
+                                                  "pedals forward along the road past the boats."}})
+    advisory_only("chained", "N4", {2: {"motion": "The courier pedals past the old monk beside the "
+                                                  "crates and on toward the end of the quay."}})
+    advisory_only("chained", "N5", {1: {"image": seu.panel_json("chained", 1)["image"][:300] + " "
+                                                 + seu.TEMPLE}})
+    advisory_only("no_stills", "N7", {2: {"prompt": seu.panel_json("no_stills", 2)["prompt"]
+                                                    + " A fisherman shouts across the water."}})
+    advisory_only("chained", "N7", {3: {"motion": 'The courier reads the "urgent" note and pedals '
+                                                  "on toward the end of the quay."}})
+    advisory_only("shots", "N7", {2: {"image": seu.panel_json("shots", 2)["image"]
+                                               + " A caption fills the lower edge."}})
+    advisory_only("chained", "N8", {2: {"motion": "The courier pedals toward a noise off-screen at "
+                                                  "the far end of the long quay."}})
+    advisory_only("chained", "N9", {2: {"motion": "The courier pedals hard and we cut to the far "
+                                                  "end of the quay at once."}})
+    advisory_only("chained", "N10", {1: {"narration": "<one sentence of voice-over narration>"}})
+    replies = {2: {"motion": STRIKE}, 3: {"motion": "The courier steps forward then turns."}}
+    ctx, plan, parts, text, path = _story(ws, "shots", 3, plan_mut=_two_people, replies=replies)
+    parts[2]["narration"] = ""
+    text = se.assemble(ctx, plan, parts)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    hard, advisory = se.panel_checks(ctx._replace(panels=4), plan, parts, text, path)
+    assert _ids(hard) == {"S1", "S3", "N11"} and {"S5", "S8"} <= _ids(advisory)
+    saved, _text = _saved(ws, monkeypatch, "shots", story_id="d18", plan_mut=_two_people,
+                          replies=replies)
+    _edit(saved, "Narration: " + seu.panel_json("shots", 3)["narration"] + "\n", "")
+    assert se.recheck(saved, ltx_movie._validate_story_md)[0] == 2
+    checks = _read_json(os.path.join(saved.story_dir, "story_checks.json"))
+    assert {"S3", "N11"} <= _ids(checks["hard"]) and not {"S5", "S8"} & _ids(checks["hard"])
+    assert {"S5", "S8"} <= _ids(checks["advisory"])
+    story_md = os.path.join(saved.story_dir, "story.md")
+    report = se.plan_free_report(story_md, "shots", 4, [], ltx_movie._validate_story_md, ws=ws)
+    assert _ids(report[0]) == {"S1", "S3", "N11"} and {"S5", "S8"} <= _ids(report[1])
+    os.remove(os.path.join(saved.story_dir, "plan.json"))
+    capsys.readouterr()
+    assert se.recheck(saved._replace(panels=4), ltx_movie._validate_story_md) == (2, [])
+    err = capsys.readouterr().err
+    assert "  - story: S1 panel count: expected exactly 4 panels, found 3\n" in err
+    assert " S3 fields: " in err and " S5 " not in err and " S8 " not in err
+
+    def plan_classes(mutate, mode="chained"):
+        ctx = seu.make_ctx(se, ws, mode=mode, panels=3)
+        raw = seu.plan_json(mode, 3)
+        mutate(raw)
+        plan, shape = se.normalize_plan(ctx, raw)
+        return se.plan_checks(ctx, plan, shape)
+
+    seu.ronin(story_env["lib"])
+    for mutate, rule, mode in (
+            (lambda raw: raw["locations"][0].update(setting="A rainy harbour town in modern Japan, "
+                                                            "wet cobblestones underfoot, boats "
+                                                            "behind, under grey light."), "P4",
+             "chained"),
+            (lambda raw: raw["beats"][1].update(arc="middle"), "P5", "chained"),
+            (lambda raw: raw["beats"][2].update(shot="aerial shot"), "P7", "chained"),
+            (lambda raw: raw["beats"][2].update(camera="zoom"), "P8", "chained"),
+            (lambda raw: raw["cast"][1].update(phrase="the very old bald monk"), "P3", "chained"),
+            (lambda raw: raw["cast"][1].update(descriptor="an old man"), "P3", "chained"),
+            (lambda raw: raw["cast"][1].update(phrase="the ronin"), "P13", "chained"),
+            (lambda raw: (raw["cast"].append({"id": "c3", "phrase": "the guard",
+                                              "descriptor": seu.MONK}),
+                          raw["beats"][1].update(cast=["c1", "c2", "c3"])), "P9", "shots")):
+        hard, advisory = plan_classes(mutate, mode)
+        assert hard == [] and _only(advisory, rule), (rule, hard, advisory)
+    for phrase in ("The Courier", "the monk!"):
+        hard, advisory = plan_classes(lambda raw: raw["cast"][1].update(phrase=phrase))
+        assert _only(hard, "P3") and not _only(advisory, "P3"), phrase
+    files = str(tmp_path / "files")
+    entries = [seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
+               seu.catalog_entry(seu.lora_file(files, "big"), "big-style", kind="style"),
+               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+               seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics")]
+    lctx = seu.make_ctx(se, ws, catalog={"schema_version": 1, "entries": entries})
+
+    def lora(loras, ctx=lctx):
+        raw = seu.plan_json("chained", 3)
+        raw["loras"] = dict({"global": [], "per_beat": {}, "stills": []}, **loras)
+        plan, _shape = se.normalize_plan(ctx, raw)
+        compatible = dict((e["id"], e) for e in se.compatible_entries(ctx))
+        return se.lora_checks(ctx, plan, compatible, dict((e["id"], e) for e in entries))
+
+    def pick(entry_id, strength=0.8):
+        return {"id": entry_id, "strength": strength}
+
+    assert lora({"global": [pick("fast-motion", 2.5)]}) == ([
+        "plan: L5 strength: 'fast-motion' strength 2.5 is outside (0, 2], which the renderer "
+        "refuses"], [])
+    assert lora({"global": [pick("fast-motion", 1.4)]}) == ([], [
+        "plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"])
+    for loras, rule, ctx in (
+            ({"global": [pick("film-grain"), pick("big-style")]}, "L2", lctx),
+            ({"per_beat": {"2": [pick("film-grain")]}}, "L2", lctx),
+            ({"global": [pick("fast-motion")], "per_beat": {"2": [pick("rain-physics")]}}, "L3",
+             lctx),
+            ({"global": [pick("film-grain")], "per_beat": {"2": [pick("fast-motion")]}}, "L4",
+             lctx._replace(pinned=[{"path": "/p/%d.safetensors" % i, "strength": 1.0,
+                                    "catalog_id": None, "kind": None} for i in (1, 2, 3)]))):
+        hard, advisory = lora(loras, ctx)
+        assert hard == [] and _only(advisory, rule), (rule, hard, advisory)
+    assert lora({"global": [pick("nope")]}) == (["plan: L1 catalog id: 'nope' is not in the "
+                                                 "catalog"], [])
+    rain = dict((e["id"], e["path"]) for e in entries)["rain-physics"]
+    hard, _advisory = lora({"global": [pick("rain-physics")]}, lctx._replace(pinned=[
+        {"path": rain, "strength": 1.0, "catalog_id": "rain-physics", "kind": "physics"}]))
+    assert _only(hard, "L6")
+    assert _only(lora({"stills": [pick("nope"), pick("nope-two")]})[0], "L7")
+
+
+def test_dlg21_an_advisory_only_round_0_passes_untouched(tmp_path, monkeypatch, capsys):
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    monkeypatch.setattr(ltx_movie, "_check_sudo_and_start_keepalive", lambda: None)
+    camera = ("The courier pedals forward along the road as the camera slowly pans left past the "
+              "boats.")
+    quote = 'The courier reads the "urgent" note and pedals on toward the end of the quay.'
+    cases = (("chained", [], {2: [{"motion": camera}], 3: [{"motion": quote}]},
+              "panel 3: N7 dialogue and text: Motion: contains a double quote"),
+             ("shots", ["--shots"], {2: [{"motion": STRIKE}]},
+              "panel 2: S8 contact: Motion: 'strikes' acts on 'the old monk'; two people touching "
+              "on screen"))
+    for mode, flags, overrides, advisory in cases:
+        raw = seu.plan_json(mode, 3)
+        if mode == "shots":
+            _two_people(raw)
+        story_id = "d21-" + mode
+        log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)],
+                               panel=_replies(mode, 3, overrides))
+        rc = ltx_movie.main([NARRATIVE, "--story-id", story_id, "--panels", "3", "--story-only",
+                             "--no-review"] + flags)
+        out = capsys.readouterr().out
+        assert rc == 0, mode
+        assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "panel", "panel", "panel"]
+        story_dir = os.path.join(ws, "generated", "stories", story_id)
+        with open(os.path.join(story_dir, "story.md"), "rb") as f:
+            final = f.read()
+        with open(os.path.join(story_dir, "story_rounds", "round_0", "story.md"), "rb") as f:
+            assert f.read() == final, mode
+        checks = _read_json(os.path.join(story_dir, "story_checks.json"))
+        assert (checks["stop_reason"], checks["hard"], checks["unresolved"]) == ("passed", [], [])
+        assert "Warning: " + advisory + "\n" in out, mode
+        assert " N3 " not in out
+
+
+def test_dlg25_recheck_blocks_only_on_blocking_violations(ws, monkeypatch, capsys, story_env):
+    validate = ltx_movie._validate_story_md
+    ctx, _text = _saved(ws, monkeypatch, story_id="r1", replies={2: {"motion": BUSY}})
+    capsys.readouterr()
+    assert se.recheck(ctx, validate)[0] == 0
+    assert ("Warning: unresolved: " + T2_MESSAGE + "\n") in capsys.readouterr().out
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert checks["hard"] == [] and _ids(checks["unresolved"]) == {"T2"}
+    ctx, _text = _saved(ws, monkeypatch, story_id="r2", plan_mut=_speaking(2),
+                        replies={2: {"dialogue": OVER_CAP}})
+    assert se.recheck(ctx, validate)[0] == 2
+    assert " T1 spoken timing: Dialogue: is 15 words" in capsys.readouterr().err
+    ctx, _text = _saved(ws, monkeypatch, story_id="r3", plan_mut=_speaking(2),
+                        replies={2: {"dialogue": "Keep moving."}})
+    _edit(ctx, "Dialogue: the courier: Keep moving.", "Dialogue: the stranger: Halt.")
+    assert se.recheck(ctx, validate)[0] == 2
+    assert ("  - panel 2: N18 dialogue: Dialogue: names 'the stranger', which is no character's "
+            "referring phrase; use one of: 'the courier', 'the old monk'\n") in (
+        capsys.readouterr().err)
+    seu.ronin(story_env["lib"])
+    ctx, _text = _saved(ws, monkeypatch, story_id="r4")
+    os.remove(os.path.join(ctx.story_dir, "plan.json"))
+    _edit(ctx, "Narration: The rain had not stopped since dawn.\n",
+          "Narration: The ronin watched the rain.\n")
+    assert se.recheck(ctx, validate) == (0, [])
+    out, err = capsys.readouterr()
+    assert err == ""
+    assert "Warning: panel 1: N15 undeclared character: Narration: names library character ronin" in out
+    ctx, _text = _saved(ws, monkeypatch, "shots", story_id="r5", plan_mut=_two_people,
+                        replies={2: {"motion": STRIKE}})
+    os.remove(os.path.join(ctx.story_dir, "plan.json"))
+    rc, advisories = se.recheck(ctx, validate)
+    assert rc == 0 and ("panel 2: S8 contact: Motion: 'strikes' acts on 'the old monk'; two "
+                        "people touching on screen") in advisories
+    assert se.recheck(ctx._replace(panels=4), validate) == (2, [])
+    assert "  - story: S1 panel count: expected exactly 4 panels, found 3\n" in (
+        capsys.readouterr().err)
