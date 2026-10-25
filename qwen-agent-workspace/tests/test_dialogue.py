@@ -1495,3 +1495,53 @@ def test_dlg25_recheck_blocks_only_on_blocking_violations(ws, monkeypatch, capsy
     assert se.recheck(ctx._replace(panels=4), validate) == (2, [])
     assert "  - story: S1 panel count: expected exactly 4 panels, found 3\n" in (
         capsys.readouterr().err)
+
+
+# --- DLG19: the critic prompt (8.3) -----------------------------------------------------------
+
+N12_MESSAGE = "panel 1: N12 one action: Motion: chains actions with 'then'"
+MOTION_LINE = ('- target "panel", field "%s", index = the panel number, only for a panel with a '
+               "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
+               "identical to the current text except for the sentence or sentences that hold the "
+               "extra or missing action.")
+DIALOGUE_FIELD_LINE = ('- target "panel", field "dialogue", index = the panel number, only for a '
+                       "panel with a [hard] T1 problem: replacement is the shortened spoken line, "
+                       "without the speaker's phrase and without quotation marks, within the "
+                       "limit the T1 problem states.")
+
+
+def test_dlg19_critic_prompt(ws):
+    header = ("\nProblems the pipeline's own checks found in this draft. Only the [hard] ones are "
+              "fixed by patches; the [advisory] ones are reported to the user and must never be "
+              "patched:\n- [hard] " + T2_MESSAGE + "\n- [advisory] " + N12_MESSAGE + "\n")
+    render = ("- renderability: every panel shows physical action that a video model can render "
+              "in 6 seconds -- neither more actions than fit nor none -- every spoken line fits "
+              "its clip, and there is no on-screen text and nothing outside the frame. Camera "
+              "directions and dialogue are part of a good panel, never a fault.\n")
+    patches = ("Then propose at most 8 patches, most important first, only for the [hard] "
+               "problems: a spoken line that does not fit its clip, or a panel with more or fewer "
+               "actions than its clip can hold. Each patch is an object with exactly the keys "
+               "target, index, field, reason and replacement. The allowed patches are:\n")
+    preserve = ("\nPreserve every camera direction, every descriptive sentence and every dialogue "
+                "line word for word: change only the sentence or sentences that cause the "
+                "problem, and copy every other sentence of the field unchanged. A patch that "
+                "changes anything else is rejected. A panel replacement holds only the text the "
+                "writer writes: never include a character's description, a setting sentence or "
+                "the shot type, because the pipeline adds those itself. The number of panels, the "
+                "characters' referring phrases and their descriptions never change.\n")
+    for mode in ("chained", "no_stills", "shots"):
+        _ctx, plan, _parts, text, _p = _story(ws, mode, 3)
+        prompt = se.build_critic_prompt(plan, text, ([T2_MESSAGE], [N12_MESSAGE]))
+        for piece in (header, render, patches, preserve):
+            assert piece in prompt, (mode, piece[:50])
+        field, label = ("prompt", "Prompt") if mode == "no_stills" else ("motion", "Motion")
+        lines = [MOTION_LINE % (field, label), DIALOGUE_FIELD_LINE]
+        assert se.critic_field_lines(mode, None).split("\n") == lines, mode
+        assert se.critic_field_lines(mode, None, False).split("\n") == lines[:1], mode
+        assert ("are:\n" + "\n".join(lines) + "\nPreserve") in prompt, mode
+        for absent in ("(only 1:", 'field "beat.action"', 'field "image"', 'field "narration"',
+                       "@@"):
+            assert absent not in prompt, (mode, absent)
+    assert se.critic_field_lines("chained", ["- fast-motion: x"]).split("\n")[0].startswith(
+        '- target "plan", field "lora", index 0 for the global picks')
+    assert not hasattr(se, "ONLY1")

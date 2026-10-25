@@ -1960,7 +1960,8 @@ CRITIC_PROMPT_TEMPLATE = (
     "The draft story.md:\n"
     "@@STORY_MD@@\n"
     "\n"
-    "Problems the pipeline's own checks found in this draft (fix the hard ones first):\n"
+    "Problems the pipeline's own checks found in this draft. Only the [hard] ones are fixed by "
+    "patches; the [advisory] ones are reported to the user and must never be patched:\n"
     "@@VIOLATIONS@@\n"
     "\n"
     "Score the draft from 1 (worst) to 10 (best) on each of:\n"
@@ -1968,17 +1969,22 @@ CRITIC_PROMPT_TEMPLATE = (
     "panel.\n"
     "- story: the panels tell the narrative@@GOAL_CLAUSE@@, with a clear introduction, climax "
     "and resolution, and every panel moves the action forward.\n"
-    "- renderability: every panel shows one concrete physical action that a video model can "
-    "render in @@SECONDS@@ seconds, with no dialogue, no on-screen text and nothing outside the "
-    "frame.\n"
+    "- renderability: every panel shows physical action that a video model can render in "
+    "@@SECONDS@@ seconds -- neither more actions than fit nor none -- every spoken line fits its "
+    "clip, and there is no on-screen text and nothing outside the frame. Camera directions and "
+    "dialogue are part of a good panel, never a fault.\n"
     "\n"
-    "Then propose at most 8 patches, most important first. Each patch is an object with exactly "
-    "the keys target, index, field, reason and replacement. The allowed patches are:\n"
+    "Then propose at most 8 patches, most important first, only for the [hard] problems: a "
+    "spoken line that does not fit its clip, or a panel with more or fewer actions than its clip "
+    "can hold. Each patch is an object with exactly the keys target, index, field, reason and "
+    "replacement. The allowed patches are:\n"
     "@@FIELD_LINES@@\n"
-    "A panel replacement holds only the text the writer writes: never include a character's "
-    "description, a setting sentence, the shot type or a camera sentence, because the pipeline "
-    "adds those itself. The number of panels, the characters' referring phrases and their "
-    "descriptions never change.\n"
+    "Preserve every camera direction, every descriptive sentence and every dialogue line word for "
+    "word: change only the sentence or sentences that cause the problem, and copy every other "
+    "sentence of the field unchanged. A patch that changes anything else is rejected. A panel "
+    "replacement holds only the text the writer writes: never include a character's description, "
+    "a setting sentence or the shot type, because the pipeline adds those itself. The number of "
+    "panels, the characters' referring phrases and their descriptions never change.\n"
     "\n"
     "@@REPLY_PARAGRAPH@@")
 CRITIC_REPLY_PARAGRAPH = (
@@ -1991,7 +1997,6 @@ JUDGE_REPLY_PARAGRAPH = "Call submit_review with your scores, verdict and patche
 CRITIC_RETRY_SUFFIX = ("\n\nYour previous reply was not one JSON object with the keys scores, "
                        "verdict and patches in the required form. Reply with that JSON object "
                        "only.")
-ONLY1 = " (only 1: later panels continue the same picture)"
 
 
 def listed(lines):
@@ -2002,34 +2007,25 @@ def listed(lines):
 
 
 def critic_field_lines(mode, catalog_lines, narration=True):
-    lines = [
-        '- target "plan", field "beat.action", index = the beat number: replacement is the beat\'s '
-        "new action, one sentence of 6 to 40 words; the pipeline rewrites that panel from it.",
-        '- target "plan", field "beat.shot", index = the beat number@@ONLY1@@: replacement is '
-        "exactly one of: " + ", ".join(shot_types(narration)) + ".",
-        '- target "plan", field "beat.camera", index = the beat number@@ONLY1@@: replacement is '
-        "exactly one of: " + ", ".join(CAMERA_KEYS) + ".",
-        '- target "plan", field "location.setting", index = the place\'s position in the plan\'s '
-        "locations list (1 is the first): replacement is its new setting sentence, 12 to 45 "
-        'words starting "The setting is"; it replaces that sentence in every panel at that '
-        "place."]
+    """The allowed-patch lines of the critic prompt (dialogue spec 8.3): the lora line when
+    catalog_lines is set, the Motion: (Prompt: in no_stills) line for a T2/T3 panel, and the
+    dialogue line for a T1 panel unless the movie has no spoken lines."""
+    lines = []
     if catalog_lines:
         lines.append('- target "plan", field "lora", index 0 for the global picks or a beat '
                      "number for that beat's own picks: replacement is the complete new list of "
                      "picks, each an object with the keys id and strength, from this catalog:"
                      + "\n" + "\n".join(catalog_lines))
-    if mode in ("chained", "shots"):
-        lines.append('- target "panel", field "image", index = the panel number@@ONLY1@@: '
-                     "replacement is the new writer text of that panel's Image: field.")
-        lines.append('- target "panel", field "motion", index = the panel number: replacement is '
-                     "the new writer text of that panel's Motion: field.")
-    else:
-        lines.append('- target "panel", field "prompt", index = the panel number: replacement is '
-                     "the new writer text of that panel's Prompt: field.")
-    if narration:
-        lines.append('- target "panel", field "narration", index = the panel number: replacement '
-                     "is the panel's new narration sentence (prefixed with the speaker's referring "
-                     "phrase and a colon when a character in the shot says it).")
+    label = "Prompt" if mode == "no_stills" else "Motion"
+    lines.append('- target "panel", field "%s", index = the panel number, only for a panel with a '
+                 "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
+                 "identical to the current text except for the sentence or sentences that hold "
+                 "the extra or missing action." % (label.lower(), label))
+    if narration is not False:
+        lines.append('- target "panel", field "dialogue", index = the panel number, only for a '
+                     "panel with a [hard] T1 problem: replacement is the shortened spoken line, "
+                     "without the speaker's phrase and without quotation marks, within the limit "
+                     "the T1 problem states.")
     return "\n".join(lines)
 
 
@@ -2048,7 +2044,6 @@ def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for
         ("@@VIOLATIONS@@", "\n".join(lines) if lines else "- none"),
         ("@@GOAL_CLAUSE@@", " and serve the target output goal" if plan["goal"] else ""),
         ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines, narration)),
-        ("@@ONLY1@@", ONLY1 if plan["mode"] == "chained" else ""),
         ("@@REPLY_PARAGRAPH@@", JUDGE_REPLY_PARAGRAPH if for_judge else CRITIC_REPLY_PARAGRAPH),
     ]
     text = CRITIC_PROMPT_TEMPLATE

@@ -736,8 +736,7 @@ def test_rst20e_speech_only_framing(ws):
         in prompt and "wide shot" not in prompt
     assert "close-up, extreme close-up" in se.build_plan_prompt(
         seu.make_ctx(se, ws, mode="shots", panels=3), [], [])
-    assert "exactly one of: medium shot, medium close-up, close-up." in se.critic_field_lines(
-        "shots", None, "speech")
+    assert 'field "beat.shot"' not in se.critic_field_lines("shots", None, "speech")
     for mode in ("chained", "no_stills", "shots"):
         ctx, plan, parts, _text, _path = _story(ws, mode, 3, ctx_kw=speech, plan_mut=MEDIUM)
         assert se.SPEECH_FRAMING_SENTENCE in se.build_panel_prompt(ctx, plan, parts, 1), mode
@@ -1199,17 +1198,17 @@ def test_rst22_critic_prompt(ws, tmp_path):
         texts[mode] = prompt
         assert prompt.startswith('You are the critic for a short narrated movie (story-id "s1").')
         assert "\nThe draft story.md:\n" + text + "\n\nProblems" in prompt
-        assert "\nProblems the pipeline's own checks found in this draft (fix the hard ones first):"\
-               "\n- none\n" in prompt
+        assert ("\nProblems the pipeline's own checks found in this draft. Only the [hard] ones "
+                "are fixed by patches; the [advisory] ones are reported to the user and must "
+                "never be patched:\n- none\n") in prompt
         assert '"title": "The Sealed Letter"' in prompt and '"schema"' not in prompt
         assert prompt.endswith(se.CRITIC_REPLY_PARAGRAPH)
         assert "{" in prompt
         assert 'field "lora"' not in prompt
         has = {f: ('field "%s"' % f) in prompt for f in ("image", "motion", "prompt")}
-        assert has == {"image": mode != "no_stills", "motion": mode != "no_stills",
+        assert has == {"image": False, "motion": mode != "no_stills",
                        "prompt": mode == "no_stills"}, mode
-        assert prompt.count("(only 1: later panels continue the same picture)") == (
-            3 if mode == "chained" else 0)
+        assert prompt.count("(only 1: later panels continue the same picture)") == 0
         assert "render in 6 seconds" in prompt and "@@" not in prompt
     ctx, plan, parts, text, _p = _story(ws, "shots", 3)
     lines = ["- fast-motion: motion LoRA for video, default strength 0.8, range 0.5 to 1.0."]
@@ -1220,7 +1219,7 @@ def test_rst22_critic_prompt(ws, tmp_path):
     many = (["panel %d: N1 word count: x" % i for i in range(1, 39)],
             ["panel 1: N13 repeat: y", "panel 2: N13 repeat: y", "panel 3: N13 repeat: y"])
     capped = se.build_critic_prompt(plan, text, many)
-    block = capped.split("fix the hard ones first):\n", 1)[1].split("\n\nScore the draft", 1)[0]
+    block = capped.split("must never be patched:\n", 1)[1].split("\n\nScore the draft", 1)[0]
     assert block.split("\n") == (["- [hard] panel %d: N1 word count: x" % i for i in range(1, 39)]
                                  + ["- [advisory] panel 1: N13 repeat: y",
                                     "- [advisory] panel 2: N13 repeat: y", "- ... and 1 more"])
