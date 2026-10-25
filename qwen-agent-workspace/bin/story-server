@@ -8,16 +8,21 @@
 # images at all regardless of model). See
 # docs/superpowers/plans/2026-09-17-story-server-lifecycle-plan.md.
 #
-# Contract and known hazards (plan D2/R1/R3 -- these are documented, NOT defended in
-# code; there is no lock file and no health watchdog):
+# Contract and known hazards (plan D2/R1/R3 -- the lock is defended in code (VLM
+# lifecycle spec VS2); there is no health watchdog):
 #   * `vision` and `text` are idempotent: they exit 0 when the requested mode is
 #     already serving OR still loading. There is no `ensure` subcommand, because it
 #     would be a second name for that same behaviour.
 #   * Switching modes is `stop` then `vision`/`text`. Nothing else switches modes.
+#   * vision/text/mlx-vision and stop hold an exclusive flock on $STATE_DIR/story-server.lock for
+#     their whole run; status and lockinfo never take it. A start that finds a start of the same
+#     mode in progress exits 0, of another mode exits 3; a stop in progress makes it wait. A stop
+#     that finds a start in progress SIGTERMs that start (its trap kills the half-loaded server)
+#     and waits. A wait gives up after STORY_SERVER_LOCK_TIMEOUT s (exit 7).
 #   * (R1) The mode file is the ONLY discriminator during the load window, because
 #     vLLM binds the port only after the model is resident (measured: still unbound
-#     after 7m29s). If you delete it by hand mid-load, the next `vision` sees a free
-#     port and spawns a SECOND ~22 GiB server, which will OOM this host.
+#     after 7m29s). A second start during the load is now refused by the lock, whatever
+#     the mode file says.
 #   * (R3) vllm-metal has a reproduced fatal crash under overlapping requests and the
 #     vision server runs --max-num-seqs 4. Do not run `bin/qwen-agent chat` against
 #     this server while a story phase is in flight: a concurrent turn can kill the
@@ -77,6 +82,10 @@ TEXT_LOG="$WS/generated/mtplx_serve.log"
 STATE_DIR="${STORY_SERVER_STATE_DIR:-/Users/ailab1/.qwen-serve-guard}"
 MODE_FILE="$STATE_DIR/story-server-mode"
 STANDDOWN="$STATE_DIR/stand-down"
+LOCK_FILE="$STATE_DIR/story-server.lock"
+# Longest legitimate hold: a start's readiness poll (READY_TIMEOUT 840 s) + warm-up (WARM_TIMEOUT
+# 300 s) + one kill_set (60 + 10 s) + probe slack = 1260 s (VLM lifecycle spec 2.5).
+LOCK_TIMEOUT="${STORY_SERVER_LOCK_TIMEOUT:-1260}"
 
 # Measured 2026-09-17 on macOS 25.5.0: lsof is in /usr/sbin, NOT /usr/bin.
 # Never invoke it unqualified and never assume /usr/bin/lsof exists.
@@ -267,6 +276,96 @@ add_pid() {
     printf '%s' "${list:+$list }$p"
 }
 
+# Takes the exclusive story-server lock for CMD and keeps it on fd 9 until this script exits
+# (VLM lifecycle spec VS2). Exits the script itself on the fast paths (0: same-mode start already
+# running; 3: other-mode start running), on timeout (7) and when the lock file cannot be opened (4;
+# a stop then warns and continues without the lock, so a host without $STATE_DIR can still stop).
+lock_take() {
+    /bin/mkdir -p "$STATE_DIR" 2>/dev/null
+    if ! { : >>"$LOCK_FILE"; } 2>/dev/null; then
+        if [ "$1" = "stop" ]; then
+            say "WARNING: cannot open the lock file $LOCK_FILE; stopping without the lock"   # M37
+            return 0
+        fi
+        die2 "cannot open the lock file $LOCK_FILE; refusing to run $1 without it"   # M34
+        exit 4
+    fi
+    exec 9>>"$LOCK_FILE"
+    "$PY" - "$$" "$1" "$LOCK_TIMEOUT" "$LOCK_FILE" "$HEALTH_URL" <<'LOCKPY'
+import fcntl, os, signal, subprocess, sys, time
+owner, cmd, timeout, path, url = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+SERVE = ("vision", "text", "mlx-vision")
+def say(text, err=False):
+    stream = sys.stderr if err else sys.stdout
+    stream.write("story-server: " + text + "\n")
+    stream.flush()
+def holder():
+    try:
+        with open(path) as f:
+            parts = f.read().split()
+    except OSError:
+        parts = []
+    parts = (parts + ["?", "?", "?"])[:3]
+    pid = int(parts[0]) if parts[0].isdigit() else None
+    alive = False
+    if pid is not None:
+        try:
+            os.kill(pid, 0)
+            alive = True
+        except ProcessLookupError:
+            alive = False
+        except PermissionError:
+            alive = True
+    return pid, parts[0], parts[1], parts[2], alive
+def is_story_server(pid):
+    try:
+        line = subprocess.run(["/bin/ps", "-ww", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        line = ""
+    return "story-server" in line
+start = time.monotonic()
+next_note = 30
+preempted = None
+while True:
+    try:
+        fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        pass
+    pid, pid_text, held, since, alive = holder()
+    if alive and held in SERVE and cmd in SERVE and is_story_server(pid):
+        if held == cmd:
+            say("a %s start (story-server pid %s) is already running; it may still be loading -- poll %s" % (cmd, pid_text, url))
+            sys.exit(20)
+        say("REFUSING: a %s start (story-server pid %s) is already running; run \"story-server stop\" first, then start %s" % (held, pid_text, cmd), err=True)
+        sys.exit(3)
+    if alive and held in SERVE and cmd == "stop" and preempted != pid:
+        if is_story_server(pid):
+            say("preempting the %s start in progress (story-server pid %d)" % (held, pid))
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        preempted = pid
+    waited = int(time.monotonic() - start)
+    if waited >= timeout:
+        say("TIMEOUT: %s is still held by pid %s (%s since %s) after %ds; not running %s" % (path, pid_text, held, since, waited, cmd), err=True)
+        sys.exit(7)
+    if waited >= next_note:
+        say("waiting for the lock held by pid %s (%s since %s) (%ds elapsed)" % (pid_text, held, since, waited))
+        next_note += 30
+    time.sleep(1)
+os.ftruncate(9, 0)
+os.write(9, ("%d %s %s\n" % (owner, cmd, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))).encode("ascii"))
+LOCKPY
+    local rc=$?
+    case "$rc" in
+        0)  return 0 ;;
+        20) exit 0 ;;
+        *)  exit "$rc" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # vision / text
 # ---------------------------------------------------------------------------
@@ -274,6 +373,7 @@ add_pid() {
 cmd_serve() {
     MODE="$CMD"                     # S-0
     say "v1 cmd=$CMD port=$PORT state-dir=$STATE_DIR"   # M00
+    lock_take "$MODE"                # VS2: exits on the fast paths, on timeout and on M34
 
     local mf_ok=1
     read_mode_file && mf_ok=0
@@ -377,19 +477,19 @@ cmd_serve() {
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
             --gpu-memory-utilization "$VISION_GPU_MEM_UTIL" \
-            >>"$log" 2>&1 </dev/null &
+            >>"$log" 2>&1 </dev/null 9>&- &
         SPAWN_PID=$!
     elif [ "$MODE" = "mlx-vision" ]; then
         /usr/bin/nohup "$MLX_VLM_PYTHON" -m mlx_vlm.server \
             --model "$MLX_VISION_MODEL_ID" \
             --host 127.0.0.1 --port "$PORT" \
             --max-tokens "$MLX_VISION_MAX_TOKENS" \
-            >>"$log" 2>&1 </dev/null &
+            >>"$log" 2>&1 </dev/null 9>&- &
         SPAWN_PID=$!
     else
         /usr/bin/nohup "$MTPLX_BIN" serve --model "$TEXT_MODEL_REPO" \
             --model-id "$MODEL_ID" --port "$PORT" --profile "$TEXT_PROFILE" \
-            >>"$log" 2>&1 </dev/null &
+            >>"$log" 2>&1 </dev/null 9>&- &
         SPAWN_PID=$!
     fi
 
@@ -462,7 +562,7 @@ cmd_serve() {
     local started body rc content elapsed_warm
     started=$(/bin/date +%s)
     body=$("$CURL" -s -m "$WARM_TIMEOUT" -H 'Content-Type: application/json' \
-           -X POST "$CHAT_URL" --data-binary @- <<EOF
+           -X POST "$CHAT_URL" --data-binary @- 9>&- <<EOF
 {"model":"$MODEL_ID","max_tokens":$WARM_MAX_TOKENS,"messages":[{"role":"user","content":"Reply with the single word ok"}]}
 EOF
 )
@@ -647,6 +747,36 @@ cmd_stop() {
 }
 
 # ---------------------------------------------------------------------------
+# lockinfo (VLM lifecycle spec VS4): never takes the lock
+# ---------------------------------------------------------------------------
+
+cmd_lockinfo() {
+    if [ ! -e "$LOCK_FILE" ]; then
+        printf 'lock: free path=%s\n' "$LOCK_FILE"
+        exit 0
+    fi
+    "$PY" - "$LOCK_FILE" <<'PROBEPY'
+import fcntl, os, sys
+path = sys.argv[1]
+try:
+    fd = os.open(path, os.O_RDONLY)
+except OSError:
+    print("lock: free path=%s" % path)
+    sys.exit(0)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    with open(path) as f:
+        parts = (f.read().split() + ["?", "?", "?"])[:3]
+    print("lock: held pid=%s cmd=%s since=%s path=%s" % (parts[0], parts[1], parts[2], path))
+else:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    print("lock: free path=%s" % path)
+PROBEPY
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # entry point and dependency gate
 # ---------------------------------------------------------------------------
 
@@ -654,8 +784,9 @@ CMD="${1:-}"
 
 if [ "$#" -ne 1 ] || { [ "$CMD" != "vision" ] && [ "$CMD" != "text" ] \
                         && [ "$CMD" != "mlx-vision" ] \
-                        && [ "$CMD" != "status" ] && [ "$CMD" != "stop" ]; }; then
-    printf 'usage: story-server [vision|text|mlx-vision|status|stop]\n' >&2   # M01
+                        && [ "$CMD" != "status" ] && [ "$CMD" != "stop" ] \
+                        && [ "$CMD" != "lockinfo" ]; }; then
+    printf 'usage: story-server [vision|text|mlx-vision|status|stop|lockinfo]\n' >&2   # M01
     exit 2
 fi
 
@@ -687,6 +818,10 @@ case "$CMD" in
         ;;
     stop)
         say "v1 cmd=$CMD port=$PORT state-dir=$STATE_DIR"   # M00
+        lock_take stop
         cmd_stop
+        ;;
+    lockinfo)
+        cmd_lockinfo
         ;;
 esac

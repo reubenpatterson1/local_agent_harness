@@ -11,6 +11,7 @@ Every server-shaped process in this file is a stub bound to an ephemeral port
 stub process it may have spawned survives.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -307,7 +309,7 @@ def test_s1_usage():
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, timeout=10)
         assert proc.returncode == 2, args
-        assert proc.stderr == "usage: story-server [vision|text|mlx-vision|status|stop]\n", args
+        assert proc.stderr == "usage: story-server [vision|text|mlx-vision|status|stop|lockinfo]\n", args
 
 
 # ---------------------------------------------------------------------------
@@ -388,14 +390,16 @@ def test_s4_s5_idempotence_during_load_and_stop(tmp_path):
 
         rc4, out4, err4 = _run(["stop"], env, timeout=90)
         assert rc4 == 0
-        assert "stopped pid(s)" in out4 and mode_pid_s in out4  # M24
+        # The stop preempts the start that holds the lock (VLM lifecycle spec VS2, M30); the
+        # start's interrupt trap kills its half-loaded server, so the stop finds nothing left.
+        assert "preempting the vision start in progress (story-server pid %d)" % proc1.pid in out4
         assert not _pid_alive(mode_pid)
         assert not os.path.exists(mode_file)
         assert os.path.exists(standdown)
 
         out1, err1 = proc1.communicate(timeout=90)
         assert proc1.returncode == 5
-        assert "FAILED" in err1                                 # M18
+        assert "interrupted during load" in err1
     finally:
         if proc1.poll() is None:
             proc1.kill()
@@ -883,38 +887,35 @@ def test_s18_stop_text_before_bind_via_serve_cmd_pids(tmp_path):
     """MF-C for text mode: the mode file is gone and the port was never bound, so
     `serve_cmd_pids` is the ONLY thing that can find the loading MTPLX. Its awk predicate
     must carry the R5 module literal or `stop` prints M23 and the loader survives holding
-    the memory the render needs."""
+    the memory the render needs. (VLM lifecycle spec VS2: a loader whose `story-server text`
+    still runs is now preempted through the lock, so this case starts the loader by hand --
+    the hand-started case serve_cmd_pids exists for -- and no story-server holds the lock.)"""
     port = _free_port()
     env = _base_env(tmp_path, port)
     env["STUB_LOAD_DELAY"] = "0"
     env["STUB_MODE"] = "never"
-    env["STORY_SERVER_READY_TIMEOUT"] = "60"
     mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
 
-    proc1 = subprocess.Popen([STORY_SERVER, "text"], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    loader = subprocess.Popen([env["STORY_SERVER_MTPLX_BIN"], "serve"], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Reap the loader the moment it dies: kill_set's `kill -0` would see an unreaped child of
+    # this test as alive and wait the full 70 s.
+    reaper = threading.Thread(target=loader.wait, daemon=True)
+    reaper.start()
     try:
-        _wait_for_file(mode_file, timeout=10)
-        with open(mode_file) as f:
-            _mode, mode_pid_s, _ts = f.read().split()
-        mode_pid = int(mode_pid_s)
-        cmd = _wait_for_cmd(mode_pid_s, " -m mtplx.server.openai ", timeout=10)
+        cmd = _wait_for_cmd(loader.pid, " -m mtplx.server.openai ", timeout=10)
         assert "mtplx serve" not in cmd, cmd
-
-        os.remove(mode_file)          # the Ctrl-C / hand-deleted case
+        assert not os.path.exists(mode_file)
 
         rc, out, err = _run(["stop"], env, timeout=90)
         assert rc == 0, err
-        assert "stopped pid(s)" in out and mode_pid_s in out           # M24
-        assert not _pid_alive(mode_pid)
-
-        out1, err1 = proc1.communicate(timeout=90)
-        assert proc1.returncode == 5
-        assert "FAILED" in err1                                        # M18
+        assert "stopped pid(s)" in out and str(loader.pid) in out      # M24
+        reaper.join(timeout=10)
+        assert loader.returncode is not None
     finally:
-        if proc1.poll() is None:
-            proc1.kill()
-            proc1.wait(timeout=10)
+        if loader.poll() is None:
+            loader.kill()
+            loader.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,3 +1054,228 @@ def test_s22_mlx_vision_cross_mode_refusal(tmp_path):
         if proc1.poll() is None:
             proc1.kill()
             proc1.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# VLS1-VLS7, VLS10, VLS12: the story-server lock (VLM lifecycle spec VS1-VS5, VS7-VS9)
+# ---------------------------------------------------------------------------
+
+LOCK_TS = "2026-10-25T00:00:00Z"
+
+
+def _lock_path(env):
+    return os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server.lock")
+
+
+def _hold_lock(path, cmd, pid):
+    """Take the story-server lock in this test process with the record "<pid> <cmd> <ts>", the
+    way a story-server holder writes it (spec 2.3); returns the fd, and os.close releases it.
+    The fd is not inherited by any child (PEP 446)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.ftruncate(fd, 0)
+    os.write(fd, ("%d %s %s\n" % (pid, cmd, LOCK_TS)).encode("ascii"))
+    return fd
+
+
+def _release_later(fd, seconds):
+    timer = threading.Timer(seconds, os.close, args=(fd,))
+    timer.start()
+    return timer
+
+
+def _lockinfo(env):
+    return _run(["lockinfo"], env)
+
+
+def test_vls1_lockinfo(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    path = _lock_path(env)
+    assert not os.path.exists(path)
+    assert _lockinfo(env) == (0, "lock: free path=%s\n" % path, "")
+    fd = _hold_lock(path, "stop", os.getpid())
+    try:
+        assert _lockinfo(env) == (
+            0, "lock: held pid=%d cmd=stop since=%s path=%s\n" % (os.getpid(), LOCK_TS, path), "")
+    finally:
+        os.close(fd)
+    assert _lockinfo(env) == (0, "lock: free path=%s\n" % path, "")
+
+
+def test_vls2_a_start_holds_the_lock_for_its_whole_load(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STUB_LOAD_DELAY"] = "5"
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    proc1 = subprocess.Popen([STORY_SERVER, "vision"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_for_file(mode_file, timeout=10)
+        rc, out, err = _lockinfo(env)
+        assert rc == 0
+        assert out.startswith("lock: held pid=%d cmd=vision since=" % proc1.pid), out
+        out1, err1 = proc1.communicate(timeout=60)
+        assert proc1.returncode == 0, err1
+        assert _lockinfo(env)[1] == "lock: free path=%s\n" % _lock_path(env)
+    finally:
+        if proc1.poll() is None:
+            proc1.kill()
+            proc1.wait(timeout=10)
+        _run(["stop"], env, timeout=30)
+
+
+def test_vls3_three_concurrent_starts_spawn_one_server(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STUB_LOAD_DELAY"] = "3"
+    procs = [subprocess.Popen([STORY_SERVER, "vision"], env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(3)]
+    try:
+        results = [p.communicate(timeout=90) for p in procs]
+        assert [p.returncode for p in procs] == [0, 0, 0], results
+        winners = [p.pid for p, (out, _err) in zip(procs, results)
+                   if "launched vision server, pid" in out]
+        assert len(winners) == 1, results
+        fast = [out for out, _err in results
+                if ("a vision start (story-server pid %d) is already running; it may still be "
+                    "loading -- poll http://127.0.0.1:%s/v1/models"
+                    % (winners[0], env["STORY_SERVER_PORT"])) in out]
+        assert len(fast) == 2, results
+        assert _count_server_procs(env) == 1
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(timeout=10)
+        _run(["stop"], env, timeout=30)
+
+
+def test_vls4_stop_preempts_a_load(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STUB_LOAD_DELAY"] = "30"
+    env["STORY_SERVER_READY_TIMEOUT"] = "60"
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    proc1 = subprocess.Popen([STORY_SERVER, "vision"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_for_file(mode_file, timeout=10)
+        rc, out, err = _run(["stop"], env, timeout=90)
+        assert rc == 0, err
+        assert ("story-server: preempting the vision start in progress (story-server pid %d)\n"
+                % proc1.pid) in out
+        out1, err1 = proc1.communicate(timeout=90)
+        assert proc1.returncode == 5
+        assert "interrupted during load" in err1
+        assert _count_server_procs(env) == 0
+        assert not os.path.exists(mode_file)
+    finally:
+        if proc1.poll() is None:
+            proc1.kill()
+            proc1.wait(timeout=10)
+
+
+def test_vls5_stop_waits_for_a_stop(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    path = _lock_path(env)
+    env["STORY_SERVER_LOCK_TIMEOUT"] = "2"
+    fd = _hold_lock(path, "stop", os.getpid())
+    try:
+        rc, out, err = _run(["stop"], env, timeout=30)
+    finally:
+        os.close(fd)
+    assert rc == 7
+    assert err == ("story-server: TIMEOUT: %s is still held by pid %d (stop since %s) after 2s; "
+                   "not running stop\n" % (path, os.getpid(), LOCK_TS))
+    env["STORY_SERVER_LOCK_TIMEOUT"] = "30"
+    fd = _hold_lock(path, "stop", os.getpid())
+    timer = _release_later(fd, 1.0)
+    started = time.monotonic()
+    try:
+        rc, out, err = _run(["stop"], env, timeout=60)
+    finally:
+        timer.join()
+    assert rc == 0, err
+    assert time.monotonic() - started >= 1.0
+    assert "nothing to stop" in out
+
+
+def test_vls6_a_reused_pid_never_takes_a_fast_path_or_a_signal(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STORY_SERVER_LOCK_TIMEOUT"] = "2"
+    path = _lock_path(env)
+    # A live process whose command line lacks "story-server" stands in for a reused pid.
+    sleeper = subprocess.Popen(["/bin/sleep", "60"])
+    fd = _hold_lock(path, "vision", sleeper.pid)
+    try:
+        for args, absent in ((["stop"], "preempting"), (["vision"], "already running"),
+                             (["text"], "REFUSING")):
+            rc, out, err = _run(args, env, timeout=30)
+            assert rc == 7, (args, out, err)
+            assert absent not in out + err, args
+            assert ("story-server: TIMEOUT: %s is still held by pid %d (vision since %s) after "
+                    "2s; not running %s\n" % (path, sleeper.pid, LOCK_TS, args[0])) == err, args
+            assert sleeper.poll() is None, args
+    finally:
+        os.close(fd)
+        sleeper.kill()
+        sleeper.wait(timeout=10)
+
+
+def test_vls7_the_server_does_not_hold_the_lock(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STUB_LOAD_DELAY"] = "0"
+    rc, out, err = _run(["vision"], env, timeout=60)
+    try:
+        assert rc == 0, err
+        assert _count_server_procs(env) == 1
+        assert _lockinfo(env)[1] == "lock: free path=%s\n" % _lock_path(env)
+    finally:
+        _run(["stop"], env, timeout=30)
+
+
+def test_vls10_a_start_waits_for_a_stop(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    env["STUB_LOAD_DELAY"] = "0"
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    fd = _hold_lock(_lock_path(env), "stop", os.getpid())
+    proc1 = subprocess.Popen([STORY_SERVER, "vision"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        time.sleep(2.0)
+        assert proc1.poll() is None
+        assert not os.path.exists(mode_file)      # still waiting for the lock: nothing spawned
+        os.close(fd)
+        fd = None
+        out1, err1 = proc1.communicate(timeout=60)
+        assert proc1.returncode == 0, err1
+        assert "launched vision server, pid" in out1
+        assert _count_server_procs(env) == 1
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if proc1.poll() is None:
+            proc1.kill()
+            proc1.wait(timeout=10)
+        _run(["stop"], env, timeout=30)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_vls12_an_unopenable_lock(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    env["STORY_SERVER_STATE_DIR"] = str(ro / "state")
+    lock = os.path.join(str(ro), "state", "story-server.lock")
+    os.chmod(str(ro), 0o500)
+    try:
+        rc, out, err = _run(["stop"], env)
+        assert rc == 0, err
+        assert ("story-server: WARNING: cannot open the lock file %s; stopping without the lock\n"
+                % lock) in out
+        assert "nothing to stop" in out
+        assert not os.path.exists(lock)
+        rc, out, err = _run(["vision"], env)
+        assert rc == 4
+        assert err == ("story-server: cannot open the lock file %s; refusing to run vision "
+                       "without it\n" % lock)
+        assert _count_server_procs(env) == 0
+    finally:
+        os.chmod(str(ro), 0o700)
