@@ -1199,8 +1199,9 @@ def test_t23_api_key_never_leaks(tmp_path, monkeypatch, capsys, synthetic_clips)
 
 # --- --goal: the target output goal as a parameter (spec 2026-10-05 section 3) --------
 
-# sha256 of the SYSTEM_PROMPT constant at commit 1d8580b, before --goal existed (3166 chars).
-LEGACY_SYSTEM_PROMPT_SHA256 = "ac604f73c470bae702f8380aab81418258ea9cc3e9db75f26a319f2342594c3d"
+# sha256 of the default-goal SYSTEM_PROMPT since its Dialogue: rule (dialogue spec CM5; 3200
+# chars). Before it: ac604f73... (3166 chars), the constant at commit 1d8580b.
+LEGACY_SYSTEM_PROMPT_SHA256 = "bd5a50ea1f7a581bc53cb978c41e4600e10cb76a01fa17389b99889cbc1d1453"
 # "%" and "{...}" prove the goal is inserted verbatim, never formatted.
 CUSTOM_GOAL = "a slow 100% {literal} dialogue-driven drama"
 
@@ -1212,7 +1213,7 @@ def test_goal_default_prompt_byte_identical():
     assert judge_clips.SYSTEM_PROMPT_TEMPLATE.count(judge_clips.GOAL_TOKEN) == 1
     rendered = judge_clips.build_system_prompt(judge_clips.DEFAULT_GOAL)
     assert rendered == judge_clips.SYSTEM_PROMPT
-    assert len(rendered) == 3166
+    assert len(rendered) == 3200
     assert hashlib.sha256(rendered.encode("utf-8")).hexdigest() == LEGACY_SYSTEM_PROMPT_SHA256
     assert "The target output goal is the most realistic action scenes possible.\n" in rendered
 

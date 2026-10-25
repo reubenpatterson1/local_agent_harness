@@ -1573,3 +1573,26 @@ def test_judge_story_reports_unresolved_as_advisory(tmp_path):
     (tmp_path / "story_checks.json").write_text(json.dumps(checks), encoding="utf-8")
     assert judge_story._story_checks_messages(str(tmp_path)) == (
         ["panel 2: T1 spoken timing: x"], [N12_MESSAGE])
+
+
+# --- DLG29: bin/judge-clips (CM5, G6) --------------------------------------------------------
+
+def test_dlg29_judge_clips_panel_text():
+    judge_clips = _judge("judge_clips_for_dialogue", "bin/judge-clips")
+    base = {"index": 2, "title": "Gate", "motion_prompt": "The courier waits.", "image_path": None}
+    head = "## Panel 2 — Gate\nMotion: The courier waits.\n"
+    assert judge_clips.format_panel_text(2, dict(
+        base, speaker="the courier", speech="Keep moving.", speech_source="dialogue",
+        narration="The bell had not rung.")) == (
+        head + "Dialogue: the courier: Keep moving.\nNarration: The bell had not rung.")
+    alias = dict(base, speaker="the courier", speech="Keep moving.", speech_source="narration",
+                 narration="the courier: Keep moving.")
+    assert judge_clips.format_panel_text(2, alias) == head + "Dialogue: the courier: Keep moving."
+    older = dict(alias)
+    del older["speech_source"]
+    assert judge_clips.format_panel_text(2, older) == head + "Dialogue: the courier: Keep moving."
+    assert judge_clips.format_panel_text(2, dict(base, narration="Rain fell.")) == (
+        head + "Narration: Rain fell.")
+    assert ("A Dialogue: text is a line the named character speaks on camera in that panel's clip; "
+            "Narration: text is voice-over.") in judge_clips.SYSTEM_PROMPT
+    assert "starts with a character's referring phrase and a colon" not in judge_clips.SYSTEM_PROMPT

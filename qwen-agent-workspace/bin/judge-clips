@@ -146,9 +146,8 @@ SYSTEM_PROMPT_TEMPLATE = (
     "frames cannot show.\n"
     "\n"
     "The movie also has a soundtrack, but you receive no audio. Do not judge audio, voice, "
-    "music, or sound effects. A Narration: text that starts with a character's referring "
-    "phrase and a colon is a line that character speaks on camera in that panel's clip; any "
-    "other Narration: text is voice-over.\n"
+    "music, or sound effects. A Dialogue: text is a line the named character speaks on camera "
+    "in that panel's clip; Narration: text is voice-over.\n"
     "\n"
     "Score each clip on these dimensions, each an integer from 1 (worst) to 10 (best):\n"
     "- motion_fidelity: whether the clip actually performs the action its Motion: text "
@@ -359,18 +358,27 @@ def _text_field(panel, key):
 
 
 def format_panel_text(number, panel):
-    """Header, then Opening still: (panel 1 only, when it has a still), Motion:, Narration:,
-    each only when non-empty; no trailing newline (spec 3.7). Pure."""
+    """Header, then Opening still: (panel 1 only, when it has a still), Motion:, Dialogue: (the
+    manifest's speaker and speech, when both are set), Narration:, each only when non-empty; a
+    Narration: that is itself the spoken line (speech_source "narration", or an older manifest
+    with a speaker and no speech_source) is left out. No trailing newline (spec 3.7; dialogue
+    spec CM5). Pure."""
     title = _text_field(panel, "title")
     lines = ["## Panel %d — %s" % (number, title) if title else "## Panel %d —" % number]
     if number == 1 and _text_field(panel, "image_path"):
         opening = _text_field(panel, "panel_text")
         if opening:
             lines.append("Opening still: %s" % opening)
-    for label, key in (("Motion", "motion_prompt"), ("Narration", "narration")):
-        value = _text_field(panel, key)
-        if value:
-            lines.append("%s: %s" % (label, value))
+    motion = _text_field(panel, "motion_prompt")
+    if motion:
+        lines.append("Motion: %s" % motion)
+    speaker, speech = _text_field(panel, "speaker"), _text_field(panel, "speech")
+    if speaker and speech:
+        lines.append("Dialogue: %s: %s" % (speaker, speech))
+    narration = _text_field(panel, "narration")
+    source = panel.get("speech_source", "narration" if panel.get("speaker") else None)
+    if narration and source != "narration":
+        lines.append("Narration: %s" % narration)
     return "\n".join(lines)
 
 
