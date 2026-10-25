@@ -681,6 +681,100 @@ def insert_speech(text, sentence):
     return (text.rstrip() + " " + sentence).strip()
 
 
+# On-camera dialogue (docs/superpowers/specs/2026-10-24-on-camera-dialogue-design.md Section 3):
+# a panel's Dialogue: field is "<referring phrase>: <the spoken words>"; bin/ltx-story-manifest
+# splits the words at sentence ends and writes them into the motion prompt with fixed beats and a
+# fixed acoustic sentence, so LTX voices each fragment once.
+DIALOGUE_MAX_WORDS = 14
+DIALOGUE_MAX_FRAGMENTS = 3
+DIALOGUE_WORDS_PER_SECOND = 2.4
+DIALOGUE_BEAT_SECONDS = 0.4          # clip time each beat between fragments consumes
+SPEECH_DELIVERIES = ("beats", "plain", "beats-no-acoustic")
+DEFAULT_SPEECH_DELIVERY = "beats"
+SPEECH_BEATS = ("After a breath", "After a short pause")   # before fragment 2, before fragment 3
+ACOUSTIC_SENTENCE = ("The audio is clear close-mic dialogue with a subtle natural room tone; "
+                     "the dialogue takes priority over the quiet ambience.")
+NO_KNOWN_PHRASES = "none (no --cast, no ## Characters section and no plan.json cast)"
+
+
+def dialogue_word_cap(seconds, fragments=1):
+    """The most words a spoken line of `fragments` sentences may have in a clip of `seconds`
+    (DG2): 2.4 words a second, less 0.4 s for each beat between fragments, never above 14."""
+    return min(DIALOGUE_MAX_WORDS,
+               int(DIALOGUE_WORDS_PER_SECOND * (seconds - DIALOGUE_BEAT_SECONDS * (fragments - 1))
+                   + 1e-9))
+
+
+def split_fragments(line):
+    """The sentences of a spoken line, split at sentence ends (DG4)."""
+    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(line.strip()) if s.strip()]
+
+
+def clean_line(text):
+    """A spoken line with one surrounding pair of straight or curly double quotes removed, every
+    other double quote turned into an apostrophe and whitespace collapsed (DG3 step 4)."""
+    line = (text or "").strip()
+    for left, right in (('"', '"'), ("“", "”")):
+        if len(line) >= 2 and line.startswith(left) and line.endswith(right):
+            line = line[1:-1].strip()
+            break
+    for quote in _QUOTES:
+        line = line.replace(quote, "'")
+    return " ".join(line.split())
+
+
+def _speaker_regex(phrase):
+    """The phrase, case-insensitive and whitespace-tolerant, then a colon, at the start of a
+    text (DG3 step 2)."""
+    return re.compile(r"^\s*" + r"\s+".join(re.escape(w) for w in phrase.split()) + r"\s*:\s*",
+                      re.IGNORECASE)
+
+
+def parse_dialogue(value, phrases):
+    """(phrase, line, problem) for a Dialogue: value (DG3). phrase is the known phrase, as given,
+    that the value starts with (most words first, then longest); line is the spoken words,
+    cleaned, ending in . ! or ?. An empty value gives (None, "", None); a value that names no
+    known phrase, or has no words, gives (None, "", problem)."""
+    text = " ".join((value or "").split())
+    if not text:
+        return None, "", None
+    for phrase in sorted((p for p in phrases if p.split()),
+                         key=lambda p: (-len(p.split()), -len(p), p.lower())):
+        match = _speaker_regex(phrase).match(text)
+        if match:
+            break
+    else:
+        found = speaker_prefix(text)
+        if found:
+            known = ", ".join(repr(p) for p in phrases) if phrases else NO_KNOWN_PHRASES
+            return None, "", ("names %r, which is no character's referring phrase; use one of: %s"
+                              % (found[0], known))
+        return None, "", "has no speaker; write it as <referring phrase>: <the spoken words>"
+    line = clean_line(text[match.end():])
+    if not line:
+        return None, "", "has a speaker but no words"
+    if line[-1:] not in ".!?":
+        line += "."
+    return phrase, line, None
+
+
+def speech_text(phrase, line, delivery=DEFAULT_SPEECH_DELIVERY):
+    """The motion-prompt text for a spoken line (DG5). beats: '<Phrase> says, "<fragment 1>"',
+    then ' <beat>, "<fragment n>"' for each later fragment (at most three; the rest join the
+    third), then ACOUSTIC_SENTENCE; beats-no-acoustic leaves that sentence out; plain is
+    speech_sentence's '<Phrase> says: "<line>"'."""
+    fragments = split_fragments(line)
+    if len(fragments) > DIALOGUE_MAX_FRAGMENTS:
+        fragments = (fragments[:DIALOGUE_MAX_FRAGMENTS - 1]
+                     + [" ".join(fragments[DIALOGUE_MAX_FRAGMENTS - 1:])])
+    if delivery == "plain":
+        return speech_sentence(phrase, line)
+    text = phrase[:1].upper() + phrase[1:] + ' says, "' + fragments[0] + '"'
+    for i in range(1, len(fragments)):
+        text += " " + SPEECH_BEATS[i - 1] + ', "' + fragments[i] + '"'
+    return text if delivery == "beats-no-acoustic" else text + " " + ACOUSTIC_SENTENCE
+
+
 def panel_strengths(names, members, character_strength, shots=False):
     """{name: strength} for one panel: 1.0 when exactly one cast character is named (continuous
     mode only); else -- and always in shots mode -- each character's own character.json strength
