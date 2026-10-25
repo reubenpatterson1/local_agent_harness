@@ -2861,3 +2861,24 @@ def test_rst63_isolation(story_env):
             source = f.read()
         assert "@pytest.fixture(autouse=True)\ndef story_env(monkeypatch, tmp_path):\n    return " \
                "seu.set_story_env(monkeypatch, tmp_path)\n" in source
+
+
+def test_rst27b_patch_validation_messages_on_live_fields(ws):
+    # Live fields (motion, lora) reach the index and type checks of _patch_problem; the index
+    # and type checks run before the repairable gate, so none of these is rejected earlier.
+    ctx, state = _state(ws, "shots", n=4)
+    new, applied, rejected = se.apply_patches(ctx, state, [
+        _patch("panel", 99, "motion", "x"),
+        _patch("panel", True, "motion", "x"),
+        _patch("panel", "1", "motion", "x"),
+        _patch("panel", 1, "motion", ["x"]),
+        _patch("plan", 9, "lora", []),
+        _patch("plan", 0, "lora", "x")], lora_allowed=True)
+    assert applied == [] and new == state
+    assert _reasons(rejected) == [
+        "index 99 is out of range for motion (allowed: 1 to 4)",
+        "index is not an integer",
+        "index is not an integer",
+        "replacement must be a string",
+        "index 9 is out of range for lora (allowed: 0 to 4)",
+        "replacement must be a list of picks"]
