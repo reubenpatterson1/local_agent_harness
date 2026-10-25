@@ -807,3 +807,17 @@ def test_review_focus_1_writer_dialogue_with_label_prefix_and_quotes(ws):
         reply = dict(seu.panel_json("chained", 2), dialogue=written)
         assert se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))["dialogue"] == (
             "Keep moving."), written
+
+
+def test_empty_parts_uses_panel_keys_with_ctx(ws):
+    ctx, plan, _parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                       replies={2: {"dialogue": LINE}})
+    got = se.empty_parts(ctx.mode, 2, plan, ctx)
+    assert sorted(got) == sorted(se.panel_keys(ctx, plan, 2))
+    assert "dialogue" in got
+    assert "dialogue" not in se.empty_parts(ctx.mode, 2, plan)
+    ctx, plan, _parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                       replies={2: {"dialogue": LINE}},
+                                       ctx_kw={"narration": "speech"})
+    got = se.empty_parts(ctx.mode, 2, plan, ctx)
+    assert "narration" not in got and "dialogue" in got

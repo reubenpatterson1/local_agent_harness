@@ -1337,8 +1337,9 @@ def clean_writer(lib, text, pasted=()):
     return text
 
 
-def empty_parts(mode, k, plan):
-    parts = {key: "" for key in writer_keys(mode, k)}
+def empty_parts(mode, k, plan, ctx=None):
+    keys = panel_keys(ctx, plan, k) if ctx is not None else writer_keys(mode, k)
+    parts = {key: "" for key in keys}
     parts["title"] = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
     return parts
 
@@ -2460,7 +2461,7 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
-        parts = [empty_parts(ctx.mode, k, plan) for k in range(1, ctx.panels + 1)]
+        parts = [empty_parts(ctx.mode, k, plan, ctx) for k in range(1, ctx.panels + 1)]
         valid = 0
         for k in range(1, ctx.panels + 1):
             if self.expired():
