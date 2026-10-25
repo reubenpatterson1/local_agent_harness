@@ -247,9 +247,9 @@ def test_mut25_source_scan_of_new_python_files():
         with open(os.path.join(mt.WS, rel), encoding="utf-8") as f:
             source = f.read()
         imported = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M))
-        allowed = {"argparse", "calendar", "errno", "fcntl", "hashlib", "hmac", "http.server", "json", "os",
-                   "platform", "re", "secrets", "shlex", "shutil", "signal", "socket", "struct", "subprocess",
-                   "sys", "threading", "time", "fleet_lib", "movie_ui_lib"}
+        allowed = {"argparse", "calendar", "errno", "fcntl", "hashlib", "hmac", "http.client", "http.server",
+                   "json", "os", "platform", "re", "secrets", "shlex", "shutil", "signal", "socket", "struct",
+                   "subprocess", "sys", "threading", "time", "fleet_lib", "movie_ui_lib"}
         assert imported <= allowed, (rel, imported - allowed)
         for loader in ("importlib", "SourceFileLoader", "runpy", "exec(", "__import__"):
             assert loader not in source, (rel, loader)

@@ -188,3 +188,287 @@ def test_vl5_vlm_restore_wanted(state, tmp_path):
         lib.write_queue(state, [])
         job_id = mt.make_job(state, ["x"], ws, kind=kind)
         assert lib.vlm_restore_wanted(state) == (wanted, text % job_id), kind
+
+
+# --- F-TOOLS and F-HTTP (spec 11.2) ------------------------------------------------------------
+
+MODEL = "test-vlm-model"
+COMPLETION = {"model": MODEL, "max_tokens": 1,
+              "messages": [{"role": "user", "content": "Reply with the single word ok"}]}
+
+FAKE_TOOL_SOURCE = r'''
+import fcntl
+import json
+import os
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+args = sys.argv[1:]
+record = {"tool": TOOL, "argv": args, "pid": os.getpid(), "ppid": os.getppid(),
+          "pgid": os.getpgid(0), "sid": os.getsid(0), "t": time.time()}
+probe = os.environ.get("FAKE_PROBE_JOB_DIR")
+if probe and TOOL == "story-server-restore":
+    fd = os.open(os.path.join(probe, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        record["job_lock_held"] = False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        record["job_lock_held"] = True
+    os.close(fd)
+    try:
+        with open(os.path.join(probe, "status.json"), encoding="utf-8") as f:
+            record["job_state"] = json.load(f).get("state")
+    except (OSError, ValueError):
+        record["job_state"] = None
+with open(os.path.join(HERE, "calls.jsonl"), "a", encoding="utf-8") as f:
+    f.write(json.dumps(record) + "\n")
+try:
+    with open(os.path.join(HERE, "config.json"), encoding="utf-8") as f:
+        config = json.load(f)
+except (OSError, ValueError):
+    config = {}
+
+
+def set_state(text):
+    with open(os.path.join(HERE, "vlm_state"), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+if TOOL == "story-server":
+    if args == ["status"]:
+        entry = config.get("status", {})
+        time.sleep(entry.get("sleep", 0))
+        with open(os.path.join(HERE, "vlm_state"), encoding="utf-8") as f:
+            vlm_state = f.read().strip()
+        sys.stdout.write(entry.get("stdout", "story-server status  X\n  state:          %s\n"
+                                             "  health:         HTTP 200 model=%s\n"
+                                             % (vlm_state, PARAMS["model"])))
+        sys.exit(entry.get("exit", 0))
+    if args == ["stop"]:
+        set_state("STOPPED")
+        sys.exit(PARAMS["stop_rc"])
+    if args == ["lockinfo"]:
+        sys.stdout.write("lock: free path=x\n")
+        sys.exit(0)
+    sys.exit(0)
+if "--wait" in args:
+    time.sleep(PARAMS["restore_sleep"])
+    if PARAMS["serve_on_restore"]:
+        set_state("SERVING mlx-vision")
+    sys.exit(PARAMS["restore_rc"])
+sys.exit(0)
+'''
+
+
+def make_fake_tools(tmp, model, stop_rc=0, restore_rc=0, restore_sleep=0, serve_on_restore=True):
+    """F-TOOLS: <tmp>/tools/story-server and story-server-restore, #!sys.executable scripts that
+    append one JSON line per call to <tmp>/tools/calls.jsonl and share <tmp>/tools/vlm_state
+    (initially STOPPED); <tmp>/tools/config.json {"status": {"exit", "sleep", "stdout"}}
+    overrides status. Returns the tools directory."""
+    tools = os.path.join(str(tmp), "tools")
+    os.makedirs(tools, exist_ok=True)
+    params = {"model": model, "stop_rc": stop_rc, "restore_rc": restore_rc,
+              "restore_sleep": restore_sleep, "serve_on_restore": serve_on_restore}
+    for tool in ("story-server", "story-server-restore"):
+        path = os.path.join(tools, tool)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!%s\nTOOL = %r\nPARAMS = %r\n%s" % (sys.executable, tool, params,
+                                                         FAKE_TOOL_SOURCE))
+        os.chmod(path, 0o755)
+    set_vlm_state(tools, "STOPPED")
+    return tools
+
+
+def set_vlm_state(tools, text):
+    with open(os.path.join(tools, "vlm_state"), "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def set_tool_config(tools, config):
+    with open(os.path.join(tools, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f)
+
+
+def tool_calls(tools, include_status=False):
+    try:
+        with open(os.path.join(tools, "calls.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        rows = []
+    return [r for r in rows if include_status or r["argv"] != ["status"]]
+
+
+def call_names(tools, include_status=False):
+    out = []
+    for row in tool_calls(tools, include_status):
+        if row["tool"] == "story-server-restore":
+            out.append("restore --wait" if "--wait" in row["argv"] else "restore")
+        else:
+            out.append(" ".join(row["argv"]))
+    return out
+
+
+def lifecycle_on(monkeypatch, tools, port):
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "1")
+    monkeypatch.setenv("MOVIE_UI_VLM_TOOLS", tools)
+    monkeypatch.setenv("MOVIE_UI_VLM_PORT", str(port))
+    monkeypatch.setattr(lib, "VLM_RECOVERY", [])
+
+
+class FakeVLM(object):
+    """F-HTTP: a ThreadingHTTPServer on 127.0.0.1:0 serving GET /v1/models (models, or the raw
+    bytes models_raw, with models_status) and POST /v1/chat/completions (completion_body after
+    completion_delay s, with completion_status; a list status is consumed one per request, its
+    last value repeating). Every request is recorded as (method, path, JSON body or None)."""
+
+    def __init__(self, models, models_status=200, completion_status=200, completion_body=None,
+                 completion_delay=0, models_raw=None):
+        self.models, self.models_status, self.models_raw = models, models_status, models_raw
+        self.completion_status, self.completion_body = completion_status, completion_body
+        self.completion_delay = completion_delay
+        self.requests = []
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, status, raw):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                try:
+                    self.wfile.write(raw)
+                except OSError:
+                    pass
+
+            def do_GET(self):
+                fake.requests.append(("GET", self.path, None))
+                raw = fake.models_raw
+                if raw is None:
+                    raw = json.dumps({"object": "list", "data": fake.models}).encode("utf-8")
+                self._reply(fake.models_status, raw)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                fake.requests.append(("POST", self.path, json.loads(raw.decode("utf-8")) if raw else None))
+                time.sleep(fake.completion_delay)
+                status = fake.completion_status
+                if isinstance(status, list):
+                    status = status.pop(0) if len(status) > 1 else status[0]
+                body = fake.completion_body
+                if body is None:
+                    body = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+                self._reply(status, json.dumps(body).encode("utf-8"))
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def vlm():
+    fake = FakeVLM([{"id": "other-cached-model", "loaded": False}, {"id": MODEL, "loaded": True}])
+    yield fake
+    fake.close()
+
+
+def _free_closed_port():
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+# --- VL6-VL8, Review Focus 4: the health check (VR4) -------------------------------------------
+
+def test_vl6_health_happy_path(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL)
+    set_vlm_state(tools, "SERVING mlx-vision")
+    assert lib.vlm_health(tools, vlm.port) == (True, "%s on 127.0.0.1:%d" % (MODEL, vlm.port))
+    assert call_names(tools, include_status=True) == ["status"]
+
+
+def test_vl7_health_problems(tmp_path):
+    tools = make_fake_tools(tmp_path, MODEL)
+    set_vlm_state(tools, "SERVING mlx-vision")
+    serving = [{"id": MODEL, "loaded": True}]
+
+    def health(fake=None, **kw):
+        port = fake.port if fake is not None else _free_closed_port()
+        try:
+            return lib.vlm_health(tools, port, **kw)
+        finally:
+            if fake is not None:
+                fake.close()
+
+    set_tool_config(tools, {"status": {"sleep": 3}})
+    assert health(status_timeout=1) == (False, "bin/story-server status timed out after 1 s")    # H1
+    set_tool_config(tools, {"status": {"exit": 4}})
+    assert health() == (False, "bin/story-server status exited 4")                                # H2
+    set_tool_config(tools, {})
+    set_vlm_state(tools, "LOADING mlx-vision")
+    assert health() == (False, "story server is LOADING mlx-vision, not SERVING mlx-vision")      # H3
+    set_tool_config(tools, {"status": {"stdout": "story-server status  X\n"}})
+    assert health() == (False, "story server is UNKNOWN, not SERVING mlx-vision")
+    set_tool_config(tools, {"status": {"stdout": "  state:          SERVING mlx-vision\n"
+                                                 "  health:         HTTP 000 model=none\n"}})
+    assert health() == (False, "bin/story-server status printed no served model")                # H9
+    set_tool_config(tools, {"status": {"stdout": "  state:          SERVING mlx-vision\n"}})
+    assert health() == (False, "bin/story-server status printed no served model")
+    set_tool_config(tools, {})
+    set_vlm_state(tools, "SERVING mlx-vision")
+    assert health(FakeVLM(serving, models_status=503)) == (False, "GET /v1/models failed: HTTP 503")
+    assert health(FakeVLM(serving, models_raw=b"{")) == (False, "GET /v1/models failed: invalid JSON")
+    assert health(FakeVLM(serving, models_raw=b'{"data": {}}')) == (
+        False, "GET /v1/models failed: invalid JSON")
+    assert health() == (False, "GET /v1/models failed: ConnectionRefusedError")                   # H4
+    assert health(FakeVLM([{"id": "other", "loaded": True}])) == (
+        False, "GET /v1/models does not list %s" % MODEL)                                       # H5
+    assert health(FakeVLM([{"id": MODEL, "loaded": False}])) == (
+        False, "%s is listed by /v1/models but not loaded" % MODEL)                             # H6
+    assert health(FakeVLM([{"id": MODEL}]))[0] is True
+    assert health(FakeVLM(serving, completion_status=500)) == (False, "completion failed: HTTP 500")
+    assert health(FakeVLM(serving, completion_delay=3), completion_timeout=1) == (
+        False, "completion failed: TimeoutError")                                               # H7
+    assert health(FakeVLM(serving, completion_body={"choices": []})) == (
+        False, "completion reply has no choices")                                               # H8
+    assert health(FakeVLM(serving, completion_body={"text": "ok"})) == (
+        False, "completion reply has no choices")
+
+
+def test_vl8_health_request_shape(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL)
+    set_vlm_state(tools, "SERVING mlx-vision")
+    assert lib.vlm_health(tools, vlm.port)[0] is True
+    assert vlm.requests == [("GET", "/v1/models", None), ("POST", "/v1/chat/completions", COMPLETION)]
+    other = FakeVLM([{"id": "other", "loaded": True}])
+    try:
+        assert lib.vlm_health(tools, other.port)[1] == "GET /v1/models does not list %s" % MODEL
+        assert other.requests == [("GET", "/v1/models", None)]
+    finally:
+        other.close()
+
+
+def test_review_focus_4_models_reply_not_utf8_or_oversized(tmp_path):
+    tools = make_fake_tools(tmp_path, MODEL)
+    set_vlm_state(tools, "SERVING mlx-vision")
+    big = b'{"data": [' + b" " * lib.VLM_MAX_BODY + b'{"id": "%s", "loaded": true}]}' % MODEL.encode()
+    for raw in (b'{"data": [{"id": "\xff\xfe"}]}', big):
+        fake = FakeVLM([], models_raw=raw)
+        try:
+            assert lib.vlm_health(tools, fake.port) == (False, "GET /v1/models failed: invalid JSON")
+            assert [r[0] for r in fake.requests] == ["GET"]
+        finally:
+            fake.close()

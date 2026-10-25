@@ -10,6 +10,7 @@ atomically, mode 0600; every directory it creates is mode 0700 (GC10).
 
 import calendar
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -444,6 +445,71 @@ def vlm_restore_wanted(state):
     if policy == "forbidden":
         return False, "next job %s runs without it" % job_id
     return False, "next job %s is vlm=any" % job_id
+
+
+def _vlm_request(port, timeout, method, path, body=None):
+    """One loopback request to the VLM (VR4; http.client ignores proxy variables, GC3): (reply,
+    None) with the parsed JSON of a 200 reply (at most VLM_MAX_BODY bytes read), else (None,
+    what) with what "HTTP <n>", "invalid JSON" or the exception class name."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        if body is None:
+            conn.request(method, path)
+        else:
+            conn.request(method, path, body=json.dumps(body).encode("utf-8"),
+                         headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read(VLM_MAX_BODY)
+        if resp.status != 200:
+            return None, "HTTP %d" % resp.status
+    except (OSError, http.client.HTTPException) as e:
+        return None, type(e).__name__
+    finally:
+        conn.close()
+    try:
+        return json.loads(raw.decode("utf-8")), None
+    except (ValueError, RecursionError):
+        return None, "invalid JSON"
+
+
+def vlm_health(tools, port, status_timeout=VLM_STATUS_TIMEOUT_S, http_timeout=VLM_HTTP_TIMEOUT_S,
+               completion_timeout=VLM_COMPLETION_TIMEOUT_S):
+    """(ok, detail) of the port-scoped health check (VR4), called only from vlm_preflight: one
+    bin/story-server status, one GET /v1/models, one 1-token completion, in that order and
+    without retries; the first failure returns its H1-H9 text (spec 10)."""
+    run = run_light([os.path.join(tools, "story-server"), "status"], tools, timeout=status_timeout)
+    if run["timed_out"]:
+        return False, "bin/story-server status timed out after %d s" % status_timeout
+    if run["exit_code"] != 0:
+        return False, "bin/story-server status exited %s" % (
+            "none" if run["exit_code"] is None else run["exit_code"])
+    lines = run["stdout"].splitlines()
+    state = next((m.group(1) for m in (STATE_LINE_RE.match(l) for l in lines) if m), "UNKNOWN")
+    if state != "SERVING " + VLM_MODE:
+        return False, "story server is %s, not SERVING %s" % (state, VLM_MODE)
+    model = next((m.group(1) for m in (HEALTH_LINE_RE.match(l) for l in lines) if m), None)
+    if model is None or model == "none":
+        return False, "bin/story-server status printed no served model"
+    reply, what = _vlm_request(port, http_timeout, "GET", "/v1/models")
+    data = reply.get("data") if isinstance(reply, dict) else None
+    if what is None and not isinstance(data, list):
+        what = "invalid JSON"
+    if what is not None:
+        return False, "GET /v1/models failed: %s" % what
+    entries = [d for d in data if isinstance(d, dict) and d.get("id") == model]
+    if not entries:
+        return False, "GET /v1/models does not list %s" % model
+    if "loaded" in entries[0] and entries[0]["loaded"] is not True:
+        return False, "%s is listed by /v1/models but not loaded" % model
+    reply, what = _vlm_request(port, completion_timeout, "POST", "/v1/chat/completions",
+                               {"model": model, "max_tokens": 1, "messages": [
+                                   {"role": "user", "content": "Reply with the single word ok"}]})
+    if what is not None:
+        return False, "completion failed: %s" % what
+    choices = reply.get("choices") if isinstance(reply, dict) else None
+    if not (isinstance(choices, list) and choices):
+        return False, "completion reply has no choices"
+    return True, "%s on 127.0.0.1:%d" % (model, port)
 
 
 # ---------------------------------------------------------------------------
