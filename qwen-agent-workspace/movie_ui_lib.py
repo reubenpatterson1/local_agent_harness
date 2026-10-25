@@ -299,29 +299,51 @@ def cancel_tree(child, grace):
 
 
 def run_job(jdir, grace=CANCEL_GRACE_S):
-    """Run one dispatched job to its end (MU22). Returns 0 after a final status, 1 when the job
-    argv could not be started, 3 when the status was not "starting" (MU24)."""
+    """Run one dispatched job to its end (MU22), with the VLM preflight before the child and the
+    postflight after every end, both under jdir/lock (VLM lifecycle spec VR1). Returns 0 after a
+    final status, 1 when the job argv could not be started or the VLM preflight failed, 3 when
+    the status was not "starting" (MU24)."""
     lock_fd = os.open(os.path.join(jdir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(lock_fd, fcntl.LOCK_EX)
     status = read_status(jdir) or {}
     if status.get("state") != "starting":
         _say("job is %s; nothing to run" % (status.get("state") or "unknown"))
         return 3
+    state_root = os.path.dirname(os.path.dirname(jdir))
     cancel = os.path.join(jdir, "cancel")
     if os.path.exists(cancel):
         write_status(jdir, {"state": "cancelled", "exit_code": None, "ended": utc_now()})
         _say("cancelled before start")
+        vlm_postflight(state_root)
         return 0
     job = read_job(jdir)
+    if vlm_lifecycle_enabled():
+        outcome, error = vlm_preflight(job, cancel)
+        if outcome == "cancelled":
+            write_status(jdir, {"state": "cancelled", "exit_code": None, "ended": utc_now()})
+            _say("cancelled during the VLM preflight")
+            vlm_postflight(state_root)
+            return 0
+        if outcome == "failed":
+            write_status(jdir, {"state": "failed", "dispatched": status.get("dispatched"),
+                                "runner_pid": os.getpid(), "pgid": None, "started": None,
+                                "exit_code": None, "ended": utc_now(), "error": error})
+            _say(error)
+            vlm_postflight(state_root)
+            return 1
     log = open(os.path.join(jdir, "log.txt"), "ab")
     try:
         # Default the VLM model id to "auto" so the character/story pipeline resolves the
         # single *loaded* model the story-server reports (mlx_vlm serves it by path on this
         # host, not under the author's "qwen38-6bit" alias). An explicit env still wins.
+        # STORY_SERVER_ENGINE_SCAN=0 switches off an older release's host-wide EngineCore sweep
+        # in this job's own bin/story-server stop, which could kill the 8178 embed server
+        # (VLM lifecycle spec VR1, R4); the current bin/story-server ignores it.
         child = subprocess.Popen(
             job["argv"], cwd=job["workspace"],
             env=dict(os.environ, PYTHONUNBUFFERED="1",
-                     QWEN_AGENT_VLM_MODEL=os.environ.get("QWEN_AGENT_VLM_MODEL") or "auto"),
+                     QWEN_AGENT_VLM_MODEL=os.environ.get("QWEN_AGENT_VLM_MODEL") or "auto",
+                     STORY_SERVER_ENGINE_SCAN="0"),
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True, close_fds=True)
     except OSError as e:
@@ -330,6 +352,7 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
                             "runner_pid": os.getpid(), "pgid": None, "started": None,
                             "exit_code": None, "ended": utc_now(), "error": error})
         _say(error)
+        vlm_postflight(state_root)
         return 1
     finally:
         log.close()
@@ -352,6 +375,7 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
     final.update({"state": state, "exit_code": code, "ended": utc_now()})
     write_status(jdir, final)
     _say("exit %d (%s)" % (code, state))
+    vlm_postflight(state_root)
     return 0
 
 
@@ -616,6 +640,32 @@ def vlm_preflight(job, cancel, tools=None, port=None, health=None, timeout=VLM_P
         if value != 0:
             return "failed", ("VLM preflight failed: bin/story-server stop exited %d; the log above "
                               "shows why" % value)
+
+
+def vlm_postflight(state):
+    """After every job end, still holding jdir/lock (VR5): restore the VLM, without --wait, iff
+    the queue is empty or the next job needs it. story-server-restore detaches the start under
+    launchd and returns once the start holds the story-server lock (or after at most 10 s)."""
+    if not vlm_lifecycle_enabled():
+        return
+    wanted, why = vlm_restore_wanted(state)
+    if not wanted:
+        _say("vlm: postflight: not restoring the VLM (%s)" % why)
+        return
+    _say("vlm: postflight: restoring the VLM in its own session (%s)" % why)
+    argv = [os.path.join(vlm_tools_dir(), "story-server-restore"), VLM_MODE]
+    _say("vlm: running: %s" % shlex.join(argv))
+    try:
+        rc = subprocess.run(argv, stdin=subprocess.DEVNULL, close_fds=True,
+                            timeout=VLM_POSTFLIGHT_TIMEOUT_S).returncode
+    except subprocess.TimeoutExpired:
+        _say("vlm: postflight: bin/story-server-restore timed out after %d s" % VLM_POSTFLIGHT_TIMEOUT_S)
+        return
+    except OSError as e:
+        _say("vlm: postflight: cannot run %s: %s" % (argv[0], e.strerror or e))
+        return
+    if rc != 0:
+        _say("vlm: postflight: bin/story-server-restore exited %d" % rc)
 
 
 # ---------------------------------------------------------------------------

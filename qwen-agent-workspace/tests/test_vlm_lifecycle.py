@@ -620,3 +620,171 @@ def test_review_focus_5_tools_path_with_a_space(tmp_path, vlm, capsys):
     restore = os.path.join(tools, "story-server-restore")
     assert _say_lines(capsys)[1] == "[movie-ui] vlm: running: '%s' mlx-vision --wait" % restore
     assert call_names(tools) == ["restore --wait"]
+
+
+# --- VL17-VL21, Review Focus 1: the runner's preflight and postflight (VR1, VR5) ----------------
+
+STATUS_KEYS_FAILED = {"state", "dispatched", "runner_pid", "pgid", "started", "exit_code", "ended",
+                      "error"}
+
+
+def _final(state, job_id, timeout=30):
+    return mt.wait_until(lambda: mt.status_of(state, job_id).get("state") in lib.FINISHED_STATES
+                         and mt.status_of(state, job_id), timeout)
+
+
+def _child_probe(path):
+    """A job argv whose child records its own start time and STORY_SERVER_ENGINE_SCAN."""
+    return mt.py_argv("import json, os, time\n"
+                      "json.dump({'t': time.time(), 'scan': os.environ.get('STORY_SERVER_ENGINE_SCAN')}, "
+                      "open(%r, 'w'))\n" % path)
+
+
+def test_vl17_required_job_end_to_end(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    probe = str(tmp_path / "child.json")
+    job_id = mt.make_job(state, _child_probe(probe), str(tmp_path), kind="story")
+    assert mt.dispatch(state, job_id).wait(timeout=60) == 0
+    assert mt.status_of(state, job_id)["state"] == "done"
+    lines = mt.read_log(state, job_id).splitlines()
+    started = [i for i, line in enumerate(lines) if line.startswith("[movie-ui] started pid ")][0]
+    assert [line for line in lines[:started] if line.startswith("[movie-ui] vlm:")] == [
+        "[movie-ui] vlm: preflight: this job needs the VLM (vlm=required)",
+        "[movie-ui] vlm: running: %s mlx-vision --wait" % os.path.join(tools, "story-server-restore"),
+        "[movie-ui] vlm: healthy: %s on 127.0.0.1:%d" % (MODEL, vlm.port)]
+    with open(probe) as f:
+        child = json.load(f)
+    assert child["scan"] == "0"
+    rows = tool_calls(tools, include_status=True)
+    assert [r["argv"] for r in rows if r["t"] < child["t"]] == [["mlx-vision", "--wait"], ["status"]]
+    assert call_names(tools, include_status=True) == ["restore --wait", "status", "restore"]
+    # The lifecycle off: no tool runs, and the child still gets STORY_SERVER_ENGINE_SCAN=0 (VR1).
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "0")
+    probe_off = str(tmp_path / "child-off.json")
+    off = mt.make_job(state, _child_probe(probe_off), str(tmp_path), kind="story")
+    assert mt.dispatch(state, off).wait(timeout=60) == 0
+    with open(probe_off) as f:
+        assert json.load(f)["scan"] == "0"
+    assert len(tool_calls(tools, include_status=True)) == 3
+    assert "[movie-ui] vlm:" not in mt.read_log(state, off)
+
+
+def test_vl18_preflight_failure_end_to_end(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL, restore_rc=1)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    job_id = mt.make_job(state, mt.py_argv("print('the child ran')"), str(tmp_path), kind="story")
+    assert mt.dispatch(state, job_id).wait(timeout=60) == 1
+    status = mt.status_of(state, job_id)
+    assert set(status) == STATUS_KEYS_FAILED
+    assert (status["state"], status["pgid"], status["started"], status["exit_code"]) == (
+        "failed", None, None, None)
+    assert status["error"] == "VLM preflight failed after one restart: " + RESTORE_EXIT_1
+    assert call_names(tools) == ["restore --wait", "stop", "restore --wait", "restore"]
+    log = mt.read_log(state, job_id)
+    assert "the child ran" not in log and "[movie-ui] started pid" not in log
+    assert "[movie-ui] " + status["error"] + "\n" in log
+    assert "[movie-ui] vlm: postflight: restoring the VLM in its own session (queue empty)\n" in log
+
+
+def test_vl19_postflight_runs_under_the_job_lock_after_the_final_status(state, tmp_path, vlm,
+                                                                         monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    job_id = mt.make_job(state, mt.py_argv("import time; time.sleep(0.5)"), str(tmp_path),
+                         kind="smoke")
+    monkeypatch.setenv("FAKE_PROBE_JOB_DIR", lib.job_dir(state, job_id))
+    assert mt.dispatch(state, job_id).wait(timeout=60) == 0
+    status = mt.status_of(state, job_id)
+    assert status["state"] == "done"
+    restores = [r for r in tool_calls(tools) if r["tool"] == "story-server-restore"]
+    assert len(restores) == 1 and restores[0]["argv"] == ["mlx-vision"]
+    assert restores[0]["job_lock_held"] is True
+    assert restores[0]["job_state"] == "done"
+    assert restores[0]["pgid"] != status["pgid"]
+    assert not lib.group_alive(status["pgid"])
+
+
+def test_vl20_postflight_decisions(state, tmp_path, vlm, monkeypatch, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    ws = str(tmp_path)
+    restore = os.path.join(tools, "story-server-restore")
+    lib.vlm_postflight(state)
+    assert call_names(tools) == ["restore"]
+    assert _say_lines(capsys) == [
+        "[movie-ui] vlm: postflight: restoring the VLM in its own session (queue empty)",
+        "[movie-ui] vlm: running: %s mlx-vision" % restore]
+    nxt = mt.make_job(state, ["x"], ws, kind="story")
+    lib.vlm_postflight(state)
+    assert call_names(tools) == ["restore", "restore"]
+    assert _say_lines(capsys)[0] == ("[movie-ui] vlm: postflight: restoring the VLM in its own "
+                                     "session (next job %s needs it)" % nxt)
+    for kind, why in (("smoke", "next job %s runs without it"), ("download", "next job %s is vlm=any")):
+        lib.write_queue(state, [])
+        nxt = mt.make_job(state, ["x"], ws, kind=kind)
+        lib.vlm_postflight(state)
+        assert call_names(tools) == ["restore", "restore"], kind
+        assert _say_lines(capsys) == ["[movie-ui] vlm: postflight: not restoring the VLM (%s)"
+                                      % (why % nxt)]
+    lib.write_queue(state, [])
+    failing = str(tmp_path / "failing-tools")
+    os.makedirs(failing)
+    with open(os.path.join(failing, "story-server-restore"), "w") as f:
+        f.write("#!/bin/sh\nexit 3\n")
+    os.chmod(os.path.join(failing, "story-server-restore"), 0o755)
+    monkeypatch.setenv("MOVIE_UI_VLM_TOOLS", failing)
+    lib.vlm_postflight(state)
+    assert _say_lines(capsys)[-1] == "[movie-ui] vlm: postflight: bin/story-server-restore exited 3"
+    missing = str(tmp_path / "missing-tools")
+    monkeypatch.setenv("MOVIE_UI_VLM_TOOLS", missing)
+    lib.vlm_postflight(state)
+    assert _say_lines(capsys)[-1] == ("[movie-ui] vlm: postflight: cannot run %s: No such file or "
+                                      "directory" % os.path.join(missing, "story-server-restore"))
+
+
+def test_vl21_back_to_back_renders_do_not_reload(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    ws = str(tmp_path)
+    first = mt.make_job(state, mt.py_argv("print('render 1')"), ws, kind="smoke")
+    second = mt.make_job(state, mt.py_argv("print('render 2')"), ws, kind="smoke")
+    assert lib.dispatch_tick(state, mt.WS) == first
+    mt.wait_until(lambda: lib.dispatch_tick(state, mt.WS) == second, 30)
+    _final(state, second)
+    mt.wait_until(lambda: call_names(tools)[-1:] == ["restore"], 30)
+    assert call_names(tools) == ["stop", "stop", "restore"]
+    assert tool_calls(tools)[-1]["t"] >= lib.parse_utc(mt.status_of(state, second)["ended"])
+    assert ("[movie-ui] vlm: postflight: not restoring the VLM (next job %s runs without it)"
+            % second) in mt.read_log(state, first)
+    log = mt.read_log(state, second)
+    assert log.index("[movie-ui] exit 0 (done)") < log.index(
+        "[movie-ui] vlm: postflight: restoring the VLM in its own session (queue empty)")
+
+
+def test_review_focus_1_story_then_movie_of_the_same_story(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    ws = str(tmp_path / "ws")
+    os.makedirs(ws)
+    sdir = lib.story_dir(ws, "s1")
+    write_story = mt.py_argv("import os\nos.makedirs(%r, exist_ok=True)\n"
+                             "open(os.path.join(%r, 'story.md'), 'w').write('## Panel 1\\n')\n"
+                             % (sdir, sdir))
+    story = mt.make_job(state, write_story, ws, kind="story", fields={"action": "story"})
+    movie = mt.make_job(state, mt.py_argv("print('render')"), ws, kind="movie",
+                        fields={"action": "movie"})
+    assert lib.read_job(lib.job_dir(state, movie))["vlm"] == "required"
+    assert lib.dispatch_tick(state, mt.WS) == story
+    mt.wait_until(lambda: lib.dispatch_tick(state, mt.WS) == movie, 60)
+    _final(state, movie)
+    mt.wait_until(lambda: call_names(tools)[-1:] == ["restore"], 30)
+    assert call_names(tools) == ["restore --wait", "stop", "restore"]
+    assert mt.status_of(state, story)["state"] == "done"
+    assert mt.status_of(state, movie)["state"] == "done"
+    assert ("[movie-ui] vlm: postflight: not restoring the VLM (next job %s runs without it)"
+            % movie) in mt.read_log(state, story)
+    log = mt.read_log(state, movie)
+    assert ("[movie-ui] vlm: job.json says vlm=required; story.md exists now, so vlm=forbidden"
+            in log)
+    assert log.index("[movie-ui] vlm: stopped for this job") < log.index("[movie-ui] started pid")
