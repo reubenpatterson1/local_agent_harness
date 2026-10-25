@@ -270,8 +270,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # served model), then to d3796bf (bin/qwen-agent's 120000 fallback context window and
     # --danger-auto-approve reaching any path), then to 8df5fdb (ltx-movie seed geometry under
     # host autotune), then to the qwen-agent-redteam merge of macstudio (opt-in autotune guard
-    # kept around the seed-aware field list). This invariant holds from the new baseline.
-    BASELINE = "e2b4a27f71948d00ec57794a3c7f714380b9af66"
+    # kept around the seed-aware field list), then to
+    # 1f5aa2c36cefe38567d76230c9e3e342c8f14869 (on-camera dialogue). This invariant holds from the new baseline.
+    BASELINE = "1f5aa2c36cefe38567d76230c9e3e342c8f14869"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
