@@ -613,16 +613,20 @@ def phrase_occurs(text, phrase):
     return _phrase_regex(normalize_phrase(phrase)).search(text) is not None
 
 
-def cast_text(text, members, insert=None):
+def cast_text(text, members, insert=None, skip_quoted=False):
     """(text with each cast phrase's trigger inserted, sorted names of the members found).
     Longest phrase first; a match overlapping an already-claimed span is ignored; an
     occurrence that already carries the trigger is counted but not re-inserted (spec 3.6).
     insert: if given, a set of names; every member still claims its spans, but only these
-    members get a trigger and are reported."""
+    members get a trigger and are reported. skip_quoted: a match lying wholly inside a "..."
+    span (a spoken line) is neither triggered nor reported (dialogue spec DG6)."""
+    quoted = [m.span() for m in re.finditer(r'"[^"]*"', text)] if skip_quoted else []
     found = []
     for member in sorted(members, key=lambda m: (-len(m.phrase), m.phrase.lower(), m.name)):
         for match in _phrase_regex(member.phrase, member.trigger).finditer(text):
             start, end = match.span()
+            if any(s <= start and end <= e for s, e in quoted):
+                continue
             if any(start < e and s < end for s, e, _, _ in found):
                 continue
             found.append((start, end, member, match.group("trig") is not None))
@@ -680,12 +684,19 @@ def speech_sentence(phrase, speech):
     return '%s says: "%s"' % (phrase[:1].upper() + phrase[1:], speech)
 
 
-def insert_speech(text, sentence):
-    """text with sentence added: before a trailing camera sentence (_is_camera_sentence) when
-    there is one, else at the end, so the line belongs to the action, not to the camera."""
+def insert_speech(text, sentence, phrases=()):
+    """text with sentence added before the run of trailing camera sentences
+    (_is_camera_sentence with phrases, so a pasted "<Speaker> faces the camera." stays with the
+    action), never before the first sentence; at the end when there is no such run (dialogue
+    spec DG6)."""
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
-    if len(sentences) > 1 and _is_camera_sentence(sentences[-1]):
-        return " ".join(sentences[:-1] + [sentence, sentences[-1]])
+    trailing = 0
+    while (trailing < len(sentences)
+           and _is_camera_sentence(sentences[len(sentences) - 1 - trailing], phrases)):
+        trailing += 1
+    if len(sentences) > 1 and trailing >= 1:
+        at = max(len(sentences) - trailing, 1)
+        return " ".join(sentences[:at] + [sentence] + sentences[at:])
     return (text.rstrip() + " " + sentence).strip()
 
 

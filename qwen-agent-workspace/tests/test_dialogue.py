@@ -175,3 +175,46 @@ def test_dlg34_motion_problems_with_phrases():
     panel = {"number": 1, "title": "One", "image": "The courier waits.", "motion": motion,
              "narration": "It rained.", "prompt": "", "dialogue": ""}
     assert "panel 1: %s: %s" % two in character_lib.shots_violations(text, [panel], 1, [])
+
+
+# --- DLG4, DLG6: placement and triggers (DG6) -----------------------------------------------
+
+def _members(story_env, *names):
+    """Resolved CastMembers for the test library characters kyra and ronin."""
+    for name in names:
+        {"kyra": seu.kyra, "ronin": seu.ronin}[name](story_env["lib"])
+    return character_lib.resolve_cast([(None, name) for name in names])
+
+
+def test_dlg4_insert_speech_placement():
+    lib = character_lib
+    said = 'The courier says, "Go."'
+    motion = "The courier raises the letter. The courier faces the camera. The camera stays static."
+    assert lib.insert_speech(motion, said, ["the courier"]) == (
+        "The courier raises the letter. The courier faces the camera. " + said
+        + " The camera stays static.")
+    assert lib.insert_speech(motion, said) == (
+        "The courier raises the letter. " + said + " The courier faces the camera. The camera "
+        "stays static.")
+    run = "The courier runs. The camera slowly pushes in. The camera holds."
+    assert lib.insert_speech(run, said, ["the courier"]) == (
+        "The courier runs. " + said + " The camera slowly pushes in. The camera holds.")
+    assert lib.insert_speech("The camera stays static. The camera holds.", said) == (
+        "The camera stays static. " + said + " The camera holds.")
+    assert lib.insert_speech("The camera stays static.", said) == "The camera stays static. " + said
+    he = 'He says: "Go."'
+    assert lib.insert_speech("He runs. The camera tracks alongside the movement.", he) == (
+        'He runs. He says: "Go." The camera tracks alongside the movement.')
+    assert lib.insert_speech("He runs. He jumps.", he) == 'He runs. He jumps. He says: "Go."'
+
+
+def test_dlg6_cast_text_skip_quoted(story_env):
+    members = _members(story_env, "kyra", "ronin")
+    text = 'The woman in grey says, "Tell the ronin the woman in grey is here."'
+    assert character_lib.cast_text(text, members, skip_quoted=True) == (
+        'The kyrawmn woman in grey says, "Tell the ronin the woman in grey is here."', ["kyra"])
+    assert character_lib.cast_text(text, members) == (
+        'The kyrawmn woman in grey says, "Tell the roninmn ronin the kyrawmn woman in grey is '
+        'here."', ["kyra", "ronin"])
+    assert character_lib.cast_text('"The ronin waits."', members, skip_quoted=True) == (
+        '"The ronin waits."', [])
