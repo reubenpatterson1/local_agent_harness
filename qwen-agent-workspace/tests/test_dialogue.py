@@ -1871,3 +1871,131 @@ def test_ca6_n19_cast_reference(ws, story_env):
         assert _only(hard, "N19") == [] and _only(advisory, "N19") == expected, (mode, text)
     assert se.GENERATION_CHECKS[-1] == "N19" and se.RECHECK_IDS[-1] == "N19"
     assert "N19" not in se.PLAN_FREE_IDS and "N19" not in se.REPAIR_IDS
+
+
+# --- DLG-H, DLG-K1, DK2, DK3: the merge gate and the guards (DK2-DK6, 10.1) -------------------
+
+DLG_H_TEXT = {
+    "chained": ("motion", "The courier leans into the bend while rain streams off the yellow hood. "
+                          "Water sprays from the front wheel across the cobblestones. The camera "
+                          "slowly pans left."),
+    "shots": ("motion", "The courier leans into the bend as rain streams off the yellow hood. The "
+                        "camera slowly pans left."),
+    "no_stills": ("prompt", seu.panel_json("no_stills", 2)["prompt"]
+                  + " The camera slowly pans left as the yellow hood flaps in the wind."),
+}
+
+
+@pytest.mark.parametrize("speaking", [False, True], ids=["silent", "speaking"])
+@pytest.mark.parametrize("mode", ["chained", "shots", "no_stills"])
+def test_dlg_h_offline_merge_gate(mode, speaking, ws, tmp_path, monkeypatch):
+    raw = seu.plan_json(mode, 3)
+    if speaking:
+        raw["beats"][1]["speaker"] = "c1"
+    key, text = DLG_H_TEXT[mode]
+    reply = {key: text}
+    if speaking:
+        reply["dialogue"] = LINE
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, mode=mode, plan=[seu.answer(raw)],
+                            panel=_replies(mode, 3, {2: [reply]}))
+    assert rc == 0
+    rounds = os.path.join(ctx.story_dir, "story_rounds")
+    assert _read_json(os.path.join(rounds, "round_0", "story_checks.json"))["hard"] == []
+    assert _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["stop_reason"] == "passed"
+    assert [r["stage"] for r in log].count("critic") == 0
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        story = f.read()
+    for sentence in se._sentences(text):
+        assert sentence in story, sentence
+    if speaking:
+        assert "Dialogue: the courier: " + LINE + "\n" in story
+
+
+KPI_DIR = os.path.join(WS, "tests", "fixtures", "dialogue_kpi")
+
+
+def test_dlg_k1_calibration_replay(tmp_path, monkeypatch, capsys):
+    cases = (sorted(n for n in os.listdir(KPI_DIR) if os.path.isdir(os.path.join(KPI_DIR, n)))
+             if os.path.isdir(KPI_DIR) else [])
+    if not cases:
+        pytest.skip("dialogue KPI corpus not recorded")
+
+    def no_agent(*args, **kwargs):
+        raise AssertionError("the DLG-K1 replay makes no panel or plan call")
+
+    monkeypatch.setattr(se, "run_agent", no_agent)
+    monkeypatch.setattr(se, "run_critic", lambda ctx, prompt: (
+        "ok", json.dumps(seu.critic_json(verdict="revise")), "local"))
+    passed = []
+    for name in cases:
+        case_dir = os.path.join(KPI_DIR, name)
+        case = _read_json(os.path.join(case_dir, "case.json"))
+        plan = _read_json(os.path.join(case_dir, "plan.json"))
+        parts = [dict((key, value) for key, value in p.items() if key != "index")
+                 for p in _read_json(os.path.join(case_dir, "parts.json"))["panels"]]
+        ctx = seu.make_ctx(se, seu.make_ws(tmp_path / name), story_id="kpi-" + name,
+                           mode=case["mode"], panels=case["panels"], seconds=case["seconds"],
+                           clip_seconds=case["clip_seconds"], narration=case["narration"])
+        runner = se._Run(ctx, "")
+        runner.make_state(0, plan, parts)
+        runner.critic_loop()
+        if not se.final_outcome(runner.states)[1]:
+            passed.append(name)
+    with capsys.disabled():
+        print("\nDLG-K1: %d of %d cases have 0 blocking violations" % (len(passed), len(cases)))
+    if os.environ.get("DIALOGUE_KPI_ENFORCE") == "1":
+        assert len(passed) >= 22, sorted(set(cases) - set(passed))
+
+
+DK2_FILES = ("character_lib.py", "story_engine.py", "bin/ltx-story-manifest", "bin/ltx-movie",
+             "bin/judge-story", "bin/judge-clips", "bin/judge-stills", "tests/test_dialogue.py",
+             "tests/test_story_engine.py", "tests/test_casting_pipeline.py",
+             "tests/test_shots_mode.py", "tests/test_judge_story.py", "tests/test_judge_clips.py",
+             "tests/test_movie_ui_builder.py")
+COMPILE_ONLY = ("import sys\n"
+                "for path in sys.argv[1:]:\n"
+                "    with open(path, encoding='utf-8') as f:\n"
+                "        compile(f.read(), path, 'exec')\n"
+                "print('compiled %d' % (len(sys.argv) - 1))\n")
+
+
+def test_dk2_both_interpreters_compile_every_changed_file():
+    paths = [os.path.join(WS, rel) for rel in DK2_FILES]
+    for interpreter in ("/usr/bin/python3", sys.executable):
+        proc = subprocess.run([interpreter, "-c", COMPILE_ONLY] + paths, capture_output=True,
+                              text=True)
+        assert (proc.returncode, proc.stdout) == (0, "compiled %d\n" % len(paths)), (
+            interpreter, proc.stderr)
+
+
+def _top_level_imports(rel):
+    import ast
+    with open(os.path.join(WS, rel), encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=rel)
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(node.module)
+    return names
+
+
+def test_dk3_import_sets_are_unchanged():
+    expected = {
+        "character_lib.py": {"collections", "datetime", "json", "os", "re", "uuid"},
+        "story_engine.py": {"collections", "copy", "datetime", "hashlib", "importlib.machinery",
+                            "json", "os", "re", "shlex", "subprocess", "sys", "time", "uuid"},
+        "bin/ltx-story-manifest": {"PIL", "argparse", "datetime", "glob", "importlib.machinery",
+                                   "json", "os", "re", "sys"},
+        "bin/ltx-movie": {"argparse", "glob", "importlib.machinery", "json", "os", "pipeline_log",
+                          "shlex", "subprocess", "sys", "threading", "time"},
+        "bin/judge-story": {"anthropic", "argparse", "datetime", "json", "jsonschema", "os", "sys"},
+        "bin/judge-clips": {"anthropic", "argparse", "base64", "datetime", "fractions", "json",
+                            "jsonschema", "os", "pipeline_log", "re", "shutil", "subprocess",
+                            "sys", "tempfile"},
+        "bin/judge-stills": {"anthropic", "argparse", "base64", "datetime", "json", "jsonschema",
+                             "os", "pipeline_log", "re", "sys"},
+    }
+    for rel, names in expected.items():
+        assert _top_level_imports(rel) == names, rel
