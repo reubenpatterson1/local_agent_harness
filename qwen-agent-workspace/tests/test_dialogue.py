@@ -1697,3 +1697,150 @@ def test_ca9_member_referenced_and_prefix_character_triggers(story_env):
     assert prefix("the kyrawmn-like blur", ["kyrawmn"]) == "kyrawmn. the kyrawmn-like blur"
     assert character_lib.story_strength(kyra, 0.8) == 0.8
     assert character_lib.story_strength(kyra._replace(strength=0.5), 0.8) == 0.5
+
+
+# --- CA1, CA3-CA5, CA8: chained casting attachment (11.2-11.5, 11.9) -------------------------
+
+CA_STORY = """# Cast test
+
+Kyra at the harbour.
+
+## Panel 1 — One
+Image: The woman in grey stands at the harbour wall.
+Motion: @@M1@@
+Narration: The tide was turning.
+
+## Panel 2 — Two
+Motion: @@M2@@
+Narration: Nobody came.
+"""
+KYRA_ENTRY = {"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K,
+              "cast_name": "kyra"}
+RONIN_ENTRY = {"id": "c2", "phrase": "the ronin", "descriptor": seu.DESC_R, "cast_name": "ronin"}
+PRONOUN = "She turns her head toward the harbour."
+WATCHES = "The woman in grey watches the boats."
+
+
+def _ca_plan(*beat_casts):
+    return {"schema": "ltx-movie.plan.v1", "cast": [KYRA_ENTRY, RONIN_ENTRY],
+            "beats": [{"cast": list(c)} for c in beat_casts]}
+
+
+def _ca_manifest(tmp_path, monkeypatch, story_id, m1, m2, plan=None, cast=("kyra",), extra=()):
+    text = CA_STORY.replace("@@M1@@", m1).replace("@@M2@@", m2)
+    story_md, images, mws = _manifest_ws(tmp_path, monkeypatch, story_id, text, plan=plan)
+    flags = []
+    for name in cast:
+        flags += ["--cast", {"kyra": "the woman in grey=kyra", "ronin": "the ronin=ronin"}[name]]
+    rc = story_manifest.main(_manifest_argv(story_id, story_md, images, extra=flags + list(extra)))
+    return rc, (_read_manifest(mws, story_id)["panels"] if rc == 0 else None)
+
+
+def _short(panel):
+    return [(c["name"], c["strength"]) for c in panel["characters"]]
+
+
+def test_ca1_plan_attaches_a_pronoun_only_panel(tmp_path, monkeypatch, capsys, story_env):
+    _members(story_env, "kyra")
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca1", WATCHES, PRONOUN,
+                              plan=_ca_plan(["c1"], ["c1"]))
+    assert rc == 0
+    assert _short(panels[1]) == [("kyra", 0.8)]
+    assert panels[1]["motion_prompt"] == "kyrawmn. " + PRONOUN
+    assert panels[0]["motion_prompt"] == "The kyrawmn woman in grey watches the boats."
+    assert ("cast: panel 2: kyra attached from plan.json (Motion: does not name them); trigger "
+            "prefixed\n") in capsys.readouterr().out
+
+
+def test_ca3_without_a_usable_plan_characters_attach_from_the_text(tmp_path, monkeypatch, capsys,
+                                                                    story_env):
+    _members(story_env, "kyra")
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca3", WATCHES, PRONOUN)
+    assert rc == 0 and panels[1]["characters"] == [] and panels[1]["motion_prompt"] == PRONOUN
+    assert "plan.json" not in capsys.readouterr().out
+    note = ("note: plan.json is not usable for casting (%s); characters attach from the Motion: "
+            "text only\n")
+    for i, (plan, reason) in enumerate((
+            ("{not json", "it is unreadable or not a JSON object"),
+            ("[]", "it is unreadable or not a JSON object"),
+            ({"schema": "other"}, "its schema is not ltx-movie.plan.v1"),
+            ({"schema": "ltx-movie.plan.v1", "cast": "c1", "beats": []},
+             "its cast is not a list of objects"),
+            (_ca_plan(["c1"]), "it has 1 beats for 2 panels"),
+            ({"schema": "ltx-movie.plan.v1", "cast": [KYRA_ENTRY],
+              "beats": [{"cast": ["c1"]}, {"cast": "c1"}]}, "beat 2 has no cast list"))):
+        rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca3-%d" % i, WATCHES, PRONOUN, plan=plan)
+        assert rc == 0 and panels[1]["characters"] == [], reason
+        assert panels[1]["motion_prompt"] == PRONOUN, reason
+        assert (note % reason) in capsys.readouterr().out, reason
+
+
+def test_ca4_text_and_plan_names_are_united(tmp_path, monkeypatch, story_env):
+    _members(story_env, "kyra", "ronin")
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca4", WATCHES, "The ronin bows low.",
+                              plan=_ca_plan(["c1"], ["c1"]), cast=("kyra", "ronin"))
+    assert rc == 0 and [c["name"] for c in panels[1]["characters"]] == ["kyra", "ronin"]
+    assert panels[1]["motion_prompt"] == "kyrawmn. The roninmn ronin bows low."
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca4b", WATCHES, "The woman in grey bows low.",
+                              plan=_ca_plan([], []))
+    assert rc == 0 and [c["name"] for c in panels[1]["characters"]] == ["kyra"]
+
+
+def test_ca5_one_strength_per_character_for_the_story(tmp_path, monkeypatch, story_env):
+    seu.kyra(story_env["lib"])
+    seu.ronin(story_env["lib"], strength=0.5)
+    both = ("kyra", "ronin")
+    bows = "The ronin bows to the woman in grey."
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca5", "The woman in grey waits.", bows,
+                              cast=both)
+    assert rc == 0
+    assert [_short(p) for p in panels] == [[("kyra", 0.8)], [("kyra", 0.8), ("ronin", 0.5)]]
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca5b", "The woman in grey waits.", bows,
+                              cast=both, extra=["--character-strength", "1.0"])
+    assert [_short(p) for p in panels] == [[("kyra", 1.0)], [("kyra", 1.0), ("ronin", 0.5)]]
+    shots = ("# Shots cast\n\n## Panel 1 — One\nImage: The woman in grey stands alone.\nMotion: The "
+             "woman in grey waits.\nNarration: It rained.\n\n## Panel 2 — Two\nImage: " + bows
+             + "\nMotion: " + bows + "\nNarration: It poured.\n")
+    story_md, images, mws = _manifest_ws(tmp_path, monkeypatch, "ca5s", shots, images=2)
+    assert story_manifest.main(_manifest_argv("ca5s", story_md, images, mode="shots", extra=[
+        "--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin"])) == 0
+    members = character_lib.resolve_cast([(None, "kyra"), (None, "ronin")])
+    panels = _read_manifest(mws, "ca5s")["panels"]
+    for p, names in zip(panels, (["kyra"], ["kyra", "ronin"])):
+        expected = character_lib.panel_strengths(names, members, 0.8, shots=True)
+        assert _short(p) == [(n, expected[n]) for n in names]
+
+
+def test_ca8_catalog_triggers_go_in_front_of_the_character_prefix(tmp_path, monkeypatch,
+                                                                  story_env):
+    _members(story_env, "kyra")
+    lora = tmp_path / "cat.safetensors"
+    lora.write_bytes(b"x" * 16)
+    entry = {"id": "cat-motion", "kind": "motion", "path": str(lora), "sha256": "0" * 64,
+             "strength": 0.7, "triggers": ["cattrig"]}
+    catalog = tmp_path / "catalog_loras.json"
+    catalog.write_text(json.dumps({"schema": "ltx-movie.catalog-loras.v1", "story_id": "ca8",
+                                   "panels": [[], [entry]]}), encoding="utf-8")
+    rc, panels = _ca_manifest(tmp_path, monkeypatch, "ca8", WATCHES, PRONOUN,
+                              plan=_ca_plan(["c1"], ["c1"]),
+                              extra=["--catalog-loras", str(catalog)])
+    assert rc == 0 and panels[1]["motion_prompt"] == "cattrig. kyrawmn. " + PRONOUN
+
+
+def test_casting_help_and_docstring_text():
+    actions = story_manifest.build_parser()._option_string_actions
+    assert actions["--character-strength"].help == (
+        "LoRA strength for each cast character without its own character.json strength (default "
+        "0.8, provisional), the same in every panel")
+    assert actions["--cast"].help.endswith(
+        "; under --chain a panel also gets every character its plan.json beat lists")
+    assert ltx_movie.build_parser()._option_string_actions["--character-strength"].help == (
+        "LoRA strength for each cast character without its own character.json strength (default "
+        "0.8, provisional): the same in every clip of the story, alone or with others; a panel "
+        "still of exactly one character uses 1.0")
+    doc = " ".join(story_manifest.__doc__.split())
+    assert ("under --chain, strength is the character's own character.json strength or "
+            "--character-strength (default 0.8) in every panel") in doc
+    assert "strength is 1.0 when the panel names exactly one cast character" not in doc
+    assert ("in the chained flow each character keeps one strength in every clip"
+            in " ".join(ltx_movie.__doc__.split()))

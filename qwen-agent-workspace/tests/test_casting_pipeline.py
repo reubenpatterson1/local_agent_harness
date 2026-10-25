@@ -724,14 +724,14 @@ def test_p20_cast_inserts_triggers_and_lists_characters(tmp_path, monkeypatch, c
         "Leaves drift across the empty trail."]
     assert [p["panel_text"] for p in cast["panels"]] == [p["panel_text"] for p in uncast["panels"]]
     assert [_short(p["characters"]) for p in cast["panels"]] == [
-        [("kyra", 1.0)], [("kyra", 0.8), ("ronin", 0.8)], []]
+        [("kyra", 0.8)], [("kyra", 0.8), ("ronin", 0.8)], []]
     kyra = cast["panels"][0]["characters"][0]
     assert kyra == {"name": "kyra", "phrase": "the woman in grey", "trigger": "kyrawmn",
                     "video_lora": os.path.join(lib_dir, "kyra", "lora", "video.safetensors"),
-                    "strength": 1.0}
+                    "strength": 0.8}
     assert all(set(c) == {"name", "phrase", "trigger", "video_lora", "strength"}
                for p in cast["panels"] for c in p["characters"])
-    assert "cast: panel 1: kyra@1.0" in out.splitlines()
+    assert "cast: panel 1: kyra@0.8" in out.splitlines()
     assert "cast: panel 2: kyra@0.8, ronin@0.8" in out.splitlines()
     assert not any(line.startswith("cast: panel 3") for line in out.splitlines())
 
@@ -744,7 +744,7 @@ def test_p21_character_strength_and_override(tmp_path, monkeypatch, lib_dir):
         "cast", story_md, image, "--cast", "the woman in grey=kyra",
         "--cast", "the ronin=ronin", "--character-strength", "0.6")) == 0
     panels = _read_manifest(ws, "cast")["panels"]
-    assert _short(panels[0]["characters"]) == [("kyra", 1.0)]
+    assert _short(panels[0]["characters"]) == [("kyra", 0.6)]
     assert _short(panels[1]["characters"]) == [("kyra", 0.6), ("ronin", 0.5)]
 
 

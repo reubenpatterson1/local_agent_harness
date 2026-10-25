@@ -599,7 +599,7 @@ def test_s62_shots_strength_overrides(tmp_path, monkeypatch, lib_dir):
              "--fps", "24", "--target-seconds", repr(145 * 4 / 24.0), "--min-frames", "145",
              "--max-frames", "145", "--force"] + cast
     assert story_manifest.main(chain) == 0
-    assert _names_strengths(_shots_manifest(ws, "chain")["panels"][0]) == [("kyra", 1.0)]
+    assert _names_strengths(_shots_manifest(ws, "chain")["panels"][0]) == [("kyra", 0.8)]
 
 
 def test_s63_shots_manifest_errors(tmp_path, monkeypatch, capsys):

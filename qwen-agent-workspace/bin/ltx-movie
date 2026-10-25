@@ -78,8 +78,10 @@ character's referring phrase and description; for an existing story.md, --charac
 is the same as --cast "<its referring phrase>=NAME", and --cast "PHRASE=NAME" casts it
 under a phrase the story already uses. Phases 2 and 3 receive --cast PHRASE=NAME per
 member plus --character-strength, so every panel whose prompt names a cast phrase renders
-with that character's LoRAs (1.0 for one character, --character-strength, default 0.8, for
-two or more). Every casting problem exits 2 before any phase runs. character_lib.py is
+with that character's LoRAs (in the chained flow each character keeps one strength in every
+clip: its character.json strength, else --character-strength, default 0.8; a panel whose
+Motion: only refers to a character by pronoun still gets its LoRA from plan.json). Every
+casting problem exits 2 before any phase runs. character_lib.py is
 loaded by path only when casting or --shots is used, so an uncast run without --shots
 never reads it -- on the --story-legacy path and in every dry run; the default story engine
 loads it for its checks.
@@ -350,10 +352,10 @@ def build_parser():
                               "(repeatable); PHRASE must occur in story.md")
     parser.add_argument("--character-strength", dest="character_strength", type=float,
                          default=None,
-                         help="LoRA strength for each cast character in a panel that names two "
-                              "or more of them (default 0.8, provisional); a panel that names "
-                              "one cast character uses 1.0, except with --shots, where every "
-                              "cast character uses this strength")
+                         help="LoRA strength for each cast character without its own "
+                              "character.json strength (default 0.8, provisional): the same in "
+                              "every clip of the story, alone or with others; a panel still of "
+                              "exactly one character uses 1.0")
     parser.add_argument("--action", dest="actions", action="append", default=None,
                          metavar="NAME[:STRENGTH]",
                          help="apply a trained action (motion) LoRA from generated/actions/ to "
