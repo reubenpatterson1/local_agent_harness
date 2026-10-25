@@ -101,15 +101,6 @@ WARM_MAX_TOKENS=8
 STOP_TERM_WAIT=60
 STOP_KILL_WAIT=10
 LOG_TAIL_LINES=40
-# D9's VLLM::EngineCore sweep is host-global: it is deliberately NOT scoped by $PORT,
-# so it reaps an EngineCore belonging to a vLLM on any port (R8, accepted in
-# production -- this host runs at most one vLLM). That makes it unsafe for the
-# offline test suite, which runs `stop` against an ephemeral port while a real vLLM
-# may be loading on the production port: without this switch every `stop` in the
-# suite silently adds the real EngineCore to its kill set. Set
-# STORY_SERVER_ENGINE_SCAN=0 to disable the sweep. Production sets nothing; the
-# default 1 is the contract.
-ENGINE_SCAN="${STORY_SERVER_ENGINE_SCAN:-1}"
 # How much of a command line the `mode pid:` status line shows. Measured 2026-09-17
 # on this host: the real vLLM front-end's argv[0] is the 123-char Homebrew framework
 # python, so the literal `vllm serve` starts at column 170 and a 120-char cut hides
@@ -136,11 +127,14 @@ die2() { printf 'story-server: %s\n' "$1" >&2; }          # stderr, caller sets 
 
 iso_now() { /bin/date -u "+%Y-%m-%dT%H:%M:%SZ"; }
 
-# stdin: a /v1/models body. stdout: data[0].id, or empty on any failure.
+# stdin: a /v1/models body. stdout: the id of the first entry with "loaded": true (mlx_vlm.server
+# lists every cached model and flags the active one), else data[0].id, or empty on any failure.
 extract_served_id() {
     "$PY" -c 'import json,sys
 try:
-    print(json.load(sys.stdin)["data"][0]["id"])
+    data = json.load(sys.stdin)["data"]
+    loaded = [d["id"] for d in data if isinstance(d, dict) and d.get("loaded") is True]
+    print(loaded[0] if loaded else data[0]["id"])
 except Exception:
     print("")'
 }
@@ -194,13 +188,6 @@ is_server_pid() {
         *" -m mlx_vlm.server")   return 0 ;;
     esac
     return 1
-}
-
-# stdout: space-separated live VLLM::EngineCore pids (see D9).
-engine_pids() {
-    [ "$ENGINE_SCAN" = "1" ] || return 0
-    /bin/ps -xww -o pid=,command= 2>/dev/null \
-      | /usr/bin/awk '$2 ~ /^VLLM::EngineCore/ { printf "%s ", $1 }'
 }
 
 # Reads $MODE_FILE into MODE_REC / PID_REC / TS_REC (empty when absent/garbage).
@@ -264,6 +251,21 @@ serve_cmd_pids() {
           if (index(cmd, "vllm serve") > 0 || index(cmd, "mtplx serve") > 0 ||
               index(cmd, " -m mtplx.server.openai ") > 0 ||
               index(cmd, " -m mlx_vlm.server") > 0) printf "%s ", pid }'
+}
+
+# stdout: space-separated live descendants of the space-separated root pids in $1 (the roots
+# themselves are not printed). Port-scoped by construction: callers pass only this port's
+# server pids, so a vLLM on another port (the 8178 embed server) is never in the set.
+tree_pids() {
+    /bin/ps -A -o pid=,ppid= 2>/dev/null | /usr/bin/awk -v roots="$1" '
+        BEGIN { n = split(roots, r, " ")
+                for (i = 1; i <= n; i++) if (r[i] ~ /^[0-9]+$/ && r[i] + 0 > 1) want[r[i]] = 1 }
+        { p[NR] = $1; pp[NR] = $2 }
+        END { changed = 1
+              while (changed) { changed = 0
+                  for (i = 1; i <= NR; i++)
+                      if ((pp[i] in want) && !(p[i] in want)) { want[p[i]] = 1; out = out p[i] " "; changed = 1 } }
+              printf "%s", out }'
 }
 
 # Usage: CAND=$(add_pid "$CAND" "$p")  -- appends $p to a space-separated list
@@ -502,7 +504,7 @@ cmd_serve() {
     on_interrupt() {
         trap - INT TERM
         die2 "interrupted during load; killing the $MODE server (pid $SPAWN_PID) so it does not hold memory the render needs"
-        kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+        kill_set "$SPAWN_PID $(port_pids) $(tree_pids "$SPAWN_PID $(port_pids)")"
         /bin/rm -f "$MODE_FILE"
         exit 5
     }
@@ -528,7 +530,7 @@ cmd_serve() {
             else
                 die2 "FAILED: the $MODE server (pid $SPAWN_PID) exited after ${waited}s before becoming ready; last $LOG_TAIL_LINES lines of $log follow"   # M18
                 /usr/bin/tail -n "$LOG_TAIL_LINES" "$log" >&2
-                kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+                kill_set "$SPAWN_PID $(port_pids) $(tree_pids "$SPAWN_PID $(port_pids)")"
                 /bin/rm -f "$MODE_FILE"
                 exit 5
             fi
@@ -541,7 +543,7 @@ cmd_serve() {
     if [ "$ready" -ne 1 ]; then
         die2 "TIMEOUT: 127.0.0.1:$PORT did not become ready in ${READY_TIMEOUT}s; killing the $MODE server (pid $SPAWN_PID) so it does not hold memory the render needs; last $LOG_TAIL_LINES lines of $log follow"   # M19
         /usr/bin/tail -n "$LOG_TAIL_LINES" "$log" >&2
-        kill_set "$SPAWN_PID $(port_pids) $(engine_pids)"
+        kill_set "$SPAWN_PID $(port_pids) $(tree_pids "$SPAWN_PID $(port_pids)")"
         /bin/rm -f "$MODE_FILE"
         exit 5
     fi
@@ -664,11 +666,10 @@ cmd_stop() {
     # resolved from the RECORDED mode, not the fixed "stop" $CMD.
     if [ "$MODE_REC" = "mlx-vision" ]; then MODEL_ID="$MLX_VISION_MODEL_ID"; fi
 
-    local port_list serve_list eng_list pid cmd120 accepted
+    local port_list serve_list pid cmd120 accepted
 
     port_list=$(port_pids)
     serve_list=$(serve_cmd_pids)
-    eng_list=$(engine_pids)
 
     # Step 2: validate every port_pids member before touching anything (D8, MF-C).
     for pid in $port_list; do
@@ -691,14 +692,18 @@ cmd_stop() {
         fi
     done
 
-    # Step 1: build the candidate set.
+    # Step 1: build the candidate set: the port owners, this port's serve argv matches, the
+    # mode-file pid, and every descendant of those (VLM lifecycle spec VS6). An orphaned
+    # VLLM::EngineCore outside that tree is reported (M31), never killed.
     CAND=""
-    for pid in $port_list $serve_list $eng_list; do
-        CAND=$(add_pid "$CAND" "$pid")
+    for pid in $port_list $serve_list; do CAND=$(add_pid "$CAND" "$pid"); done
+    if is_server_pid "$PID_REC"; then CAND=$(add_pid "$CAND" "$PID_REC"); fi
+    for pid in $(tree_pids "$CAND"); do CAND=$(add_pid "$CAND" "$pid"); done
+    /bin/ps -A -o pid=,ppid=,command= 2>/dev/null \
+      | /usr/bin/awk '$2 == 1 && $3 ~ /^VLLM::EngineCore/ { print $1 }' | while read -r p; do
+        case " $CAND " in *" $p "*) continue ;; esac
+        say "WARNING: VLLM::EngineCore pid $p has parent pid 1 and is not in port $PORT's process tree; left running (it may belong to another vLLM, such as the embed server on 8178)"   # M31
     done
-    if is_server_pid "$PID_REC"; then
-        CAND=$(add_pid "$CAND" "$PID_REC")
-    fi
 
     if [ -z "$CAND" ]; then
         say "nothing to stop"   # M23

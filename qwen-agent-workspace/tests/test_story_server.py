@@ -12,9 +12,11 @@ stub process it may have spawned survives.
 """
 
 import fcntl
+import http.server
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -190,11 +192,6 @@ def _base_env(tmp_path, port):
     env["STORY_SERVER_MLX_VLM_PYTHON"] = str(mlx_vlm_python_path)
     env["STORY_SERVER_READY_POLL"] = "1"
     env["STORY_SERVER_WARM_TIMEOUT"] = "10"
-    # engine_pids() is host-global, not port-scoped (plan D9/R8). Without this the
-    # kill set of every `stop`/timeout/trap path in this suite would include a REAL
-    # `VLLM::EngineCore` if one is alive on this host, and the suite would SIGKILL a
-    # production vLLM that it never started.
-    env["STORY_SERVER_ENGINE_SCAN"] = "0"
     env["STUB_SERVER_PY"] = str(stub_server_py)
     env["STUB_POST_LOG"] = str(tmp_path / "post.log")
     return env
@@ -706,25 +703,27 @@ def test_s14_source_guards():
     assert re.search(r"^set -u\s*$", text, re.MULTILINE)
     assert not re.search(r"^set -e\b", text, re.MULTILINE)
 
+    # The host values are bin/story-server's macstudio defaults (VLM lifecycle spec 11.4, G5):
+    # a future host-adapt of those defaults must update this table in the same commit.
     expected_constants = {
-        "STORY_SERVER_WS": "/Users/reubenpatterson/local_model_harness/qwen-agent-workspace",
+        "STORY_SERVER_WS": "/Users/ailab1/local_agent_harness/qwen-agent-workspace",
         "STORY_SERVER_MODEL_ID": "qwen38-6bit",
         "STORY_SERVER_PORT": "8177",
-        "STORY_SERVER_VISION_MODEL_DIR": "/Users/reubenpatterson/mlx_models/qwen3-vl",
-        "STORY_SERVER_VLLM_BIN": "/Users/reubenpatterson/.venv-vllm-metal/bin/vllm",
+        "STORY_SERVER_VISION_MODEL_DIR": "/Users/ailab1/mlx_models/qwen3-vl",
+        "STORY_SERVER_VLLM_BIN": "/Users/ailab1/.venv-vllm-metal/bin/vllm",
         "STORY_SERVER_MTPLX_BIN": "/opt/homebrew/bin/mtplx",
         "STORY_SERVER_MTPLX_VERSION": "2.10.1",
         "STORY_SERVER_TEXT_MODEL_REPO": DEFAULT_TEXT_MODEL_REPO,
-        "STORY_SERVER_STATE_DIR": "/Users/reubenpatterson/.qwen-serve-guard",
+        "STORY_SERVER_STATE_DIR": "/Users/ailab1/.qwen-serve-guard",
         "STORY_SERVER_LSOF": "/usr/sbin/lsof",
         "STORY_SERVER_PY": "/usr/bin/python3",
         "STORY_SERVER_READY_TIMEOUT": "840",
         "STORY_SERVER_READY_POLL": "5",
         "STORY_SERVER_WARM_TIMEOUT": "300",
-        "STORY_SERVER_ENGINE_SCAN": "1",
+        "STORY_SERVER_LOCK_TIMEOUT": "1260",
         "STORY_SERVER_VISION_GPU_MEM_UTIL": "0.70",
-        "STORY_SERVER_MLX_VISION_MODEL_ID": "andrevp/Qwen3.5-9B-Distilled-OPUS-Heretic-MLX-VLM-8bit",
-        "STORY_SERVER_MLX_VLM_PYTHON": "python3",
+        "STORY_SERVER_MLX_VISION_MODEL_ID": "/Users/ailab1/mlx_models/qwen3-vl",
+        "STORY_SERVER_MLX_VLM_PYTHON": "/Users/ailab1/mlx-serve/bin/python",
         "STORY_SERVER_MLX_VISION_MAX_TOKENS": "16384",
     }
     assert len(expected_constants) == 19
@@ -1279,3 +1278,147 @@ def test_vls12_an_unopenable_lock(tmp_path):
         assert _count_server_procs(env) == 0
     finally:
         os.chmod(str(ro), 0o700)
+
+
+# ---------------------------------------------------------------------------
+# VLS8, VLS9, VLS11, VLS13: port scoping and the loaded model (VLM lifecycle spec VS6, VS10)
+# ---------------------------------------------------------------------------
+
+# A loader whose own child is reachable only through its process tree: the child neither
+# listens on the port nor carries a serve argv, so only tree_pids can find it.
+TREE_STUB = """#!/bin/bash
+if [ "${1:-}" = "-c" ]; then exit 0; fi
+/usr/bin/python3 -c 'import os, sys, time; f = open(sys.argv[1] + ".tmp", "w"); f.write(str(os.getpid())); f.close(); os.rename(sys.argv[1] + ".tmp", sys.argv[1]); time.sleep(600)' "$TREE_CHILD_PID_FILE"
+"""
+
+
+def _read_pid_file(path, timeout=10):
+    _wait_for_file(path, timeout=timeout)
+    with open(path) as f:
+        return int(f.read())
+
+
+def test_vls8_stop_kills_the_port_owner_tree_and_nothing_outside_it(tmp_path):
+    port = _free_port()
+    env = _base_env(tmp_path, port)
+    stub = str(tmp_path / "stub-bin" / "tree-stub")
+    _write_executable(stub, TREE_STUB)
+    child_file = str(tmp_path / "tree-child.pid")
+    env["TREE_CHILD_PID_FILE"] = child_file
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    loader = subprocess.Popen([stub, "-m", "mlx_vlm.server", "--port", str(port)], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=loader.wait, daemon=True).start()
+    # Outside the tree: a test child named like a vLLM engine (not an orphan, not on the port).
+    # bash's exec -a sets argv[0]; the framework Python would replace an argv[0] given to it.
+    engine = subprocess.Popen(["/bin/bash", "-c", "exec -a VLLM::EngineCore /bin/sleep 60"])
+    child = None
+    try:
+        assert _wait_for_cmd(engine.pid, "VLLM::EngineCore").startswith("VLLM::EngineCore")
+        child = _read_pid_file(child_file)
+        with open(mode_file, "w") as f:
+            f.write("mlx-vision %d 2026-10-25T00:00:00Z\n" % loader.pid)
+        rc, out, err = _run(["stop"], env, timeout=90)
+        assert rc == 0, err
+        stopped = out.split("stopped pid(s) ", 1)[1].split("\n", 1)[0].split()
+        assert str(loader.pid) in stopped and str(child) in stopped, out
+        assert str(engine.pid) not in stopped
+        deadline = time.monotonic() + 10
+        while _pid_alive(child) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not _pid_alive(child)
+        assert engine.poll() is None
+    finally:
+        engine.kill()
+        engine.wait(timeout=10)
+        if loader.poll() is None:
+            loader.kill()
+        if child is not None and _pid_alive(child):
+            os.kill(child, signal.SIGKILL)
+
+
+def test_vls9_an_orphan_engine_core_survives_and_is_named(tmp_path):
+    env = _base_env(tmp_path, _free_port())
+    # A double-forked engine-named process: its parent becomes launchd (pid 1).
+    launcher = ("import subprocess\n"
+                "p = subprocess.Popen(['/bin/bash', '-c', 'exec -a VLLM::EngineCore /bin/sleep 60'], "
+                "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL)\n"
+                "print(p.pid)\n")
+    orphan = int(subprocess.run([sys.executable, "-c", launcher], capture_output=True, text=True,
+                                timeout=30).stdout)
+    try:
+        assert _wait_for_cmd(orphan, "VLLM::EngineCore").startswith("VLLM::EngineCore")
+        deadline = time.monotonic() + 10
+        while (subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(orphan)], capture_output=True,
+                              text=True).stdout.strip() != "1" and time.monotonic() < deadline):
+            time.sleep(0.1)
+        rc, out, err = _run(["stop"], env, timeout=30)
+        assert rc == 0, err
+        assert ("story-server: WARNING: VLLM::EngineCore pid %d has parent pid 1 and is not in "
+                "port %s's process tree; left running (it may belong to another vLLM, such as "
+                "the embed server on 8178)\n" % (orphan, env["STORY_SERVER_PORT"])) in out
+        assert "nothing to stop" in out
+        assert _pid_alive(orphan)
+    finally:
+        os.kill(orphan, signal.SIGKILL)
+
+
+def test_vls11_source_guards_for_the_lock_and_the_port_tree():
+    with open(STORY_SERVER) as f:
+        text = f.read()
+    assert "engine_pids" not in text and "ENGINE_SCAN" not in text
+    spawn = [line for line in text.splitlines() if line.rstrip().endswith("</dev/null 9>&- &")]
+    assert len(spawn) == 3, spawn
+    assert '--data-binary @- 9>&- <<EOF' in text
+    assert text.count('lock_take "$MODE"') == 1
+    assert text.count("lock_take stop") == 1
+    assert 'kill_set "$SPAWN_PID $(port_pids) $(tree_pids "$SPAWN_PID $(port_pids)")"' in text
+
+
+def _json_server(port, body):
+    raw = json.dumps(body).encode("utf-8")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_vls13_status_prefers_the_loaded_model(tmp_path):
+    port = _free_port()
+    env = _base_env(tmp_path, port)
+    model = "test-mlx-vlm-model"
+    env["STORY_SERVER_MLX_VISION_MODEL_ID"] = model
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    sleeper = subprocess.Popen(["/bin/sleep", "60"])
+    with open(mode_file, "w") as f:
+        f.write("mlx-vision %d 2026-10-25T00:00:00Z\n" % sleeper.pid)
+    try:
+        for listing, state, served in (
+                ([{"id": "other", "loaded": False}, {"id": model, "loaded": True}],
+                 "SERVING mlx-vision", model),
+                ([{"id": model}, {"id": "other"}], "SERVING mlx-vision", model),
+                ([{"id": "other"}, {"id": model}], "FOREIGN pid", "other")):
+            server = _json_server(port, {"object": "list", "data": listing})
+            try:
+                rc, out, err = _run(["status"], env)
+            finally:
+                server.shutdown()
+                server.server_close()
+            assert rc == 0, err
+            assert "state:          %s" % state in out, (listing, out)
+            assert re.search(r"health:\s+HTTP 200 model=%s\n" % re.escape(served), out), out
+    finally:
+        sleeper.kill()
+        sleeper.wait(timeout=10)
