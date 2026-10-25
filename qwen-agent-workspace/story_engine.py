@@ -1663,6 +1663,9 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
         if detail:
             advisory.append("%s T1 spoken timing: Narration: speaks %s" % (prefix, detail))
     action_label = "Prompt" if ctx.mode == "no_stills" else "Motion"
+    if ("T2" in ids or "T3" in ids) and action_label in dict(fields) \
+            and not dict(fields)[action_label].strip():
+        hard.append("%s S3 fields: missing/empty %s: field" % (prefix, action_label))
     if ("T2" in ids or "T3" in ids) and action_label in dict(fields):
         actions, units, most = action_units(ctx, lib, writers.get(action_label, ""), known)
         if actions == 0:

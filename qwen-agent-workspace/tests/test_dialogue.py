@@ -2019,3 +2019,26 @@ def test_dk3_import_sets_are_unchanged():
     }
     for rel, names in expected.items():
         assert _top_level_imports(rel) == names, rel
+
+
+# --- final fix wave ----------------------------------------------------------------------------
+
+EMPTY_MOTION = "panel 2: S3 fields: missing/empty Motion: field"
+
+
+def test_ff1_empty_action_field_is_blocking(ws, tmp_path, monkeypatch, capsys):
+    panel = _replies("chained", 3)
+    panel["2"] = [seu.answer("x"), seu.answer("x")]
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=panel, narration=False,
+                            critic=[{"answer": "x"}] * 4)
+    assert rc == 2
+    assert EMPTY_MOTION in capsys.readouterr().err
+    fixed = seu.panel_json("chained", 2)["motion"]
+    panel = _replies("chained", 3)
+    panel["2"] = [seu.answer("x"), seu.answer("x")]
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="fixed", panel=panel,
+                            narration=False, critic=[seu.answer(seu.critic_json(
+                                (8, 8, 8), "revise", [_patch("panel", 2, "motion", fixed)]))] * 2)
+    assert rc == 0
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert checks["hard"] == []
