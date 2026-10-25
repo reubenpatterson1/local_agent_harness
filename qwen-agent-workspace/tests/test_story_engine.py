@@ -256,7 +256,8 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
     prompt = se.build_plan_prompt(ctx, [], [])
     assert "\n\nThe target output goal is the most realistic action.\n\nHow this movie is made: it " \
            "is a sequence of separate shots joined by cuts, 6 seconds each." in prompt
-    assert "beats: a list of EXACTLY 14 objects" in prompt and "at most 2.\n" in prompt
+    assert "beats: a list of EXACTLY 14 objects" in prompt
+    assert "at most 2. speaker is the id of the one character who says something aloud" in prompt
     assert "Rules for this movie: two people never touch on screen." in prompt
     assert "loras: " + se.LORA_EMPTY_PARAGRAPH + "\n" in prompt
     pins = [{"path": "/p/a.safetensors", "strength": 1.0, "catalog_id": None, "kind": None},

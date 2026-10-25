@@ -301,14 +301,15 @@ PLAN_PROMPT_TEMPLATE = (
     "name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list "
     "when no object matters.\n"
     "beats: a list of EXACTLY @@PANELS@@ objects, one per panel in order, with the keys index, "
-    "arc, action, shot, camera, location and cast. index runs from 1 to @@PANELS@@. arc is one of "
+    "arc, action, shot, camera, location, cast and speaker. index runs from 1 to @@PANELS@@. arc "
+    "is one of "
     "introduction, rising, climax, falling, resolution, in story order; @@ARC_RULE@@ action is "
     "one sentence of 6 to 40 words saying what the characters physically do during these "
     "@@SECONDS@@ seconds: one continuous physical action that a camera can film, not a sequence "
-    "of steps, with no dialogue and no on-screen text. shot is exactly one of: @@SHOT_LIST@@. "
+    "of steps, with no on-screen text. shot is exactly one of: @@SHOT_LIST@@. "
     "camera is exactly one of: @@CAMERA_LIST@@. location is the id of the place where the beat "
     "happens. cast is the list of ids of the characters on screen in the beat, at most "
-    "@@MAX_CAST@@.\n"
+    "@@MAX_CAST@@.@@SPEAKER_RULE@@\n"
     "loras: @@LORA_PARAGRAPH@@\n"
     "\n"
     "@@MODE_RULES@@" + NO_TOOL_SENTENCE)
@@ -341,6 +342,12 @@ MODE_RULES = {
               "the contact itself is never on screen.\n\n"),
     "no_stills": "",
 }
+SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
+                "during the beat, or an empty string when nobody speaks; give a speaker only where "
+                "a spoken line moves the story. A beat with a speaker shows only that character "
+                "(its cast is just their id), in a medium close-up or close-up, facing the camera, "
+                "with the camera static or a slow push-in.")
+SILENT_SPEAKER_RULE = " speaker is always an empty string: nobody speaks in this movie."
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
 LORA_PICK_PARAGRAPH = (
@@ -547,6 +554,7 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
+        ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False else SPEAKER_RULE),
     ]
     scalars = [("@@STORY_ID@@", ctx.story_id), ("@@PANELS@@", str(ctx.panels)),
                ("@@SECONDS@@", ctx.seconds), ("@@MAX_CAST@@", str(MAX_CAST[ctx.mode]))]

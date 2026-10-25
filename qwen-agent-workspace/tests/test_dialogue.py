@@ -642,3 +642,24 @@ def test_story_context_carries_the_clip_length(tmp_path, monkeypatch):
     assert se.engine_seconds(ctx) == 97 / 24.0
     assert se.engine_seconds(ctx._replace(clip_seconds=None)) == 4.0
     assert ltx_movie._story_context(_movie_args("n", "--story-id", "x")).clip_seconds == 145 / 24.0
+
+
+# --- DLG12: the plan prompt (8.1) ------------------------------------------------------------
+
+def test_dlg12_plan_prompt_speaker_rule(ws):
+    spoken = (" speaker is the id of the one character who says something aloud on screen during "
+              "the beat, or an empty string when nobody speaks; give a speaker only where a spoken "
+              "line moves the story. A beat with a speaker shows only that character (its cast is "
+              "just their id), in a medium close-up or close-up, facing the camera, with the camera "
+              "static or a slow push-in.")
+    silent = " speaker is always an empty string: nobody speaks in this movie."
+    for mode in ("chained", "no_stills", "shots"):
+        for narration, rule in ((True, spoken), ("speech", spoken), (False, silent)):
+            prompt = se.build_plan_prompt(seu.make_ctx(se, ws, mode=mode, narration=narration),
+                                          [], [])
+            where = (mode, narration)
+            assert ("at most %d.%s\n" % (se.MAX_CAST[mode], rule)) in prompt, where
+            assert ("with the keys index, arc, action, shot, camera, location, cast and speaker."
+                    in prompt), where
+            assert "not a sequence of steps, with no on-screen text." in prompt, where
+            assert "no dialogue" not in prompt and "@@" not in prompt, where
