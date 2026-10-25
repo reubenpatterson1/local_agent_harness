@@ -133,6 +133,14 @@ _SHOT_TYPE_RE = re.compile(r"(?<![\w-])(extreme wide shot|extreme close-up|mediu
 _CAMERA_SHORT_MAX_WORDS = 4
 _CAMERA_TERM_RE = re.compile(r"\b(?:camera|shot|push-in|pull-back|pans?|tilts?|zooms?|dolly|"
                              r"tracking|static|locked-off|handheld)\b", re.IGNORECASE)
+# Dialogue spec CM1: a longer sentence is a camera sentence too when it uses one of these terms
+# and refers to no person (no cast phrase, no person or animal noun and no pronoun).
+_CAMERA_WIDE_TERM_RE = re.compile(r"\b(?:cameras?|lens|dolly|dollies|push-in|pull-back|"
+                                  r"extreme close-up|medium close-up|close-up|wide shot|medium shot|"
+                                  r"tracking shot|handheld|locked-off|framing)\b", re.IGNORECASE)
+_PRONOUN_RE = re.compile(r"\b(?:he|she|they|him|her|them|his|hers|their|theirs|himself|herself|"
+                         r"themselves)\b", re.IGNORECASE)
+_PERSON_WORDS = SHOTS_PERSON_NOUNS | SHOTS_ANIMAL_NOUNS
 _POSSESSIVE_DETERMINERS = frozenset(("his", "her", "their", "its"))
 _NOUN_MARKERS = frozenset("""
     a an the his her their its my your our this that these those one each every no another both
@@ -879,13 +887,32 @@ def is_animal_phrase(phrase):
     return any(_POSSESSIVE_RE.sub("", w.lower()) in SHOTS_ANIMAL_NOUNS for w in phrase.split())
 
 
-def _is_camera_sentence(sentence):
-    """A camera sentence (shots spec 4.3 S5; shots rules v2 spec 3.6): it starts with "camera"
-    or "the camera", or it has at most _CAMERA_SHORT_MAX_WORDS words and contains a camera term
-    ("Static camera.", "Slow push-in.")."""
+def _refers_to_person(sentence, phrases):
+    """True when a sentence names one of phrases (a phrase that is not a valid referring phrase is
+    skipped), a person or animal noun (possessive removed) or a pronoun (dialogue spec CM1)."""
+    for phrase in phrases:
+        try:
+            if phrase_occurs(sentence, phrase):
+                return True
+        except CharacterError:
+            continue
+    if any(_POSSESSIVE_RE.sub("", word.lower()) in _PERSON_WORDS
+           for word in _WORD_RE.findall(sentence)):
+        return True
+    return bool(_PRONOUN_RE.search(sentence))
+
+
+def _is_camera_sentence(sentence, phrases=()):
+    """A camera sentence (shots spec 4.3 S5; shots rules v2 spec 3.6; dialogue spec CM1): it
+    starts with "camera" or "the camera"; or it has at most _CAMERA_SHORT_MAX_WORDS words and
+    contains a camera term ("Static camera.", "Slow push-in."); or it contains a wide camera term
+    ("A close-up of the sealed letter.") and refers to no person (_refers_to_person with
+    phrases, so "The courier faces the camera." is an action when "the courier" is a phrase)."""
     return bool(_CAMERA_SENTENCE_RE.match(sentence)
                 or (len(sentence.split()) <= _CAMERA_SHORT_MAX_WORDS
-                    and _CAMERA_TERM_RE.search(sentence)))
+                    and _CAMERA_TERM_RE.search(sentence))
+                or (_CAMERA_WIDE_TERM_RE.search(sentence)
+                    and not _refers_to_person(sentence, phrases)))
 
 
 def _blank(text, spans):
@@ -998,13 +1025,13 @@ def _appositive_nouns(sentence, members):
     return spans
 
 
-def motion_problems(motion):
+def motion_problems(motion, phrases=()):
     """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S5; S4 is advisory,
     motion_length_advisory). A camera sentence
-    (_is_camera_sentence) is not an action sentence."""
+    (_is_camera_sentence, with phrases) is not an action sentence."""
     problems = []
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(motion.strip()) if s.strip()]
-    actions = [s for s in sentences if not _is_camera_sentence(s)]
+    actions = [s for s in sentences if not _is_camera_sentence(s, phrases)]
     if len(actions) != 1:
         problems.append(("S5 one action", "Motion: has %d action sentences; it must have exactly "
                          "one, optionally followed by a camera sentence" % len(actions)))
@@ -1055,7 +1082,7 @@ def shots_violations(text, panels, expected_panels, members, narration=True):
                        "Motion: and Narration:" % num)
         if p["motion"].strip():
             out += ["panel %d: %s: %s" % (num, rule, detail)
-                    for rule, detail in motion_problems(p["motion"])]
+                    for rule, detail in motion_problems(p["motion"], humans + animals)]
         names = []
         if members:
             names = sorted(set(cast_text(p["image"], members)[1])
@@ -1076,7 +1103,7 @@ def shots_violations(text, panels, expected_panels, members, narration=True):
         for label, key in (("Motion", "motion"), ("Image", "image")):
             sentences = [s for s in _SENTENCE_SPLIT_RE.split(p[key].strip()) if s.strip()]
             if key == "motion":
-                sentences = [s for s in sentences if not _is_camera_sentence(s)]
+                sentences = [s for s in sentences if not _is_camera_sentence(s, humans + animals)]
             for sentence in sentences:
                 contact = find_contact(sentence, humans, animals, descriptions)
                 if contact:

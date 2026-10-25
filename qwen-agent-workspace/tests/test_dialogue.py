@@ -144,3 +144,34 @@ def test_dlg5b_speech_text_empty_line_composes_nothing():
     for delivery in ("beats", "beats-no-acoustic"):
         assert lib.speech_text("the courier", "", delivery) == ""
     assert lib.speech_text("the courier", "   ", "beats") == ""
+
+
+# --- DLG5, DLG34: camera sentences (CM1) ----------------------------------------------------
+
+def test_dlg5_camera_sentence_classifier():
+    cam = character_lib._is_camera_sentence
+    assert cam("Slowly the lens drifts across the empty quay.")
+    assert cam("A close-up of the sealed letter.")
+    assert not cam("He turns toward the camera.")
+    assert not cam("The courier faces the camera.", ["the courier"])
+    assert not cam("The waves pan out across the bay.")
+    assert cam("A wide shot of the harbour.", ["the monk!"])          # a CharacterError is skipped
+    for _key, sentence in se.CAMERA_SENTENCES:
+        assert cam(sentence), sentence
+        assert cam(sentence, PHRASES), sentence
+    for tail in ("Static camera.", "Slow push-in.", "Handheld, slow pan left.", "He stays static."):
+        assert cam(tail), tail
+    for tail in ("He kneels.", "The robber takes the shot."):
+        assert not cam(tail), tail
+
+
+def test_dlg34_motion_problems_with_phrases():
+    motion = "The courier raises the sealed letter. The courier faces the camera."
+    two = ("S5 one action", "Motion: has 2 action sentences; it must have exactly one, optionally "
+                            "followed by a camera sentence")
+    assert character_lib.motion_problems(motion) == []
+    assert character_lib.motion_problems(motion, ["the courier"]) == [two]
+    text = '# S\n\n## Characters\n- "the courier": %s.\n' % seu.COURIER
+    panel = {"number": 1, "title": "One", "image": "The courier waits.", "motion": motion,
+             "narration": "It rained.", "prompt": "", "dialogue": ""}
+    assert "panel 1: %s: %s" % two in character_lib.shots_violations(text, [panel], 1, [])
