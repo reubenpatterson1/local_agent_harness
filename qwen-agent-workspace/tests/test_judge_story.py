@@ -486,24 +486,26 @@ def test_target_panels_optional():
 
 # --- --goal: the target output goal as a parameter (spec 2026-10-05 section 3) --------
 
-# sha256 of the SYSTEM_PROMPT constant at commit 1d8580b, before --goal existed (2223 chars).
-LEGACY_SYSTEM_PROMPT_SHA256 = "39be908ef72c563313398c1a0f1ff4a69bd948a0e5f90c030aaea879694cb97b"
+# sha256 of the default-goal SYSTEM_PROMPT since the on-camera dialogue goal (dialogue spec
+# CM5; 2264 chars). Before it: 39be908e... (2223 chars), the constant at commit 1d8580b.
+LEGACY_SYSTEM_PROMPT_SHA256 = "63e5219eed17241bc56a72395afa8ece3a9edb920e373da9a25017dbc05761b1"
 # "%" and "{...}" prove the goal is inserted verbatim, never formatted.
 CUSTOM_GOAL = "a quiet 100% {literal} drama, mostly dialogue"
 
 
 def test_goal_default_prompt_byte_identical():
-    assert judge_story.DEFAULT_GOAL == ("the most realistic action scenes possible, with "
-                                        "relatively little dialogue")
+    assert judge_story.DEFAULT_GOAL == ("the most realistic action scenes possible, with any "
+                                        "spoken lines delivered on camera by the character who "
+                                        "says them")
     assert judge_story.GOAL_TOKEN == "@@GOAL@@"
     assert judge_story.GOAL_MAX_CHARS == 300
     assert judge_story.SYSTEM_PROMPT_TEMPLATE.count(judge_story.GOAL_TOKEN) == 1
     rendered = judge_story.build_system_prompt(judge_story.DEFAULT_GOAL)
     assert rendered == judge_story.SYSTEM_PROMPT
-    assert len(rendered) == 2223
+    assert len(rendered) == 2264
     assert hashlib.sha256(rendered.encode("utf-8")).hexdigest() == LEGACY_SYSTEM_PROMPT_SHA256
-    assert ("The target output goal is the most realistic action scenes possible, with "
-            "relatively little dialogue.\n") in rendered
+    assert ("The target output goal is the most realistic action scenes possible, with any "
+            "spoken lines delivered on camera by the character who says them.\n") in rendered
 
 
 def test_goal_custom_rendering_and_validation(capsys):

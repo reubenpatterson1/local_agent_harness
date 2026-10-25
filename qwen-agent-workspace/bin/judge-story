@@ -78,7 +78,8 @@ SUBMIT_JUDGMENT_SCHEMA = {
 # The target output goal stated in the system prompt; --goal replaces it. With --goal
 # omitted, the prompt sent is byte-identical to the constant this template replaced
 # (spec 2026-10-05-prompt-anchoring-fixes.md section 3).
-DEFAULT_GOAL = "the most realistic action scenes possible, with relatively little dialogue"
+DEFAULT_GOAL = ("the most realistic action scenes possible, with any spoken lines delivered on "
+                "camera by the character who says them")
 # Substituted with str.replace, never %-formatting or str.format, so a literal %, { or }
 # in the template or in a goal needs no escaping.
 GOAL_TOKEN = "@@GOAL@@"
@@ -144,7 +145,7 @@ REVIEW_TOOL_DESCRIPTION = ("Submit your review of the story: three 1-10 scores, 
                            "most 8 patches. You must call this exactly once.")
 REVIEW_SCORE_KEYS = ("continuity", "story", "renderability")
 PATCH_FIELDS = ("beat.action", "beat.shot", "beat.camera", "location.setting", "lora", "motion",
-                "image", "prompt", "narration")
+                "image", "prompt", "narration", "dialogue")
 SUBMIT_REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
@@ -330,8 +331,10 @@ def _story_checks_messages(story_dir):
     try:
         with open(os.path.join(story_dir, "story_checks.json"), encoding="utf-8") as f:
             checks = json.load(f)
+        # Unresolved T2/T3 (never blocking) are reported as advisory (dialogue spec 2.6, D6).
         return ([v["message"] for v in checks["hard"]],
-                [v["message"] for v in checks["advisory"]])
+                [v["message"] for v in checks.get("unresolved", [])]
+                + [v["message"] for v in checks["advisory"]])
     except Exception:
         return [], []
 

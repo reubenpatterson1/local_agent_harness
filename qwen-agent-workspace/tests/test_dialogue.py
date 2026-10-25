@@ -1545,3 +1545,31 @@ def test_dlg19_critic_prompt(ws):
     assert se.critic_field_lines("chained", ["- fast-motion: x"]).split("\n")[0].startswith(
         '- target "plan", field "lora", index 0 for the global picks')
     assert not hasattr(se, "ONLY1")
+
+
+# --- DLG30: bin/judge-story (CM5, G5) --------------------------------------------------------
+
+def test_dlg30_judge_story_goal_and_patch_fields():
+    judge_story = _judge("judge_story_for_dialogue", "bin/judge-story")
+    assert judge_story.DEFAULT_GOAL == ("the most realistic action scenes possible, with any "
+                                        "spoken lines delivered on camera by the character who "
+                                        "says them")
+    assert judge_story.PATCH_FIELDS == ("beat.action", "beat.shot", "beat.camera",
+                                        "location.setting", "lora", "motion", "image", "prompt",
+                                        "narration", "dialogue")
+    assert '"dialogue"' in json.dumps(judge_story.SUBMIT_REVIEW_SCHEMA)
+
+
+def test_judge_story_reports_unresolved_as_advisory(tmp_path):
+    # Controller ruling Q2 (Spec amendment 2): unresolved T2/T3 reach the judge as [advisory].
+    judge_story = _judge("judge_story_for_dialogue", "bin/judge-story")
+    checks = {"hard": [{"message": "panel 2: T1 spoken timing: x"}],
+              "unresolved": [{"message": T2_MESSAGE}],
+              "advisory": [{"message": N12_MESSAGE}]}
+    (tmp_path / "story_checks.json").write_text(json.dumps(checks), encoding="utf-8")
+    assert judge_story._story_checks_messages(str(tmp_path)) == (
+        ["panel 2: T1 spoken timing: x"], [T2_MESSAGE, N12_MESSAGE])
+    del checks["unresolved"]
+    (tmp_path / "story_checks.json").write_text(json.dumps(checks), encoding="utf-8")
+    assert judge_story._story_checks_messages(str(tmp_path)) == (
+        ["panel 2: T1 spoken timing: x"], [N12_MESSAGE])
