@@ -697,7 +697,18 @@ cmd_stop() {
     # VLLM::EngineCore outside that tree is reported (M31), never killed.
     CAND=""
     for pid in $port_list $serve_list; do CAND=$(add_pid "$CAND" "$pid"); done
-    if is_server_pid "$PID_REC"; then CAND=$(add_pid "$CAND" "$PID_REC"); fi
+    if is_server_pid "$PID_REC"; then
+        # A stale mode file's pid may have been reused by a server on another port (the 8178
+        # embed server): it is a root only if it is already a port-owner / serve-argv match
+        # for $PORT, or its own command line carries `--port $PORT`.
+        case " $CAND " in
+            *" $PID_REC "*) ;;
+            *) case "$(pid_cmd "$PID_REC") " in
+                   *" --port $PORT "*) CAND=$(add_pid "$CAND" "$PID_REC") ;;
+                   *) say "WARNING: mode-file pid $PID_REC is not serving port $PORT; not stopping it" ;;
+               esac ;;
+        esac
+    fi
     for pid in $(tree_pids "$CAND"); do CAND=$(add_pid "$CAND" "$pid"); done
     /bin/ps -A -o pid=,ppid=,command= 2>/dev/null \
       | /usr/bin/awk '$2 == 1 && $3 ~ /^VLLM::EngineCore/ { print $1 }' | while read -r p; do

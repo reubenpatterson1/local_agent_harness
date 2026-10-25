@@ -1320,6 +1320,7 @@ def test_vls8_stop_kills_the_port_owner_tree_and_nothing_outside_it(tmp_path):
             f.write("mlx-vision %d 2026-10-25T00:00:00Z\n" % loader.pid)
         rc, out, err = _run(["stop"], env, timeout=90)
         assert rc == 0, err
+        assert "stopped pid(s) " in out, out
         stopped = out.split("stopped pid(s) ", 1)[1].split("\n", 1)[0].split()
         assert str(loader.pid) in stopped and str(child) in stopped, out
         assert str(engine.pid) not in stopped
@@ -1422,3 +1423,23 @@ def test_vls13_status_prefers_the_loaded_model(tmp_path):
     finally:
         sleeper.kill()
         sleeper.wait(timeout=10)
+
+
+def test_vls8b_a_mode_file_pid_serving_another_port_is_not_stopped(tmp_path):
+    port = _free_port()
+    other = _free_port()
+    env = _base_env(tmp_path, port)
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    # argv carries `vllm serve` and another port, as a reused pid of the 8178 embed server would.
+    fake = subprocess.Popen(["/bin/bash", "-c", 'exec -a "vllm serve --port %d" /bin/sleep 60' % other])
+    try:
+        assert "vllm serve" in _wait_for_cmd(fake.pid, "vllm serve")
+        with open(mode_file, "w") as f:
+            f.write("vision %d 2026-10-25T00:00:00Z\n" % fake.pid)
+        rc, out, err = _run(["stop"], env, timeout=30)
+        assert rc == 0, err
+        assert "WARNING: mode-file pid %d is not serving port %d; not stopping it" % (fake.pid, port) in out, out
+        assert fake.poll() is None
+    finally:
+        fake.kill()
+        fake.wait(timeout=10)
