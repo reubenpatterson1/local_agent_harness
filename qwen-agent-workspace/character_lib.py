@@ -613,26 +613,51 @@ def phrase_occurs(text, phrase):
     return _phrase_regex(normalize_phrase(phrase)).search(text) is not None
 
 
-def cast_text(text, members, insert=None, skip_quoted=False):
-    """(text with each cast phrase's trigger inserted, sorted names of the members found).
-    Longest phrase first; a match overlapping an already-claimed span is ignored; an
-    occurrence that already carries the trigger is counted but not re-inserted (spec 3.6).
-    insert: if given, a set of names; every member still claims its spans, but only these
-    members get a trigger and are reported. skip_quoted: a match lying wholly inside a "..."
-    span (a spoken line) is neither triggered nor reported (dialogue spec DG6)."""
+def cast_text(text, members, insert=None, skip_quoted=False, match_names=False):
+    """(text with each cast member's trigger inserted, sorted names of the members found)
+    (casting spec 3.6; dialogue spec DG6, 11.3). Spans are claimed in up to three passes, each
+    taking members longest phrase first; a match overlapping an already-claimed span is ignored.
+    Pass 1, the referring phrase: the trigger is inserted unless the occurrence already carries
+    it. Pass 2 (match_names), the character's name with an initial capital and no article right
+    before it: the trigger and a space go in front of it unless already there. Pass 3
+    (match_names), the trigger itself: counted, nothing inserted. skip_quoted: a match lying
+    wholly inside a "..." span (a spoken line) is neither triggered nor reported. insert: if
+    given, a set of names; every member still claims its spans, but only these members get a
+    trigger and are reported."""
     quoted = [m.span() for m in re.finditer(r'"[^"]*"', text)] if skip_quoted else []
+    order = sorted(members, key=lambda m: (-len(m.phrase), m.phrase.lower(), m.name))
     found = []
-    for member in sorted(members, key=lambda m: (-len(m.phrase), m.phrase.lower(), m.name)):
+
+    def claim(start, end, member, kind):
+        if any(s <= start and end <= e for s, e in quoted):
+            return
+        if any(start < e and s < end for s, e, _, _ in found):
+            return
+        found.append((start, end, member, kind))
+
+    for member in order:
         for match in _phrase_regex(member.phrase, member.trigger).finditer(text):
-            start, end = match.span()
-            if any(s <= start and end <= e for s, e in quoted):
-                continue
-            if any(start < e and s < end for s, e, _, _ in found):
-                continue
-            found.append((start, end, member, match.group("trig") is not None))
+            claim(match.start(), match.end(), member,
+                  "carried" if match.group("trig") is not None else "phrase")
+    if match_names:
+        for member in order:
+            for match in re.finditer(r"(?<![\w-])" + re.escape(member.name) + r"(?![\w-])", text,
+                                     re.IGNORECASE):
+                before = re.search(r"([A-Za-z']+)\s+$", text[:match.start()])
+                if (text[match.start()].isupper()
+                        and not (before and before.group(1).lower() in ARTICLES)):
+                    claim(match.start(), match.end(), member, "name")
+        for member in order:
+            for match in re.finditer(r"(?<![\w-])" + re.escape(member.trigger) + r"(?![\w-])",
+                                     text, re.IGNORECASE):
+                claim(match.start(), match.end(), member, "trigger")
     out = text
-    for start, _end, member, already in sorted(found, key=lambda f: f[0], reverse=True):
-        if already or (insert is not None and member.name not in insert):
+    for start, _end, member, kind in sorted(found, key=lambda f: f[0], reverse=True):
+        if kind in ("carried", "trigger") or (insert is not None and member.name not in insert):
+            continue
+        if kind == "name":
+            if not text[:start].lower().endswith(member.trigger.lower() + " "):
+                out = out[:start] + member.trigger + " " + out[start:]
             continue
         words = member.phrase.split()
         if len(words) > 1 and words[0].lower() in ARTICLES:
@@ -642,6 +667,12 @@ def cast_text(text, members, insert=None, skip_quoted=False):
             out = out[:start] + member.trigger + " " + out[start:]
     return out, sorted({member.name for _, _, member, _ in found
                         if insert is None or member.name in insert})
+
+
+def member_referenced(text, member):
+    """True when text names a cast member by its referring phrase, its name (initial capital, no
+    article right before it) or its trigger, outside "..." spans (dialogue spec 11.3)."""
+    return bool(cast_text(text, [member], skip_quoted=True, match_names=True)[1])
 
 
 # Spoken narration: a Narration: line is voice-over unless it starts with an on-screen character's
@@ -805,6 +836,29 @@ def panel_strengths(names, members, character_strength, shots=False):
         return {names[0]: SINGLE_CHARACTER_STRENGTH}
     return {n: (by_name[n].strength if by_name[n].strength is not None else character_strength)
             for n in names}
+
+
+def story_strength(member, character_strength):
+    """A cast character's LoRA strength in every panel of a chained story (dialogue spec 11.5):
+    its character.json strength when set, else character_strength."""
+    return member.strength if member.strength is not None else character_strength
+
+
+def prefix_character_triggers(prompt, triggers):
+    """prompt with the missing character triggers in front as "t1, t2. " (dialogue spec 11.4):
+    the triggers, in order, de-duplicated case-insensitively, that do not already occur as whole
+    words. The rule of lora_catalog.prefix_triggers, duplicated so the chained cast pass does not
+    load lora_catalog.py."""
+    missing, seen = [], set()
+    for trigger in triggers:
+        if trigger.lower() in seen:
+            continue
+        seen.add(trigger.lower())
+        if not re.search(r"(?<![\w-])" + re.escape(trigger) + r"(?![\w-])", prompt, re.IGNORECASE):
+            missing.append(trigger)
+    if not missing:
+        return prompt
+    return ", ".join(missing) + ". " + prompt
 
 
 def identity_sentence(member):

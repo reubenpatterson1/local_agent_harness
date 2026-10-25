@@ -1646,3 +1646,54 @@ def test_ltx_movie_dialogue_help_and_docstring_text():
     assert ("up to two local critic rounds that repair only spoken timing and the amount of action"
             in doc)
     assert "when blocking violations remain" in doc and "up to three local critic rounds" not in doc
+
+
+# --- CA2, CA7, CA9: casting helpers (11.3-11.5) ----------------------------------------------
+
+def test_ca2_name_and_trigger_matching(story_env):
+    members = _members(story_env, "kyra", "ronin")
+
+    def cast(text):
+        return character_lib.cast_text(text, members, skip_quoted=True, match_names=True)
+
+    assert cast("Kyra turns.") == ("kyrawmn Kyra turns.", ["kyra"])
+    assert cast("kyrawmn Kyra turns.") == ("kyrawmn Kyra turns.", ["kyra"])
+    assert cast("A ronin waits.") == ("A ronin waits.", [])
+    assert cast("the old ronin waits") == ("the old ronin waits", [])
+    assert cast("kyrawmn") == ("kyrawmn", ["kyra"])
+    assert cast('She says, "Kyra, wait."') == ('She says, "Kyra, wait."', [])
+    assert cast("The ronin bows to Kyra.") == ("The roninmn ronin bows to kyrawmn Kyra.",
+                                               ["kyra", "ronin"])
+    assert character_lib.cast_text("Kyra turns.", members) == ("Kyra turns.", [])
+
+
+def test_ca7_cast_text_defaults_are_unchanged(story_env):
+    members = _members(story_env, "kyra", "ronin")
+    for text, expected in (
+            ("The woman in grey turns her head; the camera stays static.",
+             ("The kyrawmn woman in grey turns her head; the camera stays static.", ["kyra"])),
+            ("The ronin nods to the woman in grey.",
+             ("The roninmn ronin nods to the kyrawmn woman in grey.", ["kyra", "ronin"])),
+            ("Leaves drift across the empty trail.", ("Leaves drift across the empty trail.", []))):
+        assert character_lib.cast_text(text, members) == expected, text
+        assert character_lib.cast_text(text, members, skip_quoted=True,
+                                       match_names=True) == expected, text
+    assert character_lib.cast_text("The woman in grey and the ronin", members,
+                                   insert={"kyra"}) == ("The kyrawmn woman in grey and the ronin",
+                                                        ["kyra"])
+
+
+def test_ca9_member_referenced_and_prefix_character_triggers(story_env):
+    kyra = _members(story_env, "kyra")[0]
+    for text, expected in (("The woman in grey turns.", True), ("Kyra turns.", True),
+                           ("kyrawmn turns.", True), ("She turns her head.", False),
+                           ('She says, "Kyra, wait."', False), ("a kyra doll", False)):
+        assert character_lib.member_referenced(text, kyra) is expected, text
+    prefix = character_lib.prefix_character_triggers
+    assert prefix("She turns.", ["kyrawmn"]) == "kyrawmn. She turns."
+    assert prefix("She turns.", ["kyrawmn", "KyraWmn", "roninmn"]) == "kyrawmn, roninmn. She turns."
+    assert prefix("kyrawmn turns.", ["kyrawmn"]) == "kyrawmn turns."
+    assert prefix("She turns.", []) == "She turns."
+    assert prefix("the kyrawmn-like blur", ["kyrawmn"]) == "kyrawmn. the kyrawmn-like blur"
+    assert character_lib.story_strength(kyra, 0.8) == 0.8
+    assert character_lib.story_strength(kyra._replace(strength=0.5), 0.8) == 0.5
