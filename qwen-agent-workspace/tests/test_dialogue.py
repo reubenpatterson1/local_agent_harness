@@ -1874,16 +1874,26 @@ def test_ca6_n19_cast_reference(ws, story_env):
 
 
 # --- DLG-H, DLG-K1, DK2, DK3: the merge gate and the guards (DK2-DK6, 10.1) -------------------
+# DK4 merge gate = DLG21-24 + DLG-H + DLG20. Every DLG-H text holds content the old strict checks
+# blocked (S5, N1, N3, N7); the gate asserts each is now advisory and the run still needs no critic.
 
 DLG_H_TEXT = {
     "chained": ("motion", "The courier leans into the bend while rain streams off the yellow hood. "
-                          "Water sprays from the front wheel across the cobblestones. The camera "
-                          "slowly pans left."),
+                          "The courier shouts over the rain. The grey harbour wall and the narrow "
+                          "road beside it stay wet and dark under the heavy sky for the whole "
+                          "shot. The camera slowly pans left."),
     "shots": ("motion", "The courier leans into the bend as rain streams off the yellow hood. The "
-                        "camera slowly pans left."),
-    "no_stills": ("prompt", seu.panel_json("no_stills", 2)["prompt"]
-                  + " The camera slowly pans left as the yellow hood flaps in the wind."),
+                        "courier shouts over the rain. The camera slowly pans left."),
+    "no_stills": ("prompt", seu.panel_json("no_stills", 2, words={"prompt": 300})["prompt"]
+                  + " The courier shouts over the rain. The camera slowly pans left as the yellow "
+                  "hood flaps in the wind."),
 }
+# A word count more than 25 percent outside the field's N1 band: the chained Motion and the no_stills
+# Prompt above carry it; shots exempts Motion from N1, so its Image is replaced by a too-long one.
+DLG_H_BAND = {"chained": {}, "no_stills": {},
+              "shots": {"image": seu.panel_json("shots", 2, words={"image": 230})["image"]}}
+DLG_H_ADVISORY = {"chained": {"N1", "N3", "N7"}, "shots": {"N1", "N7", "S5"},
+                  "no_stills": {"N1", "N7"}}
 
 
 @pytest.mark.parametrize("speaking", [False, True], ids=["silent", "speaking"])
@@ -1893,14 +1903,18 @@ def test_dlg_h_offline_merge_gate(mode, speaking, ws, tmp_path, monkeypatch):
     if speaking:
         raw["beats"][1]["speaker"] = "c1"
     key, text = DLG_H_TEXT[mode]
-    reply = {key: text}
+    reply = dict(DLG_H_BAND[mode], **{key: text})
     if speaking:
         reply["dialogue"] = LINE
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, mode=mode, plan=[seu.answer(raw)],
                             panel=_replies(mode, 3, {2: [reply]}))
     assert rc == 0
     rounds = os.path.join(ctx.story_dir, "story_rounds")
-    assert _read_json(os.path.join(rounds, "round_0", "story_checks.json"))["hard"] == []
+    round_0 = _read_json(os.path.join(rounds, "round_0", "story_checks.json"))
+    assert round_0["hard"] == []
+    advisory_ids = set(v["id"] for v in round_0["advisory"] if v["index"] == 2)
+    assert DLG_H_ADVISORY[mode] <= advisory_ids, (mode, sorted(advisory_ids))
+    assert not DLG_H_ADVISORY[mode] & set(v["id"] for v in round_0["hard"])
     assert _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["stop_reason"] == "passed"
     assert [r["stage"] for r in log].count("critic") == 0
     with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
@@ -1927,6 +1941,7 @@ def test_dlg_k1_calibration_replay(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(se, "run_critic", lambda ctx, prompt: (
         "ok", json.dumps(seu.critic_json(verdict="revise")), "local"))
     passed = []
+    rows = []
     for name in cases:
         case_dir = os.path.join(KPI_DIR, name)
         case = _read_json(os.path.join(case_dir, "case.json"))
@@ -1939,11 +1954,16 @@ def test_dlg_k1_calibration_replay(tmp_path, monkeypatch, capsys):
         runner = se._Run(ctx, "")
         runner.make_state(0, plan, parts)
         runner.critic_loop()
-        if not se.final_outcome(runner.states)[1]:
+        _best, blocking, unresolved = se.final_outcome(runner.states)
+        rows.append((name, len(blocking), len(unresolved)))
+        if not blocking:
             passed.append(name)
     with capsys.disabled():
+        for name, n_blocking, n_unresolved in rows:
+            print("\nDLG-K1 %s: %d blocking, %d unresolved" % (name, n_blocking, n_unresolved))
         print("\nDLG-K1: %d of %d cases have 0 blocking violations" % (len(passed), len(cases)))
     if os.environ.get("DIALOGUE_KPI_ENFORCE") == "1":
+        assert len(cases) == 24, "corpus has %d cases; expected 24" % len(cases)
         assert len(passed) >= 22, sorted(set(cases) - set(passed))
 
 
