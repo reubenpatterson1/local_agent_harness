@@ -761,9 +761,10 @@ def test_rst20b_narration_speaker(ws):
     assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == []
 
 
-def test_rst20c_narration_modes(ws):
-    # --speech-only: Narration: may be empty; a voice-over line is hard N16. --no-narration:
-    # no Narration: field at all and no narration check.
+def test_rst20c_narration_modes(ws, monkeypatch, capsys):
+    # --speech-only: there is no narration key (dialogue spec SP5); a hand-written voice-over
+    # Narration: is N16 on re-check. --no-narration: no Narration: field at all and no
+    # narration check.
     def narration(text):   # panel 2 says text; the other panels have no narration
         return lambda parts: [p.update(narration=text if k == 1 else "")
                               for k, p in enumerate(parts)]
@@ -773,16 +774,20 @@ def test_rst20c_narration_modes(ws):
         assert _story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech) == [], mode
         assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low."),
                              ctx_kw=speech, plan_mut=MEDIUM) == [], mode
-    assert _story_checks(ws, "chained", part_mut=narration("Rain falls on the harbour town."),
-                         ctx_kw=speech) == [
-        "panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; start it "
-        "with the referring phrase of the character in the shot who says it and a colon, or "
-        "leave it empty"]
     ctx, plan, parts, text, _path = _story(ws, "chained", 3, part_mut=narration(""), ctx_kw=speech)
     assert "Narration:" not in text
     reply = dict(seu.panel_json("chained", 2, plan["cast"][0]["phrase"]), narration="")
-    assert se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))["narration"] == ""
-    assert se.KEY_LINE_TEMPLATES["narration_speech"] in se.build_panel_prompt(ctx, plan, parts, 2)
+    assert "narration" not in se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))
+    assert "\nnarration: " not in se.build_panel_prompt(ctx, plan, parts, 2)
+    saved, _text = _saved_story(ws, monkeypatch, ctx_kw=dict(speech, story_id="s20c"))
+    motion = "Motion: " + seu.panel_json("chained", 2)["motion"] + "\n"
+    _edit_story(saved, motion, motion + "Narration: Rain falls on the harbour town.\n")
+    voice_over = ("panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; "
+                  "start it with the referring phrase of the character in the shot who says it "
+                  "and a colon, or leave it empty")
+    assert se.recheck(saved, lambda path, panels, no_stills=False: ltx_movie._validate_story_md(
+        path, panels, no_stills, no_narration=True)) == (2, [])
+    assert "  - %s\n" % voice_over in capsys.readouterr().err
     off = {"narration": False}
     for mode in ("chained", "no_stills", "shots"):
         assert _story_checks(ws, mode, ctx_kw=off) == [], mode
@@ -790,7 +795,7 @@ def test_rst20c_narration_modes(ws):
         assert "Narration:" not in text and "narration" not in se.writer_keys(mode, 1, False)
         prompt = se.build_panel_prompt(ctx, plan, parts, 1)
         assert se.KEY_LINE_TEMPLATES["narration"] not in prompt
-        assert se.KEY_LINE_TEMPLATES["narration_speech"] not in prompt
+        assert se.KEY_LINE_TEMPLATES["narration_with_dialogue"] not in prompt
 
 
 def test_rst16_panel_prompt(ws):
@@ -842,7 +847,9 @@ def test_rst16_panel_prompt(ws):
     fixed = se.build_panel_prompt(ctx, plan, parts, 2, fix=["panel 2: N3 appearance: x",
                                                             "panel 2: N12 one action: y"])
     assert ("\n\nYour previous version of this panel was rejected. Problems:\n- panel 2: N3 "
-            "appearance: x\n- panel 2: N12 one action: y\nPrevious version:\ntitle: "
+            "appearance: x\n- panel 2: N12 one action: y\nFix only these problems. Keep every "
+            "camera direction, every descriptive sentence and the dialogue word for word, and "
+            "change only the sentence or sentences that cause them.\nPrevious version:\ntitle: "
             + parts[1]["title"] + "\nmotion: " + parts[1]["motion"] + "\nnarration: "
             + parts[1]["narration"] + "\n\nReply with the JSON object only") in fixed
     assert se.unparseable_panel_problem("chained", 2) == (
@@ -1550,7 +1557,9 @@ def test_rst17b_invalid_panel_retried_once_never_three_times(ws, tmp_path, monke
     panel2 = [r for r in log if r["stage"] == "panel" and r["panel"] == 2]
     assert len(panel2) == 2
     assert ("Your previous version of this panel was rejected. Problems:\n- the reply is not one "
-            "JSON object with the keys title, motion, narration\nPrevious version:\ntitle: "
+            "JSON object with the keys title, motion, narration\nFix only these problems. Keep "
+            "every camera direction, every descriptive sentence and the dialogue word for word, "
+            "and change only the sentence or sentences that cause them.\nPrevious version:\ntitle: "
             "the courier swerves around a\nmotion: \nnarration: \n\n") in panel2[1]["argv"][-1]
     parts = _read_json(os.path.join(_rounds(ctx, 0), "parts.json"))["panels"]
     assert parts[1] == {"index": 2, "title": "the courier swerves around a", "motion": "",

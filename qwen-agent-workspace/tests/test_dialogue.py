@@ -663,3 +663,147 @@ def test_dlg12_plan_prompt_speaker_rule(ws):
                     in prompt), where
             assert "not a sequence of steps, with no on-screen text." in prompt, where
             assert "no dialogue" not in prompt and "@@" not in prompt, where
+
+
+# --- DLG13, DLG14, Review Focus 1: writer keys and the panel prompt (SP5, 8.2) ----------------
+
+def _speaking(k=2, speaker="c1"):
+    """A plan mutation: speaker speaks in beat k."""
+    def mutate(raw):
+        raw["beats"][k - 1]["speaker"] = speaker
+    return mutate
+
+
+def _story(ws, mode, n=3, plan_mut=None, replies=None, ctx_kw=None):
+    """(ctx, plan, parts, text, path) for seu.plan_json/panel_json; replies maps a panel number to
+    a dict merged into that panel's writer reply before it is parsed (a speaking panel's reply
+    needs a "dialogue")."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=n, **(ctx_kw or {}))
+    raw = seu.plan_json(mode, n)
+    if plan_mut:
+        plan_mut(raw)
+    plan, _shape = se.normalize_plan(ctx, raw)
+    phrase = plan["cast"][0]["phrase"]
+    parts = []
+    for k in range(1, n + 1):
+        reply = dict(seu.panel_json(mode, k, phrase), **(replies or {}).get(k, {}))
+        parts.append(se.parse_panel_reply(ctx, plan, k, json.dumps(reply)))
+    text = se.assemble(ctx, plan, parts)
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return ctx, plan, parts, text, path
+
+
+NO_STILLS_PROMPT = (
+    "prompt: W1 to W2 words in the present tense: one flowing paragraph in strict chronological "
+    "order that opens with the main action, carries enough separate beats to fill the full "
+    "@@SECONDS@@ seconds, links them with temporal connectors (initially, as, then, while, a moment "
+    "later), names the ambient and environmental sounds alongside the actions that make them, and "
+    "states the camera viewpoint and the lighting and colour; you may also state a camera "
+    "movement. Name each character only by their referring phrase. Do not describe any "
+    "character's appearance or clothing, do not write a sentence about the place itself and do "
+    "not name the shot type: the pipeline adds each character's description, the place's setting "
+    "sentence, the shot type and, unless you state one, the camera movement itself. Describe only "
+    "what is physically observable, with no mood words, no spoken words and no markdown.")
+LINE = "Keep moving. The gate is close."
+
+
+def test_dlg13_writer_keys_and_speaking_key_lines(ws):
+    base = {("chained", 1): ["title", "image", "motion"], ("chained", 2): ["title", "motion"],
+            ("no_stills", 1): ["title", "prompt"], ("no_stills", 2): ["title", "prompt"],
+            ("shots", 1): ["title", "image", "motion"], ("shots", 2): ["title", "image", "motion"]}
+    for (mode, k), keys in base.items():
+        for narration in (True, "speech", False):
+            for speaks in (False, True):
+                expected = (keys + (["dialogue"] if speaks and narration is not False else [])
+                            + (["narration"] if narration is True else []))
+                assert list(se.writer_keys(mode, k, narration, speaks)) == expected, (
+                    mode, k, narration, speaks)
+    assert se.writer_keys("chained", 2) == ("title", "motion", "narration")
+    for name, text in se.KEY_LINE_TEMPLATES.items():
+        assert "Do not mention the camera" not in text and "camera or lens" not in text, name
+    assert "narration_speech" not in se.KEY_LINE_TEMPLATES
+    assert se.KEY_LINE_TEMPLATES["no_stills_prompt"] == NO_STILLS_PROMPT
+    assert se.KEY_LINE_TEMPLATES["narration"] == (
+        "narration: one sentence of 3 to 30 words of voice-over that nobody on screen says aloud. "
+        "Never put a spoken line here.")
+    assert se.KEY_LINE_TEMPLATES["narration_with_dialogue"] == (
+        "narration: one sentence of 3 to 30 words of voice-over that nobody on screen says aloud, "
+        "or an empty string: this panel's spoken line goes in dialogue, never here.")
+    ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                      replies={2: {"dialogue": LINE}})
+    prompt = se.build_panel_prompt(ctx, plan, parts, 2)
+    assert ('\ndialogue: the exact words "the courier" says aloud in this panel: at most 14 words '
+            "as one sentence, about one word fewer for each further sentence, and at most three "
+            "sentences; no quotation marks, no speaker name and no description of how the words "
+            "are said -- the pipeline adds who says them and how.\n") in prompt
+    assert "\n" + se.KEY_LINE_TEMPLATES["narration_with_dialogue"] + "\n" in prompt
+    assert ('already on screen. You may add one camera direction. In this panel "the courier" '
+            "speaks the dialogue: keep their movement small -- a breath, a glance, a small hand "
+            "gesture -- with the camera holding still, and do not write the spoken words or a "
+            "speaking verb here; the pipeline adds them.\n") in prompt
+    assert "@@" not in prompt
+    quiet = se.build_panel_prompt(ctx, plan, parts, 3)
+    assert "\ndialogue: " not in quiet
+    assert "\n" + se.KEY_LINE_TEMPLATES["narration"] + "\n" in quiet
+    ctx, plan, parts, _t, _p = _story(ws, "no_stills", 3, plan_mut=_speaking(2),
+                                      replies={2: {"dialogue": LINE}})
+    prompt = se.build_panel_prompt(ctx, plan, parts, 2)
+    assert ('fills the full 6 seconds with small, continuous movements of "the courier" -- a '
+            "breath, a glance, a small hand gesture -- names the ambient") in prompt
+    assert ("no spoken words and no markdown. Do not write the spoken words or a speaking verb "
+            "here; the pipeline adds them.\n") in prompt
+    ctx, plan, parts, _t, _p = _story(ws, "shots", 3, plan_mut=_speaking(2),
+                                      replies={2: {"dialogue": LINE}})
+    prompt = se.build_panel_prompt(ctx, plan, parts, 2)
+    assert ('Never name a person who is not in this shot. "the courier" is the only person in the '
+            "frame, facing the camera.\n") in prompt
+    assert ('without one, the pipeline adds the planned camera sentence. In this panel "the '
+            'courier" speaks the dialogue:') in prompt
+    ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                      replies={2: {"dialogue": LINE}},
+                                      ctx_kw={"seconds": "4", "clip_seconds": 97 / 24.0})
+    assert "at most 9 words as one sentence" in se.build_panel_prompt(ctx, plan, parts, 2)
+
+
+def test_dlg14_parse_panel_reply_on_a_speaking_panel(ws):
+    ctx = seu.make_ctx(se, ws)
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    reply = dict(seu.panel_json("chained", 2), narration="",
+                 dialogue='the courier: You came far. He said "wait".')
+    parts = se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))
+    assert list(parts) == ["title", "motion", "dialogue", "narration"]
+    assert (parts["dialogue"], parts["narration"]) == ("You came far. He said 'wait'.", "")
+    assert se.parse_panel_reply(ctx, plan, 2, json.dumps(dict(reply, dialogue="  "))) is None
+    no_line = dict(reply)
+    del no_line["dialogue"]
+    assert se.parse_panel_reply(ctx, plan, 2, json.dumps(no_line)) is None
+    quiet = se.parse_panel_reply(ctx, plan, 3, json.dumps(dict(seu.panel_json("chained", 3),
+                                                               dialogue="Ignored.")))
+    assert list(quiet) == ["title", "motion", "narration"]
+    assert se.parse_panel_reply(ctx, plan, 3, json.dumps(dict(seu.panel_json("chained", 3),
+                                                              narration=""))) is None
+    speech = ctx._replace(narration="speech")
+    plan_speech, _shape = se.normalize_plan(speech, raw)
+    assert list(se.parse_panel_reply(speech, plan_speech, 2, json.dumps(reply))) == [
+        "title", "motion", "dialogue"]
+    off = ctx._replace(narration=False)
+    plan_off, _shape = se.normalize_plan(off, raw)
+    assert list(se.parse_panel_reply(off, plan_off, 2, json.dumps(reply))) == ["title", "motion"]
+    assert se.unparseable_panel_problem("chained", 2, True, True) == (
+        "the reply is not one JSON object with the keys title, motion, dialogue, narration")
+
+
+def test_review_focus_1_writer_dialogue_with_label_prefix_and_quotes(ws):
+    ctx = seu.make_ctx(se, ws)
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    for written in ("dialogue: the courier: “Keep moving.”", 'The Courier: "Keep moving."',
+                    '"Keep moving."', "the courier:   Keep   moving."):
+        reply = dict(seu.panel_json("chained", 2), dialogue=written)
+        assert se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))["dialogue"] == (
+            "Keep moving."), written

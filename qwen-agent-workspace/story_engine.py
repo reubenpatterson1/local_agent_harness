@@ -1145,10 +1145,12 @@ COPIED_EXAMPLES = (
     "her eyebrows angle down and her lips press together",
     "a charge, a draw and a strike",
 )
-_LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration)\s*:\s*", re.IGNORECASE)
+_LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration|dialogue)\s*:\s*",
+                       re.IGNORECASE)
 _QUOTE_PAIRS = (('"', '"'), ("“", "”"))
 _TITLE_CHARS_RE = re.compile(r"[^A-Za-z0-9 '-]")
-LABELS = {"image": "Image", "motion": "Motion", "prompt": "Prompt", "narration": "Narration"}
+LABELS = {"image": "Image", "motion": "Motion", "prompt": "Prompt", "narration": "Narration",
+          "dialogue": "Dialogue"}
 
 PANEL_PROMPT_TEMPLATE = (
     'You are writing panel @@K@@ of @@PANELS@@ of a short narrated movie (story-id '
@@ -1191,26 +1193,28 @@ KEY_LINE_TEMPLATES = {
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
         "word for word. Describe ONE continuous physical motion, not a sequence of separate "
-        "steps. Do not mention the camera: the pipeline adds the camera sentence."),
+        "steps. You may add one camera direction; without one, the pipeline adds the planned "
+        "camera sentence."),
     "chained_motion": (
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "
         "Name each character only by their referring phrase, word for word. Describe ONE "
         "continuous physical motion, not a sequence of separate steps: @@SECONDS@@ seconds is "
         "enough for a single gesture, a few footsteps or the start of a movement. Do not describe "
-        "appearance, clothing, setting, lighting, colour, style, camera or lens -- all of that is "
-        "already on screen."),
+        "appearance, clothing, setting, lighting, colour or style -- all of that is already on "
+        "screen. You may add one camera direction."),
     "no_stills_prompt": (
         "prompt: W1 to W2 words in the present tense: one flowing paragraph in strict "
         "chronological order that opens with the main action, carries enough separate beats to "
         "fill the full @@SECONDS@@ seconds, links them with temporal connectors (initially, as, "
         "then, while, a moment later), names the ambient and environmental sounds alongside the "
-        "actions that make them, and states the camera viewpoint and the lighting and colour. "
-        "Name each character only by their referring phrase. Do not describe any character's "
-        "appearance or clothing, do not write a sentence about the place itself and do not name "
-        "the shot type or the camera motion: the pipeline adds each character's description, the "
-        "place's setting sentence, the shot type and the camera motion itself. Describe only what "
-        "is physically observable, with no mood words, no spoken dialogue and no markdown."),
+        "actions that make them, and states the camera viewpoint and the lighting and colour; you "
+        "may also state a camera movement. Name each character only by their referring phrase. Do "
+        "not describe any character's appearance or clothing, do not write a sentence about the "
+        "place itself and do not name the shot type: the pipeline adds each character's "
+        "description, the place's setting sentence, the shot type and, unless you state one, the "
+        "camera movement itself. Describe only what is physically observable, with no mood words, "
+        "no spoken words and no markdown."),
     "shots_image": (
         "image: W1 to W2 words describing this shot's first frame as one still picture: where "
         "each character stands and which way they face, using fixed left and right screen "
@@ -1223,35 +1227,74 @@ KEY_LINE_TEMPLATES = {
         "motion: ONE sentence of W1 to W2 words naming ONE character by their referring phrase "
         "and the ONE physical action they perform during these @@SECONDS@@ seconds. Never chain "
         "actions with then, while, meanwhile, simultaneously, afterwards, followed by or a comma "
-        "before and, and never use a semicolon. Do not mention the camera: the pipeline adds the "
-        "camera sentence."),
-    "narration_speech": ("narration: leave it empty unless a character in this shot says something "
-                         "aloud; then one sentence of 3 to 30 words: that character's referring "
-                         "phrase, word for word, and a colon, followed by their words with no "
-                         "quotation marks. This movie has no voice-over, and every spoken line "
-                         "belongs here, never in another field. A character who speaks needs a "
-                         "medium shot or closer and no fixed smile or grin, so their lips can "
-                         "move."),
-    "narration": ("narration: one sentence of 3 to 30 words. It is voice-over unless a character "
-                  "in this shot says it aloud: then begin with that character's referring phrase, "
-                  "word for word, and a colon, followed by their words with no quotation marks. "
-                  "Every spoken line belongs here, never in another field. A character who speaks "
-                  "needs a medium shot or closer and no fixed smile or grin, so their lips can "
-                  "move."),
+        "before and, and never use a semicolon. You may follow it with one camera sentence; "
+        "without one, the pipeline adds the planned camera sentence."),
+    "narration": ("narration: one sentence of 3 to 30 words of voice-over that nobody on screen "
+                  "says aloud. Never put a spoken line here."),
+    "narration_with_dialogue": ("narration: one sentence of 3 to 30 words of voice-over that "
+                                "nobody on screen says aloud, or an empty string: this panel's "
+                                "spoken line goes in dialogue, never here."),
+    "dialogue": ("dialogue: the exact words @@SPEAKER@@ says aloud in this panel: at most "
+                 "@@DWORDS@@ words as one sentence, about one word fewer for each further "
+                 "sentence, and at most three sentences; no quotation marks, no speaker name and "
+                 "no description of how the words are said -- the pipeline adds who says them and "
+                 "how."),
 }
+KEY_LINE_TEMPLATES["no_stills_prompt_speaking"] = KEY_LINE_TEMPLATES["no_stills_prompt"].replace(
+    "carries enough separate beats to fill the full @@SECONDS@@ seconds, links them with temporal "
+    "connectors (initially, as, then, while, a moment later), ",
+    "fills the full @@SECONDS@@ seconds with small, continuous movements of @@SPEAKER@@ -- a "
+    "breath, a glance, a small hand gesture -- ")
+# Appended to a speaking panel's key lines (dialogue spec 8.2); @@SPEAKER@@ is the speaker's
+# quoted referring phrase.
+SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: keep their movement "
+                            "small -- a breath, a glance, a small hand gesture -- with the camera "
+                            "holding still, and do not write the spoken words or a speaking verb "
+                            "here; the pipeline adds them.")
+SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
+                            "adds them.")
+SPEAKING_IMAGE_SENTENCE = " @@SPEAKER@@ is the only person in the frame, facing the camera."
+SPEAKING_SENTENCES = {"image": SPEAKING_IMAGE_SENTENCE, "motion": SPEAKING_ACTION_SENTENCE,
+                      "prompt": SPEAKING_PROMPT_SENTENCE}
+FIX_INSTRUCTION = ("\nFix only these problems. Keep every camera direction, every descriptive "
+                   "sentence and the dialogue word for word, and change only the sentence or "
+                   "sentences that cause them.")
 
 
-def writer_keys(mode, k, narration=True):
-    """The writer parts of panel k (Section 2.3), in order; no "narration" when narration is
-    False."""
+def writer_keys(mode, k, narration=True, speaks=False):
+    """The writer parts of panel k (Section 2.3; dialogue spec SP5), in order: title, image
+    (chained panel 1 and shots), motion or prompt, dialogue when the panel speaks and the movie
+    has spoken lines, narration only when narration is True (--speech-only has none)."""
     if mode == "chained":
-        keys = ("title", "image", "motion", "narration") if k == 1 else (
-            "title", "motion", "narration")
+        keys = ["title", "image", "motion"] if k == 1 else ["title", "motion"]
     elif mode == "no_stills":
-        keys = ("title", "prompt", "narration")
+        keys = ["title", "prompt"]
     else:
-        keys = ("title", "image", "motion", "narration")
-    return keys if narration else keys[:-1]
+        keys = ["title", "image", "motion"]
+    if speaks and narration is not False:
+        keys.append("dialogue")
+    if narration is True:
+        keys.append("narration")
+    return tuple(keys)
+
+
+def panel_speaks(ctx, plan, k):
+    """True when beat k has a speaker and the movie has spoken lines (dialogue spec SP4)."""
+    return bool(plan["beats"][k - 1]["speaker"]) and ctx.narration is not False
+
+
+def speaker_phrase(plan, k):
+    """The referring phrase of beat k's speaker, or None when nobody speaks."""
+    speaker = plan["beats"][k - 1]["speaker"]
+    for entry in plan["cast"]:
+        if speaker and entry["id"] == speaker:
+            return entry["phrase"]
+    return None
+
+
+def panel_keys(ctx, plan, k):
+    """writer_keys for panel k of a plan (dialogue spec SP5)."""
+    return writer_keys(ctx.mode, k, ctx.narration, speaks=bool(plan["beats"][k - 1]["speaker"]))
 
 
 def writer_targets(ctx, plan, k):
@@ -1308,18 +1351,30 @@ def parse_panel_reply(ctx, plan, k, answer):
         return None
     lib = _character_lib(ctx.ws)
     pasted = pasted_pieces(ctx, plan, k)
+    speaks = panel_speaks(ctx, plan, k)
     parts = {}
-    for key in writer_keys(ctx.mode, k, ctx.narration):
+    for key in panel_keys(ctx, plan, k):
         if key == "title":
             continue
         value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
-        if not value and not (key == "narration" and ctx.narration == "speech"):
+        if key == "dialogue":
+            value = _clean_dialogue(lib, value, speaker_phrase(plan, k))
+        if not value and not (key == "narration" and speaks):
             return None
         parts[key] = value
     title = clean_writer(lib, obj.get("title"))
     if not title or _words(title) > 6:
         title = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
     return dict({"title": title}, **parts)
+
+
+def _clean_dialogue(lib, text, phrase):
+    """A writer's or critic's spoken line: a leading "<phrase>:" removed (case-insensitive), then
+    one surrounding pair of quotes off and every other double quote turned into an apostrophe
+    (dialogue spec SP5, PG4; DG3 step 4)."""
+    if phrase:
+        text = lib._speaker_regex(phrase).sub("", text, count=1)
+    return lib.clean_line(text)
 
 
 def panel_fields(ctx, plan, parts, k):
@@ -1605,7 +1660,7 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     writers_by_panel = []
     for k in range(1, len(parts) + 1):
         fields = panel_fields(ctx, plan, parts, k)
-        writers = {LABELS[key]: parts[k - 1].get(key, "") for key in writer_keys(ctx.mode, k, ctx.narration)
+        writers = {LABELS[key]: parts[k - 1].get(key, "") for key in panel_keys(ctx, plan, k)
                    if key != "title"}
         writers_by_panel.append(writers)
         h, a = _field_checks(ctx, lib, plan, k, parts[k - 1]["title"], fields, writers,
@@ -1650,27 +1705,40 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         previous = ("The previous panel's Motion: "
                     + dict(panel_fields(ctx, plan, parts, k - 1))["Motion"] + "\n")
     seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
+    speaks = panel_speaks(ctx, plan, k)
+    phrase = speaker_phrase(plan, k) if speaks else None
+    words = str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 1)) if speaks else ""
     key_lines = []
-    for key in writer_keys(ctx.mode, k, ctx.narration):
-        if key == "title" or key == "narration":
-            line = KEY_LINE_TEMPLATES["narration_speech" if key == "narration"
-                                      and ctx.narration == "speech" else key]
+    for key in panel_keys(ctx, plan, k):
+        if key == "title":
+            line = KEY_LINE_TEMPLATES["title"]
+        elif key == "narration":
+            line = KEY_LINE_TEMPLATES["narration_with_dialogue" if speaks else "narration"]
+        elif key == "dialogue":
+            line = KEY_LINE_TEMPLATES["dialogue"]
         elif ctx.mode == "chained":
             line = KEY_LINE_TEMPLATES["chained_image" if key == "image" else
                                       "chained_motion1" if k == 1 else "chained_motion"]
+        elif key == "prompt" and speaks:
+            line = KEY_LINE_TEMPLATES["no_stills_prompt_speaking"]
         else:
             line = KEY_LINE_TEMPLATES["%s_%s" % (ctx.mode, key)]
         if key in ("image", "motion", "prompt") and ctx.narration == "speech":
             line += SPEECH_FRAMING_SENTENCE
+        if speaks:
+            line += SPEAKING_SENTENCES.get(key, "")
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
+        if speaks:
+            line = line.replace("@@SPEAKER@@", '"%s"' % phrase).replace("@@DWORDS@@", words)
         key_lines.append(line)
     fix_block = ""
     if fix is not None:
-        keys = writer_keys(ctx.mode, k, ctx.narration)
+        keys = panel_keys(ctx, plan, k)
         current = parts[k - 1] if k <= len(parts) and parts[k - 1] else {}
         fix_block = ("Your previous version of this panel was rejected. Problems:\n"
                      + "\n".join("- " + m for m in fix[:MAX_LISTED])
+                     + FIX_INSTRUCTION
                      + "\nPrevious version:\n"
                      + "\n".join("%s: %s" % (key, current.get(key, "")) for key in keys)
                      + "\n\n")
@@ -1692,9 +1760,9 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     return _fill(PANEL_PROMPT_TEMPLATE, fragments, scalars, ctx.narrative)
 
 
-def unparseable_panel_problem(mode, k, narration=True):
+def unparseable_panel_problem(mode, k, narration=True, speaks=False):
     return ("the reply is not one JSON object with the keys %s"
-            % ", ".join(writer_keys(mode, k, narration)))
+            % ", ".join(writer_keys(mode, k, narration, speaks)))
 
 
 # ---------------------------------------------------------------------------
@@ -2239,8 +2307,7 @@ class _Run(object):
                  "advisory": pa + la + na, "scores": None, "verdict": None, "dir": rdir}
         _write_json(os.path.join(rdir, "plan.json"), plan)
         _write_json(os.path.join(rdir, "parts.json"), {"panels": [
-            dict([("index", k)] + [(key, p.get(key, ""))
-                                   for key in writer_keys(ctx.mode, k, ctx.narration)])
+            dict([("index", k)] + [(key, p.get(key, "")) for key in panel_keys(ctx, plan, k)])
             for k, p in enumerate(parts, start=1)]})
         _write_json(os.path.join(rdir, "story_checks.json"), _checks_doc(ctx, state))
         print("round %d: %d hard, %d advisory" % (rnd, len(state["hard"]), len(state["advisory"])))
@@ -2402,8 +2469,8 @@ class _Run(object):
             if new is None and self.panel_calls[k] < PANEL_MAX_CALLS:
                 if self.expired():
                     return self.round0_timeout()
-                new = self.panel_call(plan, parts, k, 0,
-                                      [unparseable_panel_problem(ctx.mode, k, ctx.narration)])
+                new = self.panel_call(plan, parts, k, 0, [unparseable_panel_problem(
+                    ctx.mode, k, ctx.narration, bool(plan["beats"][k - 1]["speaker"]))])
             if new is not None:
                 parts[k - 1] = new
                 valid += 1
