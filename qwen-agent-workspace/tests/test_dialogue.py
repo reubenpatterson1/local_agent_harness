@@ -1596,3 +1596,36 @@ def test_dlg29_judge_clips_panel_text():
     assert ("A Dialogue: text is a line the named character speaks on camera in that panel's clip; "
             "Narration: text is voice-over.") in judge_clips.SYSTEM_PROMPT
     assert "starts with a character's referring phrase and a colon" not in judge_clips.SYSTEM_PROMPT
+
+
+# --- DLG27: bin/ltx-movie --speech-delivery (DG8) --------------------------------------------
+
+def test_dlg27_speech_delivery_reaches_the_manifest(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(ltx_movie, "WS", seu.make_ws(tmp_path))
+    assert ltx_movie.build_parser().parse_args(["n", "--story-id", "x"]).speech_delivery == "beats"
+    calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "run",
+                        lambda cmd, **kw: calls.append(list(cmd)) or _Done())
+    for delivery in ("beats", "plain", "beats-no-acoustic"):
+        calls[:] = []
+        argv = ["n", "--story-id", "sd1", "--panels", "3", "--no-review"]
+        if delivery != "beats":
+            argv += ["--speech-delivery", delivery]
+        assert ltx_movie.phase3_manifest(_movie_args(*argv)) == 0
+        manifest = calls[0]
+        assert "ltx-story-manifest" in manifest[1]
+        assert ("--speech-delivery" in manifest) == (delivery != "beats"), delivery
+        if delivery != "beats":
+            assert manifest[manifest.index("--speech-delivery") + 1] == delivery
+    for flags, expected in (([], None), (["--speech-delivery", "plain"], "plain"),
+                            (["--story-legacy", "--speech-delivery", "beats-no-acoustic"],
+                             "beats-no-acoustic")):
+        capsys.readouterr()
+        assert ltx_movie.main(["n", "--story-id", "sd2", "--panels", "3", "--dry-run",
+                               "--no-review"] + flags) == 0, flags
+        line = [l for l in capsys.readouterr().out.splitlines()
+                if l.startswith("Command: ") and "ltx-story-manifest" in l][0]
+        if expected is None:
+            assert "--speech-delivery" not in line
+        else:
+            assert line.endswith(" --force --speech-delivery " + expected), line

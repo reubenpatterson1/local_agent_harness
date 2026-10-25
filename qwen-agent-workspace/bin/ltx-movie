@@ -460,6 +460,11 @@ def build_parser():
                          help="Narration: is only ever a character's spoken line (\"the courier: "
                               "...\"), never voice-over, and may be empty; panels share the "
                               "length equally. Needs the default story engine.")
+    parser.add_argument("--speech-delivery", dest="speech_delivery",
+                         choices=["beats", "plain", "beats-no-acoustic"], default="beats",
+                         help="how spoken lines reach the video model (bin/ltx-story-manifest "
+                              "--speech-delivery): beats (default), beats-no-acoustic, or plain, "
+                              "the earlier '<Speaker> says: \"...\"' form, for A/B comparison")
     parser.add_argument("--no-auto-lora", dest="no_auto_lora", action="store_true", default=False,
                          help="the story plan picks no catalog LoRAs (generated/loras/catalog.json); "
                               "--lora/--stills-lora still apply")
@@ -2018,6 +2023,8 @@ def phase3_manifest(args):
                      "--force"]
     if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
         cmd_manifest += ["--pace", "equal"]
+    if getattr(args, "speech_delivery", "beats") != "beats":
+        cmd_manifest += ["--speech-delivery", args.speech_delivery]
     cmd_manifest += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args)
     if error:
@@ -2356,6 +2363,8 @@ def _print_dry_run_plan(args):
                              "--max-frames", str(args.frames), "--force"]
     if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
         phase3_manifest_cmd += ["--pace", "equal"]
+    if getattr(args, "speech_delivery", "beats") != "beats":
+        phase3_manifest_cmd += ["--speech-delivery", args.speech_delivery]
     phase3_manifest_cmd += _cast_flags(args)
     error, catalog_lists = _catalog_panel_loras(args, dry_run=True)
     if error:
