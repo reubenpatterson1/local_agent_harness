@@ -63,7 +63,7 @@ STILL_NAME_RE = re.compile(r"panel_(\d{2,})\.png")
 # Verbatim copies of bin/ltx-story-manifest:81-82 (_PANEL_HEADER_RE, _PANEL_LABEL_RE).
 # Duplicated rather than loaded, per spec 1.1 / G7: if those change, change these too.
 PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
-PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
+PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style|Dialogue):\s*(.*)$")
 
 # visual_continuity is deliberately NOT in scores.required: it is required only when
 # 2 or more stills are judged, which JSON Schema cannot express, so
@@ -197,7 +197,7 @@ def parse_panels(story_md_text):
     """Panel sections of story.md, in file order, as dicts with header/image/motion/
     narration. The section and field rules duplicate bin/ltx-story-manifest's
     _parse_prompts_md (:202-245) verbatim, so pairing matches what was rendered.
-    Prompt: and Style: are recognized only to close the open field, then dropped
+    Prompt:, Style: and Dialogue: are recognized only to close the open field, then dropped
     (spec 3.2, G5). Pure."""
     sections = []
     current = None
@@ -219,7 +219,8 @@ def parse_panels(story_md_text):
 
     panels = []
     for section in sections:
-        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": []}
+        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": [],
+                  "Dialogue": []}
         open_field = None
         for line in section["body"]:
             m = PANEL_LABEL_RE.match(line)

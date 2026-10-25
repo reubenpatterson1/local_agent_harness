@@ -107,7 +107,7 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 _PANEL_NUM_RE = re.compile(r"panel[-_]?(\d+)", re.IGNORECASE)
 _PANEL_HEADER_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
-_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
+_PANEL_LABEL_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style|Dialogue):\s*(.*)$")
 MAX_PROMPT_WORDS = 150
 
 
@@ -289,8 +289,8 @@ def _extract_narrative(lines):
 
 def _parse_prompts_md(path):
     """Return (narrative, [{'title': str, 'text': str, 'image': str,
-    'motion': str, 'narration': str, 'prompt': str, 'style': str}, ...]) parsed from a
-    prompts.md file. Raises OSError if the file cannot be read.
+    'motion': str, 'narration': str, 'prompt': str, 'style': str, 'dialogue': str}, ...])
+    parsed from a prompts.md file. Raises OSError if the file cannot be read.
 
     v2: inside a panel section, a line matching `Image:`/`Motion:`/
     `Narration:` opens that field; subsequent non-blank unlabeled lines
@@ -313,6 +313,10 @@ def _parse_prompts_md(path):
     bin/ltx-story-images appends Panel 1's `style` verbatim to every panel's
     image prompt. `style` is "" when the label never appears, so a story.md
     written before this field existed parses exactly as it did before.
+
+    A `Dialogue:` label holds the panel's spoken line, "<referring phrase>: <the
+    spoken words>" (docs/superpowers/specs/2026-10-24-on-camera-dialogue-design.md);
+    `dialogue` is "" when the label never appears.
     """
     with open(path) as f:
         lines = f.read().splitlines()
@@ -341,7 +345,8 @@ def _parse_prompts_md(path):
     for p in panels:
         p["text"] = " ".join(s.strip() for s in p["body"] if s.strip())
 
-        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": []}
+        fields = {"Image": [], "Motion": [], "Narration": [], "Prompt": [], "Style": [],
+                  "Dialogue": []}
         open_field = None
         for line in p["body"]:
             m = _PANEL_LABEL_RE.match(line)
@@ -358,6 +363,7 @@ def _parse_prompts_md(path):
         p["narration"] = " ".join(fields["Narration"])
         p["prompt"] = " ".join(fields["Prompt"])
         p["style"] = " ".join(fields["Style"])
+        p["dialogue"] = " ".join(fields["Dialogue"])
 
     return narrative, panels
 

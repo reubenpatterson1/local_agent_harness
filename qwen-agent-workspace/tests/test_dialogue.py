@@ -218,3 +218,59 @@ def test_dlg6_cast_text_skip_quoted(story_env):
         'here."', ["kyra", "ronin"])
     assert character_lib.cast_text('"The ronin waits."', members, skip_quoted=True) == (
         '"The ronin waits."', [])
+
+
+# --- DLG32: the Dialogue: label (DG7 step 1, G7) ---------------------------------------------
+
+LABEL_PATTERN = r"^(Image|Motion|Narration|Prompt|Style|Dialogue):\s*(.*)$"
+STORY_WITH_DIALOGUE = """# Gate
+
+A courier reaches a temple gate.
+
+## Panel 1 — Arrival
+Image: The courier stands at the gate.
+Motion: The courier raises the letter.
+Dialogue: the courier: I carry a letter
+for the abbot.
+Narration: The bell had not yet rung.
+"""
+IMAGE_THEN_DIALOGUE = """# Gate
+
+## Panel 1 — Arrival
+Image: A temple gate at dusk.
+Dialogue: the courier: I carry a letter.
+Motion: The courier raises the letter.
+"""
+
+
+def _judge(name, rel):
+    """A bin/judge-* script, loaded only by the tests that use it (they import anthropic and
+    jsonschema, which collecting this module must not need)."""
+    pytest.importorskip("anthropic")
+    pytest.importorskip("jsonschema")
+    return _load(name, rel)
+
+
+def test_dlg32_dialogue_label(tmp_path):
+    assert story_manifest._PANEL_LABEL_RE.pattern == LABEL_PATTERN
+    assert character_lib._STORY_FIELD_RE.pattern == LABEL_PATTERN
+    path = tmp_path / "story.md"
+    path.write_text(STORY_WITH_DIALOGUE, encoding="utf-8")
+    panel = story_manifest._parse_prompts_md(str(path))[1][0]
+    assert (panel["image"], panel["motion"], panel["dialogue"], panel["narration"]) == (
+        "The courier stands at the gate.", "The courier raises the letter.",
+        "the courier: I carry a letter for the abbot.", "The bell had not yet rung.")
+    plain = tmp_path / "plain.md"
+    plain.write_text(STORY_WITH_DIALOGUE.replace(
+        "Dialogue: the courier: I carry a letter\nfor the abbot.\n", ""), encoding="utf-8")
+    assert story_manifest._parse_prompts_md(str(plain))[1][0]["dialogue"] == ""
+    member = character_lib.CastMember("courier", "the courier", "courierx", "man", seu.COURIER,
+                                      "/v.safetensors", None, None, None)
+    assert character_lib.repair_cast_descriptions(IMAGE_THEN_DIALOGUE, [member]) == (
+        IMAGE_THEN_DIALOGUE, [])
+    judge_stills = _judge("judge_stills_for_dialogue", "bin/judge-stills")
+    assert judge_stills.PANEL_LABEL_RE.pattern == LABEL_PATTERN
+    parsed = judge_stills.parse_panels(STORY_WITH_DIALOGUE)[0]
+    assert (parsed["image"], parsed["motion"], parsed["narration"]) == (
+        "The courier stands at the gate.", "The courier raises the letter.",
+        "The bell had not yet rung.")

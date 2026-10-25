@@ -172,7 +172,7 @@ _DISTANCE_CUE_RE = re.compile(r"\b(?:far\s+(?:in\s+the\s+)?(?:background|distanc
 _SETTING_SENTENCE_RE = re.compile(r"""["“]?the\s+setting\s+is\b""", re.IGNORECASE)
 _VIOLATION_RE = re.compile(r"(?:story|panel (\d+)): (S\d+ [^:]+): (.*)", re.DOTALL)
 _STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
-_STORY_FIELD_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style):\s*(.*)$")
+_STORY_FIELD_RE = re.compile(r"^(Image|Motion|Narration|Prompt|Style|Dialogue):\s*(.*)$")
 _SENTENCE_END_RE = re.compile(r"""[.!?]["”’']?(?=\s|$)""")
 
 TRIGGER_REGISTRY = ".triggers"
