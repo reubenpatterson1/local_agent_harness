@@ -341,7 +341,7 @@ beats:
 ... The old monk faces the camera. The old monk says, "Come in." After a breath, "Sit by the fire." After a short pause, "He will see you." <AC> The camera stays static.
 ```
 
-**Over the cap.** `Dialogue: the courier: I carry a sealed letter from the harbour master for the abbot of this temple.` is 16 words. The engine reports T1 (blocking); the manifest exits 2 with the message in DG7 step 6.
+**Over the cap.** `Dialogue: the courier: I carry a sealed letter from the harbour master for the abbot of this temple.` is 15 words. The engine reports T1 (blocking); the manifest exits 2 with the message in DG7 step 6.
 
 **Alias.** `Narration: the courier: Keep moving.` with no Dialogue gives `speech_source: "narration"`. With beats it produces `The courier says, "Keep moving." <AC>`. With plain it produces today's bytes.
 
@@ -792,7 +792,7 @@ Stdlib plus pytest. Modules are loaded by path, as in `tests/test_story_engine.p
 | DLG13 | `writer_keys(..., speaks)` for every mode and narration value; speaking key lines, including `no_stills_prompt_speaking` and the cap; no template contains "Do not mention the camera" or "camera or lens" |
 | DLG14 | `parse_panel_reply` on a speaking panel |
 | DLG15 | assembly goldens with Dialogue in all 3 modes; manifest round trip; CM4 dedupe drops `{cam}` from the assembly for "The camera slowly pans left." but `pasted_pieces` still lists it; "The camera viewpoint is front-facing." keeps `{cam}`; `story_fields` emits `("Dialogue", ...)` |
-| DLG16 | T1 exact messages (16 words in 1 sentence; 13 words in 3 sentences gives T1 because the cap is 12; 4 sentences); alias T1 is advisory |
+| DLG16 | T1 exact messages (15 words in 1 sentence; 13 words in 3 sentences gives T1 because the cap is 12; 4 sentences); alias T1 is advisory |
 | DLG17 | T2/T3: chained "then" ×1 gives none, ×2 gives T2, ×4 gives T3; shots with 3 sentences gives T2; no_stills with 6 connectors gives T2; camera-only motion gives "no physical action"; every `seu.panel_json` fixture panel gives no T violation |
 | DLG18 | reclassification: the rst20 N2-N10 mutations go to advisory; S2 and S5-S12 go to advisory and S1/S3 stay hard in `panel_checks`, `recheck` with a plan, the no-plan shots `recheck`, and `plan_free_report`; P4/P5/P7/P8/P9/P13 advisory; L2-L4 advisory; L5 strength 2.5 is hard and in-(0,2]-but-out-of-range is advisory; L1/L6/L7 hard |
 | DLG19 | the critic prompt contains every 8.3 sentence; the field lines are exactly the allowed set; "(only 1:" and `field "beat.action"` are absent |
@@ -833,7 +833,7 @@ DLG28 (movie-ui) was cut with the Compose field.
 | `::test_rst20e` | `critic_field_lines` has no `beat.shot` line |
 | `::test_rst22_critic_prompt` (`:1174`) | header text; no image line; ONLY1 count 0 |
 | `::test_rst27`, `::test_rst28`, `::test_rst29`, `::test_rst30`, `::test_rst31`, `::test_rst32` | `apply_patches` returns a 3-tuple and has no `regen`; setting, shot, camera, image, narration and beat.action patches are rejected with the NOT_REPAIRED reason; `::test_rst29` becomes a beat.action rejection test |
-| `::test_rst26b`, `::test_rst33`-`::test_rst39`, `::test_rst43`, `::test_rst51`-`::test_rst54`, `::test_rst58`, `::test_rst55b_p13_forces_plan_call_2` | `_shouting` (`:1476`; N7 strings at `:1571`, `:1651`, `:1776`) is replaced by a T2 helper (motion `"The courier stops at the crates, then turns, then pedals on toward the far end of the wet road."`). Exit-2 cases use a **T1 helper**: plan mutation `beats[1]["speaker"] = "c1"`, and panel 2's reply carries the 16-word over-cap dialogue in DG9. A clean round 0 makes no critic call; max rounds is 2; `story_checks` gains `unresolved`; P13 no longer forces plan call 2; `::test_rst38` is report-only |
+| `::test_rst26b`, `::test_rst33`-`::test_rst39`, `::test_rst43`, `::test_rst51`-`::test_rst54`, `::test_rst58`, `::test_rst55b_p13_forces_plan_call_2` | `_shouting` (`:1476`; N7 strings at `:1571`, `:1651`, `:1776`) is replaced by a T2 helper (motion `"The courier stops at the crates, then turns, then pedals on toward the far end of the wet road."`). Exit-2 cases use a **T1 helper**: plan mutation `beats[1]["speaker"] = "c1"`, and panel 2's reply carries the 15-word over-cap dialogue in DG9. A clean round 0 makes no critic call; max rounds is 2; `story_checks` gains `unresolved`; P13 no longer forces plan call 2; `::test_rst38` is report-only |
 | `::test_rst36`, `::test_rst36b` | the new ranking key; `_new_rs37` reads advisories |
 | `::test_rst44`, `::test_rst44b`, `::test_rst44d`, `::test_rst44e`, `::test_rst45`, `::test_rst56`, `::test_rst56b` (both), `::test_rst56c` | N15/N7 are advisory; re-check exits 2 only when something is blocking; `plan_free_report` returns `(hard, advisory)` (`:2018-2026`) |
 | `::test_rst47_robust_dry_run` (`:2529`, `:2534`) | 6.8 and 6.9 lines |
@@ -1111,3 +1111,16 @@ Must pass unchanged:
 ### 14.3 Open
 
 None.
+
+## 15. Amendments (post-plan)
+
+- Q1: the pasted "<Phrase> faces the camera." sentence is excluded from S5 (shots_violations is called with ignore_facing=True for robust callers).
+- Q2: judge-story reads story_checks.json "unresolved" as [advisory].
+- The OVER_CAP example line is 15 words (not 16); every "16 words" that refers to it now reads "15 words".
+- SP5 cleanup order follows PG4: strip "<phrase>:" first, then quotes.
+- A speaking panel always gets a Dialogue: field, so an empty part yields N18.
+- The 9.2 table also edits test_rst39 (the speech_notes key).
+- Fix wave item 1: an empty action field (Motion or Prompt) adds a blocking S3 message ("missing/empty <Label>: field") while T2 still fires so the critic patch can repair it.
+- Fix wave item 3: the critic dialogue patch is allowed for a panel with T1 or N18 (prompt wording updated to match).
+- Fix wave item 5: a beat speaker equal (case-insensitive, stripped) to a cast phrase is mapped to that cast id, with no note.
+- Fix wave item 6: "Warning: unresolved after N critic round(s)" counts the critic rounds actually run, including a round that stopped on a plateau.
