@@ -2058,3 +2058,19 @@ def test_ff3_critic_dialogue_patch_repairs_n18(ws, tmp_path, monkeypatch, capsys
                                            [_patch("panel", 2, "dialogue", line)]))] * 2)
     assert rc == 0
     assert "Dialogue: " + line + "\n" in _story_md(ctx)
+
+
+@pytest.mark.parametrize("mode", ["chained", "shots", "no_stills"])
+def test_ff4_t1_repair_through_the_critic(ws, tmp_path, monkeypatch, mode):
+    line = "the courier: “I carry a letter for the abbot.”"
+    rc, _a, ctx, log = _run(
+        ws, tmp_path, monkeypatch, mode=mode, plan=_speaking_plan(mode, 3, 2),
+        panel=_replies(mode, 3, {2: [{"dialogue": OVER_CAP}]}),
+        critic=[seu.answer(seu.critic_json((8, 8, 8), "revise",
+                                           [_patch("panel", 2, "dialogue", line)]))])
+    assert rc == 0
+    round_0 = _read_json(os.path.join(ctx.story_dir, "story_rounds", "round_0",
+                                      "story_checks.json"))
+    assert "T1" in [v["id"] for v in round_0["hard"]]
+    assert "Dialogue: the courier: I carry a letter for the abbot.\n" in _story_md(ctx)
+    assert [r["stage"] for r in log].count("critic") == 1
