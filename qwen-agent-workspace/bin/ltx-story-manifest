@@ -70,7 +70,7 @@ empty) of {"name", "phrase", "trigger", "video_lora", "strength"} entries, sorte
 name: strength is 1.0 when the panel names exactly one cast character, else the
 character's own character.json strength or --character-strength (default 0.8).
 schema_version stays 3, because the key is optional. character_lib.py is loaded by path
-only when --cast is given or a Narration: line has a colon.
+only when --cast is given, a Narration: line has a colon or a panel has a Dialogue: line.
 
 Spoken narration: a Narration: line is voice-over (not sent to the video model) unless it
 starts with a known referring phrase and a colon -- "the courier: Keep moving." The known
@@ -175,6 +175,13 @@ def build_parser():
                          help="per-panel catalog LoRAs (bin/ltx-movie's catalog_loras.json): each "
                               "panel gets a catalog_loras list and its triggers are prefixed to its "
                               "motion_prompt")
+    parser.add_argument("--speech-delivery", dest="speech_delivery",
+                         choices=["beats", "plain", "beats-no-acoustic"], default="beats",
+                         help="how a Dialogue: line (or a spoken Narration: line) is written into "
+                              "motion_prompt: beats (default) splits it at sentence ends with "
+                              "short fixed beats and adds a fixed close-mic audio sentence; "
+                              "beats-no-acoustic omits that sentence; plain is '<Speaker> says: "
+                              "\"<line>\"'")
     return parser
 
 
@@ -388,14 +395,31 @@ def _known_phrases(args, members):
     return phrases
 
 
-def _spoken_narration(args, prompt_texts, members):
-    """[(speaker phrase or None, spoken text or the narration)] per prompts panel; character_lib
-    is loaded only when some Narration: has a colon."""
-    narrations = [pt["narration"] for pt in (prompt_texts or [])]
-    if not any(":" in n for n in narrations):
-        return [(None, n) for n in narrations]
+def _spoken(args, prompt_texts, members):
+    """[(speaker phrase or None, spoken text or the narration, source)] per prompts panel (dialogue
+    spec DG7 step 4), or None after an Error line for a Dialogue: that names no known phrase.
+    source is "dialogue", "narration" (a Narration: line spoken by a known phrase, the
+    back-compat alias) or None (voice-over); a panel with a Dialogue: keeps its Narration: as
+    voice-over. character_lib is loaded only when some Dialogue: is non-empty or some
+    Narration: has a colon."""
+    panels = prompt_texts or []
+    if not any(pt["dialogue"].strip() or ":" in pt["narration"] for pt in panels):
+        return [(None, pt["narration"], None) for pt in panels]
     lib, phrases = _character_lib(), _known_phrases(args, members)
-    return [lib.split_speaker(n, phrases) if ":" in n else (None, n) for n in narrations]
+    spoken = []
+    for i, pt in enumerate(panels, start=1):
+        if pt["dialogue"].strip():
+            phrase, line, problem = lib.parse_dialogue(pt["dialogue"], phrases)
+            if problem:
+                print("Error: panel %d: Dialogue: %s" % (i, problem), file=sys.stderr)
+                return None
+            spoken.append((phrase, line, "dialogue"))
+        elif ":" in pt["narration"]:
+            speaker, speech = lib.split_speaker(pt["narration"], phrases)
+            spoken.append((speaker, speech, None if speaker is None else "narration"))
+        else:
+            spoken.append((None, pt["narration"], None))
+    return spoken
 
 
 def _prompt_length_warning(unit_index, prompt):
@@ -607,7 +631,9 @@ def main(argv=None):
             print("Error: %s" % e, file=sys.stderr)
             return 2
 
-    spoken = _spoken_narration(args, prompt_texts, members)
+    spoken = _spoken(args, prompt_texts, members)
+    if spoken is None:
+        return 2
 
     n_panels = len(prompt_texts) if (args.no_images or args.chain) else len(matched)
 
@@ -639,13 +665,15 @@ def main(argv=None):
             weights = []
             for i in range(1, n_panels + 1):
                 narration = prompt_texts[i - 1]["narration"]
-                if not narration.strip():
-                    print("Error: --pace proportional requires every panel to have a "
-                          "non-empty Narration field; panel %d has none" % i, file=sys.stderr)
+                speaker, speech, source = (spoken[i - 1] if i <= len(spoken)
+                                           else (None, narration, None))
+                if not narration.strip() and source != "dialogue":
+                    print("Error: --pace proportional requires every panel to have a non-empty "
+                          "Narration or Dialogue field; panel %d has neither" % i,
+                          file=sys.stderr)
                     return 2
-                if i <= len(spoken) and spoken[i - 1][0] is not None:
-                    narration = spoken[i - 1][1]
-                weights.append(max(len(narration.split()), 1))
+                weights.append(max(len((speech if speaker is not None else narration).split()),
+                                   1))
         else:
             weights = [1] * n_panels
         frame_counts = _allocate_frames(weights, target_frames, args.min_frames, args.max_frames)
@@ -661,6 +689,27 @@ def main(argv=None):
                 file=sys.stderr,
             )
             return 2
+
+    # The word cap of each spoken line, against its own clip (dialogue spec DG7 step 6): a
+    # Dialogue: line over it is refused; an old prefixed Narration: line only warns (D1).
+    if any(speaker is not None for speaker, _speech, _source in spoken):
+        dlib = _character_lib()
+        for i, (speaker, speech, source) in enumerate(spoken[:n_panels], start=1):
+            if speaker is None:
+                continue
+            seconds = frame_counts[i - 1] / float(args.fps)
+            n = len(dlib.split_fragments(speech))
+            cap = dlib.dialogue_word_cap(seconds, n)
+            words = len(speech.split())
+            if words > cap or n > dlib.DIALOGUE_MAX_FRAGMENTS:
+                detail = ("%d words in %d sentences; a %.2f-second clip fits at most %d words in "
+                          "%d sentences, and a line has at most 3 sentences; shorten the line, or "
+                          "split it across alternating close-up panels (the speaker, then the "
+                          "listener, then the speaker again)" % (words, n, seconds, cap, n))
+                if source == "dialogue":
+                    print("Error: panel %d: Dialogue: is %s" % (i, detail), file=sys.stderr)
+                    return 2
+                print("WARNING: panel %d: the spoken Narration: is %s" % (i, detail))
 
     panels = []
     for i in range(1, n_panels + 1):
@@ -713,10 +762,11 @@ def main(argv=None):
                 motion_prompt = None
                 narration = ""
         num_frames = frame_counts[i - 1]
-        speaker, speech = spoken[i - 1] if i <= len(spoken) else (None, narration)
+        speaker, speech, source = spoken[i - 1] if i <= len(spoken) else (None, narration, None)
         if speaker is not None and motion_prompt is not None:
             lib_ = _character_lib()
-            motion_prompt = lib_.insert_speech(motion_prompt, lib_.speech_sentence(speaker, speech))
+            motion_prompt = lib_.insert_speech(
+                motion_prompt, lib_.speech_text(speaker, speech, args.speech_delivery), [speaker])
         panel = {
             "index": i,
             "image_path": None if image_path is None else os.path.abspath(image_path),
@@ -732,14 +782,14 @@ def main(argv=None):
         if conditioning is not None:
             panel["conditioning"] = conditioning
         if speaker is not None:
-            panel["speaker"], panel["speech"] = speaker, speech
+            panel["speaker"], panel["speech"], panel["speech_source"] = speaker, speech, source
         panels.append(panel)
 
     if members:
         by_name = {m.name: m for m in members}
         used = set()
         for p in panels:
-            p["motion_prompt"], names = lib.cast_text(p["motion_prompt"], members)
+            p["motion_prompt"], names = lib.cast_text(p["motion_prompt"], members, skip_quoted=True)
             if args.shots:
                 names = sorted(set(names) | set(lib.cast_text(p["panel_text"], members)[1]))
             strengths = lib.panel_strengths(names, members, strength, shots=args.shots)

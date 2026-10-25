@@ -274,3 +274,264 @@ def test_dlg32_dialogue_label(tmp_path):
     assert (parsed["image"], parsed["motion"], parsed["narration"]) == (
         "The courier stands at the gate.", "The courier raises the letter.",
         "The bell had not yet rung.")
+
+
+# --- DLG7-DLG10, Review Focus 2-3: bin/ltx-story-manifest speech (DG7, DG9) ---------------------
+
+DG9_SETTING = ("The setting is a hilltop temple gate in modern Japan, worn stone steps underfoot, "
+               "cedar trees behind, under low golden evening light.")
+CAST_PLAN = {"schema": "ltx-movie.plan.v1", "cast": [
+    {"id": "c1", "phrase": "the courier", "descriptor": seu.COURIER, "cast_name": None},
+    {"id": "c2", "phrase": "the old monk", "descriptor": seu.MONK, "cast_name": None}],
+    "beats": [{"cast": ["c1"]}, {"cast": ["c2"]}]}
+CHAINED_DG9 = """# The Gate
+
+A courier reaches a hilltop temple.
+
+## Panel 1 — The Steps
+Image: %s The courier climbs toward the gate.
+Motion: The courier climbs the last worn step toward the gate. The camera stays static.
+Narration: The bell had not yet rung.
+
+## Panel 2 — At the Gate
+Motion: The old monk lowers his broom and lifts his eyes. The old monk faces the camera. The camera stays static.
+@@LINES@@
+""" % DG9_SETTING
+SHOTS_DG9 = """# The Letter
+
+A courier brings a letter to a temple.
+
+## Characters
+- "the courier": %(courier)s.
+- "the old monk": %(monk)s.
+
+## Panel 1 — The Road
+Image: %(setting)s The courier walks up the road. The shot is a wide shot.
+Motion: The courier walks up the road toward the gate. The camera tracks alongside the movement.
+Narration: The road was long.
+
+## Panel 2 — The Stairs
+Image: %(setting)s The courier climbs the stairs. The shot is a medium shot.
+Motion: The courier climbs the worn stone stairs. The camera stays static.
+Narration: The stairs were steep.
+
+## Panel 3 — The Letter
+Image: %(setting)s The courier is %(courier)s. The courier stands at the gate holding the sealed letter at chest height. The courier faces the camera. The shot is a medium close-up.
+Motion: The courier raises the sealed letter toward the gate. The courier faces the camera. The camera stays static.
+Dialogue: the courier: I carry a letter for the abbot.
+Narration: The bell had not yet rung.
+""" % {"courier": seu.COURIER, "monk": seu.MONK, "setting": DG9_SETTING}
+NO_STILLS_DG9 = """# Shelter
+
+A courier finds shelter.
+
+## Panel 1 — Rain
+Prompt: The courier runs through the rain toward the temple. The camera stays static.
+Narration: The rain came suddenly.
+
+## Panel 2 — Gate
+Prompt: The courier reaches the temple gate and knocks twice. The camera stays static.
+Narration: Someone was inside.
+
+## Panel 3 — Door
+Prompt: The old monk opens the heavy wooden door. The camera stays static.
+Narration: The door creaked open.
+
+## Panel 4 — Shelter
+Prompt: The old monk sets down his broom as rain drips from the eaves. The old monk is %s. %s The shot is a close-up. The old monk faces the camera. The camera stays static.
+Dialogue: the old monk: Come in. Sit by the fire. He will see you.
+Narration: Inside, the fire was already lit.
+""" % (seu.MONK, seu.TEMPLE)
+OVER_CAP = "I carry a sealed letter from the harbour master for the abbot of this temple."
+
+
+def _manifest_ws(tmp_path, monkeypatch, story_id, text, plan=None, images=1):
+    """A workspace for bin/ltx-story-manifest (its module WS patched), with character_lib.py and
+    lora_catalog.py symlinked in, the story.md, `images` panel stills, and plan (a dict, or the
+    raw file text) as generated/stories/<story_id>/plan.json when given."""
+    ws = tmp_path / "mws"
+    if not ws.exists():
+        ws.mkdir()
+        for name in ("character_lib.py", "lora_catalog.py"):
+            os.symlink(os.path.join(WS, name), str(ws / name))
+    monkeypatch.setattr(story_manifest, "WS", str(ws))
+    story_md = tmp_path / ("%s.md" % story_id)
+    story_md.write_text(text, encoding="utf-8")
+    paths = []
+    for k in range(1, images + 1):
+        path = tmp_path / ("%s_%02d.png" % (story_id, k))
+        path.write_bytes(PNG_1X1)
+        paths.append(str(path))
+    if plan is not None:
+        story_dir = ws / "generated" / "stories" / story_id
+        story_dir.mkdir(parents=True, exist_ok=True)
+        (story_dir / "plan.json").write_text(plan if isinstance(plan, str) else json.dumps(plan),
+                                             encoding="utf-8")
+    return str(story_md), paths, str(ws)
+
+
+def _manifest_argv(story_id, story_md, images, mode="chain", panels=2, frames=145, extra=()):
+    argv = ["--story-id", story_id, "--prompts-md", story_md]
+    if mode == "chain":
+        argv += ["--chain", "--image", images[0]]
+    elif mode == "shots":
+        argv += ["--shots"]
+        for image in images:
+            argv += ["--image", image]
+    else:
+        argv += ["--no-images"]
+    return argv + ["--fps", "24", "--target-seconds", repr(frames * panels / 24.0),
+                   "--min-frames", str(frames), "--max-frames", str(frames), "--force"] + list(extra)
+
+
+def _read_manifest(ws, story_id):
+    with open(os.path.join(ws, "generated", "stories", story_id, "manifest.json"),
+              encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_dlg7_manifest_goldens(tmp_path, monkeypatch):
+    chained = CHAINED_DG9.replace(
+        "@@LINES@@", "Dialogue: the old monk: You came far. Rest here before the abbot sees you.")
+    head = "The old monk lowers his broom and lifts his eyes. The old monk faces the camera. "
+    expected = {
+        "beats": head + 'The old monk says, "You came far." After a breath, "Rest here before the '
+                        'abbot sees you." ' + AC + " The camera stays static.",
+        "plain": head + 'The old monk says: "You came far. Rest here before the abbot sees you." '
+                        "The camera stays static.",
+        "beats-no-acoustic": head + 'The old monk says, "You came far." After a breath, "Rest here '
+                                    'before the abbot sees you." The camera stays static.'}
+    for delivery, motion in expected.items():
+        story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg7c", chained, plan=CAST_PLAN)
+        extra = [] if delivery == "beats" else ["--speech-delivery", delivery]
+        assert story_manifest.main(_manifest_argv("dlg7c", story_md, images, extra=extra)) == 0
+        panels = _read_manifest(ws, "dlg7c")["panels"]
+        assert panels[1]["motion_prompt"] == motion, delivery
+        assert (panels[1]["speaker"], panels[1]["speech"], panels[1]["speech_source"],
+                panels[1]["narration"], panels[1]["narration_words"]) == (
+            "the old monk", "You came far. Rest here before the abbot sees you.", "dialogue", "",
+            10)
+        assert not {"speaker", "speech", "speech_source"} & set(panels[0])
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg7s", SHOTS_DG9, images=3)
+    assert story_manifest.main(_manifest_argv("dlg7s", story_md, images, mode="shots",
+                                              panels=3)) == 0
+    panel = _read_manifest(ws, "dlg7s")["panels"][2]
+    assert panel["motion_prompt"] == (
+        'The courier raises the sealed letter toward the gate. The courier faces the camera. The '
+        'courier says, "I carry a letter for the abbot." ' + AC + " The camera stays static.")
+    assert (panel["speech_source"], panel["narration"]) == ("dialogue", "The bell had not yet rung.")
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg7n", NO_STILLS_DG9,
+                                        plan=CAST_PLAN, images=0)
+    assert story_manifest.main(_manifest_argv("dlg7n", story_md, images, mode="no_images",
+                                              panels=4)) == 0
+    panel = _read_manifest(ws, "dlg7n")["panels"][3]
+    assert panel["motion_prompt"] == (
+        "The old monk sets down his broom as rain drips from the eaves. The old monk is %s. %s The "
+        'shot is a close-up. The old monk faces the camera. The old monk says, "Come in." After a '
+        'breath, "Sit by the fire." After a short pause, "He will see you." %s The camera stays '
+        "static." % (seu.MONK, seu.TEMPLE, AC))
+    assert panel["speech"] == "Come in. Sit by the fire. He will see you."
+
+
+def test_dlg8_narration_alias(tmp_path, monkeypatch):
+    alias = CHAINED_DG9.replace(
+        "Motion: The old monk lowers his broom and lifts his eyes. The old monk faces the camera. "
+        "The camera stays static.\n@@LINES@@",
+        "Motion: The courier runs. The camera tracks alongside the movement.\n"
+        "Narration: the courier: Keep moving.")
+    for delivery, motion in (
+            ("beats", 'The courier runs. The courier says, "Keep moving." ' + AC
+                      + " The camera tracks alongside the movement."),
+            ("plain", 'The courier runs. The courier says: "Keep moving." The camera tracks '
+                      "alongside the movement.")):
+        story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg8", alias, plan=CAST_PLAN)
+        assert story_manifest.main(_manifest_argv(
+            "dlg8", story_md, images, extra=["--speech-delivery", delivery])) == 0
+        panel = _read_manifest(ws, "dlg8")["panels"][1]
+        assert panel["motion_prompt"] == motion, delivery
+        assert (panel["speaker"], panel["speech"], panel["speech_source"], panel["narration"],
+                panel["narration_words"]) == ("the courier", "Keep moving.", "narration",
+                                              "the courier: Keep moving.", 2)
+
+
+def test_dlg9_manifest_errors(tmp_path, monkeypatch, capsys):
+    tail = SPLIT
+    cases = [
+        ("Dialogue: the stranger: Halt.", 2, "",
+         "Error: panel 2: Dialogue: names 'the stranger', which is no character's referring "
+         "phrase; use one of: 'the courier', 'the old monk'\n"),
+        ("Dialogue: the courier: " + OVER_CAP, 2, "",
+         "Error: panel 2: Dialogue: is 15 words in 1 sentences; a 6.04-second clip fits at most "
+         "14 words in 1 sentences" + tail + "\n"),
+        ("Narration: the courier: " + OVER_CAP, 0,
+         "WARNING: panel 2: the spoken Narration: is 15 words in 1 sentences; a 6.04-second clip "
+         "fits at most 14 words in 1 sentences" + tail + "\n", ""),
+        ("", 2, "",
+         "Error: --pace proportional requires every panel to have a non-empty Narration or "
+         "Dialogue field; panel 2 has neither\n"),
+    ]
+    for i, (lines, rc, out, err) in enumerate(cases):
+        story_id = "dlg9-%d" % i
+        story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, story_id,
+                                            CHAINED_DG9.replace("@@LINES@@", lines), plan=CAST_PLAN)
+        capsys.readouterr()
+        assert story_manifest.main(_manifest_argv(story_id, story_md, images)) == rc, lines
+        captured = capsys.readouterr()
+        assert out in captured.out, lines
+        assert captured.err == err, lines
+        assert os.path.exists(os.path.join(ws, "generated", "stories", story_id,
+                                           "manifest.json")) == (rc == 0)
+
+
+def test_dlg10_dialogue_wins_over_a_prefixed_narration(tmp_path, monkeypatch):
+    both = CHAINED_DG9.replace(
+        "Motion: The old monk lowers his broom and lifts his eyes. The old monk faces the camera. "
+        "The camera stays static.\n@@LINES@@",
+        "Motion: The courier waits at the gate. The camera stays static.\n"
+        "Dialogue: the courier: Keep moving.\nNarration: the old monk: Wait.")
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg10", both, plan=CAST_PLAN)
+    assert story_manifest.main(_manifest_argv("dlg10", story_md, images)) == 0
+    panel = _read_manifest(ws, "dlg10")["panels"][1]
+    assert (panel["speaker"], panel["speech"], panel["speech_source"], panel["narration"]) == (
+        "the courier", "Keep moving.", "dialogue", "the old monk: Wait.")
+    assert panel["motion_prompt"] == ('The courier waits at the gate. The courier says, "Keep '
+                                      'moving." ' + AC + " The camera stays static.")
+
+
+def test_review_focus_2_a_spoken_line_that_names_another_cast_member(tmp_path, monkeypatch,
+                                                                     story_env, capsys):
+    _members(story_env, "kyra", "ronin")
+    text = """# Quay
+
+Two travellers on a quay.
+
+## Panel 1 — One
+Image: The woman in grey stands on the quay.
+Motion: The woman in grey watches the ronin cross the quay. The camera stays static.
+Narration: The tide was turning.
+
+## Panel 2 — Two
+Motion: The woman in grey lifts her chin. The woman in grey faces the camera. The camera stays static.
+Dialogue: the woman in grey: Tell the ronin I am here.
+"""
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "rf2", text)
+    assert story_manifest.main(_manifest_argv("rf2", story_md, images, extra=[
+        "--cast", "the woman in grey=kyra", "--cast", "the ronin=ronin"])) == 0
+    panels = _read_manifest(ws, "rf2")["panels"]
+    assert panels[1]["motion_prompt"] == (
+        "The kyrawmn woman in grey lifts her chin. The kyrawmn woman in grey faces the camera. The "
+        'kyrawmn woman in grey says, "Tell the ronin I am here." ' + AC + " The camera stays static.")
+    assert [c["name"] for c in panels[1]["characters"]] == ["kyra"]
+    assert [c["name"] for c in panels[0]["characters"]] == ["kyra", "ronin"]
+
+
+def test_review_focus_3_dialogue_with_equal_pace_and_no_narration(tmp_path, monkeypatch):
+    text = CHAINED_DG9.replace("Narration: The bell had not yet rung.\n", "").replace(
+        "@@LINES@@", "Dialogue: the old monk: You came far.")
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "rf3", text, plan=CAST_PLAN)
+    assert story_manifest.main(_manifest_argv("rf3", story_md, images,
+                                              extra=["--pace", "equal"])) == 0
+    panels = _read_manifest(ws, "rf3")["panels"]
+    assert (panels[1]["speech_source"], panels[1]["narration"]) == ("dialogue", "")
+    assert 'The old monk says, "You came far." ' + AC in panels[1]["motion_prompt"]
+    assert panels[0]["narration"] == "" and "speaker" not in panels[0]
