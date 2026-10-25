@@ -2428,6 +2428,7 @@ class _Run(object):
         self.time_up = False
         self.shape = []
         self.states = []
+        self.critic_rounds_run = 0
         self.doc = {"schema": RUN_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
                     "panels": ctx.panels, "started_at": _utc(), "finished_at": None,
                     "budgets": {"plan_calls": PLAN_MAX_CALLS, "panel_calls": PANEL_MAX_CALLS,
@@ -2676,6 +2677,8 @@ class _Run(object):
             if self.expired():
                 return "time_cap"
             stop = self.critic_round(k, k - 1)
+            if stop != "time_cap":
+                self.critic_rounds_run += 1
             if stop:
                 return stop
             if not self.states[-1]["hard"]:
@@ -2748,7 +2751,7 @@ class _Run(object):
         if not blocking_list:
             for message in unresolved_list:
                 print("Warning: unresolved after %d critic round(s): %s"
-                      % (len(self.states) - 1, message))
+                      % (self.critic_rounds_run, message))
             return self.finish(0)
         print("Error: story.md has %d hard violation(s) after the critic rounds (best round %d of "
               "%d):" % (len(blocking_list), best, len(self.states) - 1), file=sys.stderr)

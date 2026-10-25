@@ -1115,7 +1115,7 @@ def test_dlg23_two_rounds_blocking_and_ranking(ws, tmp_path, monkeypatch, capsys
         "chained", 3, {2: [{"motion": OVERLOAD}, {"motion": OVERLOAD}]}),
         critic=[{"answer": "x"}] * 4)
     assert rc == 0
-    assert ("Warning: unresolved after 1 critic round(s): %s\n" % t3) in capsys.readouterr().out
+    assert ("Warning: unresolved after 2 critic round(s): %s\n" % t3) in capsys.readouterr().out
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="t1",
                             plan=_speaking_plan("chained", 3, 2), panel=_replies(
                                 "chained", 3, {2: [{"dialogue": OVER_CAP}, {"dialogue": OVER_CAP}]}),
@@ -2083,3 +2083,13 @@ def test_ff5_speaker_given_as_phrase(ws):
     plan, _shape = se.normalize_plan(chained, raw)
     assert [b["speaker"] for b in plan["beats"]] == ["", "c1", ""]
     assert plan["speech_notes"] == []
+
+
+def test_ff6_unresolved_warning_counts_the_critic_rounds_run(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_replies("chained", 3, {2: [
+        {"motion": BUSY}, {"motion": BUSY}]}), critic=[{"answer": "x"}] * 4)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "stop: plateau; best round 1 (1 hard)\n" in out
+    assert [r["stage"] for r in log].count("critic") == 4
+    assert ("Warning: unresolved after 2 critic round(s): %s\n" % T2_MESSAGE) in out
