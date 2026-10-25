@@ -1505,7 +1505,7 @@ MOTION_LINE = ('- target "panel", field "%s", index = the panel number, only for
                "identical to the current text except for the sentence or sentences that hold the "
                "extra or missing action.")
 DIALOGUE_FIELD_LINE = ('- target "panel", field "dialogue", index = the panel number, only for a '
-                       "panel with a [hard] T1 problem: replacement is the shortened spoken line, "
+                       "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
                        "without the speaker's phrase and without quotation marks, within the "
                        "limit the T1 problem states.")
 
@@ -1523,8 +1523,8 @@ def test_dlg19_critic_prompt(ws):
                "actions than its clip can hold. Each patch is an object with exactly the keys "
                "target, index, field, reason and replacement. The allowed patches are:\n")
     preserve = ("\nPreserve every camera direction, every descriptive sentence and every dialogue "
-                "line word for word: change only the sentence or sentences that cause the "
-                "problem, and copy every other sentence of the field unchanged. A patch that "
+                "line word for word, except a spoken line that a [hard] T1 or N18 problem names: "
+                "change only the sentence or sentences that cause the problem, and copy every other sentence of the field unchanged. A patch that "
                 "changes anything else is rejected. A panel replacement holds only the text the "
                 "writer writes: never include a character's description, a setting sentence or "
                 "the shot type, because the pipeline adds those itself. The number of panels, the "
@@ -2042,3 +2042,19 @@ def test_ff1_empty_action_field_is_blocking(ws, tmp_path, monkeypatch, capsys):
     assert rc == 0
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert checks["hard"] == []
+
+
+def _story_md(ctx):
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_ff3_critic_dialogue_patch_repairs_n18(ws, tmp_path, monkeypatch, capsys):
+    line = "the courier: I carry a letter for the abbot."
+    rc, _a, ctx, log = _run(
+        ws, tmp_path, monkeypatch, plan=_speaking_plan("chained", 3, 2),
+        panel=_replies("chained", 3, {2: [{"dialogue": ""}, {"dialogue": ""}]}),
+        critic=[seu.answer(seu.critic_json((8, 8, 8), "revise",
+                                           [_patch("panel", 2, "dialogue", line)]))] * 2)
+    assert rc == 0
+    assert "Dialogue: " + line + "\n" in _story_md(ctx)

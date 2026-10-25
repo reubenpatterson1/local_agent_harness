@@ -1996,7 +1996,7 @@ CRITIC_PROMPT_TEMPLATE = (
     "replacement. The allowed patches are:\n"
     "@@FIELD_LINES@@\n"
     "Preserve every camera direction, every descriptive sentence and every dialogue line word for "
-    "word: change only the sentence or sentences that cause the problem, and copy every other "
+    "word, except a spoken line that a [hard] T1 or N18 problem names: change only the sentence or sentences that cause the problem, and copy every other "
     "sentence of the field unchanged. A patch that changes anything else is rejected. A panel "
     "replacement holds only the text the writer writes: never include a character's description, "
     "a setting sentence or the shot type, because the pipeline adds those itself. The number of "
@@ -2039,7 +2039,7 @@ def critic_field_lines(mode, catalog_lines, narration=True):
                  "the extra or missing action." % (label.lower(), label))
     if narration is not False:
         lines.append('- target "panel", field "dialogue", index = the panel number, only for a '
-                     "panel with a [hard] T1 problem: replacement is the shortened spoken line, "
+                     "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
                      "without the speaker's phrase and without quotation marks, within the limit "
                      "the T1 problem states.")
     return "\n".join(lines)
@@ -2233,7 +2233,7 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
         if patch["target"] != "panel":
             continue
         k, field = patch["index"], patch["field"]
-        need = {"T1"} if field == "dialogue" else {"T2", "T3"}
+        need = {"T1", "N18"} if field == "dialogue" else {"T2", "T3"}
         if repairable is not None and not (repairable.get(k, set()) & need):
             rejected.append({"patch": patch, "reason": "panel %d has no hard timing or "
                                                        "amount-of-action problem; advisory "
