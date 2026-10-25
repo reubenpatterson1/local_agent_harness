@@ -1844,3 +1844,30 @@ def test_casting_help_and_docstring_text():
     assert "strength is 1.0 when the panel names exactly one cast character" not in doc
     assert ("in the chained flow each character keeps one strength in every clip"
             in " ".join(ltx_movie.__doc__.split()))
+
+
+# --- CA6: N19 (11.6) ---------------------------------------------------------------------------
+
+def test_ca6_n19_cast_reference(ws, story_env):
+    members = _members(story_env, "kyra")
+
+    def kyra_cast(raw):
+        raw["cast"] = [{"id": "c1", "phrase": "the woman in grey", "descriptor": seu.DESC_K}]
+
+    tail = "; the pipeline attaches kyra's LoRA from the plan and prefixes the trigger"
+    for mode, key, text, expected in (
+            ("chained", "motion", PRONOUN,
+             ["panel 2: N19 cast reference: Motion: refers to 'the woman in grey' only by "
+              "pronoun" + tail]),
+            ("chained", "motion", "Rain falls on the quay.",
+             ["panel 2: N19 cast reference: Motion: never names 'the woman in grey'" + tail]),
+            ("chained", "motion", "The woman in grey turns her head.", []),
+            ("chained", "motion", "Kyra turns her head toward the harbour.", []),
+            ("chained", "motion", "kyrawmn turns her head toward the harbour.", []),
+            ("shots", "motion", PRONOUN, []),
+            ("no_stills", "prompt", PRONOUN + " " + seu.panel_json("no_stills", 2)["prompt"], [])):
+        hard, advisory = _checks(ws, mode, plan_mut=kyra_cast, replies={2: {key: text}},
+                                 ctx_kw={"members": members})
+        assert _only(hard, "N19") == [] and _only(advisory, "N19") == expected, (mode, text)
+    assert se.GENERATION_CHECKS[-1] == "N19" and se.RECHECK_IDS[-1] == "N19"
+    assert "N19" not in se.PLAN_FREE_IDS and "N19" not in se.REPAIR_IDS

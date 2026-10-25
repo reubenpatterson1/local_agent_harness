@@ -1681,6 +1681,19 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 hard.append("%s T2 action amount: %s: holds %d actions; a %s-second clip fits at "
                             "most %d, so cut the extra actions and keep every other sentence word "
                             "for word" % (prefix, action_label, units, ctx.seconds, most))
+    if "N19" in ids and ctx.mode == "chained" and plan and beat is not None:
+        motion = dict(fields).get("Motion", "")
+        cast_members = dict((m.name, m) for m in ctx.members)
+        for cid in beat["cast"]:
+            entry = by_cast.get(cid)
+            member = cast_members.get(entry.get("cast_name")) if entry else None
+            if member is None or lib.member_referenced(motion, member):
+                continue
+            how = ("refers to %s only by pronoun" if lib._PRONOUN_RE.search(writers.get("Motion", ""))
+                   else "never names %s")
+            add(advisory, "N19", "cast reference", "Motion",
+                (how % _q(member.phrase)) + "; the pipeline attaches %s's LoRA from the plan "
+                "and prefixes the trigger" % member.name)
     if "N12" in ids and ctx.mode == "chained":
         writer = writers.get("Motion", "")
         chain = _first(lib._CHAIN_WORD_RE, writer)
@@ -1807,7 +1820,7 @@ def plan_copied_examples(plan):
 
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3")
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N19")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -2784,7 +2797,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16", "N17", "N18", "T1", "T2", "T3")
+               "N16", "N17", "N18", "T1", "T2", "T3", "N19")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
