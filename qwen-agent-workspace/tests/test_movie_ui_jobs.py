@@ -62,7 +62,9 @@ def test_store_writes_atomically_with_private_modes(state, tmp_path):
     jdir = lib.job_dir(state, job_id)
     assert stat.S_IMODE(os.stat(jdir).st_mode) == 0o700
     assert lib.read_job(jdir) == job
-    assert set(job) == {"schema", "id", "kind", "workspace", "story_id", "character", "argv", "fields", "created"}
+    assert set(job) == {"schema", "id", "kind", "workspace", "story_id", "character", "argv", "fields", "vlm",
+                        "created"}
+    assert job["vlm"] == "required"
     assert job["schema"] == "movie-ui.job.v1"
     assert os.path.getsize(os.path.join(jdir, "log.txt")) == 0
     assert lib.read_status(jdir) is None

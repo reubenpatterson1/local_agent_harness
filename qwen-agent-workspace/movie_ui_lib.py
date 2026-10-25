@@ -178,7 +178,7 @@ def create_job(state, job_id, kind, workspace, story_id, character, argv, fields
     os.chmod(jdir, 0o700)
     job = {"schema": JOB_SCHEMA, "id": job_id, "kind": kind, "workspace": workspace,
            "story_id": story_id, "character": character, "argv": list(argv),
-           "fields": fields, "created": utc_now()}
+           "fields": fields, "vlm": job_vlm(kind, fields, workspace, story_id), "created": utc_now()}
     write_json_atomic(os.path.join(jdir, "job.json"), job)
     write_bytes_atomic(os.path.join(jdir, "log.txt"), b"")
     write_queue(state, read_queue(state) + [job_id])
@@ -352,6 +352,98 @@ def run_job(jdir, grace=CANCEL_GRACE_S):
     write_status(jdir, final)
     _say("exit %d (%s)" % (code, state))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# The VLM at job boundaries (docs/superpowers/specs/2026-10-25-vlm-lifecycle-design.md): each
+# job's vlm policy, the runner's preflight and postflight, and the startup restore. Only
+# bin/story-server and bin/story-server-restore start or stop the VLM; this code decides when.
+# ---------------------------------------------------------------------------
+
+VLM_MODE = "mlx-vision"
+VLM_POLICIES = ("required", "forbidden", "any")
+VLM_STATUS_TIMEOUT_S = 60
+VLM_HTTP_TIMEOUT_S = 10
+VLM_COMPLETION_TIMEOUT_S = 120
+VLM_PREFLIGHT_TIMEOUT_S = 6900    # two restore --wait, two health checks and one stop (spec 2.5)
+VLM_POSTFLIGHT_TIMEOUT_S = 90
+VLM_TOOL_KILL_WAIT_S = 5
+VLM_MAX_BODY = 1048576
+VLM_RESTORE_LOG_TEXT = "~/.local/share/qwen-agent/story-server-restore.log"
+HEALTH_LINE_RE = re.compile(r"^\s*health:\s*HTTP\s+\d{3}\s+model=(.+?)\s*$")
+VLM_RECOVERY = []    # pending startup-restore reasons (server process only, VU2)
+RESTORERS = []       # Popen objects of startup restores, polled (never waited for) to reap them
+
+
+def vlm_lifecycle_enabled():
+    """False only when MOVIE_UI_VLM_LIFECYCLE is "0": the runtime rollback switch, which the
+    tests also use for isolation (spec 2.5, 11.1)."""
+    return os.environ.get("MOVIE_UI_VLM_LIFECYCLE", "1") != "0"
+
+
+def vlm_tools_dir(ui_ws=None):
+    """The directory holding story-server and story-server-restore: MOVIE_UI_VLM_TOOLS when set,
+    else the UI workspace's bin/, so the runner and its tools come from one release (VR1)."""
+    return os.environ.get("MOVIE_UI_VLM_TOOLS") or os.path.join(
+        ui_ws or os.path.dirname(os.path.realpath(__file__)), "bin")
+
+
+def vlm_port():
+    """The health check's port: MOVIE_UI_VLM_PORT, else 8177."""
+    return int(os.environ.get("MOVIE_UI_VLM_PORT") or 8177)
+
+
+def job_vlm(kind, fields, workspace, story_id):
+    """The VLM state a job of kind needs: "required", "forbidden" or "any" (VP1). Pure except
+    for one os.path.isfile (a movie whose story.md exists renders without the VLM)."""
+    if kind in ("story", "character-create", "character-regenerate"):
+        return "required"
+    if kind == "movie":
+        if (fields or {}).get("action") == "redo":
+            return "forbidden"
+        if not story_id:
+            return "required"
+        return ("forbidden" if os.path.isfile(os.path.join(story_dir(workspace, story_id), "story.md"))
+                else "required")
+    if kind in ("smoke", "character-train", "action-train"):
+        return "forbidden"
+    return "any"
+
+
+def effective_vlm(job):
+    """The policy at dispatch (VP2): a movie job is recomputed (a story job queued ahead of it
+    can create story.md); any other job uses its recorded vlm, and no or an unknown key is "any"."""
+    if job.get("kind") == "movie":
+        return job_vlm("movie", job.get("fields"), job.get("workspace"), job.get("story_id"))
+    vlm = job.get("vlm")
+    return vlm if vlm in VLM_POLICIES else "any"
+
+
+def next_queued_job(state):
+    """(job_id, job) of the first queued ID without a status.json and with a readable job.json
+    (the dispatcher's skip rule, MU30), else (None, None). Never writes (VP3)."""
+    for job_id in read_queue(state):
+        jdir = job_dir(state, job_id)
+        if os.path.lexists(os.path.join(jdir, "status.json")):
+            continue
+        job = read_job(jdir)
+        if job is not None:
+            return job_id, job
+    return None, None
+
+
+def vlm_restore_wanted(state):
+    """(wanted, why): restore the VLM after a job iff the queue is empty or the next job needs
+    it (VP4)."""
+    job_id, job = next_queued_job(state)
+    if job is None:
+        return True, "queue empty"
+    policy = effective_vlm(job)
+    if policy == "required":
+        return True, "next job %s needs it" % job_id
+    if policy == "forbidden":
+        return False, "next job %s runs without it" % job_id
+    return False, "next job %s is vlm=any" % job_id
 
 
 # ---------------------------------------------------------------------------
