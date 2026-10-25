@@ -640,6 +640,7 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narra
     --no-stills: every panel has non-empty Prompt:/Narration: fields and neither
     Image: nor Motion:.
     no_narration (--no-narration, --speech-only): Narration: is not required.
+    A panel with a non-empty Dialogue: needs no Narration: (dialogue spec 6.3).
     """
     violations = []
     manifest_tool_path = os.path.join(WS, "bin", "ltx-story-manifest")
@@ -661,7 +662,8 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narra
         if no_stills:
             for label, key in (("Prompt", "prompt"),) + (
                     () if no_narration else (("Narration", "narration"),)):
-                if not p[key].strip():
+                if not p[key].strip() and not (key == "narration"
+                                               and p.get("dialogue", "").strip()):
                     violations.append("panel %d: missing/empty %s: field" % (num, label))
             if p["prompt"].strip() and (p["image"].strip() or p["motion"].strip()):
                 violations.append(
@@ -674,7 +676,8 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narra
             else:
                 required = (("Motion", "motion"), ("Narration", "narration"))
             for label, key in required[:-1] if no_narration else required:
-                if not p[key].strip():
+                if not p[key].strip() and not (key == "narration"
+                                               and p.get("dialogue", "").strip()):
                     violations.append("panel %d: missing/empty %s: field" % (num, label))
             if p["prompt"].strip():
                 violations.append(

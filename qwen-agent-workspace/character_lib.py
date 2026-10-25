@@ -1086,7 +1086,7 @@ def shots_violations(text, panels, expected_panels, members, narration=True):
         num = p["number"]
         labels = (("Image", "image"), ("Motion", "motion"), ("Narration", "narration"))
         for label, key in labels if narration else labels[:2]:
-            if not p[key].strip():
+            if not p[key].strip() and not (key == "narration" and p.get("dialogue", "").strip()):
                 out.append("panel %d: S3 fields: missing/empty %s: field" % (num, label))
         if p["prompt"].strip():
             out.append("panel %d: S3 fields: has a Prompt: field; shots mode expects Image:, "

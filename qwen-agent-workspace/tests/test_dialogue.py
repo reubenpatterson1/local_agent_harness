@@ -535,3 +535,28 @@ def test_review_focus_3_dialogue_with_equal_pace_and_no_narration(tmp_path, monk
     assert (panels[1]["speech_source"], panels[1]["narration"]) == ("dialogue", "")
     assert 'The old monk says, "You came far." ' + AC in panels[1]["motion_prompt"]
     assert panels[0]["narration"] == "" and "speaker" not in panels[0]
+
+
+# --- DLG31: Dialogue in place of Narration (S3, V0) ------------------------------------------
+
+def test_dlg31_dialogue_satisfies_the_narration_requirement(tmp_path):
+    shots = ('# S\n\n## Characters\n- "the courier": %s.\n\n## Panel 1 — One\nImage: %s The courier '
+             "stands at the gate.\nMotion: The courier raises the letter.\n@@LINE@@\n"
+             % (seu.COURIER, DG9_SETTING))
+    chained = ("# C\n\n## Panel 1 — One\nImage: A quay.\nMotion: The courier waits.\n@@LINE@@\n\n"
+               "## Panel 2 — Two\nMotion: The courier runs.\nNarration: Rain fell.\n")
+    no_stills = ("# N\n\n## Panel 1 — One\nPrompt: The courier waits on the quay.\n@@LINE@@\n")
+    missing_s3 = "panel 1: S3 fields: missing/empty Narration: field"
+    missing_v0 = "panel 1: missing/empty Narration: field"
+    for line, ok in (("Dialogue: the courier: I carry a letter.", True), ("", False)):
+        path = tmp_path / "shots.md"
+        path.write_text(shots.replace("@@LINE@@", line), encoding="utf-8")
+        panels = story_manifest._parse_prompts_md(str(path))[1]
+        found = character_lib.shots_violations(path.read_text(encoding="utf-8"), panels, 1, [])
+        assert (missing_s3 not in found) == ok, line
+        for text, no_stills_flag, count in ((chained, False, 2), (no_stills, True, 1)):
+            path = tmp_path / "story.md"
+            path.write_text(text.replace("@@LINE@@", line), encoding="utf-8")
+            assert (ltx_movie._validate_story_md(str(path), count, no_stills_flag) == []) == ok
+            if not ok:
+                assert missing_v0 in ltx_movie._validate_story_md(str(path), count, no_stills_flag)
