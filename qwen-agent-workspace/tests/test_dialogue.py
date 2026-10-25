@@ -821,3 +821,111 @@ def test_empty_parts_uses_panel_keys_with_ctx(ws):
                                        ctx_kw={"narration": "speech"})
     got = se.empty_parts(ctx.mode, 2, plan, ctx)
     assert "narration" not in got and "dialogue" in got
+
+
+# --- DLG15: assembly (SP4, CM4) --------------------------------------------------------------
+
+SPEAKING_WRITERS = {
+    "chained": [{"title": "Wet Road", "image": "The courier waits on the left",
+                 "motion": "The courier pushes off", "narration": "The rain had not stopped"},
+                {"title": "The Bend", "motion": "The courier leans into the bend.",
+                 "dialogue": LINE, "narration": ""}],
+    "no_stills": [{"title": "Wet Road", "prompt": "The courier pedals through the rain",
+                   "narration": "The rain had not stopped"},
+                  {"title": "The Bend", "prompt": "The courier leans into the bend.",
+                   "dialogue": LINE, "narration": "Every street led down to the water."}],
+    "shots": [{"title": "Wet Road", "image": "The courier waits on the left",
+               "motion": "The courier pushes off", "narration": "The rain had not stopped"},
+              {"title": "The Bend", "image": "The courier leans right.",
+               "motion": "The courier leans into the bend.", "dialogue": LINE,
+               "narration": "Every street led down to the water."}],
+}
+HEAD = ("# The Sealed Letter\n\nA courier carries a sealed letter through a rainy harbour town and "
+        "delivers it at the temple gate.\n\n")
+IDENTITY = "The courier is " + seu.COURIER + "."
+PANEL1_IMAGE = ("Image: " + seu.HARBOUR + " " + IDENTITY
+                + " The courier waits on the left. The shot is a medium shot.\n")
+PANEL1_REST = "Motion: The courier pushes off. The camera stays static.\nNarration: The rain had not stopped.\n\n"
+DIALOGUE_LINE = "Dialogue: the courier: Keep moving. The gate is close.\n"
+GOLDEN_SPEAKING = {
+    "chained": (HEAD + "## Panel 1 — Wet Road\n" + PANEL1_IMAGE + PANEL1_REST
+                + "## Panel 2 — The Bend\nMotion: The courier leans into the bend. The courier "
+                  "faces the camera. The camera stays static.\n" + DIALOGUE_LINE),
+    "no_stills": (HEAD + "## Panel 1 — Wet Road\nPrompt: The courier pedals through the rain. "
+                  + IDENTITY + " " + seu.HARBOUR + " The shot is a medium shot. The camera stays "
+                  "static.\nNarration: The rain had not stopped.\n\n## Panel 2 — The Bend\nPrompt: "
+                  "The courier leans into the bend. " + IDENTITY + " " + seu.HARBOUR + " The shot "
+                  "is a medium close-up. The courier faces the camera. The camera stays static.\n"
+                  + DIALOGUE_LINE + "Narration: Every street led down to the water.\n"),
+    "shots": (HEAD + "## Characters\n- \"the courier\": " + seu.COURIER + ".\n- \"the old monk\": "
+              + seu.MONK + ".\n\n## Panel 1 — Wet Road\n" + PANEL1_IMAGE + PANEL1_REST
+              + "## Panel 2 — The Bend\nImage: " + seu.HARBOUR + " " + IDENTITY + " The courier "
+                "leans right. The courier faces the camera. The shot is a medium close-up.\n"
+                "Motion: The courier leans into the bend. The courier faces the camera. The camera "
+                "stays static.\n" + DIALOGUE_LINE
+              + "Narration: Every street led down to the water.\n"),
+}
+
+
+def test_dlg15_assembly_goldens_and_dedupe(ws, tmp_path):
+    for mode, golden in GOLDEN_SPEAKING.items():
+        ctx = seu.make_ctx(se, ws, mode=mode, panels=2)
+        raw = seu.plan_json(mode, 2)
+        raw["beats"][1]["speaker"] = "c1"
+        plan, _shape = se.normalize_plan(ctx, raw)
+        text = se.assemble(ctx, plan, SPEAKING_WRITERS[mode])
+        assert text == golden, mode
+        path = tmp_path / ("%s.md" % mode)
+        path.write_text(text, encoding="utf-8")
+        panel = story_manifest._parse_prompts_md(str(path))[1][1]
+        assert panel["dialogue"] == "the courier: " + LINE
+        assert character_lib.parse_dialogue(panel["dialogue"], PHRASES) == ("the courier", LINE,
+                                                                            None)
+        labels = [label for label, _text in se.story_fields(mode, 2, panel)]
+        assert labels[-2:] == ["Dialogue", "Narration"], mode
+        assert [label for label, _text in se.story_fields(mode, 2, panel, False)][-1] == "Dialogue"
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2)
+    plan, _shape = se.normalize_plan(ctx, seu.plan_json("shots", 2))
+    parts = [dict(SPEAKING_WRITERS["shots"][0]),
+             dict(SPEAKING_WRITERS["shots"][1], motion="The courier turns. The camera slowly pans "
+                                                       "left.")]
+    assert dict(se.panel_fields(ctx, plan, parts, 2))["Motion"] == (
+        "The courier turns. The camera slowly pans left.")
+    assert se.pasted_pieces(ctx, plan, 2)["motion"] == ["The camera tracks alongside the movement."]
+    parts[1]["motion"] = "The courier turns. The camera viewpoint is front-facing."
+    assert dict(se.panel_fields(ctx, plan, parts, 2))["Motion"] == (
+        "The courier turns. The camera viewpoint is front-facing. The camera tracks alongside the "
+        "movement.")
+    raw = seu.plan_json("shots", 2)
+    raw["beats"][1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    parts[1]["motion"] = "The courier turns. The camera slowly pans left."
+    assert dict(se.panel_fields(ctx, plan, parts, 2))["Motion"] == (
+        "The courier turns. The camera slowly pans left. The courier faces the camera. The camera "
+        "stays static.")
+    assert se.pasted_pieces(ctx, plan, 2)["motion"] == ["The courier faces the camera.",
+                                                        "The camera stays static."]
+    lib = se._character_lib(WS)
+    fields = [("Motion", "The courier waits."),
+              ("Dialogue", "the courier: Tell the old monk <later>.")]
+    assert se._field_checks(ctx, lib, plan, 2, "T", fields, {"Dialogue": "Tell the old monk "
+                                                                         "<later>."},
+                            ("N4", "N10"), []) == ([], [])
+
+
+def test_shots_s5_ignores_the_pasted_facing_sentence(ws):
+    # Controller ruling Q1 (Spec amendment 1): the pasted facing sentence is not an S5 action.
+    s5 = ("panel 2: S5 one action: Motion: has 2 action sentences; it must have exactly one, "
+          "optionally followed by a camera sentence")
+    ctx, plan, parts, text, path = _story(ws, "shots", 3, plan_mut=_speaking(2),
+                                          replies={2: {"dialogue": LINE}})
+    hard, advisory = se.panel_checks(ctx, plan, parts, text, path)
+    assert not [m for m in hard + advisory if " S5 " in m]
+    panels = story_manifest._parse_prompts_md(path)[1]
+    assert panels[1]["motion"].endswith(" The courier faces the camera. The camera stays static.")
+    assert s5 in character_lib.shots_violations(text, panels, 3, [])
+    assert s5 not in character_lib.shots_violations(text, panels, 3, [], ignore_facing=True)
+    panels[1]["motion"] = panels[1]["motion"].replace(
+        "The courier faces the camera.", "The courier faces the camera. The courier waves.")
+    assert s5 in character_lib.shots_violations(text, panels, 3, [], ignore_facing=True)
+    assert se.FACING_SENTENCE == character_lib.FACING_SENTENCE

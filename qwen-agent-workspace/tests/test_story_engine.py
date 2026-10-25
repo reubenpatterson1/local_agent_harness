@@ -658,7 +658,8 @@ def test_rst12_lexicons():
         assert _norm(example) in templates, example
     for word in ("short", "light", "ring", "cap", "fair"):
         assert word not in se.APPEARANCE_WORDS
-    assert {"grey", "kimono", "camera", "close-up", "palette"} <= se.APPEARANCE_WORDS
+    assert {"grey", "kimono", "palette"} <= se.APPEARANCE_WORDS
+    assert not ({"camera", "close-up"} & se.APPEARANCE_WORDS)
 
 
 def _story(ws, mode, n, plan_mut=None, part_mut=None, ctx_kw=None):
@@ -998,13 +999,12 @@ def test_rst20_panel_checks(ws):
         ("chained", {"part_mut": part(2, motion="The courier pulls the grey hood tighter and "
                                                 "pedals forward along the road past the boats.")},
          ["panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
-          "appearance, clothing, setting, lighting, colour, style or camera"]),
+          "appearance, clothing, setting, lighting, colour or style"]),
         ("chained", {"part_mut": part(2, motion="The courier holds the parcel up to the camera and "
                                                 "pedals forward along the road past the boats.")}, []),
         ("chained", {"part_mut": part(2, motion="The courier pedals forward along the road as the "
                                                 "camera slowly pans left past the boats.")},
-         ["panel 2: N3 appearance: Motion: says 'camera'; panels after the first never re-describe "
-          "appearance, clothing, setting, lighting, colour, style or camera"]),
+         []),
         ("chained", {"part_mut": part(2, motion="The courier pedals past the old monk beside the "
                                                 "crates and on toward the end of the quay.")},
          ["panel 2: N4 stray cast: Motion: names 'the old monk', who is not in beat 2's cast"]),

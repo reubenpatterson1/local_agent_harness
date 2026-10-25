@@ -1036,6 +1036,19 @@ def _appositive_nouns(sentence, members):
     return spans
 
 
+# The sentence the robust engine pastes into a speaking panel's Motion: (dialogue spec SP4); with
+# shots_violations(ignore_facing=True) it is not an S5 action sentence (controller ruling Q1).
+FACING_SENTENCE = "%s faces the camera."
+
+
+def _drop_facing(text, phrases):
+    """text without the sentences that are exactly a pasted "<Phrase> faces the camera." for one
+    of phrases (case-insensitive)."""
+    facing = set((FACING_SENTENCE % (p[:1].upper() + p[1:])).lower() for p in phrases)
+    return " ".join(s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip())
+                    if s.strip() and s.strip().lower() not in facing)
+
+
 def motion_problems(motion, phrases=()):
     """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S5; S4 is advisory,
     motion_length_advisory). A camera sentence
@@ -1057,13 +1070,15 @@ def motion_problems(motion, phrases=()):
     return problems
 
 
-def shots_violations(text, panels, expected_panels, members, narration=True):
+def shots_violations(text, panels, expected_panels, members, narration=True, ignore_facing=False):
     """Every shot-rule violation of a shots-mode story.md (shots spec 4.3; shots rules v2 spec 4),
     in this order: S1, S2, then per panel S3, S5, S6, S7, S8 (Motion:, then Image:), S9, S10,
     S11 (Image:, then Motion:), S12. text is the whole file; panels are bin/ltx-story-manifest
     _parse_prompts_md dicts; members are CastMember (may be empty: then S2, S6, S7, S9 and S10
     are skipped). The roster is read even without members, so S8 knows an uncast story's
-    extras and animals. narration False (--no-narration) drops the Narration: requirement."""
+    extras and animals. narration False (--no-narration) drops the Narration: requirement.
+    ignore_facing (the robust story engine) leaves a Motion: sentence that is exactly a pasted
+    "<Phrase> faces the camera." out of S5's action count."""
     out = []
     if len(panels) != expected_panels:
         out.append("story: S1 panel count: expected exactly %d panels, found %d"
@@ -1093,7 +1108,9 @@ def shots_violations(text, panels, expected_panels, members, narration=True):
                        "Motion: and Narration:" % num)
         if p["motion"].strip():
             out += ["panel %d: %s: %s" % (num, rule, detail)
-                    for rule, detail in motion_problems(p["motion"], humans + animals)]
+                    for rule, detail in motion_problems(
+                        _drop_facing(p["motion"], humans + animals) if ignore_facing
+                        else p["motion"], humans + animals)]
         names = []
         if members:
             names = sorted(set(cast_text(p["image"], members)[1])

@@ -783,9 +783,42 @@ def _setting_problems(setting):
     return problems
 
 
+FACING_SENTENCE = "%s faces the camera."
+SPEAKING_CAMERA = "The camera stays static."
+# CM4: on a non-speaking panel, a writer camera sentence that names one of these movements takes
+# the place of the planned camera sentence in the assembled field.
+CAMERA_MOTION_RE = re.compile(r"\b(?:static|still|holds?|locked-off|push(?:es)?\s+in|push-in|"
+                              r"pull(?:s)?\s+back|pull-back|pans?|tilts?|tracks?|tracking|dolly|"
+                              r"dollies|zooms?|orbits?|cranes?|handheld|follows?)\b", re.IGNORECASE)
+
+
+def _sentences(text):
+    """The non-empty sentences of a text, stripped."""
+    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+
+
+def _facing(ctx, plan, k):
+    """[the pasted "<Speaker> faces the camera." sentence] on a speaking panel, else [] (SP4)."""
+    phrase = speaker_phrase(plan, k) if panel_speaks(ctx, plan, k) else None
+    return [FACING_SENTENCE % (phrase[:1].upper() + phrase[1:])] if phrase else []
+
+
+def _moves_camera(ctx, plan, text):
+    """True when writer text holds a camera sentence (_is_camera_sentence with the plan's cast
+    phrases) that names a camera movement (CAMERA_MOTION_RE) (CM4)."""
+    if not CAMERA_MOTION_RE.search(text or ""):
+        return False
+    lib = _character_lib(ctx.ws)
+    phrases = [c["phrase"] for c in plan["cast"] if c["phrase"]]
+    return any(lib._is_camera_sentence(s, phrases) and CAMERA_MOTION_RE.search(s)
+               for s in _sentences(text))
+
+
 def pasted_pieces(ctx, plan, k):
-    """{field: [pasted sentences in assembly order]} for panel k (RS14): the pieces of each
-    assembled field that the writer does not write."""
+    """{field: [pasted sentences in assembly order]} for panel k (RS14; dialogue spec SP4): the
+    pieces of each assembled field that the writer does not write. A speaking panel adds the
+    facing sentence (and, chained k >= 2, SPEAKING_CAMERA). The planned camera sentence is always
+    listed, even when CM4 leaves it out of the assembled field."""
     beat = plan["beats"][k - 1]
     by_cast = {c["id"]: c for c in plan["cast"]}
     by_location = {l["id"]: l for l in plan["locations"]}
@@ -793,14 +826,15 @@ def pasted_pieces(ctx, plan, k):
     identities = [identity(by_cast[c]) for c in beat["cast"] if c in by_cast]
     shot = shot_sentence(beat) if beat["shot"] in SHOT_TYPES else ""
     camera = dict(CAMERA_SENTENCES).get(beat["camera"], "")
-    pieces = [setting] + identities + [shot]
+    facing = _facing(ctx, plan, k)
+    pieces = [setting] + identities + facing + [shot]
     if ctx.mode == "chained":
         if k == 1:
-            return {"image": pieces, "motion": [camera], "narration": []}
-        return {"motion": [], "narration": []}
+            return {"image": pieces, "motion": facing + [camera], "narration": []}
+        return {"motion": facing + ([SPEAKING_CAMERA] if facing else []), "narration": []}
     if ctx.mode == "no_stills":
-        return {"prompt": identities + [setting, shot, camera], "narration": []}
-    return {"image": pieces, "motion": [camera], "narration": []}
+        return {"prompt": identities + [setting, shot] + facing + [camera], "narration": []}
+    return {"image": pieces, "motion": facing + [camera], "narration": []}
 
 
 def identity(cast_entry):
@@ -1113,13 +1147,10 @@ APPEARANCE_WORDS = frozenset("""
     spectacles earrings necklace bracelet
     slender stocky muscular skinny plump pale tanned
     lighting lit sunlight moonlight palette colour color cinematic photorealistic rendered style
-    camera lens zoom zooms dolly framing close-up""".split())
+    """.split())
 _APPEARANCE_RE = re.compile(r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(
     re.escape(w) for w in sorted(APPEARANCE_WORDS, key=lambda w: (-len(w), w))), re.IGNORECASE)
-# N3: "camera"/"lens" as the target of an action ("holds it up to the camera") is a direction,
-# not a camera description, so it is blanked before the appearance search.
-_CAMERA_TARGET_RE = re.compile(r"\b(?:to|toward|towards|into|at|from|past)\s+(?:the\s+)?(?:camera|lens)\b",
-                               re.IGNORECASE)
+# Camera language is never an N3 fault (dialogue spec CM2, D5).
 # N17: a speaking character needs a visible, moving mouth.
 WIDE_SHOTS = ("extreme wide shot", "wide shot")
 HELD_EXPRESSION_RE = re.compile(r"\b(?:broad\s+|wide\s+|big\s+)?(?:smil(?:e|es|ing)|grin(?:s|ning)?|"
@@ -1379,9 +1410,15 @@ def _clean_dialogue(lib, text, phrase):
 
 
 def panel_fields(ctx, plan, parts, k):
-    """[(Label, assembled text)] of panel k in file order (RS14)."""
+    """[(Label, assembled text)] of panel k in file order (RS14; dialogue spec SP4): Image: where
+    the mode has one (setting, identities, writer image, facing, shot), Motion: or Prompt: (the
+    writer text, then the pasted sentences; on a non-speaking panel the planned camera sentence
+    is left out when the writer text moves the camera, CM4), Dialogue: on a speaking panel
+    ("<phrase>: <line>"), then Narration: when narration is True and the part is non-empty or the
+    panel does not speak."""
     p = parts[k - 1]
     pasted = pasted_pieces(ctx, plan, k)
+    facing = _facing(ctx, plan, k)
 
     def join(pieces):
         return " ".join(_sentence(piece) for piece in pieces if piece and piece.strip())
@@ -1389,12 +1426,17 @@ def panel_fields(ctx, plan, parts, k):
     fields = []
     if (ctx.mode == "chained" and k == 1) or ctx.mode == "shots":
         image = pasted["image"]
-        fields.append(("Image", join(image[:-1] + [p.get("image", "")] + image[-1:])))
-    if ctx.mode == "no_stills":
-        fields.append(("Prompt", join([p.get("prompt", "")] + pasted["prompt"])))
-    else:
-        fields.append(("Motion", join([p.get("motion", "")] + pasted["motion"])))
-    if ctx.narration is True or (ctx.narration and p.get("narration", "").strip()):
+        cut = len(image) - 1 - len(facing)
+        fields.append(("Image", join(image[:cut] + [p.get("image", "")] + image[cut:])))
+    key = "prompt" if ctx.mode == "no_stills" else "motion"
+    pieces = pasted[key]
+    if not facing and pieces and _moves_camera(ctx, plan, p.get(key, "")):
+        pieces = pieces[:-1]
+    fields.append((LABELS[key], join([p.get(key, "")] + pieces)))
+    if facing:
+        line = _sentence(_character_lib(ctx.ws).clean_line(p.get("dialogue", "")))
+        fields.append(("Dialogue", (speaker_phrase(plan, k) + ": " + line).rstrip()))
+    if ctx.narration is True and (p.get("narration", "").strip() or not facing):
         fields.append(("Narration", _sentence(p.get("narration", ""))))
     return fields
 
@@ -1472,13 +1514,12 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             if "N3" in ids:
                 blanked = lib._blank(text, lib._passage_spans(
                     text, list(phrases) + [p["name"] for p in plan["props"] if p["name"]]))
-                blanked = _CAMERA_TARGET_RE.sub(lambda m: " " * len(m.group(0)), blanked)
                 word = _first(_APPEARANCE_RE, blanked)
                 if word:
                     add(hard, "N3", "appearance", label,
                         "says %s; panels after the first never re-describe appearance, clothing, "
-                        "setting, lighting, colour, style or camera" % _q(word))
-        if "N4" in ids and label != "Narration" and beat is not None:
+                        "setting, lighting, colour or style" % _q(word))
+        if "N4" in ids and label not in ("Narration", "Dialogue") and beat is not None:
             for phrase in lib.find_phrases(writer, list(phrases)):
                 if phrases[phrase] not in beat["cast"]:
                     add(hard, "N4", "stray cast", label,
@@ -1530,7 +1571,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 if word:
                     add(hard, "N9", "cut wording", label,
                         "says %s; one panel is one continuous shot" % _q(word))
-        if "N10" in ids:
+        if "N10" in ids and label != "Dialogue":
             found = PLACEHOLDER_RE.search(writer)
             copied = found.group(0) if found else next(
                 (ex for ex in COPIED_EXAMPLES if _norm_text(ex) in _norm_text(writer)), None)
@@ -1671,7 +1712,8 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
-        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration is True)
+        hard += lib.shots_violations(text, panels, ctx.panels, ctx.members, ctx.narration is True,
+                                     ignore_facing=True)
         advisory += lib.shots_advisories(panels, ctx.members)
     return hard, advisory
 
@@ -2583,15 +2625,19 @@ def load_plan(ctx):
 
 
 def story_fields(mode, k, panel, narration=True):
-    """[(Label, text)] of a parsed story.md panel, the fields RS3 assembles for mode/panel k
-    (no Narration when narration is False)."""
+    """[(Label, text)] of a parsed story.md panel: the fields RS3 assembles for mode/panel k, a
+    Dialogue: whenever the panel has one (every mode, every narration value; dialogue spec SP4),
+    and no Narration when narration is False."""
     if mode == "no_stills":
-        labels = ("Prompt", "Narration")
+        labels = ["Prompt"]
     elif mode == "chained" and k >= 2:
-        labels = ("Motion", "Narration")
+        labels = ["Motion"]
     else:
-        labels = ("Image", "Motion", "Narration")
-    labels = labels if narration else labels[:-1]
+        labels = ["Image", "Motion"]
+    if panel.get("dialogue", "").strip():
+        labels.append("Dialogue")
+    if narration:
+        labels.append("Narration")
     return [(label, panel[label.lower()]) for label in labels]
 
 
@@ -2632,7 +2678,7 @@ def plan_free_report(story_md, mode, panels, members, legacy_validate, ws=None):
         hard += _field_checks(ctx, lib, None, k, panel["title"], fields, dict(fields),
                               PLAN_FREE_IDS, undeclared)[0]
     if mode == "shots":
-        hard += lib.shots_violations(text, parsed, panels, members)
+        hard += lib.shots_violations(text, parsed, panels, members, ignore_facing=True)
     return hard
 
 
@@ -2676,7 +2722,7 @@ def recheck(ctx, legacy_validate):
             advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
             if ctx.mode == "shots":
                 hard += lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                            ctx.narration is True)
+                                            ctx.narration is True, ignore_facing=True)
                 advisory += lib.shots_advisories(parsed, ctx.members)
             if ctx.auto_lora:
                 compatible = dict((e["id"], e) for e in compatible_entries(ctx))
@@ -2716,7 +2762,7 @@ def recheck(ctx, legacy_validate):
     try:
         text, parsed = _read_story(ctx, story_md)
         violations = lib.shots_violations(text, parsed, ctx.panels, ctx.members,
-                                               ctx.narration is True)
+                                               ctx.narration is True, ignore_facing=True)
         advisories = lib.shots_advisories(parsed, ctx.members)
     except OSError as e:
         violations, advisories = ["story: cannot read story.md: %s" % e], []
