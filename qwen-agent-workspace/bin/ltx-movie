@@ -102,7 +102,7 @@ Phase 1 asks the story model for a JSON plan and then one panel at a time, assem
 itself, runs deterministic checks and up to two local critic rounds that repair only spoken
 timing and the amount of action (the fleet analyst skill), and exits 2 with story.md, plan.json
 and story_checks.json saved when blocking violations remain; a rerun re-checks the existing
-story.md. --judge adds bin/judge-story --patches as a final gate;
+story.md. --judge adds bin/judge-story --patches as a final report;
 --story-legacy restores the single-prompt path. The plan may pick catalog LoRAs
 (bin/lora-catalog), which Phases 2 and 3 apply per panel; --no-auto-lora turns that off.
 """
@@ -462,9 +462,9 @@ def build_parser():
                               "lines); panels share the length equally. Needs the default story "
                               "engine.")
     parser.add_argument("--speech-only", dest="speech_only", action="store_true", default=False,
-                         help="Narration: is only ever a character's spoken line (\"the courier: "
-                              "...\"), never voice-over, and may be empty; panels share the "
-                              "length equally. Needs the default story engine.")
+                         help="no voice-over: the only spoken words are the Dialogue: lines of "
+                              "beats the plan gives a speaker; no Narration: is written; panels "
+                              "share the length equally. Needs the default story engine.")
     parser.add_argument("--speech-delivery", dest="speech_delivery",
                          choices=["beats", "plain", "beats-no-acoustic"], default="beats",
                          help="how spoken lines reach the video model (bin/ltx-story-manifest "
