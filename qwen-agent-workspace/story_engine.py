@@ -729,6 +729,10 @@ def coerce_speakers(ctx, plan):
             continue
         if not raw:
             continue
+        for entry in plan["cast"]:
+            if (raw not in cast_ids and entry.get("phrase")
+                    and raw.strip().lower() == entry["phrase"].strip().lower()):
+                raw = entry["id"]
         if raw not in cast_ids:
             notes.append("beat %d: P14 speaking beat: speaker %s is not a cast id, so nobody speaks "
                          "in this beat" % (k, _q(raw)))

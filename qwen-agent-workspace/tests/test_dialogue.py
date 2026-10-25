@@ -2074,3 +2074,12 @@ def test_ff4_t1_repair_through_the_critic(ws, tmp_path, monkeypatch, mode):
     assert "T1" in [v["id"] for v in round_0["hard"]]
     assert "Dialogue: the courier: I carry a letter for the abbot.\n" in _story_md(ctx)
     assert [r["stage"] for r in log].count("critic") == 1
+
+
+def test_ff5_speaker_given_as_phrase(ws):
+    chained = seu.make_ctx(se, ws)
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][1]["speaker"] = "The Courier"
+    plan, _shape = se.normalize_plan(chained, raw)
+    assert [b["speaker"] for b in plan["beats"]] == ["", "c1", ""]
+    assert plan["speech_notes"] == []
