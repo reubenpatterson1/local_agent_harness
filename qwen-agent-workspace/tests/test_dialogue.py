@@ -1055,3 +1055,129 @@ def test_review_focus_4_a_short_clip_uses_the_same_cap_in_engine_and_manifest(ws
     assert capsys.readouterr().err == (
         "Error: panel 2: Dialogue: is 10 words in 1 sentences; a 4.04-second clip fits at most 9 "
         "words in 1 sentences" + SPLIT + "\n")
+
+
+# --- DLG23, DLG24, DLG26: the round controller (6.1, 6.5, PG5, 6.8) --------------------------
+
+def _replies(mode, n, overrides=None, phrase="the courier"):
+    """The fake agent's panel script: one valid reply per panel; overrides maps a panel number to
+    a list of dicts, each merged into that panel's seu.panel_json reply (one reply per call)."""
+    script = {}
+    for k in range(1, n + 1):
+        changes = (overrides or {}).get(k, [{}])
+        script[str(k)] = [seu.answer(dict(seu.panel_json(mode, k, phrase), **c)) for c in changes]
+    return script
+
+
+def _run(ws, tmp_path, monkeypatch, mode="chained", n=3, plan=None, panel=None, critic=(),
+         **ctx_kw):
+    log = seu.script_agent(monkeypatch, tmp_path,
+                           plan=plan if plan is not None else [seu.answer(seu.plan_json(mode, n))],
+                           panel=panel if panel is not None else _replies(mode, n),
+                           critic=list(critic))
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=n, **ctx_kw)
+    rc, advisories = se.run(ctx)
+    return rc, advisories, ctx, seu.agent_log(log)
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _speaking_plan(mode, n, *ks):
+    raw = seu.plan_json(mode, n)
+    for k in ks:
+        raw["beats"][k - 1]["speaker"] = "c1"
+    return [seu.answer(raw)]
+
+
+T2_MESSAGE = ("panel 2: T2 action amount: Motion: holds 3 actions; a 6-second clip fits at most 2, "
+              "so cut the extra actions and keep every other sentence word for word")
+
+
+def test_dlg23_two_rounds_blocking_and_ranking(ws, tmp_path, monkeypatch, capsys):
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, panel=_replies("chained", 3, {2: [
+        {"motion": BUSY}]}), critic=[seu.answer(seu.critic_json((6, 6, 6), "revise")),
+                                     seu.answer(seu.critic_json((7, 7, 7), "revise"))])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "stop: max_rounds; best round 2 (1 hard)\n" in out
+    assert out.endswith("Warning: unresolved after 2 critic round(s): %s\n" % T2_MESSAGE)
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert checks["hard"] == [] and [v["message"] for v in checks["unresolved"]] == [T2_MESSAGE]
+    run_doc = _read_json(os.path.join(ctx.story_dir, "story_rounds", "run.json"))
+    assert run_doc["budgets"]["critic_rounds"] == 2
+    assert [r["stage"] for r in log].count("critic") == 2
+    t3 = ("panel 2: T3 action overload: Motion: holds 5 actions; a 6-second clip fits at most 2 "
+          "and cannot render more than 4; give the extra actions their own panels")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="t3", panel=_replies(
+        "chained", 3, {2: [{"motion": OVERLOAD}, {"motion": OVERLOAD}]}),
+        critic=[{"answer": "x"}] * 4)
+    assert rc == 0
+    assert ("Warning: unresolved after 1 critic round(s): %s\n" % t3) in capsys.readouterr().out
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, story_id="t1",
+                            plan=_speaking_plan("chained", 3, 2), panel=_replies(
+                                "chained", 3, {2: [{"dialogue": OVER_CAP}, {"dialogue": OVER_CAP}]}),
+                            critic=[{"answer": "x"}] * 4)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert err.startswith("Error: story.md has 1 hard violation(s) after the critic rounds")
+    assert "split it across alternating close-up panels (the speaker, then the listener, then the " \
+           "speaker again)" in err
+    t1 = ("panel 2: T1 spoken timing: Dialogue: is 15 words in 1 sentences; a 6-second clip fits "
+          "at most 14 words in 1 sentences" + SPLIT)
+    a = {"hard": [t1], "advisory": [], "scores": None}
+    t2s = [T2_MESSAGE.replace("panel 2:", "panel %d:" % k) for k in (1, 2, 3)]
+    b = {"hard": t2s, "advisory": [], "scores": None}
+    assert se.best_round([a, b]) == 1 and se.better([a, b], 1, 0)
+    assert se.final_outcome([a, b]) == (1, [], t2s)
+    assert se.final_outcome([a]) == (0, [t1], [])
+
+
+def test_dlg24_code_only_round_merge(ws):
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3)
+    raw = seu.plan_json("shots", 3)
+    raw["beats"][1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    old = {"title": "Old", "image": "The courier stands at the gate.",
+           "motion": "The courier turns, then waves.", "dialogue": OVER_CAP,
+           "narration": "It rained."}
+    new = {"title": "New", "image": "A different picture.", "motion": "The courier waves.",
+           "dialogue": "I carry a letter.", "narration": "It poured."}
+    assert se.merge_repair(ctx, plan, 2, old, new, {"T2"}) == dict(old, motion="The courier waves.")
+    assert se.merge_repair(ctx, plan, 2, old, new, {"T1"}) == dict(old, dialogue="I carry a letter.")
+    assert se.merge_repair(ctx, plan, 2, old, new, {"N11"}) == dict(old, narration="It poured.")
+    assert se.merge_repair(ctx, plan, 2, old, dict(new, dialogue=OVER_CAP + " Again."),
+                           {"T1"}) == old
+    wide = dict(old, motion="The courier turns. The courier waves, then bows.")
+    rewrite = dict(new, motion="The courier kneels. The courier bows. The courier rises.")
+    assert se.merge_repair(ctx, plan, 2, wide, rewrite, {"T2"}) == wide
+    assert se.merge_repair(ctx, plan, 2, old, new, {"N7"}) == old
+
+
+def test_dlg26_judge_gate_is_report_only(tmp_path, monkeypatch, capsys):
+    ws = seu.make_ws(tmp_path, fake_judge=True)
+    reply = seu.critic_json((4, 8, 8), "revise", [
+        {"target": "panel", "index": 2, "field": "motion", "reason": "r",
+         "replacement": "The courier waves."}])
+    monkeypatch.setenv("FAKE_JUDGE_REPLY", json.dumps(reply))
+    monkeypatch.setenv("FAKE_JUDGE_LOG", os.path.join(str(tmp_path), "judge_log.jsonl"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-not-a-key")
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, judge=True)
+    assert rc == 0
+    rounds = os.path.join(ctx.story_dir, "story_rounds")
+    saved = os.path.join(rounds, "round_0", "judgment.patches.json")
+    assert _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["judge"] == {
+        "status": "ok", "detail": "min score 4",
+        "scores": {"continuity": 4, "story": 8, "renderability": 8}, "min_score": 4,
+        "applied": False}
+    assert sorted(os.listdir(rounds)) == ["round_0", "run.json"]
+    with open(os.path.join(rounds, "round_0", "story.md"), encoding="utf-8") as f:
+        round_0 = f.read()
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        assert f.read() == round_0
+    assert ("Warning: judge-story minimum score 4 is below 7; its patches are saved in %s and were "
+            "not applied (only spoken timing and the amount of action are repaired automatically)\n"
+            % saved) in capsys.readouterr().out
+    assert _read_json(saved)["patches"] == reply["patches"]

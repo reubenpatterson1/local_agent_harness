@@ -63,10 +63,9 @@ WORD_TOLERANCE = 0.25
 MAX_CAST = {"chained": 4, "no_stills": 4, "shots": 2}
 PLAN_MAX_CALLS = 2
 PANEL_MAX_CALLS = 2
-CRITIC_MAX_ROUNDS = 3
+CRITIC_MAX_ROUNDS = 2
 CRITIC_CALLS_PER_ROUND = 2
 MAX_PATCHES = 8
-MIN_OK_SCORE = 7
 JUDGE_MIN_SCORE = 7
 LORA_PANEL_LIMIT = 4
 PANEL_MAX_TOKENS = 1536
@@ -2248,8 +2247,78 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
 # budgets and the wall clock (RS23), outputs (RS25-RS27)
 # ---------------------------------------------------------------------------
 
-WRITER_CHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "S4", "S5", "S7",
-                    "S8", "S10", "S11")
+# Dialogue spec 6.1: T2 and T3 trigger repair but never block; every other hard violation blocks.
+NON_BLOCKING_IDS = ("T2", "T3")
+# The hard ids a code-only round sends back to the panel writer (PG5).
+REPAIR_IDS = ("N11", "T1", "T2", "T3")
+
+
+def blocking(messages):
+    """The hard violations among messages that block the story (dialogue spec 6.1)."""
+    return [m for m in messages if parse_violation(m)["id"] not in NON_BLOCKING_IDS]
+
+
+def unresolved(messages):
+    """The hard violations among messages that never block: T2 and T3 (dialogue spec 6.1)."""
+    return [m for m in messages if parse_violation(m)["id"] in NON_BLOCKING_IDS]
+
+
+def n_blocking(state):
+    return len(blocking(state["hard"]))
+
+
+def guard_problem(ctx, plan, old, new):
+    """Why replacing the writer action text old with new (already cleaned) is rejected, or None
+    (dialogue spec PG3): only one contiguous run of at most max(1, units - max_actions) sentences
+    of old may change, every other sentence is kept word for word, and a camera sentence of that
+    run must survive into the new run."""
+    lib = _character_lib(ctx.ws)
+    phrases = cast_phrases(ctx, plan)
+    a, b = _sentences(old), _sentences(new)
+    p = 0
+    while p < min(len(a), len(b)) and a[p] == b[p]:
+        p += 1
+    s = 0
+    while s < min(len(a), len(b)) - p and a[len(a) - 1 - s] == b[len(b) - 1 - s]:
+        s += 1
+    old_span, new_span = a[p:len(a) - s], b[p:len(b) - s]
+    _actions, units, most = action_units(ctx, lib, old, phrases)
+    limit = max(1, units - most)
+    if len(old_span) > limit:
+        return ("the patch changes %d sentences; it may change at most %d contiguous sentence(s) "
+                "and must keep every other sentence word for word" % (len(old_span), limit))
+    for sentence in old_span:
+        if lib._is_camera_sentence(sentence, phrases) and sentence not in new_span:
+            return "the patch drops the camera direction %s" % _q(sentence)
+    return None
+
+
+def line_problem(ctx, lib, line):
+    """The PG4 reason a new spoken line does not fit this clip, else None."""
+    n = len(lib.split_fragments(line))
+    words = len(line.split())
+    cap = lib.dialogue_word_cap(engine_seconds(ctx), n)
+    if words > cap or n > lib.DIALOGUE_MAX_FRAGMENTS:
+        return ("the new line is %d words in %d sentences; at most %d words in %d sentences fit "
+                "this clip" % (words, n, cap, n))
+    return None
+
+
+def merge_repair(ctx, plan, k, old, new, ids):
+    """Panel k's writer parts after a code-only round (dialogue spec PG5): new's motion or prompt
+    when ids has T2 or T3 and the PG3 guard accepts it, new's dialogue when ids has T1 and the
+    line fits, new's narration when ids has N11; every other part keeps old's text."""
+    merged = dict(old)
+    action = "prompt" if ctx.mode == "no_stills" else "motion"
+    if (ids & {"T2", "T3"} and new.get(action)
+            and guard_problem(ctx, plan, old.get(action, ""), new[action]) is None):
+        merged[action] = new[action]
+    if ("T1" in ids and new.get("dialogue")
+            and line_problem(ctx, _character_lib(ctx.ws), _sentence(new["dialogue"])) is None):
+        merged["dialogue"] = new["dialogue"]
+    if "N11" in ids and "narration" in new:
+        merged["narration"] = new["narration"]
+    return merged
 
 
 def _unused_dir(path):
@@ -2277,7 +2346,7 @@ def _key(states, i):
     scores = _scores_of(states, i)
     low = min(scores.values()) if scores else 0
     total = sum(scores.values()) if scores else 0
-    return (len(states[i]["hard"]), -low, -total)
+    return (n_blocking(states[i]), len(states[i]["hard"]), -low, -total)
 
 
 def better(states, a, b):
@@ -2286,27 +2355,32 @@ def better(states, a, b):
 
 
 def _new_rs37(states, i):
-    """1 when states[i] has a P13 or N15 hard violation that round 0 does not have (a patch or a
-    regeneration introduced an undeclared library character), else 0."""
-    base = set(states[0]["hard"])
+    """1 when states[i] has a P13 or N15 violation (hard or advisory) that round 0 does not have
+    (a patch or a rewrite introduced an undeclared library character), else 0."""
+    base = set(states[0]["hard"] + states[0]["advisory"])
     return int(any(parse_violation(m)["id"] in ("P13", "N15") and m not in base
-                   for m in states[i]["hard"]))
+                   for m in states[i]["hard"] + states[i]["advisory"]))
 
 
 def best_round(states):
-    """The index of the state with the smallest (hard, new P13/N15, -min, -total, -round)
-    (RS22; on an equal hard count a state that introduced an undeclared library character
-    loses)."""
+    """The index of the state with the smallest (blocking, hard, new P13/N15, -min, -total,
+    -round) (RS22; dialogue spec 6.4: blocking first, so a T1 state never beats T2-only ones)."""
     return min(range(len(states)),
-               key=lambda i: (len(states[i]["hard"]), _new_rs37(states, i))
-               + _key(states, i)[1:] + (-i,))
+               key=lambda i: (n_blocking(states[i]), len(states[i]["hard"]), _new_rs37(states, i))
+               + _key(states, i)[2:] + (-i,))
+
+
+def final_outcome(states):
+    """(best round, its blocking violations, its unresolved T2/T3 violations) (dialogue spec 6.5)."""
+    best = best_round(states)
+    return best, blocking(states[best]["hard"]), unresolved(states[best]["hard"])
 
 
 def _checks_doc(ctx, state, source="robust"):
     return {"schema": CHECKS_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
             "panels": ctx.panels, "checked_at": _utc(), "source": source,
             "round": state["round"] if source == "robust" else None,
-            "hard": [parse_violation(m) for m in state["hard"]],
+            "hard": [parse_violation(m) for m in state["hard"]], "unresolved": [],
             "advisory": [parse_violation(m) for m in state["advisory"]],
             "scores": state.get("scores"), "verdict": state.get("verdict"), "stop_reason": None,
             "rounds": [], "best_round": None, "judge": None}
@@ -2469,14 +2543,17 @@ class _Run(object):
 
     # -- critic rounds ---------------------------------------------------------------------
 
-    def critic_round(self, k, judged, passed_only=False):
-        """One RS21 iteration on states[judged]. Returns a stop reason or None (a new state was
-        appended)."""
+    def critic_round(self, k, judged):
+        """One round on states[judged] (RS21; dialogue spec 6.5, PG5, PG6). Returns "plateau",
+        "time_cap" or None (a new state was appended)."""
         ctx = self.ctx
         prev = self.states[judged]
         rdir = os.path.join(self.rounds_dir, "round_%d" % k)
+        lora_allowed = bool(self.catalog_lines) and any(
+            parse_violation(m)["id"] in ("L1", "L5", "L6", "L7") for m in prev["hard"])
         base = build_critic_prompt(prev["plan"], prev["text"], (prev["hard"], prev["advisory"]),
-                                   self.catalog_lines, narration=self.ctx.narration)
+                                   self.catalog_lines if lora_allowed else None,
+                                   narration=self.ctx.narration)
         prompt, reply, route, calls = base, None, None, 0
         for attempt in range(1, CRITIC_CALLS_PER_ROUND + 1):
             if self.expired():
@@ -2509,18 +2586,14 @@ class _Run(object):
                          scores["renderability"], reply["verdict"], len(reply["patches"]),
                          applied, rejected))
 
-            if (not prev["hard"] and reply["verdict"] == "ok"
-                    and min(scores.values()) >= MIN_OK_SCORE):
-                _write_json(critic_path, critic)
-                line(0, 0)
-                return "passed"
-            if not passed_only and judged >= 1 and not better(self.states, judged, judged - 1):
+            if judged >= 1 and not better(self.states, judged, judged - 1):
                 _write_json(critic_path, critic)
                 line(0, 0)
                 return "plateau"
             new, applied, rejected, _regen = apply_patches(
                 ctx, {"plan": prev["plan"], "parts": prev["parts"]}, reply["patches"],
-                regen=lambda kk, plan, parts: self.regenerate(prev, kk, plan, parts, k))
+                regen=lambda kk, plan, parts: self.regenerate(prev, kk, plan, parts, k),
+                lora_allowed=lora_allowed)
             critic["applied"], critic["rejected"] = applied, rejected
             _write_json(critic_path, critic)
             line(len(applied), len(rejected))
@@ -2528,32 +2601,36 @@ class _Run(object):
             return None
         print("critic round %d: no valid reply after %d call(s); code-only round" % (k, calls))
         _write_json(critic_path, critic)
-        if (not passed_only and judged >= 1
-                and len(prev["hard"]) >= len(self.states[judged - 1]["hard"])):
+        if judged >= 1 and ((n_blocking(prev), len(prev["hard"]))
+                            >= (n_blocking(self.states[judged - 1]),
+                                len(self.states[judged - 1]["hard"]))):
             return "plateau"
         parts = copy.deepcopy(prev["parts"])
         plan = copy.deepcopy(prev["plan"])
         for kk in range(1, ctx.panels + 1):
             mine = [m for m in prev["hard"] if parse_violation(m)["scope"] == "panel"
-                    and parse_violation(m)["index"] == kk
-                    and parse_violation(m)["id"] in WRITER_CHECK_IDS]
-            if not mine or self.panel_calls[kk] >= PANEL_MAX_CALLS:
+                    and parse_violation(m)["index"] == kk]
+            ids = set(parse_violation(m)["id"] for m in mine)
+            if not ids & set(REPAIR_IDS) or self.panel_calls[kk] >= PANEL_MAX_CALLS:
                 continue
             if self.expired():
                 self.time_up = True
                 break
             new = self.panel_call(plan, parts, kk, k, mine)
             if new is not None:
-                parts[kk - 1] = new
+                parts[kk - 1] = merge_repair(ctx, plan, kk, parts[kk - 1], new, ids)
         self.make_state(k, plan, parts)
         return None
 
     # -- judge -----------------------------------------------------------------------------
 
     def judge_gate(self):
+        """bin/judge-story --patches on the best round, as a final report only (dialogue spec 6.8):
+        skipped when the best round has a blocking violation; its patches stay in the
+        judgment.patches.json it writes into that round's directory and are never applied."""
         ctx = self.ctx
         best = self.states[best_round(self.states)]
-        if best["hard"]:
+        if blocking(best["hard"]):
             return {"status": "skipped", "detail": "best round has hard violations",
                     "scores": None, "min_score": None, "applied": False}
         if self.expired():
@@ -2567,26 +2644,33 @@ class _Run(object):
             return {"status": "error", "detail": detail, "scores": None, "min_score": None,
                     "applied": False}
         low = min(reply["scores"].values())
-        judge = {"status": "ok", "detail": "min score %d" % low, "scores": reply["scores"],
-                 "min_score": low, "applied": False}
-        if low >= JUDGE_MIN_SCORE:
-            return judge
-        j = len(self.states)
-        rdir = self.round_dir(j)
-        new, applied, rejected, _regen = apply_patches(
-            ctx, {"plan": best["plan"], "parts": best["parts"]}, reply["patches"],
-            regen=lambda kk, plan, parts: self.regenerate(best, kk, plan, parts, j),
-            lora_allowed=False)
-        _write_json(os.path.join(rdir, "judgment.patches.json"), reply)
-        _write_json(os.path.join(rdir, "critic.json"), {
-            "route": None, "calls": 0, "reply": reply, "applied": applied, "rejected": rejected})
-        self.make_state(j, new["plan"], new["parts"])
-        if not self.expired():
-            self.critic_round(j + 1, j, passed_only=True)
-        judge["applied"] = True
-        return judge
+        if low < JUDGE_MIN_SCORE:
+            print("Warning: judge-story minimum score %d is below %d; its patches are saved in %s "
+                  "and were not applied (only spoken timing and the amount of action are repaired "
+                  "automatically)" % (low, JUDGE_MIN_SCORE,
+                                      os.path.join(best["dir"], "judgment.patches.json")))
+        return {"status": "ok", "detail": "min score %d" % low, "scores": reply["scores"],
+                "min_score": low, "applied": False}
 
     # -- the whole run ---------------------------------------------------------------------
+
+    def critic_loop(self):
+        """The critic rounds after round 0 (dialogue spec 6.5); returns the stop reason. A state
+        with no hard violation stops at once, without a critic call; at most CRITIC_MAX_ROUNDS
+        rounds run."""
+        if not self.states[-1]["hard"]:
+            return "passed"
+        for k in range(1, CRITIC_MAX_ROUNDS + 1):
+            if self.expired():
+                return "time_cap"
+            stop = self.critic_round(k, k - 1)
+            if stop:
+                return stop
+            if not self.states[-1]["hard"]:
+                return "passed"
+            if self.time_up:
+                return "time_cap"
+        return "max_rounds"
 
     def go(self):
         ctx = self.ctx
@@ -2632,25 +2716,15 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         self.make_state(0, plan, parts)
-        stop = None
-        for k in range(1, CRITIC_MAX_ROUNDS + 1):
-            if self.expired():
-                stop = "time_cap"
-                break
-            stop = self.critic_round(k, k - 1)
-            if stop:
-                break
-            if self.time_up:
-                stop = "time_cap"
-                break
-            if k == CRITIC_MAX_ROUNDS:
-                stop = "max_rounds"
+        stop = self.critic_loop()
         judge = self.judge_gate() if ctx.judge else None
-        best = best_round(self.states)
+        best, blocking_list, unresolved_list = final_outcome(self.states)
         state = self.states[best]
         print("stop: %s; best round %d (%d hard)" % (stop, best, len(state["hard"])))
         doc = _checks_doc(ctx, state)
-        doc.update({"stop_reason": stop, "best_round": best, "judge": judge,
+        doc.update({"hard": [parse_violation(m) for m in blocking_list],
+                    "unresolved": [parse_violation(m) for m in unresolved_list],
+                    "stop_reason": stop, "best_round": best, "judge": judge,
                     "rounds": [{"round": s["round"], "hard": len(s["hard"]),
                                 "advisory": len(s["advisory"]), "scores": s["scores"],
                                 "verdict": s["verdict"]} for s in self.states]})
@@ -2659,12 +2733,19 @@ class _Run(object):
         _write_text(os.path.join(ctx.story_dir, "story.md"), state["text"])
         self.doc["stop_reason"], self.doc["best_round"] = stop, best
         self.advisories = state["advisory"]
-        if not state["hard"]:
+        if not blocking_list:
+            for message in unresolved_list:
+                print("Warning: unresolved after %d critic round(s): %s"
+                      % (len(self.states) - 1, message))
             return self.finish(0)
         print("Error: story.md has %d hard violation(s) after the critic rounds (best round %d of "
-              "%d):" % (len(state["hard"]), best, len(self.states) - 1), file=sys.stderr)
-        for message in state["hard"]:
+              "%d):" % (len(blocking_list), best, len(self.states) - 1), file=sys.stderr)
+        for message in blocking_list:
             print("  - %s" % message, file=sys.stderr)
+        if unresolved_list:
+            print("Also unresolved (not blocking):", file=sys.stderr)
+            for message in unresolved_list:
+                print("  - %s" % message, file=sys.stderr)
         print("story.md, plan.json and story_checks.json are saved in %s. Hand-edit story.md to "
               "fix the violations above and rerun: story.md already exists, so Phase 1 re-checks "
               "it instead of regenerating it (pass --force-story to regenerate)." % ctx.story_dir,
