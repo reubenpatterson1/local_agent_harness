@@ -929,3 +929,129 @@ def test_shots_s5_ignores_the_pasted_facing_sentence(ws):
         "The courier faces the camera.", "The courier faces the camera. The courier waves.")
     assert s5 in character_lib.shots_violations(text, panels, 3, [], ignore_facing=True)
     assert se.FACING_SENTENCE == character_lib.FACING_SENTENCE
+
+
+# --- DLG16, DLG17, Review Focus 4: T1, T2, T3, N18 and the Dialogue N16/N17 (6.2, 7) ------------
+
+BUSY = "The courier stops at the crates, then turns, then pedals on toward the far end of the wet road."
+OVERLOAD = ("The courier stops, then turns, then waves, then pedals on, then rides away along the "
+            "wet road.")
+SIXTEEN = "I carry a sealed letter from the old harbour master for the abbot of this temple."
+
+
+def _checks(ws, mode, **kw):
+    ctx, plan, parts, text, path = _story(ws, mode, 3, **kw)
+    return se.panel_checks(ctx, plan, parts, text, path)
+
+
+def _only(messages, rule):
+    return [m for m in messages if " %s " % rule in m]
+
+
+def test_dlg16_t1_spoken_timing(ws):
+    def t1(line):
+        hard, advisory = _checks(ws, "chained", plan_mut=_speaking(2), replies={2: {"dialogue": line}})
+        assert not _only(advisory, "T1")
+        return _only(hard, "T1")
+
+    assert t1(SIXTEEN) == ["panel 2: T1 spoken timing: Dialogue: is 16 words in 1 sentences; a "
+                           "6-second clip fits at most 14 words in 1 sentences" + SPLIT]
+    assert t1("Come in now. Sit by the warm fire. He will see you soon.") == [
+        "panel 2: T1 spoken timing: Dialogue: is 13 words in 3 sentences; a 6-second clip fits at "
+        "most 12 words in 3 sentences" + SPLIT]
+    assert t1("Stop. Wait. Look. Go.") == [
+        "panel 2: T1 spoken timing: Dialogue: is 4 words in 4 sentences; a 6-second clip fits at "
+        "most 11 words in 4 sentences" + SPLIT]
+    assert t1(LINE) == []
+    hard, advisory = _checks(ws, "chained", replies={2: {"narration": "the courier: " + SIXTEEN}})
+    assert not _only(hard, "T1")
+    assert _only(advisory, "T1") == [
+        "panel 2: T1 spoken timing: Narration: speaks 16 words in 1 sentences; a 6-second clip "
+        "fits at most 14 words in 1 sentences" + SPLIT]
+
+
+def test_dlg17_t2_t3_action_amount(ws):
+    def t(mode, key, text):
+        hard, advisory = _checks(ws, mode, replies={2: {key: text}})
+        assert not _only(advisory, "T2") and not _only(advisory, "T3")
+        return _only(hard, "T2") + _only(hard, "T3")
+
+    cut = ", so cut the extra actions and keep every other sentence word for word"
+    assert t("chained", "motion", "The courier stops at the crates, then pedals on toward the far "
+                                  "end of the wet road.") == []
+    assert t("chained", "motion", BUSY) == [
+        "panel 2: T2 action amount: Motion: holds 3 actions; a 6-second clip fits at most 2" + cut]
+    assert t("chained", "motion", OVERLOAD) == [
+        "panel 2: T3 action overload: Motion: holds 5 actions; a 6-second clip fits at most 2 and "
+        "cannot render more than 4; give the extra actions their own panels"]
+    assert t("shots", "motion", "The courier turns. The courier waves. The courier steps "
+                                "forward.") == [
+        "panel 2: T2 action amount: Motion: holds 3 actions; a 6-second clip fits at most 2" + cut]
+    six = ("The courier pedals along the wet harbour road. Initially the tyres hiss. A moment later "
+           "a gull cries. Moments later the rain thickens. Finally the bell rings. After that the "
+           "lamps glow. Soon after the courier slows.")
+    assert t("no_stills", "prompt", six) == [
+        "panel 2: T2 action amount: Prompt: holds 7 actions; a 6-second clip fits at most 6" + cut]
+    assert t("chained", "motion", "The camera slowly pans left. The camera holds.") == [
+        "panel 2: T2 action amount: Motion: has no physical action; a 6-second clip needs one, so "
+        "add one action sentence and keep every other sentence word for word"]
+    for mode in ("chained", "no_stills", "shots"):
+        ctx, plan, parts, text, path = _story(ws, mode, 6)
+        hard, advisory = se.panel_checks(ctx, plan, parts, text, path)
+        assert not [m for m in hard + advisory if " T1 " in m or " T2 " in m or " T3 " in m], mode
+    assert se.GENERATION_CHECKS[16:20] == ("N18", "T1", "T2", "T3")
+    assert se.RECHECK_IDS[14:18] == ("N18", "T1", "T2", "T3")
+
+
+def test_n16_n17_n18_dialogue_messages(ws):
+    ctx, plan, _parts, _text, _path = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                             replies={2: {"dialogue": "Keep moving."}})
+    lib = se._character_lib(WS)
+    ids = ("N16", "N17", "N18", "T1")
+
+    def checks(fields, writers=None, beat_cast=None):
+        p = copy.deepcopy(plan)
+        if beat_cast:
+            p["beats"][1]["cast"] = beat_cast
+        return se._field_checks(ctx, lib, p, 2, "T", fields, writers or {}, ids, [])
+
+    waits = ("Motion", "The courier waits.")
+    assert checks([waits, ("Dialogue", "the stranger: Halt.")]) == ([
+        "panel 2: N18 dialogue: Dialogue: names 'the stranger', which is no character's referring "
+        "phrase; use one of: 'the courier', 'the old monk'"], [])
+    assert checks([waits, ("Dialogue", "the courier:")]) == ([
+        "panel 2: N18 dialogue: Dialogue: has a speaker but no words"], [])
+    assert checks([waits, ("Dialogue", "the old monk: Wait for me.")]) == ([], [
+        "panel 2: N16 speaker: Dialogue: is spoken by 'the old monk', who is not in this shot; put "
+        "'the old monk' in the shot or move the line to a panel that shows them"])
+    assert checks([waits, ("Dialogue", "the courier: Keep moving.")], beat_cast=["c1", "c2"]) == (
+        [], ["panel 2: N17 speaking shot: Dialogue: 'the courier' speaks in a shot that also shows "
+             "'the old monk'; a speaking shot shows only the speaker"])
+    pans = "The courier waits. The camera slowly pans left."
+    assert checks([("Motion", pans), ("Dialogue", "the courier: Keep moving.")],
+                  {"Motion": pans}) == ([], [
+        "panel 2: N17 speaking shot: Motion: has the camera direction 'The camera slowly pans "
+        "left.' while 'the courier' speaks; a speaking shot keeps the camera static"])
+    pushes = "The courier waits. The camera slowly pushes in."
+    assert checks([("Motion", pushes), ("Dialogue", "the courier: Keep moving.")],
+                  {"Motion": pushes}) == ([], [])
+
+
+def test_review_focus_4_a_short_clip_uses_the_same_cap_in_engine_and_manifest(ws, tmp_path,
+                                                                              monkeypatch, capsys):
+    ten = "I carry a letter for the abbot of this temple."
+    short = {"seconds": "4", "clip_seconds": 97 / 24.0}
+    hard, _advisory = _checks(ws, "chained", plan_mut=_speaking(2), replies={2: {"dialogue": ten}},
+                              ctx_kw=short)
+    assert _only(hard, "T1") == ["panel 2: T1 spoken timing: Dialogue: is 10 words in 1 "
+                                 "sentences; a 4-second clip fits at most 9 words in 1 sentences"
+                                 + SPLIT]
+    hard, _advisory = _checks(ws, "chained", plan_mut=_speaking(2), replies={2: {"dialogue": ten}})
+    assert _only(hard, "T1") == []
+    story_md, images, mws = _manifest_ws(tmp_path, monkeypatch, "rf4", CHAINED_DG9.replace(
+        "@@LINES@@", "Dialogue: the old monk: " + ten), plan=CAST_PLAN)
+    capsys.readouterr()
+    assert story_manifest.main(_manifest_argv("rf4", story_md, images, frames=97)) == 2
+    assert capsys.readouterr().err == (
+        "Error: panel 2: Dialogue: is 10 words in 1 sentences; a 4.04-second clip fits at most 9 "
+        "words in 1 sentences" + SPLIT + "\n")

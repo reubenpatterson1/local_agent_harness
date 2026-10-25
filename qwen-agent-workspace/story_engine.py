@@ -1455,6 +1455,57 @@ def assemble(ctx, plan, parts):
     return "\n".join(lines[:-1]) + "\n"
 
 
+# Dialogue spec 6.2: the timing and action rules.
+ACTION_SECONDS = 3.0
+NO_STILLS_BEAT_SECONDS = 1.0
+SEQUENCE_RE = re.compile(r"\b(?:then|afterwards?|whereupon|followed\s+by|as\s+soon\s+as)\b",
+                         re.IGNORECASE)
+NO_STILLS_CONNECTOR_RE = re.compile(r"\b(?:initially|a\s+moment\s+later|moments\s+later|finally|"
+                                    r"after\s+that|soon\s+after)\b", re.IGNORECASE)
+# N17: the CAMERA_MOTION_RE words that keep a speaking shot still (a slow push-in is planned).
+STILL_CAMERA_MOVES = ("static", "still", "hold", "holds", "locked-off", "push in", "pushes in",
+                      "push-in")
+SPLIT_INSTRUCTION = ("shorten the line, or split it across alternating close-up panels (the "
+                     "speaker, then the listener, then the speaker again)")
+
+
+def cast_phrases(ctx, plan):
+    """The plan's cast phrases, or the cast members' phrases when there is no plan."""
+    if plan:
+        return [c["phrase"] for c in plan["cast"] if c.get("phrase")]
+    return [m.phrase for m in ctx.members]
+
+
+def action_units(ctx, lib, text, phrases):
+    """(action sentences, action units, the most actions the clip fits) of a writer action text
+    (dialogue spec 6.2): chained 1 + sequence markers + sentences beyond two; shots sentences +
+    sequence markers; no_stills 1 + sequence markers + connectors. A camera sentence
+    (_is_camera_sentence with phrases) is not an action sentence."""
+    actions = len([s for s in _sentences(text) if not lib._is_camera_sentence(s, phrases)])
+    seq = len(SEQUENCE_RE.findall(text))
+    if ctx.mode == "chained":
+        units = 1 + seq + max(0, actions - 2)
+    elif ctx.mode == "shots":
+        units = actions + seq
+    else:
+        units = 1 + seq + len(NO_STILLS_CONNECTOR_RE.findall(text))
+    per = NO_STILLS_BEAT_SECONDS if ctx.mode == "no_stills" else ACTION_SECONDS
+    return actions, units, max(1, int(engine_seconds(ctx) / per + 1e-9))
+
+
+def over_cap(ctx, lib, line):
+    """The T1 detail when a spoken line does not fit this clip (more words than its fragment-aware
+    cap, or more than three sentences), else None (dialogue spec 6.2)."""
+    n = len(lib.split_fragments(line))
+    words = len(line.split())
+    cap = lib.dialogue_word_cap(engine_seconds(ctx), n)
+    if words <= cap and n <= lib.DIALOGUE_MAX_FRAGMENTS:
+        return None
+    return ("%d words in %d sentences; a %s-second clip fits at most %d words in %d sentences, and "
+            "a line has at most 3 sentences; %s" % (words, n, ctx.seconds, cap, n,
+                                                    SPLIT_INSTRUCTION))
+
+
 def _norm_text(text):
     return " ".join(text.lower().split()).rstrip(".")
 
@@ -1585,6 +1636,42 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
             for hit in undeclared_references(lib, text, undeclared, masks=masks):
                 hard.append(undeclared_message("%s N15 undeclared character:" % prefix,
                                                label + ":", hit))
+    known = cast_phrases(ctx, plan)
+    dialogue = dict(fields).get("Dialogue", "")
+    if dialogue.strip():
+        _phrase, line, problem = lib.parse_dialogue(dialogue, known)
+        if problem:
+            if "N18" in ids:
+                hard.append("%s N18 dialogue: Dialogue: %s" % (prefix, problem))
+        elif "T1" in ids:
+            detail = over_cap(ctx, lib, line)
+            if detail:
+                hard.append("%s T1 spoken timing: Dialogue: is %s" % (prefix, detail))
+    elif "T1" in ids:
+        spoken = dict(fields).get("Narration", "")
+        speaker, speech = lib.split_speaker(spoken, known) if ":" in spoken else (None, "")
+        detail = over_cap(ctx, lib, speech) if speaker else None
+        if detail:
+            advisory.append("%s T1 spoken timing: Narration: speaks %s" % (prefix, detail))
+    action_label = "Prompt" if ctx.mode == "no_stills" else "Motion"
+    if ("T2" in ids or "T3" in ids) and action_label in dict(fields):
+        actions, units, most = action_units(ctx, lib, writers.get(action_label, ""), known)
+        if actions == 0:
+            if "T2" in ids:
+                hard.append("%s T2 action amount: %s: has no physical action; a %s-second clip "
+                            "needs one, so add one action sentence and keep every other sentence "
+                            "word for word" % (prefix, action_label, ctx.seconds))
+        elif units > 2 * most:
+            if "T3" in ids:
+                hard.append("%s T3 action overload: %s: holds %d actions; a %s-second clip fits at "
+                            "most %d and cannot render more than %d; give the extra actions their "
+                            "own panels" % (prefix, action_label, units, ctx.seconds, most,
+                                            2 * most))
+        elif units > most:
+            if "T2" in ids:
+                hard.append("%s T2 action amount: %s: holds %d actions; a %s-second clip fits at "
+                            "most %d, so cut the extra actions and keep every other sentence word "
+                            "for word" % (prefix, action_label, units, ctx.seconds, most))
     if "N12" in ids and ctx.mode == "chained":
         writer = writers.get("Motion", "")
         chain = _first(lib._CHAIN_WORD_RE, writer)
@@ -1595,18 +1682,23 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
         if chain:
             add(advisory, "N12", "one action", "Motion", "chains actions with %s" % _q(chain))
     narration = dict(fields).get("Narration", "")
+    on_screen = ([by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
+                 if beat is not None else [])
+    spoken_by = lib.parse_dialogue(dialogue, known)[0] if dialogue.strip() else None
     if "N16" in ids and beat is not None:
         found = lib.speaker_prefix(narration)
         speech_only = ctx.narration == "speech"
-        if speech_only and narration.strip() and (
-                not found or lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[0]
-                is None):
+        if spoken_by is not None:
+            if spoken_by.lower() not in [p.lower() for p in on_screen]:
+                add(advisory, "N16", "speaker", "Dialogue",
+                    "is spoken by %s, who is not in this shot; put %s in the shot or move the "
+                    "line to a panel that shows them" % (_q(spoken_by), _q(spoken_by)))
+        elif speech_only and narration.strip() and (
+                not found or lib.split_speaker(narration, known)[0] is None):
             add(hard, "N16", "speaker", "Narration",
                 "is voice-over, but this story is speech-only; start it with the referring "
                 "phrase of the character in the shot who says it and a colon, or leave it empty")
         elif found:
-            on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
-            known = [c["phrase"] for c in plan["cast"]]
             if lib.split_speaker(narration, on_screen)[0] is not None:
                 pass
             elif lib.split_speaker(narration, known)[0] is not None:
@@ -1619,20 +1711,38 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                     "starts with %s, which is no character's referring phrase, so it is read as "
                     "voice-over; start a spoken line with the speaker's referring phrase, or drop "
                     "the colon" % _q(found[0] + ":"))
-    if "N17" in ids and beat is not None and narration.strip():
-        on_screen = [by_cast[c]["phrase"] for c in beat["cast"] if c in by_cast]
-        speaker = lib.split_speaker(narration, on_screen)[0]
-        shot_applies = ctx.mode != "chained" or k == 1
-        if speaker and shot_applies and beat["shot"] in WIDE_SHOTS:
-            add(advisory, "N17", "speaking shot", "Narration",
-                "%s speaks in a %s, too small to read the lips, so it plays as voice-over; use "
-                "a medium shot or closer" % (_q(speaker), beat["shot"]))
-        held = speaker and next((w for w in (_first(HELD_EXPRESSION_RE, writers.get(label, ""))
-                                             for label in action_fields) if w), None)
-        if held:
-            add(advisory, "N17", "speaking shot", "Narration",
-                "%s speaks, but the panel holds the expression %s, which freezes the mouth; "
-                "describe the speaking instead" % (_q(speaker), _q(held)))
+    if "N17" in ids and beat is not None:
+        if spoken_by is not None:
+            speech_label = "Dialogue"
+            speaker = (spoken_by if spoken_by.lower() in [p.lower() for p in on_screen] else None)
+        else:
+            speech_label = "Narration"
+            speaker = lib.split_speaker(narration, on_screen)[0] if narration.strip() else None
+        if speaker:
+            shot_applies = ctx.mode != "chained" or k == 1
+            if shot_applies and beat["shot"] in WIDE_SHOTS:
+                add(advisory, "N17", "speaking shot", speech_label,
+                    "%s speaks in a %s, too small to read the lips, so it plays as voice-over; "
+                    "use a medium shot or closer" % (_q(speaker), beat["shot"]))
+            held = next((w for w in (_first(HELD_EXPRESSION_RE, writers.get(field, ""))
+                                     for field in action_fields) if w), None)
+            if held:
+                add(advisory, "N17", "speaking shot", speech_label,
+                    "%s speaks, but the panel holds the expression %s, which freezes the mouth; "
+                    "describe the speaking instead" % (_q(speaker), _q(held)))
+            others = [p for p in on_screen if p.lower() != speaker.lower()]
+            if speech_label == "Dialogue" and others:
+                add(advisory, "N17", "speaking shot", "Dialogue",
+                    "%s speaks in a shot that also shows %s; a speaking shot shows only the "
+                    "speaker" % (_q(speaker), ", ".join(_q(p) for p in others)))
+            for sentence in _sentences(writers.get(action_label, "")):
+                move = CAMERA_MOTION_RE.search(sentence)
+                if (move and lib._is_camera_sentence(sentence, known)
+                        and " ".join(move.group(0).lower().split()) not in STILL_CAMERA_MOVES):
+                    add(advisory, "N17", "speaking shot", action_label,
+                        "has the camera direction %s while %s speaks; a speaking shot keeps the "
+                        "camera static" % (_q(sentence), _q(speaker)))
+                    break
     if "N14" in ids:
         if plan:
             narration = lib.split_speaker(narration, [c["phrase"] for c in plan["cast"]])[1]
@@ -1688,7 +1798,7 @@ def plan_copied_examples(plan):
 
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15", "N16", "N17")
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -2601,7 +2711,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16", "N17")
+               "N16", "N17", "N18", "T1", "T2", "T3")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 

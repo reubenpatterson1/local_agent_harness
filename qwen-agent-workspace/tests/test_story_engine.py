@@ -757,9 +757,14 @@ def test_rst20b_narration_speaker(ws):
         "panel 2: N16 speaker: Narration: starts with 'Dawn:', which is no character's referring "
         "phrase, so it is read as voice-over; start a spoken line with the speaker's referring "
         "phrase, or drop the colon"]
-    # N14 counts the spoken words only: "the courier:" does not push 29 words over 30.
+    # N14 counts the spoken words only: "the courier:" does not push 29 words over 30; the alias
+    # line is over the 14-word cap, which is advisory for a Narration: line (dialogue spec 6.2).
     words29 = " ".join(["go"] * 28) + " now."
-    assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == []
+    assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == [
+        "panel 2: T1 spoken timing: Narration: speaks 29 words in 1 sentences; a 6-second clip "
+        "fits at most 14 words in 1 sentences, and a line has at most 3 sentences; shorten the "
+        "line, or split it across alternating close-up panels (the speaker, then the listener, "
+        "then the speaker again)"]
 
 
 def test_rst20c_narration_modes(ws, monkeypatch, capsys):
