@@ -560,3 +560,85 @@ def test_dlg31_dialogue_satisfies_the_narration_requirement(tmp_path):
             assert (ltx_movie._validate_story_md(str(path), count, no_stills_flag) == []) == ok
             if not ok:
                 assert missing_v0 in ltx_movie._validate_story_md(str(path), count, no_stills_flag)
+
+
+# --- DLG11, DLG33: the plan's speaker and its coercion (2.2, 2.4, SP2) ------------------------
+
+class _Done(object):
+    returncode = 0
+
+
+def _movie_args(*argv):
+    """bin/ltx-movie args after the resolvers main() runs before Phase 1."""
+    args = ltx_movie.build_parser().parse_args(list(argv))
+    args.video_width, args.video_height = 704, 448
+    for resolve in (ltx_movie._resolve_shots, ltx_movie._resolve_casting,
+                    ltx_movie._resolve_global_loras, ltx_movie._resolve_story_engine):
+        assert resolve(args) == 0
+    return args
+
+
+def test_dlg11_speaking_beat_coercion(ws):
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3)
+    raw = seu.plan_json("shots", 3)
+    raw["beats"][1].update(speaker="c1", cast=["c1", "c2"])        # a wide shot, tracking
+    raw["beats"][2].update(speaker="c1", shot="extreme close-up", camera="slow push-in")
+    plan, shape = se.normalize_plan(ctx, raw)
+    assert [b["speaker"] for b in plan["beats"]] == ["", "c1", "c1"]
+    assert plan["beats"][1]["cast"] == ["c1"]
+    assert (plan["beats"][1]["shot"], plan["beats"][1]["camera"]) == ("medium close-up", "static")
+    assert (plan["beats"][2]["shot"], plan["beats"][2]["camera"]) == ("close-up", "slow push-in")
+    assert plan["speech_notes"] == [
+        "beat 2: P14 speaking beat: cast [c1, c2] changed to [c1] so the speaker is alone on screen",
+        "beat 2: P14 speaking beat: shot 'wide shot' changed to 'medium close-up' so the speaker's "
+        "face stays readable",
+        "beat 2: P14 speaking beat: camera 'tracking' changed to 'static' so the speaker's face "
+        "stays readable",
+        "beat 3: P14 speaking beat: shot 'extreme close-up' changed to 'close-up' so the "
+        "speaker's face stays readable"]
+    assert se.plan_checks(ctx, plan, shape)[1][-4:] == plan["speech_notes"]
+    chained = seu.make_ctx(se, ws)
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][1]["speaker"] = "c9"
+    plan, _shape = se.normalize_plan(chained, raw)
+    assert plan["beats"][1]["speaker"] == "" and plan["speech_notes"] == [
+        "beat 2: P14 speaking beat: speaker 'c9' is not a cast id, so nobody speaks in this beat"]
+    raw["beats"][1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(chained._replace(narration=False), raw)
+    assert plan["beats"][1]["speaker"] == "" and plan["speech_notes"] == [
+        "beat 2: P14 speaking beat: speaker 'c1' dropped: this movie has no spoken lines"]
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][2].update(speaker="c1", shot="wide shot", camera="tracking")
+    plan, _shape = se.normalize_plan(chained, raw)
+    assert [(b["shot"], b["camera"], b["speaker"]) for b in plan["beats"]] == [
+        ("medium shot", "static", ""), ("wide shot", "tracking", ""), ("wide shot", "tracking", "c1")]
+    assert plan["speech_notes"] == []
+    runner = se._Run(chained, "")
+    runner.make_state(0, plan, [se.empty_parts("chained", k, plan) for k in (1, 2, 3)])
+    with open(os.path.join(chained.story_dir, "story_rounds", "round_0", "plan.json"),
+              encoding="utf-8") as f:
+        saved = json.load(f)
+    assert [b["speaker"] for b in saved["beats"]] == ["", "", "c1"]
+    assert saved["speech_notes"] == [] and list(saved)[-1] == "speech_notes"
+
+
+def test_dlg33_an_older_plan_json_loads(ws):
+    ctx = seu.make_ctx(se, ws)
+    plan, _shape = se.normalize_plan(ctx, seu.plan_json("chained", 3))
+    del plan["speech_notes"]
+    for beat in plan["beats"]:
+        del beat["speaker"]
+    with open(os.path.join(ctx.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    loaded = se.load_plan(ctx)
+    assert [b["speaker"] for b in loaded["beats"]] == ["", "", ""]
+    assert loaded["speech_notes"] == []
+
+
+def test_story_context_carries_the_clip_length(tmp_path, monkeypatch):
+    monkeypatch.setattr(ltx_movie, "WS", seu.make_ws(tmp_path))
+    ctx = ltx_movie._story_context(_movie_args("n", "--story-id", "x", "--frames", "97"))
+    assert (ctx.seconds, ctx.clip_seconds) == ("4", 97 / 24.0)
+    assert se.engine_seconds(ctx) == 97 / 24.0
+    assert se.engine_seconds(ctx._replace(clip_seconds=None)) == 4.0
+    assert ltx_movie._story_context(_movie_args("n", "--story-id", "x")).clip_seconds == 145 / 24.0

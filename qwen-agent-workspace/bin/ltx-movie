@@ -1434,7 +1434,8 @@ def _story_context(args, dry_run=False):
         context_window=args.story_context_window, video_model=args.model,
         auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
         stills_pinned=stills, judge=args.judge,
-        narration=False if args.no_narration else "speech" if args.speech_only else True)
+        narration=False if args.no_narration else "speech" if args.speech_only else True,
+        clip_seconds=args.frames / float(args.fps))
 
 
 def _no_stills_rules():

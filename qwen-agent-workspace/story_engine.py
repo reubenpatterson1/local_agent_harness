@@ -82,10 +82,18 @@ SCORE_KEYS = ("continuity", "story", "renderability")
 StoryContext = collections.namedtuple("StoryContext", [
     "ws", "story_id", "story_dir", "mode", "panels", "seconds", "narrative", "goal", "members",
     "seed_image", "seed_agent_image", "story_model", "context_window", "video_model",
-    "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration"], defaults=(True,))
+    "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration", "clip_seconds"],
+    defaults=(True, None))
 # narration True: Narration: is voice-over or a character's spoken line. "speech"
 # (bin/ltx-movie --speech-only): Narration: is optional and, when present, a character's spoken
 # line. False (--no-narration): panels have no Narration: field and no narration check runs.
+# clip_seconds: the exact clip length (frames / fps) the timing rules use; None means
+# float(seconds) (docs/superpowers/specs/2026-10-24-on-camera-dialogue-design.md 2.4).
+
+
+def engine_seconds(ctx):
+    """The clip length in seconds that the timing rules use (dialogue spec 2.4)."""
+    return ctx.clip_seconds if ctx.clip_seconds is not None else float(ctx.seconds)
 
 # Injectable seams (tests replace them with monkeypatch.setattr).
 _now = time.monotonic
@@ -672,7 +680,8 @@ def normalize_plan(ctx, raw):
             "shot": _clean_str(item.get("shot")).lower(),
             "camera": _clean_str(item.get("camera")).lower(),
             "location": _clean_str(item.get("location")),
-            "cast": [_clean_str(c) if isinstance(c, str) else json.dumps(c) for c in beat_cast]})
+            "cast": [_clean_str(c) if isinstance(c, str) else json.dumps(c) for c in beat_cast],
+            "speaker": _clean_str(item.get("speaker"))})
     plan["beats"] = beats
     loras = raw.get("loras")
     if not ctx.auto_lora or not isinstance(loras, dict):
@@ -687,7 +696,52 @@ def normalize_plan(ctx, raw):
                  "stills": _normalize_picks(loras.get("stills"), by_id)}
     picks["pinned"] = [dict(pin) for pin in ctx.pinned]
     plan["loras"] = picks
+    plan["speech_notes"] = coerce_speakers(ctx, plan)
     return plan, shape
+
+
+SPEAKING_SHOTS = ("medium close-up", "close-up")
+SPEAKING_CAMERAS = ("static", "slow push-in")
+
+
+def coerce_speakers(ctx, plan):
+    """The P14 notes of the speaking-beat coercion (dialogue spec SP2), in beat order. Every beat
+    gets a "speaker": a cast id or "". A speaker the movie cannot have (--no-narration) or that is
+    not a plan cast id is dropped. A kept speaker is alone in the beat's cast, and when the beat
+    frames its own shot (not a chained continuation, k >= 2) its shot becomes a medium close-up
+    or close-up and its camera static or a slow push-in. No other beat is ever changed."""
+    notes = []
+    cast_ids = [c["id"] for c in plan["cast"]]
+    for k, beat in enumerate(plan["beats"], start=1):
+        raw = beat["speaker"]
+        beat["speaker"] = ""
+        if ctx.narration is False:
+            if raw:
+                notes.append("beat %d: P14 speaking beat: speaker %s dropped: this movie has no "
+                             "spoken lines" % (k, _q(raw)))
+            continue
+        if not raw:
+            continue
+        if raw not in cast_ids:
+            notes.append("beat %d: P14 speaking beat: speaker %s is not a cast id, so nobody speaks "
+                         "in this beat" % (k, _q(raw)))
+            continue
+        beat["speaker"] = raw
+        if beat["cast"] != [raw]:
+            notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker is "
+                         "alone on screen" % (k, ", ".join(beat["cast"]), raw))
+            beat["cast"] = [raw]
+        if ctx.mode != "chained" or k == 1:
+            if beat["shot"] not in SPEAKING_SHOTS:
+                shot = "close-up" if beat["shot"] == "extreme close-up" else "medium close-up"
+                notes.append("beat %d: P14 speaking beat: shot %s changed to %s so the speaker's "
+                             "face stays readable" % (k, _q(beat["shot"]), _q(shot)))
+                beat["shot"] = shot
+            if beat["camera"] not in SPEAKING_CAMERAS:
+                notes.append("beat %d: P14 speaking beat: camera %s changed to 'static' so the "
+                             "speaker's face stays readable" % (k, _q(beat["camera"])))
+                beat["camera"] = "static"
+    return notes
 
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")   # character_lib._SENTENCE_SPLIT_RE
@@ -921,6 +975,7 @@ def plan_checks(ctx, plan, shape=()):
             for hit in undeclared_references(lib, text, undeclared, exact_phrase=exact,
                                         masks=masks):
                 hard.append(undeclared_message("plan: P13 undeclared character:", where, hit))
+    advisory += plan["speech_notes"]
     return hard, advisory
 
 
@@ -2444,6 +2499,10 @@ def load_plan(ctx):
             or plan.get("mode") != ctx.mode or plan.get("panels") != ctx.panels
             or not all(k in plan for k in _PLAN_KEYS)):
         return None
+    for beat in plan["beats"] if isinstance(plan["beats"], list) else []:
+        if isinstance(beat, dict):
+            beat.setdefault("speaker", "")
+    plan.setdefault("speech_notes", [])
     return plan
 
 
