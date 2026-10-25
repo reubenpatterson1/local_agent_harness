@@ -1627,7 +1627,7 @@ def test_rst34_stop_plateau(ws, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert ("critic round 2 (local): continuity=5 story=5 renderability=5 verdict=revise; 1 "
             "patch(es): 0 applied, 0 rejected\nstop: plateau; best round 0 (1 hard)\n") in out
-    assert out.endswith("Warning: unresolved after 1 critic round(s): " + _t2(2) + "\n")
+    assert out.endswith("Warning: unresolved after 2 critic round(s): " + _t2(2) + "\n")
     assert _read_json(os.path.join(_rounds(ctx, 2), "critic.json"))["applied"] == []
     assert not os.path.exists(os.path.join(_rounds(ctx, 2), "plan.json"))
     with open(os.path.join(ctx.story_dir, "story.md")) as f:
