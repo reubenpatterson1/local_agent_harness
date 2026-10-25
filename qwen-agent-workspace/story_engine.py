@@ -2097,19 +2097,26 @@ def lora_patches_allowed(ctx):
     return ctx.auto_lora and any(e["target"] == "video" for e in compatible_entries(ctx))
 
 
+NOT_REPAIRED = "advisory"
+NOT_REPAIRED_REASON = ("not repaired automatically: only spoken timing and the amount of action "
+                       "are patched")
+
+
 def patch_ranges(ctx, plan, lora_allowed):
-    """{(target, field): (lo, hi) | None} -- None means "field not allowed in this mode"."""
+    """{(target, field): (lo, hi) | None | NOT_REPAIRED} (dialogue spec PG1) -- None means "field
+    not allowed in this mode"; NOT_REPAIRED marks a field that is never patched (it only ever
+    holds advisory findings)."""
     n, mode = ctx.panels, ctx.mode
-    first_only = (1, 1) if mode == "chained" else (1, n)
-    return {("plan", "beat.action"): (1, n),
-            ("plan", "beat.shot"): first_only,
-            ("plan", "beat.camera"): first_only,
-            ("plan", "location.setting"): (1, len(plan["locations"])),
+    return {("plan", "beat.action"): NOT_REPAIRED,
+            ("plan", "beat.shot"): NOT_REPAIRED,
+            ("plan", "beat.camera"): NOT_REPAIRED,
+            ("plan", "location.setting"): NOT_REPAIRED,
             ("plan", "lora"): (0, n) if lora_allowed else None,
-            ("panel", "image"): first_only if mode != "no_stills" else None,
+            ("panel", "image"): NOT_REPAIRED,
             ("panel", "motion"): (1, n) if mode != "no_stills" else None,
             ("panel", "prompt"): (1, n) if mode == "no_stills" else None,
-            ("panel", "narration"): (1, n) if ctx.narration else None}
+            ("panel", "dialogue"): (1, n) if ctx.narration is not False else None,
+            ("panel", "narration"): NOT_REPAIRED}
 
 
 def _patch_problem(ranges, patch):
@@ -2119,6 +2126,8 @@ def _patch_problem(ranges, patch):
     if not all(isinstance(v, str) for v in key) or key not in ranges:
         return "unknown target or field"
     span = ranges[key]
+    if span == NOT_REPAIRED:
+        return NOT_REPAIRED_REASON
     if span is None:
         return "field not allowed in this mode"
     index = patch["index"]
@@ -2135,18 +2144,20 @@ def _patch_problem(ranges, patch):
     return None
 
 
-def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
-    """(new_state, applied, rejected, regenerate) for a state {"plan", "parts"} and a patch
-    list (RS20). Works on a deep copy. regen(k, plan, parts) -> ("ok", parts_k) | ("failed",
-    None) | ("budget", None) | ("time", None) regenerates panel k after a beat.action patch;
-    without regen the panel keeps its parts. rejected items are {"patch", "reason"}."""
+def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
+    """(new_state, applied, rejected) for a state {"plan", "parts"} and a patch list (RS20;
+    dialogue spec PG1-PG4). Works on a deep copy; rejected items are {"patch", "reason"}.
+    repairable is {panel: set of hard ids} of the judged state, or None for no restriction: a
+    motion or prompt patch needs a T2 or T3 on its panel, a dialogue patch a T1. A motion or
+    prompt replacement must pass the PG3 sentence guard; a dialogue replacement must fit the
+    clip (PG4)."""
     new = copy.deepcopy(state)
     plan, parts = new["plan"], new["parts"]
     lib = _character_lib(ctx.ws)
     if lora_allowed is None:
         lora_allowed = lora_patches_allowed(ctx)
     ranges = patch_ranges(ctx, plan, lora_allowed)
-    applied, rejected, regenerate = [], [], []
+    applied, rejected = [], []
     accepted, seen = [], set()
     patches = patches if isinstance(patches, list) else []
     for i, patch in enumerate(patches):
@@ -2168,78 +2179,57 @@ def apply_patches(ctx, state, patches, regen=None, lora_allowed=None):
     for patch in accepted:
         if patch["target"] != "plan":
             continue
-        field, index = patch["field"], patch["index"]
-        if field == "beat.action":
-            action = clean_writer(lib, patch["replacement"])
-            words = _words(action)
-            if outside_range(words, 6, 40):
-                rejected.append({"patch": patch, "reason": "the new action is %d words; it must "
-                                                           "be 6 to 40" % words})
-                continue
-            plan["beats"][index - 1]["action"] = action
-            regenerate.append(index)
-        elif field in ("beat.shot", "beat.camera"):
-            value = _collapse(patch["replacement"]).lower()
-            allowed = shot_types(ctx.narration) if field == "beat.shot" else CAMERA_KEYS
-            if value not in allowed:
-                rejected.append({"patch": patch, "reason": "%s is not one of: %s"
-                                 % (_q(value), ", ".join(allowed))})
-                continue
-            plan["beats"][index - 1][field.split(".")[1]] = value
-        elif field == "location.setting":
-            setting = _collapse(patch["replacement"])
-            if setting and not setting.endswith((".", "!", "?")):
-                setting += "."
-            problems = _setting_problems(setting)
-            if problems:
-                rejected.append({"patch": patch, "reason": "the new setting " + problems[0]})
-                continue
-            plan["locations"][index - 1]["setting"] = setting
+        index = patch["index"]
+        before = lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+        saved = copy.deepcopy(plan["loras"])
+        if index == 0:
+            plan["loras"]["global"] = patch["replacement"]
+        elif patch["replacement"]:
+            plan["loras"]["per_beat"][str(index)] = patch["replacement"]
         else:
-            before = lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
-            saved = copy.deepcopy(plan["loras"])
-            if index == 0:
-                plan["loras"]["global"] = patch["replacement"]
-            elif patch["replacement"]:
-                plan["loras"]["per_beat"][str(index)] = patch["replacement"]
-            else:
-                plan["loras"]["per_beat"].pop(str(index), None)
-            broken = [h for h in lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
-                      if h not in before]
-            if broken:
-                plan["loras"] = saved
-                rejected.append({"patch": patch, "reason": "would break " + broken[0]})
-                continue
-        applied.append(patch)
-    regenerate = sorted(set(regenerate))
-    for k in regenerate:
-        if regen is None:
+            plan["loras"]["per_beat"].pop(str(index), None)
+        broken = [h for h in lora_checks(ctx, plan, compatible_by_id, catalog_by_id)[0]
+                  if h not in before]
+        if broken:
+            plan["loras"] = saved
+            rejected.append({"patch": patch, "reason": "would break " + broken[0]})
             continue
-        outcome, new_parts = regen(k, plan, parts)
-        if outcome == "ok":
-            parts[k - 1] = new_parts
-        elif outcome in ("budget", "time"):
-            action_patch = [p for p in accepted if p["field"] == "beat.action"
-                            and p["index"] == k][0]
-            rejected.append({"patch": action_patch, "reason": "panel %d regeneration skipped: %s"
-                             % (k, "call budget exhausted" if outcome == "budget"
-                                else "wall-clock cap reached")})
+        applied.append(patch)
     for patch in accepted:
         if patch["target"] != "panel":
             continue
         k, field = patch["index"], patch["field"]
-        if k in regenerate:
-            rejected.append({"patch": patch,
-                             "reason": "panel regenerated from a beat.action patch this round"})
+        need = {"T1"} if field == "dialogue" else {"T2", "T3"}
+        if repairable is not None and not (repairable.get(k, set()) & need):
+            rejected.append({"patch": patch, "reason": "panel %d has no hard timing or "
+                                                       "amount-of-action problem; advisory "
+                                                       "findings are never patched" % k})
             continue
-        text = clean_writer(lib, patch["replacement"],
-                            pasted_pieces(ctx, plan, k).get(field, ()))
-        if not text:
-            rejected.append({"patch": patch, "reason": "empty after cleanup"})
+        if field == "dialogue":
+            text = _sentence(_clean_dialogue(lib, clean_writer(lib, patch["replacement"]),
+                                             speaker_phrase(plan, k)))
+            problem = line_problem(ctx, lib, text) if text else "empty after cleanup"
+        else:
+            text = clean_writer(lib, patch["replacement"],
+                                pasted_pieces(ctx, plan, k).get(field, ()))
+            problem = (guard_problem(ctx, plan, parts[k - 1].get(field, ""), text) if text
+                       else "empty after cleanup")
+        if problem:
+            rejected.append({"patch": patch, "reason": problem})
             continue
         parts[k - 1][field] = text
         applied.append(patch)
-    return new, applied, rejected, regenerate
+    return new, applied, rejected
+
+
+def repairable_ids(hard):
+    """{panel number: set of its hard violation ids} (dialogue spec PG2)."""
+    out = {}
+    for message in hard:
+        violation = parse_violation(message)
+        if violation["scope"] == "panel" and violation["index"]:
+            out.setdefault(violation["index"], set()).add(violation["id"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2504,21 +2494,6 @@ class _Run(object):
                     _reply_text(status, answer))
         return parse_panel_reply(ctx, plan, k, answer)
 
-    def regenerate(self, state, k, plan, parts, rnd):
-        """("ok", parts_k) | ("failed", None) | ("budget", None) | ("time", None)."""
-        if self.panel_calls[k] >= PANEL_MAX_CALLS:
-            return "budget", None
-        if self.expired():
-            self.time_up = True
-            return "time", None
-        fix = [m for m in state["hard"] + state["advisory"]
-               if parse_violation(m)["index"] == k
-               and parse_violation(m)["scope"] in ("panel", "beat")]
-        if not fix:
-            fix = ["this panel's beat was revised; rewrite the panel for the new beat"]
-        new = self.panel_call(plan, parts, k, rnd, fix)
-        return ("ok", new) if new is not None else ("failed", None)
-
     # -- states ----------------------------------------------------------------------------
 
     def make_state(self, rnd, plan, parts):
@@ -2590,10 +2565,9 @@ class _Run(object):
                 _write_json(critic_path, critic)
                 line(0, 0)
                 return "plateau"
-            new, applied, rejected, _regen = apply_patches(
+            new, applied, rejected = apply_patches(
                 ctx, {"plan": prev["plan"], "parts": prev["parts"]}, reply["patches"],
-                regen=lambda kk, plan, parts: self.regenerate(prev, kk, plan, parts, k),
-                lora_allowed=lora_allowed)
+                lora_allowed=lora_allowed, repairable=repairable_ids(prev["hard"]))
             critic["applied"], critic["rejected"] = applied, rejected
             _write_json(critic_path, critic)
             line(len(applied), len(rejected))

@@ -1300,6 +1300,10 @@ def _reasons(rejected):
     return [r["reason"] for r in rejected]
 
 
+NOT_REPAIRED_REASON = ("not repaired automatically: only spoken timing and the amount of action "
+                       "are patched")
+
+
 def test_rst27_whitelist_limit_and_duplicates(ws):
     ctx, state = _state(ws, "chained")
     good_action = "the courier coasts slowly down the empty harbour road"
@@ -1317,92 +1321,67 @@ def test_rst27_whitelist_limit_and_duplicates(ws):
         _patch("panel", 1, "narration", ["x"]),
         _patch("plan", 1, "lora", "x"),
     ]
-    new, applied, rejected, regenerate = se.apply_patches(ctx, state, patches[:8])
-    assert applied == [] and regenerate == []
+    new, applied, rejected = se.apply_patches(ctx, state, patches[:8])
+    assert applied == []
     assert _reasons(rejected) == [
-        "index 2 is out of range for beat.shot (allowed: 1 only)",
-        "index 2 is out of range for beat.camera (allowed: 1 only)",
-        "index 2 is out of range for image (allowed: 1 only)",
-        "field not allowed in this mode",
-        "field not allowed in this mode",
-        "index 4 is out of range for beat.action (allowed: 1 to 3)",
-        "index is not an integer",
-        "index 0 is out of range for narration (allowed: 1 to 3)"]
-    _new, _a, rejected, _r = se.apply_patches(ctx, state, patches[8:])
+        NOT_REPAIRED_REASON, NOT_REPAIRED_REASON, NOT_REPAIRED_REASON,
+        "field not allowed in this mode", "field not allowed in this mode",
+        NOT_REPAIRED_REASON, NOT_REPAIRED_REASON, NOT_REPAIRED_REASON]
+    _new, _a, rejected = se.apply_patches(ctx, state, patches[8:])
     assert _reasons(rejected) == [
         "unknown target or field",
         "not an object with the keys target, index, field, reason and replacement",
-        "replacement must be a string", "field not allowed in this mode"]
-    nine = [_patch("panel", (i % 3) + 1, "narration", "Line %d of the rain." % i) for i in range(9)]
-    _new, applied, rejected, _r = se.apply_patches(ctx, state, nine)
+        NOT_REPAIRED_REASON, "field not allowed in this mode"]
+    nine = [_patch("panel", (i % 3) + 1, "dialogue", "Line %d of the rain." % i) for i in range(9)]
+    _new, applied, rejected = se.apply_patches(ctx, state, nine)
     assert [p["index"] for p in applied] == [1, 2, 3]
     assert _reasons(rejected) == ["duplicate patch target"] * 5 + ["over the 8-patch limit"]
     assert rejected[-1]["patch"] is nine[8]
     shots_ctx, shots_state = _state(ws, "shots")
-    _new, applied, rejected, _r = se.apply_patches(shots_ctx, shots_state, [
+    _new, applied, rejected = se.apply_patches(shots_ctx, shots_state, [
         _patch("plan", 3, "beat.shot", "close-up"), _patch("panel", 3, "image", "The courier "
                                                                                 "waits."),
         _patch("panel", 2, "prompt", "x")])
-    assert len(applied) == 2 and _reasons(rejected) == ["field not allowed in this mode"]
+    assert applied == [] and _reasons(rejected) == [
+        NOT_REPAIRED_REASON, NOT_REPAIRED_REASON, "field not allowed in this mode"]
     no_stills_ctx, ns_state = _state(ws, "no_stills")
-    _new, applied, rejected, _r = se.apply_patches(no_stills_ctx, ns_state, [
-        _patch("panel", 2, "motion", "x"), _patch("panel", 2, "prompt", "The courier pedals.")])
+    rest = se._SENTENCE_SPLIT_RE.split(ns_state["parts"][1]["prompt"], 1)[1]
+    _new, applied, rejected = se.apply_patches(no_stills_ctx, ns_state, [
+        _patch("panel", 2, "motion", "x"),
+        _patch("panel", 2, "prompt", "The courier coasts along the wet harbour road. " + rest)])
     assert len(applied) == 1 and _reasons(rejected) == ["field not allowed in this mode"]
     assert state["parts"][0]["narration"] == "The rain had not stopped since dawn."
 
 
 def test_rst28_location_setting_patch(ws):
     ctx, state = _state(ws, "shots")
-    new_setting = ("The setting is a stormy fishing harbour in modern Japan, slick black "
-                   "cobblestones underfoot, cranes behind, under blue evening light.")
-    new, applied, rejected, _r = se.apply_patches(ctx, state, [
-        _patch("plan", 1, "location.setting", new_setting[:-1]),
-        _patch("plan", 2, "location.setting", "A short harbour")])
-    assert len(applied) == 1
-    assert _reasons(rejected) == ['the new setting does not start with "The setting is"']
-    text = se.assemble(ctx, new["plan"], new["parts"])
-    assert text.count(new_setting) == 3
-    assert seu.HARBOUR not in text
+    new, applied, rejected = se.apply_patches(ctx, state, [
+        _patch("plan", 1, "location.setting", seu.TEMPLE)])
+    assert applied == [] and _reasons(rejected) == [NOT_REPAIRED_REASON]
+    assert se.assemble(ctx, new["plan"], new["parts"]).count(seu.HARBOUR) == 3
     assert state["plan"]["locations"][0]["setting"] == seu.HARBOUR
 
 
 def test_rst29_beat_action_regenerates_that_panel(ws):
+    # A beat.action patch is never applied and no panel is regenerated (dialogue spec PG1, PG2).
     ctx, state = _state(ws, "shots")
-    calls = []
-
-    def regen(k, plan, parts):
-        calls.append((k, plan["beats"][k - 1]["action"]))
-        return "ok", dict(parts[k - 1], motion="The courier rests one hand on the railing.")
-
     action = "the courier stops beside the railing to catch his breath"
-    new, applied, rejected, regenerate = se.apply_patches(ctx, state, [
-        _patch("plan", 2, "beat.action", action),
-        _patch("panel", 2, "motion", "The courier waves."),
-        _patch("plan", 3, "beat.action", "too short")], regen=regen)
-    assert calls == [(2, action)] and regenerate == [2]
-    assert new["parts"][1]["motion"] == "The courier rests one hand on the railing."
-    assert _reasons(rejected) == ["the new action is 2 words; it must be 6 to 40",
-                                  "panel regenerated from a beat.action patch this round"]
-    new, applied, rejected, regenerate = se.apply_patches(
-        ctx, state, [_patch("plan", 2, "beat.action", action)],
-        regen=lambda k, plan, parts: ("budget", None))
-    assert new["plan"]["beats"][1]["action"] == action
-    assert new["parts"][1] == state["parts"][1]
-    assert _reasons(rejected) == ["panel 2 regeneration skipped: call budget exhausted"]
+    new, applied, rejected = se.apply_patches(ctx, state, [_patch("plan", 2, "beat.action", action)])
+    assert applied == [] and new == state
+    assert _reasons(rejected) == [NOT_REPAIRED_REASON]
+    assert "regen" not in inspect.signature(se.apply_patches).parameters
+    assert not hasattr(se._Run, "regenerate")
 
 
 def test_rst30_shot_and_camera_reassemble_without_agent_calls(ws, monkeypatch):
     ctx, state = _state(ws, "shots")
     monkeypatch.setattr(se, "run_agent", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
-    new, applied, rejected, regenerate = se.apply_patches(ctx, state, [
-        _patch("plan", 2, "beat.shot", "Close-Up"), _patch("plan", 2, "beat.camera", "slow pan left"),
-        _patch("plan", 3, "beat.shot", "aerial")])
-    assert regenerate == [] and len(applied) == 2
-    assert _reasons(rejected) == ["'aerial' is not one of: extreme wide shot, wide shot, medium "
-                                  "shot, medium close-up, close-up, extreme close-up"]
+    new, applied, rejected = se.apply_patches(ctx, state, [
+        _patch("plan", 2, "beat.shot", "Close-Up"), _patch("plan", 2, "beat.camera", "slow pan left")])
+    assert applied == [] and _reasons(rejected) == [NOT_REPAIRED_REASON] * 2
     fields = dict(se.panel_fields(ctx, new["plan"], new["parts"], 2))
-    assert fields["Image"].endswith(" The shot is a close-up.")
-    assert fields["Motion"].endswith(" The camera slowly pans left.")
+    assert fields["Image"].endswith(" The shot is a wide shot.")
+    assert fields["Motion"].endswith(" The camera tracks alongside the movement.")
 
 
 def _lora_state(ws, tmp_path, story_env, cast_kyra=False):
@@ -1426,7 +1405,7 @@ def _lora_state(ws, tmp_path, story_env, cast_kyra=False):
 
 def test_rst31_lora_patch(ws, tmp_path, story_env):
     ctx, state = _lora_state(ws, tmp_path, story_env)
-    new, applied, rejected, _r = se.apply_patches(ctx, state, [
+    new, applied, rejected = se.apply_patches(ctx, state, [
         _patch("plan", 0, "lora", [{"id": "fast-motion", "strength": 0.7}]),
         _patch("plan", 2, "lora", [{"id": "rain-physics", "strength": 0.9}])])
     assert len(applied) == 1
@@ -1434,7 +1413,7 @@ def test_rst31_lora_patch(ws, tmp_path, story_env):
     assert new["plan"]["loras"]["per_beat"] == {}
     assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion or physics LoRAs on "
                                   "this panel (fast-motion, rain-physics); at most 1"]
-    cleared, applied, _rj, _r = se.apply_patches(ctx, new, [_patch("plan", 0, "lora", [])])
+    cleared, applied, _rj = se.apply_patches(ctx, new, [_patch("plan", 0, "lora", [])])
     assert cleared["plan"]["loras"]["global"] == [] and len(applied) == 1
 
 
@@ -1451,7 +1430,7 @@ def test_rst32_patches_never_change_counts_phrases_or_descriptors(ws):
     for _ in range(20):
         patches = [_patch(rng.choice(["plan", "panel", "cast"]), rng.randint(-1, 5),
                           rng.choice(fields), rng.choice(values)) for _ in range(rng.randint(0, 10))]
-        new, _a, _rj, _r = se.apply_patches(ctx, state, patches)
+        new, _a, _rj = se.apply_patches(ctx, state, patches)
         after = (len(new["parts"]), len(new["plan"]["beats"]),
                  [(c["phrase"], c["descriptor"]) for c in new["plan"]["cast"]])
         assert after == before
@@ -1465,7 +1444,7 @@ def test_lct28_lora_limits_with_a_cast_character(ws, tmp_path, story_env):
     compatible = {e["id"]: e for e in se.compatible_entries(ctx)}
     catalog = {e["id"]: e for e in ctx.catalog["entries"]}
     assert se.lora_checks(ctx, plan, compatible, catalog) == ([], [])
-    _new, applied, rejected, _r = se.apply_patches(ctx, state, [
+    _new, applied, rejected = se.apply_patches(ctx, state, [
         _patch("plan", 2, "lora", [{"id": "fast-motion", "strength": 0.7},
                                    {"id": "rain-physics", "strength": 0.6}])])
     assert applied == []

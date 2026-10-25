@@ -1181,3 +1181,90 @@ def test_dlg26_judge_gate_is_report_only(tmp_path, monkeypatch, capsys):
             "not applied (only spoken timing and the amount of action are repaired automatically)\n"
             % saved) in capsys.readouterr().out
     assert _read_json(saved)["patches"] == reply["patches"]
+
+
+# --- DLG20, DLG22: the patch whitelist and guards (PG1-PG4) ----------------------------------
+
+NOT_REPAIRED_REASON = ("not repaired automatically: only spoken timing and the amount of action "
+                       "are patched")
+THREE = ("The courier stops at the crates, then turns, then pedals on. The courier glances up at "
+         "the rain. The camera slowly pans left.")
+ONE_CHANGED = ("The courier stops at the crates and pedals on. The courier glances up at the rain. "
+               "The camera slowly pans left.")
+TWO_CHANGED = ("The courier stops at the crates and pedals on. The courier looks up at the grey "
+               "sky. The camera slowly pans left.")
+
+
+def _patch(target, index, field, replacement):
+    return {"target": target, "index": index, "field": field, "reason": "r",
+            "replacement": replacement}
+
+
+def test_dlg20_apply_patches_whitelist_and_guard(ws):
+    no_problem = ("panel %d has no hard timing or amount-of-action problem; advisory findings are "
+                  "never patched")
+    ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
+                                      replies={2: {"motion": THREE, "dialogue": OVER_CAP}})
+    state = {"plan": plan, "parts": parts}
+    result = se.apply_patches(ctx, state, [
+        _patch("plan", 2, field, "x") for field in ("beat.action", "beat.shot", "beat.camera",
+                                                    "location.setting")]
+        + [_patch("panel", 1, "image", "x"), _patch("panel", 2, "narration", "x")])
+    assert len(result) == 3
+    new, applied, rejected = result
+    assert applied == [] and new == state
+    assert [r["reason"] for r in rejected] == [NOT_REPAIRED_REASON] * 6
+    _new, applied, rejected = se.apply_patches(ctx, state, [
+        _patch("panel", 2, "motion", ONE_CHANGED), _patch("panel", 3, "dialogue", "Hello there.")],
+        repairable={2: {"T1"}})
+    assert applied == [] and [r["reason"] for r in rejected] == [no_problem % 2, no_problem % 3]
+    new, applied, rejected = se.apply_patches(ctx, state, [
+        _patch("panel", 2, "dialogue", 'the courier: "I carry a letter for the abbot"')],
+        repairable={2: {"T1"}})
+    assert len(applied) == 1 and new["parts"][1]["dialogue"] == "I carry a letter for the abbot."
+    for replacement, reason in (
+            (OVER_CAP, "the new line is 15 words in 1 sentences; at most 14 words in 1 sentences "
+                       "fit this clip"),
+            ('  ""  ', "empty after cleanup")):
+        _new, applied, rejected = se.apply_patches(ctx, state, [
+            _patch("panel", 2, "dialogue", replacement)])
+        assert applied == [] and [r["reason"] for r in rejected] == [reason], replacement
+    new, applied, rejected = se.apply_patches(ctx, state, [_patch("panel", 2, "motion",
+                                                                  ONE_CHANGED)])
+    assert len(applied) == 1 and new["parts"][1]["motion"] == ONE_CHANGED
+    _new, applied, rejected = se.apply_patches(ctx, state, [_patch("panel", 2, "motion",
+                                                                   TWO_CHANGED)])
+    assert [r["reason"] for r in rejected] == [
+        "the patch changes 2 sentences; it may change at most 1 contiguous sentence(s) and must "
+        "keep every other sentence word for word"]
+    panned = {"plan": plan, "parts": copy.deepcopy(parts)}
+    panned["parts"][2]["motion"] = "The courier stops, then turns, then waves. The camera slowly pans left."
+    _new, applied, rejected = se.apply_patches(ctx, panned, [
+        _patch("panel", 3, "motion", "The courier stops, then turns, then waves. The courier rests.")])
+    assert [r["reason"] for r in rejected] == [
+        "the patch drops the camera direction 'The camera slowly pans left.'"]
+
+
+def test_dlg22_the_critic_rewrites_one_sentence(ws, tmp_path, monkeypatch):
+    good = _patch("panel", 2, "motion", ONE_CHANGED)
+    rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, plan=_speaking_plan("chained", 3, 2),
+                            panel=_replies("chained", 3, {2: [{"motion": THREE, "dialogue": LINE}]}),
+                            critic=[seu.answer(seu.critic_json((6, 6, 6), "revise", [good]))])
+    assert rc == 0
+    rounds = os.path.join(ctx.story_dir, "story_rounds")
+    with open(os.path.join(rounds, "round_0", "story.md"), encoding="utf-8") as f:
+        before = f.read()
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        after = f.read()
+    assert after == before.replace("Motion: " + THREE + " ", "Motion: " + ONE_CHANGED + " ")
+    assert ("Motion: " + ONE_CHANGED + " The courier faces the camera. The camera stays static.\n"
+            + "Dialogue: the courier: " + LINE + "\n") in after
+    assert _read_json(os.path.join(rounds, "round_1", "critic.json"))["applied"] == [good]
+    state0 = {"plan": _read_json(os.path.join(rounds, "round_0", "plan.json")),
+              "parts": [dict((key, value) for key, value in p.items() if key != "index")
+                        for p in _read_json(os.path.join(rounds, "round_0", "parts.json"))["panels"]]}
+    _new, applied, rejected = se.apply_patches(ctx, state0, [dict(good, replacement=TWO_CHANGED)],
+                                               repairable={2: {"T2"}})
+    assert applied == [] and [r["reason"] for r in rejected] == [
+        "the patch changes 2 sentences; it may change at most 1 contiguous sentence(s) and must "
+        "keep every other sentence word for word"]
