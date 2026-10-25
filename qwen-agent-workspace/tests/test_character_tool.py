@@ -129,7 +129,8 @@ class _Fakes(object):
         monkeypatch.setattr(character_dataset, "run_edit_child", _child)
         monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: [])
         monkeypatch.setattr(character_dataset, "restore_story_server",
-                            lambda: fakes.server_calls.append("restore"))
+                            lambda wait=False: fakes.server_calls.append(
+                                "restore-wait" if wait else "restore") or 0)
         monkeypatch.setattr(character_dataset, "story_server",
                             lambda cmd: fakes.server_calls.append(cmd) or 0)
         monkeypatch.setattr(character_dataset, "wait_for_vlm", lambda timeout_s: True)
@@ -364,7 +365,7 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
         character_dataset.verify_ffprobe(os.path.join(cdir, "dataset", "videos", name))
     with open(os.path.join(lib_dir, ".triggers")) as f:
         assert f.read() == "kyrawmn kyra\n"
-    assert fakes.server_calls == ["stop", "mlx-vision"]
+    assert fakes.server_calls == ["stop", "restore-wait"]
     assert os.path.isfile(os.path.join(cdir, "seed.png"))
     with open(os.path.join(cdir, "seed_face.json")) as f:
         assert json.load(f) == {"face_box": [350, 100, 650, 500]}
@@ -448,7 +449,7 @@ def test_k13_generation_failure_restarts_the_vision_server(lib_dir, monkeypatch,
         "Z-Image child process exited 1; log: /x.log"))
     assert tool.main(_ronin_create()) == 1
     assert capsys.readouterr().err == "Error: Z-Image child process exited 1; log: /x.log\n"
-    assert fakes.server_calls == ["stop", "mlx-vision"]
+    assert fakes.server_calls == ["stop", "restore-wait"]
     assert character_lib.load_character("ronin")["status"] == "dataset"
 
 
@@ -549,7 +550,7 @@ def test_k20_preview_stop(tmp_path, lib_dir, monkeypatch, capsys):
     assert os.path.isfile(sheet)
     assert prompts == ["Review the preview stills in %s. Enter to edit the remaining 18, Ctrl-C "
                        "to abort: " % sheet]
-    assert fakes.server_calls == ["stop", "mlx-vision"]
+    assert fakes.server_calls == ["stop", "restore-wait"]
     assert character_lib.load_character("kyra")["status"] == "untrained"
 
 
@@ -608,3 +609,49 @@ def test_k24_seed_image_with_a_given_descriptor(tmp_path, lib_dir, monkeypatch, 
     assert (data["descriptor"], data["class_noun"]) == (DESCRIPTOR, "woman")
     assert data["source"]["type"] == "seed_image"
     assert not os.path.exists(os.path.join(lib_dir, "kyra", "dataset", "description.json"))
+
+
+# --- VLC1: the generate phase restores through story-server-restore --wait (VLM lifecycle VC1) --
+def test_vlc1_create_restores_with_wait(lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, scores=[9] * 24)
+    assert tool.main(_ronin_create()) == 0
+    assert fakes.server_calls == ["stop", "restore-wait"]
+    with open(character_dataset.__file__, encoding="utf-8") as f:
+        assert "story_server(VLM_SERVE_MODE)" not in f.read()
+    assert "warning: story-server-restore" not in capsys.readouterr().err
+
+
+def test_vlc1_a_failed_restore_warns(lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, scores=[9] * 24)
+    monkeypatch.setattr(character_dataset, "restore_story_server",
+                        lambda wait=False: fakes.server_calls.append(
+                            "restore-wait" if wait else "restore") or 1)
+    assert tool.main(_ronin_create()) == 0
+    assert fakes.server_calls == ["stop", "restore-wait"]
+    assert ("warning: story-server-restore mlx-vision --wait returned 1\n"
+            in capsys.readouterr().err)
+
+
+def test_vlc1_restore_story_server_argv(monkeypatch, capsys):
+    seen = []
+
+    class _Done(object):
+        returncode = 3
+
+    def _run(argv, timeout=None):
+        seen.append((argv, timeout))
+        return _Done()
+
+    monkeypatch.setattr(character_dataset.subprocess, "run", _run)
+    restore = os.path.join(WS, "bin", "story-server-restore")
+    assert character_dataset.restore_story_server(wait=True) == 3
+    assert character_dataset.restore_story_server() == 3
+    assert seen == [([restore, "mlx-vision", "--wait"], None), ([restore, "mlx-vision"], 60)]
+
+    def _fail(argv, timeout=None):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(character_dataset.subprocess, "run", _fail)
+    assert character_dataset.restore_story_server(wait=True) == 1
+    assert capsys.readouterr().err == ("warning: story-server-restore failed: no such file; run "
+                                       "bin/story-server mlx-vision\n")

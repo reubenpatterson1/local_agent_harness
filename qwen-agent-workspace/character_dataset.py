@@ -482,15 +482,17 @@ def story_server(cmd):
     return result.returncode
 
 
-def restore_story_server():
-    """Start the vision server through bin/story-server-restore: in its own session, without
-    waiting (clean-stop spec S1, S3)."""
+def restore_story_server(wait=False):
+    """Start the vision server through bin/story-server-restore (clean-stop spec S1; VLM lifecycle
+    spec VRS3: the server's parent is launchd, so no kill sweep reaches it). Without wait it returns
+    at once; with wait it waits for the start. Returns the restore's exit code (1 on an error)."""
+    argv = [os.path.join(WS, "bin", "story-server-restore"), VLM_SERVE_MODE] + (["--wait"] if wait else [])
     try:
-        subprocess.run([os.path.join(WS, "bin", "story-server-restore"), VLM_SERVE_MODE],
-                       timeout=60)
+        return subprocess.run(argv, timeout=None if wait else 60).returncode
     except (OSError, subprocess.SubprocessError) as e:
         print("warning: story-server-restore failed: %s; run bin/story-server %s"
               % (e, VLM_SERVE_MODE), file=sys.stderr)
+        return 1
 
 
 def story_server_state():
@@ -998,9 +1000,9 @@ def _build_dataset(data, face_height, review=False):
             # the job exits inside the cancel grace and its kill sweep cannot reach the server.
             restore_story_server()
         else:
-            rc = story_server(VLM_SERVE_MODE)
+            rc = restore_story_server(wait=True)
             if rc != 0:
-                print("warning: story-server %s returned %d" % (VLM_SERVE_MODE, rc),
+                print("warning: story-server-restore %s --wait returned %d" % (VLM_SERVE_MODE, rc),
                       file=sys.stderr)
             if not wait_for_vlm(VLM_WAIT_S):
                 raise DatasetError("timed out waiting for the vision server to come back")
