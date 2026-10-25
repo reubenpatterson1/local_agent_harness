@@ -769,6 +769,8 @@ def speech_text(phrase, line, delivery=DEFAULT_SPEECH_DELIVERY):
                      + [" ".join(fragments[DIALOGUE_MAX_FRAGMENTS - 1:])])
     if delivery == "plain":
         return speech_sentence(phrase, line)
+    if not fragments:
+        return ""
     text = phrase[:1].upper() + phrase[1:] + ' says, "' + fragments[0] + '"'
     for i in range(1, len(fragments)):
         text += " " + SPEECH_BEATS[i - 1] + ', "' + fragments[i] + '"'

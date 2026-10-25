@@ -137,3 +137,10 @@ def test_review_focus_5_non_ascii_spoken_words():
     assert len(line.split()) == 5
     assert lib.speech_text("the courier", line, "beats-no-acoustic") == (
         'The courier says, "¿Dónde está el abad?" After a breath, "¡Aquí!"')
+
+
+def test_dlg5b_speech_text_empty_line_composes_nothing():
+    lib = character_lib
+    for delivery in ("beats", "beats-no-acoustic"):
+        assert lib.speech_text("the courier", "", delivery) == ""
+    assert lib.speech_text("the courier", "   ", "beats") == ""
