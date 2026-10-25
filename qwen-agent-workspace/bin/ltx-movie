@@ -97,9 +97,10 @@ paired. --redo N[,M] moves those panels' stills and clips, and movie.mp4, into
 
 Story engine (docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md): by default
 Phase 1 asks the story model for a JSON plan and then one panel at a time, assembles story.md
-itself, runs deterministic checks and up to three local critic rounds (the fleet analyst skill),
-and exits 2 with story.md, plan.json and story_checks.json saved when hard violations remain; a
-rerun re-checks the existing story.md. --judge adds bin/judge-story --patches as a final gate;
+itself, runs deterministic checks and up to two local critic rounds that repair only spoken
+timing and the amount of action (the fleet analyst skill), and exits 2 with story.md, plan.json
+and story_checks.json saved when blocking violations remain; a rerun re-checks the existing
+story.md. --judge adds bin/judge-story --patches as a final gate;
 --story-legacy restores the single-prompt path. The plan may pick catalog LoRAs
 (bin/lora-catalog), which Phases 2 and 3 apply per panel; --no-auto-lora turns that off.
 """
@@ -451,7 +452,9 @@ def build_parser():
     parser.add_argument("--story-legacy", dest="story_legacy", action="store_true", default=False,
                          help="Phase 1 uses the single-prompt story path (one bin/qwen-agent call that "
                               "writes story.md), exactly as before the robust story engine. See "
-                              "docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md.")
+                              "docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md. "
+                              "It does not ask for Dialogue: lines; a prefixed Narration: line still "
+                              "renders as dialogue.")
     parser.add_argument("--no-narration", dest="no_narration", action="store_true", default=False,
                          help="the story has no Narration: fields (no voice-over and no spoken "
                               "lines); panels share the length equally. Needs the default story "
@@ -470,8 +473,8 @@ def build_parser():
                               "--lora/--stills-lora still apply")
     parser.add_argument("--judge", dest="judge", action="store_true", default=False,
                          help="after the local critic rounds, run bin/judge-story --patches (Claude; "
-                              "needs ANTHROPIC_API_KEY) as a final gate; a minimum score below 7 "
-                              "applies its patches and runs one more critic round")
+                              "needs ANTHROPIC_API_KEY) as a final report: its scores go into "
+                              "story_checks.json and its patches are saved, never applied")
     parser.add_argument("--goal", dest="goal", type=_parse_goal, default=None, metavar="TEXT",
                          help="the target output goal given to the story planner, the critic and the "
                               "judge, worded to complete 'The target output goal is TEXT.'")
@@ -2201,9 +2204,9 @@ def _print_robust_phase1(args, paths):
     compatible = engine.compatible_entries(ctx)
     print("Would skip if %s already exists and re-check it instead (pass --force-story to "
           "regenerate)." % paths["story_md"])
-    print("Story engine: a JSON plan, one call per panel, deterministic checks and up to 3 critic "
-          "rounds (analyst via the local qwen-agentd, else a local one-shot); --story-legacy for "
-          "the single-prompt path.")
+    print("Story engine: a JSON plan, one call per panel, deterministic checks and up to 2 critic "
+          "rounds that repair only spoken timing and the amount of action (analyst via the local "
+          "qwen-agentd, else a local one-shot); --story-legacy for the single-prompt path.")
     for warning in engine.catalog_warnings(ctx):
         print(warning)
     catalog_path = _lora_catalog().catalog_path(WS)
@@ -2215,7 +2218,7 @@ def _print_robust_phase1(args, paths):
     else:
         print("Catalog LoRAs: none compatible in %s" % catalog_path)
     if args.judge:
-        print("Judge gate: bin/judge-story --patches after the critic rounds.")
+        print("Judge gate: bin/judge-story --patches after the critic rounds (report only).")
     prompt = engine.build_plan_prompt(ctx, compatible, ctx.pinned)
     argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_max_tokens(args.panels),
                             image=ctx.seed_agent_image)

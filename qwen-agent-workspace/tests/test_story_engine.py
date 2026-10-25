@@ -2547,13 +2547,14 @@ def test_rst47_robust_dry_run(tmp_path, story_env, monkeypatch):
             "--- Phase 1: story ---",
             "Would skip if %s already exists and re-check it instead (pass --force-story to "
             "regenerate)." % os.path.join(story_dir, "story.md"),
-            "Story engine: a JSON plan, one call per panel, deterministic checks and up to 3 "
-            "critic rounds (analyst via the local qwen-agentd, else a local one-shot); "
-            "--story-legacy for the single-prompt path.",
+            "Story engine: a JSON plan, one call per panel, deterministic checks and up to 2 "
+            "critic rounds that repair only spoken timing and the amount of action (analyst via "
+            "the local qwen-agentd, else a local one-shot); --story-legacy for the single-prompt "
+            "path.",
             catalog_line]
         command = block[5 if judge else 4]
         if judge:
-            assert block[4] == "Judge gate: bin/judge-story --patches after the critic rounds."
+            assert block[4] == "Judge gate: bin/judge-story --patches after the critic rounds (report only)."
         assert command.startswith("Command (subprocess timeout 600s): ")
         argv = shlex.split(proc.stdout.split("Command (subprocess timeout 600s): ", 1)[1]
                            .split("\n\nRendered plan prompt:\n", 1)[0])

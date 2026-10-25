@@ -1629,3 +1629,20 @@ def test_dlg27_speech_delivery_reaches_the_manifest(tmp_path, monkeypatch, capsy
             assert "--speech-delivery" not in line
         else:
             assert line.endswith(" --force --speech-delivery " + expected), line
+
+
+# --- 6.8, 6.9, CM6: bin/ltx-movie text ---------------------------------------------------------
+
+def test_ltx_movie_dialogue_help_and_docstring_text():
+    actions = ltx_movie.build_parser()._option_string_actions
+    assert actions["--judge"].help == (
+        "after the local critic rounds, run bin/judge-story --patches (Claude; needs "
+        "ANTHROPIC_API_KEY) as a final report: its scores go into story_checks.json and its "
+        "patches are saved, never applied")
+    assert actions["--story-legacy"].help.endswith(
+        " It does not ask for Dialogue: lines; a prefixed Narration: line still renders as "
+        "dialogue.")
+    doc = " ".join(ltx_movie.__doc__.split())
+    assert ("up to two local critic rounds that repair only spoken timing and the amount of action"
+            in doc)
+    assert "when blocking violations remain" in doc and "up to three local critic rounds" not in doc
