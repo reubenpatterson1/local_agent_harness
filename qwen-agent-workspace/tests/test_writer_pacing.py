@@ -115,8 +115,9 @@ SPEAKING_CHAINED = (
     " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
     "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
     "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
-    "the dialogue comes before they do anything, it is how they turn toward the camera); only "
-    "when the beat has them act after the dialogue, write what they do then as a second "
+    "the dialogue comes before they do anything, it is how they turn or step toward the camera; "
+    "never write only that they face it); only when the beat has them act after the dialogue, "
+    "write what they do then as a second "
     "sentence. Begin each of these sentences with @@SPEAKER@@, word for word, and write nothing "
     "about anyone else before the first one. The action before the dialogue and the action "
     "after it are the two parts of this one motion: never put an action from before the "
@@ -297,6 +298,13 @@ def test_wt5_the_contract_matches_the_placement(ws):
                    "ice. FuboTV hockey player faces the camera. " + SAY2 + " The FuboTV hockey "
                    "player skates off camera. The camera stays static.")
     assert out.index(SAY2) < out.index("skates off")
+    first = ("The FuboTV hockey player turns toward the camera. "
+             "The FuboTV hockey player skates away at real-time speed.")
+    out = _compose(first)
+    assert out == ("The FuboTV hockey player turns toward the camera. FuboTV hockey player faces "
+                   "the camera. " + SAY2 + " The FuboTV hockey player skates away at real-time "
+                   "speed. The camera stays static.")
+    assert out.index(SAY2) < out.index("skates away")
 
 
 def test_wt6_the_contract_motion_passes_the_checks(ws, tmp_path):
