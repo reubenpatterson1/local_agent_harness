@@ -1217,8 +1217,8 @@ def character_create_errors(body, state):
         errors.append("class noun must match [a-z]{3,12}")
     if trigger not in (None, "") and not (isinstance(trigger, str) and re.fullmatch(r"[a-z][a-z0-9]{3,15}", trigger)):
         errors.append("trigger must match [a-z][a-z0-9]{3,15}")
-    if seed_n is not None and not (isinstance(seed_n, int) and not isinstance(seed_n, bool) and seed_n >= 0):
-        errors.append("seed must be an integer >= 0")
+    if seed_n is not None and not (isinstance(seed_n, int) and not isinstance(seed_n, bool) and 0 <= seed_n <= 2147483647):
+        errors.append("seed must be an integer from 0 to 2147483647")
     if seed is not None and not (isinstance(seed, str) and lib.UPLOAD_ID_RE.fullmatch(seed)
                                  and os.path.isfile(os.path.join(state, "uploads", seed))):
         errors.append("seed image upload %s not found" % (_fs_text(seed) if isinstance(seed, str) else seed,))

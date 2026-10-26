@@ -849,7 +849,7 @@
       const name = S.character.character.name;
       const seedText = $("#ch-regen-seed").value.trim();
       const seedValue = Number(seedText);
-      const withSeed = seedText !== "" && Number.isInteger(seedValue) && seedValue >= 0 && seedValue <= 2147483647;
+      const withSeed = seedText !== "";
       const confirmText = withSeed ? "Regenerate the dataset of " + name + " with seed " + seedText + "?"
                                   : "Regenerate the dataset of " + name + "?";
       if (!(await askConfirm(confirmText))) { return; }

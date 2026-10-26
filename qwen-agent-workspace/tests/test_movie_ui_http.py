@@ -661,6 +661,9 @@ def test_mu64_mu65_character_endpoints(env):
     seed = _upload(s, mt.PNG, "image/png")[2]["upload_id"]
     create = {"ws": ws, "name": "kyra", "phrase": "the young woman", "class_noun": None, "descriptor": None,
               "trigger": None, "seed": None, "seed_upload": seed, "force": False}
+    for bad in (-1, 2 ** 31):
+        status, _h, payload = mt.api(s, "POST", "/api/characters", body=dict(create, seed=bad))
+        assert status == 400 and payload["errors"] == ["seed must be an integer from 0 to 2147483647"], bad
     status, _h, payload = mt.api(s, "POST", "/api/characters", body=create)
     assert status == 201 and payload["job"]["kind"] == "character-create" and payload["job"]["character"] == "kyra"
     job = lib.read_job(lib.job_dir(state, payload["job"]["id"]))

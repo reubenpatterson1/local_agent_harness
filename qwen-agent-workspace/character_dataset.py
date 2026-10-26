@@ -1152,15 +1152,6 @@ def create(args):
             new_seed = args.seed
         else:
             new_seed = old_seed
-        if new_seed != old_seed:
-            data["seed"] = new_seed
-            try:
-                character_lib.write_character(data)
-            except character_lib.CharacterError as e:
-                return _error(e)
-            print("seed: %d -> %d" % (old_seed, new_seed))
-        else:
-            print("seed: %d (unchanged)" % old_seed)
     else:
         if getattr(args, "new_seed", False):
             return _error("--new-seed needs --regenerate")
@@ -1247,6 +1238,17 @@ def create(args):
                           "bin/story-server %s" % (VLM_MODEL, MODELS_URL, VLM_SERVE_MODE))
 
         if data is not None:
+            # Persisted only now: the lock is held and every preflight passed, so a refused
+            # run never burns a seed and a concurrent job's character.json is never rewritten.
+            if new_seed != old_seed:
+                data["seed"] = new_seed
+                try:
+                    character_lib.write_character(data)
+                except character_lib.CharacterError as e:
+                    return _error(e)
+                print("seed: %d -> %d" % (old_seed, new_seed))
+            else:
+                print("seed: %d (unchanged)" % old_seed)
             return _regenerate(data, review)
 
         fh = raw = cls_vlm = box = None

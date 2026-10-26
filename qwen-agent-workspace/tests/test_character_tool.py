@@ -733,20 +733,77 @@ def test_seed_regenerate_plain_is_unchanged(lib_dir, monkeypatch, capsys):
 
 
 def test_seed_regenerate_same_seed_does_not_rewrite(lib_dir, monkeypatch, capsys):
+    _ronin_dataset(lib_dir, monkeypatch, seed=9)
+    capsys.readouterr()
+    real_write, real_regen = character_lib.write_character, character_dataset._regenerate
+    for extra in (["--seed", "9"], []):
+        # stop at generation with the child_error fake; the build itself rewrites the file
+        # later, so count the writes made before the build starts.
+        fakes = _Fakes(monkeypatch, child_error=character_dataset.DatasetError("boom"))
+        writes = []
+        monkeypatch.setattr(character_lib, "write_character",
+                            lambda data: writes.append(data["seed"]) or real_write(data))
+        before_build = []
+        monkeypatch.setattr(character_dataset, "_regenerate",
+                            lambda data, review=False: before_build.append(len(writes))
+                            or real_regen(data, review))
+        assert tool.main(["create", "ronin", "--regenerate"] + extra) == 1
+        assert before_build == [0]
+        assert "seed: 9 (unchanged)" in capsys.readouterr().out.splitlines()
+
+
+def test_seed_regenerate_refused_preflight_does_not_burn_the_seed(lib_dir, monkeypatch, capsys):
     path = _ronin_dataset(lib_dir, monkeypatch, seed=9)
     capsys.readouterr()
     before = open(path).read()
-    # stop before generation: the vision model is "not served"
+    lock = os.path.join(lib_dir, ".lock")
+    with monkeypatch.context() as m:
+        _Fakes(m)
+        with open(lock, "w") as f:
+            f.write(str(os.getppid()))
+        assert tool.main(["create", "ronin", "--regenerate", "--new-seed"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ("Error: another bin/character create/train is running (pid %d); run "
+                            "one at a time\n" % os.getppid())
+    assert "seed:" not in captured.out and open(path).read() == before
+    os.remove(lock)
+    with monkeypatch.context() as m:
+        _Fakes(m)
+        m.setattr(character_dataset, "busy_process", lambda: (4242, "train"))
+        assert tool.main(["create", "ronin", "--regenerate", "--new-seed"]) == 2
+    captured = capsys.readouterr()
+    assert "seed:" not in captured.out and open(path).read() == before
+    with monkeypatch.context() as m:
+        _Fakes(m)
+        m.setattr(character_dataset, "vlm_ready", lambda: False)
+        assert tool.main(["create", "ronin", "--regenerate", "--new-seed"]) == 2
+    assert "seed:" not in capsys.readouterr().out and open(path).read() == before
+
+
+def test_seed_regenerate_seed_mode_new_seed_reaches_the_edit_jobs(tmp_path, lib_dir, monkeypatch,
+                                                                   capsys):
+    _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=[3] * 20 + [9] * 5)
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 3
+    capsys.readouterr()
+    fakes = _Fakes(monkeypatch, scores=[9] * 25)
+    assert tool.main(["create", "kyra", "--regenerate", "--new-seed", "--no-review"]) == 0
+    assert "seed: 0 -> 1" in capsys.readouterr().out.splitlines()
+    spec, step = fakes.child_specs[0]
+    assert step == "edit" and spec["jobs"]
+    assert all(job["seed"] == 1 for job in spec["jobs"])
+    assert character_lib.load_character("kyra")["seed"] == 1
+
+
+def test_seed_new_seed_on_a_trained_character_is_refused(lib_dir, monkeypatch, capsys):
     _Fakes(monkeypatch)
-    monkeypatch.setattr(character_dataset, "vlm_ready", lambda: False)
-    os.utime(path, (1000000000, 1000000000))
-    assert tool.main(["create", "ronin", "--regenerate", "--seed", "9"]) == 2
-    out = capsys.readouterr().out
-    assert "seed: 9 (unchanged)" in out.splitlines()
-    assert open(path).read() == before and os.stat(path).st_mtime == 1000000000
-    assert tool.main(["create", "ronin", "--regenerate"]) == 2
-    assert "seed: 9 (unchanged)" in capsys.readouterr().out.splitlines()
-    assert open(path).read() == before and os.stat(path).st_mtime == 1000000000
+    make_character(lib_dir)
+    path = os.path.join(lib_dir, "kyra", "character.json")
+    before = open(path).read()
+    assert tool.main(["create", "kyra", "--regenerate", "--new-seed"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == ("Error: character kyra is trained; regenerating its dataset would orphan "
+                            "its LoRAs. Create a new character instead\n")
+    assert "seed:" not in captured.out and open(path).read() == before
 
 
 @pytest.mark.parametrize("extra,message", [
