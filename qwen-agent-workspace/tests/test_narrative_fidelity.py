@@ -638,3 +638,55 @@ def test_nf22b_cut_words_and_collective_heads():
     for phrase in ("the captain of the team", "a member of the crowd",
                    "the lead singer of the band", "the man in the crowd", "the woman in grey"):
         assert not se.is_group_entry(_entry(phrase)), phrase
+
+
+# --- NF12: the plan prompt (QL6, 7.1) -------------------------------------------------------------
+
+CAST_LINE = ("cast: a list with one object per individual character who acts or speaks on screen, "
+             "with the keys id, phrase and descriptor; a group of people (a crowd, an audience, "
+             "fans, spectators, a team) is never a cast entry, and belongs in the setting sentence "
+             "of its place. id is c1, c2, c3 and so on, in order. phrase is the character's "
+             "referring phrase:")
+SETTING_LINE = ("names the period, the place, the ground, the light and any crowd or other group "
+                "of people in the background.\n")
+SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
+                "during the beat, or an empty string when nobody speaks; give a speaker only where "
+                "a spoken line moves the story. A beat with a speaker shows only that character "
+                "(its cast is just their id), facing the camera, in a medium shot, medium close-up "
+                "or close-up; the speaker may move during the beat, and the camera may stay static, "
+                "push in, pull back or track them, as long as their face stays in frame and lit "
+                "while they speak.")
+LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
+              "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
+              "exactly one beat, in the narrative's order: give each line to the beat whose action "
+              "surrounds it in the narrative, and give a speaker to every beat with lines and to no "
+              "other beat. A beat may hold two or more consecutive lines only when together they "
+              "are at most @@LINE_WORDS@@ words. Give each line its own beat whenever there are at "
+              "least as many beats as lines.")
+SPOKEN_BLOCK = ("\n\nSpoken lines (the narrative quotes these words; the movie must speak every one "
+                "of them on camera, word for word, in this order):\n1. \"%s\"\n2. \"%s\""
+                % (LINE1, LINE2))
+
+
+def test_nf12_the_plan_prompt(ws):
+    assert (se.SPEAKER_RULE, se.LINES_RULE) == (SPEAKER_RULE, LINES_RULE)
+    assert se.spoken_lines_block([LINE1, LINE2]) == SPOKEN_BLOCK
+    assert se.spoken_lines_block([]) == ""
+    prompt = se.build_plan_prompt(_hockey_ctx(ws, "hockey-2x145"), [], [])
+    assert ("Narrative to adapt:\n" + HOCKEY + SPOKEN_BLOCK + "\n\nThe target output goal is "
+            ) in prompt
+    assert "location, cast, speaker and lines. index runs from 1 to 2." in prompt
+    assert ("at most 4." + SPEAKER_RULE + LINES_RULE.replace("@@LINE_WORDS@@", "13") + "\n"
+            ) in prompt
+    assert CAST_LINE in prompt and SETTING_LINE in prompt and "@@" not in prompt
+    one = se.build_plan_prompt(_hockey_ctx(ws, "hockey-1x241"), [], [])
+    assert "together they are at most 14 words." in one and "@@" not in one
+    quiet = se.build_plan_prompt(seu.make_ctx(se, ws), [], [])
+    assert "Spoken lines (" not in quiet and "lines is the list" not in quiet
+    assert "location, cast and speaker. index runs" in quiet
+    assert ("at most 4." + SPEAKER_RULE + "\n") in quiet
+    assert CAST_LINE in quiet and SETTING_LINE in quiet and "@@" not in quiet
+    silent = se.build_plan_prompt(_hockey_ctx(ws, "hockey-2x145", narration=False), [], [])
+    assert "Spoken lines (" not in silent and "lines is the list" not in silent
+    assert "location, cast and speaker. index runs" in silent
+    assert ("at most 4." + se.SILENT_SPEAKER_RULE + "\n") in silent

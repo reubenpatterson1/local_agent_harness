@@ -286,8 +286,10 @@ PLAN_PROMPT_TEMPLATE = (
     "\n"
     "title: the movie's title, at most 8 words.\n"
     "logline: one sentence of 8 to 40 words that summarises the story.\n"
-    "cast: a list with one object per character who is ever on screen, with the keys id, phrase "
-    "and descriptor. id is c1, c2, c3 and so on, in order. phrase is the character's referring "
+    "cast: a list with one object per individual character who acts or speaks on screen, with "
+    "the keys id, phrase and descriptor; a group of people (a crowd, an audience, fans, "
+    "spectators, a team) is never a cast entry, and belongs in the setting sentence of its "
+    "place. id is c1, c2, c3 and so on, in order. phrase is the character's referring "
     "phrase: at most four words, built only from details in their descriptor or stated by the "
     "narrative; the movie names them by this exact phrase everywhere. descriptor is their full "
     'visual description in 8 to 60 words that starts with "a " or "an " and does not end with a '
@@ -295,12 +297,13 @@ PLAN_PROMPT_TEMPLATE = (
     "accessories.@@CAST_FIXED@@\n"
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
     'so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names '
-    "the period, the place, the ground and the light.\n"
+    "the period, the place, the ground, the light and any crowd or other group of people in the "
+    "background.\n"
     "props: a list with one object per object that matters to the story, with the keys id and "
     "name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list "
     "when no object matters.\n"
     "beats: a list of EXACTLY @@PANELS@@ objects, one per panel in order, with the keys index, "
-    "arc, action, shot, camera, location, cast and speaker. index runs from 1 to @@PANELS@@. arc "
+    "arc, action, shot, camera, location, @@BEAT_KEYS@@. index runs from 1 to @@PANELS@@. arc "
     "is one of "
     "introduction, rising, climax, falling, resolution, in story order; @@ARC_RULE@@ action is "
     "one sentence of 6 to 40 words saying what the characters physically do during these "
@@ -308,7 +311,7 @@ PLAN_PROMPT_TEMPLATE = (
     "of steps, with no on-screen text. shot is exactly one of: @@SHOT_LIST@@. "
     "camera is exactly one of: @@CAMERA_LIST@@. location is the id of the place where the beat "
     "happens. cast is the list of ids of the characters on screen in the beat, at most "
-    "@@MAX_CAST@@.@@SPEAKER_RULE@@\n"
+    "@@MAX_CAST@@.@@SPEAKER_RULE@@@@LINES_RULE@@\n"
     "loras: @@LORA_PARAGRAPH@@\n"
     "\n"
     "@@MODE_RULES@@" + NO_TOOL_SENTENCE)
@@ -344,9 +347,19 @@ MODE_RULES = {
 SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
-                "(its cast is just their id), in a medium close-up or close-up, facing the camera, "
-                "with the camera static or a slow push-in.")
+                "(its cast is just their id), facing the camera, in a medium shot, medium close-up "
+                "or close-up; the speaker may move during the beat, and the camera may stay static, "
+                "push in, pull back or track them, as long as their face stays in frame and lit "
+                "while they speak.")
 SILENT_SPEAKER_RULE = " speaker is always an empty string: nobody speaks in this movie."
+# Narrative dialogue fidelity spec 7.1 (e): only when the narrative quotes spoken lines.
+LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
+              "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
+              "exactly one beat, in the narrative's order: give each line to the beat whose action "
+              "surrounds it in the narrative, and give a speaker to every beat with lines and to no "
+              "other beat. A beat may hold two or more consecutive lines only when together they "
+              "are at most @@LINE_WORDS@@ words. Give each line its own beat whenever there are at "
+              "least as many beats as lines.")
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
 LORA_PICK_PARAGRAPH = (
@@ -483,6 +496,15 @@ def spoken_lines(narrative):
 def required_lines(ctx):
     """The spoken lines the movie must speak on camera (QL4): none with --no-narration."""
     return [] if ctx.narration is False else spoken_lines(ctx.narrative)
+
+
+def spoken_lines_block(lines):
+    """The numbered spoken-lines block appended to the narrative in the plan and critic prompts
+    (QL6, QL11), or "" when there are no lines."""
+    if not lines:
+        return ""
+    return "\n\n" + SPOKEN_LINES_HEADER + "".join('\n%d. "%s"' % (i, line)
+                                                 for i, line in enumerate(lines, start=1))
 
 
 def _n_sentences(n):
@@ -688,7 +710,9 @@ def undeclared_message(prefix, where, hit):
 
 
 def build_plan_prompt(ctx, compatible, pins):
-    """The exact plan prompt of RS7."""
+    """The exact plan prompt of RS7 (narrative dialogue fidelity spec QL6: the spoken-lines block
+    after the narrative, the lines key and LINES_RULE when the narrative quotes spoken lines)."""
+    lines = required_lines(ctx)
     undeclared = undeclared_characters(ctx)
     cast_fixed = ""
     if undeclared:
@@ -723,10 +747,18 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
         ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False else SPEAKER_RULE),
+        ("@@BEAT_KEYS@@", "cast, speaker and lines" if lines else "cast and speaker"),
+        ("@@LINES_RULE@@", LINES_RULE if lines else ""),
     ]
+    # character_lib is loaded only for a narrative with spoken lines, so an uncast dry run still
+    # never loads it (test_rst47, test_s53).
+    line_cap = (str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 2))
+                if lines else "")
     scalars = [("@@STORY_ID@@", ctx.story_id), ("@@PANELS@@", str(ctx.panels)),
-               ("@@SECONDS@@", ctx.seconds), ("@@MAX_CAST@@", str(MAX_CAST[ctx.mode]))]
-    return _fill(PLAN_PROMPT_TEMPLATE, fragments, scalars, ctx.narrative)
+               ("@@SECONDS@@", ctx.seconds), ("@@MAX_CAST@@", str(MAX_CAST[ctx.mode])),
+               ("@@LINE_WORDS@@", line_cap)]
+    return _fill(PLAN_PROMPT_TEMPLATE, fragments, scalars,
+                 ctx.narrative + spoken_lines_block(lines))
 
 
 def _readable(path):

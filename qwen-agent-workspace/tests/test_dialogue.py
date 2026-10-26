@@ -648,8 +648,9 @@ def test_dlg12_plan_prompt_speaker_rule(ws):
     spoken = (" speaker is the id of the one character who says something aloud on screen during "
               "the beat, or an empty string when nobody speaks; give a speaker only where a spoken "
               "line moves the story. A beat with a speaker shows only that character (its cast is "
-              "just their id), in a medium close-up or close-up, facing the camera, with the camera "
-              "static or a slow push-in.")
+              "just their id), facing the camera, in a medium shot, medium close-up or close-up; "
+              "the speaker may move during the beat, and the camera may stay static, push in, pull "
+              "back or track them, as long as their face stays in frame and lit while they speak.")
     silent = " speaker is always an empty string: nobody speaks in this movie."
     for mode in ("chained", "no_stills", "shots"):
         for narration, rule in ((True, spoken), ("speech", spoken), (False, silent)):
