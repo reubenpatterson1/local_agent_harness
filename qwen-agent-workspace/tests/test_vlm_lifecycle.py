@@ -1013,7 +1013,7 @@ def test_vl27_story_server_bash_syntax():
 # --- VL22: VK2 end to end through the real story-server-restore (VRS3, VR6) --------------------
 
 # An F-SS variant (spec 11.2): its mode call takes the "lock", starts a `sleep 60` standing in for
-# the loading server (pid in <dir>/sleeper.pid), and exits after 3 s.
+# the loading server (pid in <dir>/sleeper.pid), and exits after 3 s; its own pid is in <dir>/fake.pid.
 FSS_SPAWN = """#!/bin/bash
 T='%s'
 case "$1" in
@@ -1026,6 +1026,7 @@ case "$1" in
         exit 0 ;;
 esac
 echo "lock: held pid=$$ cmd=$1 since=x path=x" > "$T/lockinfo"
+echo $$ > "$T/fake.pid.tmp" && mv "$T/fake.pid.tmp" "$T/fake.pid"
 /bin/sleep 60 &
 echo $! > "$T/sleeper.pid.tmp" && mv "$T/sleeper.pid.tmp" "$T/sleeper.pid"
 sleep 3
@@ -1049,11 +1050,17 @@ def _restore_job(state, tmp_path, name, monkeypatch):
     runner = mt.dispatch(state, job_id)
     pid_file = fss / "sleeper.pid"
     mt.wait_until(pid_file.exists, 20)
+    fake = int((fss / "fake.pid").read_text())
+    # The launcher exited at once, so the fake server (the started story-server) is reparented to
+    # launchd and leads its own session: the double fork (VRS3).
+    mt.wait_until(lambda: _ppid(fake) == 1, 5)
+    assert _ppid(fake) == 1
+    assert os.getsid(fake) == fake
     return job_id, runner, int(pid_file.read_text())
 
 
 def _ppid(pid):
-    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
     return int(out.stdout.strip() or -1)
 
 
@@ -1072,8 +1079,6 @@ def test_vl22_cancel_and_kill_orphan_never_reach_a_started_server(state, tmp_pat
         assert status["pgid"] in groups
         assert mt.pid_alive(sleeper)
         assert os.getpgid(sleeper) not in groups and os.getsid(sleeper) not in groups
-        mt.wait_until(lambda: _ppid(sleeper) == 1, 10)
-        assert _ppid(sleeper) == 1
 
         job_id, runner, sleeper = _restore_job(state, tmp_path, "orphaned", monkeypatch)
         sleepers.append(sleeper)
@@ -1086,8 +1091,6 @@ def test_vl22_cancel_and_kill_orphan_never_reach_a_started_server(state, tmp_pat
         assert lib.kill_orphan(state, job_id) == status["pgid"]
         mt.wait_until(lambda: not lib.group_alive(status["pgid"]), 10)
         assert mt.pid_alive(sleeper)
-        mt.wait_until(lambda: _ppid(sleeper) == 1, 10)
-        assert _ppid(sleeper) == 1 and os.getsid(sleeper) != status["pgid"]
     finally:
         for pid in sleepers:
             try:
