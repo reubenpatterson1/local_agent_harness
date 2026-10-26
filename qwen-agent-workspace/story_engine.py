@@ -438,8 +438,8 @@ def _speech_verb_at(words, p, inverted=False):
     noun, "everyone" or "everybody", and the two words before are not "passers by". When
     inverted (the verb opens the clause after the quote, as in '"Go!" yells the crowd'), a
     group word within three words after the verb also rejects it, if the group word heads its
-    noun phrase (it ends the words, or a preposition of AFTER_VERB_PREPOSITIONS, "of" or a
-    CLAUSE_STOP_WORDS word follows it) and no AFTER_VERB_PREPOSITIONS word comes first (a
+    noun phrase (it ends the words, or a preposition of AFTER_VERB_PREPOSITIONS, "of", "in",
+    "on", "from" or a CLAUSE_STOP_WORDS word follows it) and no AFTER_VERB_PREPOSITIONS word comes first (a
     preposition first means the speaker addresses the group)."""
     word = words[p]
     verb = word in SPEECH_VERBS or (word in CALL_VERBS and p + 1 < len(words)
@@ -454,7 +454,8 @@ def _speech_verb_at(words, p, inverted=False):
                 break
             if words[q] in GROUP_SPEAKER_WORDS and (
                     q + 1 == len(words) or words[q + 1] in AFTER_VERB_PREPOSITIONS
-                    or words[q + 1] == "of" or words[q + 1] in CLAUSE_STOP_WORDS):
+                    or words[q + 1] in ("of", "in", "on", "from")
+                    or words[q + 1] in CLAUSE_STOP_WORDS):
                 return False
     return True
 

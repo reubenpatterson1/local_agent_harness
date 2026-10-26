@@ -1369,7 +1369,8 @@ def test_nf21b_q1_patch_keeps_order(ws):
 def test_nf2b_crowd_speech_is_not_a_required_line():
     for narrative in ('"Go!" yells the crowd.', '"Encore!" cry the fans.',
                       'Passers-by shout "Hey!"', 'Everybody yells "Surprise!"',
-                      'Everyone shouts "Now!"', '"Again!" chants the whole crowd.'):
+                      'Everyone shouts "Now!"', '"Again!" chants the whole crowd.',
+                      '"Go!" yells the crowd in the stands.'):
         assert [spoken for _inner, spoken in se.classify_quotes(narrative)] == [False], narrative
     for narrative in ('Mia yells at the crowd, "Go home!"', '"Run," says Tom to the fans.',
                       'The captain shouts "Skate!"', 'The coach tells the team, "Skate hard."',
