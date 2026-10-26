@@ -441,7 +441,7 @@
       showChecks(res.data.checks);
       selectJob(res.data.job.id);
       await pollJobs();
-      showTab("jobs");
+      if (!(res.data.checks || []).some(function (c) { return c.status === "warn"; })) { showTab("jobs"); }
     } else if (res.status === 409) {
       showChecks(res.data.checks);
     } else {

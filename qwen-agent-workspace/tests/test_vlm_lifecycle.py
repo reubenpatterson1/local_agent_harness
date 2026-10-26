@@ -962,6 +962,8 @@ def test_vl26_page_gate_and_warn_style():
         css = f.read()
     assert ".check-warn { color: var(--warn); }\n" in css
     assert css.index(".check-skip, .check-running") < css.index(".check-warn")
+    assert 'c.status === "warn"' in js
+    assert 'showTab("jobs"); }' in js
 
 
 # --- VL24, VL27: the escape hatch and the compile guards (2.5, 13(d), VK7) ---------------------
