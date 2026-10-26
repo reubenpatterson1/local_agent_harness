@@ -42,17 +42,17 @@ def shot_types(narration):
     return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
 CAMERA_SENTENCES = (
     ("static", "The camera stays static."),
-    ("slow push-in", "The camera slowly pushes in."),
-    ("slow pull-back", "The camera slowly pulls back."),
-    ("slow pan left", "The camera slowly pans left."),
-    ("slow pan right", "The camera slowly pans right."),
-    ("slow tilt up", "The camera slowly tilts up."),
-    ("slow tilt down", "The camera slowly tilts down."),
+    ("slow push-in", "The camera pushes in."),
+    ("slow pull-back", "The camera pulls back."),
+    ("slow pan left", "The camera pans left."),
+    ("slow pan right", "The camera pans right."),
+    ("slow tilt up", "The camera tilts up."),
+    ("slow tilt down", "The camera tilts down."),
     ("tracking", "The camera tracks alongside the movement."),
 )
 CAMERA_KEYS = tuple(key for key, _ in CAMERA_SENTENCES)
 ARC_ROLES = ("introduction", "rising", "climax", "falling", "resolution")
-WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (25, 50), "motion": (15, 35)},
+WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (15, 35), "motion": (15, 35)},
                "no_stills": {"prompt": (150, 220)},
                "shots": {"image": (80, 170), "motion": (10, 25)}}
 NARRATION_WORDS = (3, 30)
@@ -1234,8 +1234,10 @@ KEY_LINE_TEMPLATES = {
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
         "word for word. Describe ONE continuous physical motion, not a sequence of separate "
-        "steps. You may add one camera direction; without one, the pipeline adds the planned "
-        "camera sentence."),
+        "steps: @@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the "
+        "start of a movement. The motion plays at natural, real-time speed: do not use words "
+        "that slow it down, such as slow, slowly, gently or gradually. You may add one camera "
+        "direction; without one, the pipeline adds the planned camera sentence."),
     "chained_motion": (
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "

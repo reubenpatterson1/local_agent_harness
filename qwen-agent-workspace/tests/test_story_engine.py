@@ -85,7 +85,7 @@ def test_rs4_constants():
         "static", "slow push-in", "slow pull-back", "slow pan left", "slow pan right",
         "slow tilt up", "slow tilt down", "tracking"]
     assert se.ARC_ROLES == ("introduction", "rising", "climax", "falling", "resolution")
-    assert se.WORD_RANGES["chained"] == {"image1": (120, 170), "motion1": (25, 50),
+    assert se.WORD_RANGES["chained"] == {"image1": (120, 170), "motion1": (15, 35),
                                          "motion": (15, 35)}
     assert se.MAX_CAST == {"chained": 4, "no_stills": 4, "shots": 2}
     assert (se.PLAN_MAX_CALLS, se.PANEL_MAX_CALLS, se.CRITIC_MAX_ROUNDS,
@@ -819,7 +819,7 @@ def test_rst16_panel_prompt(ws):
     rules = "\n".join(line.strip() for line in rules.split("\n"))
     expected = {
         ("chained", 1): ["image: 27 to 77 words describing the opening frame",
-                         "motion: 21 to 46 words in one or two plain sentences: what the characters "
+                         "motion: 11 to 31 words in one or two plain sentences: what the characters "
                          "physically do during these 6 seconds. Name"],
         ("chained", 2): ["motion: 15 to 35 words in one or two plain sentences: what the characters "
                          "physically do during these 6 seconds, continuing"],
@@ -2888,3 +2888,41 @@ def test_rst27b_patch_validation_messages_on_live_fields(ws):
         "replacement must be a string",
         "index 9 is out of range for lora (allowed: 0 to 4)",
         "replacement must be a list of picks"]
+
+
+def test_pacing_camera_sentences_classify_as_before(ws):
+    ctx, plan, _parts, _t, _p = _story(ws, "chained", 3)
+    lib = se._character_lib(WS)
+    phrases = [c["phrase"] for c in plan["cast"] if c["phrase"]]
+    sentences = dict(se.CAMERA_SENTENCES)
+    assert len(sentences) == 8
+    old = {"slow push-in": "The camera slowly pushes in.", "slow pull-back": "The camera slowly pulls back.",
+           "slow pan left": "The camera slowly pans left.", "slow pan right": "The camera slowly pans right.",
+           "slow tilt up": "The camera slowly tilts up.", "slow tilt down": "The camera slowly tilts down.",
+           "static": sentences["static"], "tracking": sentences["tracking"]}
+    for key, sentence in sentences.items():
+        # same classification as the pre-change sentence; "static" is True for all three
+        # (CAMERA_MOTION_RE lists static/holds as camera-direction words)
+        assert lib._is_camera_sentence(sentence, phrases), key
+        assert lib._is_camera_sentence(old[key], phrases), key
+        assert se._moves_camera(ctx, plan, sentence) is True, key
+        assert se._moves_camera(ctx, plan, old[key]) is True, key
+        assert bool(se.CAMERA_MOTION_RE.search(sentence)) is True, key
+    assert sentences["slow push-in"] == "The camera pushes in."
+    assert sentences["slow tilt down"] == "The camera tilts down."
+
+
+def test_pacing_panel1_prompt_and_no_slowly(ws):
+    ctx, plan, parts, _t, _p = _story(ws, "chained", 3)
+    prompt = se.build_panel_prompt(ctx, plan, parts, 1)
+    assert "The motion plays at natural, real-time speed: do not use words that slow it down, " \
+        "such as slow, slowly, gently or gradually." in prompt
+    # the 15-35 band less the 4 words of the pasted camera sentence ("The camera stays static.")
+    assert "motion: 11 to 31 words" in prompt
+    assert se.WORD_RANGES["chained"]["motion1"] == (15, 35)
+    for sentence in dict(se.CAMERA_SENTENCES).values():
+        assert "slowly" not in sentence
+    pacing = se.KEY_LINE_TEMPLATES["chained_motion1"]
+    for name, text in list(se.KEY_LINE_TEMPLATES.items()) + [("panel", se.PANEL_PROMPT_TEMPLATE)]:
+        if text is not pacing:
+            assert "slowly" not in text, name
