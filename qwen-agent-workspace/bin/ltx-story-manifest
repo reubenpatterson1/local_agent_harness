@@ -828,7 +828,8 @@ def main(argv=None):
         if speaker is not None and motion_prompt is not None:
             lib_ = _character_lib()
             motion_prompt = lib_.insert_speech(
-                motion_prompt, lib_.speech_text(speaker, speech, args.speech_delivery), [speaker])
+                motion_prompt, lib_.speech_text(speaker, speech, args.speech_delivery), [speaker],
+                first_action=bool(args.chain or args.shots))
         panel = {
             "index": i,
             "image_path": None if image_path is None else os.path.abspath(image_path),

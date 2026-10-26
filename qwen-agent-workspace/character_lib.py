@@ -715,16 +715,30 @@ def speech_sentence(phrase, speech):
     return '%s says: "%s"' % (phrase[:1].upper() + phrase[1:], speech)
 
 
-def insert_speech(text, sentence, phrases=()):
+def insert_speech(text, sentence, phrases=(), first_action=False):
     """text with sentence added before the run of trailing camera sentences
     (_is_camera_sentence with phrases, so a pasted "<Speaker> faces the camera." stays with the
     action), never before the first sentence; at the end when there is no such run (dialogue
-    spec DG6)."""
+    spec DG6). With first_action (bin/ltx-story-manifest --chain and --shots) and two or more
+    action sentences before that run (neither a camera sentence nor a pasted facing sentence),
+    sentence goes right after the first action sentence instead, any pasted facing sentence
+    moves to just before it, and the trailing camera run stays last (narrative dialogue fidelity
+    spec SP-P1)."""
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
     trailing = 0
     while (trailing < len(sentences)
            and _is_camera_sentence(sentences[len(sentences) - 1 - trailing], phrases)):
         trailing += 1
+    if first_action:
+        body = sentences[:len(sentences) - trailing]
+        actions = [i for i, s in enumerate(body)
+                   if not _is_camera_sentence(s, phrases) and not is_facing_sentence(s, phrases)]
+        if len(actions) >= 2:
+            facing = [s for s in body if is_facing_sentence(s, phrases)]
+            rest = [s for s in body if not is_facing_sentence(s, phrases)]
+            at = len([s for s in body[:actions[0] + 1] if not is_facing_sentence(s, phrases)])
+            return " ".join(rest[:at] + facing + [sentence] + rest[at:]
+                            + sentences[len(sentences) - trailing:])
     if len(sentences) > 1 and trailing >= 1:
         at = max(len(sentences) - trailing, 1)
         return " ".join(sentences[:at] + [sentence] + sentences[at:])
@@ -1093,6 +1107,13 @@ def _appositive_nouns(sentence, members):
 # The sentence the robust engine pastes into a speaking panel's Motion: (dialogue spec SP4); with
 # shots_violations(ignore_facing=True) it is not an S5 action sentence (controller ruling Q1).
 FACING_SENTENCE = "%s faces the camera."
+
+
+def is_facing_sentence(sentence, phrases):
+    """True when sentence is exactly a pasted "<Phrase> faces the camera." for one of phrases
+    (case-insensitive; narrative dialogue fidelity spec SP-P1)."""
+    return sentence.strip().lower() in {(FACING_SENTENCE % (p[:1].upper() + p[1:])).lower()
+                                        for p in phrases}
 
 
 def _drop_facing(text, phrases):
