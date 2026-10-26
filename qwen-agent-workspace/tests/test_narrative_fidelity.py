@@ -1163,6 +1163,20 @@ def test_nf37b_assign_keeps_runs_consecutive(ws):
              3: {"speaker": "c1", "lines": [5]}}
     ctx, plan = _lines_plan(ws, five, beats)
     notes = se.assign_missing_lines(ctx, plan)
-    assert [b["lines"] for b in plan["beats"]] == [[], [], [4, 5]]
-    assert notes == [GIVEN % (3, 4)]
+    # the pass repeats: line 4 first, then line 3 ([3, 5] was not a run). [2, 3, 4, 5] is 13 words
+    # in 4 sentences and the clip fits 11, so line 2 stays out; line 1 would make [1, 3, 4, 5].
+    assert [b["lines"] for b in plan["beats"]] == [[], [], [3, 4, 5]]
+    assert notes == [GIVEN % (3, 4), GIVEN % (3, 3)]
+    before = copy.deepcopy(plan)
+    assert se.assign_missing_lines(ctx, plan) == [] and plan == before
+    # courier: beats 1 and 2 two-cast and no speaker, beat 3 holds [3]; line 2 joins it in the
+    # first pass, line 1 in the second ([1, 2, 3] is 9 words, which fits)
+    beats = {1: {"cast": ["c1", "c2"]}, 2: {"cast": ["c1", "c2"]},
+             3: {"speaker": "c1", "lines": [3]}}
+    ctx, plan = _lines_plan(ws, COURIER_LINES, beats)
+    notes = se.assign_missing_lines(ctx, plan)
+    assert [b["lines"] for b in plan["beats"]] == [[], [], [1, 2, 3]]
+    assert notes == [GIVEN % (3, 2), GIVEN % (3, 1)]
+    before = copy.deepcopy(plan)
+    assert se.assign_missing_lines(ctx, plan) == [] and plan == before
 

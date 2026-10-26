@@ -1046,36 +1046,42 @@ def assign_missing_lines(ctx, plan):
     it has a speaker or exactly one cast member (who becomes the speaker, with
     speaking_coercion), its lines with the new one still form a consecutive run, and they still
     fit the clip. A line with no eligible beat stays unassigned, for Q1 and the critic. Lines the
-    plan placed never move."""
+    plan placed never move. The pass repeats until it places no line (at most once for each
+    spoken line), so the result does not depend on the order lines are tried."""
     spoken, beats, notes = plan["spoken_lines"], plan["beats"], []
     if not spoken:
         return notes
     lib = _character_lib(ctx.ws)
     cast_ids = [c["id"] for c in plan["cast"]]
     holder = dict((n, k) for k, beat in enumerate(beats, start=1) for n in beat["lines"])
-    for n in range(1, len(spoken) + 1):
-        if n in holder:
-            continue
-        earlier = [holder[m] for m in range(1, n) if m in holder]
-        prev_k = earlier[-1] if earlier else 0
-        later = [holder[m] for m in range(n + 1, len(spoken) + 1) if m in holder]
-        next_k = later[0] if later else len(beats)
-        for k in list(range(prev_k + 1, next_k + 1)) + ([prev_k] if prev_k else []):
-            beat = beats[k - 1]
-            if not (beat["speaker"] or (len(beat["cast"]) == 1 and beat["cast"][0] in cast_ids)):
+    for _ in range(len(spoken)):
+        placed = len(notes)
+        for n in range(1, len(spoken) + 1):
+            if n in holder:
                 continue
-            lines = sorted(beat["lines"] + [n])
-            if any(b != a + 1 for a, b in zip(lines, lines[1:])):
-                continue
-            if line_problem(ctx, lib, " ".join(spoken[m - 1] for m in lines)):
-                continue
-            notes.append("beat %d: P14 speaking beat: line %d given to this beat by the pipeline, "
-                         "because the plan gave it to no beat" % (k, n))
-            if not beat["speaker"]:
-                beat["speaker"] = beat["cast"][0]
-                notes += speaking_coercion(ctx, plan, k)
-            beat["lines"] = lines
-            holder[n] = k
+            earlier = [holder[m] for m in range(1, n) if m in holder]
+            prev_k = earlier[-1] if earlier else 0
+            later = [holder[m] for m in range(n + 1, len(spoken) + 1) if m in holder]
+            next_k = later[0] if later else len(beats)
+            for k in list(range(prev_k + 1, next_k + 1)) + ([prev_k] if prev_k else []):
+                beat = beats[k - 1]
+                if not (beat["speaker"]
+                        or (len(beat["cast"]) == 1 and beat["cast"][0] in cast_ids)):
+                    continue
+                lines = sorted(beat["lines"] + [n])
+                if any(b != a + 1 for a, b in zip(lines, lines[1:])):
+                    continue
+                if line_problem(ctx, lib, " ".join(spoken[m - 1] for m in lines)):
+                    continue
+                notes.append("beat %d: P14 speaking beat: line %d given to this beat by the pipeline, "
+                             "because the plan gave it to no beat" % (k, n))
+                if not beat["speaker"]:
+                    beat["speaker"] = beat["cast"][0]
+                    notes += speaking_coercion(ctx, plan, k)
+                beat["lines"] = lines
+                holder[n] = k
+                break
+        if len(notes) == placed:
             break
     return notes
 

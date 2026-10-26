@@ -438,6 +438,8 @@ A beat is **eligible** for line `n` when all of these hold:
 
 The candidates are the first eligible beat after the beat holding the nearest earlier line, in beat order, and then that same beat. A line with no eligible beat stays unassigned: Q1 then fires, and the critic's Q1 patch (QL13) is the remaining repair.
 
+**Amendment (implementation ruling, 2026-10-26):** a beat is eligible for line n only if its lines plus n form a consecutive run (spec 7.1 e); and the pass repeats until it places no line (at most one pass per spoken line), so the result does not depend on processing order and a second call is a no-op. Pinned by NF37b.
+
 The notes reach `plan_checks` through `speech_notes` and are written to plan.json. The function runs only in `go()`; the replays NF8 and NF9 call `make_state` directly, so they still exercise Q1 itself.
 
 Expected results on the recorded replies:
@@ -905,6 +907,7 @@ No test renders, contacts a server or reads the real HOME. Helpers:
 | NF35 | the manifest (`_manifest_ws`/`_manifest_argv` of test_dialogue, chained, 2 panels, `frames=145`, plan with cast `the FuboTV player`). Panel 2 of the SP-P worked example → `motion_prompt` equals the worked example with `<AC>` = `ACOUSTIC_SENTENCE`; with `--speech-delivery plain` → the plain variant. The same panel under `--shots` gets the same placement. A no_stills `Prompt:` panel with two action sentences keeps today's placement (before the trailing camera run) |
 | NF36 | Q3: the narrative `He says "Go.` → the advisory exactly `"plan: Q3 quotes: the narrative has an odd number of double quotes (1), so its last quote is unmatched and ignored; close every quoted line"`; hockey (8 quotes) → none; it fires for narration `True`, `"speech"` and `False` alike |
 | NF37 | `assign_missing_lines` unit cases, chained 3 with the NF13 narrative, cast `c1`/`c2`, no `lines` given. (a) Every beat `["c1"]` and no speakers → lines `[[1], [2], [3]]`, three "given" notes, beat 1 shot and camera unchanged. (b) Beat 2 cast `["c1", "c2"]` → `[[1], [], [2, 3]]`. (c) Plan lines beat 1 `[1]` and beat 2 `[3]`, with speakers `c1` → line 2 goes to beat 2 (`[2, 3]`), never to beat 3. (d) A 1-beat plan at 6 s whose two lines are 7 words each → beat 1 `[1]` only; `line_assignment_problems` still lists line 2 |
+| NF37b | `assign_missing_lines` keeps each beat's lines a consecutive run and repeats until nothing changes. (a) Beat 1 `[1]`, beats 2 and 3 two-cast without speakers, line 2 too long to fit, line 3 short → `[[1], [], []]`, no notes (line 3 never joins `[1]` as `[1, 3]`). (b) Five lines, beats 1 and 2 two-cast, beat 3 holds `[5]` → `[[], [], [3, 4, 5]]` with the notes for line 4 then line 3 (line 2 does not fit: 13 words in 4 sentences, 11 fit). (c) Beats 1 and 2 two-cast, beat 3 holds `[3]` → `[[], [], [1, 2, 3]]`, notes for line 2 then line 1. A second call returns `[]` and leaves the plan unchanged |
 
 ### 8.2 Fixtures: `tests/fixtures/narrative_fidelity/`
 
