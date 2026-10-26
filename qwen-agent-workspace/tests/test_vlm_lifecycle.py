@@ -788,3 +788,115 @@ def test_review_focus_1_story_then_movie_of_the_same_story(state, tmp_path, vlm,
     assert ("[movie-ui] vlm: job.json says vlm=required; story.md exists now, so vlm=forbidden"
             in log)
     assert log.index("[movie-ui] vlm: stopped for this job") < log.index("[movie-ui] started pid")
+
+
+# --- VL23, Review Focus 2: the startup restore (VU2) -------------------------------------------
+
+def test_vl23_startup_restore_runs_once_at_the_first_idle_tick(state, tmp_path, vlm, monkeypatch,
+                                                                capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    lib.startup_recovery(state)
+    assert lib.VLM_RECOVERY == ["startup"]
+    assert tool_calls(tools) == []
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.VLM_RECOVERY == []
+    assert len(lib.RESTORERS) == 1
+    proc = lib.RESTORERS[0]
+    assert proc.wait(timeout=30) == 0
+    assert capsys.readouterr().err == ("movie-ui: VLM restore (startup; queue empty): started %s "
+                                       "mlx-vision (pid %d)\n"
+                                       % (os.path.join(tools, "story-server-restore"), proc.pid))
+    row = tool_calls(tools)[0]
+    assert row["argv"] == ["mlx-vision"] and row["sid"] != os.getsid(0)
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert call_names(tools) == ["restore"]
+
+
+def test_vl23_startup_restore_waits_for_a_live_orphan(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    orphan = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+    try:
+        mt.make_job(state, ["x"], str(tmp_path), kind="smoke",
+                    status={"state": "lost", "pgid": orphan.pid, "exit_code": None, "ended": None,
+                            "detected": lib.utc_now()})
+        lib.startup_recovery(state)
+        assert lib.VLM_RECOVERY == ["startup"]
+        assert lib.dispatch_tick(state, mt.WS) is None
+        assert lib.VLM_RECOVERY == ["startup"] and lib.RESTORERS == [] and tool_calls(tools) == []
+    finally:
+        orphan.kill()
+        orphan.wait(timeout=10)
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.VLM_RECOVERY == [] and len(lib.RESTORERS) == 1
+    assert lib.RESTORERS[0].wait(timeout=30) == 0
+    assert call_names(tools) == ["restore"]
+
+
+def test_vl23_startup_restore_skipped_when_the_next_job_runs_without_it(state, tmp_path, vlm,
+                                                                         monkeypatch, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    job_id = mt.make_job(state, ["x"], str(tmp_path), kind="smoke")
+    assert lib.recovery_restore(state, mt.WS, "startup") is None
+    assert capsys.readouterr().err == ("movie-ui: VLM restore (startup): skipped (next job %s runs "
+                                       "without it)\n" % job_id)
+    assert lib.RESTORERS == [] and tool_calls(tools) == []
+    monkeypatch.setenv("MOVIE_UI_VLM_TOOLS", str(tmp_path / "missing-tools"))
+    lib.write_queue(state, [])
+    assert lib.recovery_restore(state, mt.WS, "startup") is None
+    assert capsys.readouterr().err == ("movie-ui: VLM restore (startup): cannot start %s: No such "
+                                       "file or directory\n"
+                                       % os.path.join(str(tmp_path / "missing-tools"),
+                                                      "story-server-restore"))
+
+
+def test_vl23_lost_jobs_and_kill_orphan_queue_nothing(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    stale = mt.make_job(state, ["x"], str(tmp_path), kind="smoke",
+                        status={"state": "running", "dispatched": "2026-01-01T00:00:00Z",
+                                "runner_pid": 1, "pgid": None, "started": "2026-01-01T00:00:00Z"})
+    assert lib.job_alive(lib.job_dir(state, stale)) is False
+    assert mt.status_of(state, stale)["state"] == "lost"
+    orphan = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+    try:
+        lost = mt.make_job(state, ["x"], str(tmp_path), kind="smoke",
+                           status={"state": "lost", "pgid": orphan.pid, "exit_code": None,
+                                   "ended": None, "detected": lib.utc_now()})
+        assert lib.kill_orphan(state, lost) == orphan.pid
+        orphan.wait(timeout=10)
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=10)
+    assert lib.VLM_RECOVERY == []
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.RESTORERS == [] and tool_calls(tools) == []
+
+
+def test_review_focus_2_startup_restore_waits_for_a_running_job(state, tmp_path, vlm, monkeypatch):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    job_id = mt.make_job(state, ["x"], str(tmp_path), kind="smoke",
+                         status={"state": "running", "dispatched": lib.utc_now(),
+                                 "runner_pid": os.getpid(), "pgid": None, "started": lib.utc_now()})
+    jdir = lib.job_dir(state, job_id)
+    fd = os.open(os.path.join(jdir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)        # the detached runner that survived the restart
+    try:
+        lib.startup_recovery(state)
+        assert mt.status_of(state, job_id)["state"] == "running"
+        assert lib.VLM_RECOVERY == ["startup"]
+        for _ in range(3):
+            assert lib.dispatch_tick(state, mt.WS) is None
+        assert lib.VLM_RECOVERY == ["startup"] and lib.RESTORERS == [] and tool_calls(tools) == []
+        lib.write_status(jdir, dict(mt.status_of(state, job_id), state="done", exit_code=0,
+                                    ended=lib.utc_now()))
+    finally:
+        os.close(fd)
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.VLM_RECOVERY == [] and len(lib.RESTORERS) == 1
+    assert lib.RESTORERS[0].wait(timeout=30) == 0
+    assert call_names(tools) == ["restore"]

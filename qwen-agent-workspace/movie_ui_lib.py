@@ -668,6 +668,38 @@ def vlm_postflight(state):
         _say("vlm: postflight: bin/story-server-restore exited %d" % rc)
 
 
+def _vlm_recheck(reason):
+    """Queue one server-side VLM restore for the next idle dispatcher tick (VU2); called only by
+    startup_recovery."""
+    if vlm_lifecycle_enabled():
+        VLM_RECOVERY.append(reason)
+
+
+def recovery_restore(state, ui_ws, reason):
+    """The server's restore after startup (VU2): when vlm_restore_wanted says so, start
+    story-server-restore (no --wait) in its own session and return its Popen, never waiting under
+    STORE_LOCK; else None. Every outcome is one line on the server's stderr."""
+    if not vlm_lifecycle_enabled():
+        return None
+    wanted, why = vlm_restore_wanted(state)
+    if not wanted:
+        sys.stderr.write("movie-ui: VLM restore (%s): skipped (%s)\n" % (reason, why))
+        return None
+    argv = [os.path.join(vlm_tools_dir(ui_ws), "story-server-restore"), VLM_MODE]
+    RESTORERS[:] = [p for p in RESTORERS if p.poll() is None]
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True,
+                                close_fds=True)
+    except OSError as e:
+        sys.stderr.write("movie-ui: VLM restore (%s): cannot start %s: %s\n"
+                         % (reason, argv[0], e.strerror or e))
+        return None
+    RESTORERS.append(proc)
+    sys.stderr.write("movie-ui: VLM restore (%s; %s): started %s (pid %d)\n"
+                     % (reason, why, shlex.join(argv), proc.pid))
+    return proc
+
+
 # ---------------------------------------------------------------------------
 # Liveness, the dispatcher, startup recovery and job actions (MU26, MU29-MU31, MU68).
 # Every function here that reads or writes queue.json or a status is called with STORE_LOCK
@@ -718,6 +750,10 @@ def dispatch_tick(state, ui_ws):
     for job_id in list_job_ids(state):
         if orphan_info(read_status(job_dir(state, job_id))) is not None:
             return None
+    if VLM_RECOVERY:
+        reason = "; ".join(VLM_RECOVERY)
+        del VLM_RECOVERY[:]
+        recovery_restore(state, ui_ws, reason)
     queue = read_queue(state)
     while queue:
         job_id = queue.pop(0)
@@ -748,7 +784,8 @@ def dispatch_tick(state, ui_ws):
 
 def startup_recovery(state):
     """Rewrite queue.json without IDs that are malformed, duplicated, lack job.json or already
-    have a status; then re-attach or mark lost every starting/running job (MU31)."""
+    have a status; then re-attach or mark lost every starting/running job (MU31), and queue the
+    startup VLM restore for the first idle dispatcher tick (VLM lifecycle spec VU2)."""
     kept = []
     for job_id in read_queue(state):
         jdir = job_dir(state, job_id)
@@ -759,6 +796,7 @@ def startup_recovery(state):
     write_queue(state, kept)
     for job_id in active_job_ids(state):
         job_alive(job_dir(state, job_id))
+    _vlm_recheck("startup")
 
 
 def job_state(state, job_id, queue):
