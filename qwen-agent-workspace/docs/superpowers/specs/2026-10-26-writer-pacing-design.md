@@ -310,6 +310,8 @@ Change `critic_field_lines` (`:2571-2594`):
 - Append this sentence to the docstring: `With speaking (the plan has a speaking beat) in chained mode, the Motion line ends with CRITIC_SPEAKING_MOTION_CLAUSE (writer pacing spec WP4).`
 - Nothing else changes. In particular the lora, dialogue and Q1 lines and their order are as today.
 
+**Amendment 2026-10-26 (Task 1 review).** The clause ends with "Begin each of those sentences with the speaker's referring phrase.", matching the WP2 amendment, so a critic Motion patch cannot put a short camera-like sentence ("He skates off camera.") where the placement would skip it.
+
 ### WP5. `build_critic_prompt` passes `speaking` (`story_engine.py:2611-2612`)
 
 The call becomes:

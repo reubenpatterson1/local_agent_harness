@@ -358,3 +358,85 @@ def test_wt9_old_stories_check_unchanged(ws, tmp_path):
             shutil.copy(os.path.join(FIX, name, filename), os.path.join(ctx.story_dir, filename))
         rc, _adv = se.recheck(ctx, lambda path, panels, no_stills=False: [])
         assert rc == 0, name
+
+
+# --- WT7, Review Focus 3, 4, 5: the critic's chained Motion patch line (WP4, WP5, D6) -----------
+
+MOTION = dlg.MOTION_LINE % ("motion", "Motion")
+CRITIC_CLAUSE = (
+    " On a panel with a Dialogue: line, the pipeline inserts the spoken words right after the "
+    "first sentence about what the speaker does, so keep everything the speaker does before "
+    "the line in that first sentence and everything they do after it in a later sentence. Begin "
+    "each of those sentences with the speaker's referring phrase.")
+CATALOG = ["- fast-motion: x"]
+
+
+def test_wt7_the_critic_clause(ws):
+    assert se.CRITIC_SPEAKING_MOTION_CLAUSE == CRITIC_CLAUSE
+    assert "slowly" not in CRITIC_CLAUSE.lower() and "no adverbs" not in CRITIC_CLAUSE
+    assert re.findall(r"@@[A-Z_]+@@", CRITIC_CLAUSE) == []
+    assert se.critic_field_lines("chained", None, "speech", True, speaking=True).split("\n")[0] == (
+        MOTION + CRITIC_CLAUSE)
+    for mode in ("shots", "no_stills"):
+        assert se.critic_field_lines(mode, None, "speech", True, speaking=True) == (
+            se.critic_field_lines(mode, None, "speech", True)), mode
+    assert se.critic_field_lines("chained", None, False, False, speaking=True) == (
+        se.critic_field_lines("chained", None, False))
+    for mode in ("chained", "shots", "no_stills"):
+        assert se.critic_field_lines(mode, None) == se.critic_field_lines(
+            mode, None, True, False, False), mode
+    plan = _json("hockey-2x145-f", "plan.json")
+    text = _read("hockey-2x145-f", "story.md")
+    for for_judge in (False, True):
+        prompt = se.build_critic_prompt(plan, text, ([], []), narration="speech",
+                                        for_judge=for_judge)
+        assert "\n" + MOTION + CRITIC_CLAUSE + "\n" in prompt, for_judge
+    _c, quiet, _parts, quiet_text, _p = dlg._story(ws, "chained", 3)
+    for narration in (True, "speech"):
+        assert CRITIC_CLAUSE not in se.build_critic_prompt(quiet, quiet_text, ([], []),
+                                                           narration=narration), narration
+
+
+def test_review_focus_3_a_silent_chained_movie_gets_pacing_and_no_speech_point(ws):
+    ctx, plan, parts, text, _p = dlg._story(ws, "chained", 3, plan_mut=dlg._speaking(2),
+                                            ctx_kw={"narration": False})
+    assert [b["speaker"] for b in plan["beats"]] == ["", "", ""]
+    for k in (1, 2, 3):
+        prompt = se.build_panel_prompt(ctx, plan, parts, k)
+        assert prompt.count(se.PACING_SENTENCE) == 1, k
+        assert "speaks the dialogue" not in prompt and "\ndialogue: " not in prompt, k
+    assert "are:\n" + MOTION + "\nPreserve" in se.build_critic_prompt(plan, text, ([], []),
+                                                                      narration=False)
+    hockey = _json("hockey-2x145-f", "plan.json")
+    prompt = se.build_critic_prompt(hockey, _read("hockey-2x145-f", "story.md"), ([], []),
+                                    narration=False)
+    assert "are:\n" + MOTION + "\nPreserve" in prompt and CRITIC_CLAUSE not in prompt
+
+
+def test_review_focus_4_the_lora_catalog_line_stays_first(ws):
+    lines = se.critic_field_lines("chained", CATALOG, "speech", True, speaking=True)
+    before = se.critic_field_lines("chained", CATALOG, "speech", True)
+    assert lines == before.replace("\n" + MOTION + "\n", "\n" + MOTION + CRITIC_CLAUSE + "\n")
+    assert lines.count(CRITIC_CLAUSE) == 1
+    assert lines.startswith('- target "plan", field "lora", index 0 for the global picks')
+    prompt = se.build_critic_prompt(_json("hockey-2x145-f", "plan.json"),
+                                    _read("hockey-2x145-f", "story.md"), ([], []), CATALOG,
+                                    narration="speech")
+    assert ("\n- fast-motion: x\n" + MOTION + CRITIC_CLAUSE + "\n" + dlg.DIALOGUE_FIELD_LINE
+            + "\n") in prompt
+
+
+def test_review_focus_5_an_older_plan_json_through_judge_story():
+    text = _read("hockey-2x145-f", "story.md")
+    older = _json("hockey-2x145-f", "plan.json")
+    del older["spoken_lines"]
+    for beat in older["beats"]:
+        del beat["speaker"]
+        del beat["lines"]
+    prompt = se.build_critic_prompt(older, text, ([], []), for_judge=True)
+    assert "are:\n" + MOTION + "\n" + dlg.DIALOGUE_FIELD_LINE + "\nPreserve" in prompt
+    assert CRITIC_CLAUSE not in prompt
+    mixed = copy.deepcopy(older)
+    mixed["beats"][1]["speaker"] = "c1"
+    assert ("are:\n" + MOTION + CRITIC_CLAUSE + "\n" + dlg.DIALOGUE_FIELD_LINE + "\nPreserve") in (
+        se.build_critic_prompt(mixed, text, ([], []), for_judge=True))

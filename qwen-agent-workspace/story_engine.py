@@ -2581,6 +2581,12 @@ CRITIC_Q1_FIELD_LINE = (
     "speaker's referring phrase, a colon and then that spoken line, or several consecutive "
     "spoken lines, copied word for word from the Spoken lines list in their order; the pipeline "
     "makes that character the panel's speaker. This is the only patch that adds spoken words.")
+# Writer pacing spec WP4, D6: a chained Motion patch on a speaking panel keeps the speech point.
+CRITIC_SPEAKING_MOTION_CLAUSE = (
+    " On a panel with a Dialogue: line, the pipeline inserts the spoken words right after the "
+    "first sentence about what the speaker does, so keep everything the speaker does before "
+    "the line in that first sentence and everything they do after it in a later sentence. Begin "
+    "each of those sentences with the speaker's referring phrase.")
 
 
 def listed(lines):
@@ -2590,11 +2596,13 @@ def listed(lines):
     return list(lines[:MAX_LISTED]) + ["- ... and %d more" % (len(lines) - MAX_LISTED)]
 
 
-def critic_field_lines(mode, catalog_lines, narration=True, spoken=False):
+def critic_field_lines(mode, catalog_lines, narration=True, spoken=False, speaking=False):
     """The allowed-patch lines of the critic prompt (dialogue spec 8.3): the lora line when
     catalog_lines is set, the Motion: (Prompt: in no_stills) line for a T2/T3 panel, and the
     dialogue line for a T1 panel unless the movie has no spoken lines; then, when the narrative
-    quotes spoken lines (spoken), the Q1 dialogue line (narrative dialogue fidelity spec QL11)."""
+    quotes spoken lines (spoken), the Q1 dialogue line (narrative dialogue fidelity spec QL11).
+    With speaking (the plan has a speaking beat) in chained mode, the Motion line ends with
+    CRITIC_SPEAKING_MOTION_CLAUSE (writer pacing spec WP4)."""
     lines = []
     if catalog_lines:
         lines.append('- target "plan", field "lora", index 0 for the global picks or a beat '
@@ -2602,10 +2610,13 @@ def critic_field_lines(mode, catalog_lines, narration=True, spoken=False):
                      "picks, each an object with the keys id and strength, from this catalog:"
                      + "\n" + "\n".join(catalog_lines))
     label = "Prompt" if mode == "no_stills" else "Motion"
-    lines.append('- target "panel", field "%s", index = the panel number, only for a panel with a '
-                 "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
-                 "identical to the current text except for the sentence or sentences that hold "
-                 "the extra or missing action." % (label.lower(), label))
+    motion = ('- target "panel", field "%s", index = the panel number, only for a panel with a '
+              "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
+              "identical to the current text except for the sentence or sentences that hold "
+              "the extra or missing action." % (label.lower(), label))
+    if speaking and mode == "chained" and narration is not False:
+        motion += CRITIC_SPEAKING_MOTION_CLAUSE
+    lines.append(motion)
     if narration is not False:
         lines.append('- target "panel", field "dialogue", index = the panel number, only for a '
                      "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
@@ -2631,7 +2642,9 @@ def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for
         ("@@VIOLATIONS@@", "\n".join(lines) if lines else "- none"),
         ("@@GOAL_CLAUSE@@", " and serve the target output goal" if plan["goal"] else ""),
         ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines, narration,
-                                               spoken=bool(plan.get("spoken_lines")))),
+                                               spoken=bool(plan.get("spoken_lines")),
+                                               speaking=any(b.get("speaker")
+                                                            for b in plan["beats"]))),
         ("@@REPLY_PARAGRAPH@@", JUDGE_REPLY_PARAGRAPH if for_judge else CRITIC_REPLY_PARAGRAPH),
     ]
     text = CRITIC_PROMPT_TEMPLATE
