@@ -1180,3 +1180,42 @@ def test_nf37b_assign_keeps_runs_consecutive(ws):
     before = copy.deepcopy(plan)
     assert se.assign_missing_lines(ctx, plan) == [] and plan == before
 
+
+
+# --- NF25: the critic prompt (QL11, 7.3) --------------------------------------------------------------
+
+CRITIC_Q1_FIELD_LINE = (
+    '- target "panel", field "dialogue", index = the number of the panel that shows the line '
+    "being said, only when a [hard] Q1 problem names a spoken line: replacement is the "
+    "speaker's referring phrase, a colon and then that spoken line, or several consecutive "
+    "spoken lines, copied word for word from the Spoken lines list in their order; the pipeline "
+    "makes that character the panel's speaker. This is the only patch that adds spoken words.")
+
+
+def test_nf25_the_critic_prompt(ws):
+    assert se.CRITIC_Q1_FIELD_LINE == CRITIC_Q1_FIELD_LINE
+    state, plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_1.txt")
+    prompt = se.build_critic_prompt(plan, state["text"], (state["hard"], state["advisory"]),
+                                    narration="speech")
+    assert ("Narrative to adapt:\n" + HOCKEY + SPOKEN_BLOCK + "\n\nThe target output goal is "
+            ) in prompt
+    assert ("\n" + dlg.DIALOGUE_FIELD_LINE + "\n" + CRITIC_Q1_FIELD_LINE + "\nPreserve every "
+            ) in prompt
+    assert "\n- [hard] " + Q1_MISSING % (2, LINE2) + "\n" in prompt
+    assert "@@" not in prompt
+    for mode in ("chained", "no_stills", "shots"):
+        lines = se.critic_field_lines(mode, None)
+        assert lines == se.critic_field_lines(mode, None, True, False), mode
+        assert CRITIC_Q1_FIELD_LINE not in lines and lines.endswith(dlg.DIALOGUE_FIELD_LINE), mode
+        assert se.critic_field_lines(mode, None, "speech", True) == (
+            lines + "\n" + CRITIC_Q1_FIELD_LINE), mode
+        assert se.critic_field_lines(mode, None, False, True) == se.critic_field_lines(
+            mode, None, False), mode
+    ctx = _hockey_ctx(ws, "hockey-2x145", narration=False)
+    silent, _shape = se.normalize_plan(ctx, _reply("hockey-2x145"))
+    prompt = se.build_critic_prompt(silent, state["text"], ([], []), narration=False)
+    assert "Spoken lines (" not in prompt and CRITIC_Q1_FIELD_LINE not in prompt
+    older = dict(plan)
+    del older["spoken_lines"]
+    prompt = se.build_critic_prompt(older, state["text"], ([], []))
+    assert "Spoken lines (" not in prompt and CRITIC_Q1_FIELD_LINE not in prompt

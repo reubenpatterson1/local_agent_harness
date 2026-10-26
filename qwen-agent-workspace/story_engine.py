@@ -2531,6 +2531,13 @@ JUDGE_REPLY_PARAGRAPH = "Call submit_review with your scores, verdict and patche
 CRITIC_RETRY_SUFFIX = ("\n\nYour previous reply was not one JSON object with the keys scores, "
                        "verdict and patches in the required form. Reply with that JSON object "
                        "only.")
+# Narrative dialogue fidelity spec 7.3: the critic's one way to add a missing quoted line (QL13).
+CRITIC_Q1_FIELD_LINE = (
+    '- target "panel", field "dialogue", index = the number of the panel that shows the line '
+    "being said, only when a [hard] Q1 problem names a spoken line: replacement is the "
+    "speaker's referring phrase, a colon and then that spoken line, or several consecutive "
+    "spoken lines, copied word for word from the Spoken lines list in their order; the pipeline "
+    "makes that character the panel's speaker. This is the only patch that adds spoken words.")
 
 
 def listed(lines):
@@ -2540,10 +2547,11 @@ def listed(lines):
     return list(lines[:MAX_LISTED]) + ["- ... and %d more" % (len(lines) - MAX_LISTED)]
 
 
-def critic_field_lines(mode, catalog_lines, narration=True):
+def critic_field_lines(mode, catalog_lines, narration=True, spoken=False):
     """The allowed-patch lines of the critic prompt (dialogue spec 8.3): the lora line when
     catalog_lines is set, the Motion: (Prompt: in no_stills) line for a T2/T3 panel, and the
-    dialogue line for a T1 panel unless the movie has no spoken lines."""
+    dialogue line for a T1 panel unless the movie has no spoken lines; then, when the narrative
+    quotes spoken lines (spoken), the Q1 dialogue line (narrative dialogue fidelity spec QL11)."""
     lines = []
     if catalog_lines:
         lines.append('- target "plan", field "lora", index 0 for the global picks or a beat '
@@ -2560,6 +2568,8 @@ def critic_field_lines(mode, catalog_lines, narration=True):
                      "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
                      "without the speaker's phrase and without quotation marks, within the limit "
                      "the T1 problem states.")
+        if spoken:
+            lines.append(CRITIC_Q1_FIELD_LINE)
     return "\n".join(lines)
 
 
@@ -2577,7 +2587,8 @@ def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[plan["mode"]]),
         ("@@VIOLATIONS@@", "\n".join(lines) if lines else "- none"),
         ("@@GOAL_CLAUSE@@", " and serve the target output goal" if plan["goal"] else ""),
-        ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines, narration)),
+        ("@@FIELD_LINES@@", critic_field_lines(plan["mode"], catalog_lines, narration,
+                                               spoken=bool(plan.get("spoken_lines")))),
         ("@@REPLY_PARAGRAPH@@", JUDGE_REPLY_PARAGRAPH if for_judge else CRITIC_REPLY_PARAGRAPH),
     ]
     text = CRITIC_PROMPT_TEMPLATE
@@ -2586,7 +2597,8 @@ def build_critic_prompt(plan, story_md_text, violations, catalog_lines=None, for
     for token, value in (("@@STORY_ID@@", plan["story_id"]), ("@@SECONDS@@", plan["seconds"])):
         text = text.replace(token, value)
     text = text.replace("@@PLAN_JSON@@", plan_json).replace("@@STORY_MD@@", story_md_text)
-    return text.replace("@@NARRATIVE@@", plan["narrative"])
+    return text.replace("@@NARRATIVE@@",
+                        plan["narrative"] + spoken_lines_block(plan.get("spoken_lines", [])))
 
 
 def run_critic(ctx, prompt):
