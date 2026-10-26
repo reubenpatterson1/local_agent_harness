@@ -739,8 +739,9 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
             "are said -- the pipeline adds who says them and how.\n") in prompt
     assert "\n" + se.KEY_LINE_TEMPLATES["narration_with_dialogue"] + "\n" in prompt
     assert ('already on screen. You may add one camera direction. In this panel "the courier" '
-            "speaks the dialogue: keep their movement small -- a breath, a glance, a small hand "
-            "gesture -- with the camera holding still, and do not write the spoken words or a "
+            "speaks the dialogue: they may move as the beat says, but write the motion so that "
+            "their face is toward the camera, in frame and lit while they speak -- a speaker who "
+            "approaches the camera speaks once close -- and do not write the spoken words or a "
             "speaking verb here; the pipeline adds them.\n") in prompt
     assert "@@" not in prompt
     quiet = se.build_panel_prompt(ctx, plan, parts, 3)
@@ -749,15 +750,16 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
     ctx, plan, parts, _t, _p = _story(ws, "no_stills", 3, plan_mut=_speaking(2),
                                       replies={2: {"dialogue": LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
-    assert ('fills the full 6 seconds with small, continuous movements of "the courier" -- a '
-            "breath, a glance, a small hand gesture -- names the ambient") in prompt
+    assert ('fills the full 6 seconds with the one continuous movement of "the courier" that the '
+            "beat describes, keeping their face toward the camera while they speak, names the "
+            "ambient") in prompt
     assert ("no spoken words and no markdown. Do not write the spoken words or a speaking verb "
             "here; the pipeline adds them.\n") in prompt
     ctx, plan, parts, _t, _p = _story(ws, "shots", 3, plan_mut=_speaking(2),
                                       replies={2: {"dialogue": LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
     assert ('Never name a person who is not in this shot. "the courier" is the only person in the '
-            "frame, facing the camera.\n") in prompt
+            "foreground, facing the camera; any crowd stays in the background.\n") in prompt
     assert ('without one, the pipeline adds the planned camera sentence. In this panel "the '
             'courier" speaks the dialogue:') in prompt
     ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),

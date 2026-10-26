@@ -690,3 +690,70 @@ def test_nf12_the_plan_prompt(ws):
     assert "Spoken lines (" not in silent and "lines is the list" not in silent
     assert "location, cast and speaker. index runs" in silent
     assert ("at most 4." + se.SILENT_SPEAKER_RULE + "\n") in silent
+
+
+# --- NF15, NF20: the panel writer (QL9, SM4, 7.2) ---------------------------------------------------
+
+DIALOGUE_FIXED = ("dialogue: exactly @@LINE@@ -- the narrative's own words, which @@SPEAKER@@ says "
+                  "aloud in this panel; copy them unchanged, because the pipeline uses the "
+                  "narrative's words whatever this field holds.")
+SPEAKING_ACTION = (" In this panel @@SPEAKER@@ speaks the dialogue: they may move as the beat "
+                   "says, but write the motion so that their face is toward the camera, in frame "
+                   "and lit while they speak -- a speaker who approaches the camera speaks once "
+                   "close -- and do not write the spoken words or a speaking verb here; the "
+                   "pipeline adds them.")
+SPEAKING_IMAGE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; any crowd "
+                  "stays in the background.")
+SPEECH_FRAMING = (" Characters speak on screen in this movie: keep each character within medium "
+                  "to close-up range of the camera while they speak, and never have a character "
+                  "shrink into the distance or leave the frame before their line ends.")
+
+
+def _panel_reply(case, k):
+    """The parsed JSON of a recorded panel reply."""
+    return se.extract_json(_fixture_text(case, "panel_%02d_reply_1.txt" % k))
+
+
+def test_nf15_the_writer_gets_the_narrative_words(ws):
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    plan, _shape = se.normalize_plan(ctx, _reply("hockey-2x145", "plan_reply_fixed.json"))
+    assert (se.assigned_dialogue(plan, 1), se.assigned_dialogue(plan, 2)) == (LINE1, LINE2)
+    parts = [se.empty_parts(ctx.mode, k, plan, ctx) for k in (1, 2)]
+    assert [p["dialogue"] for p in parts] == [LINE1, LINE2]
+    assert "dialogue" not in se.empty_parts(ctx.mode, 2, plan)
+    prompt = se.build_panel_prompt(ctx, plan, parts, 2)
+    assert ('\ndialogue: exactly "It\'s just FuboTV." -- the narrative\'s own words, which "the '
+            'FuboTV player" says aloud in this panel; copy them unchanged, because the pipeline '
+            "uses the narrative's words whatever this field holds.\n") in prompt
+    assert "@@" not in prompt and "\ndialogue: the exact words" not in prompt
+    assert '\ndialogue: exactly "%s" -- ' % LINE1 in se.build_panel_prompt(ctx, plan, parts, 1)
+    reply = _panel_reply("hockey-2x145", 2)
+    for written in (dict(reply, dialogue="Something else."), reply):
+        assert se.parse_panel_reply(ctx, plan, 2, json.dumps(written))["dialogue"] == LINE2
+    parts[1] = dict(se.parse_panel_reply(ctx, plan, 2, json.dumps(reply)), dialogue="Other words.")
+    assert dict(se.panel_fields(ctx, plan, parts, 2))["Dialogue"] == PLAYER + ": " + LINE2
+    recorded, _shape = se.normalize_plan(ctx, _reply("hockey-2x145"))
+    assert se.assigned_dialogue(recorded, 1) == ""
+    assert ('\ndialogue: the exact words "the FuboTV player" says aloud in this panel: at most 14 '
+            "words") in se.build_panel_prompt(ctx, recorded, parts, 1)
+    written = se.parse_panel_reply(ctx, recorded, 1, json.dumps(_panel_reply("hockey-2x145", 1)))
+    assert written["dialogue"] == "Getting the best deal on hockey isn't a hat trick."
+
+
+def test_nf20_the_panel_prompt_constants():
+    assert se.KEY_LINE_TEMPLATES["dialogue_fixed"] == DIALOGUE_FIXED
+    assert se.SPEAKING_ACTION_SENTENCE == SPEAKING_ACTION
+    assert se.SPEAKING_IMAGE_SENTENCE == SPEAKING_IMAGE
+    assert se.SPEECH_FRAMING_SENTENCE == SPEECH_FRAMING
+    base = se.KEY_LINE_TEMPLATES["no_stills_prompt"]
+    assert se.KEY_LINE_TEMPLATES["no_stills_prompt_speaking"] == base.replace(
+        "carries enough separate beats to fill the full @@SECONDS@@ seconds, links them with "
+        "temporal connectors (initially, as, then, while, a moment later), ",
+        "fills the full @@SECONDS@@ seconds with the one continuous movement of @@SPEAKER@@ that "
+        "the beat describes, keeping their face toward the camera while they speak, ")
+    assert se.KEY_LINE_TEMPLATES["no_stills_prompt_speaking"] != base
+    assert se.SPEAKING_SENTENCES == {"image": SPEAKING_IMAGE, "motion": SPEAKING_ACTION,
+                                     "prompt": se.SPEAKING_PROMPT_SENTENCE}
+    for text in (DIALOGUE_FIXED, SPEAKING_ACTION, SPEAKING_IMAGE, SPEECH_FRAMING,
+                 se.KEY_LINE_TEMPLATES["no_stills_prompt_speaking"]):
+        assert "slowly" not in text.lower()

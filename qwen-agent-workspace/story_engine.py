@@ -34,8 +34,9 @@ SPEECH_SHOT_TYPES = ("medium shot", "medium close-up", "close-up")
 SPEECH_SHOT_NOTE = (" (characters speak on screen in this movie, so only these framings keep "
                     "the speaker's lips readable)")
 SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each character within "
-                          "medium to close-up range of the camera, and never have them shrink "
-                          "into the distance or leave the frame.")
+                           "medium to close-up range of the camera while they speak, and never "
+                           "have a character shrink into the distance or leave the frame before "
+                           "their line ends.")
 
 
 def shot_types(narration):
@@ -1662,20 +1663,28 @@ KEY_LINE_TEMPLATES = {
                  "no description of how the words are said -- the pipeline adds who says them and "
                  "how."),
 }
+# Narrative dialogue fidelity spec QL9, 7.2: the dialogue key line of a beat that says the
+# narrative's spoken lines (@@LINE@@ is those lines, quoted; the pipeline pastes them itself).
+KEY_LINE_TEMPLATES["dialogue_fixed"] = (
+    "dialogue: exactly @@LINE@@ -- the narrative's own words, which @@SPEAKER@@ says aloud in "
+    "this panel; copy them unchanged, because the pipeline uses the narrative's words whatever "
+    "this field holds.")
 KEY_LINE_TEMPLATES["no_stills_prompt_speaking"] = KEY_LINE_TEMPLATES["no_stills_prompt"].replace(
     "carries enough separate beats to fill the full @@SECONDS@@ seconds, links them with temporal "
     "connectors (initially, as, then, while, a moment later), ",
-    "fills the full @@SECONDS@@ seconds with small, continuous movements of @@SPEAKER@@ -- a "
-    "breath, a glance, a small hand gesture -- ")
-# Appended to a speaking panel's key lines (dialogue spec 8.2); @@SPEAKER@@ is the speaker's
-# quoted referring phrase.
-SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: keep their movement "
-                            "small -- a breath, a glance, a small hand gesture -- with the camera "
-                            "holding still, and do not write the spoken words or a speaking verb "
-                            "here; the pipeline adds them.")
+    "fills the full @@SECONDS@@ seconds with the one continuous movement of @@SPEAKER@@ that the "
+    "beat describes, keeping their face toward the camera while they speak, ")
+# Appended to a speaking panel's key lines (dialogue spec 8.2; narrative dialogue fidelity spec
+# 7.2); @@SPEAKER@@ is the speaker's quoted referring phrase.
+SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: they may move as the "
+                            "beat says, but write the motion so that their face is toward the "
+                            "camera, in frame and lit while they speak -- a speaker who approaches "
+                            "the camera speaks once close -- and do not write the spoken words or "
+                            "a speaking verb here; the pipeline adds them.")
 SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
                             "adds them.")
-SPEAKING_IMAGE_SENTENCE = " @@SPEAKER@@ is the only person in the frame, facing the camera."
+SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; "
+                           "any crowd stays in the background.")
 SPEAKING_SENTENCES = {"image": SPEAKING_IMAGE_SENTENCE, "motion": SPEAKING_ACTION_SENTENCE,
                       "prompt": SPEAKING_PROMPT_SENTENCE}
 FIX_INSTRUCTION = ("\nFix only these problems. Keep every camera direction, every descriptive "
@@ -1712,6 +1721,15 @@ def speaker_phrase(plan, k):
         if speaker and entry["id"] == speaker:
             return entry["phrase"]
     return None
+
+
+def assigned_dialogue(plan, k):
+    """The narrative's spoken lines that beat k says, joined by spaces, or "" (narrative dialogue
+    fidelity spec QL9): the pasted Dialogue text of a beat with lines, whatever the writer
+    replied. A plan without spoken_lines or lines (an older plan.json) gives ""."""
+    spoken = plan.get("spoken_lines", [])
+    return " ".join(spoken[n - 1] for n in plan["beats"][k - 1].get("lines", [])
+                    if 1 <= n <= len(spoken))
 
 
 def panel_keys(ctx, plan, k):
@@ -1763,6 +1781,8 @@ def empty_parts(mode, k, plan, ctx=None):
     keys = panel_keys(ctx, plan, k) if ctx is not None else writer_keys(mode, k)
     parts = {key: "" for key in keys}
     parts["title"] = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
+    if ctx is not None and assigned_dialogue(plan, k):
+        parts["dialogue"] = assigned_dialogue(plan, k)
     return parts
 
 
@@ -1781,7 +1801,8 @@ def parse_panel_reply(ctx, plan, k, answer):
             continue
         value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
         if key == "dialogue":
-            value = _clean_dialogue(lib, value, speaker_phrase(plan, k))
+            value = assigned_dialogue(plan, k) or _clean_dialogue(lib, value,
+                                                                  speaker_phrase(plan, k))
         if not value and not (key == "narration" and speaks):
             return None
         parts[key] = value
@@ -1825,7 +1846,8 @@ def panel_fields(ctx, plan, parts, k):
         pieces = pieces[:-1]
     fields.append((LABELS[key], join([p.get(key, "")] + pieces)))
     if facing:
-        line = _sentence(_character_lib(ctx.ws).clean_line(p.get("dialogue", "")))
+        line = _sentence(assigned_dialogue(plan, k)
+                         or _character_lib(ctx.ws).clean_line(p.get("dialogue", "")))
         fields.append(("Dialogue", (speaker_phrase(plan, k) + ": " + line).rstrip()))
     if ctx.narration is True and (p.get("narration", "").strip() or not facing):
         fields.append(("Narration", _sentence(p.get("narration", ""))))
@@ -2287,6 +2309,7 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     speaks = panel_speaks(ctx, plan, k)
     phrase = speaker_phrase(plan, k) if speaks else None
     words = str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 1)) if speaks else ""
+    assigned = assigned_dialogue(plan, k)
     key_lines = []
     for key in panel_keys(ctx, plan, k):
         if key == "title":
@@ -2294,7 +2317,7 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         elif key == "narration":
             line = KEY_LINE_TEMPLATES["narration_with_dialogue" if speaks else "narration"]
         elif key == "dialogue":
-            line = KEY_LINE_TEMPLATES["dialogue"]
+            line = KEY_LINE_TEMPLATES["dialogue_fixed" if assigned else "dialogue"]
         elif ctx.mode == "chained":
             line = KEY_LINE_TEMPLATES["chained_image" if key == "image" else
                                       "chained_motion1" if k == 1 else "chained_motion"]
@@ -2309,7 +2332,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         if speaks:
-            line = line.replace("@@SPEAKER@@", '"%s"' % phrase).replace("@@DWORDS@@", words)
+            line = (line.replace("@@SPEAKER@@", '"%s"' % phrase).replace("@@DWORDS@@", words)
+                    .replace("@@LINE@@", '"%s"' % assigned))
         key_lines.append(line)
     fix_block = ""
     if fix is not None:
