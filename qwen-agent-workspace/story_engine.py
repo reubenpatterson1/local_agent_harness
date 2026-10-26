@@ -483,6 +483,64 @@ def required_lines(ctx):
     return [] if ctx.narration is False else spoken_lines(ctx.narrative)
 
 
+def _n_sentences(n):
+    """The text "1 sentence" or "<n> sentences" (QL5's new messages only)."""
+    return "1 sentence" if n == 1 else "%d sentences" % n
+
+
+def _lines_fit(lib, seconds, group):
+    """True when the consecutive spoken lines of group, joined, fit one clip of seconds (QL5)."""
+    text = " ".join(group)
+    n = len(lib.split_fragments(text))
+    return (n <= lib.DIALOGUE_MAX_FRAGMENTS
+            and len(text.split()) <= lib.dialogue_word_cap(seconds, n))
+
+
+def panels_needed(lib, seconds, lines):
+    """The fewest panels that speak lines in order, packing consecutive lines greedily (QL5)."""
+    needed, i = 0, 0
+    while i < len(lines):
+        j = i
+        while j + 1 < len(lines) and _lines_fit(lib, seconds, lines[i:j + 2]):
+            j += 1
+        needed += 1
+        i = j + 1
+    return needed
+
+
+def spoken_lines_problem(ctx):
+    """Why the narrative's spoken lines cannot be spoken in this movie, or None (QL5): a line no
+    clip fits, a line this clip length does not fit, or more lines than the panels can hold."""
+    lines = required_lines(ctx)
+    if not lines:
+        return None
+    lib = _character_lib(ctx.ws)
+    secs = engine_seconds(ctx)
+    for i, line in enumerate(lines, start=1):
+        n = len(lib.split_fragments(line))
+        words = len(line.split())
+        if n > lib.DIALOGUE_MAX_FRAGMENTS or words > lib.DIALOGUE_MAX_WORDS:
+            return ("the narrative's spoken line %d (\"%s\") is %d words in %s; no clip fits it, "
+                    "because a spoken line has at most %d words in at most %d sentences; split it "
+                    "into shorter quoted lines in the narrative"
+                    % (i, line, words, _n_sentences(n), lib.DIALOGUE_MAX_WORDS,
+                       lib.DIALOGUE_MAX_FRAGMENTS))
+        cap = lib.dialogue_word_cap(secs, n)
+        if words > cap:
+            return ("the narrative's spoken line %d (\"%s\") is %d words in %s; a %s-second clip "
+                    "fits at most %d words in %s; use longer clips (a larger --frames) or split it "
+                    "into shorter quoted lines in the narrative"
+                    % (i, line, words, _n_sentences(n), ctx.seconds, cap, _n_sentences(n)))
+    needed = panels_needed(lib, secs, lines)
+    if needed > ctx.panels:
+        return ("the narrative quotes %d spoken lines, which need at least %d panels of %s seconds "
+                "(one panel speaks at most %d words), but this movie has %d; use --panels %d or "
+                "more, or longer clips (a larger --frames)"
+                % (len(lines), needed, ctx.seconds, lib.dialogue_word_cap(secs, 1), ctx.panels,
+                   needed))
+    return None
+
+
 def catalog_line(entry):
     """One catalog entry as the planner and the critic see it (RS7)."""
     lo, hi = entry["strength_range"]
@@ -2808,6 +2866,10 @@ class _Run(object):
         self.write_run()
         for warning in catalog_warnings(ctx):
             print(warning)
+        problem = spoken_lines_problem(ctx)
+        if problem:
+            print("Error: %s" % problem, file=sys.stderr)
+            return self.finish(2)
         found, why = self.plan_round()
         if why == "timeout":
             return self.round0_timeout()

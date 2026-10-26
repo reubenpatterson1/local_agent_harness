@@ -258,3 +258,66 @@ def test_nf4_required_lines(ws):
             LINE1, LINE2], narration
     assert se.required_lines(_hockey_ctx(ws, "hockey-2x145", narration=False)) == []
     assert se.required_lines(seu.make_ctx(se, ws)) == []
+
+
+# --- NF5, NF6, NF31: the pre-flight (QL5) ----------------------------------------------------------
+
+COURIER_LINES = ('The courier says "Keep moving." Then he says "The gate is close." At the gate he '
+                 'whispers "We made it."')
+SIX_WORD_LINES = ('The courier says "Keep moving along the wet road." Then he says "The temple gate '
+                  'is close now." At the gate he whispers "We made it here at last."')
+OVER_CAP = "I carry a sealed letter from the harbour master for the abbot of this temple."
+PANELS_PROBLEM = ("the narrative quotes 3 spoken lines, which need at least 2 panels of 6 seconds "
+                  "(one panel speaks at most 14 words), but this movie has 1; use --panels 2 or "
+                  "more, or longer clips (a larger --frames)")
+
+
+def test_nf5_spoken_lines_problem(ws):
+    def problem(narrative, **kw):
+        return se.spoken_lines_problem(seu.make_ctx(se, ws, narrative=narrative, **kw))
+
+    assert problem('The courier says "%s"' % OVER_CAP) == (
+        "the narrative's spoken line 1 (\"%s\") is 15 words in 1 sentence; no clip fits it, because "
+        "a spoken line has at most 14 words in at most 3 sentences; split it into shorter quoted "
+        "lines in the narrative" % OVER_CAP)
+    assert problem('The courier says "Stop. Wait. Look. Go."') == (
+        "the narrative's spoken line 1 (\"Stop. Wait. Look. Go.\") is 4 words in 4 sentences; no "
+        "clip fits it, because a spoken line has at most 14 words in at most 3 sentences; split it "
+        "into shorter quoted lines in the narrative")
+    ten = "I carry a letter for the abbot of this temple."
+    assert problem('The courier says "%s"' % ten, seconds="4", clip_seconds=97 / 24.0) == (
+        "the narrative's spoken line 1 (\"%s\") is 10 words in 1 sentence; a 4-second clip fits at "
+        "most 9 words in 1 sentence; use longer clips (a larger --frames) or split it into shorter "
+        "quoted lines in the narrative" % ten)
+    assert problem('The courier says "%s"' % ten) is None
+    assert problem(SIX_WORD_LINES, panels=1) == PANELS_PROBLEM
+    assert problem(SIX_WORD_LINES, panels=2) is None
+    assert problem(SIX_WORD_LINES, panels=1, narration=False) is None
+    assert problem(seu.make_ctx(se, ws).narrative, panels=1) is None
+    for case, panels in (("hockey-2x145", 2), ("hockey-2x145", 1), ("hockey-1x241", 1)):
+        assert se.spoken_lines_problem(_hockey_ctx(ws, case, panels=panels)) is None, (case, panels)
+    assert (se._n_sentences(1), se._n_sentences(2)) == ("1 sentence", "2 sentences")
+
+
+def test_nf6_panels_needed():
+    lib = character_lib
+    six = 145 / 24.0
+    assert se.panels_needed(lib, six, [LINE1, LINE2]) == 1
+    assert se.panels_needed(lib, six, se.spoken_lines(SIX_WORD_LINES)) == 2
+    four = ["Keep moving now, friend.", "The gate is close.", "We made it here.",
+            "Please open the door."]
+    assert se.panels_needed(lib, six, four) == 2
+    assert se.panels_needed(lib, six, []) == 0
+    assert se.panels_needed(lib, six, [OVER_CAP]) == 1
+
+
+def test_nf31_an_infeasible_line_set_exits_2_before_any_call(ws, tmp_path, monkeypatch, capsys):
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 1))])
+    ctx = seu.make_ctx(se, ws, panels=1, narrative=SIX_WORD_LINES)
+    capsys.readouterr()
+    rc, _advisories = se.run(ctx)
+    assert rc == 2
+    assert capsys.readouterr().err == "Error: " + PANELS_PROBLEM + "\n"
+    assert seu.agent_log(log) == []
+    with open(os.path.join(ctx.story_dir, "story_rounds", "run.json"), encoding="utf-8") as f:
+        assert json.load(f)["exit"] == 2
