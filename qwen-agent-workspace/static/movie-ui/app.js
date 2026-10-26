@@ -790,6 +790,7 @@
     if (res.status !== 200) { $("#ch-status").textContent = (res.data && res.data.error) || "error"; return; }
     S.character = res.data;
     show($("#ch-detail"), true);
+    $("#ch-regen-seed").value = String((res.data.character.seed + 1) % 2147483648);
     $("#ch-title").textContent = name + " (" + res.data.character.status + ")";
     const gallery = clear($("#ch-gallery"));
     if (res.data.dataset) {
@@ -846,8 +847,14 @@
     $("#ch-accept").addEventListener("click", function () { show($("#ch-train-form"), true); });
     $("#ch-regenerate").addEventListener("click", async function () {
       const name = S.character.character.name;
-      if (!(await askConfirm("Regenerate the dataset of " + name + "?"))) { return; }
-      const res = await api("POST", "/api/characters/" + enc(name) + "/regenerate", {ws: S.ws});
+      const seedText = $("#ch-regen-seed").value.trim();
+      const seedValue = Number(seedText);
+      const withSeed = seedText !== "" && Number.isInteger(seedValue) && seedValue >= 0 && seedValue <= 2147483647;
+      const confirmText = withSeed ? "Regenerate the dataset of " + name + " with seed " + seedText + "?"
+                                  : "Regenerate the dataset of " + name + "?";
+      if (!(await askConfirm(confirmText))) { return; }
+      const res = await api("POST", "/api/characters/" + enc(name) + "/regenerate",
+                            withSeed ? {ws: S.ws, seed: seedValue} : {ws: S.ws});
       $("#ch-status").textContent = res.status === 201 ? "queued job " + res.data.job.id : (res.data && res.data.error);
     });
     $("#ch-train").addEventListener("click", async function () {

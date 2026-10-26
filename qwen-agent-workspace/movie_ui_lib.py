@@ -1059,7 +1059,10 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
     argv = [py, os.path.join(ws_real, "bin", "character")]
     if kind == "character-regenerate":
         # Jobs have no terminal: skip the seed-image preview stop (seed-edit spec E10).
-        return argv + ["create", fields["name"], "--regenerate", "--no-review"]
+        argv += ["create", fields["name"], "--regenerate", "--no-review"]
+        if fields.get("seed") is not None:
+            argv += ["--seed", str(fields["seed"])]
+        return argv
     if kind == "character-train":
         # Route through character-train-vlm, which stops the VLM (freeing its memory for
         # training) and always restarts it afterward -- so the UI Train button needs no

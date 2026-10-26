@@ -6,7 +6,7 @@
                         [--trigger WORD] [--seed N] [--force] [--no-review]
   bin/character create NAME --phrase PHRASE --descriptor TEXT --class NOUN
                         [--trigger WORD] [--seed N]
-  bin/character create NAME --regenerate [--no-review]
+  bin/character create NAME --regenerate [--seed N | --new-seed] [--no-review]
   bin/character train NAME [--video] [--stills] [--force]
   bin/character list
   bin/character show NAME
@@ -63,6 +63,8 @@ def build_parser():
     p.add_argument("--seed", type=int, default=None, metavar="N")
     p.add_argument("--force", action="store_true",
                    help="proceed although the seed image's face is small or not found")
+    p.add_argument("--new-seed", dest="new_seed", action="store_true",
+                   help="with --regenerate: use the stored seed + 1")
     p.add_argument("--regenerate", action="store_true",
                    help="rebuild an existing, untrained character's dataset from its character.json")
     p.add_argument("--no-review", dest="no_review", action="store_true",

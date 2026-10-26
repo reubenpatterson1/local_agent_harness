@@ -687,6 +687,13 @@ def test_mu64_mu65_character_endpoints(env):
     assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
         "create", "kyra", "--regenerate", "--no-review"]
     assert payload["job"]["kind"] == "character-regenerate" and payload["job"]["queue_position"] == 3
+    status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/regenerate", body={"ws": ws, "seed": 9})
+    assert status == 201 and lib.read_job(lib.job_dir(state, payload["job"]["id"]))["argv"][2:] == [
+        "create", "kyra", "--regenerate", "--no-review", "--seed", "9"]
+    for bad in ("x", -1, True, 2 ** 31):
+        status, _h, payload = mt.api(s, "POST", "/api/characters/kyra/regenerate", body={"ws": ws, "seed": bad})
+        assert (status, payload) == (400, {"error": "invalid fields",
+                                           "errors": ["seed must be an integer from 0 to 2147483647"]}), bad
     mt.stub_config(ws, {"character show kyra": {"exit": 2, "stderr": "Error: no character kyra\n"}})
     assert mt.api(s, "GET", "/api/characters/kyra?ws=" + ws)[:3:2][0] == 502
 
@@ -1126,3 +1133,14 @@ def test_choose_token_env_override():
     assert note is None and re.fullmatch(r"[A-Za-z0-9_-]{16,}", tok)
     # two random tokens differ
     assert srv.choose_token({})[0] != srv.choose_token({})[0]
+
+
+def test_regenerate_seed_field_is_wired_in_the_static_ui():
+    static = os.path.join(mt.WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    assert 'id="ch-regen-seed"' in html and 'max="2147483647"' in html
+    assert html.index('id="ch-regen-seed"') < html.index('id="ch-regenerate"')
+    assert "seed:" in js and "#ch-regen-seed" in js and "% 2147483648" in js

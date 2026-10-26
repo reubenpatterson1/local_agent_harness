@@ -87,6 +87,12 @@ def test_mut1_character_argv():
         "--trigger", "kyrax", "--seed", "0", "--force", "--no-review"]
     assert lib.character_argv("character-regenerate", {"name": "kyra"}, WS, STATE, py=PY) == c + [
         "create", "kyra", "--regenerate", "--no-review"]
+    assert lib.character_argv("character-regenerate", {"name": "kyra", "seed": None}, WS, STATE, py=PY) == c + [
+        "create", "kyra", "--regenerate", "--no-review"]
+    assert lib.character_argv("character-regenerate", {"name": "kyra", "seed": 9}, WS, STATE, py=PY) == c + [
+        "create", "kyra", "--regenerate", "--no-review", "--seed", "9"]
+    assert lib.character_argv("character-regenerate", {"name": "kyra", "seed": 0}, WS, STATE, py=PY)[-2:] == [
+        "--seed", "0"]
     # character-train routes through the VLM-managing wrapper: [wrapper, py, name, flags].
     tw = ["/w/bin/character-train-vlm", PY]
     assert lib.character_argv("character-train", {"name": "kyra", "video": True, "stills": False, "force": False},

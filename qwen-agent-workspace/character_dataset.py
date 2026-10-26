@@ -1078,21 +1078,24 @@ def _build_dataset(data, face_height, review=False):
           % (kept_count, total, character_lib.MIN_KEEP, dataset_dir))
     print("contact sheet: %s" % sheet)
     # A seed dataset is edited from seed.png: "descriptor" only feeds stories (seed-edit E9).
-    field = "seed" if seed_mode else "descriptor"
     if kept_count < character_lib.MIN_KEEP:
-        print('Error: only %d/%d stills kept (need %d); the dataset is kept in %s; %s '
-              '"%s" in %s and run bin/character create %s --regenerate'
-              % (kept_count, total, character_lib.MIN_KEEP, dataset_dir,
-                 "change" if seed_mode else "edit", field, json_path, name),
+        if seed_mode:
+            fix = "run bin/character create %s --regenerate --new-seed" % name
+        else:
+            fix = ('edit "descriptor" in %s and run bin/character create %s --regenerate '
+                   '(add --new-seed for different stills)' % (json_path, name))
+        print('Error: only %d/%d stills kept (need %d); the dataset is kept in %s; %s'
+              % (kept_count, total, character_lib.MIN_KEEP, dataset_dir, fix),
               file=sys.stderr)
         return 3
     if seed_mode:
-        print('next: review the contact sheet. For different stills, change "seed" in %s and run '
-              'bin/character create %s --regenerate; otherwise run bin/character train %s'
-              % (json_path, name, name))
+        print('next: review the contact sheet. For different stills, run '
+              'bin/character create %s --regenerate --new-seed; otherwise run bin/character train %s'
+              % (name, name))
     else:
         print('next: review the contact sheet. To change the look, edit "descriptor" in %s and '
-              'run bin/character create %s --regenerate; otherwise run bin/character train %s'
+              'run bin/character create %s --regenerate (add --new-seed for different stills); '
+              'otherwise run bin/character train %s'
               % (json_path, name, name))
     return 0
 
@@ -1109,6 +1112,9 @@ def _face_problem(fh):
             head + "; proceeding (--force)")
 
 
+SEED_MAX = 2147483647
+
+
 def create(args):
     """bin/character create (spec 4.4). Returns 0, 1, 2 or 3."""
     import ltx_image_fit
@@ -1122,10 +1128,15 @@ def create(args):
     data = None
     if args.regenerate:
         if (any(v is not None for v in (args.phrase, args.seed_image, args.descriptor,
-                                        args.class_noun, args.trigger, args.seed))
+                                        args.class_noun, args.trigger))
                 or args.force):
             return _error("--regenerate takes no --phrase, --seed-image, --descriptor, --class, "
-                          "--trigger, --seed or --force; edit %s instead" % json_path)
+                          "--trigger or --force (only --seed N or --new-seed); edit %s instead"
+                          % json_path)
+        if args.seed is not None and args.new_seed:
+            return _error("give --seed or --new-seed, not both")
+        if args.seed is not None and not 0 <= args.seed <= SEED_MAX:
+            return _error("--seed must be between 0 and 2147483647")
         try:
             data = character_lib.load_character(name)
         except character_lib.CharacterError as e:
@@ -1134,7 +1145,25 @@ def create(args):
             return _error("character %s is trained; regenerating its dataset would orphan its "
                           "LoRAs. Create a new character instead" % name)
         seed_mode = data["source"]["type"] == "seed_image"
+        old_seed = data["seed"]
+        if args.new_seed:
+            new_seed = 0 if old_seed >= SEED_MAX else old_seed + 1
+        elif args.seed is not None:
+            new_seed = args.seed
+        else:
+            new_seed = old_seed
+        if new_seed != old_seed:
+            data["seed"] = new_seed
+            try:
+                character_lib.write_character(data)
+            except character_lib.CharacterError as e:
+                return _error(e)
+            print("seed: %d -> %d" % (old_seed, new_seed))
+        else:
+            print("seed: %d (unchanged)" % old_seed)
     else:
+        if getattr(args, "new_seed", False):
+            return _error("--new-seed needs --regenerate")
         if os.path.exists(char_dir):
             return _error("character %s already exists (%s); use --regenerate to rebuild its "
                           "dataset" % (name, char_dir))
@@ -1172,8 +1201,8 @@ def create(args):
             except Exception as e:
                 return _error("--seed-image is not a readable image: %s: %s" % (seed_path, e))
         seed = args.seed if args.seed is not None else 0
-        if seed < 0:
-            return _error("--seed must be >= 0")
+        if not 0 <= seed <= SEED_MAX:
+            return _error("--seed must be between 0 and 2147483647")
         if args.trigger is not None:
             try:
                 character_lib.validate_trigger(args.trigger)

@@ -242,7 +242,8 @@ def test_k4_create_argument_errors(tmp_path, lib_dir, monkeypatch, capsys):
          "Error: trigger nova must not be a word of the phrase or the class noun"),
         (base + ["--descriptor", RONIN_DESCRIPTOR, "--class", "mann", "--trigger", "mann"],
          "Error: trigger mann must not be a word of the phrase or the class noun"),
-        (base + desc + ["--seed", "-1"], "Error: --seed must be >= 0"),
+        (base + desc + ["--seed", "-1"], "Error: --seed must be between 0 and 2147483647"),
+        (base + desc + ["--seed", "2147483648"], "Error: --seed must be between 0 and 2147483647"),
     ]
     before = _tree(lib_dir)
     for argv, message in cases:
@@ -262,11 +263,11 @@ def test_k5_regenerate_refusals(lib_dir, monkeypatch, capsys):
     json_path = os.path.join(lib_dir, "kyra", "character.json")
     cases = [
         (["create", "kyra", "--regenerate", "--phrase", "the lady"],
-         "Error: --regenerate takes no --phrase, --seed-image, --descriptor, --class, --trigger, "
-         "--seed or --force; edit %s instead" % json_path),
+         "Error: --regenerate takes no --phrase, --seed-image, --descriptor, --class, --trigger "
+         "or --force (only --seed N or --new-seed); edit %s instead" % json_path),
         (["create", "kyra", "--regenerate", "--force"],
-         "Error: --regenerate takes no --phrase, --seed-image, --descriptor, --class, --trigger, "
-         "--seed or --force; edit %s instead" % json_path),
+         "Error: --regenerate takes no --phrase, --seed-image, --descriptor, --class, --trigger "
+         "or --force (only --seed N or --new-seed); edit %s instead" % json_path),
         (["create", "ghost", "--regenerate"],
          "Error: unknown character: ghost (no %s)" % os.path.join(lib_dir, "ghost",
                                                                   "character.json")),
@@ -375,13 +376,11 @@ def test_k9_seed_mode_happy_path(tmp_path, lib_dir, monkeypatch, capsys):
         manifest = json.load(f)
     assert [item["n"] for item in manifest["items"]] == list(range(25))
     assert manifest["reference"] == "char_00" and manifest["face_height"] == 0.4
-    json_path = os.path.join(cdir, "character.json")
     assert capsys.readouterr().out.splitlines()[-3:] == [
         "dataset: 24/25 stills kept (minimum 12) in %s" % os.path.join(cdir, "dataset"),
         "contact sheet: %s" % os.path.join(cdir, "dataset", "contact_sheet.jpg"),
-        'next: review the contact sheet. For different stills, change "seed" in %s and run '
-        'bin/character create kyra --regenerate; otherwise run bin/character train kyra'
-        % json_path]
+        'next: review the contact sheet. For different stills, run '
+        'bin/character create kyra --regenerate --new-seed; otherwise run bin/character train kyra']
 
 
 def test_k10_descriptor_mode(lib_dir, monkeypatch):
@@ -408,7 +407,8 @@ def test_k11_too_few_kept(lib_dir, monkeypatch, capsys):
     cdir = os.path.join(lib_dir, "ronin")
     assert capsys.readouterr().err == (
         'Error: only 11/24 stills kept (need 12); the dataset is kept in %s; edit "descriptor" in '
-        '%s and run bin/character create ronin --regenerate\n'
+        '%s and run bin/character create ronin --regenerate (add --new-seed for different '
+        'stills)\n'
         % (os.path.join(cdir, "dataset"), os.path.join(cdir, "character.json")))
     data = character_lib.load_character("ronin")
     assert data["status"] == "dataset"
@@ -655,3 +655,135 @@ def test_vlc1_restore_story_server_argv(monkeypatch, capsys):
     assert character_dataset.restore_story_server(wait=True) == 1
     assert capsys.readouterr().err == ("warning: story-server-restore failed: no such file; run "
                                        "bin/story-server mlx-vision\n")
+
+
+# --- regenerate with a new seed (seed-spec) -----------------------------------------------
+def _ronin_dataset(lib_dir, monkeypatch, seed=None):
+    """A descriptor-mode ronin whose first build kept too few stills (status dataset); returns
+    its character.json path after storing seed, when given."""
+    _Fakes(monkeypatch, scores=[3] * 14 + [9] * 10)
+    assert tool.main(_ronin_create()) == 3
+    path = os.path.join(lib_dir, "ronin", "character.json")
+    if seed is not None:
+        with open(path) as f:
+            data = json.load(f)
+        data["seed"] = seed
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    return path
+
+
+def _regen(monkeypatch, capsys, *extra):
+    fakes = _Fakes(monkeypatch, scores=[9] * 24)
+    code = tool.main(["create", "ronin", "--regenerate"] + list(extra))
+    return code, capsys.readouterr(), fakes
+
+
+def test_seed_regenerate_with_seed_records_it(lib_dir, monkeypatch, capsys):
+    _ronin_dataset(lib_dir, monkeypatch)
+    capsys.readouterr()
+    code, out, fakes = _regen(monkeypatch, capsys, "--seed", "7")
+    assert code == 0
+    assert "seed: 0 -> 7" in out.out.splitlines()
+    assert character_lib.load_character("ronin")["seed"] == 7
+    assert all(job["seed"] == 7 for job in fakes.child_specs[0][0]["jobs"])
+
+
+def test_seed_regenerate_new_seed_increments(lib_dir, monkeypatch, capsys):
+    _ronin_dataset(lib_dir, monkeypatch, seed=41)
+    capsys.readouterr()
+    code, out, _ = _regen(monkeypatch, capsys, "--new-seed")
+    assert code == 0
+    assert "seed: 41 -> 42" in out.out.splitlines()
+    assert character_lib.load_character("ronin")["seed"] == 42
+
+
+def test_seed_regenerate_new_seed_wraps_to_zero(lib_dir, monkeypatch, capsys):
+    _ronin_dataset(lib_dir, monkeypatch, seed=2147483647)
+    capsys.readouterr()
+    code, out, _ = _regen(monkeypatch, capsys, "--new-seed")
+    assert code == 0
+    assert "seed: 2147483647 -> 0" in out.out.splitlines()
+    assert character_lib.load_character("ronin")["seed"] == 0
+
+
+def test_seed_regenerate_seed_persisted_before_generation(lib_dir, monkeypatch, capsys):
+    _ronin_dataset(lib_dir, monkeypatch, seed=5)
+    capsys.readouterr()
+    fakes = _Fakes(monkeypatch, scores=[9] * 24, child_error=character_dataset.DatasetError("boom"))
+    assert tool.main(["create", "ronin", "--regenerate", "--new-seed"]) == 1
+    assert fakes.child_specs
+    assert character_lib.load_character("ronin")["seed"] == 6
+
+
+def test_seed_regenerate_plain_is_unchanged(lib_dir, monkeypatch, capsys):
+    path = _ronin_dataset(lib_dir, monkeypatch, seed=9)
+    capsys.readouterr()
+    writes = []
+    real_write = character_lib.write_character
+    monkeypatch.setattr(character_lib, "write_character",
+                        lambda data: writes.append(data["seed"]) or real_write(data))
+    code, out, fakes = _regen(monkeypatch, capsys)
+    assert code == 0
+    assert "seed: 9 (unchanged)" in out.out.splitlines()
+    assert all(job["seed"] == 9 for job in fakes.child_specs[0][0]["jobs"])
+    # The seed step itself never rewrote the file; the build's own status write happened later.
+    assert writes and all(w == 9 for w in writes)
+    assert character_lib.load_character("ronin")["seed"] == 9
+
+
+def test_seed_regenerate_same_seed_does_not_rewrite(lib_dir, monkeypatch, capsys):
+    path = _ronin_dataset(lib_dir, monkeypatch, seed=9)
+    capsys.readouterr()
+    before = open(path).read()
+    # stop before generation: the vision model is "not served"
+    _Fakes(monkeypatch)
+    monkeypatch.setattr(character_dataset, "vlm_ready", lambda: False)
+    os.utime(path, (1000000000, 1000000000))
+    assert tool.main(["create", "ronin", "--regenerate", "--seed", "9"]) == 2
+    out = capsys.readouterr().out
+    assert "seed: 9 (unchanged)" in out.splitlines()
+    assert open(path).read() == before and os.stat(path).st_mtime == 1000000000
+    assert tool.main(["create", "ronin", "--regenerate"]) == 2
+    assert "seed: 9 (unchanged)" in capsys.readouterr().out.splitlines()
+    assert open(path).read() == before and os.stat(path).st_mtime == 1000000000
+
+
+@pytest.mark.parametrize("extra,message", [
+    (["--seed", "-1"], "--seed must be between 0 and 2147483647"),
+    (["--seed", "2147483648"], "--seed must be between 0 and 2147483647"),
+    (["--seed", "3", "--new-seed"], "give --seed or --new-seed, not both"),
+])
+def test_seed_regenerate_bad_flags(lib_dir, monkeypatch, capsys, extra, message):
+    path = _ronin_dataset(lib_dir, monkeypatch, seed=9)
+    capsys.readouterr()
+    before = open(path).read()
+    _Fakes(monkeypatch)
+    assert tool.main(["create", "ronin", "--regenerate"] + extra) == 2
+    assert capsys.readouterr().err == "Error: %s\n" % message
+    assert open(path).read() == before
+
+
+def test_seed_new_seed_needs_regenerate(lib_dir, monkeypatch, capsys):
+    _Fakes(monkeypatch)
+    assert tool.main(_ronin_create("--new-seed")) == 2
+    assert capsys.readouterr().err == "Error: --new-seed needs --regenerate\n"
+    assert not os.path.exists(os.path.join(lib_dir, "ronin"))
+
+
+def test_seed_regenerate_still_refuses_other_flags(lib_dir, monkeypatch, capsys):
+    _Fakes(monkeypatch)
+    make_character(lib_dir)
+    json_path = os.path.join(lib_dir, "kyra", "character.json")
+    assert tool.main(["create", "kyra", "--regenerate", "--new-seed", "--phrase", "x"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: --regenerate takes no --phrase, --seed-image, --descriptor, --class, --trigger "
+        "or --force (only --seed N or --new-seed); edit %s instead\n" % json_path)
+
+
+def test_seed_guidance_names_new_seed(tmp_path, lib_dir, monkeypatch, capsys):
+    _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=[3] * 20 + [9] * 5)
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 3
+    assert capsys.readouterr().err == (
+        "Error: only 6/25 stills kept (need 12); the dataset is kept in %s; run "
+        "bin/character create kyra --regenerate --new-seed\n" % os.path.join(lib_dir, "kyra", "dataset"))

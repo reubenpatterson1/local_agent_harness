@@ -1252,7 +1252,11 @@ def _h_character_create(self, groups, query, body):
 
 def _h_character_regenerate(self, groups, query, body):
     real = self.ws(body.get("ws"))
-    return create_character_job(self.server, "character-regenerate", real, {"ws": real, "name": groups[0]})
+    seed = body.get("seed")
+    if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and 0 <= seed <= 2147483647):
+        raise ApiError(400, "invalid fields", errors=["seed must be an integer from 0 to 2147483647"])
+    return create_character_job(self.server, "character-regenerate", real,
+                                {"ws": real, "name": groups[0], "seed": seed})
 
 
 def _h_character_train(self, groups, query, body):
