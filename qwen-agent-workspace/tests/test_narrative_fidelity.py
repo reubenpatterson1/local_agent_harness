@@ -174,3 +174,87 @@ def test_nf35_manifest_places_the_line_after_the_first_action(tmp_path, monkeypa
         "The FuboTV player skates forward. He skates away from the camera. The FuboTV player "
         'faces the camera. The FuboTV player says, "It\'s just FuboTV." ' + dlg.AC
         + " The camera stays static.")
+
+
+# --- NF1-NF4: the spoken lines of a narrative (QL1-QL4) -----------------------------------------
+
+def _hockey(case):
+    """The case.json of a recorded hockey run (spec 8.2)."""
+    with open(os.path.join(FIXTURES, case, "case.json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+with open(os.path.join(FIXTURES, "narrative.txt"), encoding="utf-8") as _f:
+    HOCKEY = _f.read().strip()
+LINE1 = "Getting the best deal on hockey isn't a hat trick..."
+LINE2 = "It's just FuboTV."
+
+
+def _hockey_ctx(ws, case, **kw):
+    """The StoryContext of a recorded hockey run (spec 8.1): chained, --speech-only, the case's
+    panels, seconds, clip length and goal; keyword arguments replace fields."""
+    c = _hockey(case)
+    fields = dict(story_id=c["story_id"], mode="chained", panels=c["panels"],
+                  seconds=c["seconds"], clip_seconds=c["frames"] / 24.0, narration="speech",
+                  narrative=HOCKEY, goal=c["goal"])
+    fields.update(kw)
+    return seu.make_ctx(se, ws, **fields)
+
+
+def test_nf1_the_hockey_narrative():
+    assert se.classify_quotes(HOCKEY) == [("FuboTV", False), ("FuboTV", False), (LINE1, True),
+                                          (LINE2, True)]
+    assert se.spoken_lines(HOCKEY) == [LINE1, LINE2]
+    assert se.line_words(LINE1) == ["getting", "the", "best", "deal", "on", "hockey", "isn't", "a",
+                                    "hat", "trick"]
+
+
+NF2_CASES = (
+    ("She whispers, “Keep moving.”", ["Keep moving."]),
+    ('"Run!" he shouts.', ["Run!"]),
+    ('"Wait," she says, "I\'m coming."', ["Wait.", "I'm coming."]),
+    ('He says to the old monk, "Rest here."', ["Rest here."]),
+    ('"Hi," the old monk says.', ["Hi."]),
+    ('A sign that says "OPEN" hangs on the door.', []),
+    ('The scoreboard says "GOAL".', []),
+    ('The shop called "Joe\'s" is closed.', []),
+    ('He called out "Over here!"', ["Over here!"]),
+    ('The monk says nothing, pointing at the "EXIT" sign.', []),
+    ('He nods. "Go!" flashes on the screen.', []),
+    ('He says "Keep moving.', []),
+    ('He says "".', []),
+    ('He says "...".', []),
+    ('He says "Wait…"', ["Wait..."]),
+    ('He says "Keep moving" and leaves.', ["Keep moving."]),
+    ('A sign says "OPEN" and he says "Come in."', ["Come in."]),
+    ('He looks at the "FuboTV" logo and says "Wow."', ["Wow."]),
+    ('He wears a "Fubo" cap and says nothing.', []),
+    ('He says nothing and points at the "EXIT" sign.', []),
+    ('He calls his dog "Rex"', []),
+    ('The crowd chants "Go Fubo!" as he says hello.', []),
+    ('The crowd yells "Goal!"', []),
+)
+
+
+def test_nf2_which_quotes_are_spoken():
+    for narrative, expected in NF2_CASES:
+        assert se.spoken_lines(narrative) == expected, narrative
+    assert se.spoken_lines(HOCKEY) == [LINE1, LINE2]
+
+
+def test_nf3_line_words():
+    for text in ("It's just FuboTV.", "IT’S JUST FUBOTV", "it‘s just fubotv...", "It's  just FuboTV…",
+                 "it's, just; FuboTV!"):
+        assert se.line_words(text) == ["it's", "just", "fubotv"], text
+    assert se.line_words("Café au lait, s’il vous plaît.") == [
+        "café", "au", "lait", "s'il", "vous", "plaît"]
+    assert se.line_words("a well-known stop") == ["a", "well", "known", "stop"]
+    assert se.line_words("...") == []
+
+
+def test_nf4_required_lines(ws):
+    for narration in (True, "speech"):
+        assert se.required_lines(_hockey_ctx(ws, "hockey-2x145", narration=narration)) == [
+            LINE1, LINE2], narration
+    assert se.required_lines(_hockey_ctx(ws, "hockey-2x145", narration=False)) == []
+    assert se.required_lines(seu.make_ctx(se, ws)) == []

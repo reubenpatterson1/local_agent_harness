@@ -1,0 +1,74 @@
+{
+  "title": "FuboTV: It's Just FuboTV",
+  "logline": "A FuboTV hockey player skates toward the camera, delivers a deal line, and finishes with a hard stop that sprays ice before skating away.",
+  "cast": [
+    {
+      "id": "c1",
+      "phrase": "the FuboTV player",
+      "descriptor": "a man in his late twenties, athletic build, light skin, short dark hair, wearing a reddish-orange and white hockey jersey with a large FuboTV logo on the chest, white pants, black skates, and a white helmet with a clear visor"
+    },
+    {
+      "id": "c2",
+      "phrase": "the cheering crowd",
+      "descriptor": "a dense group of spectators in their twenties and thirties, mixed skin tones, casual winter clothing, seated in the bleachers behind the rink boards, some with raised arms and open mouths, cheering"
+    }
+  ],
+  "locations": [
+    {
+      "id": "l1",
+      "setting": "The setting is a modern indoor ice hockey arena at night, a smooth white ice rink floor, bright overhead floodlights with FuboTV boards and banners around the perimeter."
+    }
+  ],
+  "props": [
+    {
+      "id": "p1",
+      "name": "hockey stick"
+    },
+    {
+      "id": "p2",
+      "name": "FuboTV rink boards"
+    },
+    {
+      "id": "p3",
+      "name": "digital bleacher banners"
+    }
+  ],
+  "beats": [
+    {
+      "index": 1,
+      "arc": "introduction",
+      "action": "The FuboTV player skates forward toward the camera, gliding steadily across the ice while speaking directly to the lens.",
+      "shot": "medium close-up",
+      "camera": "static",
+      "location": "l1",
+      "cast": [
+        "c1"
+      ],
+      "speaker": "c1",
+      "lines": [
+        1
+      ]
+    },
+    {
+      "index": 2,
+      "arc": "resolution",
+      "action": "The FuboTV player skates forward, halts in a sharp hockey stop that sprays ice mist, then skates away from the camera.",
+      "shot": "medium shot",
+      "camera": "static",
+      "location": "l1",
+      "cast": [
+        "c1",
+        "c2"
+      ],
+      "speaker": "c1",
+      "lines": [
+        2
+      ]
+    }
+  ],
+  "loras": {
+    "global": [],
+    "per_beat": {},
+    "stills": []
+  }
+}

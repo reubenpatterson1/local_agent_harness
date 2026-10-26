@@ -1,0 +1,16 @@
+{
+  "panels": [
+    {
+      "index": 1,
+      "title": "Skating Toward the Lens",
+      "image": "The FuboTV player glides forward on the ice, facing the camera directly, in a medium close-up. Behind him, the rink boards and digital banners glow with bright FuboTV logos, and blurred cheering crowds fill the stands. Cool blue ice contrasts with warm arena floodlights, giving the scene a crisp, saturated, realistic cinematic look.",
+      "motion": "the FuboTV player glides forward toward the camera, arms swinging gently at his sides, his head turning slightly as he looks into the lens.",
+      "dialogue": "Getting the best deal on hockey isn't a hat trick."
+    },
+    {
+      "index": 2,
+      "title": "The FuboTV Hockey Stop",
+      "motion": "The FuboTV player skates forward, then halts in a sharp hockey stop that sprays ice mist into the air. He holds the pose, then skates away from the camera."
+    }
+  ]
+}

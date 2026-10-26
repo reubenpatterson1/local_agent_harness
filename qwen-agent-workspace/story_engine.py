@@ -374,6 +374,115 @@ def _goal_paragraph(goal):
     return "" if goal is None else "The target output goal is " + goal + ".\n\n"
 
 
+# Narrative dialogue fidelity (docs/superpowers/specs/2026-10-26-narrative-dialogue-fidelity-
+# design.md QL1, GC1): the narrative's quoted spoken lines are required on-camera dialogue (Q1),
+# and a group of people is setting, never cast.
+QUOTE_RE = re.compile(r'"([^"]*)"')
+_LINE_WORD_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)*")
+_CLAUSE_BREAK_RE = re.compile(r"[.!?;,]")
+_QUOTE_EDGE_CHARS = " \t\n,:;—–-"
+BEFORE_WINDOW_WORDS = 6
+AFTER_WINDOW_WORDS = 4
+SPEECH_VERBS = frozenset("""
+    say says said saying ask asks asked asking reply replies replied replying
+    answer answers answered answering shout shouts shouted shouting yell yells yelled yelling
+    scream screams screamed screaming cry cries cried crying
+    whisper whispers whispered whispering murmur murmurs murmured murmuring
+    mutter mutters muttered muttering exclaim exclaims exclaimed exclaiming
+    announce announces announced announcing declare declares declared declaring
+    tell tells told telling speak speaks spoke speaking""".split())
+CALL_VERBS = frozenset(("call", "calls", "called", "calling"))     # speech only before "out"
+CLAUSE_STOP_WORDS = frozenset("and then as but while before after until so or when".split())
+NOT_SPEAKER_WORDS = frozenset("""
+    that which it sign signs banner banners logo logos screen screens scoreboard jumbotron
+    board boards billboard poster posters label caption display shirt jersey note card""".split())
+GROUP_NOUNS = frozenset("""
+    crowd crowds audience audiences fans spectators onlookers bystanders passers-by passersby
+    pedestrians commuters supporters cheerleaders throng throngs mob mobs masses public
+    congregation team teams squad squads band bands people extras""".split())
+GROUP_DESCRIPTOR_RE = re.compile(
+    r"^an?\s+(?:[A-Za-z-]+\s+){0,2}(?:group|crowd|throng|mob|mass|sea|line|row|pack|band|team|"
+    r"squad|horde|swarm|flock|herd)\s+of\b", re.IGNORECASE)
+SPOKEN_LINES_HEADER = ("Spoken lines (the narrative quotes these words; the movie must speak "
+                       "every one of them on camera, word for word, in this order):")
+
+
+def line_words(text):
+    """The words of a text for spoken-line matching (QL2): lower case, curly apostrophes made
+    straight, an apostrophe inside a word kept, every other non-letter, non-digit character a
+    word break (so case, punctuation and an ellipsis never matter)."""
+    return _LINE_WORD_RE.findall(text.replace("’", "'").replace("‘", "'").lower())
+
+
+def _speech_verb_at(words, p):
+    """True when words[p] is a speech verb (a call verb only right before "out") whose word
+    before it is not that, which, it, a text surface or a group noun (QL2 step 5)."""
+    word = words[p]
+    verb = word in SPEECH_VERBS or (word in CALL_VERBS and p + 1 < len(words)
+                                    and words[p + 1] == "out")
+    return verb and (words[p - 1] if p > 0 else "") not in NOT_SPEAKER_WORDS | GROUP_NOUNS
+
+
+def classify_quotes(narrative):
+    """[(inner, spoken)] for every double-quoted span of the narrative, in order (QL2): curly
+    double quotes count as straight ones and pair left to right (an unmatched last quote is
+    ignored); inner is the quoted text with its whitespace collapsed; spoken is True when a
+    speech verb lies in the clause before the quote (at most 6 words back, after the last
+    conjunction) or in the clause after it (at most 4 words on, before the first conjunction)."""
+    text = narrative.replace("“", '"').replace("”", '"')
+    matches = list(QUOTE_RE.finditer(text))
+    out = []
+    for i, match in enumerate(matches):
+        prev_end = matches[i - 1].end() if i > 0 else 0
+        next_start = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        before = line_words(_CLAUSE_BREAK_RE.split(
+            text[prev_end:match.start()].rstrip(_QUOTE_EDGE_CHARS))[-1])
+        stops = [j for j, w in enumerate(before) if w in CLAUSE_STOP_WORDS]
+        if stops:
+            before = before[stops[-1] + 1:]
+        after = line_words(_CLAUSE_BREAK_RE.split(
+            text[match.end():next_start].lstrip(_QUOTE_EDGE_CHARS))[0])
+        stops = [j for j, w in enumerate(after) if w in CLAUSE_STOP_WORDS]
+        if stops:
+            after = after[:stops[0]]
+        spoken = (any(_speech_verb_at(before, p)
+                      for p in range(max(0, len(before) - BEFORE_WINDOW_WORDS), len(before)))
+                  or any(_speech_verb_at(after, p)
+                         for p in range(min(AFTER_WINDOW_WORDS, len(after)))))
+        out.append((" ".join(match.group(1).split()), spoken))
+    return out
+
+
+def spoken_display(inner):
+    """The display text of a quoted spoken line (QL3): one surrounding pair of straight or curly
+    double quotes removed, every other double quote an apostrophe, whitespace collapsed (the
+    three steps of character_lib.clean_line), "…" written as "...", trailing commas, semicolons,
+    colons and dashes removed, and a full stop added unless it ends in . ! or ?. The author's
+    ellipsis is kept."""
+    line = inner.strip()
+    for left, right in (('"', '"'), ("“", "”")):
+        if len(line) >= 2 and line.startswith(left) and line.endswith(right):
+            line = line[1:-1].strip()
+            break
+    for quote in ('"', "“", "”"):
+        line = line.replace(quote, "'")
+    line = " ".join(line.split()).replace("…", "...").rstrip(" ,;:—–-")
+    if not line.endswith((".", "!", "?")):
+        line += "."
+    return line
+
+
+def spoken_lines(narrative):
+    """The display text of every spoken quote of the narrative that has a word, in order (QL3)."""
+    return [spoken_display(inner) for inner, spoken in classify_quotes(narrative)
+            if spoken and line_words(inner)]
+
+
+def required_lines(ctx):
+    """The spoken lines the movie must speak on camera (QL4): none with --no-narration."""
+    return [] if ctx.narration is False else spoken_lines(ctx.narrative)
+
+
 def catalog_line(entry):
     """One catalog entry as the planner and the critic see it (RS7)."""
     lo, hi = entry["strength_range"]

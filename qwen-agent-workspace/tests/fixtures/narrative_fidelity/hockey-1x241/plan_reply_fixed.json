@@ -1,0 +1,54 @@
+{
+  "title": "FuboTV: It's Just FuboTV",
+  "logline": "A FuboTV hockey player skates toward the camera, delivers a deal line, and finishes with a hard stop that sprays ice before skating away.",
+  "cast": [
+    {
+      "id": "c1",
+      "phrase": "the FuboTV player",
+      "descriptor": "a man in his late twenties, athletic build, light skin, short brown hair, wearing a reddish-orange and white hockey jersey with a large FuboTV logo on the chest, white pants, black skates, and a white helmet with a clear visor"
+    }
+  ],
+  "locations": [
+    {
+      "id": "l1",
+      "setting": "The setting is a modern indoor hockey arena, with a white ice rink, reddish-orange boards, and bright overhead lights reflecting off the glossy surface."
+    }
+  ],
+  "props": [
+    {
+      "id": "p1",
+      "name": "FuboTV jersey"
+    },
+    {
+      "id": "p2",
+      "name": "hockey skates"
+    },
+    {
+      "id": "p3",
+      "name": "ice mist"
+    }
+  ],
+  "beats": [
+    {
+      "index": 1,
+      "arc": "climax",
+      "action": "The FuboTV player skates forward toward the camera, stops abruptly in a hockey stop that sprays ice mist into the air, then skates away from the camera.",
+      "shot": "medium shot",
+      "camera": "tracking",
+      "location": "l1",
+      "cast": [
+        "c1"
+      ],
+      "speaker": "c1",
+      "lines": [
+        1,
+        2
+      ]
+    }
+  ],
+  "loras": {
+    "global": [],
+    "per_beat": {},
+    "stills": []
+  }
+}

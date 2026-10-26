@@ -1,0 +1,5 @@
+{
+  "title": "The FuboTV Hockey Stop",
+  "image": "The FuboTV player stands centered in the foreground, facing directly toward the camera with a focused expression. The ice surface stretches out behind him, reflecting the bright overhead arena lights. The background is a soft blur of the rink boards, digital banners, and cheering crowd, bathed in cool blue and white tones with warm highlights from the lighting. The scene is rendered in a polished, realistic cinematic style with sharp focus on the player and a shallow depth of field.",
+  "motion": "The FuboTV player skates forward toward the camera, then stops abruptly in a hockey stop, spraying ice mist into the air. He then skates away from the camera."
+}
