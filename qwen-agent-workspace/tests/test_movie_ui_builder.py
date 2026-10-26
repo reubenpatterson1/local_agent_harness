@@ -273,8 +273,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # kept around the seed-aware field list), then to
     # 1f5aa2c36cefe38567d76230c9e3e342c8f14869 (on-camera dialogue), then to
     # 5cda31ecc94ca568f8a5ec587b00ee7393532809 (panel-1 pacing: story_engine.py camera
-    # sentences and chained panel-1 template). This invariant holds from the new baseline.
-    BASELINE = "5cda31ecc94ca568f8a5ec587b00ee7393532809"
+    # sentences and chained panel-1 template), then to
+    # 6a0b3035bdf3f6eb20833372436fd5e64af1f67b (panel-1 pacing instruction reworded). This invariant holds from the new baseline.
+    BASELINE = "6a0b3035bdf3f6eb20833372436fd5e64af1f67b"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
