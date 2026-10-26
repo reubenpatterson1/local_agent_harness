@@ -45,6 +45,7 @@ pre { background: var(--code); padding: 8px; overflow: auto; white-space: pre-wr
 .errors li, .check-fail { color: var(--bad); }
 .check-pass { color: var(--ok); }
 .check-skip, .check-running { color: var(--muted); }
+.check-warn { color: var(--warn); }
 table.list { border-collapse: collapse; width: 100%; }
 table.list th, table.list td { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: left; vertical-align: top; }
 .clickable { cursor: pointer; }

@@ -461,7 +461,7 @@
   function updateComposeButtons() {
     const mode = $("#c-mode").value;
     gate($("#c-run-all"), $("#c-run-all-reason"), mode === "no_stills" ? ["render"] : ["render", "stills"]);
-    gate($("#c-write-story"), $("#c-write-story-reason"), ["story_server"]);
+    gate($("#c-write-story"), $("#c-write-story-reason"), []);
     gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
   }
 

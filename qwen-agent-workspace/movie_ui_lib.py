@@ -1427,11 +1427,13 @@ def stills_check(ws_real, py=sys.executable):
     return False, "stills dependencies not importable: %s" % last_line(run["stderr"])
 
 
-def story_server_check(ws_real):
-    """(ok, detail) for V2 "story server": bin/story-server status (bash, run directly)."""
+def story_server_probe(ws_real):
+    """bin/story-server status (bash, run directly) as ("serving", state), ("down", state),
+    ("timeout", None) or ("error", "bin/story-server status exited <n|none>: <last stderr line
+    or ->") (VLM lifecycle spec VU1)."""
     run = run_light([os.path.join(ws_real, "bin", "story-server"), "status"], ws_real)
     if run["timed_out"]:
-        return False, "bin/story-server status timed out after %d s" % LIGHT_TIMEOUT
+        return "timeout", None
     state = None
     for line in run["stdout"].splitlines():
         match = STATE_LINE_RE.match(line)
@@ -1440,10 +1442,42 @@ def story_server_check(ws_real):
             break
     if run["exit_code"] != 0 or state is None:
         code = "none" if run["exit_code"] is None else str(run["exit_code"])
-        return False, "bin/story-server status exited %s: %s" % (code, last_line(run["stderr"]) or "-")
+        return "error", "bin/story-server status exited %s: %s" % (code, last_line(run["stderr"]) or "-")
     if state.startswith("SERVING "):
-        return True, "story server: %s" % state
-    return False, "story server is %s; start it with bin/story-server mlx-vision" % state
+        return "serving", state
+    return "down", state
+
+
+def _story_server_pair(kind, value):
+    """The (ok, detail) of one story_server_probe result, as V2 reported it before the VLM
+    lifecycle."""
+    if kind == "serving":
+        return True, "story server: %s" % value
+    if kind == "down":
+        return False, "story server is %s; start it with bin/story-server mlx-vision" % value
+    if kind == "timeout":
+        return False, "bin/story-server status timed out after %d s" % LIGHT_TIMEOUT
+    return False, value
+
+
+def story_server_check(ws_real):
+    """(ok, detail) for the MU60 capability probe: bin/story-server status (bash, run directly)."""
+    return _story_server_pair(*story_server_probe(ws_real))
+
+
+def story_server_record(ws_real):
+    """V2's "story server" record. While the VLM lifecycle is on, a stopped server or a status
+    timeout is a warn (the job's preflight starts or checks it at dispatch, VU1); otherwise, and
+    for an error, the record is pass or fail as before."""
+    kind, value = story_server_probe(ws_real)
+    if vlm_lifecycle_enabled() and kind == "down":
+        return check("V2", "story server", "warn", "story server is %s; the job starts it when it "
+                     "reaches the front of the queue (a 5-14 min load)" % value)
+    if vlm_lifecycle_enabled() and kind == "timeout":
+        return check("V2", "story server", "warn", "bin/story-server status timed out after 60 s; "
+                     "the job checks the story server and restarts it if needed when it reaches "
+                     "the front of the queue")
+    return _from_pair("V2", "story server", _story_server_pair(kind, value))
 
 
 def judge_key_check():
@@ -1481,7 +1515,7 @@ def host_checks(fields, ws_real, py=sys.executable):
     out = [_from_pair("V2", "render", render_check()) if render_needed(fields) else not_needed("V2", "render"),
            _from_pair("V2", "stills", stills_check(ws_real, py)) if stills_needed(fields)
            else not_needed("V2", "stills"),
-           _from_pair("V2", "story server", story_server_check(ws_real)) if story_needed(fields, ws_real)
+           story_server_record(ws_real) if story_needed(fields, ws_real)
            else not_needed("V2", "story server"),
            _from_pair("V2", "judge key", judge_key_check()) if fields["judge"] is True
            else not_needed("V2", "judge key")]

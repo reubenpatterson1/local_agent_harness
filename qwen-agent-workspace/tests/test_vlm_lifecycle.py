@@ -900,3 +900,57 @@ def test_review_focus_2_startup_restore_waits_for_a_running_job(state, tmp_path,
     assert lib.VLM_RECOVERY == [] and len(lib.RESTORERS) == 1
     assert lib.RESTORERS[0].wait(timeout=30) == 0
     assert call_names(tools) == ["restore"]
+
+
+# --- VL25, VL26: V2 at submit and the page (VU1, VU3) ------------------------------------------
+
+W1 = ("story server is STOPPED; the job starts it when it reaches the front of the queue "
+      "(a 5-14 min load)")
+W2 = ("bin/story-server status timed out after 60 s; the job checks the story server and restarts "
+      "it if needed when it reaches the front of the queue")
+
+
+def test_vl25_a_stopped_story_server_is_a_warning_while_the_lifecycle_is_on(http_env, monkeypatch,
+                                                                             tmp_path):
+    s, ws = http_env["srv"], http_env["ws"]
+    lifecycle_on(monkeypatch, make_fake_tools(tmp_path / "vlm", MODEL), 9)
+    mt.stub_config(ws, {"story-server status": {
+        "stdout": "story-server status  X\n  state:          STOPPED\n"}})
+    warn = lib.check("V2", "story server", "warn", W1)
+    assert lib.story_server_record(ws) == warn
+    status, _h, payload = mt.api(s, "POST", "/api/jobs", body=mt.fields(ws))
+    assert status == 201, payload
+    assert warn in payload["checks"] and lib.checks_pass(payload["checks"])
+    # The capability probe (MU60) keeps HEAD's pair.
+    assert lib.story_server_check(ws) == (
+        False, "story server is STOPPED; start it with bin/story-server mlx-vision")
+    monkeypatch.setattr(lib, "LIGHT_TIMEOUT", 1)
+    mt.stub_config(ws, {"story-server status": {"sleep": 3}})
+    assert lib.story_server_record(ws) == lib.check("V2", "story server", "warn", W2)
+    monkeypatch.setattr(lib, "LIGHT_TIMEOUT", 60)
+    mt.stub_config(ws, {"story-server status": {
+        "exit": 4, "stderr": "story-server: /usr/sbin/lsof is missing or not executable\n"}})
+    fail = lib.check("V2", "story server", "fail", "bin/story-server status exited 4: story-server: "
+                                                   "/usr/sbin/lsof is missing or not executable")
+    assert lib.story_server_record(ws) == fail
+    status, _h, payload = mt.api(s, "POST", "/api/jobs", body=mt.fields(ws))
+    assert status == 409 and fail in payload["checks"]
+    mt.stub_config(ws, {})
+    assert lib.story_server_record(ws) == lib.check("V2", "story server", "pass",
+                                                    "story server: SERVING vision")
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "0")
+    mt.stub_config(ws, {"story-server status": {
+        "stdout": "story-server status  X\n  state:          STOPPED\n"}})
+    assert lib.story_server_record(ws) == lib.check(
+        "V2", "story server", "fail", "story server is STOPPED; start it with bin/story-server mlx-vision")
+
+
+def test_vl26_page_gate_and_warn_style():
+    with open(os.path.join(mt.WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    assert 'gate($("#c-write-story"), $("#c-write-story-reason"), []);' in js
+    assert '["story_server"]' not in js
+    with open(os.path.join(mt.WS, "static", "movie-ui", "app.css"), encoding="utf-8") as f:
+        css = f.read()
+    assert ".check-warn { color: var(--warn); }\n" in css
+    assert css.index(".check-skip, .check-running") < css.index(".check-warn")
