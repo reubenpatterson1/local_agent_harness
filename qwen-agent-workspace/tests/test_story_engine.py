@@ -1757,7 +1757,7 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
     assert list(plan) == ["schema", "story_id", "mode", "panels", "seconds", "narrative", "goal",
                           "seed_image", "video_model", "auto_lora", "title", "logline", "cast",
-                          "locations", "props", "beats", "loras", "speech_notes"]
+                          "locations", "props", "beats", "loras", "cast_notes", "speech_notes"]
     assert plan["schema"] == "ltx-movie.plan.v1" and plan["panels"] == 3
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert list(checks) == ["schema", "story_id", "mode", "panels", "checked_at", "source",

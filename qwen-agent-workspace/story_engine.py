@@ -870,6 +870,7 @@ def normalize_plan(ctx, raw):
                  "stills": _normalize_picks(loras.get("stills"), by_id)}
     picks["pinned"] = [dict(pin) for pin in ctx.pinned]
     plan["loras"] = picks
+    plan["cast_notes"] = drop_groups(plan)
     plan["speech_notes"] = coerce_speakers(ctx, plan)
     return plan, shape
 
@@ -938,6 +939,47 @@ def speaking_coercion(ctx, plan, k):
             notes.append("beat %d: P14 speaking beat: camera %s changed to 'static' so the "
                          "speaker's face stays readable" % (k, _q(beat["camera"])))
             beat["camera"] = "static"
+    return notes
+
+
+def is_group_entry(entry):
+    """True when a plan cast entry is a group of people, not a character (narrative dialogue
+    fidelity spec GC2): it is not a library character, and the head word of its phrase (the last
+    word, lowercased, without a trailing 's or ') is a GROUP_NOUNS word, or its descriptor
+    starts like "a group of" (GROUP_DESCRIPTOR_RE)."""
+    if entry.get("cast_name") is not None:
+        return False
+    words = (entry.get("phrase") or "").split()
+    head = words[-1].lower() if words else ""
+    for tail in ("'s", "’s", "'", "’"):
+        if head.endswith(tail):
+            head = head[:-len(tail)]
+            break
+    return head in GROUP_NOUNS or bool(GROUP_DESCRIPTOR_RE.match(entry.get("descriptor") or ""))
+
+
+def drop_groups(plan):
+    """The P15 notes of GC3, in cast order: every group entry is removed from plan["cast"], and
+    each removed id that no kept entry also uses is removed from every beat's cast (order kept)."""
+    groups = [entry for entry in plan["cast"] if is_group_entry(entry)]
+    if not groups:
+        return []
+    plan["cast"] = [entry for entry in plan["cast"] if not is_group_entry(entry)]
+    gone = set(entry["id"] for entry in groups) - set(entry["id"] for entry in plan["cast"])
+    listed = {}
+    for k, beat in enumerate(plan["beats"], start=1):
+        for cid in beat["cast"]:
+            if cid in gone and k not in listed.setdefault(cid, []):
+                listed[cid].append(k)
+        beat["cast"] = [cid for cid in beat["cast"] if cid not in gone]
+    notes = []
+    for entry in groups:
+        beats = listed.get(entry["id"], [])
+        where = ("" if not beats else " and from beat%s %s"
+                 % ("s" if len(beats) > 1 else "", ", ".join(str(k) for k in beats)))
+        notes.append("plan: P15 group cast: %s %s is a group of people, not a character, so it is "
+                     "removed from the cast%s; describe it in the setting sentence instead"
+                     % (entry["id"], _q(entry["phrase"]), where))
     return notes
 
 
@@ -1211,6 +1253,18 @@ def plan_checks(ctx, plan, shape=()):
             for hit in undeclared_references(lib, text, undeclared, exact_phrase=exact,
                                         masks=masks):
                 advisory.append(undeclared_message("plan: P13 undeclared character:", where, hit))
+    advisory += plan.get("cast_notes", [])
+    if ctx.narration is False:
+        silent = spoken_lines(ctx.narrative)
+        if silent:
+            advisory.append("plan: Q2 spoken lines: the narrative quotes %d spoken line(s), but "
+                            "--no-narration makes this movie silent, so none of them is spoken"
+                            % len(silent))
+    quotes = ctx.narrative.replace("“", '"').replace("”", '"').count('"')
+    if quotes % 2:
+        advisory.append("plan: Q3 quotes: the narrative has an odd number of double quotes (%d), "
+                        "so its last quote is unmatched and ignored; close every quoted line"
+                        % quotes)
     advisory += plan["speech_notes"]
     return hard, advisory
 

@@ -396,3 +396,92 @@ def test_nf19_n17_accepts_a_moving_speaking_camera(ws):
     for camera in ("The camera tracks the courier.", "The camera pulls back.",
                    "The camera follows the courier.", "The camera slowly pushes in."):
         assert n17("The courier waits. " + camera) == ([], []), camera
+
+
+# --- NF22, NF23, NF27, NF36: groups are setting; the plan advisories P15, Q2, Q3 (GC, QL12) -------
+
+P15_2X145 = ("plan: P15 group cast: c2 'the cheering crowd' is a group of people, not a "
+             "character, so it is removed from the cast and from beat 2; describe it in the "
+             "setting sentence instead")
+
+
+def _reply(case, name="plan_reply_1.txt"):
+    """The parsed JSON of a fixture plan reply."""
+    with open(os.path.join(FIXTURES, case, name), encoding="utf-8") as f:
+        return se.extract_json(f.read())
+
+
+def _entry(phrase, descriptor="a man in a red jersey with short dark hair", cast_name=None):
+    return {"id": "c2", "phrase": phrase, "descriptor": descriptor, "cast_name": cast_name}
+
+
+def test_nf22_is_group_entry():
+    for phrase in ("the cheering crowd", "the fans'", "the hockey team", "the people",
+                   "the spectators", "the fans’"):
+        assert se.is_group_entry(_entry(phrase)), phrase
+    for phrase in ("the team captain", "the crowd's leader", "the crowd’s leader", PLAYER):
+        assert not se.is_group_entry(_entry(phrase)), phrase
+    assert se.is_group_entry(_entry("the onlookers", "a dense group of spectators in the stands"))
+    assert se.is_group_entry(_entry("the hecklers", "a dense group of hecklers in the stands"))
+    assert se.is_group_entry(_entry("the hecklers", "A row of hecklers in winter coats"))
+    assert not se.is_group_entry(_entry("the hiker", "a man with a group of friends"))
+    assert not se.is_group_entry(_entry("the crowd", cast_name="crowd"))
+
+
+def test_nf23_normalization_drops_the_crowd(ws):
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    plan, shape = se.normalize_plan(ctx, _reply("hockey-2x145"))
+    assert shape == []
+    assert [c["id"] for c in plan["cast"]] == ["c1"]
+    assert plan["cast_notes"] == [P15_2X145]
+    assert plan["beats"][1]["cast"] == ["c1"]
+    advisory = se.plan_checks(ctx, plan, shape)[1]
+    assert P15_2X145 in advisory and not [m for m in advisory if " P12 " in m]
+    raw = _reply("hockey-2x145")
+    raw["beats"][1]["speaker"] = "c9"
+    plan, shape = se.normalize_plan(ctx, raw)
+    not_cast = "beat 2: P14 speaking beat: speaker 'c9' is not a cast id, so nobody speaks in this beat"
+    assert plan["speech_notes"] == [not_cast]
+    assert se.plan_checks(ctx, plan, shape)[1][-2:] == [P15_2X145, not_cast]
+    assert list(plan)[-2:] == ["cast_notes", "speech_notes"]
+    many = {"cast": [_entry(PLAYER, cast_name=None), _entry("the fans", "a sea of fans")],
+            "beats": [{"cast": ["c1", "c2"]}, {"cast": ["c2", "c2"]}, {"cast": ["c1"]}]}
+    many["cast"][0]["id"] = "c1"
+    assert se.drop_groups(many) == [
+        "plan: P15 group cast: c2 'the fans' is a group of people, not a character, so it is "
+        "removed from the cast and from beats 1, 2; describe it in the setting sentence instead"]
+    assert [b["cast"] for b in many["beats"]] == [["c1"], [], ["c1"]]
+    alone = {"cast": [_entry("the audience")], "beats": [{"cast": []}]}
+    assert se.drop_groups(alone) == [
+        "plan: P15 group cast: c2 'the audience' is a group of people, not a character, so it is "
+        "removed from the cast; describe it in the setting sentence instead"]
+    assert alone["cast"] == []
+
+
+Q2_HOCKEY = ("plan: Q2 spoken lines: the narrative quotes 2 spoken line(s), but --no-narration "
+             "makes this movie silent, so none of them is spoken")
+
+
+def test_nf27_q2_no_narration_drops_the_spoken_lines(ws):
+    for narration, expected in ((False, [Q2_HOCKEY]), ("speech", []), (True, [])):
+        ctx = _hockey_ctx(ws, "hockey-2x145", narration=narration)
+        plan, shape = se.normalize_plan(ctx, seu.plan_json("chained", 2))
+        hard, advisory = se.plan_checks(ctx, plan, shape)
+        assert [m for m in advisory if " Q2 " in m] == expected, narration
+        assert not [m for m in hard if " Q2 " in m]
+
+
+def test_nf36_q3_an_odd_quote_count(ws):
+    q3 = ("plan: Q3 quotes: the narrative has an odd number of double quotes (1), so its last "
+          "quote is unmatched and ignored; close every quoted line")
+    for narration in (True, "speech", False):
+        ctx = seu.make_ctx(se, ws, narrative='He says "Go.', narration=narration)
+        plan, shape = se.normalize_plan(ctx, seu.plan_json("chained", 3))
+        assert [m for m in se.plan_checks(ctx, plan, shape)[1] if " Q3 " in m] == [q3], narration
+        ctx = _hockey_ctx(ws, "hockey-2x145", narration=narration)
+        plan, shape = se.normalize_plan(ctx, seu.plan_json("chained", 2))
+        assert not [m for m in se.plan_checks(ctx, plan, shape)[1] if " Q3 " in m], narration
+    ctx = seu.make_ctx(se, ws, narrative="He says “Go.” Then “Stop.")
+    plan, shape = se.normalize_plan(ctx, seu.plan_json("chained", 3))
+    assert [m for m in se.plan_checks(ctx, plan, shape)[1] if " Q3 " in m] == [
+        q3.replace("(1)", "(3)")]
