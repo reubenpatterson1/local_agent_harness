@@ -1,0 +1,82 @@
+{
+  "schema": "ltx-movie.plan.v1",
+  "story_id": "hockey-2x145-f",
+  "mode": "chained",
+  "panels": 2,
+  "seconds": "6",
+  "narrative": "A hockey player in a reddish-orange and white uniform with \"FuboTV\" in a big logo on the front stands in a hockey rink with \"FuboTV\" on the sides of the rink and on digital banners on the bleachers, with cheering crowds in the stands. He skates forward towards the camera and says \"Getting the best deal on hockey isn't a hat trick...\" then stops short, kicking up ice mist into the air, then says \"It's just FuboTV.\" then skates away.",
+  "goal": "a polished, realistic FuboTV hockey promo: on-camera lines delivered by the player, a hockey stop with ice spray, legible FuboTV branding",
+  "seed_image": null,
+  "video_model": "/Users/reubenpatterson/ltx-2-mlx/models/ltx-2.5-mlx-q8",
+  "auto_lora": true,
+  "title": "FuboTV: It's Just FuboTV",
+  "logline": "A FuboTV hockey player skates toward the camera, delivers a deal line, and finishes with a hard stop that sprays ice before skating away.",
+  "cast": [
+    {
+      "id": "c1",
+      "phrase": "FuboTV hockey player",
+      "descriptor": "a man in his late twenties, athletic build, light skin, short brown hair, wearing a reddish-orange and white hockey jersey with a large FuboTV logo on the chest, white pants, black skates, and a white helmet with a clear visor",
+      "cast_name": null
+    }
+  ],
+  "locations": [
+    {
+      "id": "l1",
+      "setting": "The setting is a modern indoor hockey arena, with a white ice rink, boards and glass barriers, FuboTV logos on the rink sides and digital banners on the bleachers, bright overhead lights, and cheering crowds in the stands."
+    }
+  ],
+  "props": [
+    {
+      "id": "p1",
+      "name": "hockey skates"
+    },
+    {
+      "id": "p2",
+      "name": "FuboTV jersey"
+    }
+  ],
+  "beats": [
+    {
+      "index": 1,
+      "arc": "introduction",
+      "action": "The player skates forward toward the camera across the ice, his face lit and in frame, and says the first line about the best deal on hockey.",
+      "shot": "medium shot",
+      "camera": "tracking",
+      "location": "l1",
+      "cast": [
+        "c1"
+      ],
+      "speaker": "c1",
+      "lines": [
+        1
+      ]
+    },
+    {
+      "index": 2,
+      "arc": "resolution",
+      "action": "He stops short, kicks up a spray of ice mist into the air, says the closing line, then skates away from the camera.",
+      "shot": "medium shot",
+      "camera": "static",
+      "location": "l1",
+      "cast": [
+        "c1"
+      ],
+      "speaker": "c1",
+      "lines": [
+        2
+      ]
+    }
+  ],
+  "loras": {
+    "global": [],
+    "per_beat": {},
+    "stills": [],
+    "pinned": []
+  },
+  "spoken_lines": [
+    "Getting the best deal on hockey isn't a hat trick...",
+    "It's just FuboTV."
+  ],
+  "cast_notes": [],
+  "speech_notes": []
+}

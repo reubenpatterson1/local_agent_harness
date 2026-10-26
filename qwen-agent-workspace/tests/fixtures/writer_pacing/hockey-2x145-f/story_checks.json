@@ -1,0 +1,58 @@
+{
+  "schema": "ltx-movie.story-checks.v1",
+  "story_id": "hockey-2x145-f",
+  "mode": "chained",
+  "panels": 2,
+  "checked_at": "2026-10-26T11:42:52Z",
+  "source": "robust",
+  "round": 0,
+  "hard": [],
+  "unresolved": [],
+  "advisory": [
+    {
+      "id": "N7",
+      "name": "dialogue and text",
+      "scope": "panel",
+      "index": 1,
+      "message": "panel 1: N7 dialogue and text: Motion: says 'speaks'"
+    },
+    {
+      "id": "N12",
+      "name": "one action",
+      "scope": "panel",
+      "index": 2,
+      "message": "panel 2: N12 one action: Motion: chains actions with 'then'"
+    },
+    {
+      "id": "N1",
+      "name": "word count",
+      "scope": "panel",
+      "index": 2,
+      "message": "panel 2: N1 word count: Motion: is 46 words; aim for 15-35"
+    }
+  ],
+  "scores": null,
+  "verdict": null,
+  "stop_reason": "passed",
+  "rounds": [
+    {
+      "round": 0,
+      "hard": 0,
+      "advisory": 3,
+      "scores": null,
+      "verdict": null
+    }
+  ],
+  "best_round": 0,
+  "judge": {
+    "status": "ok",
+    "detail": "min score 7",
+    "scores": {
+      "continuity": 8,
+      "story": 8,
+      "renderability": 7
+    },
+    "min_score": 7,
+    "applied": false
+  }
+}

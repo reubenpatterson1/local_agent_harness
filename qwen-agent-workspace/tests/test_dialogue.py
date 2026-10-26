@@ -738,11 +738,9 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
             "sentences; no quotation marks, no speaker name and no description of how the words "
             "are said -- the pipeline adds who says them and how.\n") in prompt
     assert "\n" + se.KEY_LINE_TEMPLATES["narration_with_dialogue"] + "\n" in prompt
-    assert ('already on screen. You may add one camera direction. In this panel "the courier" '
-            "speaks the dialogue: they may move as the beat says, but write the motion so that "
-            "their face is toward the camera, in frame and lit while they speak -- a speaker who "
-            "approaches the camera speaks once close -- and do not write the spoken words or a "
-            "speaking verb here; the pipeline adds them.\n") in prompt
+    assert ('already on screen. You may add one camera direction.'
+            + se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
+            + "\n") in prompt
     assert "@@" not in prompt
     quiet = se.build_panel_prompt(ctx, plan, parts, 3)
     assert "\ndialogue: " not in quiet

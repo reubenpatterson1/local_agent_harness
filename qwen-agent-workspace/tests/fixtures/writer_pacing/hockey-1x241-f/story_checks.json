@@ -1,0 +1,44 @@
+{
+  "schema": "ltx-movie.story-checks.v1",
+  "story_id": "hockey-1x241-f",
+  "mode": "chained",
+  "panels": 1,
+  "checked_at": "2026-10-26T11:50:13Z",
+  "source": "robust",
+  "round": 0,
+  "hard": [],
+  "unresolved": [],
+  "advisory": [
+    {
+      "id": "N12",
+      "name": "one action",
+      "scope": "panel",
+      "index": 1,
+      "message": "panel 1: N12 one action: Motion: chains actions with 'then'"
+    }
+  ],
+  "scores": null,
+  "verdict": null,
+  "stop_reason": "passed",
+  "rounds": [
+    {
+      "round": 0,
+      "hard": 0,
+      "advisory": 1,
+      "scores": null,
+      "verdict": null
+    }
+  ],
+  "best_round": 0,
+  "judge": {
+    "status": "ok",
+    "detail": "min score 6",
+    "scores": {
+      "continuity": 8,
+      "story": 7,
+      "renderability": 6
+    },
+    "min_score": 6,
+    "applied": false
+  }
+}

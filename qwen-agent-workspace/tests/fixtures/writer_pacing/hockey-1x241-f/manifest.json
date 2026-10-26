@@ -1,0 +1,30 @@
+{
+  "schema_version": 3,
+  "story_id": "hockey-1x241-f",
+  "title": "",
+  "narrative": "A FuboTV hockey player skates toward the camera, delivers a deal line, and finishes with a hard stop that sprays ice before skating away.",
+  "created_at": "2026-10-26T11:52:05.862439+00:00",
+  "fps": 24,
+  "target_seconds": 10.041666666666666,
+  "pace": "equal",
+  "total_num_frames": 241,
+  "total_duration_s": 10.042,
+  "panels": [
+    {
+      "index": 1,
+      "image_path": "/Users/reubenpatterson/local_agent_harness/qwen-agent-workspace/generated/stories/hockey-1x241-f/images/panel_01.png",
+      "title": "FuboTV Hockey Stop",
+      "panel_text": "The setting is a modern indoor hockey arena at night, a white ice rink with FuboTV boards and digital banners, bright overhead floodlights, and cheering fans filling the stands. FuboTV hockey player is a man in his late twenties, athletic build, light skin, short brown hair, wearing a reddish-orange and white hockey jersey with a large FuboTV logo on the front, white pants, black skates, and a white helmet. A hockey player stands center ice facing the camera, body angled slightly forward, arms relaxed at his sides, mouth open mid-speech. The rink boards behind him carry bold FuboTV logos, and digital banners on the bleachers repeat the FuboTV name above a blurred cheering crowd. Cool white ice fills the foreground, with soft overhead arena lighting and a reddish-orange, white, and blue color palette. The camera sits low at ice level, framing the player from the waist up in a medium shot, rendered in a realistic cinematic promo style with shallow depth of field. FuboTV hockey player faces the camera. The shot is a medium shot.",
+      "narration": "",
+      "narration_words": 13,
+      "num_frames": 241,
+      "duration_s": 10.042,
+      "motion_prompt": "The FuboTV hockey player skates toward the camera, stops short, and kicks up a spray of ice mist. FuboTV hockey player faces the camera. FuboTV hockey player says, \"Getting the best deal on hockey isn't a hat trick...\" After a breath, \"It's just FuboTV.\" The audio is clear close-mic dialogue with a subtle natural room tone; the dialogue takes priority over the quiet ambience. He then skates away from the camera. The camera tracks alongside the movement.",
+      "transition_to_next": null,
+      "conditioning": "still",
+      "speaker": "FuboTV hockey player",
+      "speech": "Getting the best deal on hockey isn't a hat trick... It's just FuboTV.",
+      "speech_source": "dialogue"
+    }
+  ]
+}

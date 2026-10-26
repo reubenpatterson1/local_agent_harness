@@ -1676,6 +1676,12 @@ SEED_PANEL = ("An image is attached to this message. It IS this movie's first fr
               "image exactly what it shows -- each person's pose and place in the frame, the "
               "background, the lighting, the colour palette and the visual style -- and start "
               "motion from that exact pose.\n\n")
+# Writer pacing spec WP1, D5: fast, concrete motion at real-time speed, with named effects.
+PACING_SENTENCE = (" The motion plays at real-time speed: use fast, concrete action verbs, with no "
+                   "words that slow it down, and end the main action with the words 'at real-time "
+                   "speed'. When an action throws something up, such as ice, snow, water, dust or "
+                   "sparks, name it in the same sentence as a big, bright spray, splash or cloud, "
+                   "and never say how long it lasts, how small it is or when it settles.")
 KEY_LINE_TEMPLATES = {
     "title": "title: a short title for the panel, 2 to 6 words.",
     "chained_image": (
@@ -1690,17 +1696,16 @@ KEY_LINE_TEMPLATES = {
         "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
         "word for word. Describe ONE continuous physical motion, not a sequence of separate "
         "steps: @@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the "
-        "start of a movement. The motion plays at natural, real-time speed: use plain action "
-        "verbs with no adverbs of speed or manner. You may add one camera direction; without "
+        "start of a movement." + PACING_SENTENCE + " You may add one camera direction; without "
         "one, the pipeline adds the planned camera sentence."),
     "chained_motion": (
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "
         "Name each character only by their referring phrase, word for word. Describe ONE "
         "continuous physical motion, not a sequence of separate steps: @@SECONDS@@ seconds is "
-        "enough for a single gesture, a few footsteps or the start of a movement. Do not describe "
-        "appearance, clothing, setting, lighting, colour or style -- all of that is already on "
-        "screen. You may add one camera direction."),
+        "enough for a single gesture, a few footsteps or the start of a movement."
+        + PACING_SENTENCE + " Do not describe appearance, clothing, setting, lighting, colour or "
+        "style -- all of that is already on screen. You may add one camera direction."),
     "no_stills_prompt": (
         "prompt: W1 to W2 words in the present tense: one flowing paragraph in strict "
         "chronological order that opens with the main action, carries enough separate beats to "
@@ -1750,12 +1755,25 @@ KEY_LINE_TEMPLATES["no_stills_prompt_speaking"] = KEY_LINE_TEMPLATES["no_stills_
     "fills the full @@SECONDS@@ seconds with the one continuous movement of @@SPEAKER@@ that the "
     "beat describes, keeping their face toward the camera while they speak, ")
 # Appended to a speaking panel's key lines (dialogue spec 8.2; narrative dialogue fidelity spec
-# 7.2); @@SPEAKER@@ is the speaker's quoted referring phrase.
+# 7.2); @@SPEAKER@@ is the speaker's quoted referring phrase. Chained Motion uses
+# SPEAKING_CHAINED_MOTION_SENTENCE instead (writer pacing spec WP2); shots Motion keeps this one
+# (one action sentence, so the line follows it).
 SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: they may move as the "
                             "beat says, but write the motion so that their face is toward the "
                             "camera, in frame and lit while they speak -- a speaker who approaches "
                             "the camera speaks once close -- and do not write the spoken words or "
                             "a speaking verb here; the pipeline adds them.")
+# Writer pacing spec WP2, D1, D2: a chained speaking panel's motion is one sentence before the
+# dialogue (which character_lib.insert_speech places after it) and, when the beat goes on, one
+# after it.
+SPEAKING_CHAINED_MOTION_SENTENCE = (
+    " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
+    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything they do "
+    "before the dialogue, ending with them near the camera, face toward it (if the dialogue "
+    "comes before they do anything, it is how they turn toward the camera); only when the beat "
+    "has them act after the dialogue, write what they do then as a second sentence. Never put "
+    "an action from before the dialogue and one from after it in the same sentence, and do not "
+    "write the spoken words or a speaking verb; the pipeline adds them.")
 SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
                             "adds them.")
 SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; "
@@ -2455,7 +2473,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         if key in ("image", "motion", "prompt") and ctx.narration == "speech":
             line += SPEECH_FRAMING_SENTENCE
         if speaks:
-            line += SPEAKING_SENTENCES.get(key, "")
+            line += (SPEAKING_CHAINED_MOTION_SENTENCE if ctx.mode == "chained" and key == "motion"
+                     else SPEAKING_SENTENCES.get(key, ""))
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         if speaks:

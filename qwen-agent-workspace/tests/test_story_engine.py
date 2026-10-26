@@ -2920,8 +2920,9 @@ def test_pacing_camera_sentences_classify_as_before(ws):
 def test_pacing_panel1_prompt_and_no_slowly(ws):
     ctx, plan, parts, _t, _p = _story(ws, "chained", 3)
     prompt = se.build_panel_prompt(ctx, plan, parts, 1)
-    assert "The motion plays at natural, real-time speed: use plain action verbs with no " \
-        "adverbs of speed or manner." in prompt
+    assert "The motion plays at real-time speed: use fast, concrete action verbs, with no " \
+        "words that slow it down, and end the main action with the words 'at real-time " \
+        "speed'." in prompt
     # the 15-35 band less the 4 words of the pasted camera sentence ("The camera stays static.")
     assert "motion: 11 to 31 words" in prompt
     assert se.WORD_RANGES["chained"]["motion1"] == (15, 35)

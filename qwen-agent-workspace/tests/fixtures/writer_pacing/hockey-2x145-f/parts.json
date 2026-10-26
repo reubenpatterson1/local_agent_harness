@@ -1,0 +1,17 @@
+{
+  "panels": [
+    {
+      "index": 1,
+      "title": "FuboTV Player Skates In",
+      "image": "A hockey player skates toward the camera, face lit and in frame, across a rink with FuboTV logos on the boards and digital banners in the stands, cheering crowds in the background, cool ice tones with warm lighting, medium close-up, realistic cinematic style.",
+      "motion": "The FuboTV hockey player skates forward toward the camera, his face toward the lens, in frame and lit as he speaks.",
+      "dialogue": "Getting the best deal on hockey isn't a hat trick..."
+    },
+    {
+      "index": 2,
+      "title": "Hockey Stop and Sign-Off",
+      "motion": "The FuboTV hockey player carves a sharp stop, spraying ice mist into the air, his face toward the lens, then pushes off and skates away from the camera. The camera holds on him as he recedes.",
+      "dialogue": "It's just FuboTV."
+    }
+  ]
+}
