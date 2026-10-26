@@ -586,17 +586,15 @@ def test_dlg11_speaking_beat_coercion(ws):
     plan, shape = se.normalize_plan(ctx, raw)
     assert [b["speaker"] for b in plan["beats"]] == ["", "c1", "c1"]
     assert plan["beats"][1]["cast"] == ["c1"]
-    assert (plan["beats"][1]["shot"], plan["beats"][1]["camera"]) == ("medium close-up", "static")
+    assert (plan["beats"][1]["shot"], plan["beats"][1]["camera"]) == ("medium close-up", "tracking")
     assert (plan["beats"][2]["shot"], plan["beats"][2]["camera"]) == ("close-up", "slow push-in")
     assert plan["speech_notes"] == [
         "beat 2: P14 speaking beat: cast [c1, c2] changed to [c1] so the speaker is alone on screen",
         "beat 2: P14 speaking beat: shot 'wide shot' changed to 'medium close-up' so the speaker's "
         "face stays readable",
-        "beat 2: P14 speaking beat: camera 'tracking' changed to 'static' so the speaker's face "
-        "stays readable",
         "beat 3: P14 speaking beat: shot 'extreme close-up' changed to 'close-up' so the "
         "speaker's face stays readable"]
-    assert se.plan_checks(ctx, plan, shape)[1][-4:] == plan["speech_notes"]
+    assert se.plan_checks(ctx, plan, shape)[1][-3:] == plan["speech_notes"]
     chained = seu.make_ctx(se, ws)
     raw = seu.plan_json("chained", 3)
     raw["beats"][1]["speaker"] = "c9"
@@ -850,19 +848,20 @@ DIALOGUE_LINE = "Dialogue: the courier: Keep moving. The gate is close.\n"
 GOLDEN_SPEAKING = {
     "chained": (HEAD + "## Panel 1 — Wet Road\n" + PANEL1_IMAGE + PANEL1_REST
                 + "## Panel 2 — The Bend\nMotion: The courier leans into the bend. The courier "
-                  "faces the camera. The camera stays static.\n" + DIALOGUE_LINE),
+                  "faces the camera. The camera tracks alongside the movement.\n" + DIALOGUE_LINE),
     "no_stills": (HEAD + "## Panel 1 — Wet Road\nPrompt: The courier pedals through the rain. "
                   + IDENTITY + " " + seu.HARBOUR + " The shot is a medium shot. The camera stays "
                   "static.\nNarration: The rain had not stopped.\n\n## Panel 2 — The Bend\nPrompt: "
                   "The courier leans into the bend. " + IDENTITY + " " + seu.HARBOUR + " The shot "
-                  "is a medium close-up. The courier faces the camera. The camera stays static.\n"
+                  "is a medium close-up. The courier faces the camera. The camera tracks "
+                  "alongside the movement.\n"
                   + DIALOGUE_LINE + "Narration: Every street led down to the water.\n"),
     "shots": (HEAD + "## Characters\n- \"the courier\": " + seu.COURIER + ".\n- \"the old monk\": "
               + seu.MONK + ".\n\n## Panel 1 — Wet Road\n" + PANEL1_IMAGE + PANEL1_REST
               + "## Panel 2 — The Bend\nImage: " + seu.HARBOUR + " " + IDENTITY + " The courier "
                 "leans right. The courier faces the camera. The shot is a medium close-up.\n"
                 "Motion: The courier leans into the bend. The courier faces the camera. The camera "
-                "stays static.\n" + DIALOGUE_LINE
+                "tracks alongside the movement.\n" + DIALOGUE_LINE
               + "Narration: Every street led down to the water.\n"),
 }
 
@@ -902,9 +901,9 @@ def test_dlg15_assembly_goldens_and_dedupe(ws, tmp_path):
     parts[1]["motion"] = "The courier turns. The camera slowly pans left."
     assert dict(se.panel_fields(ctx, plan, parts, 2))["Motion"] == (
         "The courier turns. The camera slowly pans left. The courier faces the camera. The camera "
-        "stays static.")
+        "tracks alongside the movement.")
     assert se.pasted_pieces(ctx, plan, 2)["motion"] == ["The courier faces the camera.",
-                                                        "The camera stays static."]
+                                                        "The camera tracks alongside the movement."]
     lib = se._character_lib(WS)
     fields = [("Motion", "The courier waits."),
               ("Dialogue", "the courier: Tell the old monk <later>.")]
@@ -922,7 +921,8 @@ def test_shots_s5_ignores_the_pasted_facing_sentence(ws):
     hard, advisory = se.panel_checks(ctx, plan, parts, text, path)
     assert not [m for m in hard + advisory if " S5 " in m]
     panels = story_manifest._parse_prompts_md(path)[1]
-    assert panels[1]["motion"].endswith(" The courier faces the camera. The camera stays static.")
+    assert panels[1]["motion"].endswith(" The courier faces the camera. The camera tracks "
+                                        "alongside the movement.")
     assert s5 in character_lib.shots_violations(text, panels, 3, [])
     assert s5 not in character_lib.shots_violations(text, panels, 3, [], ignore_facing=True)
     panels[1]["motion"] = panels[1]["motion"].replace(
@@ -1031,7 +1031,8 @@ def test_n16_n17_n18_dialogue_messages(ws):
     assert checks([("Motion", pans), ("Dialogue", "the courier: Keep moving.")],
                   {"Motion": pans}) == ([], [
         "panel 2: N17 speaking shot: Motion: has the camera direction 'The camera slowly pans "
-        "left.' while 'the courier' speaks; a speaking shot keeps the camera static"])
+        "left.' while 'the courier' speaks; while someone speaks the camera stays static, pushes "
+        "in, pulls back or tracks them, so their face stays readable"])
     pushes = "The courier waits. The camera slowly pushes in."
     assert checks([("Motion", pushes), ("Dialogue", "the courier: Keep moving.")],
                   {"Motion": pushes}) == ([], [])
@@ -1257,8 +1258,8 @@ def test_dlg22_the_critic_rewrites_one_sentence(ws, tmp_path, monkeypatch):
     with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
         after = f.read()
     assert after == before.replace("Motion: " + THREE + " ", "Motion: " + ONE_CHANGED + " ")
-    assert ("Motion: " + ONE_CHANGED + " The courier faces the camera. The camera stays static.\n"
-            + "Dialogue: the courier: " + LINE + "\n") in after
+    assert ("Motion: " + ONE_CHANGED + " The courier faces the camera. The camera tracks "
+            "alongside the movement.\n" + "Dialogue: the courier: " + LINE + "\n") in after
     assert _read_json(os.path.join(rounds, "round_1", "critic.json"))["applied"] == [good]
     state0 = {"plan": _read_json(os.path.join(rounds, "round_0", "plan.json")),
               "parts": [dict((key, value) for key, value in p.items() if key != "index")

@@ -874,16 +874,22 @@ def normalize_plan(ctx, raw):
     return plan, shape
 
 
-SPEAKING_SHOTS = ("medium close-up", "close-up")
-SPEAKING_CAMERAS = ("static", "slow push-in")
+# Narrative dialogue fidelity spec SM1: a speaking beat may be a medium shot, and its camera may
+# stay static, push in, pull back or track the speaker.
+SPEAKING_SHOTS = ("medium shot", "medium close-up", "close-up")
+SPEAKING_CAMERAS = ("static", "slow push-in", "slow pull-back", "tracking")
+
+
+def speaking_camera(beat):
+    """The beat's camera when a speaking shot may keep it, else "static" (SM1)."""
+    return beat["camera"] if beat["camera"] in SPEAKING_CAMERAS else "static"
 
 
 def coerce_speakers(ctx, plan):
     """The P14 notes of the speaking-beat coercion (dialogue spec SP2), in beat order. Every beat
     gets a "speaker": a cast id or "". A speaker the movie cannot have (--no-narration) or that is
-    not a plan cast id is dropped. A kept speaker is alone in the beat's cast, and when the beat
-    frames its own shot (not a chained continuation, k >= 2) its shot becomes a medium close-up
-    or close-up and its camera static or a slow push-in. No other beat is ever changed."""
+    not a plan cast id is dropped. A kept speaker gets speaking_coercion. No other beat is ever
+    changed."""
     notes = []
     cast_ids = [c["id"] for c in plan["cast"]]
     for k, beat in enumerate(plan["beats"], start=1):
@@ -905,20 +911,33 @@ def coerce_speakers(ctx, plan):
                          "in this beat" % (k, _q(raw)))
             continue
         beat["speaker"] = raw
-        if beat["cast"] != [raw]:
-            notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker is "
-                         "alone on screen" % (k, ", ".join(beat["cast"]), raw))
-            beat["cast"] = [raw]
-        if ctx.mode != "chained" or k == 1:
-            if beat["shot"] not in SPEAKING_SHOTS:
-                shot = "close-up" if beat["shot"] == "extreme close-up" else "medium close-up"
-                notes.append("beat %d: P14 speaking beat: shot %s changed to %s so the speaker's "
-                             "face stays readable" % (k, _q(beat["shot"]), _q(shot)))
-                beat["shot"] = shot
-            if beat["camera"] not in SPEAKING_CAMERAS:
-                notes.append("beat %d: P14 speaking beat: camera %s changed to 'static' so the "
-                             "speaker's face stays readable" % (k, _q(beat["camera"])))
-                beat["camera"] = "static"
+        notes += speaking_coercion(ctx, plan, k)
+    return notes
+
+
+def speaking_coercion(ctx, plan, k):
+    """The P14 notes of SP2 step 4 for beat k, whose speaker is already set (narrative dialogue
+    fidelity spec QL7, SM2): the speaker is alone in the beat's cast, and when the beat frames
+    its own shot (not a chained continuation, k >= 2) a shot wider than a medium shot becomes a
+    medium close-up (an extreme close-up a close-up), and a camera that does not stay static,
+    push in, pull back or track becomes static. Tracking is never coerced away."""
+    notes = []
+    beat = plan["beats"][k - 1]
+    speaker = beat["speaker"]
+    if beat["cast"] != [speaker]:
+        notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker is "
+                     "alone on screen" % (k, ", ".join(beat["cast"]), speaker))
+        beat["cast"] = [speaker]
+    if ctx.mode != "chained" or k == 1:
+        if beat["shot"] not in SPEAKING_SHOTS:
+            shot = "close-up" if beat["shot"] == "extreme close-up" else "medium close-up"
+            notes.append("beat %d: P14 speaking beat: shot %s changed to %s so the speaker's "
+                         "face stays readable" % (k, _q(beat["shot"]), _q(shot)))
+            beat["shot"] = shot
+        if beat["camera"] not in SPEAKING_CAMERAS:
+            notes.append("beat %d: P14 speaking beat: camera %s changed to 'static' so the "
+                         "speaker's face stays readable" % (k, _q(beat["camera"])))
+            beat["camera"] = "static"
     return notes
 
 
@@ -987,8 +1006,10 @@ def _moves_camera(ctx, plan, text):
 def pasted_pieces(ctx, plan, k):
     """{field: [pasted sentences in assembly order]} for panel k (RS14; dialogue spec SP4): the
     pieces of each assembled field that the writer does not write. A speaking panel adds the
-    facing sentence (and, chained k >= 2, SPEAKING_CAMERA). The planned camera sentence is always
-    listed, even when CM4 leaves it out of the assembled field."""
+    facing sentence (and, chained k >= 2, the camera sentence of speaking_camera: the planned
+    camera, or "The camera stays static." for a pan or tilt; narrative dialogue fidelity spec
+    SM3). The planned camera sentence is always listed, even when CM4 leaves it out of the
+    assembled field."""
     beat = plan["beats"][k - 1]
     by_cast = {c["id"]: c for c in plan["cast"]}
     by_location = {l["id"]: l for l in plan["locations"]}
@@ -1001,7 +1022,8 @@ def pasted_pieces(ctx, plan, k):
     if ctx.mode == "chained":
         if k == 1:
             return {"image": pieces, "motion": facing + [camera], "narration": []}
-        return {"motion": facing + ([SPEAKING_CAMERA] if facing else []), "narration": []}
+        return {"motion": facing + ([dict(CAMERA_SENTENCES)[speaking_camera(beat)]]
+                                    if facing else []), "narration": []}
     if ctx.mode == "no_stills":
         return {"prompt": identities + [setting, shot] + facing + [camera], "narration": []}
     return {"image": pieces, "motion": facing + [camera], "narration": []}
@@ -1641,9 +1663,11 @@ SEQUENCE_RE = re.compile(r"\b(?:then|afterwards?|whereupon|followed\s+by|as\s+so
                          re.IGNORECASE)
 NO_STILLS_CONNECTOR_RE = re.compile(r"\b(?:initially|a\s+moment\s+later|moments\s+later|finally|"
                                     r"after\s+that|soon\s+after)\b", re.IGNORECASE)
-# N17: the CAMERA_MOTION_RE words that keep a speaking shot still (a slow push-in is planned).
+# N17: the CAMERA_MOTION_RE words a speaking shot may use: it stays still, pushes in, pulls back
+# or tracks the speaker (narrative dialogue fidelity spec SM1, SM5).
 STILL_CAMERA_MOVES = ("static", "still", "hold", "holds", "locked-off", "push in", "pushes in",
-                      "push-in")
+                      "push-in", "pull back", "pulls back", "pull-back", "track", "tracks",
+                      "tracking", "follow", "follows")
 SPLIT_INSTRUCTION = ("shorten the line, or split it across alternating close-up panels (the "
                      "speaker, then the listener, then the speaker again)")
 
@@ -1938,8 +1962,9 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 if (move and lib._is_camera_sentence(sentence, known)
                         and " ".join(move.group(0).lower().split()) not in STILL_CAMERA_MOVES):
                     add(advisory, "N17", "speaking shot", action_label,
-                        "has the camera direction %s while %s speaks; a speaking shot keeps the "
-                        "camera static" % (_q(sentence), _q(speaker)))
+                        "has the camera direction %s while %s speaks; while someone speaks the "
+                        "camera stays static, pushes in, pulls back or tracks them, so their face "
+                        "stays readable" % (_q(sentence), _q(speaker)))
                     break
     if "N14" in ids:
         if plan:

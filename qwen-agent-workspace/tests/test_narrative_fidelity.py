@@ -321,3 +321,78 @@ def test_nf31_an_infeasible_line_set_exits_2_before_any_call(ws, tmp_path, monke
     assert seu.agent_log(log) == []
     with open(os.path.join(ctx.story_dir, "story_rounds", "run.json"), encoding="utf-8") as f:
         assert json.load(f)["exit"] == 2
+
+
+# --- NF16, NF17, NF19: speaking shots may move (SM1-SM3, SM5) ------------------------------------
+
+FACING = "The courier faces the camera."
+
+
+def _speaking_beat(ctx, mode, n, k, **beat):
+    """The normalized seu.plan_json plan whose beat k is spoken by c1 (beat: field overrides)."""
+    raw = seu.plan_json(mode, n)
+    raw["beats"][k - 1].update(speaker="c1", **beat)
+    return se.normalize_plan(ctx, raw)[0]
+
+
+def test_nf16_the_speaking_coercion_table(ws):
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3)
+    shots = {"extreme wide shot": "medium close-up", "wide shot": "medium close-up",
+             "medium shot": "medium shot", "medium close-up": "medium close-up",
+             "close-up": "close-up", "extreme close-up": "close-up", "": "medium close-up"}
+    kept = ("static", "slow push-in", "slow pull-back", "tracking")
+    assert sorted(shots) == sorted(se.SHOT_TYPES + ("",))
+    for shot in se.SHOT_TYPES + ("",):
+        for camera in se.CAMERA_KEYS + ("",):
+            plan = _speaking_beat(ctx, "shots", 3, 2, shot=shot, camera=camera)
+            want = (shots[shot], camera if camera in kept else "static")
+            assert (plan["beats"][1]["shot"], plan["beats"][1]["camera"]) == want, (shot, camera)
+            notes = []
+            if want[0] != shot:
+                notes.append("beat 2: P14 speaking beat: shot %s changed to %s so the speaker's "
+                             "face stays readable" % (se._q(shot), se._q(want[0])))
+            if want[1] != camera:
+                notes.append("beat 2: P14 speaking beat: camera %s changed to 'static' so the "
+                             "speaker's face stays readable" % se._q(camera))
+            assert plan["speech_notes"] == notes, (shot, camera)
+    plan = _speaking_beat(seu.make_ctx(se, ws), "chained", 3, 3, shot="extreme wide shot",
+                          camera="slow pan left")
+    assert (plan["beats"][2]["shot"], plan["beats"][2]["camera"]) == (
+        "extreme wide shot", "slow pan left")
+    assert plan["speech_notes"] == []
+    assert se.speaking_camera({"camera": "tracking"}) == "tracking"
+    assert se.speaking_camera({"camera": "slow tilt up"}) == "static"
+
+
+def test_nf17_pasted_pieces_of_a_speaking_panel(ws):
+    def pieces(mode, camera, field):
+        ctx = seu.make_ctx(se, ws, mode=mode, panels=3)
+        return se.pasted_pieces(ctx, _speaking_beat(ctx, mode, 3, 2, camera=camera), 2)[field]
+
+    assert pieces("chained", "tracking", "motion") == [
+        FACING, "The camera tracks alongside the movement."]
+    assert pieces("chained", "slow pan left", "motion") == [FACING, "The camera stays static."]
+    assert pieces("shots", "slow pull-back", "image")[-2] == FACING
+    assert pieces("shots", "slow pull-back", "motion") == [FACING, "The camera pulls back."]
+    assert pieces("no_stills", "static", "prompt")[-2:] == [FACING, "The camera stays static."]
+    assert se.SPEAKING_CAMERA == dict(se.CAMERA_SENTENCES)["static"]
+    assert not hasattr(se, "MOVING_FACING_SENTENCE")
+    assert not hasattr(character_lib, "MOVING_FACING_SENTENCE")
+
+
+def test_nf19_n17_accepts_a_moving_speaking_camera(ws):
+    ctx = seu.make_ctx(se, ws)
+    plan = _speaking_beat(ctx, "chained", 3, 2)
+    lib = se._character_lib(WS)
+
+    def n17(motion):
+        fields = [("Motion", motion), ("Dialogue", "the courier: Keep moving.")]
+        return se._field_checks(ctx, lib, plan, 2, "T", fields, {"Motion": motion}, ("N17",), [])
+
+    assert n17("The courier waits. The camera slowly pans left.") == ([], [
+        "panel 2: N17 speaking shot: Motion: has the camera direction 'The camera slowly pans "
+        "left.' while 'the courier' speaks; while someone speaks the camera stays static, pushes "
+        "in, pulls back or tracks them, so their face stays readable"])
+    for camera in ("The camera tracks the courier.", "The camera pulls back.",
+                   "The camera follows the courier.", "The camera slowly pushes in."):
+        assert n17("The courier waits. " + camera) == ([], []), camera
