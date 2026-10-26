@@ -1235,9 +1235,9 @@ KEY_LINE_TEMPLATES = {
         "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
         "word for word. Describe ONE continuous physical motion, not a sequence of separate "
         "steps: @@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the "
-        "start of a movement. The motion plays at natural, real-time speed: do not use words "
-        "that slow it down, such as slow, slowly, gently or gradually. You may add one camera "
-        "direction; without one, the pipeline adds the planned camera sentence."),
+        "start of a movement. The motion plays at natural, real-time speed: use plain action "
+        "verbs with no adverbs of speed or manner. You may add one camera direction; without "
+        "one, the pipeline adds the planned camera sentence."),
     "chained_motion": (
         "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
         "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "

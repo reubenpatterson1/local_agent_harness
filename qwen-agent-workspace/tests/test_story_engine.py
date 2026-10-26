@@ -2908,6 +2908,10 @@ def test_pacing_camera_sentences_classify_as_before(ws):
         assert se._moves_camera(ctx, plan, sentence) is True, key
         assert se._moves_camera(ctx, plan, old[key]) is True, key
         assert bool(se.CAMERA_MOTION_RE.search(sentence)) is True, key
+        new_m, old_m = se.CAMERA_MOTION_RE.search(sentence), se.CAMERA_MOTION_RE.search(old[key])
+        assert new_m.group(0) == old_m.group(0), key
+        assert ((new_m.group(0).lower() in se.STILL_CAMERA_MOVES)
+                == (old_m.group(0).lower() in se.STILL_CAMERA_MOVES)), key
     assert sentences["slow push-in"] == "The camera pushes in."
     assert sentences["slow tilt down"] == "The camera tilts down."
 
@@ -2915,14 +2919,17 @@ def test_pacing_camera_sentences_classify_as_before(ws):
 def test_pacing_panel1_prompt_and_no_slowly(ws):
     ctx, plan, parts, _t, _p = _story(ws, "chained", 3)
     prompt = se.build_panel_prompt(ctx, plan, parts, 1)
-    assert "The motion plays at natural, real-time speed: do not use words that slow it down, " \
-        "such as slow, slowly, gently or gradually." in prompt
+    assert "The motion plays at natural, real-time speed: use plain action verbs with no " \
+        "adverbs of speed or manner." in prompt
     # the 15-35 band less the 4 words of the pasted camera sentence ("The camera stays static.")
     assert "motion: 11 to 31 words" in prompt
     assert se.WORD_RANGES["chained"]["motion1"] == (15, 35)
     for sentence in dict(se.CAMERA_SENTENCES).values():
         assert "slowly" not in sentence
-    pacing = se.KEY_LINE_TEMPLATES["chained_motion1"]
-    for name, text in list(se.KEY_LINE_TEMPLATES.items()) + [("panel", se.PANEL_PROMPT_TEMPLATE)]:
-        if text is not pacing:
-            assert "slowly" not in text, name
+    texts = [("KEY_LINE_TEMPLATES[%s]" % k, v) for k, v in se.KEY_LINE_TEMPLATES.items()]
+    texts += [("CAMERA_SENTENCES[%s]" % k, v) for k, v in se.CAMERA_SENTENCES]
+    texts += [("SPEAKING_SENTENCES[%s]" % k, v) for k, v in se.SPEAKING_SENTENCES.items()]
+    texts += [("SPEECH_FRAMING_SENTENCE", se.SPEECH_FRAMING_SENTENCE),
+              ("SHOTS_PANEL_RULES", se.SHOTS_PANEL_RULES)]
+    for name, text in texts:
+        assert "slowly" not in text.lower(), name
