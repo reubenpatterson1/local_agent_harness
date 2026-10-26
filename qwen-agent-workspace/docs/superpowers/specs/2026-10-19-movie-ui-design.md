@@ -440,7 +440,7 @@ Every MU and MP requirement is a must-have. Nothing else is built. The smoke ren
 
 ### 10.4 Host
 
-- **MU60. Capabilities and `GET /api/host`.** The probe thread computes, once at startup against the UI's own workspace, `render` and `stills` with V2's rules and `story_server` with V2's story rule; each `{"ok": <bool or null>, "reason": <text or null>, "checked": <utc or null>}` (`ok` null and reason `probing` until done). `GET /api/host?refresh=1` re-runs all three synchronously before answering **[spec choice: the story server starts and stops outside the UI]**. Response:
+- **MU60. Capabilities and `GET /api/host`.** The probe thread computes, once at startup against the UI's own workspace, `render` and `stills` with V2's rules and `story_server` with V2's story rule; each `{"ok": <bool or null>, "reason": <text or null>, "checked": <utc or null>}` (`ok` null and reason `probing` until done). `GET /api/host?refresh=1` re-runs all three synchronously before answering **[the job runner starts and stops the story server at job boundaries (VLM lifecycle spec); the page never starts or stops it; the capability probe stays a startup snapshot]**. Response:
 
   ```json
   {"host": "<socket.gethostname()>", "platform": "<sys.platform>", "python": "<platform.python_version()>",

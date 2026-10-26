@@ -1044,7 +1044,7 @@ V2 warn texts (W1, W2) are in VU1. Server stderr lines are in VU2.
 - `test_movie_ui_http.py` capability tests (`:250-261`);
 - every MUT10-MUT15 runner test;
 - `test_ltx_movie_offline.py` L40-L46;
-- `test_story_server.py` S2-S13 and S15-S23 (S22 and S23 pass through M36/M35 and preemption);
+- `test_story_server.py` S2-S13 and S15-S23 (S22 and S23 pass through M36/M35 and preemption). S18 was rewritten to start the loader by hand, because stop-preempts-start makes the unchanged S18 impossible, so it does not pass unchanged;
 - `test_clean_stop.py` CS1-CS3, CS5, CS7;
 - `test_movie_ui_builder.py:118-131`.
 
@@ -1137,6 +1137,7 @@ V2 warn texts (W1, W2) are in VU1. Server stderr lines are in VU2.
 - **R11.** Delete-with-confirm of a lost job with a live orphan unblocks the queue. The next required job's preflight can then load the VLM beside that orphan render (the user confirmed the delete).
 - **R12.** The double-fork launcher exists for milliseconds as a descendant of the caller. A cancel snapshot taken in that instant would include the server's new group.
 - **R13.** `story-server status` judges SERVING by the served id. VS10 makes that the `"loaded": true` entry. A listing with no `loaded` flag still falls back to `data[0]`. A wrong first entry then reports FOREIGN, and the preflight stops and restarts once before failing.
+- **R14.** STORY_SERVER_PORT set to 8178 in movie-ui's environment would aim story-server stop at the embed server; never set it (pre-existing).
 
 ### 15.2 Open
 
