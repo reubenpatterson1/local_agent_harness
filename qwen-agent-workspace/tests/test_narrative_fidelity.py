@@ -757,3 +757,182 @@ def test_nf20_the_panel_prompt_constants():
     for text in (DIALOGUE_FIXED, SPEAKING_ACTION, SPEAKING_IMAGE, SPEECH_FRAMING,
                  se.KEY_LINE_TEMPLATES["no_stills_prompt_speaking"]):
         assert "slowly" not in text.lower()
+
+# --- NF7-NF11, Review Focus 1, 2: Q1 (QL10, QL14) ----------------------------------------------------
+
+T2_2X145 = ("panel 2: T2 action amount: Motion: holds 3 actions; a 6-second clip fits at most 2, "
+            "so cut the extra actions and keep every other sentence word for word")
+Q1_MISSING = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is in no panel's "
+              "Dialogue:; give it word for word to the panel that shows it being said (Dialogue: "
+              "<speaker's referring phrase>: <the line>)")
+Q1_ORDER = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is spoken out of the "
+            "narrative's order; the Dialogue: fields must say the spoken lines in the order the "
+            "narrative gives them")
+PANEL2_FIXED = ("Motion: The FuboTV player skates forward, then halts in a sharp hockey stop that "
+                "sprays ice mist into the air. He holds the pose, then skates away from the camera. "
+                "The FuboTV player faces the camera. The camera stays static.\n"
+                "Dialogue: the FuboTV player: It's just FuboTV.\n")
+
+
+def _say(line):
+    return PLAYER + ": " + line
+
+
+def _replay(ws, case, reply_file, assign=False, **ctx_kw):
+    """(state, plan, notes) of a recorded run's round 0 replayed through the current checks (spec
+    8.1): the plan reply normalized; with assign, assign_missing_lines (QL8b), its notes added to
+    speech_notes as _Run.go() adds them; the recorded parts.json panels; every beat with lines
+    given its assigned dialogue; then _Run.make_state."""
+    ctx = _hockey_ctx(ws, case, **ctx_kw)
+    plan, shape = se.normalize_plan(ctx, _reply(case, reply_file))
+    notes = se.assign_missing_lines(ctx, plan) if assign else []
+    plan["speech_notes"] += notes
+    parts = [dict((key, value) for key, value in panel.items() if key != "index")
+             for panel in json.loads(_fixture_text(case, "parts.json"))["panels"]]
+    for k, beat in enumerate(plan["beats"], start=1):
+        if beat["lines"]:
+            parts[k - 1]["dialogue"] = se.assigned_dialogue(plan, k)
+    runner = se._Run(ctx, "")
+    runner.shape = shape
+    return runner.make_state(0, plan, parts), plan, notes
+
+
+def test_nf7_spoken_line_problems(ws):
+    assert (se.Q1_MISSING, se.Q1_ORDER) == (Q1_MISSING, Q1_ORDER)
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+
+    def q1(*dialogues):
+        return se.spoken_line_problems(ctx, character_lib, [PLAYER], list(dialogues))
+
+    assert q1(_say(LINE1), _say(LINE2)) == []
+    assert q1(_say(LINE1 + " " + LINE2), "") == []
+    assert q1(_say(LINE1), "") == [Q1_MISSING % (2, LINE2)]
+    assert q1(_say(LINE2), _say(LINE1)) == [Q1_ORDER % (2, LINE2)]
+    assert q1(_say("Getting the best deal on hockey"), _say("isn't a hat trick... " + LINE2)) == [
+        Q1_MISSING % (1, LINE1)]
+    assert q1(_say("Hey there. " + LINE1 + " Right?"), _say("Yes. " + LINE2 + " Go.")) == []
+    assert q1(_say("GETTING the best deal on hockey, isn’t a hat trick"), _say("it's JUST fubotv!")
+              ) == []
+    assert q1("the stranger: " + LINE1 + " " + LINE2, "") == [Q1_MISSING % (1, LINE1),
+                                                              Q1_MISSING % (2, LINE2)]
+    assert q1("", "") == [Q1_MISSING % (1, LINE1), Q1_MISSING % (2, LINE2)]
+    assert q1() == [Q1_MISSING % (1, LINE1), Q1_MISSING % (2, LINE2)]
+    twice = seu.make_ctx(se, ws, narrative='The courier says "Go." Then he says "Go."')
+    for dialogues, expected in ((["the courier: Go."], [Q1_ORDER % (2, "Go.")]),
+                                (["the courier: Go. Go."], []),
+                                (["the courier: Go.", "the courier: Go."], [])):
+        assert se.spoken_line_problems(twice, character_lib, ["the courier"], dialogues) == (
+            expected), dialogues
+    silent = _hockey_ctx(ws, "hockey-2x145", narration=False)
+    assert se.spoken_line_problems(silent, character_lib, [PLAYER], []) == []
+    assert se._find_run(["a", "b", "a", "b"], ["a", "b"], 1) == 2
+    assert se._find_run(["a", "b"], ["b", "a"], 0) is None
+    assert se.GENERATION_CHECKS[-2:] == ("Q1", "N19") and se.RECHECK_IDS[-2:] == ("Q1", "N19")
+    assert "Q1" not in se.PLAN_FREE_IDS and "Q1" not in se.NON_BLOCKING_IDS
+    assert "Q1" not in se.REPAIR_IDS
+
+
+def test_nf8_replay_the_recorded_2x145_plan(ws):
+    state, plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_1.txt")
+    q1 = Q1_MISSING % (2, LINE2)
+    assert state["hard"] == [T2_2X145, q1]
+    assert se.blocking(state["hard"]) == [q1]
+    assert se.parse_violation(q1) == {"id": "Q1", "name": "spoken line", "scope": "story",
+                                      "index": None, "message": q1}
+    assert P15_2X145 in state["advisory"]
+    assert not [m for m in state["advisory"] if " P12 " in m]
+    assert plan["beats"][1]["cast"] == ["c1"]
+
+
+def test_nf9_replay_the_recorded_1x241_plan(ws):
+    state, _plan, _notes = _replay(ws, "hockey-1x241", "plan_reply_1.txt")
+    assert state["hard"] == [Q1_MISSING % (1, LINE1), Q1_MISSING % (2, LINE2)]
+    assert se.blocking(state["hard"]) == state["hard"]
+
+
+def test_nf10_replay_the_fixed_plans(ws):
+    state, _plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_fixed.json")
+    assert state["hard"] == [T2_2X145] and se.blocking(state["hard"]) == []
+    assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in state["text"]
+    assert state["text"].endswith(PANEL2_FIXED)
+    state, plan, _notes = _replay(ws, "hockey-1x241", "plan_reply_fixed.json")
+    assert state["hard"] == [] and plan["speech_notes"] == []
+    assert (plan["beats"][0]["shot"], plan["beats"][0]["camera"]) == ("medium shot", "tracking")
+    assert ("Motion: The FuboTV player skates forward toward the camera, then stops abruptly in a "
+            "hockey stop, spraying ice mist into the air. He then skates away from the camera. The "
+            "FuboTV player faces the camera. The camera tracks alongside the movement.\n"
+            "Dialogue: the FuboTV player: " + LINE1 + " " + LINE2 + "\n") in state["text"]
+    image = [l for l in state["text"].split("\n") if l.startswith("Image: ")]
+    assert len(image) == 1
+    assert image[0].endswith(" The FuboTV player faces the camera. The shot is a medium shot.")
+
+
+def _recheck(ctx, capsys, text, check_ctx=None):
+    """(rc, captured) of se.recheck on text written as the story's story.md."""
+    with open(os.path.join(ctx.story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(text)
+    capsys.readouterr()
+    rc, _advisories = se.recheck(check_ctx or ctx, lambda path, panels, no_stills=False: [])
+    return rc, capsys.readouterr()
+
+
+def test_nf11_recheck_with_a_plan(ws, capsys):
+    state, plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_fixed.json")
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    se._write_json(os.path.join(ctx.story_dir, "plan.json"), plan)
+    rc, out = _recheck(ctx, capsys, state["text"])
+    assert rc == 0 and " Q1 " not in out.out + out.err
+    cut = state["text"].replace("Dialogue: the FuboTV player: It's just FuboTV.\n", "")
+    assert cut != state["text"]
+    rc, out = _recheck(ctx, capsys, cut)
+    assert rc == 2 and ("  - " + Q1_MISSING % (2, LINE2) + "\n") in out.err
+    rc, out = _recheck(ctx, capsys, cut, ctx._replace(narration=False))
+    assert " Q1 " not in out.out + out.err
+
+
+def test_review_focus_1_smart_quotes_in_the_narrative(ws):
+    # A narrative typed with smart quotes and a curly apostrophe (macOS text fields). Expected: the
+    # required line keeps the author's apostrophe in the plan prompt and in Dialogue:, Q1 passes,
+    # and a hand-typed Dialogue: with a straight apostrophe and no full stop also passes.
+    narrative = "The courier reaches the gate and says “It’s just a short climb.”"
+    line = "It’s just a short climb."
+    assert se.spoken_lines(narrative) == [line]
+    ctx = seu.make_ctx(se, ws, panels=1, narrative=narrative)
+    assert '\n1. "%s"\n' % line in se.build_plan_prompt(ctx, [], [])
+    raw = seu.plan_json("chained", 1)
+    raw["beats"][0].update(speaker="c1", lines=[1])
+    plan, _shape = se.normalize_plan(ctx, raw)
+    parts = [se.parse_panel_reply(ctx, plan, 1, json.dumps(seu.panel_json("chained", 1)))]
+    text = se.assemble(ctx, plan, parts)
+    assert "\nDialogue: the courier: %s\n" % line in text
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    hard, _advisory = se.panel_checks(ctx, plan, parts, text, path)
+    assert not [m for m in hard if " Q1 " in m]
+    assert se.spoken_line_problems(ctx, character_lib, ["the courier"],
+                                   ["the courier: it's just a short climb"]) == []
+
+
+def test_review_focus_2_recheck_of_a_story_written_before_this_change(ws, capsys):
+    # bin/ltx-movie re-checks an existing story.md on every rerun. A story written before this
+    # change has a plan.json with the crowd still cast and no lines, spoken_lines or cast_notes.
+    # Expected: once its Dialogue: fields hold every quoted line (the QL14 hand edit), the re-check
+    # passes with no Q1; without the edit it exits 2 and names the missing line.
+    state, plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_1.txt")
+    old = copy.deepcopy(plan)
+    del old["spoken_lines"], old["cast_notes"]
+    old["cast"].append(dict(_reply("hockey-2x145")["cast"][1], cast_name=None))
+    old["beats"][1]["cast"] = ["c1", "c2"]
+    for beat in old["beats"]:
+        del beat["lines"]
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    se._write_json(os.path.join(ctx.story_dir, "plan.json"), old)
+    rc, out = _recheck(ctx, capsys, state["text"] + "Dialogue: the FuboTV player: It's just "
+                                                    "FuboTV.\n")
+    assert rc == 0 and " Q1 " not in out.out + out.err
+    rc, out = _recheck(ctx, capsys, state["text"])
+    assert rc == 2
+    assert out.err.startswith("Error: story.md fails the story checks:\n  - "
+                              + Q1_MISSING % (2, LINE2) + "\n")
+    assert "pass --force-story to regenerate it" in out.err

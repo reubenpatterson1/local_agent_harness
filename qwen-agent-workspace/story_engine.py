@@ -2232,8 +2232,56 @@ def plan_copied_examples(plan):
     return out
 
 
+# Narrative dialogue fidelity spec QL10: a quoted spoken line of the narrative is missing from
+# every panel's Dialogue:, or is spoken out of order. Hard and blocking; story scope.
+Q1_MISSING = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is in no panel's "
+              "Dialogue:; give it word for word to the panel that shows it being said (Dialogue: "
+              "<speaker's referring phrase>: <the line>)")
+Q1_ORDER = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is spoken out of the "
+            "narrative's order; the Dialogue: fields must say the spoken lines in the order the "
+            "narrative gives them")
+
+
+def _find_run(words, run, start):
+    """The first j >= start with words[j:j + len(run)] == run, else None."""
+    for j in range(start, len(words) - len(run) + 1):
+        if words[j:j + len(run)] == run:
+            return j
+    return None
+
+
+def spoken_line_problems(ctx, lib, phrases, dialogues):
+    """The Q1 violations of a story (QL10), in line order. dialogues is one Dialogue: value per
+    panel, in order ("" for none); a value that names no known phrase counts as empty. Each
+    required line must lie, word for word (line_words: case and punctuation ignored), inside one
+    panel's line, later than the line before it; a line found only earlier is out of order."""
+    required = required_lines(ctx)
+    if not required:
+        return []
+    found = []
+    for value in dialogues:
+        phrase, line = (lib.parse_dialogue(value, phrases)[:2] if value.strip()
+                        else (None, ""))
+        found.append(line_words(line) if phrase else [])
+    kpos, jpos, out = 0, 0, []
+    for i, text in enumerate(required, start=1):
+        run = line_words(text)
+        hit = None
+        for p in range(kpos, len(found)):
+            j = _find_run(found[p], run, jpos if p == kpos else 0)
+            if j is not None:
+                hit = (p, j)
+                break
+        if hit:
+            kpos, jpos = hit[0], hit[1] + len(run)
+            continue
+        anywhere = any(_find_run(words, run, 0) is not None for words in found)
+        out.append((Q1_ORDER if anywhere else Q1_MISSING) % (i, text))
+    return out
+
+
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N19")
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -2246,8 +2294,10 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     undeclared = undeclared_characters(ctx)
     hard, advisory = [], []
     writers_by_panel = []
+    dialogues = []
     for k in range(1, len(parts) + 1):
         fields = panel_fields(ctx, plan, parts, k)
+        dialogues.append(dict(fields).get("Dialogue", ""))
         writers = {LABELS[key]: parts[k - 1].get(key, "") for key in panel_keys(ctx, plan, k)
                    if key != "title"}
         writers_by_panel.append(writers)
@@ -2257,6 +2307,8 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
         advisory += a
     advisory = plan_copied_examples(plan) + _order_by_panel(
         advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
+    if "Q1" in GENERATION_CHECKS:
+        hard += spoken_line_problems(ctx, lib, cast_phrases(ctx, plan), dialogues)
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
         shots_hard, shots_other = split_shots(lib.shots_violations(
@@ -3219,7 +3271,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16", "N17", "N18", "T1", "T2", "T3", "N19")
+               "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
@@ -3345,6 +3397,8 @@ def recheck(ctx, legacy_validate):
                                      RECHECK_IDS, undeclared)
                 hard += h
                 advisory += a
+            hard += spoken_line_problems(ctx, lib, cast_phrases(ctx, plan),
+                                         [p.get("dialogue", "") for p in parsed])
             advisory = _order_by_panel(advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
             if ctx.mode == "shots":
                 shots_hard, shots_other = split_shots(lib.shots_violations(
