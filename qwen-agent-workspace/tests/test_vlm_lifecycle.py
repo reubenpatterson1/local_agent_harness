@@ -1008,3 +1008,89 @@ def test_vl27_story_server_bash_syntax():
         proc = subprocess.run([bash, "-n", os.path.join(mt.WS, "bin", "story-server")],
                               capture_output=True, text=True, timeout=30)
         assert proc.returncode == 0, (bash, proc.stderr)
+
+
+# --- VL22: VK2 end to end through the real story-server-restore (VRS3, VR6) --------------------
+
+# An F-SS variant (spec 11.2): its mode call takes the "lock", starts a `sleep 60` standing in for
+# the loading server (pid in <dir>/sleeper.pid), and exits after 3 s.
+FSS_SPAWN = """#!/bin/bash
+T='%s'
+case "$1" in
+    status)
+        if [ -e "$T/started" ]; then echo '  state:          SERVING mlx-vision'
+        else echo '  state:          STOPPED'; fi
+        exit 0 ;;
+    lockinfo)
+        if [ -e "$T/lockinfo" ]; then cat "$T/lockinfo"; else echo 'lock: free path=x'; fi
+        exit 0 ;;
+esac
+echo "lock: held pid=$$ cmd=$1 since=x path=x" > "$T/lockinfo"
+/bin/sleep 60 &
+echo $! > "$T/sleeper.pid.tmp" && mv "$T/sleeper.pid.tmp" "$T/sleeper.pid"
+sleep 3
+touch "$T/started"
+echo 'lock: free path=x' > "$T/lockinfo"
+"""
+
+
+def _restore_job(state, tmp_path, name, monkeypatch):
+    fss = tmp_path / name
+    fss.mkdir()
+    script = fss / "story-server"
+    script.write_text(FSS_SPAWN % fss)
+    script.chmod(0o755)
+    monkeypatch.setenv("STORY_SERVER_RESTORE_BIN", str(script))
+    restore = os.path.join(mt.WS, "bin", "story-server-restore")
+    argv = mt.py_argv("import subprocess, sys\n"
+                      "sys.exit(subprocess.call([sys.executable, %r, 'mlx-vision', '--wait']))\n"
+                      % restore)
+    job_id = mt.make_job(state, argv, str(tmp_path), kind="download")
+    runner = mt.dispatch(state, job_id)
+    pid_file = fss / "sleeper.pid"
+    mt.wait_until(pid_file.exists, 20)
+    return job_id, runner, int(pid_file.read_text())
+
+
+def _ppid(pid):
+    out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+    return int(out.stdout.strip() or -1)
+
+
+def test_vl22_cancel_and_kill_orphan_never_reach_a_started_server(state, tmp_path, monkeypatch):
+    sleepers = []
+    try:
+        job_id, _runner, sleeper = _restore_job(state, tmp_path, "cancelled", monkeypatch)
+        sleepers.append(sleeper)
+        time.sleep(1.0)
+        mt.cancel_marker(state, job_id)
+        status = _final(state, job_id)
+        assert status["state"] == "cancelled"
+        line = [l for l in mt.read_log(state, job_id).splitlines()
+                if l.startswith("[movie-ui] cancel: SIGTERM to process group(s) ")][0]
+        groups = [int(g) for g in line.split("group(s) ", 1)[1].split()]
+        assert status["pgid"] in groups
+        assert mt.pid_alive(sleeper)
+        assert os.getpgid(sleeper) not in groups and os.getsid(sleeper) not in groups
+        mt.wait_until(lambda: _ppid(sleeper) == 1, 10)
+        assert _ppid(sleeper) == 1
+
+        job_id, runner, sleeper = _restore_job(state, tmp_path, "orphaned", monkeypatch)
+        sleepers.append(sleeper)
+        mt.wait_until(lambda: mt.status_of(state, job_id).get("state") == "running", 10)
+        os.killpg(runner.pid, signal.SIGKILL)
+        runner.wait(timeout=10)
+        assert lib.job_alive(lib.job_dir(state, job_id)) is False
+        status = mt.status_of(state, job_id)
+        assert status["state"] == "lost"
+        assert lib.kill_orphan(state, job_id) == status["pgid"]
+        mt.wait_until(lambda: not lib.group_alive(status["pgid"]), 10)
+        assert mt.pid_alive(sleeper)
+        mt.wait_until(lambda: _ppid(sleeper) == 1, 10)
+        assert _ppid(sleeper) == 1 and os.getsid(sleeper) != status["pgid"]
+    finally:
+        for pid in sleepers:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except OSError:
+                pass
