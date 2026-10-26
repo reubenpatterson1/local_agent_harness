@@ -403,6 +403,8 @@ GROUP_NOUNS = frozenset("""
 GROUP_DESCRIPTOR_RE = re.compile(
     r"^an?\s+(?:[A-Za-z-]+\s+){0,2}(?:group|crowd|throng|mob|row|pack|band|team|"
     r"squad|horde|swarm|flock|herd)\s+of\b", re.IGNORECASE)
+COLLECTIVE_NOUNS = frozenset("group sea line mass row pack horde swarm flock herd bunch band team "
+                             "squad mob throng crowd".split())
 SPOKEN_LINES_HEADER = ("Spoken lines (the narrative quotes these words; the movie must speak "
                        "every one of them on camera, word for word, in this order):")
 
@@ -1026,14 +1028,17 @@ def speaking_coercion(ctx, plan, k):
 def is_group_entry(entry):
     """True when a plan cast entry is a group of people, not a character (narrative dialogue
     fidelity spec GC2): it is not a library character, and the head word of its phrase (the last
-    word before the first standalone "of" or "from", lowercased, without trailing punctuation
-    (,.;:!?) or a trailing 's or ') is a GROUP_NOUNS word, or its descriptor starts like
+    word before the first standalone "of", "from", "in", "at", "on" or "with", lowercased,
+    without trailing punctuation (,.;:!?) or a trailing 's or ') is a GROUP_NOUNS word, or is a
+    COLLECTIVE_NOUNS word cut at "of" ("a group of fans"), or its descriptor starts like
     "a group of" (GROUP_DESCRIPTOR_RE)."""
     if entry.get("cast_name") is not None:
         return False
     words = (entry.get("phrase") or "").split()
+    cut = None
     for k, word in enumerate(words):
-        if word.lower() in ("of", "from"):
+        if word.lower() in ("of", "from", "in", "at", "on", "with"):
+            cut = word.lower()
             words = words[:k]
             break
     head = words[-1].lower().rstrip(",.;:!?") if words else ""
@@ -1041,6 +1046,8 @@ def is_group_entry(entry):
         if head.endswith(tail):
             head = head[:-len(tail)]
             break
+    if cut == "of" and head in COLLECTIVE_NOUNS:
+        return True
     return head in GROUP_NOUNS or bool(GROUP_DESCRIPTOR_RE.match(entry.get("descriptor") or ""))
 
 

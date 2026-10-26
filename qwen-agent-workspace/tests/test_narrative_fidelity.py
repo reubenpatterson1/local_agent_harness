@@ -629,3 +629,12 @@ def test_review_focus_3_the_planner_gives_a_line_to_the_crowd(ws):
         "beat 1: P15 group cast: the harbour crowd is part of the setting, not a speaker; the beat "
         "has no speaker",
         "beat 1: P14 speaking beat: line(s) 1 dropped: the beat has no speaker"]
+
+
+def test_nf22b_cut_words_and_collective_heads():
+    for phrase in ("a group of fans", "a sea of fans", "a line of commuters",
+                   "the fans in the stands", "the crowd from the bleachers", "the cheering crowd"):
+        assert se.is_group_entry(_entry(phrase)), phrase
+    for phrase in ("the captain of the team", "a member of the crowd",
+                   "the lead singer of the band", "the man in the crowd", "the woman in grey"):
+        assert not se.is_group_entry(_entry(phrase)), phrase
