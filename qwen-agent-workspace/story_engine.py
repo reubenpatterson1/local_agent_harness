@@ -1768,12 +1768,15 @@ SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: the
 # after it.
 SPEAKING_CHAINED_MOTION_SENTENCE = (
     " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
-    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything they do "
-    "before the dialogue, ending with them near the camera, face toward it (if the dialogue "
-    "comes before they do anything, it is how they turn toward the camera); only when the beat "
-    "has them act after the dialogue, write what they do then as a second sentence. Never put "
-    "an action from before the dialogue and one from after it in the same sentence, and do not "
-    "write the spoken words or a speaking verb; the pipeline adds them.")
+    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
+    "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
+    "the dialogue comes before they do anything, it is how they turn toward the camera); only "
+    "when the beat has them act after the dialogue, write what they do then as a second "
+    "sentence. Begin each of these sentences with @@SPEAKER@@, word for word, and write nothing "
+    "about anyone else before the first one. The action before the dialogue and the action "
+    "after it are the two parts of this one motion: never put an action from before the "
+    "dialogue and one from after it in the same sentence, and do not write the spoken words or "
+    "a speaking verb; the pipeline adds them.")
 SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
                             "adds them.")
 SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; "

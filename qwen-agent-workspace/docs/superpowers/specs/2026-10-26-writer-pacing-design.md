@@ -271,6 +271,8 @@ SPEAKING_CHAINED_MOTION_SENTENCE = (
 
 `SPEAKING_ACTION_SENTENCE` (`:1754-1758`) and `SPEAKING_SENTENCES` (`:1763-1764`) are unchanged. The comment above `SPEAKING_ACTION_SENTENCE` (`:1752-1753`) gains this sentence at its end: `Chained Motion uses SPEAKING_CHAINED_MOTION_SENTENCE instead (writer pacing spec WP2); shots Motion keeps this one (one action sentence, so the line follows it).`
 
+**Amendment 2026-10-26 (Task 1 review).** `character_lib._is_camera_sentence` treats any sentence of four words or fewer that mentions the camera or shot ("He skates off camera.", "He faces the camera.") as a camera sentence, so a short second sentence could be skipped and the line placed after it; and "Describe ONE continuous physical motion" read as forbidding the two-sentence split. The sentence therefore also requires each of the two sentences to begin with the speaker's referring phrase word for word, with nothing about anyone else before the first, and names the two sentences as the two parts of one motion. WT1 pins the new text; WT5 pins "skates off camera" as placed after the line. Placement code is still unchanged.
+
 ### WP3. `build_panel_prompt` uses WP2 for chained Motion (`story_engine.py:2457-2458`)
 
 The two lines

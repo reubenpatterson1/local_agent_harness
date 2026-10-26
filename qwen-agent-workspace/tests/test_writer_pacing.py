@@ -98,8 +98,8 @@ def _motion_key_line(prompt):
 PHRASE = "FuboTV hockey player"
 LINE1 = "Getting the best deal on hockey isn't a hat trick..."
 LINE2 = "It's just FuboTV."
-GOOD2 = ("The FuboTV hockey player snaps into a hard hockey stop that throws a big, bright spray "
-         "of ice into the air. He pushes off and skates away from the camera at real-time speed.")
+GOOD2 = ("The FuboTV hockey player snaps into a hard stop, throwing a big, bright spray of ice. "
+         "The FuboTV hockey player skates away at real-time speed.")
 SAY2 = lib.speech_text(PHRASE, LINE2, "beats")
 FACING_CAMERA = " FuboTV hockey player faces the camera. The camera stays static."
 NAMES = ("hockey-2x145-f", "hockey-1x241-f")
@@ -113,12 +113,15 @@ PACING = (" The motion plays at real-time speed: use fast, concrete action verbs
           "lasts, how small it is or when it settles.")
 SPEAKING_CHAINED = (
     " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
-    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything they do "
-    "before the dialogue, ending with them near the camera, face toward it (if the dialogue "
-    "comes before they do anything, it is how they turn toward the camera); only when the beat "
-    "has them act after the dialogue, write what they do then as a second sentence. Never put "
-    "an action from before the dialogue and one from after it in the same sentence, and do not "
-    "write the spoken words or a speaking verb; the pipeline adds them.")
+    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
+    "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
+    "the dialogue comes before they do anything, it is how they turn toward the camera); only "
+    "when the beat has them act after the dialogue, write what they do then as a second "
+    "sentence. Begin each of these sentences with @@SPEAKER@@, word for word, and write nothing "
+    "about anyone else before the first one. The action before the dialogue and the action "
+    "after it are the two parts of this one motion: never put an action from before the "
+    "dialogue and one from after it in the same sentence, and do not write the spoken words or "
+    "a speaking verb; the pipeline adds them.")
 CHAINED_MOTION1 = (
     "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
     "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, word "
@@ -260,10 +263,9 @@ def test_wt5_the_contract_matches_the_placement(ws):
     motion = dict(se.panel_fields(ctx, plan, parts, 2))["Motion"]
     assert motion == GOOD2 + FACING_CAMERA
     out = lib.insert_speech(motion, SAY2, [PHRASE], first_action=True)
-    assert out == ("The FuboTV hockey player snaps into a hard hockey stop that throws a big, "
-                   "bright spray of ice into the air. FuboTV hockey player faces the camera. "
-                   + SAY2 + " He pushes off and skates away from the camera at real-time speed. "
-                   "The camera stays static.")
+    assert out == ("The FuboTV hockey player snaps into a hard stop, throwing a big, bright spray "
+                   "of ice. FuboTV hockey player faces the camera. " + SAY2 + " The FuboTV hockey "
+                   "player skates away at real-time speed. The camera stays static.")
     assert out.index(SAY2) < out.index("skates away")
     camera_first = ("The camera holds on him. The FuboTV hockey player snaps into a hard hockey "
                     "stop. He skates away at real-time speed.")
@@ -284,11 +286,17 @@ def test_wt5_the_contract_matches_the_placement(ws):
                              + " The camera stays static.")
     plain = lib.speech_text(PHRASE, LINE2, "plain")
     out = _compose(GOOD2, plain)
-    assert out == ("The FuboTV hockey player snaps into a hard hockey stop that throws a big, "
-                   "bright spray of ice into the air. FuboTV hockey player faces the camera. "
-                   + plain + " He pushes off and skates away from the camera at real-time speed. "
-                   "The camera stays static.")
+    assert out == ("The FuboTV hockey player snaps into a hard stop, throwing a big, bright spray "
+                   "of ice. FuboTV hockey player faces the camera. " + plain + " The FuboTV hockey "
+                   "player skates away at real-time speed. The camera stays static.")
     assert out.index(plain) < out.index("skates away")
+    off = ("The FuboTV hockey player snaps into a hard stop, throwing a big, bright spray of ice. "
+           "The FuboTV hockey player skates off camera.")
+    out = _compose(off)
+    assert out == ("The FuboTV hockey player snaps into a hard stop, throwing a big, bright spray of "
+                   "ice. FuboTV hockey player faces the camera. " + SAY2 + " The FuboTV hockey "
+                   "player skates off camera. The camera stays static.")
+    assert out.index(SAY2) < out.index("skates off")
 
 
 def test_wt6_the_contract_motion_passes_the_checks(ws, tmp_path):
