@@ -954,3 +954,45 @@ def test_vl26_page_gate_and_warn_style():
         css = f.read()
     assert ".check-warn { color: var(--warn); }\n" in css
     assert css.index(".check-skip, .check-running") < css.index(".check-warn")
+
+
+# --- VL24, VL27: the escape hatch and the compile guards (2.5, 13(d), VK7) ---------------------
+
+def test_vl24_the_lifecycle_switched_off(state, tmp_path, vlm, monkeypatch, capsys):
+    tools = make_fake_tools(tmp_path, MODEL)
+    lifecycle_on(monkeypatch, tools, vlm.port)
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "0")
+    ws = mt.make_stub_workspace(tmp_path)
+    job_id = mt.make_job(state, mt.py_argv("print('child')"), ws, kind="story")
+    assert mt.dispatch(state, job_id).wait(timeout=60) == 0
+    assert mt.status_of(state, job_id)["state"] == "done"
+    assert "[movie-ui] vlm:" not in mt.read_log(state, job_id)
+    lib.vlm_postflight(state)
+    lib.startup_recovery(state)
+    assert lib.VLM_RECOVERY == []
+    assert lib.dispatch_tick(state, mt.WS) is None
+    assert lib.recovery_restore(state, mt.WS, "startup") is None
+    assert lib.RESTORERS == [] and tool_calls(tools, include_status=True) == []
+    mt.stub_config(ws, {"story-server status": {"stdout": "  state:          STOPPED\n"}})
+    assert lib.host_checks(mt.fields(ws), ws)[2] == lib.check(
+        "V2", "story server", "fail", "story server is STOPPED; start it with bin/story-server mlx-vision")
+    captured = capsys.readouterr()
+    assert "vlm:" not in captured.out and "VLM restore" not in captured.err
+
+
+@pytest.mark.parametrize("python", ["/usr/bin/python3", sys.executable])
+def test_vl27_changed_python_files_compile(python, tmp_path):
+    if not os.path.isfile(python):
+        pytest.skip("%s is not installed" % python)
+    paths = [os.path.join(mt.WS, rel) for rel in ("bin/story-server-restore", "character_dataset.py",
+                                                  "movie_ui_lib.py", "tests/test_vlm_lifecycle.py")]
+    proc = subprocess.run([python, "-m", "py_compile"] + paths, capture_output=True, text=True,
+                          timeout=120, env=dict(os.environ, PYTHONPYCACHEPREFIX=str(tmp_path)))
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_vl27_story_server_bash_syntax():
+    for bash in ("/bin/bash", "bash"):
+        proc = subprocess.run([bash, "-n", os.path.join(mt.WS, "bin", "story-server")],
+                              capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0, (bash, proc.stderr)
