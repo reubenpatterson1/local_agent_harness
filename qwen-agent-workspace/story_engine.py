@@ -432,11 +432,14 @@ def line_words(text):
     return _LINE_WORD_RE.findall(text.replace("’", "'").replace("‘", "'").lower())
 
 
-def _speech_verb_at(words, p):
+def _speech_verb_at(words, p, inverted=False):
     """True when words[p] is a speech verb (a call verb only right before "out") that is a
     speaker's (QL2 step 5): the word before it is not that, which, it, a text surface, a group
-    noun, "everyone" or "everybody"; the two words before are not "passers by"; and no group
-    word follows within three words of the verb before a word of AFTER_VERB_PREPOSITIONS (a
+    noun, "everyone" or "everybody", and the two words before are not "passers by". When
+    inverted (the verb opens the clause after the quote, as in '"Go!" yells the crowd'), a
+    group word within three words after the verb also rejects it, if the group word heads its
+    noun phrase (it ends the words, or a preposition of AFTER_VERB_PREPOSITIONS, "of" or a
+    CLAUSE_STOP_WORDS word follows it) and no AFTER_VERB_PREPOSITIONS word comes first (a
     preposition first means the speaker addresses the group)."""
     word = words[p]
     verb = word in SPEECH_VERBS or (word in CALL_VERBS and p + 1 < len(words)
@@ -445,11 +448,14 @@ def _speech_verb_at(words, p):
         return False
     if p >= 2 and words[p - 2:p] == ["passers", "by"]:
         return False
-    for after in words[p + 1:p + 4]:
-        if after in AFTER_VERB_PREPOSITIONS:
-            break
-        if after in GROUP_SPEAKER_WORDS:
-            return False
+    if inverted:
+        for q in range(p + 1, min(p + 4, len(words))):
+            if words[q] in AFTER_VERB_PREPOSITIONS:
+                break
+            if words[q] in GROUP_SPEAKER_WORDS and (
+                    q + 1 == len(words) or words[q + 1] in AFTER_VERB_PREPOSITIONS
+                    or words[q + 1] == "of" or words[q + 1] in CLAUSE_STOP_WORDS):
+                return False
     return True
 
 
@@ -477,7 +483,7 @@ def classify_quotes(narrative):
             after = after[:stops[0]]
         spoken = (any(_speech_verb_at(before, p)
                       for p in range(max(0, len(before) - BEFORE_WINDOW_WORDS), len(before)))
-                  or any(_speech_verb_at(after, p)
+                  or any(_speech_verb_at(after, p, inverted=(p == 0))
                          for p in range(min(AFTER_WINDOW_WORDS, len(after)))))
         out.append((" ".join(match.group(1).split()), spoken))
     return out

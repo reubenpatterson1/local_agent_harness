@@ -1372,7 +1372,10 @@ def test_nf2b_crowd_speech_is_not_a_required_line():
                       'Everyone shouts "Now!"', '"Again!" chants the whole crowd.'):
         assert [spoken for _inner, spoken in se.classify_quotes(narrative)] == [False], narrative
     for narrative in ('Mia yells at the crowd, "Go home!"', '"Run," says Tom to the fans.',
-                      'The captain shouts "Skate!"'):
+                      'The captain shouts "Skate!"', 'The coach tells the team, "Skate hard."',
+                      'He tells the fans "Go home!"', 'She asks the audience, "Ready?"',
+                      '"Go!" yells the team captain.', '"Go!" he yells above the crowd.',
+                      '"Go!" he shouts amid the fans.'):
         assert [spoken for _inner, spoken in se.classify_quotes(narrative)] == [True], narrative
 
 
