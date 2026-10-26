@@ -417,6 +417,8 @@ GROUP_NOUNS = frozenset("""
 GROUP_DESCRIPTOR_RE = re.compile(
     r"^an?\s+(?:[A-Za-z-]+\s+){0,2}(?:group|crowd|throng|mob|row|pack|band|team|"
     r"squad|horde|swarm|flock|herd)\s+of\b", re.IGNORECASE)
+GROUP_SPEAKER_WORDS = GROUP_NOUNS | frozenset(("everyone", "everybody"))
+AFTER_VERB_PREPOSITIONS = frozenset("to at toward towards over across into with for".split())
 COLLECTIVE_NOUNS = frozenset("group sea line mass row pack horde swarm flock herd bunch band team "
                              "squad mob throng crowd".split())
 SPOKEN_LINES_HEADER = ("Spoken lines (the narrative quotes these words; the movie must speak "
@@ -431,12 +433,24 @@ def line_words(text):
 
 
 def _speech_verb_at(words, p):
-    """True when words[p] is a speech verb (a call verb only right before "out") whose word
-    before it is not that, which, it, a text surface or a group noun (QL2 step 5)."""
+    """True when words[p] is a speech verb (a call verb only right before "out") that is a
+    speaker's (QL2 step 5): the word before it is not that, which, it, a text surface, a group
+    noun, "everyone" or "everybody"; the two words before are not "passers by"; and no group
+    word follows within three words of the verb before a word of AFTER_VERB_PREPOSITIONS (a
+    preposition first means the speaker addresses the group)."""
     word = words[p]
     verb = word in SPEECH_VERBS or (word in CALL_VERBS and p + 1 < len(words)
                                     and words[p + 1] == "out")
-    return verb and (words[p - 1] if p > 0 else "") not in NOT_SPEAKER_WORDS | GROUP_NOUNS
+    if not verb or (words[p - 1] if p > 0 else "") in NOT_SPEAKER_WORDS | GROUP_SPEAKER_WORDS:
+        return False
+    if p >= 2 and words[p - 2:p] == ["passers", "by"]:
+        return False
+    for after in words[p + 1:p + 4]:
+        if after in AFTER_VERB_PREPOSITIONS:
+            break
+        if after in GROUP_SPEAKER_WORDS:
+            return False
+    return True
 
 
 def classify_quotes(narrative):
@@ -2772,7 +2786,7 @@ def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
                       % (k, _q(beat["speaker"])))
     current = lib.parse_dialogue(dict(panel_fields(ctx, plan, parts, k)).get("Dialogue", ""),
                                  phrases)[1]
-    have = contained_lines(current, spoken)
+    have = list(beat["lines"]) if beat["lines"] else contained_lines(current, spoken)
     want = set(beat["lines"]) | set(have) | set(range(i, j + 1))
     if max(want) - min(want) + 1 != len(want):
         return True, ("the replacement must keep panel %d's spoken lines and add only an "

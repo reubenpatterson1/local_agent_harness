@@ -243,6 +243,8 @@ SPOKEN_LINES_HEADER = ("Spoken lines (the narrative quotes these words; the movi
    - (b) `(cw[p - 1] if p > 0 else "") not in NOT_SPEAKER_WORDS | GROUP_NOUNS`. A group is never a speaker (F3), so "The crowd yells "Goal!"" is not required.
 6. `spoken` is true when the before-window or the after-window contains a speech-verb index.
 
+**Amendment (final review, 2026-10-26):** a speech verb is not a speaker's when the word before it is a group word (`GROUP_NOUNS`, "everyone", "everybody") or the two words before are "passers by", or when a group word follows within three words of the verb before any of to/at/toward/towards/over/across/into/with/for. A quote the crowd speaks is setting, not a required line. The rule leans to "not spoken": a missed line falls back to the pre-feature behaviour, while a wrongly required one puts the crowd's words in a character's mouth. Pinned by NF2b.
+
 **[spec choice: the windows are clause-bounded (`.!?;,`) and cut at the nearest conjunction or temporal word (`CLAUSE_STOP_WORDS`); 6 words before and 4 after.]**
 - They reach "says to the old monk, ..." and "the old monk says ...".
 - They stop at the comma in "says nothing, pointing at the "EXIT" sign".
@@ -575,6 +577,8 @@ for patch in accepted (target "panel"):
 - `bin/judge-story`'s `PATCH_FIELDS` needs no change.
 
 **Amendment (implementation ruling, 2026-10-26):** a Q1 dialogue patch is also rejected when, at the moment it is applied, an earlier beat holds a later line or a later beat an earlier one ("spoken line N is given to beat B, so panel K cannot say line I without breaking the narrative's order"); patches apply in sequence, so an accepted patch counts for the next. Pinned by NF21b.
+
+**Amendment (final review, 2026-10-26):** step 6's `have` is the beat's `lines` when it has any (the plan is the single source of assigned lines, QL9), and `contained_lines` only otherwise, so a short line inside a longer one cannot reject a correct patch. Pinned by NF21c.
 
 ### QL14. Recheck
 

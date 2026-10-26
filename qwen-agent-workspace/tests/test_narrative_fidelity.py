@@ -1364,3 +1364,28 @@ def test_nf21b_q1_patch_keeps_order(ws):
         (1, "the courier: Keep moving."), (3, "the courier: The gate is close.")])
     assert len(applied) == 2 and rejected == []
     assert [b["lines"] for b in new["plan"]["beats"]] == [[1], [], [2]]
+
+
+def test_nf2b_crowd_speech_is_not_a_required_line():
+    for narrative in ('"Go!" yells the crowd.', '"Encore!" cry the fans.',
+                      'Passers-by shout "Hey!"', 'Everybody yells "Surprise!"',
+                      'Everyone shouts "Now!"', '"Again!" chants the whole crowd.'):
+        assert [spoken for _inner, spoken in se.classify_quotes(narrative)] == [False], narrative
+    for narrative in ('Mia yells at the crowd, "Go home!"', '"Run," says Tom to the fans.',
+                      'The captain shouts "Skate!"'):
+        assert [spoken for _inner, spoken in se.classify_quotes(narrative)] == [True], narrative
+
+
+def test_nf21c_q1_patch_uses_the_beats_lines(ws):
+    narrative = ('The courier says "Yes, I am ready." Then he says "Then go now." At the gate he '
+                 'whispers "Yes."')
+    ctx, plan = _lines_plan(ws, narrative, {1: {"speaker": "c1", "lines": [1]}})
+    assert plan["spoken_lines"] == ["Yes, I am ready.", "Then go now.", "Yes."]
+    assert plan["beats"][0]["lines"] == [1]
+    parts = [dict(seu.panel_json("chained", k)) for k in (1, 2, 3)]
+    parts[0]["dialogue"] = "the courier: Yes, I am ready."
+    new, applied, rejected = _apply(ctx, plan, parts, [
+        (1, "the courier: Yes, I am ready. Then go now.")])
+    assert _reasons(rejected) == [] and len(applied) == 1
+    assert new["plan"]["beats"][0]["lines"] == [1, 2]
+    assert new["parts"][0]["dialogue"] == "Yes, I am ready. Then go now."
