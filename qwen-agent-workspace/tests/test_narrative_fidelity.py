@@ -936,3 +936,19 @@ def test_review_focus_2_recheck_of_a_story_written_before_this_change(ws, capsys
     assert out.err.startswith("Error: story.md fails the story checks:\n  - "
                               + Q1_MISSING % (2, LINE2) + "\n")
     assert "pass --force-story to regenerate it" in out.err
+
+
+def test_nf_lines_consecutive_only(ws):
+    # Spec 7.1(e): a beat holds only consecutive spoken lines; the rest are dropped and unassigned.
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"speaker": "c1", "lines": [1, 3]}})
+    assert plan["beats"][0]["lines"] == [1]
+    assert plan["speech_notes"] == [
+        "beat 1: P14 speaking beat: line(s) 3 dropped: the beat's lines are not consecutive"]
+    problems = se.line_assignment_problems(plan)
+    assert [p.split(" is in no beat")[0] for p in problems] == [
+        'plan: Q1 spoken line: spoken line 2 "The gate is close."',
+        'plan: Q1 spoken line: spoken line 3 "We made it."']
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"speaker": "c1", "lines": [2, 3]}})
+    assert plan["beats"][0]["lines"] == [2, 3] and plan["speech_notes"] == []
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"speaker": "c1", "lines": [1, 2, 4]}})
+    assert plan["beats"][0]["lines"] == [1, 2]

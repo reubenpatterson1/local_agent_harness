@@ -1008,6 +1008,13 @@ def coerce_speakers(ctx, plan, groups=()):
                 notes.append("beat %d: P14 speaking beat: line %d dropped: together with the "
                              "beat's other lines it does not fit a %s-second clip"
                              % (k, n, ctx.seconds))
+            run = 0
+            while run < len(lines) and (run == 0 or lines[run] == lines[run - 1] + 1):
+                run += 1
+            if run < len(lines):
+                notes.append("beat %d: P14 speaking beat: line(s) %s dropped: the beat's lines are "
+                             "not consecutive" % (k, _nums(lines[run:])))
+                lines = lines[:run]
             beat["lines"] = lines
             if lines:
                 last = lines[-1]
