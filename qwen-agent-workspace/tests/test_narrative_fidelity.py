@@ -952,3 +952,217 @@ def test_nf_lines_consecutive_only(ws):
     assert plan["beats"][0]["lines"] == [2, 3] and plan["speech_notes"] == []
     _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"speaker": "c1", "lines": [1, 2, 4]}})
     assert plan["beats"][0]["lines"] == [1, 2]
+
+
+# --- NF9b, NF28-NF30, NF32, NF33, NF37, Review Focus 5: the pipeline assignment (QL8b) -------------
+
+GIVEN = ("beat %d: P14 speaking beat: line %d given to this beat by the pipeline, because the plan "
+         "gave it to no beat")
+
+
+def _engine(monkeypatch, tmp_path, ctx, plan, panel, critic=()):
+    """(rc, agent log) of se.run(ctx) with the fake agent's scripted replies."""
+    log = seu.script_agent(monkeypatch, tmp_path, plan=plan, panel=panel, critic=list(critic))
+    rc, _advisories = se.run(ctx)
+    return rc, seu.agent_log(log)
+
+
+def _story_json(ctx, *parts):
+    with open(os.path.join(ctx.story_dir, *parts), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _story_text(ctx, *parts):
+    with open(os.path.join(ctx.story_dir, *parts), encoding="utf-8") as f:
+        return f.read()
+
+
+def _stages(log):
+    return [call["stage"] for call in log]
+
+
+def test_nf9b_replay_with_the_pipeline_assignment(ws):
+    state, plan, notes = _replay(ws, "hockey-2x145", "plan_reply_1.txt", assign=True)
+    assert [b["lines"] for b in plan["beats"]] == [[1], [2]]
+    assert plan["beats"][1]["speaker"] == "c1"
+    assert notes == [GIVEN % (1, 1), GIVEN % (2, 2)]
+    assert state["hard"] == [T2_2X145]
+    state, plan, notes = _replay(ws, "hockey-1x241", "plan_reply_1.txt", assign=True)
+    beat = plan["beats"][0]
+    assert (beat["lines"], beat["speaker"], beat["shot"], beat["camera"]) == (
+        [1, 2], "c1", "medium shot", "tracking")
+    assert notes == [GIVEN % (1, 1), GIVEN % (1, 2)]
+    assert state["hard"] == []
+
+
+def test_nf37_assign_missing_lines(ws):
+    def assigned(beats, n=3, narrative=COURIER_LINES):
+        ctx, plan = _lines_plan(ws, narrative, beats, n=n)
+        notes = se.assign_missing_lines(ctx, plan)
+        return plan, notes
+
+    plan, notes = assigned({})
+    assert [b["lines"] for b in plan["beats"]] == [[1], [2], [3]]
+    assert notes == [GIVEN % (1, 1), GIVEN % (2, 2), GIVEN % (3, 3)]
+    assert [b["speaker"] for b in plan["beats"]] == ["c1", "c1", "c1"]
+    assert (plan["beats"][0]["shot"], plan["beats"][0]["camera"]) == ("medium shot", "static")
+    plan, notes = assigned({2: {"cast": ["c1", "c2"]}})
+    assert [b["lines"] for b in plan["beats"]] == [[1], [], [2, 3]]
+    assert notes == [GIVEN % (1, 1), GIVEN % (3, 2), GIVEN % (3, 3)]
+    plan, notes = assigned({1: {"speaker": "c1", "lines": [1]}, 2: {"speaker": "c1", "lines": [3]}})
+    assert [b["lines"] for b in plan["beats"]] == [[1], [2, 3], []]
+    assert notes == [GIVEN % (2, 2)]
+    seven = ('The courier says "Keep moving along the wet harbour road." Then he says "The temple '
+             'gate is close to us."')
+    plan, notes = assigned({}, n=1, narrative=seven)
+    assert [b["lines"] for b in plan["beats"]] == [[1]] and notes == [GIVEN % (1, 1)]
+    assert se.line_assignment_problems(plan) == [
+        'plan: Q1 spoken line: spoken line 2 "The temple gate is close to us." is in no beat\'s '
+        "lines; put 2 in the lines of the beat whose action surrounds it in the narrative, and "
+        "give that beat a speaker"]
+    plan, notes = assigned({}, narrative=seu.make_ctx(se, ws).narrative)
+    assert notes == [] and [b["lines"] for b in plan["beats"]] == [[], [], []]
+
+
+NF28_PATCH = {"target": "panel", "index": 2, "field": "motion", "reason": "r",
+              "replacement": "The FuboTV player skates forward, then halts in a sharp hockey stop "
+                             "that sprays ice mist into the air. He skates away from the camera."}
+
+
+def _recorded(case, name):
+    return seu.answer(_fixture_text(case, name))
+
+
+def test_nf28_engine_the_2x145_failure(ws, tmp_path, monkeypatch):
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    plan = _recorded("hockey-2x145", "plan_reply_1.txt")
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [plan, plan],
+                      {"1": [_recorded("hockey-2x145", "panel_01_reply_1.txt")],
+                       "2": [_recorded("hockey-2x145", "panel_02_reply_1.txt")]},
+                      [seu.answer(seu.critic_json((7, 6, 6), "revise", [NF28_PATCH]))])
+    assert rc == 0
+    assert _stages(log) == ["plan", "plan", "panel", "panel", "critic"]
+    round0 = _story_json(ctx, "story_rounds", "round_0", "plan.json")
+    assert [b["lines"] for b in round0["beats"]] == [[1], [2]]
+    assert (round0["beats"][1]["speaker"], round0["beats"][1]["cast"]) == ("c1", ["c1"])
+    assert round0["speech_notes"] == [GIVEN % (1, 1), GIVEN % (2, 2)]
+    checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
+    assert [v["id"] for v in checks0["hard"]] == ["T2"]
+    assert '\ndialogue: exactly "%s" -- ' % LINE1 in _story_text(
+        ctx, "story_rounds", "round_0", "panel_01_prompt_1.txt")
+    assert _story_json(ctx, "story_rounds", "round_1", "critic.json")["applied"] == [NF28_PATCH]
+    assert _story_json(ctx, "story_checks.json")["stop_reason"] == "passed"
+    story = _story_text(ctx, "story.md")
+    assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in story
+    assert story.endswith(
+        "## Panel 2 — The FuboTV Hockey Stop\nMotion: The FuboTV player skates forward, then halts "
+        "in a sharp hockey stop that sprays ice mist into the air. He skates away from the camera. "
+        "The FuboTV player faces the camera. The camera stays static.\n"
+        "Dialogue: the FuboTV player: It's just FuboTV.\n")
+
+
+def test_nf29_engine_the_1x241_failure(ws, tmp_path, monkeypatch):
+    ctx = _hockey_ctx(ws, "hockey-1x241")
+    plan = _recorded("hockey-1x241", "plan_reply_1.txt")
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [plan, plan],
+                      {"1": [_recorded("hockey-1x241", "panel_01_reply_1.txt")]})
+    assert rc == 0
+    assert _stages(log) == ["plan", "plan", "panel"]
+    assert _story_json(ctx, "story_rounds", "round_0", "story_checks.json")["hard"] == []
+    assert _story_json(ctx, "story_checks.json")["stop_reason"] == "passed"
+    assert _story_json(ctx, "plan.json")["speech_notes"] == [GIVEN % (1, 1), GIVEN % (1, 2)]
+    story = _story_text(ctx, "story.md")
+    assert ("Motion: The FuboTV player skates forward toward the camera, then stops abruptly in a "
+            "hockey stop, spraying ice mist into the air. He then skates away from the camera. The "
+            "FuboTV player faces the camera. The camera tracks alongside the movement.\n"
+            "Dialogue: the FuboTV player: " + LINE1 + " " + LINE2 + "\n") in story
+
+
+def test_nf30_q1_blocks_when_no_beat_is_eligible(ws, tmp_path, monkeypatch, capsys):
+    raw = seu.plan_json("chained", 3)
+    for beat in raw["beats"]:
+        beat["cast"] = ["c1", "c2"]
+    ctx = seu.make_ctx(se, ws, narrative=COURIER_LINES)
+    capsys.readouterr()
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [seu.answer(raw), seu.answer(raw)],
+                      dict((str(k), [seu.answer(seu.panel_json("chained", k))]) for k in (1, 2, 3)),
+                      [{"answer": "x"}] * 4)
+    assert rc == 2
+    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == []
+    err = capsys.readouterr().err
+    for i, line in enumerate(COURIER_SPOKEN, start=1):
+        assert ("  - " + Q1_MISSING % (i, line) + "\n") in err
+    assert [v["id"] for v in _story_json(ctx, "story_checks.json")["hard"]] == ["Q1", "Q1", "Q1"]
+    assert _stages(log).count("critic") == 4 and _stages(log).count("plan") == 2
+    assert "\nDialogue:" not in _story_text(ctx, "story.md")
+
+
+def test_nf32_no_narration_keeps_the_movie_silent(ws, tmp_path, monkeypatch):
+    ctx = seu.make_ctx(se, ws, narration=False, narrative=HOCKEY)
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [seu.answer(seu.plan_json("chained", 3))],
+                      dict((str(k), [seu.answer(seu.panel_json("chained", k))]) for k in (1, 2, 3)))
+    assert rc == 0 and _stages(log) == ["plan", "panel", "panel", "panel"]
+    checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
+    assert not [v for v in checks0["hard"] + checks0["advisory"] if v["id"] == "Q1"]
+    assert Q2_HOCKEY in [v["message"] for v in checks0["advisory"]]
+    assert "Spoken lines (" not in _story_text(ctx, "story_rounds", "round_0", "plan_prompt.txt")
+
+
+def test_nf33_default_narration_with_the_fixed_plan(ws, tmp_path, monkeypatch, capsys):
+    ctx = _hockey_ctx(ws, "hockey-2x145", narration=True)
+    p2 = _recorded("hockey-2x145", "panel_02_reply_1.txt")
+    capsys.readouterr()
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [_recorded("hockey-2x145", "plan_reply_fixed.json")],
+                      {"1": [_recorded("hockey-2x145", "panel_01_reply_1.txt")], "2": [p2, p2]},
+                      [{"answer": "x"}] * 4)
+    assert rc == 0
+    assert _stages(log).count("plan") == 1
+    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == []
+    checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
+    assert [v["id"] for v in checks0["hard"]] == ["T2"]
+    assert ("Warning: unresolved after 2 critic round(s): " + T2_2X145 + "\n"
+            ) in capsys.readouterr().out
+    story = _story_text(ctx, "story.md")
+    assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in story
+    assert "Dialogue: the FuboTV player: " + LINE2 + "\n" in story
+
+
+def test_review_focus_5_a_shots_movie_with_quoted_lines(ws, tmp_path, monkeypatch):
+    # --shots with a quoted narrative: every shot is its own still and the shot rules S1/S3 are
+    # hard. Expected: the plan's lines reach each speaking shot's Dialogue:, the shot rules do not
+    # trip on the pasted facing sentence or the Dialogue: line, and the run passes with no Q1.
+    narrative = 'The courier says "Keep moving." At the gate he whispers "We made it."'
+    raw = seu.plan_json("shots", 2)
+    raw["beats"][0].update(speaker="c1", lines=[1])
+    raw["beats"][1].update(speaker="c1", lines=[2])
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2, narrative=narrative)
+    rc, log = _engine(monkeypatch, tmp_path, ctx, [seu.answer(raw)],
+                      dict((str(k), [seu.answer(seu.panel_json("shots", k))]) for k in (1, 2)))
+    assert rc == 0 and _stages(log) == ["plan", "panel", "panel"]
+    assert _story_json(ctx, "story_rounds", "round_0", "story_checks.json")["hard"] == []
+    story = _story_text(ctx, "story.md")
+    assert "\nDialogue: the courier: Keep moving.\n" in story
+    assert "\nDialogue: the courier: We made it.\n" in story
+
+
+def test_nf37b_assign_keeps_runs_consecutive(ws):
+    two_sided = {2: {"cast": ["c1", "c2"]}, 3: {"cast": ["c1", "c2"]}}
+    long2 = "Keep moving along the wet harbour road toward the old temple gate by the sea now."
+    narrative = ('The courier says "Keep moving." Then he says "%s" At the gate he whispers '
+                 '"We made it."' % long2)
+    beats = dict(two_sided)
+    beats[1] = {"speaker": "c1", "lines": [1]}
+    ctx, plan = _lines_plan(ws, narrative, beats)
+    notes = se.assign_missing_lines(ctx, plan)
+    assert [b["lines"] for b in plan["beats"]] == [[1], [], []] and notes == []
+    assert [n for n, _line in enumerate(plan["spoken_lines"], start=1)
+            if not any(n in b["lines"] for b in plan["beats"])] == [2, 3]
+    five = ('The courier says "Keep moving." Then he says "The gate is close." Then he says '
+            '"We made it." Then he says "Hold the rope." At last he says "Open the door."')
+    beats = {1: {"cast": ["c1", "c2"]}, 2: {"cast": ["c1", "c2"]},
+             3: {"speaker": "c1", "lines": [5]}}
+    ctx, plan = _lines_plan(ws, five, beats)
+    notes = se.assign_missing_lines(ctx, plan)
+    assert [b["lines"] for b in plan["beats"]] == [[], [], [4, 5]]
+    assert notes == [GIVEN % (3, 4)]
+

@@ -1039,6 +1039,47 @@ def line_assignment_problems(plan):
             for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
 
 
+def assign_missing_lines(ctx, plan):
+    """The P14 notes of QL8b: each of the narrative's spoken lines that no beat holds goes to the
+    first eligible beat after the beat holding the nearest earlier line (then to that beat
+    itself), never later than the beat holding the next assigned line. A beat is eligible when
+    it has a speaker or exactly one cast member (who becomes the speaker, with
+    speaking_coercion), its lines with the new one still form a consecutive run, and they still
+    fit the clip. A line with no eligible beat stays unassigned, for Q1 and the critic. Lines the
+    plan placed never move."""
+    spoken, beats, notes = plan["spoken_lines"], plan["beats"], []
+    if not spoken:
+        return notes
+    lib = _character_lib(ctx.ws)
+    cast_ids = [c["id"] for c in plan["cast"]]
+    holder = dict((n, k) for k, beat in enumerate(beats, start=1) for n in beat["lines"])
+    for n in range(1, len(spoken) + 1):
+        if n in holder:
+            continue
+        earlier = [holder[m] for m in range(1, n) if m in holder]
+        prev_k = earlier[-1] if earlier else 0
+        later = [holder[m] for m in range(n + 1, len(spoken) + 1) if m in holder]
+        next_k = later[0] if later else len(beats)
+        for k in list(range(prev_k + 1, next_k + 1)) + ([prev_k] if prev_k else []):
+            beat = beats[k - 1]
+            if not (beat["speaker"] or (len(beat["cast"]) == 1 and beat["cast"][0] in cast_ids)):
+                continue
+            lines = sorted(beat["lines"] + [n])
+            if any(b != a + 1 for a, b in zip(lines, lines[1:])):
+                continue
+            if line_problem(ctx, lib, " ".join(spoken[m - 1] for m in lines)):
+                continue
+            notes.append("beat %d: P14 speaking beat: line %d given to this beat by the pipeline, "
+                         "because the plan gave it to no beat" % (k, n))
+            if not beat["speaker"]:
+                beat["speaker"] = beat["cast"][0]
+                notes += speaking_coercion(ctx, plan, k)
+            beat["lines"] = lines
+            holder[n] = k
+            break
+    return notes
+
+
 def speaking_coercion(ctx, plan, k):
     """The P14 notes of SP2 step 4 for beat k, whose speaker is already set (narrative dialogue
     fidelity spec QL7, SM2): the speaker is alone in the beat's cast, and when the beat frames
@@ -3183,6 +3224,7 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
+        plan["speech_notes"] += assign_missing_lines(ctx, plan)
         parts = [empty_parts(ctx.mode, k, plan, ctx) for k in range(1, ctx.panels + 1)]
         valid = 0
         for k in range(1, ctx.panels + 1):
