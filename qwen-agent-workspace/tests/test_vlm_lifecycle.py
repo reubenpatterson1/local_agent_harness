@@ -980,12 +980,24 @@ def test_vl24_the_lifecycle_switched_off(state, tmp_path, vlm, monkeypatch, caps
     assert "vlm:" not in captured.out and "VLM restore" not in captured.err
 
 
+def test_vl24b_the_lifecycle_switched_off_status_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "0")
+    monkeypatch.setattr(lib, "LIGHT_TIMEOUT", 1)
+    ws = mt.make_stub_workspace(tmp_path)
+    mt.stub_config(ws, {"story-server status": {"stdout": "  state:          SERVING mlx-vision\n",
+                                                 "sleep": 5}})
+    assert lib.story_server_record(ws) == lib.check(
+        "V2", "story server", "fail", "bin/story-server status timed out after 1 s")
+
+
 @pytest.mark.parametrize("python", ["/usr/bin/python3", sys.executable])
 def test_vl27_changed_python_files_compile(python, tmp_path):
     if not os.path.isfile(python):
         pytest.skip("%s is not installed" % python)
-    paths = [os.path.join(mt.WS, rel) for rel in ("bin/story-server-restore", "character_dataset.py",
-                                                  "movie_ui_lib.py", "tests/test_vlm_lifecycle.py")]
+    paths = [os.path.join(mt.WS, rel) for rel in (
+        "bin/story-server-restore", "character_dataset.py", "movie_ui_lib.py", "tests/conftest.py",
+        "tests/test_character_tool.py", "tests/test_clean_stop.py", "tests/test_movie_ui_builder.py",
+        "tests/test_movie_ui_jobs.py", "tests/test_story_server.py", "tests/test_vlm_lifecycle.py")]
     proc = subprocess.run([python, "-m", "py_compile"] + paths, capture_output=True, text=True,
                           timeout=120, env=dict(os.environ, PYTHONPYCACHEPREFIX=str(tmp_path)))
     assert proc.returncode == 0, proc.stderr
