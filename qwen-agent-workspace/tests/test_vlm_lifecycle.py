@@ -11,6 +11,7 @@ lifecycle_on(); VL22 alone runs the real bin/story-server-restore, against a fak
 """
 
 import fcntl
+import http.client
 import http.server
 import json
 import os
@@ -613,7 +614,10 @@ def test_vl28_another_mode_fails_without_a_stop(tmp_path, vlm):
     assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
 
 
-def test_vl28b_required_refuses_the_embed_servers_port(tmp_path, vlm):
+def test_vl28b_required_refuses_the_embed_servers_port(tmp_path, vlm, monkeypatch):
+    def no_http(*args, **kwargs):
+        raise AssertionError("no HTTP to 8178")
+    monkeypatch.setattr(http.client, "HTTPConnection", no_http)
     tools = make_fake_tools(tmp_path, MODEL)
     assert _preflight(tmp_path, REQUIRED, tools, 8178) == (
         "failed", "VLM preflight refused: MOVIE_UI_VLM_PORT=8178 is the embed server's port; unset it")
