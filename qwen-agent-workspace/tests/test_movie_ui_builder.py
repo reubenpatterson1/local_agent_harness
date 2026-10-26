@@ -280,9 +280,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # 1f5aa2c36cefe38567d76230c9e3e342c8f14869 (on-camera dialogue), then to
     # 5cda31ecc94ca568f8a5ec587b00ee7393532809 (panel-1 pacing: story_engine.py camera
     # sentences and chained panel-1 template), then to
-    # 6a0b3035bdf3f6eb20833372436fd5e64af1f67b (panel-1 pacing instruction reworded), then to e25f58f5103ae1f703ab135a00a5d51b664b8124 (VLM lifecycle + panel-1 pacing), then to 75d914b9d128434b9fa0ac25cf0482e6f9b5ca7a (character_dataset.py: regenerate with a new seed), then to 5903089fe272c03933d31ca4af105c4aec42b823 (the seed is persisted under the library lock after the preflights), then to ac23105738adee0b26ea9d391681f3abbaa26ab0 (narrative dialogue fidelity).
+    # 6a0b3035bdf3f6eb20833372436fd5e64af1f67b (panel-1 pacing instruction reworded), then to e25f58f5103ae1f703ab135a00a5d51b664b8124 (VLM lifecycle + panel-1 pacing), then to 75d914b9d128434b9fa0ac25cf0482e6f9b5ca7a (character_dataset.py: regenerate with a new seed), then to 5903089fe272c03933d31ca4af105c4aec42b823 (the seed is persisted under the library lock after the preflights), then to ac23105738adee0b26ea9d391681f3abbaa26ab0 (narrative dialogue fidelity), then to cf0a0e684ea4f9ca09f7e7d45dc0e33544242971 (writer pacing).
     # This invariant holds from the new baseline.
-    BASELINE = "ac23105738adee0b26ea9d391681f3abbaa26ab0"
+    BASELINE = "cf0a0e684ea4f9ca09f7e7d45dc0e33544242971"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
