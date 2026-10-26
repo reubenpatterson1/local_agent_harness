@@ -401,7 +401,7 @@ GROUP_NOUNS = frozenset("""
     pedestrians commuters supporters cheerleaders throng throngs mob mobs masses public
     congregation team teams squad squads band bands people extras""".split())
 GROUP_DESCRIPTOR_RE = re.compile(
-    r"^an?\s+(?:[A-Za-z-]+\s+){0,2}(?:group|crowd|throng|mob|mass|sea|line|row|pack|band|team|"
+    r"^an?\s+(?:[A-Za-z-]+\s+){0,2}(?:group|crowd|throng|mob|row|pack|band|team|"
     r"squad|horde|swarm|flock|herd)\s+of\b", re.IGNORECASE)
 SPOKEN_LINES_HEADER = ("Spoken lines (the narrative quotes these words; the movie must speak "
                        "every one of them on camera, word for word, in this order):")
@@ -945,12 +945,17 @@ def speaking_coercion(ctx, plan, k):
 def is_group_entry(entry):
     """True when a plan cast entry is a group of people, not a character (narrative dialogue
     fidelity spec GC2): it is not a library character, and the head word of its phrase (the last
-    word, lowercased, without a trailing 's or ') is a GROUP_NOUNS word, or its descriptor
-    starts like "a group of" (GROUP_DESCRIPTOR_RE)."""
+    word before the first standalone "of" or "from", lowercased, without trailing punctuation
+    (,.;:!?) or a trailing 's or ') is a GROUP_NOUNS word, or its descriptor starts like
+    "a group of" (GROUP_DESCRIPTOR_RE)."""
     if entry.get("cast_name") is not None:
         return False
     words = (entry.get("phrase") or "").split()
-    head = words[-1].lower() if words else ""
+    for k, word in enumerate(words):
+        if word.lower() in ("of", "from"):
+            words = words[:k]
+            break
+    head = words[-1].lower().rstrip(",.;:!?") if words else ""
     for tail in ("'s", "’s", "'", "’"):
         if head.endswith(tail):
             head = head[:-len(tail)]
@@ -961,10 +966,11 @@ def is_group_entry(entry):
 def drop_groups(plan):
     """The P15 notes of GC3, in cast order: every group entry is removed from plan["cast"], and
     each removed id that no kept entry also uses is removed from every beat's cast (order kept)."""
-    groups = [entry for entry in plan["cast"] if is_group_entry(entry)]
+    flags = [is_group_entry(entry) for entry in plan["cast"]]
+    groups = [entry for entry, flag in zip(plan["cast"], flags) if flag]
     if not groups:
         return []
-    plan["cast"] = [entry for entry in plan["cast"] if not is_group_entry(entry)]
+    plan["cast"] = [entry for entry, flag in zip(plan["cast"], flags) if not flag]
     gone = set(entry["id"] for entry in groups) - set(entry["id"] for entry in plan["cast"])
     listed = {}
     for k, beat in enumerate(plan["beats"], start=1):

@@ -485,3 +485,14 @@ def test_nf36_q3_an_odd_quote_count(ws):
     plan, shape = se.normalize_plan(ctx, seu.plan_json("chained", 3))
     assert [m for m in se.plan_checks(ctx, plan, shape)[1] if " Q3 " in m] == [
         q3.replace("(1)", "(3)")]
+
+
+def test_nf22b_group_head_word():
+    for phrase in ("the captain of the team", "a member of the crowd",
+                   "the lead singer of the band", "the fan from the crowd"):
+        assert not se.is_group_entry(_entry(phrase)), phrase
+    assert se.is_group_entry(_entry("the fans,"))
+    assert se.is_group_entry(_entry("the cheering crowd"))
+    for descriptor in ("a mass of curly hair framing a pale face", "a thin line of stubble",
+                       "a sea of freckles"):
+        assert not se.is_group_entry(_entry("the hiker", descriptor)), descriptor
