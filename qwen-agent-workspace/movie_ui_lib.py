@@ -613,6 +613,8 @@ def vlm_preflight(job, cancel, tools=None, port=None, health=None, timeout=VLM_P
         _say("vlm: stopped for this job")
         return "ok", None
     _say("vlm: preflight: this job needs the VLM (vlm=required)")
+    if port == 8178:
+        return "failed", "VLM preflight refused: MOVIE_UI_VLM_PORT=8178 is the embed server's port; unset it"
     for attempt in (1, 2):
         outcome, value = _vlm_step(restore, cancel, deadline, timeout)
         if outcome != "exit":

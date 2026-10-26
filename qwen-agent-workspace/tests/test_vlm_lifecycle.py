@@ -613,6 +613,14 @@ def test_vl28_another_mode_fails_without_a_stop(tmp_path, vlm):
     assert call_names(tools) == ["restore --wait", "stop", "restore --wait"]
 
 
+def test_vl28b_required_refuses_the_embed_servers_port(tmp_path, vlm):
+    tools = make_fake_tools(tmp_path, MODEL)
+    assert _preflight(tmp_path, REQUIRED, tools, 8178) == (
+        "failed", "VLM preflight refused: MOVIE_UI_VLM_PORT=8178 is the embed server's port; unset it")
+    assert call_names(tools, include_status=True) == []
+    assert vlm.requests == []
+
+
 def test_review_focus_5_tools_path_with_a_space(tmp_path, vlm, capsys):
     tools = make_fake_tools(tmp_path / "my ui ws", MODEL)
     assert " " in tools
