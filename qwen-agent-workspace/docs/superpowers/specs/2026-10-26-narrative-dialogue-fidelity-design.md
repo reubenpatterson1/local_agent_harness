@@ -574,6 +574,8 @@ for patch in accepted (target "panel"):
 - Q1 is a user-approved exception to [DLG] D6 (2026-10-26). A missing narrative line blocks even though the pipeline could proceed. D6's other limits hold: at most 2 critic rounds, only hard problems are patched, and existing Dialogue words are never rewritten.
 - `bin/judge-story`'s `PATCH_FIELDS` needs no change.
 
+**Amendment (implementation ruling, 2026-10-26):** a Q1 dialogue patch is also rejected when, at the moment it is applied, an earlier beat holds a later line or a later beat an earlier one ("spoken line N is given to beat B, so panel K cannot say line I without breaking the narrative's order"); patches apply in sequence, so an accepted patch counts for the next. Pinned by NF21b.
+
 ### QL14. Recheck
 
 QL10 wiring. A hand-edited `story.md` that adds `Dialogue: the FuboTV player: It's just FuboTV.` to panel 2 passes Q1 on re-check.

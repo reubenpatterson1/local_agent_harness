@@ -2708,13 +2708,111 @@ def _patch_problem(ranges, patch):
     return None
 
 
+Q1_ONLY_REASON = ("panel %d has no hard timing problem, and under a Q1 problem a dialogue "
+                  "replacement must be the speaker's referring phrase, a colon and one or more "
+                  "consecutive spoken lines of the narrative, word for word")
+
+
+def spoken_run(text, spoken):
+    """(i, j) when the words of text (line_words) are exactly the words of spoken lines i to j,
+    in order, for the smallest such i; else None (narrative dialogue fidelity spec QL13)."""
+    words = line_words(text)
+    if not words:
+        return None
+    for i in range(1, len(spoken) + 1):
+        run = []
+        for j in range(i, len(spoken) + 1):
+            run += line_words(spoken[j - 1])
+            if run == words:
+                return i, j
+            if len(run) >= len(words):
+                break
+    return None
+
+
+def contained_lines(text, spoken):
+    """The numbers of the spoken lines whose words lie, in order, inside text (QL13)."""
+    words = line_words(text)
+    return [n for n, line in enumerate(spoken, start=1)
+            if _find_run(words, line_words(line), 0) is not None]
+
+
+def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
+    """(matched, problem) for a critic dialogue patch on panel k under a Q1 problem (QL13).
+    matched is False when the replacement is not one or more consecutive spoken lines of the
+    narrative (then the caller's ordinary dialogue rules apply); otherwise problem is None (the
+    patch is applied in place: the beat gets its speaker when it has none, with
+    speaking_coercion, and the lines, and parts[k - 1]["dialogue"] the narrative's canonical
+    words) or the reason it is rejected. The speaker comes from the replacement's referring
+    phrase, else the beat's speaker, else the beat's sole cast member; the patch keeps the
+    panel's spoken lines, adds only adjacent ones, and never rewrites other Dialogue words."""
+    spoken = plan["spoken_lines"]
+    phrases = cast_phrases(ctx, plan)
+    text = clean_writer(lib, replacement)
+    phrase, line, _problem = lib.parse_dialogue(text, phrases)
+    if phrase:
+        sid0 = next((c["id"] for c in plan["cast"]
+                     if (c.get("phrase") or "").lower() == phrase.lower()), "")
+        run = spoken_run(line, spoken)
+    else:
+        sid0 = ""
+        run = spoken_run(lib.clean_line(text), spoken)
+        found = lib.speaker_prefix(text) if run is None else None
+        if found and spoken_run(found[1], spoken) is not None:
+            return True, "the replacement " + lib.parse_dialogue(text, phrases)[2]
+    if run is None:
+        return False, None
+    i, j = run
+    beat = plan["beats"][k - 1]
+    sid = sid0 or beat["speaker"] or (beat["cast"][0] if len(beat["cast"]) == 1 else "")
+    if not sid:
+        return True, "name the speaker: start the replacement with their referring phrase and a colon"
+    if beat["speaker"] and sid != beat["speaker"]:
+        return True, ("panel %d's speaker is %s; a spoken-line patch never changes who speaks"
+                      % (k, _q(beat["speaker"])))
+    current = lib.parse_dialogue(dict(panel_fields(ctx, plan, parts, k)).get("Dialogue", ""),
+                                 phrases)[1]
+    have = contained_lines(current, spoken)
+    want = set(beat["lines"]) | set(have) | set(range(i, j + 1))
+    if max(want) - min(want) + 1 != len(want):
+        return True, ("the replacement must keep panel %d's spoken lines and add only an "
+                      "adjacent line" % k)
+    i, j = min(want), max(want)
+    words = line_words(current)
+    if words and (not have or words != [w for n in range(min(have), max(have) + 1)
+                                        for w in line_words(spoken[n - 1])]):
+        return True, ("panel %d's Dialogue: has words that are not the narrative's spoken lines, "
+                      "and existing Dialogue words are never rewritten" % k)
+    for other_k, other in enumerate(plan["beats"], start=1):
+        overlap = set(other["lines"]) & set(range(i, j + 1))
+        if other_k != k and overlap:
+            return True, "spoken line %d is already given to beat %d" % (min(overlap), other_k)
+    for other_k, other in enumerate(plan["beats"], start=1):
+        wrong = [n for n in other["lines"] if (other_k < k and n > j) or (other_k > k and n < i)]
+        if wrong:
+            return True, ("spoken line %d is given to beat %d, so panel %d cannot say line %d "
+                          "without breaking the narrative's order" % (wrong[0], other_k, k, i))
+    canonical = " ".join(spoken[i - 1:j])
+    problem = line_problem(ctx, lib, canonical)
+    if problem:
+        return True, problem
+    if beat["speaker"] == "":
+        beat["speaker"] = sid
+        plan["speech_notes"] += speaking_coercion(ctx, plan, k)
+    beat["lines"] = list(range(i, j + 1))
+    parts[k - 1]["dialogue"] = canonical
+    return True, None
+
+
 def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
     """(new_state, applied, rejected) for a state {"plan", "parts"} and a patch list (RS20;
     dialogue spec PG1-PG4). Works on a deep copy; rejected items are {"patch", "reason"}.
-    repairable is {panel: set of hard ids} of the judged state, or None for no restriction: a
-    motion or prompt patch needs a T2 or T3 on its panel, a dialogue patch a T1. A motion or
-    prompt replacement must pass the PG3 sentence guard; a dialogue replacement must fit the
-    clip (PG4)."""
+    repairable is {panel: set of hard ids, "story": set of story-scope hard ids} of the judged
+    state, or None for no restriction: a motion or prompt patch needs a T2 or T3 on its panel, a
+    dialogue patch a T1 or N18. A motion or prompt replacement must pass the PG3 sentence guard;
+    a dialogue replacement must fit the clip (PG4). Under a story Q1 (narrative dialogue fidelity
+    spec QL13), a dialogue replacement that is consecutive spoken lines of the narrative goes
+    through q1_dialogue_patch instead; a panel's spoken lines are never rewritten."""
     new = copy.deepcopy(state)
     plan, parts = new["plan"], new["parts"]
     lib = _character_lib(ctx.ws)
@@ -2759,15 +2857,31 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
             rejected.append({"patch": patch, "reason": "would break " + broken[0]})
             continue
         applied.append(patch)
+    q1 = bool(plan.get("spoken_lines")) and (repairable is None
+                                             or "Q1" in repairable.get("story", set()))
     for patch in accepted:
         if patch["target"] != "panel":
             continue
         k, field = patch["index"], patch["field"]
+        if field == "dialogue" and q1:
+            matched, problem = q1_dialogue_patch(ctx, lib, plan, parts, k, patch["replacement"])
+            if matched:
+                if problem:
+                    rejected.append({"patch": patch, "reason": problem})
+                else:
+                    applied.append(patch)
+                continue
         need = {"T1", "N18"} if field == "dialogue" else {"T2", "T3"}
         if repairable is not None and not (repairable.get(k, set()) & need):
-            rejected.append({"patch": patch, "reason": "panel %d has no hard timing or "
-                                                       "amount-of-action problem; advisory "
-                                                       "findings are never patched" % k})
+            reason = (Q1_ONLY_REASON % k if field == "dialogue" and q1 else
+                      "panel %d has no hard timing or amount-of-action problem; advisory findings "
+                      "are never patched" % k)
+            rejected.append({"patch": patch, "reason": reason})
+            continue
+        if field == "dialogue" and plan["beats"][k - 1].get("lines"):
+            rejected.append({"patch": patch, "reason": "panel %d says the narrative's spoken "
+                                                       "line(s) %s, which are never rewritten"
+                                                       % (k, _nums(plan["beats"][k - 1]["lines"]))})
             continue
         if field == "dialogue":
             text = _sentence(_clean_dialogue(lib, clean_writer(lib, patch["replacement"]),
@@ -2787,12 +2901,15 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
 
 
 def repairable_ids(hard):
-    """{panel number: set of its hard violation ids} (dialogue spec PG2)."""
+    """{panel number: set of its hard violation ids} (dialogue spec PG2), plus "story": the set of
+    story-scope hard ids, such as Q1 (narrative dialogue fidelity spec QL13), when there is one."""
     out = {}
     for message in hard:
         violation = parse_violation(message)
         if violation["scope"] == "panel" and violation["index"]:
             out.setdefault(violation["index"], set()).add(violation["id"])
+        elif violation["scope"] == "story":
+            out.setdefault("story", set()).add(violation["id"])
     return out
 
 

@@ -1219,3 +1219,148 @@ def test_nf25_the_critic_prompt(ws):
     del older["spoken_lines"]
     prompt = se.build_critic_prompt(older, state["text"], ([], []))
     assert "Spoken lines (" not in prompt and CRITIC_Q1_FIELD_LINE not in prompt
+
+
+# --- NF21, NF24, Review Focus 4: the critic's Q1 dialogue patch (QL13) -----------------------------
+
+Q1_ONLY = ("panel %d has no hard timing problem, and under a Q1 problem a dialogue replacement must "
+           "be the speaker's referring phrase, a colon and one or more consecutive spoken lines of "
+           "the narrative, word for word")
+STORY_Q1 = {"story": {"Q1"}}
+
+
+def _dialogue_patch(index, replacement):
+    return {"target": "panel", "index": index, "field": "dialogue", "reason": "r",
+            "replacement": replacement}
+
+
+def _apply(ctx, plan, parts, replacements, repairable=None):
+    """apply_patches with one dialogue patch per (panel, replacement); repairable defaults to a
+    story Q1."""
+    state = {"plan": plan, "parts": parts}
+    patches = [_dialogue_patch(k, text) for k, text in replacements]
+    return se.apply_patches(ctx, state, patches, lora_allowed=False,
+                            repairable=STORY_Q1 if repairable is None else repairable)
+
+
+def _reasons(rejected):
+    return [r["reason"] for r in rejected]
+
+
+def _seu3(ws, beats=None, writer_dialogue=None):
+    """(ctx, plan, parts) of the NF24 "seu3" case: seu.plan_json("chained", 3) under the NF13
+    narrative, beat 2 cast c1 and c2, beat 3 spoken by c1; beats adds field overrides; the parts
+    are the raw seu.panel_json replies, panel 1 with writer_dialogue when given."""
+    fields = {2: {"cast": ["c1", "c2"]}, 3: {"speaker": "c1"}}
+    for k, extra in (beats or {}).items():
+        fields[k] = dict(fields.get(k, {}), **extra)
+    ctx, plan = _lines_plan(ws, COURIER_LINES, fields)
+    parts = [dict(seu.panel_json("chained", k)) for k in (1, 2, 3)]
+    if writer_dialogue is not None:
+        parts[0]["dialogue"] = writer_dialogue
+    return ctx, plan, parts
+
+
+def _rec(ws, case, reply="plan_reply_1.txt", **ctx_kw):
+    """(ctx, plan, parts) of a replayed recorded round 0 (no pipeline assignment)."""
+    state, plan, _notes = _replay(ws, case, reply, **ctx_kw)
+    return _hockey_ctx(ws, case, **ctx_kw), plan, state["parts"]
+
+
+def test_nf21_repairable_ids_story_scope():
+    assert se.repairable_ids(["story: Q1 spoken line: x", T2_2X145]) == {2: {"T2"},
+                                                                         "story": {"Q1"}}
+    assert se.repairable_ids([T2_2X145]) == {2: {"T2"}}
+
+
+def test_nf24_the_q1_dialogue_patch(ws):
+    assert se.Q1_ONLY_REASON == Q1_ONLY
+    ctx, plan, parts = _rec(ws, "hockey-2x145")
+    new, applied, rejected = _apply(ctx, plan, parts, [(2, _say(LINE2))])
+    assert len(applied) == 1 and rejected == []
+    assert (new["plan"]["beats"][1]["speaker"], new["plan"]["beats"][1]["lines"]) == ("c1", [2])
+    assert new["parts"][1]["dialogue"] == LINE2
+    assert plan["beats"][1]["lines"] == [] and "dialogue" not in parts[1]
+    one_ctx, one_plan, one_parts = _rec(ws, "hockey-1x241")
+    new, applied, rejected = _apply(one_ctx, one_plan, one_parts, [(1, LINE1 + " " + LINE2)])
+    assert len(applied) == 1 and new["plan"]["beats"][0]["lines"] == [1, 2]
+    assert new["plan"]["beats"][0]["speaker"] == "c1"
+    s_ctx, s_plan, s_parts = _seu3(ws)
+    _new, applied, rejected = _apply(s_ctx, s_plan, s_parts, [(2, "Keep moving.")])
+    assert _reasons(rejected) == [
+        "name the speaker: start the replacement with their referring phrase and a colon"]
+    _new, applied, rejected = _apply(ctx, plan, parts, [(2, "It is just Fubo.")])
+    assert _reasons(rejected) == [Q1_ONLY % 2]
+    f_ctx, f_plan, f_parts = _rec(ws, "hockey-2x145", "plan_reply_fixed.json")
+    _new, applied, rejected = _apply(f_ctx, f_plan, f_parts, [(1, _say(LINE1 + " " + LINE2))])
+    assert _reasons(rejected) == ["spoken line 2 is already given to beat 2"]
+    new, applied, rejected = _apply(ctx, plan, parts, [(1, _say(LINE2))])
+    assert len(applied) == 1 and new["plan"]["beats"][0]["lines"] == [1, 2]
+    assert new["parts"][0]["dialogue"] == LINE1 + " " + LINE2
+    g_ctx, g_plan, g_parts = _rec(ws, "hockey-1x241", seconds="4", clip_seconds=97 / 24.0)
+    _new, applied, rejected = _apply(g_ctx, g_plan, g_parts, [(1, LINE1 + " " + LINE2)])
+    assert _reasons(rejected) == [
+        "the new line is 13 words in 2 sentences; at most 8 words in 2 sentences fit this clip"]
+    _new, applied, rejected = _apply(s_ctx, s_plan, s_parts, [(3, "the old monk: The gate is close.")])
+    assert _reasons(rejected) == [
+        "panel 3's speaker is 'c1'; a spoken-line patch never changes who speaks"]
+    _new, applied, rejected = _apply(ctx, plan, parts, [(2, "the hockey player: " + LINE2)])
+    assert _reasons(rejected) == [
+        "the replacement names 'the hockey player', which is no character's referring phrase; use "
+        "one of: 'the FuboTV player'"]
+    _new, applied, rejected = _apply(ctx, plan, parts, [(2, _say(LINE2))], repairable={2: {"T2"}})
+    assert _reasons(rejected) == [
+        "panel 2 has no hard timing or amount-of-action problem; advisory findings are never "
+        "patched"]
+    _new, applied, rejected = _apply(f_ctx, f_plan, f_parts, [(2, "Short.")],
+                                     repairable={2: {"T1"}})
+    assert _reasons(rejected) == [
+        "panel 2 says the narrative's spoken line(s) 2, which are never rewritten"]
+    first, applied, rejected = _apply(s_ctx, s_plan, s_parts, [(1, "the courier: Keep moving.")])
+    assert len(applied) == 1 and first["plan"]["beats"][0]["lines"] == [1]
+    assert first["plan"]["beats"][0]["speaker"] == "c1"
+    second, applied, rejected = _apply(s_ctx, first["plan"], first["parts"],
+                                       [(1, "the courier: The gate is close.")])
+    assert len(applied) == 1 and second["plan"]["beats"][0]["lines"] == [1, 2]
+    assert second["parts"][0]["dialogue"] == "Keep moving. The gate is close."
+    _new, applied, rejected = _apply(s_ctx, first["plan"], first["parts"],
+                                     [(1, "the courier: We made it.")])
+    assert _reasons(rejected) == [
+        "the replacement must keep panel 1's spoken lines and add only an adjacent line"]
+    n_ctx, n_plan, n_parts = _seu3(ws, {1: {"speaker": "c1"}}, "Hello there. Keep moving.")
+    _new, applied, rejected = _apply(n_ctx, n_plan, n_parts, [(1, "the courier: The gate is close.")])
+    assert _reasons(rejected) == [
+        "panel 1's Dialogue: has words that are not the narrative's spoken lines, and existing "
+        "Dialogue words are never rewritten"]
+    assert (se.spoken_run(LINE1 + " " + LINE2, [LINE1, LINE2]),
+            se.spoken_run("it's just fubotv", [LINE1, LINE2]),
+            se.spoken_run("hat trick", [LINE1, LINE2]), se.spoken_run("...", [LINE1])) == (
+        (1, 2), (2, 2), None, None)
+    assert se.contained_lines("Yes. " + LINE2, [LINE1, LINE2]) == [2]
+
+
+def test_review_focus_4_a_retyped_q1_patch_stores_the_narrative_words(ws):
+    # A local critic re-types the missing line: other case, curly quotes, no full stop. Expected:
+    # the patch applies, the stored Dialogue: text is the narrative's own spelling, and Q1 clears.
+    ctx, plan, parts = _rec(ws, "hockey-2x145")
+    new, applied, rejected = _apply(ctx, plan, parts, [(2, "The FuboTV Player: “it’s just fubotv”")])
+    assert len(applied) == 1 and rejected == []
+    assert new["parts"][1]["dialogue"] == LINE2
+    state = se._Run(ctx, "").make_state(1, new["plan"], new["parts"])
+    assert state["hard"] == [T2_2X145]
+    assert state["text"].endswith("Dialogue: the FuboTV player: It's just FuboTV.\n")
+
+
+def test_nf21b_q1_patch_keeps_order(ws):
+    s_ctx, s_plan, s_parts = _seu3(ws)
+    new, applied, rejected = _apply(s_ctx, s_plan, s_parts, [
+        (3, "the courier: Keep moving."), (1, "the courier: The gate is close.")])
+    assert len(applied) == 1 and applied[0]["index"] == 3
+    assert _reasons(rejected) == [
+        "spoken line 1 is given to beat 3, so panel 1 cannot say line 2 without breaking the "
+        "narrative's order"]
+    assert [b["lines"] for b in new["plan"]["beats"]] == [[], [], [1]]
+    new, applied, rejected = _apply(s_ctx, s_plan, s_parts, [
+        (1, "the courier: Keep moving."), (3, "the courier: The gate is close.")])
+    assert len(applied) == 2 and rejected == []
+    assert [b["lines"] for b in new["plan"]["beats"]] == [[1], [], [2]]
