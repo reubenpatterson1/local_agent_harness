@@ -496,3 +496,136 @@ def test_nf22b_group_head_word():
     for descriptor in ("a mass of curly hair framing a pale face", "a thin line of stubble",
                        "a sea of freckles"):
         assert not se.is_group_entry(_entry("the hiker", descriptor)), descriptor
+
+
+# --- NF13, NF14, NF26, Review Focus 3: lines in the plan (QL7, QL8, 2.1) ---------------------------
+
+def _lines_plan(ws, narrative, beats, n=3, **ctx_kw):
+    """(ctx, normalized plan) of seu.plan_json("chained", n) under narrative; beats maps a beat
+    number to the fields that replace that beat's."""
+    ctx = seu.make_ctx(se, ws, panels=n, narrative=narrative, **ctx_kw)
+    raw = seu.plan_json("chained", n)
+    for k, fields in beats.items():
+        raw["beats"][k - 1].update(fields)
+    return ctx, se.normalize_plan(ctx, raw)[0]
+
+
+def _fixture_text(case, name):
+    with open(os.path.join(FIXTURES, case, name), encoding="utf-8") as f:
+        return f.read()
+
+
+COURIER_SPOKEN = ["Keep moving.", "The gate is close.", "We made it."]
+
+
+def test_nf13_coerce_speakers_with_lines(ws):
+    every = dict((k, {"speaker": "c1", "lines": [k]}) for k in (1, 2, 3))
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, every)
+    assert plan["spoken_lines"] == COURIER_SPOKEN
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [("c1", [1]), ("c1", [2]),
+                                                                    ("c1", [3])]
+    assert plan["speech_notes"] == [] and se.line_assignment_problems(plan) == []
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"speaker": "c1", "lines": [2, 1]},
+                                                 2: {"speaker": "c1", "lines": [2]},
+                                                 3: {"speaker": "c1", "lines": [4]}})
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [("c1", [1, 2]), ("c1", []),
+                                                                    ("c1", [])]
+    assert plan["speech_notes"] == [
+        "beat 2: P14 speaking beat: line 2 dropped: an earlier beat already speaks line 2 or a "
+        "later one",
+        "beat 3: P14 speaking beat: line 4 dropped: the narrative has no spoken line 4"]
+    assert se.line_assignment_problems(plan) == [
+        'plan: Q1 spoken line: spoken line 3 "We made it." is in no beat\'s lines; put 3 in the '
+        "lines of the beat whose action surrounds it in the narrative, and give that beat a "
+        "speaker"]
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"lines": [1]}})
+    assert (plan["beats"][0]["speaker"], plan["beats"][0]["lines"]) == ("c1", [1])
+    assert plan["speech_notes"] == [
+        "beat 1: P14 speaking beat: speaker set to 'c1', the only character in the beat, to say "
+        "line(s) 1"]
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, {1: {"cast": ["c1", "c2"], "lines": [1, 2]}})
+    assert (plan["beats"][0]["speaker"], plan["beats"][0]["lines"]) == ("", [])
+    assert plan["speech_notes"] == [
+        "beat 1: P14 speaking beat: line(s) 1, 2 dropped: the beat has no speaker"]
+    seven = ('The courier says "Keep moving along the wet harbour road." Then he says "The temple '
+             'gate is close to us."')
+    _ctx, plan = _lines_plan(ws, seven, {1: {"speaker": "c1", "lines": [1, 2]}})
+    assert plan["beats"][0]["lines"] == [1]
+    assert plan["speech_notes"] == [
+        "beat 1: P14 speaking beat: line 2 dropped: together with the beat's other lines it does "
+        "not fit a 6-second clip"]
+    _ctx, plan = _lines_plan(ws, seu.make_ctx(se, ws).narrative, every)
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [("c1", [])] * 3
+    assert plan["speech_notes"] == [] and plan["spoken_lines"] == []
+    _ctx, plan = _lines_plan(ws, COURIER_LINES, every, narration=False)
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [("", [])] * 3
+    assert plan["spoken_lines"] == []
+    assert se._clean_lines("1") == [] and se._clean_lines(["2", True, 1.0, 3]) == [2, 3]
+    assert se._clean_lines(None) == [] and se._clean_lines([" 4 ", "x", -1, "²"]) == [4, -1]
+    assert se._nums([1, 2, 3]) == "1, 2, 3"
+
+
+def test_nf14_the_plan_retry_gate(ws, tmp_path, monkeypatch):
+    recorded = seu.answer(_fixture_text("hockey-2x145", "plan_reply_1.txt"))
+    fixed = seu.answer(_fixture_text("hockey-2x145", "plan_reply_fixed.json"))
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[recorded, fixed])
+    found, why = se._Run(ctx, "").plan_round()
+    calls = seu.agent_log(log)
+    assert why is None and [c["stage"] for c in calls] == ["plan", "plan"]
+    retry = calls[1]["argv"][calls[1]["argv"].index("--user-prompt") + 1]
+    assert ('- plan: Q1 spoken line: spoken line 1 "%s" is in no beat\'s lines; put 1 in the '
+            "lines of the beat whose action surrounds it in the narrative, and give that beat a "
+            "speaker\n" % LINE1) in retry
+    assert '- plan: Q1 spoken line: spoken line 2 "%s"' % LINE2 in retry
+    assert [b["lines"] for b in found[0]["beats"]] == [[1], [2]] and found[2] == []
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[fixed])
+    found, why = se._Run(ctx, "").plan_round()
+    assert len(seu.agent_log(log)) == 1 and [b["lines"] for b in found[0]["beats"]] == [[1], [2]]
+
+
+def test_nf26_an_older_plan_json_loads(ws):
+    ctx = _hockey_ctx(ws, "hockey-2x145")
+    plan, _shape = se.normalize_plan(ctx, _reply("hockey-2x145", "plan_reply_fixed.json"))
+    del plan["spoken_lines"], plan["cast_notes"]
+    for beat in plan["beats"]:
+        del beat["lines"]
+    with open(os.path.join(ctx.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(plan, f)
+    loaded = se.load_plan(ctx)
+    assert [b["lines"] for b in loaded["beats"]] == [[], []]
+    assert (loaded["spoken_lines"], loaded["cast_notes"]) == ([], [])
+
+
+def test_review_focus_3_the_planner_gives_a_line_to_the_crowd(ws):
+    # The planner makes the crowd (a group, dropped by P15) the speaker of the beat that holds
+    # line 2. Expected: the line stays on that beat, spoken by its one remaining character, and
+    # one P15 note says so (controller ruling, plan Spec amendment 1); with no individual left,
+    # the note says the beat has no speaker.
+    raw = _reply("hockey-2x145", "plan_reply_fixed.json")
+    raw["beats"][1]["speaker"] = "c2"
+    plan, _shape = se.normalize_plan(_hockey_ctx(ws, "hockey-2x145"), raw)
+    assert plan["cast_notes"] == [P15_2X145]
+    beat = plan["beats"][1]
+    assert (beat["speaker"], beat["lines"], beat["cast"]) == ("c1", [2], ["c1"])
+    assert plan["speech_notes"] == [
+        "beat 2: P15 group cast: the cheering crowd is part of the setting, not a speaker; the "
+        "beat's line goes to the FuboTV player"]
+    assert se.line_assignment_problems(plan) == []
+    no_speaker = ("beat 2: P15 group cast: the cheering crowd is part of the setting, not a "
+                  "speaker; the beat has no speaker")
+    for speaker in ("c2", "The Cheering Crowd"):
+        raw = _reply("hockey-2x145")
+        raw["beats"][1]["speaker"] = speaker
+        plan, _shape = se.normalize_plan(_hockey_ctx(ws, "hockey-2x145"), raw)
+        assert (plan["beats"][1]["speaker"], plan["speech_notes"]) == ("", [no_speaker]), speaker
+    raw = seu.plan_json("chained", 3)
+    raw["cast"].append({"id": "c3", "phrase": "the harbour crowd",
+                        "descriptor": "a crowd of fishermen in yellow oilskins"})
+    raw["beats"][0].update(cast=["c1", "c2", "c3"], speaker="c3", lines=[1])
+    plan, _shape = se.normalize_plan(seu.make_ctx(se, ws, narrative=COURIER_LINES), raw)
+    assert (plan["beats"][0]["speaker"], plan["beats"][0]["lines"]) == ("", [])
+    assert plan["speech_notes"] == [
+        "beat 1: P15 group cast: the harbour crowd is part of the setting, not a speaker; the beat "
+        "has no speaker",
+        "beat 1: P14 speaking beat: line(s) 1 dropped: the beat has no speaker"]

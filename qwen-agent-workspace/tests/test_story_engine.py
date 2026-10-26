@@ -304,7 +304,7 @@ def test_rst13_normalization(ws, story_env, tmp_path):
                                                "The setting is a forest.")
     assert "surprise" not in plan
     assert [b["speaker"] for b in plan["beats"]] == ["", "", ""] and plan["speech_notes"] == []
-    assert list(plan)[-1] == "speech_notes" and list(plan["beats"][0])[-1] == "speaker"
+    assert list(plan)[-1] == "speech_notes" and list(plan["beats"][0])[-1] == "lines"
     assert list(plan)[:10] == ["schema", "story_id", "mode", "panels", "seconds", "narrative",
                                "goal", "seed_image", "video_model", "auto_lora"]
     assert plan["loras"] == {"global": [{"id": "film-grain", "strength": 0.8}],
@@ -1757,7 +1757,8 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
     assert list(plan) == ["schema", "story_id", "mode", "panels", "seconds", "narrative", "goal",
                           "seed_image", "video_model", "auto_lora", "title", "logline", "cast",
-                          "locations", "props", "beats", "loras", "cast_notes", "speech_notes"]
+                          "locations", "props", "beats", "loras", "spoken_lines", "cast_notes",
+                          "speech_notes"]
     assert plan["schema"] == "ltx-movie.plan.v1" and plan["panels"] == 3
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert list(checks) == ["schema", "story_id", "mode", "panels", "checked_at", "source",

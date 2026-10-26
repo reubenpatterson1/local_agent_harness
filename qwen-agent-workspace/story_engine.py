@@ -778,6 +778,24 @@ def _empty_loras():
     return {"global": [], "per_beat": {}, "stills": []}
 
 
+def _clean_lines(value):
+    """A beat reply's "lines" (narrative dialogue fidelity spec QL7): its integers (not bools) and
+    digit strings, as ints, in order; [] when it is not a list. Anything else is dropped,
+    including a digit string int() cannot read (such as "²")."""
+    if not isinstance(value, list):
+        return []
+    out = []
+    for item in value:
+        if isinstance(item, int) and not isinstance(item, bool):
+            out.append(item)
+        elif isinstance(item, str) and item.strip().isdigit():
+            try:
+                out.append(int(item))
+            except ValueError:
+                continue
+    return out
+
+
 def _list_of_objects(raw, key, shape, scope="plan"):
     value = raw.get(key)
     if key not in raw:
@@ -855,7 +873,8 @@ def normalize_plan(ctx, raw):
             "camera": _clean_str(item.get("camera")).lower(),
             "location": _clean_str(item.get("location")),
             "cast": [_clean_str(c) if isinstance(c, str) else json.dumps(c) for c in beat_cast],
-            "speaker": _clean_str(item.get("speaker"))})
+            "speaker": _clean_str(item.get("speaker")),
+            "lines": _clean_lines(item.get("lines"))})
     plan["beats"] = beats
     loras = raw.get("loras")
     if not ctx.auto_lora or not isinstance(loras, dict):
@@ -870,8 +889,10 @@ def normalize_plan(ctx, raw):
                  "stills": _normalize_picks(loras.get("stills"), by_id)}
     picks["pinned"] = [dict(pin) for pin in ctx.pinned]
     plan["loras"] = picks
+    plan["spoken_lines"] = required_lines(ctx)
+    groups = [entry for entry in plan["cast"] if is_group_entry(entry)]
     plan["cast_notes"] = drop_groups(plan)
-    plan["speech_notes"] = coerce_speakers(ctx, plan)
+    plan["speech_notes"] = coerce_speakers(ctx, plan, groups)
     return plan, shape
 
 
@@ -886,34 +907,94 @@ def speaking_camera(beat):
     return beat["camera"] if beat["camera"] in SPEAKING_CAMERAS else "static"
 
 
-def coerce_speakers(ctx, plan):
-    """The P14 notes of the speaking-beat coercion (dialogue spec SP2), in beat order. Every beat
-    gets a "speaker": a cast id or "". A speaker the movie cannot have (--no-narration) or that is
-    not a plan cast id is dropped. A kept speaker gets speaking_coercion. No other beat is ever
-    changed."""
+def coerce_speakers(ctx, plan, groups=()):
+    """The P14 notes of the speaking-beat coercion (dialogue spec SP2; narrative dialogue fidelity
+    spec QL7), in beat order. Every beat gets a "speaker" (a cast id or "") and "lines" (the
+    numbers of the narrative's spoken lines the beat says, ascending). A speaker the movie cannot
+    have (--no-narration) or that is not a plan cast id is dropped. A line number is dropped when
+    the narrative has no such line, when an earlier beat already says it or a later one, when the
+    beat has no speaker and no sole cast member to become the speaker, or (the last line first)
+    while the beat's lines together do not fit the clip. A beat that keeps a speaker gets
+    speaking_coercion. No other beat is ever changed. groups are the cast entries drop_groups
+    removed: a speaker that names one (by id or phrase) gets the P15 note of the controller
+    ruling (plan Spec amendment 1) in place of the "not a cast id" and "speaker set to" notes."""
     notes = []
     cast_ids = [c["id"] for c in plan["cast"]]
+    spoken = plan["spoken_lines"]
+    lib = _character_lib(ctx.ws) if spoken else None
+    last = 0
     for k, beat in enumerate(plan["beats"], start=1):
-        raw = beat["speaker"]
-        beat["speaker"] = ""
+        raw, raw_lines = beat["speaker"], beat["lines"]
+        beat["speaker"], beat["lines"] = "", []
         if ctx.narration is False:
             if raw:
                 notes.append("beat %d: P14 speaking beat: speaker %s dropped: this movie has no "
                              "spoken lines" % (k, _q(raw)))
             continue
-        if not raw:
+        sid, group, at = "", None, len(notes)
+        if raw:
+            for entry in plan["cast"]:
+                if (raw not in cast_ids and entry.get("phrase")
+                        and raw.strip().lower() == entry["phrase"].strip().lower()):
+                    raw = entry["id"]
+            if raw in cast_ids:
+                sid = raw
+            else:
+                group = next((entry["phrase"] for entry in groups
+                              if raw == entry["id"] or raw.strip().lower()
+                              == (entry.get("phrase") or "").strip().lower()), None)
+                if group is None:
+                    notes.append("beat %d: P14 speaking beat: speaker %s is not a cast id, so "
+                                 "nobody speaks in this beat" % (k, _q(raw)))
+        if spoken:
+            lines = []
+            for n in sorted(set(raw_lines)):
+                if not 1 <= n <= len(spoken):
+                    notes.append("beat %d: P14 speaking beat: line %d dropped: the narrative has "
+                                 "no spoken line %d" % (k, n, n))
+                elif n <= last:
+                    notes.append("beat %d: P14 speaking beat: line %d dropped: an earlier beat "
+                                 "already speaks line %d or a later one" % (k, n, last))
+                else:
+                    lines.append(n)
+            if lines and not sid:
+                if len(beat["cast"]) == 1 and beat["cast"][0] in cast_ids:
+                    sid = beat["cast"][0]
+                    if group is None:
+                        notes.append("beat %d: P14 speaking beat: speaker set to %s, the only "
+                                     "character in the beat, to say line(s) %s"
+                                     % (k, _q(sid), _nums(lines)))
+                else:
+                    notes.append("beat %d: P14 speaking beat: line(s) %s dropped: the beat has no "
+                                 "speaker" % (k, _nums(lines)))
+                    lines = []
+            while lines and line_problem(ctx, lib, " ".join(spoken[n - 1] for n in lines)):
+                n = lines.pop()
+                notes.append("beat %d: P14 speaking beat: line %d dropped: together with the "
+                             "beat's other lines it does not fit a %s-second clip"
+                             % (k, n, ctx.seconds))
+            beat["lines"] = lines
+            if lines:
+                last = lines[-1]
+        if group is not None:
+            notes.insert(at, "beat %d: P15 group cast: %s is part of the setting, not a speaker; %s"
+                         % (k, group, "the beat's line goes to %s" % speaker_phrase_of(plan, sid)
+                            if sid else "the beat has no speaker"))
+        if not sid:
             continue
-        for entry in plan["cast"]:
-            if (raw not in cast_ids and entry.get("phrase")
-                    and raw.strip().lower() == entry["phrase"].strip().lower()):
-                raw = entry["id"]
-        if raw not in cast_ids:
-            notes.append("beat %d: P14 speaking beat: speaker %s is not a cast id, so nobody speaks "
-                         "in this beat" % (k, _q(raw)))
-            continue
-        beat["speaker"] = raw
+        beat["speaker"] = sid
         notes += speaking_coercion(ctx, plan, k)
     return notes
+
+
+def line_assignment_problems(plan):
+    """The plan-scope Q1 messages (QL8): one for each of the narrative's spoken lines that no
+    beat's lines hold. They make the plan call retry; they never enter a state."""
+    held = set(n for beat in plan["beats"] for n in beat.get("lines", []))
+    return ["plan: Q1 spoken line: spoken line %d \"%s\" is in no beat's lines; put %d in the "
+            "lines of the beat whose action surrounds it in the narrative, and give that beat a "
+            "speaker" % (n, line, n)
+            for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
 
 
 def speaking_coercion(ctx, plan, k):
@@ -996,6 +1077,16 @@ _ID_RES = {"cast": re.compile(r"c[1-9][0-9]*"), "locations": re.compile(r"l[1-9]
 
 def _q(text):
     return "'%s'" % text
+
+
+def _nums(numbers):
+    """Spoken-line numbers as "1, 2" (QL7)."""
+    return ", ".join(str(n) for n in numbers)
+
+
+def speaker_phrase_of(plan, cid):
+    """The referring phrase of plan cast id cid (plan Spec amendment 1)."""
+    return next(c["phrase"] for c in plan["cast"] if c["id"] == cid)
 
 
 def outside_range(words, lo, hi):
@@ -2758,7 +2849,7 @@ class _Run(object):
                 hard = (plan_checks(ctx, plan, shape)[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
-                problems = hard
+                problems = hard + line_assignment_problems(plan)
             if not problems:
                 break
             text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
@@ -3084,6 +3175,9 @@ def load_plan(ctx):
     for beat in plan["beats"] if isinstance(plan["beats"], list) else []:
         if isinstance(beat, dict):
             beat.setdefault("speaker", "")
+            beat.setdefault("lines", [])
+    plan.setdefault("spoken_lines", [])
+    plan.setdefault("cast_notes", [])
     plan.setdefault("speech_notes", [])
     return plan
 
