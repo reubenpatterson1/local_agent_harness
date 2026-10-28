@@ -1022,8 +1022,9 @@ def coerce_speakers(ctx, plan, groups=()):
         sid, group, at = "", None, len(notes)
         if raw:
             for entry in plan["cast"]:
-                if (raw not in cast_ids and entry.get("phrase")
-                        and raw.strip().lower() == entry["phrase"].strip().lower()):
+                if raw not in cast_ids and any(
+                        name and raw.strip().lower() == name.strip().lower()
+                        for name in (entry.get("phrase"), entry.get("cast_name"))):
                     raw = entry["id"]
             if raw in cast_ids:
                 sid = raw

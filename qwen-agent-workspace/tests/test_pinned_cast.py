@@ -693,3 +693,27 @@ def test_pt17_back_compat_recheck(ws, tmp_path, monkeypatch, story_env):
     assert checks["source"] == "recheck"
     assert [e["message"] for e in checks["hard"] + checks["advisory"]
             if " P16 " in e["message"]] == []
+
+
+def test_final_i1_speaker_given_by_library_name(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, mode="chained", panels=3, members=members, narration="speech",
+                       narrative=LINES_NARRATIVE)
+
+    def planned(speakers, lines):
+        raw = _raw("chained", 3, [["c1", "c2"]] * 3, speakers)
+        for beat, beat_lines in zip(raw["beats"], lines):
+            beat["lines"] = beat_lines
+        return se.normalize_plan(ctx, raw)
+
+    plan, shape = planned(["", "kyra", "  Kyra "], [[], [1], [2]])
+    assert [b["speaker"] for b in plan["beats"][1:]] == ["c1", "c1"]
+    assert [b["lines"] for b in plan["beats"][1:]] == [[1], [2]]
+    for beat in plan["beats"]:
+        assert "c1" in beat["cast"] and "c2" in beat["cast"]
+    assert not [n for n in plan["speech_notes"] if "is not a cast id" in n]
+    assert not [n for n in plan["speech_notes"] if "dropped: the beat has no speaker" in n]
+    assert se.plan_checks(ctx, plan, shape)[0] == []
+
+    plan, shape = planned(["", "ronin", ""], [[], [1], []])
+    assert plan["beats"][1]["speaker"] == "c2"

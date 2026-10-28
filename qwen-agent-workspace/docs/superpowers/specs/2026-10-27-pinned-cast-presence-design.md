@@ -715,3 +715,11 @@ PR note (required, in substance): "Phase 1 now refuses a plan that leaves out a 
 ### 8.3 Open
 
 None.
+
+
+## Amendment 2026-10-27 (final whole-branch review)
+
+- **A1 (fixed).** `coerce_speakers` also resolves a speaker written as a pinned member's library name (`cast_name`, case-insensitive, surrounding space ignored) to that member's id, as it already did for the phrase. Reason: PC3 prints the library name beside each id and PC5 keeps co-stars in chained speaking beats, so the sole-member fallback that used to rescue a speaker such as "kyra" no longer fires and every line would be dropped. Beat-cast entries written as names stay a P2 error, unchanged. Test: `test_final_i1_speaker_given_by_library_name`.
+- **A2 (known limit, not changed).** When both plan calls leave a quoted line unassigned, `assign_missing_lines` can give it to a one-member beat of a pinned character who has no line in the narrative (shots mode, where LINES_PINNED_SENTENCE asks for such beats). Pre-existing behaviour. PK10's shots runs record any `speech_notes` entry saying a line was given to a beat by the pipeline.
+- **A3 (correction to Section 3).** "The critic cannot edit `beat.cast`" is inexact: a Q1 dialogue patch on a shots beat with no speaker sets the speaker from the patch's phrase, and speaker coercion then narrows that beat's cast, which can leave a pinned member in no beat (P16 then appears in that round's checks). This path dropped the member silently before this change; it is not changed here.
+- **A4 (known limit).** Under `--speech-only` the chained beat-1 widening to "medium shot" applies only to shots wider than the ones offered, so a chained beat-1 close-up with a silent co-star stays a close-up (PT10 pins this). PK10 records the beat-1 shot of the chained runs.
