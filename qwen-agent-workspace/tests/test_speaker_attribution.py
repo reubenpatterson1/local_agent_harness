@@ -481,3 +481,68 @@ def test_review_focus_4_an_invented_speaker_in_a_pinned_run(ws, story_env):
     assert _p17(ctx, raw) == [P17(2, 2, "Enter.", "c3", "the old monk", "c1", KYRA)]
     raw["beats"][1].update(cast=["c3"], speaker="c3")
     assert _p17(ctx, raw) == []
+
+
+# --- SAT7, SAT8, Review Focus 5: the pipeline never misattributes (SA4, SA5, SK7) -------------
+
+ASSIGNED = ("beat %d: P14 speaking beat: line 2 given to this beat by the pipeline, because the "
+            "plan gave it to no beat")
+
+
+def _sat7_plan(ws, story_env, narrative):
+    """(ctx, plan) of SAT7: shots, 3 panels, kyra and ronin pinned, --speech-only, beats cast
+    [c1], [c2], [c1], beat 1 spoken by c1 with line 1, line 2 in no beat; normalised only."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, members=_members(story_env),
+                       narration="speech", narrative=narrative)
+    raw = _lines(_raw("shots", 3, [["c1"], ["c2"], ["c1"]], ["c1", "", ""]), [[1], [], []])
+    return ctx, se.normalize_plan(ctx, raw)[0]
+
+
+def test_sat7_assign_missing_lines(ws, story_env):
+    ctx, plan = _sat7_plan(ws, story_env, LINES_NARRATIVE)
+    assert se.assign_missing_lines(ctx, plan) == [ASSIGNED % 3]
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        ("c1", [1]), ("", []), ("c1", [2])]
+    assert [m for m in se.plan_checks(ctx, plan)[0] if " P17 " in m] == []
+    ctx, plan = _sat7_plan(ws, story_env, PRONOUN_NARRATIVE)
+    notes = se.assign_missing_lines(ctx, plan)
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        ("c1", [1]), ("c2", [2]), ("", [])]
+    assert notes[0] == ASSIGNED % 2
+
+
+def test_sat8_q1_dialogue_patch(ws, story_env):
+    ctx, plan = _sat7_plan(ws, story_env, LINES_NARRATIVE)
+    fresh = copy.deepcopy(plan)
+    parts = [se.empty_parts("shots", k, plan, ctx) for k in (1, 2, 3)]
+    assert se.q1_dialogue_patch(ctx, lib, plan, parts, 2, "the ronin: Stay close to me.") == (
+        True, "the narrative gives spoken line 2 to 'the woman in grey', so a spoken-line patch "
+              "never gives it to 'the ronin'")
+    assert (plan["beats"][1]["speaker"], plan["beats"][1]["lines"]) == ("", [])
+    parts = [se.empty_parts("shots", k, fresh, ctx) for k in (1, 2, 3)]
+    assert se.q1_dialogue_patch(ctx, lib, fresh, parts, 3,
+                                "the woman in grey: Stay close to me.") == (True, None)
+    ctx, plan = _sat7_plan(ws, story_env, PRONOUN_NARRATIVE)
+    parts = [se.empty_parts("shots", k, plan, ctx) for k in (1, 2, 3)]
+    assert se.q1_dialogue_patch(ctx, lib, plan, parts, 2, "the ronin: Stay close to me.") == (
+        True, None)
+
+
+def test_review_focus_5_the_pin_sh2_shape_with_line_2_left_out(ws, tmp_path, monkeypatch,
+                                                               story_env):
+    raw = _lines(_raw("shots", 2, [["c1"], ["c2"]], ["c1", ""]), [[1], []])
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)] * 2,
+                           panel=SHOTS2_PANELS)
+    ctx = _shots2(ws, story_env, story_id="sa4")
+    rc, _advisories = se.run(ctx)
+    assert rc == 0
+    assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "plan", "panel", "panel"]
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert [(b["cast"], b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        (["c1"], "c1", [1, 2]), (["c2"], "", [])]
+    assert ASSIGNED % 1 in plan["speech_notes"]
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        dialogue = [line for line in f.read().splitlines() if line.startswith("Dialogue: ")]
+    assert dialogue == [
+        "Dialogue: the woman in grey: We reach the gate before dark. Stay close to me."]
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []

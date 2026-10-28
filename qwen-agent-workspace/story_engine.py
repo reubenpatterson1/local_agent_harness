@@ -1254,12 +1254,15 @@ def assign_missing_lines(ctx, plan):
     speaking_coercion), its lines with the new one still form a consecutive run, and they still
     fit the clip. A line with no eligible beat stays unassigned, for Q1 and the critic. Lines the
     plan placed never move. The pass repeats until it places no line (at most once for each
-    spoken line), so the result does not depend on the order lines are tried."""
+    spoken line), so the result does not depend on the order lines are tried. A line the
+    narrative gives to a named speaker (speaker attribution spec SA4) goes only to a beat whose
+    speaker, or sole cast member, is that speaker."""
     spoken, beats, notes = plan["spoken_lines"], plan["beats"], []
     if not spoken:
         return notes
     lib = _character_lib(ctx.ws)
     cast_ids = [c["id"] for c in plan["cast"]]
+    said_by = line_speakers(ctx.narrative, plan["cast"])
     holder = dict((n, k) for k, beat in enumerate(beats, start=1) for n in beat["lines"])
     for _ in range(len(spoken)):
         placed = len(notes)
@@ -1274,6 +1277,8 @@ def assign_missing_lines(ctx, plan):
                 beat = beats[k - 1]
                 if not (beat["speaker"]
                         or (len(beat["cast"]) == 1 and beat["cast"][0] in cast_ids)):
+                    continue
+                if said_by[n - 1] and (beat["speaker"] or beat["cast"][0]) != said_by[n - 1]:
                     continue
                 lines = sorted(beat["lines"] + [n])
                 if any(b != a + 1 for a, b in zip(lines, lines[1:])):
@@ -3062,7 +3067,9 @@ def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
     speaking_coercion, and the lines, and parts[k - 1]["dialogue"] the narrative's canonical
     words) or the reason it is rejected. The speaker comes from the replacement's referring
     phrase, else the beat's speaker, else the beat's sole cast member; the patch keeps the
-    panel's spoken lines, adds only adjacent ones, and never rewrites other Dialogue words."""
+    panel's spoken lines, adds only adjacent ones, and never rewrites other Dialogue words. A
+    patch that gives a line to a speaker other than the one the narrative names is rejected
+    (speaker attribution spec SA5)."""
     spoken = plan["spoken_lines"]
     phrases = cast_phrases(ctx, plan)
     text = clean_writer(lib, replacement)
@@ -3087,6 +3094,12 @@ def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
     if beat["speaker"] and sid != beat["speaker"]:
         return True, ("panel %d's speaker is %s; a spoken-line patch never changes who speaks"
                       % (k, _q(beat["speaker"])))
+    said_by = line_speakers(ctx.narrative, plan["cast"])
+    for n in range(i, j + 1):
+        if said_by[n - 1] and said_by[n - 1] != sid:
+            return True, ("the narrative gives spoken line %d to %s, so a spoken-line patch never "
+                          "gives it to %s" % (n, _q(speaker_phrase_of(plan, said_by[n - 1])),
+                                              _q(speaker_phrase_of(plan, sid))))
     current = lib.parse_dialogue(dict(panel_fields(ctx, plan, parts, k)).get("Dialogue", ""),
                                  phrases)[1]
     have = list(beat["lines"]) if beat["lines"] else contained_lines(current, spoken)
