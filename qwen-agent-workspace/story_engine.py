@@ -1517,8 +1517,10 @@ def field_range(ctx, k, field):
 def plan_checks(ctx, plan, shape=()):
     """(hard, advisory) violation strings for a normalized plan (RS10). shape holds
     normalize_plan's container-shape P2 violations, reported first. Hard: P1, P2, P3's normalize
-    and duplicate-phrase messages, and P16 (a library character in no beat's cast; pinned cast
-    presence spec PC1); every other P message is advisory (dialogue spec 6.3)."""
+    and duplicate-phrase messages, P16 (a library character in no beat's cast; pinned cast
+    presence spec PC1) and P17 (a spoken line given to a speaker other than the one the narrative
+    names; speaker attribution spec SA2); every other P message is advisory (dialogue spec
+    6.3)."""
     hard, advisory = list(shape), []
     n = ctx.panels
     beats = plan["beats"]
@@ -1664,6 +1666,21 @@ def plan_checks(ctx, plan, shape=()):
                 message += ("; a beat with a speaker shows only the speaker, so that beat has no "
                             "speaker or %s is its speaker" % entry["id"])
             hard.append(message)
+    # Speaker attribution spec SA2, D3: a spoken line keeps the speaker the narrative names.
+    if plan["spoken_lines"]:
+        said_by = line_speakers(ctx.narrative, plan["cast"])
+        for k, beat in enumerate(beats, start=1):
+            for n in beat["lines"]:
+                want = said_by[n - 1]
+                if want and beat["speaker"] != want:
+                    hard.append(
+                        "beat %d: P17 line speaker: the narrative gives spoken line %d \"%s\" to "
+                        "%s %s, but this beat's speaker is %s %s; put line %d in the lines of a "
+                        "beat whose speaker is %s (consecutive lines may share a beat), and never "
+                        "give it to another character"
+                        % (k, n, plan["spoken_lines"][n - 1], want,
+                           _q(speaker_phrase_of(plan, want)), beat["speaker"],
+                           _q(speaker_phrase_of(plan, beat["speaker"])), n, want))
     undeclared = undeclared_characters(ctx)
     if undeclared:
         masks = _undeclared_masks(lib, ctx, plan, undeclared)
@@ -3647,8 +3664,9 @@ class _Run(object):
         found, why = self.plan_round()
         if why == "timeout":
             return self.round0_timeout()
-        # Pinned cast presence spec PC2: a plan that drops a library character is not usable.
-        fatal = ([h for h in found[2] if parse_violation(h)["id"] in ("P1", "P2", "P16")]
+        # Pinned cast presence spec PC2, speaker attribution spec SA3: a plan that drops a library
+        # character or gives a spoken line to the wrong speaker is not usable.
+        fatal = ([h for h in found[2] if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17")]
                  if found else ["the reply is not one JSON object"])
         if fatal:
             calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])
