@@ -245,3 +245,154 @@ def test_pt5_lines_sentence_variants(ws, story_env):
     for mode in ("chained", "shots", "no_stills"):
         prompt, rule = build(mode=mode, members=members)
         assert rule not in prompt and se.LINES_PINNED_SENTENCE not in prompt, mode
+
+
+# --- PT6, PT7: P16 cast presence (PC1, PK4) ---------------------------------------------------
+
+NAMES = {"c1": (KYRA, "kyra"), "c2": (RONIN, "ronin")}
+
+
+def _p16(ctx, raw):
+    """The P16 messages of plan_checks' hard list for the normalised raw reply."""
+    plan, shape = se.normalize_plan(ctx, raw)
+    return [m for m in se.plan_checks(ctx, plan, shape)[0] if " P16 " in m]
+
+
+def test_pt6_p16_matrix(ws, story_env):
+    members = _members(story_env)
+    complete = {"chained": [["c1", "c2"]] * 3, "shots": [["c1"], ["c2"], ["c1", "c2"]],
+                "no_stills": [["c1"], ["c2"], ["c1", "c2"]]}
+    for mode in ("chained", "shots", "no_stills"):
+        for narration in (True, "speech", False):
+            ctx = seu.make_ctx(se, ws, mode=mode, members=members, narration=narration)
+            for missing in (("c1",), ("c2",), ("c1", "c2")):
+                cast = [c for c in ("c1", "c2") if c not in missing]
+                found = _p16(ctx, _raw(mode, 3, [cast] * 3))
+                where = (mode, narration, missing)
+                assert found == [P16(c, NAMES[c][0], NAMES[c][1], mode, narration)
+                                 for c in missing], where
+                for message in found:
+                    v = se.parse_violation(message)
+                    assert (v["id"], v["name"], v["scope"]) == (
+                        "P16", "cast presence", "plan"), where
+            assert _p16(ctx, _raw(mode, 3, complete[mode])) == [], (mode, narration)
+
+
+def test_pt7_p16_scope(ws, story_env):
+    for mode in ("chained", "shots", "no_stills"):
+        assert _p16(seu.make_ctx(se, ws, mode=mode), seu.plan_json(mode, 3)) == [], mode
+    members = _members(story_env)
+    raw = _raw("chained", 3, [["c1", "c2"]] * 3)
+    raw["cast"].append({"id": "c3", "phrase": "the porter", "descriptor": "a man"})
+    assert _p16(seu.make_ctx(se, ws, members=members), raw) == []
+    one = seu.make_ctx(se, ws, members=lib.resolve_cast([(None, "kyra")]))
+    raw = seu.plan_json("chained", 3, cast=[
+        {"id": "c1", "phrase": "x", "descriptor": "a woman"},
+        {"id": "c2", "phrase": "the porter", "descriptor": "a man"}])
+    for beat in raw["beats"]:
+        beat["cast"] = ["c2"]
+    assert _p16(one, raw) == [P16("c1", KYRA, "kyra", "chained", True)]
+
+
+# --- PT14, PT15, PT18, Review Focus 1: the plan retry and the fatal exit (PC2, PK5) ----------
+
+def _panel_script(n, phrase=KYRA):
+    """{"<k>": [one valid chained reply naming phrase]} for panels 1 to n."""
+    return dict((str(k), [seu.answer(seu.panel_json("chained", k, phrase))])
+                for k in range(1, n + 1))
+
+
+def _read_json(story_dir, name):
+    with open(os.path.join(story_dir, name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _fatal_err(message_lines, ctx):
+    return ("Error: the story model did not return a usable plan after 2 call(s)\n"
+            + "".join("  - %s\n" % m for m in message_lines)
+            + "Raw replies are kept in %s. Rerun the same command to try again.\n"
+            % os.path.join(ctx.story_dir, "story_rounds", "round_0"))
+
+
+def test_pt14_e2e_retry(movie, tmp_path, monkeypatch, story_env):
+    seu.kyra(story_env["lib"])
+    seu.ronin(story_env["lib"])
+    log = seu.script_agent(
+        monkeypatch, tmp_path,
+        plan=[seu.answer(_raw("chained", 3, [["c1"]] * 3)),
+              seu.answer(_raw("chained", 3, [["c1"], ["c1", "c2"], ["c1", "c2"]]))],
+        panel=_panel_script(3))
+    rc = ltx_movie.main([NARRATIVE, "--story-id", "pc1", "--panels", "3", "--character", "kyra",
+                         "--character", "ronin", "--story-only", "--no-review"])
+    log = seu.agent_log(log)
+    assert rc == 0
+    assert [r["stage"] for r in log][:3] == ["plan", "plan", "panel"]
+    assert ("YOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- "
+            + P16("c2", RONIN, "ronin", "chained", True) + "\n") in log[1]["argv"][-1]
+    story_dir = os.path.join(movie, "generated", "stories", "pc1")
+    plan = _read_json(story_dir, "plan.json")
+    assert ["c2" in beat["cast"] for beat in plan["beats"]] == [False, True, True]
+    assert _read_json(story_dir, "story_checks.json")["hard"] == []
+
+
+def test_pt15_e2e_exhausted(ws, tmp_path, monkeypatch, capsys, story_env):
+    members = _members(story_env)
+    bad = seu.answer(_raw("chained", 3, [["c1"]] * 3))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[bad, bad])
+    ctx = seu.make_ctx(se, ws, story_id="pc2", members=members)
+    capsys.readouterr()
+    rc, _advisories = se.run(ctx)
+    assert rc == 1
+    assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "plan"]
+    assert capsys.readouterr().err == _fatal_err([P16("c2", RONIN, "ronin", "chained", True)],
+                                                 ctx)
+    for name in ("story.md", "plan.json"):
+        assert not os.path.exists(os.path.join(ctx.story_dir, name)), name
+
+
+def test_pt18_seed_and_two_pinned_retried(ws, tmp_path, monkeypatch, story_env):
+    members = _members(story_env)
+    log = seu.script_agent(
+        monkeypatch, tmp_path,
+        plan=[seu.answer(_raw("chained", 3, [["c1"]] * 3)),
+              seu.answer(_raw("chained", 3, [["c1"], ["c1", "c2"], ["c1", "c2"]]))],
+        panel=_panel_script(3))
+    ctx = seu.make_ctx(se, ws, story_id="pc3", members=members, seed_agent_image="/s/seed.png")
+    rc, _advisories = se.run(ctx)
+    assert rc == 0
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "plan_prompt.txt"),
+              encoding="utf-8") as f:
+        assert se.SEED_CAST_SENTENCE in f.read()
+    plans = [r for r in seu.agent_log(log) if r["stage"] == "plan"]
+    assert len(plans) == 2
+    for call in plans:
+        assert call["argv"][call["argv"].index("--image") + 1] == "/s/seed.png"
+    assert "- " + P16("c2", RONIN, "ronin", "chained", True) + "\n" in plans[1]["argv"][-1]
+
+
+def test_review_focus_1_an_exhausted_plan_lists_every_fatal_problem(ws, tmp_path, monkeypatch,
+                                                                     capsys, story_env):
+    members = _members(story_env)
+    short = seu.answer(_raw("chained", 2, [["c1"]] * 2))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[short, short])
+    ctx = seu.make_ctx(se, ws, story_id="pc4", members=members)
+    capsys.readouterr()
+    rc, _advisories = se.run(ctx)
+    assert rc == 1
+    assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "plan"]
+    assert capsys.readouterr().err == _fatal_err(
+        ["plan: P1 beat count: expected exactly 3 beats, found 2",
+         P16("c2", RONIN, "ronin", "chained", True)], ctx)
+    for name in ("story.md", "plan.json"):
+        assert not os.path.exists(os.path.join(ctx.story_dir, name)), name
+
+
+# --- Review Focus 2: a beat cast that names a pinned member by phrase (PC1) -------------------
+
+def test_review_focus_2_a_beat_cast_that_names_a_member_by_phrase(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members)
+    plan, shape = se.normalize_plan(ctx, _raw("chained", 3, [["c1"], ["c1", "the ronin"], ["c1"]]))
+    hard = se.plan_checks(ctx, plan, shape)[0]
+    assert "beat 2: P2 structure: cast id 'the ronin' is not defined" in hard
+    assert hard[-1] == P16("c2", RONIN, "ronin", "chained", True)
