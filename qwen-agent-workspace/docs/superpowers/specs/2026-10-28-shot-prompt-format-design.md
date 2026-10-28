@@ -1401,7 +1401,7 @@ Manifest tests run `bin/ltx-story-manifest` as `tests/test_dialogue.py::test_dlg
 | SFT22 | **No server, no HOME.** `seu.script_agent` is used for every E2E; `os.path.expanduser("~")` is never the real HOME during the module (asserted via the `story_env` fixture) |
 | SFT23 | **Narrative exit detection (SF-A1).** `se.narrative_exit_after_last_line(text)` rows (text → result): the hockey narrative `$S/hockey/narrative.txt`, written out in the test → `"skates away"`; `LINES_NARRATIVE` → `None`; `'Kyra says, "Go." She walks off.'` → `"walks off"`; `'Kyra walks off. Kyra says, "Go."'` → `None` (the exit is before the last line); `'Kyra says, "Go," and the ronin leaves the frame.'` → `"leaves the frame"`; `'Kyra says, "Go." Later the crowd says, "Yes." Kyra turns away.'` → `"turns away"`; `'A sign reads "Closed". Kyra walks away.'` → `None` (no spoken line); `'Kyra says, "Go." She pushes off from the kerb.'` → `None`; curly quotes `'Kyra says, “Go.” She skates away.'` → `"skates away"` |
 | SFT24 | **When P19 fires (SF-A1).** `se.exit_left_out_notes(ctx, plan)` on normalised plans, hockey narrative, 2 spoken lines. Chained 2 beats with lines `[1]`, `[2]` → `[P19_NOTE % ("'skates away'", 3)]`. Chained 1 beat with lines `[1, 2]` → `[P19_NOTE % ("'skates away'", 2)]`. Shots 3 beats with lines `[1]`, `[2]`, `[]` → `[]` (a later beat exists). Shots 3 beats with lines `[1]`, `[]`, `[2]` → `[P19_NOTE % ("'skates away'", 4)]`. The 2-beat plan with `narration=False` → `[]`. The 2-beat plan with line 2 in no beat → `[]`. `LINES_NARRATIVE` with any plan → `[]`. `parse_violation(P19_NOTE % ("'x'", 3))` is `("P19", "exit left out", "plan", None)` |
-| SFT25 | **P19 end to end (SF-A1).** `se.run` on the hockey narrative, chained, 2 panels, `"speech"`, with a scripted plan reply whose beats hold lines `[1]` and `[2]` and scripted panel replies → rc 0. `story_checks.json` advisory and the advisories returned by `se.run` each contain exactly one P19 message, ending `"use --panels 3 to keep it"`. `plan.json` `speech_notes` holds it. The same run on `LINES_NARRATIVE` has no P19. `se.recheck` of the saved hockey story prints and returns no P19 (recheck runs no plan step) |
+| SFT25 | **P19 end to end (SF-A1).** `se.run` on the hockey narrative, chained, 2 panels, `"speech"`, with a scripted plan reply whose beats hold lines `[1]` and `[2]` and scripted panel replies → rc 0. `story_checks.json` advisory and the advisories returned by `se.run` each contain exactly one P19 message, ending `"rerun with --force-story --panels 3 to keep it"`. `plan.json` `speech_notes` holds it. The same run on `LINES_NARRATIVE` has no P19. `se.recheck` of the saved hockey story prints and returns no P19 (recheck runs no plan step) |
 
 ### 4.2 Existing tests and fixtures to re-baseline
 
@@ -1609,7 +1609,7 @@ print("TOTAL panels", total["panels"], "static", total["static"],
 | K5 | Reference copies | 0 panels |
 | K6 | Every narrative line present, in order, spoken by its attributed character (`lines ok`) | True for every run |
 | K7 | Exit code | 0 for all 9. Any other exit is reported with its stderr, plan/panel/critic call counts and `repairs`; that is a KPI miss, not a contract failure |
-| K8 | The P19 note (Amendment SF-A1) | `sf1-hk2` shows exactly one P19 ending `use --panels 3 to keep it`, and `sf1-hk1` one ending `use --panels 2 to keep it`, in `measure_after.txt` and as a `Warning: plan: P19 ...` line in `$R/run-sf1-hk2.log` and `$R/run-sf1-hk1.log`. `sf1-hk3s` shows P19 (`--panels 4`) exactly when its plan puts line 2 in beat 3. No `sf1` pin run shows P19 |
+| K8 | The P19 note (Amendment SF-A1) | `sf1-hk2` shows exactly one P19 ending `rerun with --force-story --panels 3 to keep it`, and `sf1-hk1` one ending `rerun with --force-story --panels 2 to keep it`, in `measure_after.txt` and as a `Warning: plan: P19 ...` line in `$R/run-sf1-hk2.log` and `$R/run-sf1-hk1.log`. `sf1-hk3s` shows P19 (`--panels 4`) exactly when its plan puts line 2 in beat 3. No `sf1` pin run shows P19 |
 
 **Recorded, not gating:**
 - the same rows for the before runs;
@@ -1718,7 +1718,7 @@ None.
 # left out when that line is in the last beat.
 P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
             "left out, because that line is in the last beat and a speaking beat never shows its "
-            "speaker leave; use --panels %d to keep it")
+            "speaker leave; rerun with --force-story --panels %d to keep it")
 
 
 def narrative_exit_after_last_line(narrative):
@@ -1758,7 +1758,7 @@ def exit_left_out_notes(ctx, plan):
 
 It is advisory: never hard, never retried, never blocking.
 
-**Example.** For the hockey narrative with `--panels 2`: `plan: P19 exit left out: the narrative's exit after its last spoken line ('skates away') was left out, because that line is in the last beat and a speaking beat never shows its speaker leave; use --panels 3 to keep it`. With `--panels 1` it ends `use --panels 2 to keep it`.
+**Example.** For the hockey narrative with `--panels 2`: `plan: P19 exit left out: the narrative's exit after its last spoken line ('skates away') was left out, because that line is in the last beat and a speaking beat never shows its speaker leave; rerun with --force-story --panels 3 to keep it`. With `--panels 1` it ends `rerun with --force-story --panels 2 to keep it`.
 
 **When it does not fire.**
 - `--no-narration` (`ctx.narration is False`), or the narrative has no spoken line.
@@ -1768,3 +1768,5 @@ It is advisory: never hard, never retried, never blocking.
 - `recheck`, which runs no plan step, so old stories and re-checked stories never show it.
 
 **Tests:** SFT23-SFT25 (Section 4.1). **Re-baseline code:** R17 (Section 4.2). **Live check:** K8 (Section 5.3).
+
+**SF-A1 erratum (coordinator, 2026-10-29).** The P19 hint reads "rerun with --force-story --panels %d to keep it". Without `--force-story`, a rerun with a different `--panels` re-checks the saved story and exits 1 ("expected exactly n panels"), so the hint must name both flags. Found by the soft-panel-count design review.
