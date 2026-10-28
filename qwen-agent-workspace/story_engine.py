@@ -628,7 +628,10 @@ def _speaker_after(words, mentions):
     width = _attribution_verb_at(words, 0)
     if width:
         hits = _mentions_at(words, mentions, start=width)
-        return next(iter(hits)) if len(hits) == 1 else None
+        if len(hits) != 1:
+            return None
+        cid, n = next(iter(hits.items()))
+        return None if words[width + n:width + n + 1] in (["and"], ["or"], ["nor"]) else cid
     hits = _mentions_at(words, mentions, start=0)
     if len(hits) != 1:
         return None
@@ -657,7 +660,13 @@ def line_speakers(narrative, cast):
         prev_end = matches[i - 1].end() if i > 0 else 0
         next_start = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         lead = text[prev_end:match.start()].rstrip(_QUOTE_EDGE_CHARS)
-        before = _speaker_before(line_words(_CLAUSE_BREAK_RE.split(lead)[-1]), mentions)
+        pieces = _CLAUSE_BREAK_RE.split(lead)
+        clause, prior = line_words(pieces[-1]), line_words(pieces[-2]) if len(pieces) > 1 else []
+        # D1: "A, B, and C said" is a compound subject: no constraint.
+        if clause[:1] in (["and"], ["or"], ["nor"]) and _mentions_at(prior, mentions, end=len(prior)):
+            before = None
+        else:
+            before = _speaker_before(clause, mentions)
         after_text = text[match.end():next_start]
         after = None
         if (not match.group(1).rstrip().endswith((".", "!", "?", "…"))

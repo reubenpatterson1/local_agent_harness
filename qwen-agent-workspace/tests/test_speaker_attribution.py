@@ -228,11 +228,14 @@ SAT2_ROWS = [
     ('The ronin hands Kyra rice and says, "Eat."', CAST3, [None]),
     ('Then says Kyra: "Go."', CAST3, ["c1"]),
     ('Kyra says, "Go."', [], [None]),
+    ('"Go," says Kyra and the ronin.', CAST3, [None]),
+    ('Kyra, the old monk, and the ronin said, "Go."', CAST3, [None]),
+    ('They pass under the gate together, and the ronin says, "Go."', CAST3, ["c2"]),
 ]
 
 
 def test_sat2_extraction_table():
-    assert len(SAT2_ROWS) == 39
+    assert len(SAT2_ROWS) == 42
     for text, cast, want in SAT2_ROWS:
         assert se.line_speakers(text, cast) == want, text
         assert len(want) == len(se.spoken_lines(text)), text

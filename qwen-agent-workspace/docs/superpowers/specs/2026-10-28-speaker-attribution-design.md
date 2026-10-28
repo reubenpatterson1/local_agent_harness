@@ -619,3 +619,8 @@ PR note (required, in substance): "Phase 1 now refuses a plan that gives a quote
 ### 8.3 Open
 
 None.
+
+
+## Amendment 2026-10-28 (Task 1 review)
+
+- **SA1-A1.** Two compound-subject shapes give no constraint, per D1: form A1 returns no speaker when the word after the mention is "and", "or" or "nor" ('"Go," says Kyra and the ronin.'), and form B1 gives none when the clause before the quote starts with "and", "or" or "nor" and the comma piece before it ends with a cast mention ('Kyra, the old monk, and the ronin said, "Go."'). "They pass under the gate together, and Kyra says," still attributes to Kyra. Residual (R2): a list whose earlier member is not a cast mention ("Maya, a stranger, and the ronin said") still attributes to its last member.
