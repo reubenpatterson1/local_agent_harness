@@ -1141,20 +1141,38 @@ def assign_missing_lines(ctx, plan):
 
 def speaking_coercion(ctx, plan, k):
     """The P14 notes of SP2 step 4 for beat k, whose speaker is already set (narrative dialogue
-    fidelity spec QL7, SM2): the speaker is alone in the beat's cast, and when the beat frames
-    its own shot (not a chained continuation, k >= 2) a shot wider than a medium shot becomes a
-    medium close-up (an extreme close-up a close-up), and a camera that does not stay static,
+    fidelity spec QL7, SM2; pinned cast presence spec PC7, D3): the beat's cast becomes the
+    speaker plus, in chained mode only, every library character (cast_name set) the beat already
+    lists, in the beat's order without repeats, who stays in frame silent; everyone else is
+    removed. When the beat frames its own shot (not a chained continuation, k >= 2) a shot wider
+    than a medium shot becomes a medium close-up (an extreme close-up a close-up), or a medium
+    shot when silent library characters share the beat, and a camera that does not stay static,
     push in, pull back or track becomes static. Tracking is never coerced away."""
     notes = []
     beat = plan["beats"][k - 1]
     speaker = beat["speaker"]
-    if beat["cast"] != [speaker]:
-        notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker is "
-                     "alone on screen" % (k, ", ".join(beat["cast"]), speaker))
-        beat["cast"] = [speaker]
+    pinned = (set(c["id"] for c in plan["cast"] if c.get("cast_name"))
+              if ctx.mode == "chained" else set())
+    cast = []
+    for cid in beat["cast"]:
+        if (cid == speaker or cid in pinned) and cid not in cast:
+            cast.append(cid)
+    if speaker not in cast:
+        cast.insert(0, speaker)
+    silent = [cid for cid in cast if cid != speaker]
+    if beat["cast"] != cast:
+        if silent:
+            notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s]: the speaker, "
+                         "and the library character(s) %s, who stay in frame without speaking"
+                         % (k, ", ".join(beat["cast"]), ", ".join(cast), ", ".join(silent)))
+        else:
+            notes.append("beat %d: P14 speaking beat: cast [%s] changed to [%s] so the speaker "
+                         "is alone on screen" % (k, ", ".join(beat["cast"]), speaker))
+        beat["cast"] = cast
     if ctx.mode != "chained" or k == 1:
         if beat["shot"] not in SPEAKING_SHOTS:
-            shot = "close-up" if beat["shot"] == "extreme close-up" else "medium close-up"
+            shot = ("medium shot" if silent else
+                    "close-up" if beat["shot"] == "extreme close-up" else "medium close-up")
             notes.append("beat %d: P14 speaking beat: shot %s changed to %s so the speaker's "
                          "face stays readable" % (k, _q(beat["shot"]), _q(shot)))
             beat["shot"] = shot

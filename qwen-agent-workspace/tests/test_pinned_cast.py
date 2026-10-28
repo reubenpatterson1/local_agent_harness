@@ -396,3 +396,84 @@ def test_review_focus_2_a_beat_cast_that_names_a_member_by_phrase(ws, story_env)
     hard = se.plan_checks(ctx, plan, shape)[0]
     assert "beat 2: P2 structure: cast id 'the ronin' is not defined" in hard
     assert hard[-1] == P16("c2", RONIN, "ronin", "chained", True)
+
+
+# --- PT8-PT10, Review Focus 3: the speaking-beat coercion (PC7, PK7) --------------------------
+
+PORTER = {"id": "c3", "phrase": "the porter", "descriptor": "a man"}
+KEEP_NOTE = ("beat 2: P14 speaking beat: cast [%s] changed to [%s]: the speaker, and the library "
+             "character(s) c2, who stay in frame without speaking")
+ALONE_NOTE = ("beat 2: P14 speaking beat: cast [%s] changed to [%s] so the speaker is alone on "
+              "screen")
+
+
+def _cast_notes(plan):
+    return [n for n in plan["speech_notes"] if n.startswith("beat 2: P14 speaking beat: cast ")]
+
+
+def test_pt8_chained_coercion_keeps_library_co_stars(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    cases = [(["c1", "c2", "c3"], "c1", ["c1", "c2"], KEEP_NOTE % ("c1, c2, c3", "c1, c2")),
+             (["c2", "c1"], "c1", ["c2", "c1"], None),
+             (["c2"], "c1", ["c1", "c2"], KEEP_NOTE % ("c2", "c1, c2")),
+             (["c1", "c1"], "c1", ["c1"], ALONE_NOTE % ("c1, c1", "c1")),
+             (["c1", "c2", "c3"], "c3", ["c1", "c2", "c3"], None)]
+    for cast, speaker, expected, note in cases:
+        raw = _raw("chained", 3, [["c1"], cast, ["c1", "c2"]], ["", speaker, ""])
+        raw["cast"].append(dict(PORTER))
+        plan, shape = se.normalize_plan(ctx, raw)
+        where = (cast, speaker)
+        assert plan["beats"][1]["speaker"] == speaker, where
+        assert plan["beats"][1]["cast"] == expected, where
+        assert _cast_notes(plan) == ([note] if note else []), where
+        ids = [se.parse_violation(m)["id"] for m in se.plan_checks(ctx, plan, shape)[0]]
+        assert "P16" not in ids and "P2" not in ids, (where, ids)
+
+
+def test_pt9_shots_coercion_is_unchanged_with_members(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, mode="shots", members=members)
+    plan, shape = se.normalize_plan(ctx, _raw("shots", 3, [["c1"], ["c1", "c2"], ["c1"]],
+                                              ["", "c1", ""]))
+    assert plan["beats"][1]["cast"] == ["c1"]
+    assert plan["speech_notes"][0] == ALONE_NOTE % ("c1, c2", "c1")
+    assert P16("c2", RONIN, "ronin", "shots", True) in se.plan_checks(ctx, plan, shape)[0]
+    plan, shape = se.normalize_plan(ctx, _raw("shots", 3, [["c1"], ["c1", "c2"], ["c2"]],
+                                              ["", "c1", ""]))
+    assert [m for m in se.plan_checks(ctx, plan, shape)[0] if " P16 " in m] == []
+
+
+def test_pt10_chained_k1_shot_with_co_stars(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+
+    def coerced(k, cast, shot):
+        casts = [["c1", "c2"], ["c1", "c2"], ["c1", "c2"]]
+        casts[k - 1] = cast
+        speakers = ["", "", ""]
+        speakers[k - 1] = "c1"
+        raw = _raw("chained", 3, casts, speakers)
+        raw["beats"][k - 1]["shot"] = shot
+        return se.normalize_plan(ctx, raw)[0]["beats"][k - 1]["shot"]
+
+    for shot in ("wide shot", "extreme wide shot", "extreme close-up"):
+        assert coerced(1, ["c1", "c2"], shot) == "medium shot", shot
+    for shot in ("medium close-up", "close-up", "medium shot"):
+        assert coerced(1, ["c1", "c2"], shot) == shot, shot
+    assert coerced(1, ["c1"], "wide shot") == "medium close-up"
+    assert coerced(1, ["c1"], "extreme close-up") == "close-up"
+    assert coerced(2, ["c1", "c2"], "wide shot") == "wide shot"
+
+
+def test_review_focus_3_a_speaker_named_by_phrase_and_a_repeated_co_star(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    plan, shape = se.normalize_plan(ctx, _raw("chained", 3, [["c1"], ["c2", "c2", "c1"], ["c1"]],
+                                              ["", "The Woman in Grey", ""]))
+    beat = plan["beats"][1]
+    assert (beat["speaker"], beat["cast"]) == ("c1", ["c2", "c1"])
+    assert _cast_notes(plan) == [
+        "beat 2: P14 speaking beat: cast [c2, c2, c1] changed to [c2, c1]: the speaker, and the "
+        "library character(s) c2, who stay in frame without speaking"]
+    assert se.plan_checks(ctx, plan, shape)[0] == []
