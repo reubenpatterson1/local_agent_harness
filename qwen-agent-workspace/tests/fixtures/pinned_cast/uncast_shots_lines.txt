@@ -1,0 +1,24 @@
+You are planning a short narrated movie (story-id "s1").
+
+Narrative to adapt:
+At dusk Kyra climbs the stone steps of a mountain temple, and the ronin walks one step behind her. Near the top Kyra turns and says, "We reach the gate before dark." They pass under the gate together, and Kyra says, "Stay close to me."
+
+Spoken lines (the narrative quotes these words; the movie must speak every one of them on camera, word for word, in this order):
+1. "We reach the gate before dark."
+2. "Stay close to me."
+
+How this movie is made: it is a sequence of separate shots joined by cuts, 6 seconds each. Every panel is one shot that starts from its own still picture. One beat is one action: a fight or a chase takes several beats.
+
+Write the story bible as one JSON object with exactly these seven keys:
+
+title: the movie's title, at most 8 words.
+logline: one sentence of 8 to 40 words that summarises the story.
+cast: a list with one object per individual character who acts or speaks on screen, with the keys id, phrase and descriptor; a group of people (a crowd, an audience, fans, spectators, a team) is never a cast entry, and belongs in the setting sentence of its place. id is c1, c2, c3 and so on, in order. phrase is the character's referring phrase: at most four words, built only from details in their descriptor or stated by the narrative; the movie names them by this exact phrase everywhere. descriptor is their full visual description in 8 to 60 words that starts with "a " or "an " and does not end with a full stop: apparent age group, build, skin tone, hair colour, length and style, clothing and accessories.
+locations: a list with one object per place, with the keys id and setting. id is l1, l2 and so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names the period, the place, the ground, the light and any crowd or other group of people in the background.
+props: a list with one object per object that matters to the story, with the keys id and name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list when no object matters.
+beats: a list of EXACTLY 4 objects, one per panel in order, with the keys index, arc, action, shot, camera, location, cast, speaker and lines. index runs from 1 to 4. arc is one of introduction, rising, climax, falling, resolution, in story order; the first beat is introduction, the last is resolution, and at least one beat is climax. action is one sentence of 6 to 40 words saying what the characters physically do during these 6 seconds: one continuous physical action that a camera can film, not a sequence of steps, with no on-screen text. shot is exactly one of: medium shot, medium close-up, close-up (characters speak on screen in this movie, so only these framings keep the speaker's lips readable). camera is exactly one of: static, slow push-in, slow pull-back, slow pan left, slow pan right, slow tilt up, slow tilt down, tracking. location is the id of the place where the beat happens. cast is the list of ids of the characters on screen in the beat, at most 2. speaker is the id of the one character who says something aloud on screen during the beat, or an empty string when nobody speaks; give a speaker only where a spoken line moves the story. A beat with a speaker shows only that character (its cast is just their id), facing the camera, in a medium shot, medium close-up or close-up; the speaker may move during the beat, and the camera may stay static, push in, pull back or track them, as long as their face stays in frame and lit while they speak. lines is the list of the numbers of the spoken lines above that the speaker says aloud during the beat, in order, or an empty list. Every spoken line belongs to exactly one beat, in the narrative's order: give each line to the beat whose action surrounds it in the narrative, and give a speaker to every beat with lines and to no other beat. A beat may hold two or more consecutive lines only when together they are at most 13 words. Give each line its own beat whenever there are at least as many beats as lines.
+loras: an object with the keys global, per_beat and stills, each empty: global and stills are empty lists and per_beat is an empty object.
+
+Rules for this movie: two people never touch on screen. Split every strike, grab, push, block or hand-off into two consecutive beats -- first a beat whose cast is only the person who acts, then a beat whose cast is only the person acted on -- so the contact itself is never on screen.
+
+Reply with the JSON object only, with no text before or after it. Do not call any tool: do NOT read any file, do NOT run run_python or any other tool to check it, and do NOT count or recount words.

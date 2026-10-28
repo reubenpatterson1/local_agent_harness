@@ -335,6 +335,10 @@ SEED_PARAGRAPH = ("An image is attached to this message. It IS the first frame o
                   "group, build, skin tone, hair, clothing and accessories as actually visible "
                   "-- invent no person who is not visible, and make beat 1 start from the exact "
                   "scene it shows.\n\n")
+# Pinned cast presence spec PC4, D4: a declared character the seed image does not show is not
+# an invention.
+SEED_CAST_SENTENCE = (" The already-cast characters listed below are not invented: each of them "
+                      "is in this movie even when the image does not show them.")
 MODE_RULES = {
     "chained": ("Rules for this movie: keep consecutive beats at the same location unless the "
                 "action itself moves the characters there, and put every character who can be "
@@ -353,6 +357,16 @@ SPEAKER_RULE = (" speaker is the id of the one character who says something alou
                 "push in, pull back or track them, as long as their face stays in frame and lit "
                 "while they speak.")
 SILENT_SPEAKER_RULE = " speaker is always an empty string: nobody speaks in this movie."
+# Pinned cast presence spec PC5, D3: in chained mode a declared character still in frame stays
+# in a speaking beat, silent.
+SPEAKER_RULE_KEEP_CAST = (
+    " speaker is the id of the one character who says something aloud on screen during the "
+    "beat, or an empty string when nobody speaks; give a speaker only where a spoken line moves "
+    "the story. A beat with a speaker shows that character facing the camera, in a medium shot, "
+    "medium close-up or close-up; its cast is the speaker's id plus the id of every already-cast "
+    "character who is still in frame and stays silent, and no character of your own. The speaker "
+    "may move during the beat, and the camera may stay static, push in, pull back or track them, "
+    "as long as their face stays in frame and lit while they speak.")
 # Narrative dialogue fidelity spec 7.1 (e): only when the narrative quotes spoken lines.
 LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
               "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
@@ -361,6 +375,11 @@ LINES_RULE = (" lines is the list of the numbers of the spoken lines above that 
               "other beat. A beat may hold two or more consecutive lines only when together they "
               "are at most @@LINE_WORDS@@ words. Give each line its own beat whenever there are at "
               "least as many beats as lines.")
+# Pinned cast presence spec PC6, D3: where a speaking beat shows only the speaker, a declared
+# character with no line needs a beat without a speaker.
+LINES_PINNED_SENTENCE = (" A beat with a speaker shows only the speaker, so every already-cast "
+                         "character who says none of the lines still needs a beat with no "
+                         "speaker, even when two consecutive lines must then share a beat.")
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
 LORA_PICK_PARAGRAPH = (
@@ -731,6 +750,15 @@ def undeclared_message(prefix, where, hit):
             "when declared with --character %s" % (prefix, where, name, kind, matched, name))
 
 
+# Pinned cast presence spec PC3, D2: the declared characters, by library name, all on screen.
+CAST_FIXED_INTRO = (" The following characters are already cast; list them first in cast with "
+                    "exactly these ids, phrases and descriptors, and give your own characters "
+                    "the next ids. Every one of them is in this movie: put each one's id in the "
+                    "cast of at least one beat. When the narrative calls one of them by their "
+                    "name, it means that character, whom the movie names only by their phrase:")
+CAST_FIXED_LINE = '\n- id c%d, name "%s", phrase "%s", descriptor "%s"'
+
+
 def build_plan_prompt(ctx, compatible, pins):
     """The exact plan prompt of RS7 (narrative dialogue fidelity spec QL6: the spoken-lines block
     after the narrative, the lines key and LINES_RULE when the narrative quotes spoken lines)."""
@@ -741,12 +769,9 @@ def build_plan_prompt(ctx, compatible, pins):
         cast_fixed = (" Never use these names or referring phrases, which belong to characters "
                       "who are not in this movie: " + reserved_items(undeclared) + ".")
     if ctx.members:
-        cast_fixed += (" The following characters are already cast; list them first in cast with "
-                      "exactly these ids, phrases and descriptors, and give your own characters "
-                      "the next ids:")
+        cast_fixed += CAST_FIXED_INTRO
         for i, member in enumerate(ctx.members, start=1):
-            cast_fixed += '\n- id c%d, phrase "%s", descriptor "%s"' % (
-                i, member.phrase, member.descriptor)
+            cast_fixed += CAST_FIXED_LINE % (i, member.name, member.phrase, member.descriptor)
     if not ctx.auto_lora or not compatible:
         lora = LORA_EMPTY_PARAGRAPH
     else:
@@ -757,10 +782,14 @@ def build_plan_prompt(ctx, compatible, pins):
                  "not; leave the lists empty when nothing fits.")
         lora += "\n\nLoRA catalog (pick only from these):\n"
         lora += "\n".join(catalog_line(e) for e in compatible) + _pins_block(pins)
+    seed = ""
+    if ctx.seed_agent_image:
+        seed = (SEED_PARAGRAPH[:-2] + SEED_CAST_SENTENCE + "\n\n" if ctx.members
+                else SEED_PARAGRAPH)
     fragments = [
         ("@@GOAL_PARAGRAPH@@", _goal_paragraph(ctx.goal)),
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[ctx.mode]),
-        ("@@SEED_PARAGRAPH@@", SEED_PARAGRAPH if ctx.seed_agent_image else ""),
+        ("@@SEED_PARAGRAPH@@", seed),
         ("@@CAST_FIXED@@", cast_fixed),
         ("@@ARC_RULE@@", _arc_rule(ctx.panels)),
         ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
@@ -768,9 +797,12 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
-        ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False else SPEAKER_RULE),
+        ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False
+         else SPEAKER_RULE_KEEP_CAST if ctx.mode == "chained" and ctx.members else SPEAKER_RULE),
         ("@@BEAT_KEYS@@", "cast, speaker and lines" if lines else "cast and speaker"),
-        ("@@LINES_RULE@@", LINES_RULE if lines else ""),
+        ("@@LINES_RULE@@", (LINES_RULE + (LINES_PINNED_SENTENCE
+                                          if ctx.members and ctx.mode != "chained" else ""))
+         if lines else ""),
     ]
     # character_lib is loaded only for a narrative with spoken lines, so an uncast dry run still
     # never loads it (test_rst47, test_s53).

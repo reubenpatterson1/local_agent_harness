@@ -241,9 +241,10 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
                     assert ("An image is attached to this message." in prompt) == bool(seed)
                     assert ("LoRA catalog (pick only from these):" in prompt) == (state == "catalog")
                     if cast:
-                        assert ('\n- id c1, phrase "the woman in grey", descriptor "%s"'
-                                % seu.DESC_K) in prompt
-                        assert '\n- id c2, phrase "the ronin", descriptor "%s"' % seu.DESC_R in prompt
+                        assert ('\n- id c1, name "kyra", phrase "the woman in grey", '
+                                'descriptor "%s"' % seu.DESC_K) in prompt
+                        assert ('\n- id c2, name "ronin", phrase "the ronin", descriptor "%s"'
+                                % seu.DESC_R) in prompt
                     else:
                         assert "already cast" not in prompt
                     if state == "catalog":
