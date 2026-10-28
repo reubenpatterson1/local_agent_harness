@@ -41,17 +41,28 @@ SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each
 
 def shot_types(narration):
     return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
+# Shot prompt format spec SF1, D1: moves first, static last; the pasted sentence is the fallback
+# when the writer writes no camera sentence (SF6).
 CAMERA_SENTENCES = (
-    ("static", "The camera stays static."),
     ("slow push-in", "The camera pushes in."),
     ("slow pull-back", "The camera pulls back."),
+    ("tracking", "The camera tracks alongside the movement."),
+    ("handheld", "The camera is handheld, with slight natural movement."),
     ("slow pan left", "The camera pans left."),
     ("slow pan right", "The camera pans right."),
     ("slow tilt up", "The camera tilts up."),
     ("slow tilt down", "The camera tilts down."),
-    ("tracking", "The camera tracks alongside the movement."),
+    ("static", "The camera stays static."),
 )
 CAMERA_KEYS = tuple(key for key, _ in CAMERA_SENTENCES)
+
+
+def max_static(panels):
+    """The most beats a movie of `panels` beats may give the static camera: one in three, rounded
+    up (shot prompt format spec SF2, D3)."""
+    return (panels + 2) // 3
+
+
 ARC_ROLES = ("introduction", "rising", "climax", "falling", "resolution")
 WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (15, 35), "motion": (15, 35)},
                "no_stills": {"prompt": (150, 220)},
@@ -310,7 +321,7 @@ PLAN_PROMPT_TEMPLATE = (
     "one sentence of 6 to 40 words saying what the characters physically do during these "
     "@@SECONDS@@ seconds: one continuous physical action that a camera can film, not a sequence "
     "of steps, with no on-screen text. shot is exactly one of: @@SHOT_LIST@@. "
-    "camera is exactly one of: @@CAMERA_LIST@@. location is the id of the place where the beat "
+    "camera is exactly one of: @@CAMERA_LIST@@.@@CAMERA_RULE@@ location is the id of the place where the beat "
     "happens. cast is the list of ids of the characters on screen in the beat, at most "
     "@@MAX_CAST@@.@@SPEAKER_RULE@@@@LINES_RULE@@\n"
     "loras: @@LORA_PARAGRAPH@@\n"
@@ -349,14 +360,27 @@ MODE_RULES = {
               "the contact itself is never on screen.\n\n"),
     "no_stills": "",
 }
+# Shot prompt format spec SF3, D7: a speaking beat's action is physical, and it ends with the
+# speaker in frame and nobody else acting.
+SPEAKING_BEAT_SENTENCE = (" Write a speaking beat's action as what the speaker physically does, "
+                          "never as speaking, and end it with the speaker still in frame: nobody "
+                          "else acts after the line, and when the narrative has the speaker "
+                          "leave, or another character act, after a line, give that a later beat "
+                          "with no speaker, or leave it out when no later beat is left.")
 SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
                 "(its cast is just their id), facing the camera, in a medium shot, medium close-up "
-                "or close-up; the speaker may move during the beat, and the camera may stay static, "
-                "push in, pull back or track them, as long as their face stays in frame and lit "
-                "while they speak.")
+                "or close-up; the speaker may move during the beat, as long as their face stays in "
+                "frame and lit while they speak." + SPEAKING_BEAT_SENTENCE)
 SILENT_SPEAKER_RULE = " speaker is always an empty string: nobody speaks in this movie."
+# Shot prompt format spec SF2, D1: one move per beat, static only as a capped deliberate hold.
+CAMERA_RULE = (" Give every beat one camera move from this list, and use static only for a "
+               "deliberate hold: at most one beat in three may be static, so at most "
+               "@@MAX_STATIC@@ in this movie.")
+CAMERA_SPEAKING_SENTENCE = (" On a beat with a speaker, prefer slow push-in, slow pull-back, "
+                            "tracking or handheld, and never use a pan or a tilt, which sweeps "
+                            "the speaker's face out of the frame.")
 # Pinned cast presence spec PC5, D3: in chained mode a declared character still in frame stays
 # in a speaking beat, silent.
 SPEAKER_RULE_KEEP_CAST = (
@@ -365,8 +389,8 @@ SPEAKER_RULE_KEEP_CAST = (
     "the story. A beat with a speaker shows that character facing the camera, in a medium shot, "
     "medium close-up or close-up; its cast is the speaker's id plus the id of every already-cast "
     "character who is still in frame and stays silent, and no character of your own. The speaker "
-    "may move during the beat, and the camera may stay static, push in, pull back or track them, "
-    "as long as their face stays in frame and lit while they speak.")
+    "may move during the beat, as long as their face stays in frame and lit while they speak."
+    + SPEAKING_BEAT_SENTENCE)
 # Narrative dialogue fidelity spec 7.1 (e): only when the narrative quotes spoken lines.
 LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
               "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
@@ -959,6 +983,8 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
          + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
+        ("@@CAMERA_RULE@@", CAMERA_RULE + ("" if ctx.narration is False
+                                           else CAMERA_SPEAKING_SENTENCE)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
         ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False
@@ -975,7 +1001,7 @@ def build_plan_prompt(ctx, compatible, pins):
                 if lines else "")
     scalars = [("@@STORY_ID@@", ctx.story_id), ("@@PANELS@@", str(ctx.panels)),
                ("@@SECONDS@@", ctx.seconds), ("@@MAX_CAST@@", str(MAX_CAST[ctx.mode])),
-               ("@@LINE_WORDS@@", line_cap)]
+               ("@@LINE_WORDS@@", line_cap), ("@@MAX_STATIC@@", str(max_static(ctx.panels)))]
     return _fill(PLAN_PROMPT_TEMPLATE, fragments, scalars,
                  ctx.narrative + spoken_lines_block(lines))
 
@@ -1149,15 +1175,16 @@ def normalize_plan(ctx, raw):
     return plan, shape
 
 
-# Narrative dialogue fidelity spec SM1: a speaking beat may be a medium shot, and its camera may
-# stay static, push in, pull back or track the speaker.
+# Narrative dialogue fidelity spec SM1; shot prompt format spec SF4, D2: a speaking beat may be
+# a medium shot, and its camera pushes in, pulls back, tracks, is handheld or stays static.
 SPEAKING_SHOTS = ("medium shot", "medium close-up", "close-up")
-SPEAKING_CAMERAS = ("static", "slow push-in", "slow pull-back", "tracking")
+SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
 
 
 def speaking_camera(beat):
-    """The beat's camera when a speaking shot may keep it, else "static" (SM1)."""
-    return beat["camera"] if beat["camera"] in SPEAKING_CAMERAS else "static"
+    """The beat's camera when a speaking shot may keep it, else "slow push-in" (SM1; shot prompt
+    format spec SF4)."""
+    return beat["camera"] if beat["camera"] in SPEAKING_CAMERAS else "slow push-in"
 
 
 def coerce_speakers(ctx, plan, groups=()):
@@ -1317,8 +1344,9 @@ def speaking_coercion(ctx, plan, k):
     lists, in the beat's order without repeats, who stays in frame silent; everyone else is
     removed. When the beat frames its own shot (not a chained continuation, k >= 2) a shot wider
     than a medium shot becomes a medium close-up (an extreme close-up a close-up), or a medium
-    shot when silent library characters share the beat, and a camera that does not stay static,
-    push in, pull back or track becomes static. Tracking is never coerced away."""
+    shot when silent library characters share the beat, and a camera that does not push in,
+    pull back, track, move handheld or stay static becomes a slow push-in (shot prompt format
+    spec SF4). Tracking is never coerced away."""
     notes = []
     beat = plan["beats"][k - 1]
     speaker = beat["speaker"]
@@ -1348,9 +1376,28 @@ def speaking_coercion(ctx, plan, k):
                          "face stays readable" % (k, _q(beat["shot"]), _q(shot)))
             beat["shot"] = shot
         if beat["camera"] not in SPEAKING_CAMERAS:
-            notes.append("beat %d: P14 speaking beat: camera %s changed to 'static' so the "
-                         "speaker's face stays readable" % (k, _q(beat["camera"])))
-            beat["camera"] = "static"
+            notes.append("beat %d: P14 speaking beat: camera %s changed to 'slow push-in' so "
+                         "the speaker's face stays readable" % (k, _q(beat["camera"])))
+            beat["camera"] = "slow push-in"
+    return notes
+
+
+# Shot prompt format spec SF5, D3: at most max_static(panels) static beats; the earliest excess
+# ones become a slow push-in, and the latest static beats stay as the deliberate holds.
+P18_NOTE = ("beat %d: P18 static camera: camera 'static' changed to 'slow push-in': at most %d "
+            "of the %d beats may be static, and the latest static beats are kept as the "
+            "deliberate holds")
+
+
+def cap_static_cameras(ctx, plan):
+    """The P18 notes of the static cap (shot prompt format spec SF5), in beat order; changes
+    plan["beats"] in place."""
+    cap = max_static(ctx.panels)
+    static = [k for k, beat in enumerate(plan["beats"], start=1) if beat["camera"] == "static"]
+    notes = []
+    for k in static[:max(0, len(static) - cap)]:
+        plan["beats"][k - 1]["camera"] = "slow push-in"
+        notes.append(P18_NOTE % (k, cap, ctx.panels))
     return notes
 
 
@@ -2235,7 +2282,7 @@ NO_STILLS_CONNECTOR_RE = re.compile(r"\b(?:initially|a\s+moment\s+later|moments\
 # or tracks the speaker (narrative dialogue fidelity spec SM1, SM5).
 STILL_CAMERA_MOVES = ("static", "still", "hold", "holds", "locked-off", "push in", "pushes in",
                       "push-in", "pull back", "pulls back", "pull-back", "track", "tracks",
-                      "tracking", "follow", "follows")
+                      "tracking", "follow", "follows", "handheld")
 SPLIT_INSTRUCTION = ("shorten the line, or split it across alternating close-up panels (the "
                      "speaker, then the listener, then the speaker again)")
 
@@ -3770,6 +3817,7 @@ class _Run(object):
             return self.finish(1)
         plan, self.shape, _hard = found
         plan["speech_notes"] += assign_missing_lines(ctx, plan)
+        plan["speech_notes"] += cap_static_cameras(ctx, plan)
         parts = [empty_parts(ctx.mode, k, plan, ctx) for k in range(1, ctx.panels + 1)]
         valid = 0
         for k in range(1, ctx.panels + 1):
