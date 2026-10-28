@@ -477,3 +477,219 @@ def test_review_focus_3_a_speaker_named_by_phrase_and_a_repeated_co_star(ws, sto
         "beat 2: P14 speaking beat: cast [c2, c2, c1] changed to [c2, c1]: the speaker, and the "
         "library character(s) c2, who stay in frame without speaking"]
     assert se.plan_checks(ctx, plan, shape)[0] == []
+
+
+# --- PT1 (writer half): the writer constants and _and_list (PC8) ------------------------------
+
+SILENT_CAST_MOTION_SENTENCE = (" Also in frame in this panel, and silent: @@SILENT@@. Only "
+                               "@@SPEAKER@@ speaks: mention each of the others by their referring "
+                               "phrase, word for word, only inside the sentences that begin with "
+                               "@@SPEAKER@@, and never give them a speaking verb.")
+SPEAKING_IMAGE_SILENT_SENTENCE = (" @@SPEAKER@@ is in the foreground, facing the camera; also in "
+                                  "frame, and silent: @@SILENT@@; any crowd stays in the "
+                                  "background.")
+
+
+def test_pt1_writer_constants_and_and_list():
+    assert se.SILENT_CAST_MOTION_SENTENCE == SILENT_CAST_MOTION_SENTENCE
+    assert se.SPEAKING_IMAGE_SILENT_SENTENCE == SPEAKING_IMAGE_SILENT_SENTENCE
+    for text in (SILENT_CAST_MOTION_SENTENCE, SPEAKING_IMAGE_SILENT_SENTENCE):
+        assert set(re.findall(r"@@[A-Z_]+@@", text)) <= {"@@SPEAKER@@", "@@SILENT@@"}, text[:40]
+    assert se._and_list(["a"]) == '"a"'
+    assert se._and_list(["a", "b"]) == '"a" and "b"'
+    assert se._and_list(["a", "b", "c"]) == '"a", "b" and "c"'
+
+
+# --- PT11-PT13, Review Focus 4, 5: the writer prompt, N17 and the speech (PC8, PC9, PK8) ------
+
+def _fill(text, silent='"the ronin"'):
+    return text.replace("@@SPEAKER@@", '"the woman in grey"').replace("@@SILENT@@", silent)
+
+
+def _key_line(prompt, key):
+    """The first line of a panel prompt that starts with "<key>: " (its key line)."""
+    return [line for line in prompt.split("\n") if line.startswith(key + ": ")][0]
+
+
+def _speaking_plan(ctx, beat2_cast=("c1", "c2")):
+    """PT11's normalised plan: beats 1 and 2 spoken by c1, beat 3 silent, every beat cast
+    ["c1", "c2"] except beat 2's beat2_cast."""
+    raw = _raw("chained", 3, [["c1", "c2"], list(beat2_cast), ["c1", "c2"]], ["c1", "c1", ""])
+    return se.normalize_plan(ctx, raw)[0]
+
+
+def _prompts(ctx, plan, fix=None):
+    parts = [se.empty_parts("chained", k, plan, ctx) for k in (1, 2, 3)]
+    return [se.build_panel_prompt(ctx, plan, parts, k, fix=fix) for k in (1, 2, 3)]
+
+
+ON_SCREEN_LINE = ('Characters on screen in this panel, named only by these exact referring '
+                  'phrases: "the woman in grey"; "the ronin"\n')
+
+
+def test_pt11_writer_prompt(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    prompts = _prompts(ctx, _speaking_plan(ctx))
+    assert _key_line(prompts[0], "image").endswith(
+        se.SPEECH_FRAMING_SENTENCE + _fill(se.SPEAKING_IMAGE_SILENT_SENTENCE))
+    assert _key_line(prompts[1], "motion").endswith(
+        _fill(se.SPEAKING_CHAINED_MOTION_SENTENCE + se.SILENT_CAST_MOTION_SENTENCE))
+    assert ON_SCREEN_LINE in prompts[0] and ON_SCREEN_LINE in prompts[1]
+    for text in (se.SILENT_CAST_MOTION_SENTENCE, se.SPEAKING_IMAGE_SILENT_SENTENCE):
+        assert text not in prompts[2] and _fill(text) not in prompts[2]
+    assert "and silent:" not in prompts[2]
+    alone = _prompts(ctx, _speaking_plan(ctx, beat2_cast=("c1",)))
+    motion = _key_line(alone[1], "motion")
+    assert motion.endswith(se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@",
+                                                                       '"the woman in grey"'))
+    assert "silent" not in motion
+    for prompt in prompts + alone:
+        assert "@@" not in prompt
+
+
+N17_FIELDS = [("Motion", "The woman in grey steps toward the camera. The woman in grey faces the "
+                         "camera. The camera stays static."),
+              ("Dialogue", "the woman in grey: Stay close to me.")]
+N17_WRITERS = {"Motion": "The woman in grey steps toward the camera."}
+ONLY_THE_SPEAKER = "a speaking shot shows only the speaker"
+
+
+def test_pt12_n17(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    hard, advisory = se._field_checks(ctx, lib, _speaking_plan(ctx), 2, "T", N17_FIELDS,
+                                      N17_WRITERS, ("N17",), [])
+    assert [m for m in hard + advisory if ONLY_THE_SPEAKER in m] == []
+    shots = seu.make_ctx(se, ws, mode="shots", members=members, narration="speech")
+    plan = se.normalize_plan(shots, _raw("shots", 3, [["c1"], ["c1"], ["c2"]], ["", "c1", ""]))[0]
+    plan["beats"][1]["cast"] = ["c1", "c2"]
+    hard, advisory = se._field_checks(shots, lib, plan, 2, "T", N17_FIELDS, N17_WRITERS,
+                                      ("N17",), [])
+    assert [m for m in advisory if ONLY_THE_SPEAKER in m] == [
+        "panel 2: N17 speaking shot: Dialogue: 'the woman in grey' speaks in a shot that also "
+        "shows 'the ronin'; a speaking shot shows only the speaker"]
+
+
+def test_pt13_speech_stays_with_the_speaker():
+    say = lib.speech_text(KYRA, "Stay close to me.", "beats")
+    first = "The woman in grey steps toward the camera as the ronin waits beside her."
+    second = "The woman in grey walks under the gate, the ronin a pace behind her."
+    tail = "The woman in grey faces the camera. The camera stays static."
+    one = lib.insert_speech(first + " " + tail, say, [KYRA], first_action=True)
+    assert one == (first + " The woman in grey faces the camera. " + say
+                   + " The camera stays static.")
+    two = lib.insert_speech(first + " " + second + " " + tail, say, [KYRA], first_action=True)
+    assert two == (first + " The woman in grey faces the camera. " + say + " " + second
+                   + " The camera stays static.")
+    for text in (one, two):
+        assert "the ronin says" not in text
+
+
+def test_review_focus_4_a_writer_re_ask_keeps_one_silent_sentence(ws, story_env):
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    plan = _speaking_plan(ctx)
+    parts = [se.empty_parts("chained", k, plan, ctx) for k in (1, 2, 3)]
+    parts[1]["motion"] = "The woman in grey turns, then steps toward the camera."
+    problem = "panel 2: N12 one action: Motion: chains actions with 'then'"
+    first = se.build_panel_prompt(ctx, plan, parts, 2)
+    again = se.build_panel_prompt(ctx, plan, parts, 2, fix=[problem])
+    assert "\n" + _key_line(first, "motion") + "\n" in again
+    silent = _fill(se.SILENT_CAST_MOTION_SENTENCE)
+    assert first.count(silent) == 1 and again.count(silent) == 1
+    assert "- " + problem + "\n" in again
+    assert "\nmotion: The woman in grey turns, then steps toward the camera.\n" in again
+    assert "@@" not in again
+
+
+DESC_A = "a tall young woman with short red hair wearing a green hunting cloak and leather boots"
+
+
+def test_review_focus_5_three_library_characters_in_one_speaking_panel(ws, story_env):
+    _members(story_env)
+    seu.make_character(story_env["lib"], "hana", "hanawmn", "the archer", "woman", DESC_A)
+    members = lib.resolve_cast([(None, "kyra"), (None, "ronin"), (None, "hana")])
+    ctx = seu.make_ctx(se, ws, members=members, narration="speech")
+    raw = seu.plan_json("chained", 3, cast=copy.deepcopy(CAST2) + [
+        {"id": "c3", "phrase": "z", "descriptor": "a woman"}])
+    for beat in raw["beats"]:
+        beat["cast"] = ["c2", "c1", "c3"]
+    raw["beats"][1]["speaker"] = "c1"
+    plan, shape = se.normalize_plan(ctx, raw)
+    assert plan["beats"][1]["cast"] == ["c2", "c1", "c3"]
+    assert [m for m in se.plan_checks(ctx, plan, shape)[0] if " P16 " in m] == []
+    prompt = _prompts(ctx, plan)[1]
+    assert _key_line(prompt, "motion").endswith(
+        _fill(se.SILENT_CAST_MOTION_SENTENCE, silent='"the ronin" and "the archer"'))
+    assert ('Characters on screen in this panel, named only by these exact referring phrases: '
+            '"the ronin"; "the woman in grey"; "the archer"\n') in prompt
+
+
+# --- PT16, PT17: the reported case end to end, and the back-compat re-check (PK8, PK9) --------
+
+def _pt16_run(ws, tmp_path, monkeypatch, story_env):
+    """(rc, ctx, agent log) of PT16's engine run: chained, kyra and ronin pinned, --speech-only,
+    LINES_NARRATIVE, every beat cast ["c1", "c2"], beats 2 and 3 spoken by c1."""
+    members = _members(story_env)
+    ctx = seu.make_ctx(se, ws, story_id="pc5", members=members, narration="speech",
+                       narrative=LINES_NARRATIVE)
+    raw = _raw("chained", 3, [["c1", "c2"]] * 3)
+    raw["beats"][1].update(speaker="c1", lines=[1])
+    raw["beats"][2].update(speaker="c1", lines=[2])
+    panel = {
+        "1": [seu.answer({"title": "The Temple Steps",
+                          "image": seu.panel_json("chained", 1, KYRA)["image"],
+                          "motion": "The woman in grey climbs the stone steps as the ronin "
+                                    "follows one step behind her."})],
+        "2": [seu.answer({"title": "Near The Top",
+                          "motion": "The woman in grey turns and steps toward the camera, the "
+                                    "ronin a pace behind her.",
+                          "dialogue": "We reach the gate before dark."})],
+        "3": [seu.answer({"title": "Through The Gate",
+                          "motion": "The woman in grey walks under the gate toward the camera, "
+                                    "the ronin beside her.",
+                          "dialogue": "Stay close to me."})]}
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)], panel=panel)
+    rc, _advisories = se.run(ctx)
+    return rc, ctx, seu.agent_log(log)
+
+
+def test_pt16_two_pinned_chained_every_line_spoken_by_c1(ws, tmp_path, monkeypatch, story_env):
+    rc, ctx, log = _pt16_run(ws, tmp_path, monkeypatch, story_env)
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert [beat["cast"] for beat in plan["beats"]][1:] == [["c1", "c2"], ["c1", "c2"]]
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    image = [line for line in lines if line.startswith("Image: ")][0]
+    assert "The woman in grey is " + seu.DESC_K + "." in image
+    assert "The ronin is " + seu.DESC_R + "." in image
+    assert [line for line in lines if line.startswith("Dialogue: ")] == [
+        "Dialogue: the woman in grey: We reach the gate before dark.",
+        "Dialogue: the woman in grey: Stay close to me."]
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert checks["hard"] == []
+    assert [a for a in checks["advisory"] if ONLY_THE_SPEAKER in a["message"]] == []
+
+
+def test_pt17_back_compat_recheck(ws, tmp_path, monkeypatch, story_env):
+    rc, ctx, _log = _pt16_run(ws, tmp_path, monkeypatch, story_env)
+    assert rc == 0
+    plan = _read_json(ctx.story_dir, "plan.json")
+    for beat in plan["beats"]:
+        beat["cast"] = ["c1"]
+    with open(os.path.join(ctx.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("recheck must not call plan_checks")
+
+    monkeypatch.setattr(se, "plan_checks", refuse)
+    rc, _advisories = se.recheck(ctx, lambda path, panels, no_stills=False: [])
+    assert rc == 0
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert checks["source"] == "recheck"
+    assert [e["message"] for e in checks["hard"] + checks["advisory"]
+            if " P16 " in e["message"]] == []

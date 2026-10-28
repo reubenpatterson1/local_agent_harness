@@ -1840,6 +1840,15 @@ SPEAKING_CHAINED_MOTION_SENTENCE = (
     "after it are the two parts of this one motion: never put an action from before the "
     "dialogue and one from after it in the same sentence, and do not write the spoken words or "
     "a speaking verb; the pipeline adds them.")
+# Pinned cast presence spec PC8, D3: a chained speaking panel's silent library co-stars
+# (@@SILENT@@ is their quoted phrases).
+SILENT_CAST_MOTION_SENTENCE = (" Also in frame in this panel, and silent: @@SILENT@@. Only "
+                               "@@SPEAKER@@ speaks: mention each of the others by their referring "
+                               "phrase, word for word, only inside the sentences that begin with "
+                               "@@SPEAKER@@, and never give them a speaking verb.")
+SPEAKING_IMAGE_SILENT_SENTENCE = (" @@SPEAKER@@ is in the foreground, facing the camera; also in "
+                                  "frame, and silent: @@SILENT@@; any crowd stays in the "
+                                  "background.")
 SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
                             "adds them.")
 SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; "
@@ -2323,7 +2332,10 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 add(advisory, "N17", "speaking shot", speech_label,
                     "%s speaks, but the panel holds the expression %s, which freezes the mouth; "
                     "describe the speaking instead" % (_q(speaker), _q(held)))
-            others = [p for p in on_screen if p.lower() != speaker.lower()]
+            library = (set(c["phrase"].lower() for c in plan["cast"] if c.get("cast_name"))
+                       if ctx.mode == "chained" else set())
+            others = [p for p in on_screen if p.lower() != speaker.lower()
+                      and p.lower() not in library]
             if speech_label == "Dialogue" and others:
                 add(advisory, "N17", "speaking shot", "Dialogue",
                     "%s speaks in a shot that also shows %s; a speaking shot shows only the "
@@ -2494,6 +2506,13 @@ def split_shots(violations):
             [v for v in violations if parse_violation(v)["id"] not in SHOTS_HARD_RULES])
 
 
+def _and_list(items):
+    """'"a"', '"a" and "b"' or '"a", "b" and "c"' (pinned cast presence spec PC8); items is
+    non-empty."""
+    quoted = ['"%s"' % item for item in items]
+    return quoted[0] if len(quoted) == 1 else ", ".join(quoted[:-1]) + " and " + quoted[-1]
+
+
 def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     """The exact panel prompt of RS12 (plus the RS37 reserved line)."""
     beat = plan["beats"][k - 1]
@@ -2519,6 +2538,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
     speaks = panel_speaks(ctx, plan, k)
     phrase = speaker_phrase(plan, k) if speaks else None
+    silent = ([by_cast[c]["phrase"] for c in beat["cast"] if c != beat["speaker"] and c in by_cast]
+              if speaks and ctx.mode == "chained" else [])
     words = str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 1)) if speaks else ""
     assigned = assigned_dialogue(plan, k)
     key_lines = []
@@ -2539,13 +2560,19 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         if key in ("image", "motion", "prompt") and ctx.narration == "speech":
             line += SPEECH_FRAMING_SENTENCE
         if speaks:
-            line += (SPEAKING_CHAINED_MOTION_SENTENCE if ctx.mode == "chained" and key == "motion"
-                     else SPEAKING_SENTENCES.get(key, ""))
+            if ctx.mode == "chained" and key == "motion":
+                line += SPEAKING_CHAINED_MOTION_SENTENCE + (SILENT_CAST_MOTION_SENTENCE
+                                                            if silent else "")
+            elif ctx.mode == "chained" and key == "image" and silent:
+                line += SPEAKING_IMAGE_SILENT_SENTENCE
+            else:
+                line += SPEAKING_SENTENCES.get(key, "")
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         if speaks:
             line = (line.replace("@@SPEAKER@@", '"%s"' % phrase).replace("@@DWORDS@@", words)
-                    .replace("@@LINE@@", '"%s"' % assigned))
+                    .replace("@@LINE@@", '"%s"' % assigned)
+                    .replace("@@SILENT@@", _and_list(silent) if silent else ""))
         key_lines.append(line)
     fix_block = ""
     if fix is not None:
