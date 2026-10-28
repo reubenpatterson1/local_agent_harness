@@ -380,6 +380,10 @@ LINES_RULE = (" lines is the list of the numbers of the spoken lines above that 
 LINES_PINNED_SENTENCE = (" A beat with a speaker shows only the speaker, so every already-cast "
                          "character who says none of the lines still needs a beat with no "
                          "speaker, even when two consecutive lines must then share a beat.")
+# Speaker attribution spec SA6, D5: the lines the narrative gives to already-cast characters.
+LINE_SPEAKERS_SENTENCE = (" The narrative gives these lines to already-cast characters: %s. The "
+                          "beat that holds one of these lines has that character as its speaker, "
+                          "and no other character says it.")
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
 LORA_PICK_PARAGRAPH = (
@@ -532,6 +536,136 @@ def spoken_lines(narrative):
     """The display text of every spoken quote of the narrative that has a word, in order (QL3)."""
     return [spoken_display(inner) for inner, spoken in classify_quotes(narrative)
             if spoken and line_words(inner)]
+
+
+# Speaker attribution spec SA1, D1, D2: who the narrative says speaks each spoken line.
+ATTRIBUTION_VERBS = frozenset("""
+    says said asks asked replies replied answers answered shouts shouted yells yelled
+    screams screamed cries cried whispers whispered murmurs murmured mutters muttered
+    exclaims exclaimed announces announced declares declared tells told""".split())
+CALL_OUT_VERBS = frozenset(("calls", "called"))     # an attribution verb only before "out"
+GAP_BLOCK_WORDS = frozenset("""
+    the a an this that these those his her its their my our your he she they it him them we
+    you i who whom which whose someone somebody everyone everybody nobody one as while when
+    whenever before after until because since if though although whereas""".split())
+OBJECT_WORDS = frozenset("""
+    to at toward towards beside behind with of for from near by past around under over like
+    than without into onto upon about besides""".split())
+
+
+def _attribution_verb_at(words, p):
+    """The number of words of the attribution verb at words[p] (1, or 2 for "calls out"), or 0."""
+    if p >= len(words):
+        return 0
+    if words[p] in ATTRIBUTION_VERBS:
+        return 1
+    return 2 if words[p] in CALL_OUT_VERBS and words[p + 1:p + 2] == ["out"] else 0
+
+
+def _mentions(cast):
+    """[(cast id, words)]: every entry's phrase, and a library character's name (SA1, D2)."""
+    out = []
+    for entry in cast:
+        for name in (entry.get("phrase"), entry.get("cast_name")):
+            words = line_words(name) if isinstance(name, str) else []
+            if words and entry["id"]:
+                out.append((entry["id"], words))
+    return out
+
+
+def _mentions_at(words, mentions, end=None, start=None):
+    """{cast id: words in its longest mention} for the mentions that end just before index end,
+    or begin at index start, of words."""
+    hits = {}
+    for cid, tokens in mentions:
+        n = len(tokens)
+        if end is not None:
+            span = words[end - n:end] if n <= end else None
+        else:
+            span = words[start:start + n]
+        if span == tokens:
+            hits[cid] = max(hits.get(cid, 0), n)
+    return hits
+
+
+def _speaker_before(words, mentions):
+    """The cast id the clause before a quote names as its speaker, or None (SA1 forms B1, B2)."""
+    verbs = [p for p in range(len(words)) if _attribution_verb_at(words, p)]
+    if verbs:
+        v = verbs[-1]
+        tokens = set(w for _cid, t in mentions for w in t)
+        for e in range(v, max(1, v - 3) - 1, -1):
+            gap = words[e:v]
+            joined = len(gap) in (2, 3) and gap[-1] in ("and", "then") and not any(
+                w in GAP_BLOCK_WORDS or w in tokens or w in SPEECH_VERBS for w in gap)
+            if gap and not joined and not (len(gap) == 1 and gap[0].endswith("ly")):
+                continue
+            hits = _mentions_at(words, mentions, end=e)
+            if not hits:
+                continue
+            if len(hits) > 1:
+                return None
+            cid, width = next(iter(hits.items()))
+            start = e - width
+            before = words[start - 1] if start else None
+            if before in OBJECT_WORDS or (before in ("and", "or", "nor") and start > 1):
+                return None
+            if joined and any(c != cid for c, t in mentions
+                              for q in range(len(t), start + 1) if words[q - len(t):q] == t):
+                return None
+            return cid
+    lead = 1 if words[:1] in (["and"], ["then"]) else 0
+    width = _attribution_verb_at(words, lead)
+    if width:
+        hits = _mentions_at(words, mentions, start=lead + width)
+        if len(hits) == 1 and lead + width + next(iter(hits.values())) == len(words):
+            return next(iter(hits))
+    return None
+
+
+def _speaker_after(words, mentions):
+    """The cast id the clause after a quote names as its speaker, or None (SA1 forms A1, A2)."""
+    width = _attribution_verb_at(words, 0)
+    if width:
+        hits = _mentions_at(words, mentions, start=width)
+        return next(iter(hits)) if len(hits) == 1 else None
+    hits = _mentions_at(words, mentions, start=0)
+    if len(hits) != 1:
+        return None
+    cid, n = next(iter(hits.items()))
+    rest = words[n:]
+    if _attribution_verb_at(rest, 0) or (rest[:1] and rest[0].endswith("ly")
+                                         and _attribution_verb_at(rest, 1)):
+        return cid
+    return None
+
+
+def line_speakers(narrative, cast):
+    """One entry per line of spoken_lines(narrative), in order (speaker attribution spec SA1):
+    the id of the cast entry (plan cast entries, or {"id", "phrase", "cast_name"} dicts) that the
+    narrative names as the line's speaker, or None when it names none, or not unambiguously."""
+    mentions = _mentions(cast)
+    text = narrative.replace("“", '"').replace("”", '"')
+    matches = list(QUOTE_RE.finditer(text))
+    out = []
+    for i, (match, (inner, spoken)) in enumerate(zip(matches, classify_quotes(narrative))):
+        if not (spoken and line_words(inner)):
+            continue
+        if not mentions:
+            out.append(None)
+            continue
+        prev_end = matches[i - 1].end() if i > 0 else 0
+        next_start = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        lead = text[prev_end:match.start()].rstrip(_QUOTE_EDGE_CHARS)
+        before = _speaker_before(line_words(_CLAUSE_BREAK_RE.split(lead)[-1]), mentions)
+        after_text = text[match.end():next_start]
+        after = None
+        if (not match.group(1).rstrip().endswith((".", "!", "?", "…"))
+                or re.match(r"\s*[a-z]", after_text)):
+            after = _speaker_after(line_words(_CLAUSE_BREAK_RE.split(
+                after_text.lstrip(_QUOTE_EDGE_CHARS))[0]), mentions)
+        out.append(None if before and after and before != after else before or after)
+    return out
 
 
 def required_lines(ctx):
@@ -782,6 +916,15 @@ def build_plan_prompt(ctx, compatible, pins):
                  "not; leave the lists empty when nothing fits.")
         lora += "\n\nLoRA catalog (pick only from these):\n"
         lora += "\n".join(catalog_line(e) for e in compatible) + _pins_block(pins)
+    said = ""
+    if lines and ctx.members:
+        fixed = [{"id": "c%d" % i, "phrase": m.phrase, "cast_name": m.name}
+                 for i, m in enumerate(ctx.members, start=1)]
+        items = ["line %d to %s" % (n, cid) for n, cid
+                 in enumerate(line_speakers(ctx.narrative, fixed), start=1) if cid]
+        if items:
+            said = LINE_SPEAKERS_SENTENCE % (items[0] if len(items) == 1 else
+                                             ", ".join(items[:-1]) + " and " + items[-1])
     seed = ""
     if ctx.seed_agent_image:
         seed = (SEED_PARAGRAPH[:-2] + SEED_CAST_SENTENCE + "\n\n" if ctx.members
@@ -801,7 +944,8 @@ def build_plan_prompt(ctx, compatible, pins):
          else SPEAKER_RULE_KEEP_CAST if ctx.mode == "chained" and ctx.members else SPEAKER_RULE),
         ("@@BEAT_KEYS@@", "cast, speaker and lines" if lines else "cast and speaker"),
         ("@@LINES_RULE@@", (LINES_RULE + (LINES_PINNED_SENTENCE
-                                          if ctx.members and ctx.mode != "chained" else ""))
+                                          if ctx.members and ctx.mode != "chained" else "")
+                         + said)
          if lines else ""),
     ]
     # character_lib is loaded only for a narrative with spoken lines, so an uncast dry run still

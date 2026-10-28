@@ -1,0 +1,69 @@
+{
+  "title": "Before the Gate at Dusk",
+  "logline": "At dusk, a woman and a ronin climb a mountain temple's stone steps and pass beneath its gate together before dark falls.",
+  "cast": [
+    {
+      "id": "c1",
+      "phrase": "the woman in grey",
+      "descriptor": "a young East Asian woman with fair skin, long black hair pinned up with three jade hairpins, wearing a pale grey silk kimono with a silver obi"
+    },
+    {
+      "id": "c2",
+      "phrase": "the ronin",
+      "descriptor": "a lean man in his late thirties with a topknot and a scarred brow, wearing a faded indigo haori and dark hakama"
+    }
+  ],
+  "locations": [
+    {
+      "id": "l1",
+      "setting": "The setting is a Heian-era mountain temple at dusk, weathered stone steps climbing a wooded hillside, low amber light, no other people in sight."
+    },
+    {
+      "id": "l2",
+      "setting": "The setting is the great wooden gate of a Heian-era mountain temple at dusk, dark stone ground, low amber light, no other people in sight."
+    }
+  ],
+  "props": [
+    {
+      "id": "p1",
+      "name": "the great wooden gate"
+    }
+  ],
+  "beats": [
+    {
+      "index": 1,
+      "arc": "introduction",
+      "action": "The woman in grey climbs the stone steps toward the temple gate, turns, and says to the ronin behind her.",
+      "shot": "medium close-up",
+      "camera": "static",
+      "location": "l1",
+      "cast": [
+        "c1"
+      ],
+      "speaker": "c1",
+      "lines": [
+        1
+      ]
+    },
+    {
+      "index": 2,
+      "arc": "resolution",
+      "action": "The ronin passes under the great wooden gate and says to the woman in grey.",
+      "shot": "medium close-up",
+      "camera": "static",
+      "location": "l2",
+      "cast": [
+        "c2"
+      ],
+      "speaker": "c2",
+      "lines": [
+        2
+      ]
+    }
+  ],
+  "loras": {
+    "global": [],
+    "per_beat": {},
+    "stills": []
+  }
+}
