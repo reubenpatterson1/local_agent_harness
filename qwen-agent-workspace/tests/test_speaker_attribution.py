@@ -231,11 +231,28 @@ SAT2_ROWS = [
     ('"Go," says Kyra and the ronin.', CAST3, [None]),
     ('Kyra, the old monk, and the ronin said, "Go."', CAST3, [None]),
     ('They pass under the gate together, and the ronin says, "Go."', CAST3, ["c2"]),
+    # SA1-A2: a lead word or a relative clause makes the mention no subject.
+    ('The man facing Kyra says, "Go."', CAST3, [None]),
+    ('The boy following Kyra says, "Go."', CAST3, [None]),
+    ('Everyone except Kyra says, "Go."', CAST3, [None]),
+    ('The man opposite Kyra says, "Go."', CAST3, [None]),
+    ('A stranger among the ronin says, "Go."', CAST3, [None]),
+    ('A second ronin says, "Halt."', CAST3, [None]),
+    ('Another ronin steps forward and says, "Halt."', CAST3, [None]),
+    ('A ronin says, "Halt."', CAST3, [None]),
+    ('One ronin says, "Halt."', CAST3, [None]),
+    ('The other ronin says, "Halt."', CAST3, [None]),
+    ('The stranger who saved Kyra says, "Go."', CAST3, [None]),
+    ('Every ronin shouts, "Banzai!"', CAST3, [None]),
+    # SA1-A3: only a comma piece that is exactly a cast mention makes a compound subject.
+    ('"Go," said Kyra, and the ronin replied, "Fine."', CAST3, ["c1", "c2"]),
+    ('Kyra nods to the ronin, and the old monk says, "Go."', CAST3, ["c3"]),
+    ('The old monk, Kyra, and the ronin said, "Go."', CAST3, [None]),
 ]
 
 
 def test_sat2_extraction_table():
-    assert len(SAT2_ROWS) == 42
+    assert len(SAT2_ROWS) == 57
     for text, cast, want in SAT2_ROWS:
         assert se.line_speakers(text, cast) == want, text
         assert len(want) == len(se.spoken_lines(text)), text
@@ -546,3 +563,148 @@ def test_review_focus_5_the_pin_sh2_shape_with_line_2_left_out(ws, tmp_path, mon
     assert dialogue == [
         "Dialogue: the woman in grey: We reach the gate before dark. Stay close to me."]
     assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+
+
+# --- Final whole-branch review: SA1-A2, SA5-A1, Q1-A1 (spec Amendment 2026-10-28) -------------
+
+NON_SPEAKER_LEAD_WORDS = frozenset("""
+    a an another other second one every each some any no among amid amongst between against
+    opposite across along alongside beyond inside outside within below above beneath underneath
+    except unlike including through throughout via facing following""".split())
+RELATIVE_WORDS = frozenset(("who", "whom", "whose", "that", "which"))
+Q1_SPEAKER = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is spoken by %s in "
+              "panel %d's Dialogue:, but the narrative gives it to %s; give it word for word to a "
+              "panel whose Dialogue: speaker is %s (Dialogue: %s: <the line>)")
+SA5_LINE_1 = ("the narrative gives spoken line 1 to 'the woman in grey', so a spoken-line patch "
+              "never gives it to 'the ronin'")
+SA5_LINE_2 = ("the narrative gives spoken line 2 to 'the woman in grey', so a spoken-line patch "
+              "never gives it to 'the ronin'")
+
+
+def test_sa1_a2_constants():
+    assert se.NON_SPEAKER_LEAD_WORDS == NON_SPEAKER_LEAD_WORDS
+    assert se.RELATIVE_WORDS == RELATIVE_WORDS
+    assert se.Q1_SPEAKER == Q1_SPEAKER
+
+
+def _widened(ws, story_env, narrative):
+    """(ctx, plan, parts) of the SA5-A1 case: shots, 3 panels, kyra and ronin pinned,
+    --speech-only, beat 1 cast [c2] spoken by c2 with no lines, and panel 1's Dialogue already
+    saying line 1 as free dialogue."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, members=_members(story_env),
+                       narration="speech", narrative=narrative)
+    raw = _lines(_raw("shots", 3, [["c2"], ["c1"], ["c1"]], ["c2", "", ""]), [[], [], []])
+    plan = se.normalize_plan(ctx, raw)[0]
+    parts = [se.empty_parts("shots", k, plan, ctx) for k in (1, 2, 3)]
+    parts[0]["dialogue"] = "We reach the gate before dark."
+    return ctx, plan, parts
+
+
+def test_sa5_a1_a_line_the_panel_already_says_is_checked(ws, story_env):
+    mixed = LINES_NARRATIVE.replace("and Kyra says", "and she says")
+    ctx, plan, parts = _widened(ws, story_env, mixed)
+    assert se.line_speakers(ctx.narrative, plan["cast"]) == ["c1", None]
+    assert [m for m in se.plan_checks(ctx, plan)[0] if " P17 " in m] == []
+    assert se.q1_dialogue_patch(ctx, lib, plan, parts, 1, "the ronin: Stay close to me.") == (
+        True, SA5_LINE_1)
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        ("c2", []), ("", []), ("", [])]
+    assert parts[0]["dialogue"] == "We reach the gate before dark."
+    assert [m for m in se.plan_checks(ctx, plan)[0] if " P17 " in m] == []
+    ctx, plan, parts = _widened(ws, story_env, PRONOUN_NARRATIVE)
+    assert se.q1_dialogue_patch(ctx, lib, plan, parts, 1, "the ronin: Stay close to me.") == (
+        True, None)
+    assert [(b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        ("c2", [1, 2]), ("", []), ("", [])]
+
+
+def test_q1_a1_spoken_line_problems(ws, story_env):
+    ctx = _shots2(ws, story_env)
+    line1, line2 = "We reach the gate before dark.", "Stay close to me."
+    wrong = Q1_SPEAKER % (2, line2, "'the ronin'", 2, "'the woman in grey'",
+                          "'the woman in grey'", KYRA)
+
+    def q1(dialogues, speakers=None):
+        return se.spoken_line_problems(ctx, lib, [KYRA, RONIN], dialogues, speakers)
+
+    split = [KYRA + ": " + line1, RONIN + ": " + line2]
+    assert se.spoken_line_problems(ctx, lib, [KYRA, RONIN], split) == []
+    assert q1(split) == []
+    assert q1(split, [None, None]) == []
+    assert q1(split, [KYRA, None]) == []
+    assert q1(split, [KYRA, KYRA]) == [wrong]
+    assert se.parse_violation(wrong)["id"] == "Q1"
+    assert se.parse_violation(wrong)["scope"] == "story"
+    assert q1([KYRA + ": " + line1 + " " + line2, ""], [KYRA, KYRA]) == []
+    assert q1([KYRA + ": " + line1, KYRA + ": " + line2], [KYRA, KYRA]) == []
+    assert q1([RONIN + ": " + line1 + " " + line2, ""], [KYRA, KYRA]) == [
+        Q1_SPEAKER % (1, line1, "'the ronin'", 1, "'the woman in grey'", "'the woman in grey'",
+                      KYRA),
+        Q1_SPEAKER % (2, line2, "'the ronin'", 1, "'the woman in grey'", "'the woman in grey'",
+                      KYRA)]
+    assert q1([KYRA + ": " + line1, ""], [KYRA, KYRA]) == [se.Q1_MISSING % (2, line2)]
+    assert q1([KYRA + ": " + line2, KYRA + ": " + line1], [KYRA, KYRA]) == [
+        se.Q1_ORDER % (2, line2)]
+    assert q1([KYRA + ": " + line2, KYRA + ": " + line1, RONIN + ": " + line2],
+              [KYRA, KYRA]) == [se.Q1_ORDER % (2, line2)]
+
+
+FREE_NARRATIVE = ('At dusk Kyra climbs the stone steps of a mountain temple, and the ronin walks '
+                  'one step behind her. Near the top Kyra turns and says, "We will reach the old '
+                  'gate before it is dark." They pass under the gate together, and Kyra says, '
+                  '"Stay very close to me now."')
+FREE_LINE_2 = "Stay very close to me now."
+RONIN_PATCH = {"target": "panel", "index": 2, "field": "dialogue", "reason": "r",
+               "replacement": "the ronin: Stay very close to me now."}
+
+
+def _free_run(ws, tmp_path, monkeypatch, story_env, narrative, story_id):
+    """(rc, ctx, agent log) of the final review's I1 run: shots, 2 panels, kyra and ronin
+    pinned, --speech-only; the plan (both replies) has beat 1 [c1] speaking line 1 and beat 2
+    [c2] spoken by c2 with no lines; panel 2's writer says line 2 as free dialogue; the critic
+    (both rounds) gives line 2 to the ronin."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2, members=_members(story_env),
+                       narration="speech", narrative=narrative, story_id=story_id)
+    raw = _lines(_raw("shots", 2, [["c1"], ["c2"]], ["c1", "c2"]), [[1], []])
+    panel_2 = seu.panel_json("shots", 2, RONIN)
+    panel_2["dialogue"] = FREE_LINE_2
+    critic = seu.answer(seu.critic_json((7, 6, 6), "revise", [RONIN_PATCH]))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)] * 2,
+                           panel={"1": [seu.answer(seu.panel_json("shots", 1, KYRA))],
+                                  "2": [seu.answer(panel_2)]},
+                           critic=[critic, critic])
+    rc, _advisories = se.run(ctx)
+    return rc, ctx, seu.agent_log(log)
+
+
+def test_q1_a1_a_free_line_under_the_wrong_speaker_ends_exit_2(ws, tmp_path, monkeypatch,
+                                                               capsys, story_env):
+    capsys.readouterr()
+    rc, ctx, log = _free_run(ws, tmp_path, monkeypatch, story_env, FREE_NARRATIVE, "sa5")
+    err = capsys.readouterr().err
+    wrong = Q1_SPEAKER % (2, FREE_LINE_2, "'the ronin'", 2, "'the woman in grey'",
+                          "'the woman in grey'", KYRA)
+    assert rc == 2
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "critic", "critic"]
+    assert ("  - " + wrong + "\n") in err
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert [(v["id"], v["message"]) for v in checks["hard"]] == [("Q1", wrong)]
+    critic_1 = _read_json(os.path.join(ctx.story_dir, "story_rounds", "round_1"), "critic.json")
+    assert critic_1["applied"] == []
+    assert critic_1["rejected"] == [{"patch": RONIN_PATCH, "reason": SA5_LINE_2}]
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert [(b["cast"], b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        (["c1"], "c1", [1]), (["c2"], "c2", [])]
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        assert "Dialogue: the ronin: " + FREE_LINE_2 + "\n" in f.read()
+
+
+def test_q1_a1_an_unattributed_free_line_keeps_any_speaker(ws, tmp_path, monkeypatch,
+                                                           story_env):
+    narrative = FREE_NARRATIVE.replace("and Kyra says", "and she says")
+    rc, ctx, log = _free_run(ws, tmp_path, monkeypatch, story_env, narrative, "sa6")
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel"]
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        assert "Dialogue: the ronin: " + FREE_LINE_2 + "\n" in f.read()

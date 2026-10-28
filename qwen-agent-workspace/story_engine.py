@@ -551,6 +551,14 @@ GAP_BLOCK_WORDS = frozenset("""
 OBJECT_WORDS = frozenset("""
     to at toward towards beside behind with of for from near by past around under over like
     than without into onto upon about besides""".split())
+# Speaker attribution spec SA1-A2: a word before the mention that makes it no subject ("A second
+# ronin says", "The man facing Kyra says"), and the relative words that put the mention inside a
+# relative clause ("The stranger who saved Kyra says").
+NON_SPEAKER_LEAD_WORDS = frozenset("""
+    a an another other second one every each some any no among amid amongst between against
+    opposite across along alongside beyond inside outside within below above beneath underneath
+    except unlike including through throughout via facing following""".split())
+RELATIVE_WORDS = frozenset(("who", "whom", "whose", "that", "which"))
 
 
 def _attribution_verb_at(words, p):
@@ -608,7 +616,9 @@ def _speaker_before(words, mentions):
             cid, width = next(iter(hits.items()))
             start = e - width
             before = words[start - 1] if start else None
-            if before in OBJECT_WORDS or (before in ("and", "or", "nor") and start > 1):
+            if (before in OBJECT_WORDS or before in NON_SPEAKER_LEAD_WORDS
+                    or RELATIVE_WORDS.intersection(words[:start])
+                    or (before in ("and", "or", "nor") and start > 1)):
                 return None
             if joined and any(c != cid for c, t in mentions
                               for q in range(len(t), start + 1) if words[q - len(t):q] == t):
@@ -662,8 +672,10 @@ def line_speakers(narrative, cast):
         lead = text[prev_end:match.start()].rstrip(_QUOTE_EDGE_CHARS)
         pieces = _CLAUSE_BREAK_RE.split(lead)
         clause, prior = line_words(pieces[-1]), line_words(pieces[-2]) if len(pieces) > 1 else []
-        # D1: "A, B, and C said" is a compound subject: no constraint.
-        if clause[:1] in (["and"], ["or"], ["nor"]) and _mentions_at(prior, mentions, end=len(prior)):
+        # D1, SA1-A3: "A, B, and C said" is a compound subject when the comma piece before the
+        # clause is exactly a cast mention: no constraint.
+        if clause[:1] in (["and"], ["or"], ["nor"]) and len(prior) in _mentions_at(
+                prior, mentions, end=len(prior)).values():
             before = None
         else:
             before = _speaker_before(clause, mentions)
@@ -2587,6 +2599,11 @@ Q1_MISSING = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is i
 Q1_ORDER = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is spoken out of the "
             "narrative's order; the Dialogue: fields must say the spoken lines in the order the "
             "narrative gives them")
+# Speaker attribution spec Q1-A1: a line the narrative gives to a named speaker is said only by
+# other speakers.
+Q1_SPEAKER = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is spoken by %s in "
+              "panel %d's Dialogue:, but the narrative gives it to %s; give it word for word to a "
+              "panel whose Dialogue: speaker is %s (Dialogue: %s: <the line>)")
 
 
 def _find_run(words, run, start):
@@ -2597,24 +2614,34 @@ def _find_run(words, run, start):
     return None
 
 
-def spoken_line_problems(ctx, lib, phrases, dialogues):
+def spoken_line_problems(ctx, lib, phrases, dialogues, speakers=None):
     """The Q1 violations of a story (QL10), in line order. dialogues is one Dialogue: value per
     panel, in order ("" for none); a value that names no known phrase counts as empty. Each
     required line must lie, word for word (line_words: case and punctuation ignored), inside one
-    panel's line, later than the line before it; a line found only earlier is out of order."""
+    panel's line, later than the line before it; a line found only earlier is out of order.
+    speakers is None, or one entry per required line: the referring phrase of the speaker the
+    narrative names, or None (speaker attribution spec Q1-A1). A line with a phrase counts only in
+    a panel whose Dialogue: speaker is that phrase; one found only under other speakers is
+    Q1_SPEAKER. A line with None, and every line when speakers is None, counts under any
+    speaker."""
     required = required_lines(ctx)
     if not required:
         return []
-    found = []
+    speakers = speakers or [None] * len(required)
+    found, said = [], []
     for value in dialogues:
         phrase, line = (lib.parse_dialogue(value, phrases)[:2] if value.strip()
                         else (None, ""))
         found.append(line_words(line) if phrase else [])
+        said.append(phrase)
     kpos, jpos, out = 0, 0, []
     for i, text in enumerate(required, start=1):
         run = line_words(text)
+        want = speakers[i - 1]
         hit = None
         for p in range(kpos, len(found)):
+            if want and said[p] != want:
+                continue
             j = _find_run(found[p], run, jpos if p == kpos else 0)
             if j is not None:
                 hit = (p, j)
@@ -2622,8 +2649,14 @@ def spoken_line_problems(ctx, lib, phrases, dialogues):
         if hit:
             kpos, jpos = hit[0], hit[1] + len(run)
             continue
-        anywhere = any(_find_run(words, run, 0) is not None for words in found)
-        out.append((Q1_ORDER if anywhere else Q1_MISSING) % (i, text))
+        here = [p for p, words in enumerate(found) if _find_run(words, run, 0) is not None]
+        if any(not want or said[p] == want for p in here):
+            out.append(Q1_ORDER % (i, text))
+        elif here:
+            out.append(Q1_SPEAKER % (i, text, _q(said[here[0]]), here[0] + 1, _q(want), _q(want),
+                                     want))
+        else:
+            out.append(Q1_MISSING % (i, text))
     return out
 
 
@@ -2655,7 +2688,11 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     advisory = plan_copied_examples(plan) + _order_by_panel(
         advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if "Q1" in GENERATION_CHECKS:
-        hard += spoken_line_problems(ctx, lib, cast_phrases(ctx, plan), dialogues)
+        # Speaker attribution spec Q1-A1: an attributed line counts only when its speaker says
+        # it. recheck passes no speakers, so old stories re-check exactly as before (D6).
+        speakers = [speaker_phrase_of(plan, cid) if cid else None
+                    for cid in line_speakers(ctx.narrative, plan["cast"])]
+        hard += spoken_line_problems(ctx, lib, cast_phrases(ctx, plan), dialogues, speakers)
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
         shots_hard, shots_other = split_shots(lib.shots_violations(
@@ -3094,12 +3131,6 @@ def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
     if beat["speaker"] and sid != beat["speaker"]:
         return True, ("panel %d's speaker is %s; a spoken-line patch never changes who speaks"
                       % (k, _q(beat["speaker"])))
-    said_by = line_speakers(ctx.narrative, plan["cast"])
-    for n in range(i, j + 1):
-        if said_by[n - 1] and said_by[n - 1] != sid:
-            return True, ("the narrative gives spoken line %d to %s, so a spoken-line patch never "
-                          "gives it to %s" % (n, _q(speaker_phrase_of(plan, said_by[n - 1])),
-                                              _q(speaker_phrase_of(plan, sid))))
     current = lib.parse_dialogue(dict(panel_fields(ctx, plan, parts, k)).get("Dialogue", ""),
                                  phrases)[1]
     have = list(beat["lines"]) if beat["lines"] else contained_lines(current, spoken)
@@ -3108,6 +3139,14 @@ def q1_dialogue_patch(ctx, lib, plan, parts, k, replacement):
         return True, ("the replacement must keep panel %d's spoken lines and add only an "
                       "adjacent line" % k)
     i, j = min(want), max(want)
+    # Speaker attribution spec SA5, SA5-A1: checked on the widened range, so a line the panel
+    # already says is checked too.
+    said_by = line_speakers(ctx.narrative, plan["cast"])
+    for n in range(i, j + 1):
+        if said_by[n - 1] and said_by[n - 1] != sid:
+            return True, ("the narrative gives spoken line %d to %s, so a spoken-line patch never "
+                          "gives it to %s" % (n, _q(speaker_phrase_of(plan, said_by[n - 1])),
+                                              _q(speaker_phrase_of(plan, sid))))
     words = line_words(current)
     if words and (not have or words != [w for n in range(min(have), max(have) + 1)
                                         for w in line_words(spoken[n - 1])]):
