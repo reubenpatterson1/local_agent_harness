@@ -687,8 +687,11 @@ def test_q1_a1_a_free_line_under_the_wrong_speaker_ends_exit_2(ws, tmp_path, mon
     assert rc == 2
     assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "critic", "critic"]
     assert ("  - " + wrong + "\n") in err
+    assert ("  - " + FREE_WRONG + "\n") in err
     checks = _read_json(ctx.story_dir, "story_checks.json")
-    assert [(v["id"], v["message"]) for v in checks["hard"]] == [("Q1", wrong)]
+    # Q1-A2: the panel 2 N18 joins the story Q1 (FREE_WRONG is defined with the Q1-A2 tests).
+    assert [(v["id"], v["message"]) for v in checks["hard"]] == [("Q1", wrong),
+                                                                 ("N18", FREE_WRONG)]
     critic_1 = _read_json(os.path.join(ctx.story_dir, "story_rounds", "round_1"), "critic.json")
     assert critic_1["applied"] == []
     assert critic_1["rejected"] == [{"patch": RONIN_PATCH, "reason": SA5_LINE_2}]
@@ -708,3 +711,181 @@ def test_q1_a1_an_unattributed_free_line_keeps_any_speaker(ws, tmp_path, monkeyp
     assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
     with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
         assert "Dialogue: the ronin: " + FREE_LINE_2 + "\n" in f.read()
+
+
+# --- Re-review residual: Q1-A2 (spec Amendment 2026-10-28) -------------------------------------
+
+N18_LINE_SPEAKER = ("panel %d: N18 dialogue: Dialogue: has %s say the narrative's spoken line %d "
+                    "\"%s\", which the narrative gives to %s; do not have %s say it: write a "
+                    "different line for this panel")
+FREE_LINE_1 = "We will reach the old gate before it is dark."
+FREE_WRONG = N18_LINE_SPEAKER % (2, "'the ronin'", 2, FREE_LINE_2, "'the woman in grey'",
+                                 "'the ronin'")
+GUARD_LINE = "I will guard the gate."
+GUARD_PATCH = {"target": "panel", "index": 2, "field": "dialogue", "reason": "r",
+               "replacement": GUARD_LINE}
+PROBE2_CASTS = [["c1"], ["c2"], ["c1"]]
+KYRA_SAYS = ["Dialogue: the woman in grey: " + FREE_LINE_1,
+             "Dialogue: the woman in grey: " + FREE_LINE_2]
+
+
+def test_q1_a2_constants():
+    assert se.N18_LINE_SPEAKER == N18_LINE_SPEAKER
+    assert se.REPAIR_IDS == ("N11", "N18", "T1", "T2", "T3")
+    assert se.NON_BLOCKING_IDS == ("T2", "T3")
+    violation = se.parse_violation(FREE_WRONG)
+    assert (violation["scope"], violation["index"], violation["id"]) == ("panel", 2, "N18")
+
+
+def _free3_plan(ws, story_env, narrative, casts, lines):
+    """(ctx, plan) of a shots, 3-panel, --speech-only story with kyra and ronin pinned: beat k
+    has cast casts[k - 1], spoken by its one member, and lines lines[k - 1]."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, members=_members(story_env),
+                       narration="speech", narrative=narrative)
+    raw = _lines(_raw("shots", 3, casts, [cast[0] for cast in casts]), lines)
+    return ctx, se.normalize_plan(ctx, raw)[0]
+
+
+def test_q1_a2_free_line_problems(ws, story_env):
+    ctx, plan = _free3_plan(ws, story_env, FREE_NARRATIVE, PROBE2_CASTS, [[1], [], [2]])
+    assert se.line_speakers(ctx.narrative, plan["cast"]) == ["c1", "c1"]
+
+    def free(says, speakers=(KYRA, KYRA), first=KYRA + ": " + FREE_LINE_1):
+        dialogues = [first, RONIN + ": " + says, KYRA + ": " + FREE_LINE_2]
+        return se.free_line_problems(ctx, lib, plan, dialogues, list(speakers))
+
+    assert free(FREE_LINE_2) == [FREE_WRONG]
+    assert free("Fine. " + FREE_LINE_2) == [FREE_WRONG]
+    assert free("stay VERY close to me now!") == [FREE_WRONG]
+    assert free(FREE_LINE_1 + " " + FREE_LINE_2) == [
+        N18_LINE_SPEAKER % (2, "'the ronin'", 1, FREE_LINE_1, "'the woman in grey'",
+                            "'the ronin'"), FREE_WRONG]
+    assert free("Stay very close to me now, Kyra.") == []
+    assert free("I said stay very close to me now.") == []
+    assert free(GUARD_LINE) == []
+    assert free(FREE_LINE_2, (None, None)) == []
+    assert free(FREE_LINE_2, (KYRA, None)) == []
+    assert free(FREE_LINE_2, (KYRA, RONIN)) == []
+    assert free(GUARD_LINE, first=RONIN + ": " + FREE_LINE_2) == []
+    go = 'At the gate Kyra says, "Go." The ronin waits beside her.'
+    ctx, plan = _free3_plan(ws, story_env, go, PROBE2_CASTS, [[1], [], []])
+    assert se.line_speakers(ctx.narrative, plan["cast"]) == ["c1"]
+    go_wrong = N18_LINE_SPEAKER % (2, "'the ronin'", 1, "Go.", "'the woman in grey'",
+                                   "'the ronin'")
+
+    def go_says(says):
+        dialogues = [KYRA + ": Go.", RONIN + ": " + says, ""]
+        return se.free_line_problems(ctx, lib, plan, dialogues, [KYRA])
+
+    assert go_says("Let us go.") == []
+    assert go_says("Go, now.") == []
+    assert go_says("We go at dawn.") == []
+    assert go_says("Go.") == [go_wrong]
+    assert go_says("Wait. Go!") == [go_wrong]
+    twice = 'At the gate Kyra says, "Go." The ronin says, "Go."'
+    ctx, plan = _free3_plan(ws, story_env, twice, PROBE2_CASTS, [[1], [], []])
+    assert se.line_speakers(ctx.narrative, plan["cast"]) == ["c1", "c2"]
+    assert se.free_line_problems(ctx, lib, plan, [KYRA + ": Go.", RONIN + ": Go.", ""],
+                                 [KYRA, RONIN]) == []
+
+
+def _free3_run(ws, tmp_path, monkeypatch, story_env, narrative, story_id, casts, lines, critic,
+               rewrites=()):
+    """(rc, ctx, agent log) of the re-review's probe2 run ($S/rr/test_rr_probe2.py): shots,
+    3 panels, kyra and ronin pinned, --speech-only; the plan (both replies) gives beat k cast
+    casts[k - 1], spoken by its one member, and lines lines[k - 1]; panel 2's writer says line 2
+    as free dialogue, and its later replies say each of rewrites instead; critic is the list of
+    critic replies."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, members=_members(story_env),
+                       narration="speech", narrative=narrative, story_id=story_id)
+    raw = _lines(_raw("shots", 3, casts, [cast[0] for cast in casts]), lines)
+    phrase = {"c1": KYRA, "c2": RONIN}
+    panel = {str(k): [seu.answer(seu.panel_json("shots", k, phrase[casts[k - 1][0]]))]
+             for k in (1, 3)}
+    panel["2"] = []
+    for line in (FREE_LINE_2,) + tuple(rewrites):
+        reply = seu.panel_json("shots", 2, phrase[casts[1][0]])
+        reply["dialogue"] = line
+        panel["2"].append(seu.answer(reply))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)] * 2, panel=panel,
+                           critic=list(critic))
+    rc, _advisories = se.run(ctx)
+    return rc, ctx, seu.agent_log(log)
+
+
+def _dialogue_lines(ctx):
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        return [line for line in f.read().splitlines() if line.startswith("Dialogue: ")]
+
+
+def test_q1_a2_the_probe2_shape_ends_exit_2_when_nothing_repairs_it(ws, tmp_path, monkeypatch,
+                                                                    capsys, story_env):
+    capsys.readouterr()
+    nothing = seu.answer(seu.critic_json((7, 6, 6), "revise", []))
+    rc, ctx, log = _free3_run(ws, tmp_path, monkeypatch, story_env, FREE_NARRATIVE, "sa7",
+                              PROBE2_CASTS, [[1], [], []], [nothing, nothing])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "panel", "critic",
+                                         "critic"]
+    assert ("  - " + FREE_WRONG + "\n") in err
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert [(v["id"], v["message"]) for v in checks["hard"]] == [("N18", FREE_WRONG)]
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert [(b["cast"], b["speaker"], b["lines"]) for b in plan["beats"]] == [
+        (["c1"], "c1", [1]), (["c2"], "c2", []), (["c1"], "c1", [2])]
+    assert _dialogue_lines(ctx) == [KYRA_SAYS[0], "Dialogue: the ronin: " + FREE_LINE_2,
+                                    KYRA_SAYS[1]]
+
+
+def test_q1_a2_the_critic_replaces_the_free_line(ws, tmp_path, monkeypatch, story_env):
+    critic = seu.answer(seu.critic_json((7, 6, 6), "revise", [GUARD_PATCH]))
+    rc, ctx, log = _free3_run(ws, tmp_path, monkeypatch, story_env, FREE_NARRATIVE, "sa8",
+                              PROBE2_CASTS, [[1], [], []], [critic])
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "panel", "critic"]
+    round_0 = _read_json(os.path.join(ctx.story_dir, "story_rounds", "round_0"),
+                         "story_checks.json")
+    assert [(v["id"], v["message"]) for v in round_0["hard"]] == [("N18", FREE_WRONG)]
+    critic_1 = _read_json(os.path.join(ctx.story_dir, "story_rounds", "round_1"), "critic.json")
+    assert (critic_1["applied"], critic_1["rejected"]) == ([GUARD_PATCH], [])
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+    assert _dialogue_lines(ctx) == [KYRA_SAYS[0], "Dialogue: the ronin: " + GUARD_LINE,
+                                    KYRA_SAYS[1]]
+
+
+def test_q1_a2_a_code_only_round_asks_the_writer_again(ws, tmp_path, monkeypatch, story_env):
+    bad = seu.answer("not json")
+    rc, ctx, log = _free3_run(ws, tmp_path, monkeypatch, story_env, FREE_NARRATIVE, "sa9",
+                              PROBE2_CASTS, [[1], [], []], [bad, bad], rewrites=(GUARD_LINE,))
+    assert rc == 0
+    assert [(r["stage"], r["panel"]) for r in log] == [
+        ("plan", None), ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3),
+        ("critic", None), ("critic", None), ("panel", 2)]
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_1", "panel_02_prompt_2.txt"),
+              encoding="utf-8") as f:
+        assert "\n- " + FREE_WRONG + "\n" in f.read()
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+    assert _dialogue_lines(ctx) == [KYRA_SAYS[0], "Dialogue: the ronin: " + GUARD_LINE,
+                                    KYRA_SAYS[1]]
+
+
+def test_q1_a2_an_unattributed_or_own_free_line_is_unchanged(ws, tmp_path, monkeypatch,
+                                                              story_env):
+    she = FREE_NARRATIVE.replace("and Kyra says", "and she says")
+    rc, ctx, log = _free3_run(ws, tmp_path, monkeypatch, story_env, she, "sa10", PROBE2_CASTS,
+                              [[1], [], [2]], [])
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+    assert _dialogue_lines(ctx) == [KYRA_SAYS[0], "Dialogue: the ronin: " + FREE_LINE_2,
+                                    KYRA_SAYS[1]]
+    own = FREE_NARRATIVE.replace("and Kyra says", "and the ronin says")
+    rc, ctx, log = _free3_run(ws, tmp_path, monkeypatch, story_env, own, "sa11",
+                              [["c1"], ["c2"], ["c2"]], [[1], [], [2]], [])
+    assert se.line_speakers(ctx.narrative, se.load_plan(ctx)["cast"]) == ["c1", "c2"]
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert _read_json(ctx.story_dir, "story_checks.json")["hard"] == []
+    assert _dialogue_lines(ctx) == [KYRA_SAYS[0], "Dialogue: the ronin: " + FREE_LINE_2,
+                                    "Dialogue: the ronin: " + FREE_LINE_2]

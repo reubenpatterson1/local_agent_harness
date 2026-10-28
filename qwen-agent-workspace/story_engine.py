@@ -2660,6 +2660,41 @@ def spoken_line_problems(ctx, lib, phrases, dialogues, speakers=None):
     return out
 
 
+# Speaker attribution spec Q1-A2: a panel with free dialogue (its beat has a speaker and no lines)
+# says, as whole sentences, a spoken line the narrative gives to another speaker. Hard and
+# blocking; panel scope, so the critic's dialogue patch and the code-only writer can replace it.
+N18_LINE_SPEAKER = ("panel %d: N18 dialogue: Dialogue: has %s say the narrative's spoken line %d "
+                    "\"%s\", which the narrative gives to %s; do not have %s say it: write a "
+                    "different line for this panel")
+
+
+def free_line_problems(ctx, lib, plan, dialogues, speakers):
+    """The Q1-A2 N18 violations of a story, by panel, then line. dialogues and speakers are
+    spoken_line_problems' (speakers: one phrase or None per required line). A panel counts when
+    its beat has a speaker and no lines and its Dialogue: names a known phrase. It says line n
+    when the line_words of one or more consecutive whole sentences (_sentences) of its line equal
+    line n's line_words; that is a violation when line n's phrase is not the panel's Dialogue:
+    speaker and no required line with the same words is unattributed or that speaker's."""
+    required = required_lines(ctx)
+    phrases = cast_phrases(ctx, plan)
+    out = []
+    for k, (beat, value) in enumerate(zip(plan["beats"], dialogues), start=1):
+        if not beat["speaker"] or beat.get("lines") or not value.strip():
+            continue
+        phrase, line = lib.parse_dialogue(value, phrases)[:2]
+        if not phrase:
+            continue
+        sentences = [line_words(s) for s in _sentences(line)]
+        runs = [sum(sentences[a:b], []) for a in range(len(sentences))
+                for b in range(a + 1, len(sentences) + 1)]
+        own = [line_words(t) for t, want in zip(required, speakers) if want in (None, phrase)]
+        for n, (text, want) in enumerate(zip(required, speakers), start=1):
+            words = line_words(text)
+            if want and want != phrase and words in runs and words not in own:
+                out.append(N18_LINE_SPEAKER % (k, _q(phrase), n, text, _q(want), _q(phrase)))
+    return out
+
+
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
                      "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
 
@@ -2693,6 +2728,8 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
         speakers = [speaker_phrase_of(plan, cid) if cid else None
                     for cid in line_speakers(ctx.narrative, plan["cast"])]
         hard += spoken_line_problems(ctx, lib, cast_phrases(ctx, plan), dialogues, speakers)
+        # Q1-A2: a free Dialogue: line never says another speaker's line (recheck: no, O1).
+        hard += free_line_problems(ctx, lib, plan, dialogues, speakers)
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
         shots_hard, shots_other = split_shots(lib.shots_violations(
@@ -3289,8 +3326,9 @@ def repairable_ids(hard):
 
 # Dialogue spec 6.1: T2 and T3 trigger repair but never block; every other hard violation blocks.
 NON_BLOCKING_IDS = ("T2", "T3")
-# The hard ids a code-only round sends back to the panel writer (PG5).
-REPAIR_IDS = ("N11", "T1", "T2", "T3")
+# The hard ids a code-only round sends back to the panel writer (PG5; speaker attribution spec
+# Q1-A2 adds N18, so a free line that says another speaker's line is rewritten).
+REPAIR_IDS = ("N11", "N18", "T1", "T2", "T3")
 
 
 def blocking(messages):
@@ -3346,14 +3384,15 @@ def line_problem(ctx, lib, line):
 
 def merge_repair(ctx, plan, k, old, new, ids):
     """Panel k's writer parts after a code-only round (dialogue spec PG5): new's motion or prompt
-    when ids has T2 or T3 and the PG3 guard accepts it, new's dialogue when ids has T1 and the
-    line fits, new's narration when ids has N11; every other part keeps old's text."""
+    when ids has T2 or T3 and the PG3 guard accepts it, new's dialogue when ids has T1 or N18
+    (speaker attribution spec Q1-A2) and the line fits, new's narration when ids has N11; every
+    other part keeps old's text."""
     merged = dict(old)
     action = "prompt" if ctx.mode == "no_stills" else "motion"
     if (ids & {"T2", "T3"} and new.get(action)
             and guard_problem(ctx, plan, old.get(action, ""), new[action]) is None):
         merged[action] = new[action]
-    if ("T1" in ids and new.get("dialogue")
+    if (ids & {"T1", "N18"} and new.get("dialogue")
             and line_problem(ctx, _character_lib(ctx.ws), _sentence(new["dialogue"])) is None):
         merged["dialogue"] = new["dialogue"]
     if "N11" in ids and "narration" in new:
