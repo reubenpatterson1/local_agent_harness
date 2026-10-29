@@ -2540,6 +2540,9 @@ def main(argv=None):
     if args.narrative is None and args.story_prompt_override is None:
         parser.error("either a narrative argument or --story-prompt-override is required")
     _resolve_length(args, raw_argv)
+    if args.panels < 1:
+        print("Error: --panels must be at least 1, got %d" % args.panels, file=sys.stderr)
+        return 2
 
     if getattr(args, "seed_image", None):
         if args.video_width is not None or args.video_height is not None:

@@ -1451,6 +1451,21 @@ def test_fw_g_effective_panels_at_the_top_and_below_the_range(ws, tmp_path, monk
         assert mui.effective_panels(fields, five.story_dir) == want, panels
 
 
+def test_fr_m1_panels_below_one_is_refused(movie, capsys):
+    for panels in ("0", "-1"):
+        capsys.readouterr()
+        assert ltx_movie.main([NARRATIVE, "--story-id", "frm1", "--panels", panels,
+                               "--dry-run", "--no-review"]) == 2
+        assert "Error: --panels must be at least 1, got %s" % panels in capsys.readouterr().err
+
+
+def test_fr_m2_legacy_ui_job_keeps_the_target(ws, tmp_path, monkeypatch):
+    five = save_story(ws, tmp_path, monkeypatch, "frm2", "chained", 4, 5)
+    fields = {"panels": 4, "mode": "chained"}
+    assert mui.effective_panels(fields, five.story_dir) == 5
+    assert mui.effective_panels(dict(fields, story_legacy=True), five.story_dir) == 4
+
+
 def test_fw_h_iterate_story_with_a_null_target():
     plan = {"narrative": NARRATIVE, "mode": "chained", "panels": 4, "panels_target": None,
             "cast": [], "loras": {"pinned": []}}

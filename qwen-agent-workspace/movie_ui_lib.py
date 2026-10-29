@@ -1251,7 +1251,8 @@ def effective_panels(fields, sdir):
     in [resolved_panels(fields), resolved_panels(fields) + PANELS_EXTRA], else
     resolved_panels(fields). sdir None means no story directory."""
     target = resolved_panels(fields)
-    planned = plan_panels(sdir, fields.get("mode")) if sdir is not None else None
+    planned = (plan_panels(sdir, fields.get("mode"))
+               if sdir is not None and fields.get("story_legacy") is not True else None)
     if target is not None and planned is not None and target <= planned <= target + PANELS_EXTRA:
         return planned
     return target
