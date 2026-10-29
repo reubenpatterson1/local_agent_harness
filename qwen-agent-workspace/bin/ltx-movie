@@ -306,7 +306,9 @@ def build_parser():
                               "with --no-stills and with --video-width/--video-height.")
     parser.add_argument("--panels", type=int, default=15,
                          help="number of chained clips; panel 1 also gets the movie's "
-                              "one still image; mutually exclusive with --length")
+                              "one still image; mutually exclusive with --length. With the "
+                              "default story engine it is a target: the plan may add up to 2 "
+                              "panels to fit the narrative, and Phases 2-4 use the plan's count.")
     parser.add_argument("--length", type=float, default=None,
                          help="total movie length in seconds; mutually exclusive with "
                               "--panels. Resolved as round(length / (frames / fps)) -- "
@@ -1417,6 +1419,71 @@ def _story_pins(args, catalog):
     return pins
 
 
+# Soft panel count spec SPC13, D7: the user is told when the story has more panels than its target,
+# and why, on every run.
+PANEL_COUNT_NOTE = "note: story.md has %d panels for a target of %d (%s)"
+PANEL_COUNT_PHASES = "; Phases 2-4 use all %d"
+PANEL_COUNT_NO_REASON = "plan.json records no reason"
+DRY_PANELS_RANGE = ("Panel count: a target of %d; the plan may have %d to %d beats, and Phases 2-4 "
+                    "use the plan's count.")
+DRY_PANELS_STORY = ("Panel count: plan.json and story.md have %d panels for a target of %d; Phases "
+                    "2-4 would use all %d.")
+DRY_PANELS_STOP = "Panel count: Phase 1 would stop: %s"
+
+
+def _plan_panels(args):
+    """(panels, reason) of plan.json when it is the plan of this story.md (soft panel count spec
+    SPC13, D6): a JSON object with schema ltx-movie.plan.v1, this run's mode, an int panels from
+    the target (args.panels_target, else args.panels) to the target plus
+    story_engine.PANELS_EXTRA, and story.md parsing to exactly that many panels; else None.
+    reason is "because <the text after 'because '>" of the first speech_notes entry that starts
+    "plan: P20 panel count: ", else PANEL_COUNT_NO_REASON."""
+    target = getattr(args, "panels_target", None) or args.panels
+    paths = _story_paths(args.story_id)
+    try:
+        with open(os.path.join(paths["story_dir"], "plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    panels = plan.get("panels") if isinstance(plan, dict) else None
+    if (not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1"
+            or plan.get("mode") != _story_mode(args) or not isinstance(panels, int)
+            or isinstance(panels, bool)
+            or not target <= panels <= target + _story_engine().PANELS_EXTRA
+            or len(_load_story_panels(paths["story_md"])) != panels):
+        return None
+    notes = plan.get("speech_notes") if isinstance(plan.get("speech_notes"), list) else []
+    saved = [m for m in notes if isinstance(m, str) and m.startswith("plan: P20 panel count: ")
+             and ", because " in m]
+    reason = ("because " + saved[0].split(", because ", 1)[1]) if saved else PANEL_COUNT_NO_REASON
+    return panels, reason
+
+
+def _resolve_story_panels(args):
+    """Soft panel count spec SPC13, D7: args.panels_target is --panels; with the default story
+    engine, no --force-story and an existing story.md whose plan.json is its plan for this run,
+    args.panels becomes the plan's panel count. Prints nothing; never fails."""
+    args.panels_target = args.panels
+    if (args.story_legacy or args.story_prompt_override is not None or args.force_story
+            or not os.path.isfile(_story_paths(args.story_id)["story_md"])):
+        return
+    found = _plan_panels(args)
+    if found is not None:
+        args.panels = found[0]
+
+
+def _write_story_prompt(args, story_dir):
+    """<story_dir>/story_prompt.txt: build_story_prompt for args.panels (soft panel count spec
+    SPC13, D12)."""
+    prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
+                                bool(getattr(args, "seed_image", None)),
+                                seconds=_clip_seconds(args),
+                                cast_block=getattr(args, "cast_block", None),
+                                shots=getattr(args, "shots", False))
+    with open(os.path.join(story_dir, "story_prompt.txt"), "w", encoding="utf-8") as f:
+        f.write(prompt)
+
+
 def _story_context(args, dry_run=False):
     """The story_engine.StoryContext of this run (robust story spec 2.1)."""
     engine = _story_engine()
@@ -1445,7 +1512,8 @@ def _story_context(args, dry_run=False):
         auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
         stills_pinned=stills, judge=args.judge,
         narration=False if args.no_narration else "speech" if args.speech_only else True,
-        clip_seconds=args.frames / float(args.fps))
+        clip_seconds=args.frames / float(args.fps),
+        panels_target=getattr(args, "panels_target", None), length=getattr(args, "length", None))
 
 
 def _no_stills_rules():
@@ -1608,21 +1676,16 @@ def _phase1_robust(args):
     engine = _story_engine()
     ctx = _story_context(args)
     if os.path.exists(story_md) and not args.force_story:
+        generated = False
         print("note: %s already exists; re-checking it instead of regenerating it (pass "
               "--force-story to regenerate)" % story_md)
         rc, advisories = engine.recheck(
             ctx, lambda path, panels, no_stills=False: _validate_story_md(
                 path, panels, no_stills, no_narration=args.no_narration or args.speech_only))
     else:
+        generated = True
         print("=== Phase 1: story ===")
-        prompt = build_story_prompt(args.narrative, args.story_id, args.panels, args.no_stills,
-                                     bool(getattr(args, "seed_image", None)),
-                                     seconds=_clip_seconds(args),
-                                     cast_block=getattr(args, "cast_block", None),
-                                     shots=getattr(args, "shots", False))
-        with open(os.path.join(paths["story_dir"], "story_prompt.txt"), "w",
-                  encoding="utf-8") as f:
-            f.write(prompt)
+        _write_story_prompt(args, paths["story_dir"])
         rc, advisories = engine.run(ctx, no_stills_rules=_no_stills_rules())
     if rc != 0:
         return rc
@@ -1633,6 +1696,15 @@ def _phase1_robust(args):
         print(content)
     for advisory in advisories:
         print("Warning: %s" % advisory)
+    target = getattr(args, "panels_target", None) or args.panels
+    found = _plan_panels(args)
+    if found is not None:
+        args.panels = found[0]
+        if args.panels != target:
+            if generated:
+                _write_story_prompt(args, paths["story_dir"])
+            print(PANEL_COUNT_NOTE % (args.panels, target, found[1])
+                  + ("" if args.story_only else PANEL_COUNT_PHASES % args.panels))
     members = getattr(args, "cast_members", None) or []
     if members:
         with open(story_md, encoding="utf-8") as f:
@@ -2222,13 +2294,25 @@ def _print_robust_phase1(args, paths):
     if args.judge:
         print("Judge gate: bin/judge-story --patches after the critic rounds (report only).")
     prompt = engine.build_plan_prompt(ctx, compatible, ctx.pinned)
-    argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_max_tokens(args.panels),
+    argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_max_tokens(engine.most_panels(ctx)),
                             image=ctx.seed_agent_image)
     print("Command (subprocess timeout %ds): %s"
-          % (engine.plan_timeout(args.panels), shlex.join(argv)))
+          % (engine.plan_timeout(engine.most_panels(ctx)), shlex.join(argv)))
     print()
     print("Rendered plan prompt:")
     print(prompt)
+    print()
+    # Soft panel count spec SPC13 (e); plan ruling SPR5: after the rendered prompt, so the
+    # command line is still followed by a blank line and "Rendered plan prompt:".
+    problem = engine.spoken_lines_problem(ctx)
+    lo, hi = engine.panel_range(ctx)
+    target = engine.target_panels(ctx)
+    if problem:
+        print(DRY_PANELS_STOP % problem)
+    elif ctx.panels != target:
+        print(DRY_PANELS_STORY % (ctx.panels, target, ctx.panels))
+    else:
+        print(DRY_PANELS_RANGE % (target, lo, hi))
     print()
 
 
@@ -2470,6 +2554,7 @@ def main(argv=None):
               file=sys.stderr)
         return 2
 
+    _resolve_story_panels(args)
     rc = _resolve_shots(args)
     if rc:
         return rc

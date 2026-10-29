@@ -895,3 +895,248 @@ def test_review_focus_2_a_stale_plan_is_not_adopted_by_recheck(ws, tmp_path, mon
     rc, _advisories = se.recheck(ctx, validate)
     assert rc == 0
     assert seen and set(seen) == {3}
+
+
+# --- SPT1 (Task 5 part): the bin/ltx-movie constants (SPC13 a) --------------------------------
+
+PANEL_COUNT_NOTE = "note: story.md has %d panels for a target of %d (%s)"
+PANEL_COUNT_PHASES = "; Phases 2-4 use all %d"
+PANEL_COUNT_NO_REASON = "plan.json records no reason"
+DRY_PANELS_RANGE = ("Panel count: a target of %d; the plan may have %d to %d beats, and Phases 2-4 "
+                    "use the plan's count.")
+DRY_PANELS_STORY = ("Panel count: plan.json and story.md have %d panels for a target of %d; Phases "
+                    "2-4 would use all %d.")
+DRY_PANELS_STOP = "Panel count: Phase 1 would stop: %s"
+PANELS_HELP = ("number of chained clips; panel 1 also gets the movie's one still image; mutually "
+               "exclusive with --length. With the default story engine it is a target: the plan "
+               "may add up to 2 panels to fit the narrative, and Phases 2-4 use the plan's count.")
+
+
+def test_spt1d_ltx_movie_constants():
+    assert ltx_movie.PANEL_COUNT_NOTE == PANEL_COUNT_NOTE
+    assert ltx_movie.PANEL_COUNT_PHASES == PANEL_COUNT_PHASES
+    assert ltx_movie.PANEL_COUNT_NO_REASON == PANEL_COUNT_NO_REASON
+    assert ltx_movie.DRY_PANELS_RANGE == DRY_PANELS_RANGE
+    assert ltx_movie.DRY_PANELS_STORY == DRY_PANELS_STORY
+    assert ltx_movie.DRY_PANELS_STOP == DRY_PANELS_STOP
+    helptext = " ".join(ltx_movie.build_parser().format_help().split())
+    assert PANELS_HELP in helptext
+
+
+def _args(*argv):
+    """bin/ltx-movie's args for argv after main's resolvers, story panels first (as
+    tests/test_lora_catalog.py::_movie_args, plus _resolve_story_panels)."""
+    args = ltx_movie.build_parser().parse_args(list(argv))
+    args.video_width, args.video_height = 704, 448
+    ltx_movie._resolve_story_panels(args)
+    for resolve in (ltx_movie._resolve_shots, ltx_movie._resolve_casting,
+                    ltx_movie._resolve_global_loras, ltx_movie._resolve_story_engine):
+        assert resolve(args) == 0
+    return args
+
+
+THREE_PANELS = ("# T\n\n## Panel 1 — A\nImage: The courier waits.\nMotion: x\nNarration: y\n\n"
+                "## Panel 2 — B\nMotion: x\nNarration: y\n\n## Panel 3 — C\nMotion: x\n"
+                "Narration: y\n")
+
+
+# --- SPT15: the bin/ltx-movie resolver (SPC13 b, c; D6) ---------------------------------------
+
+def test_spt15_the_resolver(movie, tmp_path, monkeypatch, capsys):
+    saved = save_story(movie, tmp_path, monkeypatch, "m1", "chained", 3, 4)
+
+    def resolved(panels, *flags):
+        args = ltx_movie.build_parser().parse_args(
+            [NARRATIVE, "--story-id", "m1", "--panels", str(panels)] + list(flags))
+        ltx_movie._resolve_story_panels(args)
+        return args.panels, args.panels_target
+
+    rows = ((3, (), (4, 3)), (2, (), (4, 2)), (4, (), (4, 4)), (1, (), (1, 1)),
+            (3, ("--force-story",), (3, 3)), (3, ("--story-legacy",), (3, 3)),
+            (3, ("--shots",), (3, 3)))
+    for panels, flags, want in rows:
+        assert resolved(panels, *flags) == want, (panels, flags)
+    story_md = os.path.join(saved.story_dir, "story.md")
+    with open(story_md, encoding="utf-8") as f:
+        text = f.read()
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(THREE_PANELS)
+    assert resolved(3) == (3, 3)
+    os.remove(story_md)
+    assert resolved(3) == (3, 3)
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(text)
+    save_story(movie, tmp_path, monkeypatch, "m1s", "shots", 3, 4)
+    args = ltx_movie.build_parser().parse_args(
+        [NARRATIVE, "--story-id", "m1s", "--panels", "3", "--shots", "--redo", "4"])
+    ltx_movie._resolve_story_panels(args)
+    assert ltx_movie._resolve_shots(args) == 0
+    assert args.redo_panels == [4]
+    args = ltx_movie.build_parser().parse_args(
+        [NARRATIVE, "--story-id", "m1s", "--panels", "3", "--shots", "--redo", "5"])
+    ltx_movie._resolve_story_panels(args)
+    capsys.readouterr()
+    assert ltx_movie._resolve_shots(args) == 2
+    assert capsys.readouterr().err == "Error: --redo panel 5 is out of range (1..4)\n"
+
+
+# --- SPT16, SPT25: adoption after Phase 1, the downstream uses, story_prompt.txt (SPC13 f, g) --
+
+def _story_prompt(story_id, panels, args):
+    return ltx_movie.build_story_prompt(NARRATIVE, story_id, panels, False, False,
+                                        seconds=ltx_movie._clip_seconds(args), cast_block=None,
+                                        shots=False)
+
+
+def test_spt16_spt25_adoption_and_story_prompt(movie, tmp_path, monkeypatch, capsys):
+    note = P20_NOTE % (4, 1, 3, P20_OTHER_REASON)
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 4))],
+                     panel=panel_script("chained", 4))
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "m2", "--panels", "3", "--story-only",
+                           "--no-review"]) == 0
+    out = capsys.readouterr().out
+    told = PANEL_COUNT_NOTE % (4, 3, "because " + P20_OTHER_REASON)
+    assert ("Warning: " + note + "\n") in out
+    assert (told + "\n") in out
+    assert out.index("Warning: " + note) < out.index(told)
+    story_dir = os.path.join(movie, "generated", "stories", "m2")
+    prompt_path = os.path.join(story_dir, "story_prompt.txt")
+    with open(prompt_path, encoding="utf-8") as f:
+        prompt = f.read()
+    assert "EXACTLY 4 panel sections" in prompt
+    args = _args(NARRATIVE, "--story-id", "m2", "--panels", "3", "--no-review")
+    assert prompt == _story_prompt("m2", 4, args)
+    assert (args.panels, args.panels_target) == (4, 3)
+    args.panels = 3
+    os.utime(prompt_path, (1000000000, 1000000000))
+    capsys.readouterr()
+    assert ltx_movie._phase1_robust(args) == 0
+    out = capsys.readouterr().out
+    assert (told + PANEL_COUNT_PHASES % 4 + "\n") in out
+    assert args.panels == 4
+    assert ltx_movie._target_seconds(args) == 4 * 145 / 24.0
+    assert os.path.getmtime(prompt_path) == 1000000000
+    args = _args(NARRATIVE, "--story-id", "m2", "--panels", "4", "--no-review")
+    capsys.readouterr()
+    assert ltx_movie._phase1_robust(args) == 0
+    assert "note: story.md has " not in capsys.readouterr().out
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 3))],
+                     panel=panel_script("chained", 3))
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "m3", "--panels", "3", "--story-only",
+                           "--no-review"]) == 0
+    assert "note: story.md has " not in capsys.readouterr().out
+    with open(os.path.join(movie, "generated", "stories", "m3", "story_prompt.txt"),
+              encoding="utf-8") as f:
+        assert "EXACTLY 3 panel sections" in f.read()
+
+
+def test_spt16c_catalog_loras_follow_the_adopted_count(movie, tmp_path, story_env):
+    files = str(tmp_path / "files")
+    fast = seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", triggers=["fastmo"])
+    seu.make_catalog(story_env["catalog"], [fast])
+    story_dir = os.path.join(movie, "generated", "stories", "c4")
+    os.makedirs(story_dir)
+    _write_json(story_dir, "plan.json", {
+        "schema": "ltx-movie.plan.v1", "mode": "chained", "panels": 4, "panels_target": 3,
+        "title": "T", "logline": "x", "cast": [], "locations": [], "props": [], "beats": [],
+        "loras": {"global": [], "per_beat": {"4": [{"id": "fast-motion", "strength": 0.7}]},
+                  "stills": []}})
+    with open(os.path.join(story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(THREE_PANELS + "\n## Panel 4 — D\nMotion: x\nNarration: y\n")
+    args = _args(NARRATIVE, "--story-id", "c4", "--panels", "3")
+    assert args.panels == 4
+    error, lists = ltx_movie._catalog_panel_loras(args)
+    assert error is None and len(lists) == 4
+    assert [p["id"] for p in lists[3]] == ["fast-motion"]
+    assert lists[3][0]["path"] == fast["path"] and lists[:3] == [[], [], []]
+
+
+def test_spt16d_shots_stills_follow_the_adopted_count(movie, tmp_path, monkeypatch):
+    save_story(movie, tmp_path, monkeypatch, "m2s", "shots", 3, 4)
+    args = _args(NARRATIVE, "--story-id", "m2s", "--panels", "3", "--shots")
+    assert args.panels == 4
+    assert len(ltx_movie._shots_image_flags(args)) == 8
+
+
+# --- Plan ruling SPR2: --length reaches the engine ----------------------------------------------
+
+TEN = (EIGHT + ' He says "The lanterns are burning low along the old wall." He says "We should '
+       'rest here until the cold morning comes."')
+
+
+def test_spr2c_length_reaches_the_story_context_and_the_hint(movie, tmp_path, monkeypatch,
+                                                             capsys):
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "l1", "--length", "30"])
+    ltx_movie._resolve_length(args, [NARRATIVE, "--story-id", "l1", "--length", "30"])
+    ltx_movie._resolve_story_panels(args)
+    ctx = ltx_movie._story_context(args)
+    assert (ctx.panels, ctx.panels_target, ctx.length) == (5, 5, 30.0)
+    args = _args(NARRATIVE, "--story-id", "l2", "--panels", "3")
+    assert ltx_movie._story_context(args).length is None
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 2))])
+    capsys.readouterr()
+    assert ltx_movie.main([TEN, "--story-id", "l3", "--length", "12", "--story-only",
+                           "--no-review"]) == 2
+    err = capsys.readouterr().err
+    cap = lib.dialogue_word_cap(145 / 24.0, 1)
+    assert ("Error: " + LINES_LENGTH_PROBLEM % (6, 6, "6", cap, 4, "12.0", 2, 2, "24.2", 4)
+            + "\n") in err
+    assert "--panels" not in err
+    assert seu.agent_log(log) == []
+
+
+# --- SPT17, Review Focus 4: the dry run (SPC13 e; plan ruling SPR5) ---------------------------
+
+def _dry(argv, capsys):
+    capsys.readouterr()
+    assert ltx_movie.main(argv + ["--dry-run", "--no-review"]) == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    start = lines.index("--- Phase 1: story ---")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("--- Phase "))
+    return out, lines[start:end]
+
+
+def test_spt17_the_dry_run(movie, tmp_path, monkeypatch, capsys):
+    out, block = _dry([NARRATIVE, "--story-id", "d1", "--panels", "20"], capsys)
+    assert DRY_PANELS_RANGE % (20, 20, 22) in block
+    assert "Command (subprocess timeout 880s): " in out
+    argv = shlex.split(out.split("Command (subprocess timeout 880s): ", 1)[1]
+                       .split("\n\nRendered plan prompt:\n", 1)[0])
+    assert argv[argv.index("--max-tokens") + 1] == "5500"
+    assert argv[-1].startswith('You are planning a short narrated movie (story-id "d1")')
+    assert block[block.index("Rendered plan prompt:") + 1].startswith("You are planning")
+    _out, block = _dry([EIGHT, "--story-id", "d2", "--panels", "1"], capsys)
+    assert [line for line in block if line.startswith(
+        "Panel count: Phase 1 would stop: the narrative quotes 4 spoken lines")]
+    save_story(movie, tmp_path, monkeypatch, "m1", "chained", 3, 4)
+    out, block = _dry([NARRATIVE, "--story-id", "m1", "--panels", "3"], capsys)
+    assert DRY_PANELS_STORY % (4, 3, 4) in block
+    assert ("--target-seconds " + str(4 * 145 / 24.0)) in out
+    assert ("--target-seconds " + str(3 * 145 / 24.0)) not in out
+
+
+# --- SPT18: why the count must be adopted before Phase 3 --------------------------------------
+
+# A valid 1x1 PNG (copied from tests/test_dialogue.py): the manifest only checks that it opens.
+PNG_1X1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+                           "60e6kgAAAABJRU5ErkJggg==")
+
+
+def test_spt18_the_manifest_needs_the_adopted_count(movie, tmp_path, monkeypatch, capsys):
+    saved = save_story(movie, tmp_path, monkeypatch, "m5", "chained", 3, 4)
+    monkeypatch.setattr(manifest, "WS", movie)
+    image = str(tmp_path / "seed.png")
+    with open(image, "wb") as f:
+        f.write(PNG_1X1)
+    base = ["--chain", "--prompts-md", os.path.join(saved.story_dir, "story.md"), "--image",
+            image, "--fps", "24", "--min-frames", "145", "--max-frames", "145", "--pace", "equal",
+            "--force", "--story-id", "x"]
+    assert manifest.main(base + ["--target-seconds", repr(4 * 145 / 24.0)]) == 0
+    written = _read_json(os.path.join(movie, "generated", "stories", "x"), "manifest.json")
+    assert len(written["panels"]) == 4
+    capsys.readouterr()
+    assert manifest.main(base + ["--target-seconds", repr(3 * 145 / 24.0)]) == 2
+    assert "not achievable" in capsys.readouterr().err
