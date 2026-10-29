@@ -999,3 +999,223 @@ def test_sft18_exit_verbs():
     for words in ("pushes off from the kerb", "turns off the light", "the leaves fall",
                   "the exit sign", "steps back", "turns toward the camera", "runs down the steel"):
         assert se.EXIT_RE.search("She %s now." % words) is None, words
+
+
+# --- SFT1 (Task 4 part): the repair constants (SF13) -------------------------------------------
+
+FORMAT_IDS = ("N7", "N20", "N21", "N22")
+REPAIR_IDS = ("N7", "N11", "N18", "N20", "N21", "N22", "T1", "T2", "T3")
+CRITIC_SPEAKING_MOTION_CLAUSE = (
+    " On a panel with a Dialogue: line, the pipeline inserts the spoken words right after the "
+    "first sentence about what the speaker does, so keep everything the speaker does before "
+    "the line in that first sentence and at most one short sentence of the speaker's reaction "
+    "after it, in which nobody else acts and the speaker never leaves the frame. Begin each of "
+    "those sentences with the speaker's referring phrase.")
+MOTION_LINE = ('- target "panel", field "%s", index = the panel number, only for a panel with '
+               "a [hard] T2, T3, N7, N20, N21 or N22 problem: replacement is the panel's whole new "
+               "%s: writer text, identical to the current text except for the sentence or "
+               "sentences that cause the problem.")
+DIALOGUE_LINE = ('- target "panel", field "dialogue", index = the panel number, only for a panel '
+                 "with a [hard] T1, N18 or N22 problem: replacement is the new spoken line, "
+                 "without the speaker's phrase and without quotation marks, within the limit a T1 "
+                 "problem states.")
+
+
+def test_sft1d_repair_constants():
+    assert se.FORMAT_IDS == FORMAT_IDS
+    assert se.REPAIR_IDS == REPAIR_IDS
+    assert se.CRITIC_SPEAKING_MOTION_CLAUSE == CRITIC_SPEAKING_MOTION_CLAUSE
+    assert "slowly" not in se.CRITIC_SPEAKING_MOTION_CLAUSE.lower()
+
+
+# --- SFT11, Review Focus 2: the round-0 re-ask, then the trim (SF13d, SK7) ----------------------
+
+SFT11_EXIT = "The woman in grey turns to the camera. The woman in grey walks away."
+SFT11_CLEAN = "The woman in grey turns to the camera at real-time speed."
+
+
+def _sft11_reply(motion):
+    return seu.answer({"title": "At The Gate", "image": seu.panel_json("shots", 1, KYRA)["image"],
+                       "motion": motion, "dialogue": "We go now."})
+
+
+def _sft11_run(ws, tmp_path, monkeypatch, story_env, story_id, panel_1):
+    """(rc, ctx, agent log) of a shots run: 2 panels, kyra and ronin pinned, --speech-only; beat
+    1 casts kyra, who speaks; beat 2 casts the ronin, silent; panel 1 gets the replies panel_1."""
+    raw = _raw("shots", 2, [["c1"], ["c2"]], ["c1", ""])
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)],
+                           panel={"1": panel_1,
+                                  "2": [seu.answer(seu.panel_json("shots", 2, RONIN))]})
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2, members=_members(story_env),
+                       narration="speech", story_id=story_id)
+    rc, _advisories = se.run(ctx)
+    return rc, ctx, seu.agent_log(log)
+
+
+def _motion_lines(ctx):
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        return [line for line in f.read().splitlines() if line.startswith("Motion: ")]
+
+
+def _messages(ctx, key):
+    return [entry["message"] for entry in _read_json(ctx.story_dir, "story_checks.json")[key]]
+
+
+def test_sft11_the_round_0_re_ask_then_the_trim(ws, tmp_path, monkeypatch, story_env):
+    removed = se.REPAIR_NOTE % (1, "N21", "after the line", "Motion",
+                                "'The woman in grey walks away.'")
+    rc, ctx, log = _sft11_run(ws, tmp_path, monkeypatch, story_env, "sf11a",
+                              [_sft11_reply(SFT11_EXIT), _sft11_reply(SFT11_CLEAN)])
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "panel_01_prompt_2.txt"),
+              encoding="utf-8") as f:
+        assert ("Your previous version of this panel was rejected. Problems:\n- panel 1: N21 after "
+                "the line: Motion: ") in f.read()
+    assert _motion_lines(ctx)[0].startswith("Motion: " + SFT11_CLEAN)
+    assert [m for m in _messages(ctx, "advisory") if "the pipeline removed" in m] == []
+    rc, ctx, log = _sft11_run(ws, tmp_path, monkeypatch, story_env, "sf11b",
+                              [_sft11_reply(SFT11_EXIT), _sft11_reply(SFT11_EXIT)])
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert "walks away" not in _motion_lines(ctx)[0]
+    assert _motion_lines(ctx)[0].startswith("Motion: The woman in grey turns to the camera. ")
+    assert removed in _messages(ctx, "advisory")
+    rc, ctx, log = _sft11_run(ws, tmp_path, monkeypatch, story_env, "sf11c",
+                              [_sft11_reply("The woman in grey skates away.")] * 2)
+    assert rc == 2
+    assert [r["stage"] for r in log][:4] == ["plan", "panel", "panel", "panel"]
+    assert _messages(ctx, "hard") == [N21_EXIT("Motion", "The woman in grey skates away.",
+                                               "skates away", KYRA)]
+
+
+def test_review_focus_2_an_unparseable_re_ask_keeps_the_first_reply_and_trims(
+        ws, tmp_path, monkeypatch, story_env):
+    rc, ctx, log = _sft11_run(ws, tmp_path, monkeypatch, story_env, "sfrf2",
+                              [_sft11_reply(SFT11_EXIT), {"answer": "not json"}])
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert _motion_lines(ctx)[0] == ("Motion: The woman in grey turns to the camera. The woman in "
+                                     "grey faces the camera. The camera stays static.")
+    assert se.REPAIR_NOTE % (1, "N21", "after the line", "Motion",
+                             "'The woman in grey walks away.'") in _messages(ctx, "advisory")
+
+
+# --- SFT16, Review Focus 1: the critic, the patches and merge_repair (SF13e-h) -----------------
+
+def _patch(target, index, field, replacement, reason="because"):
+    return {"target": target, "index": index, "field": field, "reason": reason,
+            "replacement": replacement}
+
+
+def _speaking_state(ws, motion):
+    """(ctx, state) of a 1-panel shots movie, --speech-only: the courier speaks, the camera is
+    a slow push-in, and the writer's Motion is motion."""
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1, narration="speech")
+    raw = seu.plan_json("shots", 1)
+    raw["beats"][0].update(speaker="c1", camera="slow push-in")
+    plan, _shape = se.normalize_plan(ctx, raw)
+    part = {"title": "The Gate", "image": seu.panel_json("shots", 1)["image"], "motion": motion,
+            "dialogue": "Go now."}
+    return ctx, {"plan": plan, "parts": [part]}
+
+
+SFT16_EXIT = "The courier turns to the camera. The courier walks away."
+
+
+def test_sft16_the_critic_lines_the_patches_and_merge_repair(ws):
+    for mode, label in (("chained", "Motion"), ("shots", "Motion"), ("no_stills", "Prompt")):
+        assert se.critic_field_lines(mode, None) == (
+            MOTION_LINE % (label.lower(), label) + "\n" + DIALOGUE_LINE), mode
+    ctx, state = _speaking_state(ws, SFT16_EXIT)
+    new, applied, rejected = se.apply_patches(
+        ctx, state, [_patch("panel", 1, "motion", "The courier turns to the camera.")],
+        repairable={1: {"N21"}})
+    assert (len(applied), rejected) == (1, [])
+    assert new["parts"][0]["motion"] == "The courier turns to the camera."
+    new, applied, rejected = se.apply_patches(
+        ctx, state, [_patch("panel", 1, "motion", SFT16_EXIT)], repairable={1: {"N21"}})
+    assert applied == []
+    assert [r["reason"] for r in rejected] == [
+        "the patch does not fix the panel's N7, N20, N21 or N22 problem"]
+    new, applied, rejected = se.apply_patches(
+        ctx, state, [_patch("panel", 1, "motion",
+                            "The courier sits. The courier waits. The courier nods.")],
+        repairable={1: {"T2"}})
+    assert [r["reason"] for r in rejected] == [
+        "the patch changes 2 sentences; it may change at most 1 contiguous sentence(s) and must "
+        "keep every other sentence word for word"]
+    old = dict(state["parts"][0], image="The courier stands by the zinc counter.")
+    fixed = dict(state["parts"][0], image="The courier stands by the wooden gate.")
+    assert se.merge_repair(ctx, state["plan"], 1, old, fixed, {"N22"})["image"] == (
+        "The courier stands by the wooden gate.")
+    assert se.merge_repair(ctx, state["plan"], 1, old, fixed, {"T2"})["image"] == (
+        "The courier stands by the zinc counter.")
+
+
+def test_review_focus_1_a_critic_patch_keeps_an_end_framed_camera_sentence_whole(ws):
+    ctx, state = _speaking_state(ws, SFT16_EXIT)
+    replacement = ("The courier turns to the camera. The camera pushes in — as the move "
+                   "completes, his face fills the frame.")
+    new, applied, rejected = se.apply_patches(
+        ctx, state, [_patch("panel", 1, "motion", replacement)], repairable={1: {"N21"}})
+    assert (len(applied), rejected) == (1, [])
+    assert new["parts"][0]["motion"] == replacement
+    field = dict(se.panel_fields(ctx, new["plan"], new["parts"], 1))["Motion"]
+    assert field == ("The courier turns to the camera. The camera pushes in — as the move "
+                     "completes, his face fills the frame. The courier faces the camera.")
+
+
+# --- SFT19, SFT20, Review Focus 3: the trim (SF13b) --------------------------------------------
+
+def test_sft19_the_trim_keeps_the_only_action(ws):
+    ctx, plan, parts = _hockey(ws, story_id="sf19")
+    part = dict(parts[1], motion="The FuboTV hockey player skates away.")
+    assert se.trim_format(ctx, plan, 2, part) == part
+    assert se.format_problems(ctx, plan, part, 2) != []
+
+
+def test_sft20_the_chained_hockey_shape(ws):
+    ctx, plan, parts = _hockey(ws, story_id="sf20")
+    first, cut = ("The FuboTV hockey player carves a sharp stop, spraying ice mist into the air, "
+                  "his face toward the lens, then pushes off and skates away from the camera.",
+                  "The FuboTV hockey player carves a sharp stop, spraying ice mist into the air, "
+                  "his face toward the lens, then pushes off.")
+    assert se.panel_camera(ctx, plan, 2) == "static"
+    assert se.format_problems(ctx, plan, parts[1], 2) == [
+        "panel 2: N21 after the line: Motion: '%s' has a character leave the frame or turn away "
+        "('skates away'); 'FuboTV hockey player' speaks in this panel, so end it with 'FuboTV "
+        "hockey player' still in frame, face toward the camera" % first]
+    trimmed = se.trim_format(ctx, plan, 2, parts[1])
+    assert trimmed["motion"] == cut
+    assert trimmed["repairs"] == [
+        se.REPAIR_NOTE % (2, "N21", "after the line", "Motion",
+                          "'and skates away from the camera.'"),
+        se.REPAIR_NOTE % (2, "N21", "after the line", "Motion",
+                          "'The camera holds on him as he recedes.'")]
+    assert se.format_problems(ctx, plan, trimmed, 2) == []
+    assert se.repair_action_text(ctx, plan, 2, parts[1]["motion"]) == (parts[1]["motion"], [])
+    assert se.repair_action_text(ctx, plan, 1, parts[0]["motion"]) == (
+        "The FuboTV hockey player skates forward toward the camera, his face toward the lens, in "
+        "frame and lit.", [se.REPAIR_NOTE % (1, "N7", "dialogue and text", "Motion",
+                                             "'as he speaks.'")])
+
+
+def test_review_focus_3_an_end_frame_in_the_references_words_falls_back(ws):
+    camera = ("The camera pushes in — as the move completes, her face fills the frame from chin "
+              "to brow.")
+    ctx, state = _speaking_state(ws, "The courier turns to the camera at real-time speed. "
+                                 + camera)
+    plan, part = state["plan"], state["parts"][0]
+    problems = se.format_problems(ctx, plan, part, 1)
+    assert [m for m in problems if " N22 " in m] == problems
+    assert len(problems) == 1
+    assert problems[0].startswith("panel 1: N22 reference copy: Motion: copies the format "
+                                  "reference ('")
+    trimmed = se.trim_format(ctx, plan, 1, part)
+    assert trimmed["motion"] == "The courier turns to the camera at real-time speed."
+    assert trimmed["repairs"] == [se.REPAIR_NOTE % (1, "N22", "reference copy", "Motion",
+                                                    se._q(camera))]
+    assert dict(se.panel_fields(ctx, plan, [trimmed], 1))["Motion"] == (
+        "The courier turns to the camera at real-time speed. The courier faces the camera. The "
+        "camera pushes in.")

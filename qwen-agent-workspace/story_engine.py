@@ -3138,6 +3138,85 @@ GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10"
                      "Q1", "N19")
 
 
+# Shot prompt format spec SF13, D8: the writer-format ids.
+FORMAT_IDS = ("N7", "N20", "N21", "N22")
+
+
+def format_problems(ctx, plan, part, k):
+    """The hard N7, N20, N21 and N22 messages of panel k with writer parts part (SF13)."""
+    parts = [{}] * (k - 1) + [part]
+    writers = {LABELS[key]: part.get(key, "") for key in panel_keys(ctx, plan, k)
+               if key != "title"}
+    return _field_checks(ctx, _character_lib(ctx.ws), plan, k, part.get("title", ""),
+                         panel_fields(ctx, plan, parts, k), writers, FORMAT_IDS, (),
+                         generating=True)[0]
+
+
+def trim_format(ctx, plan, k, part):
+    """part after the SF13 trim, which runs only for an N21 or N22 that format_problems still
+    finds: on the action field an exit is cut at the clause boundary before it (a camera
+    sentence with an exit is dropped), a post-line sentence with another actor is dropped, and a
+    sentence that copies the reference is dropped (_apply_drops keeps one action sentence); on
+    the image and narration fields a copying sentence is dropped while one sentence remains.
+    Each removal adds a REPAIR_NOTE to part["repairs"]."""
+    ids = set(parse_violation(m)["id"] for m in format_problems(ctx, plan, part, k))
+    if not ids & {"N21", "N22"}:
+        return part
+    lib = _character_lib(ctx.ws)
+    phrases = cast_phrases(ctx, plan)
+    new = dict(part)
+    notes = list(part.get("repairs", []))
+    action = "prompt" if ctx.mode == "no_stills" else "motion"
+    label = LABELS[action]
+    sentences = _sentences(new.get(action, ""))
+    why = {}
+    if "N21" in ids:
+        beat = plan["beats"][k - 1]
+        mentions = _mentions(plan["cast"])
+        others = [m for m in mentions if m[0] != beat["speaker"]]
+        own = [m for m in mentions if m[0] == beat["speaker"]]
+        for i, sentence in enumerate(sentences):
+            found = EXIT_RE.search(sentence)
+            if not found:
+                continue
+            cut = (None if lib._is_camera_sentence(sentence, phrases)
+                   else _cut_clause(sentence, found.start()))
+            if cut:
+                sentences[i] = cut[0]
+                notes.append(REPAIR_NOTE % (k, "N21", "after the line", label, _q(cut[1])))
+            else:
+                why[i] = "N21"
+        if ctx.mode != "no_stills":
+            actions = [i for i, s in enumerate(sentences) if not lib._is_camera_sentence(s, phrases)
+                       and not lib.is_facing_sentence(s, phrases)]
+            for i in actions[1:]:
+                if _other_actor(sentences[i], others, own):
+                    why.setdefault(i, "N21")
+    if "N22" in ids:
+        for i, sentence in enumerate(sentences):
+            if reference_copies(ctx.narrative, plan, sentence, ctx.goal):
+                why.setdefault(i, "N22")
+    kept, dropped = _apply_drops(lib, sentences, sorted(why), phrases)
+    for i, sentence in enumerate(sentences):
+        if sentence in dropped and i in why:
+            name = "after the line" if why[i] == "N21" else "reference copy"
+            notes.append(REPAIR_NOTE % (k, why[i], name, label, _q(sentence)))
+    if kept:
+        new[action] = " ".join(kept)
+    if "N22" in ids:
+        for key in ("image", "narration"):
+            if new.get(key):
+                field = _sentences(new[key])
+                bad = [s for s in field if reference_copies(ctx.narrative, plan, s, ctx.goal)]
+                if bad and len(bad) < len(field):
+                    new[key] = " ".join(s for s in field if s not in bad)
+                    notes += [REPAIR_NOTE % (k, "N22", "reference copy", LABELS[key], _q(s))
+                              for s in bad]
+    if notes:
+        new["repairs"] = notes
+    return new
+
+
 def panel_checks(ctx, plan, parts, text, story_md_path):
     """(hard, advisory) of an assembled story (RS15; dialogue spec 6.3): per panel the
     _field_checks classes; plan-scope N10 is advisory; in shots mode S1 and S3 are hard and every
@@ -3387,8 +3466,9 @@ CRITIC_Q1_FIELD_LINE = (
 CRITIC_SPEAKING_MOTION_CLAUSE = (
     " On a panel with a Dialogue: line, the pipeline inserts the spoken words right after the "
     "first sentence about what the speaker does, so keep everything the speaker does before "
-    "the line in that first sentence and everything they do after it in a later sentence. Begin "
-    "each of those sentences with the speaker's referring phrase.")
+    "the line in that first sentence and at most one short sentence of the speaker's reaction "
+    "after it, in which nobody else acts and the speaker never leaves the frame. Begin each of "
+    "those sentences with the speaker's referring phrase.")
 
 
 def listed(lines):
@@ -3413,17 +3493,17 @@ def critic_field_lines(mode, catalog_lines, narration=True, spoken=False, speaki
                      + "\n" + "\n".join(catalog_lines))
     label = "Prompt" if mode == "no_stills" else "Motion"
     motion = ('- target "panel", field "%s", index = the panel number, only for a panel with a '
-              "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
-              "identical to the current text except for the sentence or sentences that hold "
-              "the extra or missing action." % (label.lower(), label))
+              "[hard] T2, T3, N7, N20, N21 or N22 problem: replacement is the panel's whole new "
+              "%s: writer text, identical to the current text except for the sentence or "
+              "sentences that cause the problem." % (label.lower(), label))
     if speaking and mode == "chained" and narration is not False:
         motion += CRITIC_SPEAKING_MOTION_CLAUSE
     lines.append(motion)
     if narration is not False:
         lines.append('- target "panel", field "dialogue", index = the panel number, only for a '
-                     "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
-                     "without the speaker's phrase and without quotation marks, within the limit "
-                     "the T1 problem states.")
+                     "panel with a [hard] T1, N18 or N22 problem: replacement is the new spoken "
+                     "line, without the speaker's phrase and without quotation marks, within "
+                     "the limit a T1 problem states.")
         if spoken:
             lines.append(CRITIC_Q1_FIELD_LINE)
     return "\n".join(lines)
@@ -3739,7 +3819,8 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
                 else:
                     applied.append(patch)
                 continue
-        need = {"T1", "N18"} if field == "dialogue" else {"T2", "T3"}
+        need = ({"T1", "N18", "N22"} if field == "dialogue"
+                else {"T2", "T3", "N7", "N20", "N21", "N22"})
         if repairable is not None and not (repairable.get(k, set()) & need):
             reason = (Q1_ONLY_REASON % k if field == "dialogue" and q1 else
                       "panel %d has no hard timing or amount-of-action problem; advisory findings "
@@ -3757,13 +3838,27 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
             problem = line_problem(ctx, lib, text) if text else "empty after cleanup"
         else:
             text = clean_writer(lib, patch["replacement"],
-                                pasted_pieces(ctx, plan, k).get(field, ()))
-            problem = (guard_problem(ctx, plan, parts[k - 1].get(field, ""), text) if text
-                       else "empty after cleanup")
+                                cleanup_pieces(pasted_pieces(ctx, plan, k), field))
+            notes = []
+            if text and field in ("motion", "prompt"):
+                text, notes = repair_action_text(ctx, plan, k, text)
+            if not text:
+                problem = "empty after cleanup"
+            elif repairable is not None and repairable.get(k, set()) & set(FORMAT_IDS):
+                problem = (None if len(format_problems(ctx, plan, dict(parts[k - 1], **{field: text}),
+                                                       k))
+                           < len(format_problems(ctx, plan, parts[k - 1], k))
+                           else "the patch does not fix the panel's N7, N20, N21 or N22 problem")
+            else:
+                problem = guard_problem(ctx, plan, parts[k - 1].get(field, ""), text)
         if problem:
             rejected.append({"patch": patch, "reason": problem})
             continue
         parts[k - 1][field] = text
+        if field in ("motion", "prompt"):
+            parts[k - 1].pop("repairs", None)
+            if notes:
+                parts[k - 1]["repairs"] = notes
         applied.append(patch)
     return new, applied, rejected
 
@@ -3789,8 +3884,9 @@ def repairable_ids(hard):
 # Dialogue spec 6.1: T2 and T3 trigger repair but never block; every other hard violation blocks.
 NON_BLOCKING_IDS = ("T2", "T3")
 # The hard ids a code-only round sends back to the panel writer (PG5; speaker attribution spec
-# Q1-A2 adds N18, so a free line that says another speaker's line is rewritten).
-REPAIR_IDS = ("N11", "N18", "T1", "T2", "T3")
+# Q1-A2 adds N18, so a free line that says another speaker's line is rewritten; shot prompt
+# format spec SF13 adds N7, N20, N21 and N22).
+REPAIR_IDS = ("N7", "N11", "N18", "N20", "N21", "N22", "T1", "T2", "T3")
 
 
 def blocking(messages):
@@ -3848,15 +3944,30 @@ def merge_repair(ctx, plan, k, old, new, ids):
     """Panel k's writer parts after a code-only round (dialogue spec PG5): new's motion or prompt
     when ids has T2 or T3 and the PG3 guard accepts it, new's dialogue when ids has T1 or N18
     (speaker attribution spec Q1-A2) and the line fits, new's narration when ids has N11; every
-    other part keeps old's text."""
+    other part keeps old's text. With N7, N20, N21 or N22 (shot prompt format spec SF13) it takes
+    new's action text when that has fewer writer-format problems, and for N22 new's image or
+    narration when only old's copies the reference."""
     merged = dict(old)
     action = "prompt" if ctx.mode == "no_stills" else "motion"
     if (ids & {"T2", "T3"} and new.get(action)
             and guard_problem(ctx, plan, old.get(action, ""), new[action]) is None):
         merged[action] = new[action]
-    if (ids & {"T1", "N18"} and new.get("dialogue")
+    if (ids & {"T1", "N18", "N22"} and new.get("dialogue")
             and line_problem(ctx, _character_lib(ctx.ws), _sentence(new["dialogue"])) is None):
         merged["dialogue"] = new["dialogue"]
+    if (ids & set(FORMAT_IDS) and new.get(action)
+            and len(format_problems(ctx, plan, new, k))
+            < len(format_problems(ctx, plan, old, k))):
+        merged[action] = new[action]
+        merged.pop("repairs", None)
+        if new.get("repairs"):
+            merged["repairs"] = new["repairs"]
+    if "N22" in ids:
+        for key in ("image", "narration"):
+            if (new.get(key) and old.get(key)
+                    and reference_copies(ctx.narrative, plan, old[key], ctx.goal)
+                    and not reference_copies(ctx.narrative, plan, new[key], ctx.goal)):
+                merged[key] = new[key]
     if "N11" in ids and "narration" in new:
         merged["narration"] = new["narration"]
     return merged
@@ -4246,6 +4357,16 @@ class _Run(object):
                     ctx.mode, k, ctx.narration, bool(plan["beats"][k - 1]["speaker"]))])
             if new is not None:
                 parts[k - 1] = new
+                # Shot prompt format spec SF13, D8: one re-ask for a writer-format problem while
+                # the panel has a call left, then the deterministic trim.
+                problems = format_problems(ctx, plan, new, k)
+                if (problems and self.panel_calls[k] < PANEL_MAX_CALLS
+                        and not self.expired()):
+                    again = self.panel_call(plan, parts, k, 0, problems)
+                    if (again is not None
+                            and len(format_problems(ctx, plan, again, k)) <= len(problems)):
+                        parts[k - 1] = again
+                parts[k - 1] = trim_format(ctx, plan, k, parts[k - 1])
                 valid += 1
         if not valid:
             print("Error: the story model returned no valid panel in round 0; see %s"
