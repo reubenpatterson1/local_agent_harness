@@ -231,7 +231,8 @@ SPEAKING_BEAT_SENTENCE = (" Write a speaking beat's action as what the speaker p
                           "never as speaking, and end it with the speaker still in frame: nobody "
                           "else acts after the line, and when the narrative has the speaker "
                           "leave, or another character act, after a line, give that a later beat "
-                          "with no speaker, or leave it out when no later beat is left.")
+                          "with no speaker, adding that beat when the beat count allows it, and "
+                          "leave it out only when it does not.")
 SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
@@ -1225,7 +1226,9 @@ def test_review_focus_3_an_end_frame_in_the_references_words_falls_back(ws):
 
 P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
             "left out, because that line is in the last beat and a speaking beat never shows its "
-            "speaker leave; rerun with --force-story --panels %d to keep it")
+            "speaker leave; %s")
+P19_ROOM_HINT = ("the planner could have added a beat for it (this movie may have up to %d), so "
+                 "rerun with --force-story, or rerun with --force-story --panels %d to keep it")
 
 
 def test_sft23_the_narratives_exit_after_its_last_line():
@@ -1235,7 +1238,7 @@ def test_sft23_the_narratives_exit_after_its_last_line():
         (LINES_NARRATIVE, None),
         ('Kyra says, "Go." She walks off.', "walks off"),
         ('Kyra walks off. Kyra says, "Go."', None),
-        ('Kyra says, "Go," and the ronin leaves the frame.', "leaves the frame"),
+        ('Kyra says, "Go," and the ronin leaves the frame.', None),
         ('Kyra says, "Go." Later the crowd says, "Yes." Kyra turns away.', "turns away"),
         ('A sign reads "Closed". Kyra walks away.', None),
         ('Kyra says, "Go." She pushes off from the kerb.', None),
@@ -1259,10 +1262,10 @@ def _p19_plan(ws, mode, lines, narrative=HOCKEY_NARRATIVE, narration="speech"):
 
 def test_sft24_when_p19_fires(ws):
     rows = (
-        ("chained", [[1], [2]], {}, [P19_NOTE % ("'skates away'", 3)]),
-        ("chained", [[1, 2]], {}, [P19_NOTE % ("'skates away'", 2)]),
+        ("chained", [[1], [2]], {}, [P19_NOTE % ("'skates away'", P19_ROOM_HINT % (4, 3))]),
+        ("chained", [[1, 2]], {}, [P19_NOTE % ("'skates away'", P19_ROOM_HINT % (3, 2))]),
         ("shots", [[1], [2], []], {}, []),
-        ("shots", [[1], [], [2]], {}, [P19_NOTE % ("'skates away'", 4)]),
+        ("shots", [[1], [], [2]], {}, [P19_NOTE % ("'skates away'", P19_ROOM_HINT % (5, 4))]),
         ("chained", [[1], [2]], {"narration": False}, []),
         ("chained", [[1], []], {}, []),
         ("chained", [[1], [2]], {"narrative": LINES_NARRATIVE}, []),
@@ -1299,11 +1302,11 @@ def _sft25_run(ws, tmp_path, monkeypatch, story_id, narrative):
 
 
 def test_sft25_p19_end_to_end(ws, tmp_path, monkeypatch, capsys):
-    note = P19_NOTE % ("'skates away'", 3)
+    note = P19_NOTE % ("'skates away'", P19_ROOM_HINT % (4, 3))
     rc, advisories, ctx = _sft25_run(ws, tmp_path, monkeypatch, "sf25", HOCKEY_NARRATIVE)
     assert rc == 0
     assert [a for a in advisories if " P19 " in a] == [note]
-    assert note.endswith("; rerun with --force-story --panels 3 to keep it")
+    assert note.endswith(", or rerun with --force-story --panels 3 to keep it")
     assert [m for m in _messages(ctx, "advisory") if " P19 " in m] == [note]
     assert note in _read_json(ctx.story_dir, "plan.json")["speech_notes"]
     capsys.readouterr()

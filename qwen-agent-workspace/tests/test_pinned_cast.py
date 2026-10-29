@@ -128,10 +128,12 @@ SPEAKER_RULE_KEEP_CAST = (
     "Write a speaking beat's action as what the speaker physically does, never as speaking, and "
     "end it with the speaker still in frame: nobody else acts after the line, and when the "
     "narrative has the speaker leave, or another character act, after a line, give that a later "
-    "beat with no speaker, or leave it out when no later beat is left.")
+    "beat with no speaker, adding that beat when the beat count allows it, and leave it out only "
+    "when it does not.")
 LINES_PINNED_SENTENCE = (" A beat with a speaker shows only the speaker, so every already-cast "
                          "character who says none of the lines still needs a beat with no "
-                         "speaker, even when two consecutive lines must then share a beat.")
+                         "speaker: add a beat for it when the beat count allows it, else let two "
+                         "consecutive lines share one.")
 UNCHANGED = {
     "SPEAKER_RULE": (
         " speaker is the id of the one character who says something aloud on screen during the "
@@ -142,16 +144,17 @@ UNCHANGED = {
         "they speak. Write a speaking beat's action as what the speaker physically does, never "
         "as speaking, and end it with the speaker still in frame: nobody else acts after the "
         "line, and when the narrative has the speaker leave, or another character act, after a "
-        "line, give that a later beat with no speaker, or leave it out when no later beat is "
-        "left."),
+        "line, give that a later beat with no speaker, adding that beat when the beat count "
+        "allows it, and leave it out only when it does not."),
     "LINES_RULE": (
         " lines is the list of the numbers of the spoken lines above that the speaker says aloud "
         "during the beat, in order, or an empty list. Every spoken line belongs to exactly one "
         "beat, in the narrative's order: give each line to the beat whose action surrounds it in "
         "the narrative, and give a speaker to every beat with lines and to no other beat. A beat "
-        "may hold two or more consecutive lines only when together they are at most "
-        "@@LINE_WORDS@@ words. Give each line its own beat whenever there are at least as many "
-        "beats as lines."),
+        "may hold two or more consecutive lines only when one character says them all and "
+        "together they are at most @@LINE_WORDS@@ words. Give each line its own beat whenever "
+        "there are at least as many target beats (@@MIN_BEATS@@) as lines; never add a beat only "
+        "to separate lines that fit together."),
     "SEED_PARAGRAPH": (
         "An image is attached to this message. It IS the first frame of this movie. Describe "
         "every person it shows faithfully in cast -- each one's apparent age group, build, skin "
@@ -240,7 +243,8 @@ def test_pt5_lines_sentence_variants(ws, story_env):
     def build(**kw):
         ctx = seu.make_ctx(se, ws, **kw)
         cap = str(lib.dialogue_word_cap(se.engine_seconds(ctx), 2))
-        return se.build_plan_prompt(ctx, [], []), se.LINES_RULE.replace("@@LINE_WORDS@@", cap)
+        return se.build_plan_prompt(ctx, [], []), se.LINES_RULE.replace(
+            "@@LINE_WORDS@@", cap).replace("@@MIN_BEATS@@", str(se.panel_range(ctx)[0]))
 
     for mode in ("shots", "no_stills"):
         prompt, rule = build(mode=mode, members=members, narrative=LINES_NARRATIVE)
@@ -388,7 +392,7 @@ def test_review_focus_1_an_exhausted_plan_lists_every_fatal_problem(ws, tmp_path
     assert rc == 1
     assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "plan"]
     assert capsys.readouterr().err == _fatal_err(
-        ["plan: P1 beat count: expected exactly 3 beats, found 2",
+        ["plan: P1 beat count: expected 3 to 5 beats, found 2",
          P16("c2", RONIN, "ronin", "chained", True)], ctx)
     for name in ("story.md", "plan.json"):
         assert not os.path.exists(os.path.join(ctx.story_dir, name)), name

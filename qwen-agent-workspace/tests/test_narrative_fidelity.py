@@ -268,9 +268,14 @@ COURIER_LINES = ('The courier says "Keep moving." Then he says "The gate is clos
 SIX_WORD_LINES = ('The courier says "Keep moving along the wet road." Then he says "The temple gate '
                   'is close now." At the gate he whispers "We made it here at last."')
 OVER_CAP = "I carry a sealed letter from the harbour master for the abbot of this temple."
-PANELS_PROBLEM = ("the narrative quotes 3 spoken lines, which need at least 2 panels of 6 seconds "
-                  "(one panel speaks at most 14 words), but this movie has 1; use --panels 2 or "
-                  "more, or longer clips (a larger --frames)")
+# Soft panel count spec SPC3: four 8-word lines need 4 panels, more than --panels 1 plus 2 allows.
+EIGHT_WORD_LINES = ('The courier says "Keep moving along the wet harbour road now." Then he says '
+                    '"The temple gate is close to us now." He says "Can you see the lanterns by '
+                    'the gate?" At the gate he says "We made it here before the rain came."')
+PANELS_PROBLEM = ("the narrative quotes 4 spoken lines, which need at least 4 panels of 6 seconds "
+                  "(one panel has one speaker and speaks at most 14 words), but this movie has at "
+                  "most 3 (--panels 1 plus up to 2 more); rerun with --force-story --panels 2 or "
+                  "more, or with longer clips (a larger --frames)")
 
 
 def test_nf5_spoken_lines_problem(ws):
@@ -291,9 +296,11 @@ def test_nf5_spoken_lines_problem(ws):
         "most 9 words in 1 sentence; use longer clips (a larger --frames) or split it into shorter "
         "quoted lines in the narrative" % ten)
     assert problem('The courier says "%s"' % ten) is None
-    assert problem(SIX_WORD_LINES, panels=1) == PANELS_PROBLEM
+    assert problem(EIGHT_WORD_LINES, panels=1) == PANELS_PROBLEM
+    assert problem(EIGHT_WORD_LINES, panels=2) is None
+    assert problem(SIX_WORD_LINES, panels=1) is None
     assert problem(SIX_WORD_LINES, panels=2) is None
-    assert problem(SIX_WORD_LINES, panels=1, narration=False) is None
+    assert problem(EIGHT_WORD_LINES, panels=1, narration=False) is None
     assert problem(seu.make_ctx(se, ws).narrative, panels=1) is None
     for case, panels in (("hockey-2x145", 2), ("hockey-2x145", 1), ("hockey-1x241", 1)):
         assert se.spoken_lines_problem(_hockey_ctx(ws, case, panels=panels)) is None, (case, panels)
@@ -314,7 +321,7 @@ def test_nf6_panels_needed():
 
 def test_nf31_an_infeasible_line_set_exits_2_before_any_call(ws, tmp_path, monkeypatch, capsys):
     log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 1))])
-    ctx = seu.make_ctx(se, ws, panels=1, narrative=SIX_WORD_LINES)
+    ctx = seu.make_ctx(se, ws, panels=1, narrative=EIGHT_WORD_LINES)
     capsys.readouterr()
     rc, _advisories = se.run(ctx)
     assert rc == 2
@@ -659,14 +666,16 @@ SPEAKER_RULE = (" speaker is the id of the one character who says something alou
                 "speaker physically does, never as speaking, and end it with the speaker still in "
                 "frame: nobody else acts after the line, and when the narrative has the speaker "
                 "leave, or another character act, after a line, give that a later beat with no "
-                "speaker, or leave it out when no later beat is left.")
+                "speaker, adding that beat when the beat count allows it, and leave it out only "
+                "when it does not.")
 LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
               "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
               "exactly one beat, in the narrative's order: give each line to the beat whose action "
               "surrounds it in the narrative, and give a speaker to every beat with lines and to no "
-              "other beat. A beat may hold two or more consecutive lines only when together they "
-              "are at most @@LINE_WORDS@@ words. Give each line its own beat whenever there are at "
-              "least as many beats as lines.")
+              "other beat. A beat may hold two or more consecutive lines only when one character "
+              "says them all and together they are at most @@LINE_WORDS@@ words. Give each line "
+              "its own beat whenever there are at least as many target beats (@@MIN_BEATS@@) as "
+              "lines; never add a beat only to separate lines that fit together.")
 SPOKEN_BLOCK = ("\n\nSpoken lines (the narrative quotes these words; the movie must speak every one "
                 "of them on camera, word for word, in this order):\n1. \"%s\"\n2. \"%s\""
                 % (LINE1, LINE2))
@@ -679,9 +688,9 @@ def test_nf12_the_plan_prompt(ws):
     prompt = se.build_plan_prompt(_hockey_ctx(ws, "hockey-2x145"), [], [])
     assert ("Narrative to adapt:\n" + HOCKEY + SPOKEN_BLOCK + "\n\nThe target output goal is "
             ) in prompt
-    assert "location, cast, speaker and lines. index runs from 1 to 2." in prompt
-    assert ("at most 4." + SPEAKER_RULE + LINES_RULE.replace("@@LINE_WORDS@@", "13") + "\n"
-            ) in prompt
+    assert "location, cast, speaker and lines. index runs from 1 to the number of beats." in prompt
+    assert ("at most 4." + SPEAKER_RULE + LINES_RULE.replace("@@LINE_WORDS@@", "13")
+            .replace("@@MIN_BEATS@@", "2") + "\n") in prompt
     assert CAST_LINE in prompt and SETTING_LINE in prompt and "@@" not in prompt
     one = se.build_plan_prompt(_hockey_ctx(ws, "hockey-1x241"), [], [])
     assert "together they are at most 14 words." in one and "@@" not in one
@@ -1048,7 +1057,9 @@ P18_2X145 = ("beat 1: P18 static camera: camera 'static' changed to 'slow push-i
              "holds")
 P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line ('skates "
             "away') was left out, because that line is in the last beat and a speaking beat never "
-            "shows its speaker leave; rerun with --force-story --panels %d to keep it")
+            "shows its speaker leave; the planner could have added a beat for it (this movie may "
+            "have up to %d), so rerun with --force-story, or rerun with --force-story --panels %d "
+            "to keep it")
 
 
 def _recorded(case, name):
@@ -1069,7 +1080,8 @@ def test_nf28_engine_the_2x145_failure(ws, tmp_path, monkeypatch):
     round0 = _story_json(ctx, "story_rounds", "round_0", "plan.json")
     assert [b["lines"] for b in round0["beats"]] == [[1], [2]]
     assert (round0["beats"][1]["speaker"], round0["beats"][1]["cast"]) == ("c1", ["c1"])
-    assert round0["speech_notes"] == [GIVEN % (1, 1), GIVEN % (2, 2), P18_2X145, P19_NOTE % 3]
+    assert round0["speech_notes"] == [GIVEN % (1, 1), GIVEN % (2, 2), P18_2X145,
+                                      P19_NOTE % (4, 3)]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
     assert [v["id"] for v in checks0["hard"]] == []
     assert ("panel 2: N21 after the line: Motion: the pipeline removed 'then skates away from the "
@@ -1101,7 +1113,7 @@ def test_nf29_engine_the_1x241_failure(ws, tmp_path, monkeypatch):
             "the camera.'") in [v["message"] for v in checks0["advisory"]]
     assert _story_json(ctx, "story_checks.json")["stop_reason"] == "passed"
     assert _story_json(ctx, "plan.json")["speech_notes"] == [GIVEN % (1, 1), GIVEN % (1, 2),
-                                                             P19_NOTE % 2]
+                                                             P19_NOTE % (3, 2)]
     story = _story_text(ctx, "story.md")
     assert ("Motion: The FuboTV player skates forward toward the camera, then stops abruptly in a "
             "hockey stop, spraying ice mist into the air. The FuboTV player faces the camera. The "
@@ -1151,7 +1163,7 @@ def test_nf33_default_narration_with_the_fixed_plan(ws, tmp_path, monkeypatch, c
     assert rc == 0
     assert _stages(log).count("plan") == 1
     assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == [
-        P18_2X145, P19_NOTE % 3]
+        P18_2X145, P19_NOTE % (4, 3)]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
     # R16: panel 2's exit after the line is re-asked once, then trimmed, which clears its T2, so
     # no critic round runs and nothing is left unresolved.

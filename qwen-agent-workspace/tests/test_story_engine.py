@@ -257,7 +257,7 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
     prompt = se.build_plan_prompt(ctx, [], [])
     assert "\n\nThe target output goal is the most realistic action.\n\nHow this movie is made: it " \
            "is a sequence of separate shots joined by cuts, 6 seconds each." in prompt
-    assert "beats: a list of EXACTLY 14 objects" in prompt
+    assert "beats: a list of 14 to 16 objects" in prompt
     assert "at most 2. speaker is the id of the one character who says something aloud" in prompt
     assert "Rules for this movie: two people never touch on screen." in prompt
     assert "loras: " + se.LORA_EMPTY_PARAGRAPH + "\n" in prompt
@@ -269,16 +269,21 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
     assert prompt.count("\n- ") >= 4
     assert ("\nAlready applied to every panel by the user, not to be picked again:\n- a LoRA "
             "outside the catalog at strength 1.0\n- film-grain (style) at strength 0.6\n\n") in prompt
-    assert "the first beat is introduction and the last is resolution." in prompt
-    assert "arc is one of introduction, rising, climax, falling, resolution, in story order; " \
-           "use climax." in se.build_plan_prompt(seu.make_ctx(se, ws, panels=1), [], [])
+    assert ("in story order; with 2 beats, the first beat is introduction and the last is "
+            "resolution; with 3 or more beats, the first beat is introduction, the last is "
+            "resolution, and at least one beat is climax.") in prompt
+    assert ("arc is one of introduction, rising, climax, falling, resolution, in story order; "
+            "with 1 beat, use climax; with 2 beats, the first beat is introduction and the last "
+            "is resolution; with 3 or more beats, the first beat is introduction, the last is "
+            "resolution, and at least one beat is climax.") in se.build_plan_prompt(
+        seu.make_ctx(se, ws, panels=1), [], [])
 
 
 def test_rst9_narrative_is_inserted_verbatim(ws):
     ctx = seu.make_ctx(se, ws, narrative="Count @@PANELS@@ and @@STORY_ID@@ {x}.")
     prompt = se.build_plan_prompt(ctx, [], [])
     assert "Narrative to adapt:\nCount @@PANELS@@ and @@STORY_ID@@ {x}.\n" in prompt
-    assert "EXACTLY 3 objects" in prompt
+    assert "3 to 5 objects" in prompt
 
 
 def test_rst13_normalization(ws, story_env, tmp_path):
@@ -306,8 +311,8 @@ def test_rst13_normalization(ws, story_env, tmp_path):
     assert "surprise" not in plan
     assert [b["speaker"] for b in plan["beats"]] == ["", "", ""] and plan["speech_notes"] == []
     assert list(plan)[-1] == "speech_notes" and list(plan["beats"][0])[-1] == "lines"
-    assert list(plan)[:10] == ["schema", "story_id", "mode", "panels", "seconds", "narrative",
-                               "goal", "seed_image", "video_model", "auto_lora"]
+    assert list(plan)[:11] == ["schema", "story_id", "mode", "panels", "panels_target", "seconds",
+                               "narrative", "goal", "seed_image", "video_model", "auto_lora"]
     assert plan["loras"] == {"global": [{"id": "film-grain", "strength": 0.8}],
                              "per_beat": {"2": [{"id": "fast-motion", "strength": 0.7}]},
                              "stills": [], "pinned": pins}
@@ -355,7 +360,7 @@ def test_rst14_plan_checks(ws):
     cases = [
         (lambda raw: (raw["beats"].pop(2), [b.update(index=i) for i, b in
                                              enumerate(raw["beats"], start=1)]),
-         ["plan: P1 beat count: expected exactly 6 beats, found 5"]),
+         ["plan: P1 beat count: expected 6 to 8 beats, found 5"]),
         (beat(3, index=7), ["plan: P1 beat count: beat 3 has index 7; beats must be numbered 1 "
                             "to 6 in order"]),
         (lambda raw: raw.update(title=""), ["plan: P2 structure: title must be a non-empty string"]),
@@ -1608,8 +1613,8 @@ def test_rst11_short_plan_is_fatal(ws, tmp_path, monkeypatch, capsys):
     assert rc == 1 and len(log) == 2
     assert capsys.readouterr().err.splitlines()[:2] == [
         "Error: the story model did not return a usable plan after 2 call(s)",
-        "  - plan: P1 beat count: expected exactly 6 beats, found 5"]
-    assert "plan: P1 beat count: expected exactly 6 beats, found 5" in log[1]["argv"][-1]
+        "  - plan: P1 beat count: expected 6 to 8 beats, found 5"]
+    assert "plan: P1 beat count: expected 6 to 8 beats, found 5" in log[1]["argv"][-1]
 
 
 def test_rst17b_invalid_panel_retried_once_never_three_times(ws, tmp_path, monkeypatch):
@@ -1803,15 +1808,15 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     with open(os.path.join(ctx.story_dir, moved[0], "old.txt")) as f:
         assert f.read() == "kept"
     plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
-    assert list(plan) == ["schema", "story_id", "mode", "panels", "seconds", "narrative", "goal",
-                          "seed_image", "video_model", "auto_lora", "title", "logline", "cast",
-                          "locations", "props", "beats", "loras", "spoken_lines", "cast_notes",
-                          "speech_notes"]
+    assert list(plan) == ["schema", "story_id", "mode", "panels", "panels_target", "seconds",
+                          "narrative", "goal", "seed_image", "video_model", "auto_lora", "title",
+                          "logline", "cast", "locations", "props", "beats", "loras",
+                          "spoken_lines", "cast_notes", "speech_notes"]
     assert plan["schema"] == "ltx-movie.plan.v1" and plan["panels"] == 3
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
-    assert list(checks) == ["schema", "story_id", "mode", "panels", "checked_at", "source",
-                            "round", "hard", "unresolved", "advisory", "scores", "verdict",
-                            "stop_reason", "rounds", "best_round", "judge"]
+    assert list(checks) == ["schema", "story_id", "mode", "panels", "panels_target", "checked_at",
+                            "source", "round", "hard", "unresolved", "advisory", "scores",
+                            "verdict", "stop_reason", "rounds", "best_round", "judge"]
     assert checks["source"] == "robust" and checks["best_round"] == 1 and checks["judge"] is None
     assert checks["rounds"] == [
         {"round": 0, "hard": 1, "advisory": 5, "scores": {"continuity": 6, "story": 6,
@@ -1974,7 +1979,9 @@ def test_story_focus_2_a_one_panel_story(ws, tmp_path, monkeypatch):
     assert [b["arc"] for b in plan["beats"]] == ["climax"]
     with open(os.path.join(ctx.story_dir, "story.md")) as f:
         assert f.read().count("## Panel ") == 1
-    assert "use climax." in log[0]["argv"][-1]
+    assert ("in story order; with 1 beat, use climax; with 2 beats, the first beat is introduction "
+            "and the last is resolution; with 3 or more beats, the first beat is introduction, the "
+            "last is resolution, and at least one beat is climax.") in log[0]["argv"][-1]
 
 
 def test_story_focus_3_ctrl_c_during_a_run_keeps_story_md(ws, tmp_path, monkeypatch):

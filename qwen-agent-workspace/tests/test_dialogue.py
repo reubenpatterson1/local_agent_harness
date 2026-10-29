@@ -655,8 +655,8 @@ def test_dlg12_plan_prompt_speaker_rule(ws):
               "while they speak. Write a speaking beat's action as what the speaker physically "
               "does, never as speaking, and end it with the speaker still in frame: nobody else "
               "acts after the line, and when the narrative has the speaker leave, or another "
-              "character act, after a line, give that a later beat with no speaker, or leave it "
-              "out when no later beat is left.")
+              "character act, after a line, give that a later beat with no speaker, adding that "
+              "beat when the beat count allows it, and leave it out only when it does not.")
     silent = " speaker is always an empty string: nobody speaks in this movie."
     for mode in ("chained", "no_stills", "shots"):
         for narration, rule in ((True, spoken), ("speech", spoken), (False, silent)):

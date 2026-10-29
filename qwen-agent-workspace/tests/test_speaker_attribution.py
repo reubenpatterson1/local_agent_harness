@@ -264,7 +264,8 @@ def _plan_prompt(ws, **kw):
     """(plan prompt, filled LINES_RULE) of make_ctx(**kw), with no catalog and no pins."""
     ctx = seu.make_ctx(se, ws, **kw)
     cap = str(lib.dialogue_word_cap(se.engine_seconds(ctx), 2))
-    return se.build_plan_prompt(ctx, [], []), se.LINES_RULE.replace("@@LINE_WORDS@@", cap)
+    return se.build_plan_prompt(ctx, [], []), se.LINES_RULE.replace(
+        "@@LINE_WORDS@@", cap).replace("@@MIN_BEATS@@", str(se.panel_range(ctx)[0]))
 
 
 def test_sat9_plan_prompt(ws, story_env):
