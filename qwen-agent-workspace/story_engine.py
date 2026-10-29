@@ -4773,15 +4773,23 @@ PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
 
+def _count_in_range(panels, target):
+    """True when panels is an int (not a bool) from target to target + PANELS_EXTRA (SPC10)."""
+    return (isinstance(panels, int) and not isinstance(panels, bool)
+            and target <= panels <= target + PANELS_EXTRA)
+
+
 def load_plan(ctx):
-    """<story_dir>/plan.json when it is a valid plan for ctx's mode and panel count, else None."""
+    """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels lie in the
+    target's range (soft panel count spec SPC10), else None."""
     try:
         with open(os.path.join(ctx.story_dir, "plan.json"), encoding="utf-8") as f:
             plan = json.load(f)
     except (OSError, ValueError):
         return None
     if (not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA
-            or plan.get("mode") != ctx.mode or plan.get("panels") != ctx.panels
+            or plan.get("mode") != ctx.mode
+            or not _count_in_range(plan.get("panels"), target_panels(ctx))
             or not all(k in plan for k in _PLAN_KEYS)):
         return None
     for beat in plan["beats"] if isinstance(plan["beats"], list) else []:
@@ -4888,6 +4896,18 @@ def recheck(ctx, legacy_validate):
         print(warning)
     lib = _character_lib(ctx.ws)
     plan = load_plan(ctx)
+    if (plan is not None and plan["panels"] != ctx.panels
+            and len(_story_manifest(ctx.ws)._parse_prompts_md(story_md)[1]) != plan["panels"]):
+        # Plan ruling SPR4: a plan whose panel count story.md does not have is stale (a later
+        # --story-legacy run, or a hand edit); re-check story.md without it, as before SPC10.
+        plan = None
+    if plan is not None:
+        # Soft panel count spec SPC10: re-check against the plan's panel count; the saved target
+        # comes from plan.json (an older plan has none: the current target).
+        saved = plan.get("panels_target")
+        ctx = ctx._replace(panels=plan["panels"], panels_target=(
+            saved if isinstance(saved, int) and not isinstance(saved, bool)
+            else target_panels(ctx)))
     if plan is not None:
         try:
             hard = ([] if ctx.mode == "shots"

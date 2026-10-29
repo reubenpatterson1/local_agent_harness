@@ -835,3 +835,63 @@ def test_review_focus_5_an_added_panel_can_be_re_asked(ws, tmp_path, monkeypatch
     assert len([r for r in log if r["stage"] == "panel" and r["panel"] == 4]) == 2
     run = _read_json(os.path.join(ctx.story_dir, "story_rounds"), "run.json")
     assert len([c for c in run["calls"] if c["stage"] == "panel" and c["panel"] == 4]) == 2
+
+
+# --- SPT14: plan reuse and recheck (SPC10) ----------------------------------------------------
+
+def _write_json(story_dir, name, doc):
+    with open(os.path.join(story_dir, name), "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+
+
+def test_spt14_load_plan_and_recheck(ws, tmp_path, monkeypatch):
+    saved = save_story(ws, tmp_path, monkeypatch, "s1", "chained", 3, 4)
+    for panels, loads in ((2, True), (3, True), (4, True), (1, False), (5, False)):
+        found = se.load_plan(seu.make_ctx(se, ws, story_id="s1", panels=panels))
+        assert (found is not None) == loads, panels
+    plan = _read_json(saved.story_dir, "plan.json")
+    assert (plan["panels"], plan["panels_target"]) == (4, 3)
+    _write_json(saved.story_dir, "plan.json", dict(plan, panels=True))
+    assert se.load_plan(seu.make_ctx(se, ws, story_id="s1", panels=3)) is None
+    _write_json(saved.story_dir, "plan.json", plan)
+    old = save_story(ws, tmp_path, monkeypatch, "s0", "chained", 3, 3)
+    doc = _read_json(old.story_dir, "plan.json")
+    del doc["panels_target"]
+    _write_json(old.story_dir, "plan.json", doc)
+    assert se.load_plan(seu.make_ctx(se, ws, story_id="s0", panels=3)) is not None
+    seen = []
+
+    def spy(path, panels, no_stills=False):
+        seen.append(panels)
+        return []
+
+    rc, _advisories = se.recheck(seu.make_ctx(se, ws, story_id="s1", panels=2), spy)
+    assert rc == 0
+    assert seen == [4]
+    checks = _read_json(saved.story_dir, "story_checks.json")
+    assert (checks["panels"], checks["panels_target"], checks["source"]) == (4, 3, "recheck")
+    del seen[:]
+    rc, _advisories = se.recheck(seu.make_ctx(se, ws, story_id="s1", panels=1), spy)
+    assert seen and set(seen) == {1}
+
+
+# --- Review Focus 2, plan ruling SPR4: a stale plan.json beside a story.md of another count ---
+
+def test_review_focus_2_a_stale_plan_is_not_adopted_by_recheck(ws, tmp_path, monkeypatch):
+    stale = save_story(ws, tmp_path, monkeypatch, "rf2", "chained", 3, 4)
+    other = save_story(ws, tmp_path, monkeypatch, "rf2b", "chained", 3, 3)
+    with open(os.path.join(other.story_dir, "story.md"), encoding="utf-8") as f:
+        text = f.read()
+    with open(os.path.join(stale.story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(text)
+    seen = []
+
+    def validate(path, panels, no_stills=False):
+        seen.append(panels)
+        return ltx_movie._validate_story_md(path, panels, no_stills)
+
+    ctx = seu.make_ctx(se, ws, story_id="rf2", panels=3)
+    assert se.load_plan(ctx) is not None
+    rc, _advisories = se.recheck(ctx, validate)
+    assert rc == 0
+    assert seen and set(seen) == {3}
