@@ -619,3 +619,383 @@ def test_sft21_the_reference_adds_exactly_its_own_length(ws, monkeypatch):
     bare = se.build_panel_prompt(ctx, plan, parts, 2)
     assert len(full) - len(bare) == len(reference) == 2406
     assert len(full) < 9000
+
+
+# --- SFT1 (Task 3 part): the check constants (SF9-SF12, SF14) ----------------------------------
+
+REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
+                   "market hall", "fish market", "harbour doors", "meltwater",
+                   "forty years of mornings")
+REFERENCE_COPY_SEGMENTS = (
+    "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
+    "the market hall toward the half-open shutter",
+    "her heavy steps splashing through shallow puddles that hold the first glow from the "
+    "harbour doors",
+    "she reaches the shutter at frame centre, the long rows of bare zinc counters stretching "
+    "away behind her",
+    "The old fishmonger looks up from the empty ice trays to the camera, drying her knuckles on "
+    "a folded cloth at the zinc counter",
+    "The old fishmonger lets the folded cloth drop onto the counter, her shoulders sinking",
+    "her face fills the frame from chin to brow, the bare counters soft behind her",
+    "The old fishmonger presses her forehead against the cold ribs of the half-closed steel "
+    "shutter",
+    "both palms flat on the metal, her breath fogging the ribbed steel as a thin trickle of "
+    "meltwater runs past her knuckles and drips onto the wet concrete at her feet",
+    "holding her face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
+    "shut and the shutter stops trembling",
+    "Forty years of mornings. Not one more.",
+)
+REPAIR_NOTE = "panel %d: %s %s: %s: the pipeline removed %s"
+GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
+                     "Q1", "N19")
+
+
+def test_sft1c_check_constants():
+    assert se.REFERENCE_TERMS == REFERENCE_TERMS
+    assert se.REFERENCE_COPY_SEGMENTS == REFERENCE_COPY_SEGMENTS
+    assert se.REPAIR_NOTE == REPAIR_NOTE
+    assert se.GENERATION_CHECKS == GENERATION_CHECKS
+    assert se.GENERATION_CHECKS[16:20] == ("N18", "T1", "T2", "T3")
+    assert se.GENERATION_CHECKS[-2:] == ("Q1", "N19")
+    assert se.GENERATION_CHECKS[-1] == "N19"
+    assert len(se.REFERENCE_SIX_GRAMS) == 138
+    assert set(se.CAMERA_WRITER_FORMS) == set(se.CAMERA_KEYS) == set(se.CAMERA_MOVE_WORDS)
+    for key, sentence in se.CAMERA_SENTENCES:
+        form = re.sub(r"<[^<>]*>", "x", se.CAMERA_WRITER_FORMS[key][1].strip("'"))
+        for text in (sentence, form):
+            assert se._names_camera(text, key), (key, text)
+            assert not se._mixed_camera(text), (key, text)
+            assert se.camera_problem(lib, text, [], key) is None, (key, text)
+
+
+# --- SFT7, Review Focus 5: N20 detection (SF9, SK5) --------------------------------------------
+
+SFT7_ROWS = (
+    ("The courier runs. The camera pushes in.", "slow push-in", None),
+    ("The courier runs. The camera holds on him as he recedes. The camera stays static.", "static",
+     "has 2 camera directions"),
+    ("The courier runs while the camera tracks him. The camera pushes in.", "slow push-in",
+     "has 2 camera directions"),
+    ("The courier runs while the camera tracks him.", "",
+     "puts the camera direction inside the action sentence"),
+    ("The camera pushes in and stays static.", "slow push-in",
+     "the camera sentence 'The camera pushes in and stays static.' has the camera both stay still "
+     "and move"),
+    ("The camera pans left.", "slow push-in",
+     "the camera sentence 'The camera pans left.' does not move the camera the planned way"),
+    ("The camera follows with handheld movement.", "handheld", None),
+    ("The camera follows her.", "tracking", None),
+    ("The camera holds steady on her.", "static", None),
+    ("The courier faces the camera.", "static", None),
+    ("The shot is a medium shot. The courier runs. The camera tracks alongside the movement.",
+     "tracking", None),
+)
+HOCKEY_E2 = ("The FuboTV hockey player carves a sharp stop, spraying ice mist into the air, his "
+             "face toward the lens, then pushes off and skates away from the camera. The camera "
+             "holds on him as he recedes. The camera stays static.")
+
+
+def test_sft7_n20_detection(ws):
+    for text, key, start in SFT7_ROWS:
+        detail = se.camera_problem(lib, text, ["the courier"], key)
+        if start is None:
+            assert detail is None, text
+        else:
+            assert detail is not None and detail.startswith(start), (text, detail)
+    ctx, plan, parts = _hockey(ws, story_id="sf7")
+    parts[1]["motion"] = HOCKEY_E2
+    text = se.assemble(ctx, plan, parts)
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    hard, _advisory = se.panel_checks(ctx, plan, parts, text, path)
+    assert ("panel 2: N20 camera direction: Motion: has 2 camera directions ('The camera holds on "
+            "him as he recedes.'; 'The camera stays static.'); a panel has exactly one camera "
+            "sentence; write one camera sentence in which the camera stays static") in hard
+
+
+def test_review_focus_5_an_adverb_on_the_planned_move_is_one_valid_direction(ws):
+    for camera, text in (("slow push-in", "The courier runs. The camera slowly pushes in on her."),
+                         ("slow pan left",
+                          "The courier runs. The camera gently pans left toward the harbour.")):
+        ctx = seu.make_ctx(se, ws, mode="shots", panels=1)
+        raw = seu.plan_json("shots", 1)
+        raw["beats"][0]["camera"] = camera
+        plan, _shape = se.normalize_plan(ctx, raw)
+        assert se.camera_problem(lib, text, ["the courier"], camera) is None, text
+        assert se.repair_action_text(ctx, plan, 1, text) == (text, []), text
+
+
+# --- SFT8: the N20 and N7 repairs at parse time (SF11, SF13a, SK5, SK8) --------------------------
+
+def test_sft8_the_parse_time_repairs(ws):
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1)
+    raw = seu.plan_json("shots", 1)
+    raw["beats"][0]["camera"] = "slow push-in"
+    plan, _shape = se.normalize_plan(ctx, raw)
+
+    def note(check, name, removed):
+        return se.REPAIR_NOTE % (1, check, name, "Motion", se._q(removed))
+
+    rows = (
+        ("The courier runs. The camera pans left.",
+         ("The courier runs.", [note("N20", "camera direction", "The camera pans left.")])),
+        ("The courier runs while the camera tracks him.",
+         ("The courier runs.", [note("N20", "camera direction", "while the camera tracks him.")])),
+        ("The courier runs. The camera pushes in. The camera holds.",
+         ("The courier runs. The camera pushes in.",
+          [note("N20", "camera direction", "The camera holds.")])),
+        ("The courier turns toward the camera and speaks.",
+         ("The courier turns toward the camera.",
+          [note("N7", "dialogue and text", "and speaks.")])),
+        ("The courier speaks softly. The courier waves.",
+         ("The courier waves.", [note("N7", "dialogue and text", "The courier speaks softly.")])),
+        ("The courier speaks.", ("The courier speaks.", [])),
+        ("The camera pans left.", ("The camera pans left.", [])),
+    )
+    for text, want in rows:
+        assert se.repair_action_text(ctx, plan, 1, text) == want, text
+    reply = dict(seu.panel_json("shots", 1), motion="The courier runs. The camera pans left.")
+    part = se.parse_panel_reply(ctx, plan, 1, json.dumps(reply))
+    assert part["motion"] == "The courier runs."
+    assert part["repairs"] == [note("N20", "camera direction", "The camera pans left.")]
+    plain = se.parse_panel_reply(ctx, plan, 1, json.dumps(seu.panel_json("shots", 1)))
+    assert "repairs" not in plain
+    text = se.assemble(ctx, plan, [part])
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    hard, advisory = se.panel_checks(ctx, plan, [part], text, path)
+    assert note("N20", "camera direction", "The camera pans left.") in advisory
+    assert [m for m in hard if " N20 " in m] == []
+
+
+# --- SFT9: N7 is hard while generating, on the Motion or Prompt only (SF11, SK8) ----------------
+
+def test_sft9_n7_severity(ws):
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1)
+    plan, _shape = se.normalize_plan(ctx, seu.plan_json("shots", 1))
+
+    def n7(label, text, generating):
+        hard, advisory = se._field_checks(ctx, lib, plan, 1, "T", [(label, text)], {label: text},
+                                          se.GENERATION_CHECKS, (), generating=generating)
+        return [m for m in hard if " N7 " in m], [m for m in advisory if " N7 " in m]
+
+    assert n7("Motion", "The courier speaks.", True) == (
+        ["panel 1: N7 dialogue and text: Motion: says 'speaks'; the pipeline adds the spoken line "
+         "itself, so write only what the speaker physically does, with no speaking verb"], [])
+    assert n7("Motion", "The courier speaks.", False) == (
+        [], ["panel 1: N7 dialogue and text: Motion: says 'speaks'"])
+    assert n7("Image", "The courier speaks.", True) == (
+        [], ["panel 1: N7 dialogue and text: Image: says 'speaks'"])
+    quoted = 'The courier holds up a sign reading "Closed".'
+    for generating in (True, False):
+        assert n7("Motion", quoted, generating) == (
+            [], ["panel 1: N7 dialogue and text: Motion: contains a double quote"]), generating
+
+
+# --- SFT10, Review Focus 4: N21 detection (SF10, SK7) ------------------------------------------
+
+def N21_EXIT(label, sentence, words, speaker):
+    return ("panel 1: N21 after the line: %s: '%s' has a character leave the frame or turn away "
+            "('%s'); '%s' speaks in this panel, so end it with '%s' still in frame, face toward "
+            "the camera" % (label, sentence, words, speaker, speaker))
+
+
+def N21_ACTOR(label, sentence, actor, speaker):
+    return ("panel 1: N21 after the line: %s: '%s' has '%s' act after the spoken line; after the "
+            "line only '%s' reacts, and nobody else acts" % (label, sentence, actor, speaker))
+
+
+def _n21_plan(ws, story_env, mode, speaker="c1"):
+    """A 1-panel movie with kyra (c1) and ronin (c2); beat 1 cast both, speaker `speaker`."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=1, members=_members(story_env),
+                       narration="speech")
+    plan, _shape = se.normalize_plan(ctx, _raw(mode, 1, [["c1", "c2"]], [speaker]))
+    return ctx, plan
+
+
+def _n21(ctx, plan, writer):
+    """(hard N21 messages, advisory N21 messages) of panel 1 with writer action text writer."""
+    label = "Prompt" if ctx.mode == "no_stills" else "Motion"
+    hard, advisory = se._field_checks(ctx, lib, plan, 1, "T", [(label, writer)], {label: writer},
+                                      se.GENERATION_CHECKS, (), generating=True)
+    return [m for m in hard if " N21 " in m], [m for m in advisory if " N21 " in m]
+
+
+def test_sft10_n21_detection(ws, story_env):
+    for mode in ("shots", "chained", "no_stills"):
+        ctx, plan = _n21_plan(ws, story_env, mode)
+        label = "Prompt" if mode == "no_stills" else "Motion"
+        exits = (
+            ("The woman in grey turns to the camera. The woman in grey skates away.",
+             "The woman in grey skates away.", "skates away"),
+            ("The woman in grey turns to the camera, then walks off.",
+             "The woman in grey turns to the camera, then walks off.", "walks off"),
+            ("The woman in grey turns. The camera holds on her as she recedes.",
+             "The camera holds on her as she recedes.", "recedes"),
+        )
+        for writer, sentence, words in exits:
+            assert _n21(ctx, plan, writer) == ([N21_EXIT(label, sentence, words, KYRA)], []), (
+                mode, writer)
+        actors = (
+            ("The woman in grey turns. The ronin bows.", "The ronin bows.", "the ronin"),
+            ("The woman in grey turns. The woman in grey nods as the ronin bows.",
+             "The woman in grey nods as the ronin bows.", "the ronin"),
+            ("The woman in grey turns. The crowd cheers.", "The crowd cheers.", "the crowd"),
+        )
+        for writer, sentence, actor in actors:
+            want = [] if mode == "no_stills" else [N21_ACTOR(label, sentence, actor, KYRA)]
+            assert _n21(ctx, plan, writer) == (want, []), (mode, writer)
+        for writer in ("The woman in grey turns. The woman in grey glances back at the ronin.",
+                       "The woman in grey turns. Her shoulders drop."):
+            assert _n21(ctx, plan, writer) == ([], []), (mode, writer)
+        three = "The woman in grey turns. The woman in grey nods. The woman in grey breathes."
+        want = [] if mode == "no_stills" else [
+            "panel 1: N21 after the line: %s: has 2 sentences after the first one, which the "
+            "spoken line follows; after the line write at most one short sentence of how '%s' "
+            "reacts" % (label, KYRA)]
+        assert _n21(ctx, plan, three) == ([], want), mode
+        ctx, silent = _n21_plan(ws, story_env, mode, speaker="")
+        assert _n21(ctx, silent, exits[0][0]) == ([], []), mode
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1, narration="speech")
+    raw = seu.plan_json("shots", 1)
+    raw["beats"][0]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    assert _n21(ctx, plan, "The courier turns. The old monk bows.") == (
+        [N21_ACTOR("Motion", "The old monk bows.", "the old monk", "the courier")], [])
+
+
+def test_review_focus_4_the_speakers_own_name_and_an_object_are_not_other_actors(ws, story_env):
+    for mode in ("chained", "shots"):
+        ctx, plan = _n21_plan(ws, story_env, mode)
+        for writer in ("The woman in grey turns. Kyra nods.",
+                       "The woman in grey turns. The woman in grey waves to the crowd.",
+                       "The woman in grey turns. She glances at the ronin."):
+            assert _n21(ctx, plan, writer) == ([], []), (mode, writer)
+
+
+# --- SFT12: N22, the reference copy (SF12, SK9) ------------------------------------------------
+
+def test_sft12_reference_copies(ws):
+    narrative = seu.make_ctx(se, ws).narrative
+    raw = seu.plan_json("shots", 1)
+    assert se.reference_copies(narrative, raw, "The courier walks past the zinc counter.") == [
+        "zinc"]
+    hits = se.reference_copies(narrative, raw,
+                               "The courier looks up from the empty ice trays to the camera")
+    assert hits[0] == "ice trays"
+    assert "looks up from the empty ice" in hits
+    assert se.reference_copies(narrative, raw, "The courier runs at real-time speed.") == []
+    market = "The courier locks the fish market."
+    assert se.reference_copies(narrative, raw, market) == ["fish market"]
+    assert se.reference_copies("A courier closes a fish market at dawn.", raw, market) == []
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1)
+    plan, _shape = se.normalize_plan(ctx, raw)
+    part = se.parse_panel_reply(ctx, plan, 1, json.dumps(
+        dict(seu.panel_json("shots", 1), motion=se.REFERENCE_COPY_SEGMENTS[4] + ".")))
+    text = se.assemble(ctx, plan, [part])
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    hard, _advisory = se.panel_checks(ctx, plan, [part], text, path)
+    assert [m for m in hard if " N22 " in m] == [
+        "panel 1: N22 reference copy: Motion: copies the format reference ('fishmonger', 'cloth "
+        "drop onto the counter her', 'drop onto the counter her shoulders'); describe only this "
+        "movie's own people, places, objects and words"]
+    fixtures = os.path.join(WS, "tests", "fixtures")
+    seen = 0
+    for root, _dirs, names in os.walk(fixtures):
+        for name in names:
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                words = se.line_words(f.read())
+            seen += 1
+            line = " " + " ".join(words) + " "
+            assert not (se._six_grams(words) & se.REFERENCE_SIX_GRAMS), name
+            assert [t for t in se.REFERENCE_TERMS
+                    if " %s " % " ".join(se.line_words(t)) in line] == [], name
+    assert seen >= 40
+    for segment in se.REFERENCE_COPY_SEGMENTS[:-1]:
+        assert segment in se.FORMAT_REFERENCE, segment
+    assert ('"Forty years of mornings." After a breath, "Not one more."' in se.FORMAT_REFERENCE)
+    assert se.line_words(se.REFERENCE_COPY_SEGMENTS[-1]) == se.line_words(
+        "Forty years of mornings. Not one more.")
+
+
+# --- SFT15: the S4/S5 parameters of generation (SF14, SF15c) -----------------------------------
+
+def test_sft15_the_s4_and_s5_parameters(ws):
+    two = "The courier lifts the letter at real-time speed. The courier nods. The camera pushes in."
+    three = ("The courier lifts the letter. The courier nods. The courier sighs. The camera pushes "
+             "in.")
+    assert lib.motion_problems(two, ["the courier"], max_actions=2) == []
+    assert lib.motion_problems(three, ["the courier"], max_actions=2) == [
+        ("S5 one action", "Motion: has 3 action sentences; a speaking shot has one, or one and "
+                          "the speaker's reaction, optionally followed by a camera sentence")]
+    assert lib.motion_problems(two, ["the courier"]) == [
+        ("S5 one action", "Motion: has 2 action sentences; it must have exactly one, optionally "
+                          "followed by a camera sentence")]
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=1, narration="speech")
+    raw = seu.plan_json("shots", 1)
+    raw["beats"][0].update(speaker="c1", camera="slow push-in")
+    plan, _shape = se.normalize_plan(ctx, raw)
+    part = {"title": "The Letter", "image": seu.panel_json("shots", 1)["image"], "motion": two,
+            "dialogue": "Go now."}
+    text = se.assemble(ctx, plan, [part])
+    path = os.path.join(ctx.story_dir, "check.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    _hard, advisory = se.panel_checks(ctx, plan, [part], text, path)
+    assert [m for m in advisory if " S5 one action" in m] == []
+    panels = se._story_manifest(ctx.ws)._parse_prompts_md(path)[1]
+    assert [v for v in lib.shots_violations(text, panels, 1, [], True, ignore_facing=True)
+            if " S5 one action" in v] == [
+        "panel 1: S5 one action: Motion: has 2 action sentences; it must have exactly one, "
+        "optionally followed by a camera sentence"]
+    motion = " ".join(["word"] * 19) + " end."
+    assert lib.shots_advisories([{"number": 1, "motion": motion, "image": ""}], [],
+                                motion_words=(55, 105)) == [
+        "panel 1: S4 motion length: Motion: is 20 words; aim for 55-105"]
+    assert lib.shots_advisories([{"number": 1, "motion": motion, "image": ""}], []) == []
+
+
+# --- SFT17: old stories re-check exactly as before (D12, SK10) ---------------------------------
+
+def test_sft17_an_old_story_rechecks_as_before(ws, monkeypatch):
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    ctx, _plan, _parts = _hockey(ws, story_id="sf17")
+    for name in ("plan.json", "story.md"):
+        with open(os.path.join(HOCKEY_FIX, name), encoding="utf-8") as f:
+            text = f.read()
+        with open(os.path.join(ctx.story_dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        story = f.read()
+    assert "as he speaks." in story and (
+        "The camera holds on him as he recedes. FuboTV hockey player faces the camera. "
+        "The camera stays static." in story)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("recheck must not repair, compare with the reference or cap cameras")
+
+    for name in ("repair_action_text", "reference_copies", "cap_static_cameras"):
+        monkeypatch.setattr(se, name, refuse)
+    rc, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
+    assert rc == 0
+    assert "panel 1: N7 dialogue and text: Motion: says 'speaks'" in advisories
+    assert [a for a in advisories if " N20 " in a or " N21 " in a or " N22 " in a] == []
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert checks["hard"] == [] and checks["source"] == "recheck"
+
+
+# --- SFT18: the exit verbs (SF10) --------------------------------------------------------------
+
+def test_sft18_exit_verbs():
+    for words in ("skates away", "walks off", "turns away", "steps off", "pulls away",
+                  "leaves the frame", "exits", "disappears into", "out of frame", "out of the shot",
+                  "into the distance", "recedes", "turns her back"):
+        assert se.EXIT_RE.search("She %s now." % words), words
+    for words in ("pushes off from the kerb", "turns off the light", "the leaves fall",
+                  "the exit sign", "steps back", "turns toward the camera", "runs down the steel"):
+        assert se.EXIT_RE.search("She %s now." % words) is None, words

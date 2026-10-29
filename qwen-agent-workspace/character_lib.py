@@ -1124,16 +1124,22 @@ def _drop_facing(text, phrases):
                     if s.strip() and s.strip().lower() not in facing)
 
 
-def motion_problems(motion, phrases=()):
+def motion_problems(motion, phrases=(), max_actions=1):
     """[(rule, detail)] for one shots-mode Motion: text (spec 4.3 S5; S4 is advisory,
     motion_length_advisory). A camera sentence
     (_is_camera_sentence, with phrases) is not an action sentence."""
     problems = []
     sentences = [s for s in _SENTENCE_SPLIT_RE.split(motion.strip()) if s.strip()]
     actions = [s for s in sentences if not _is_camera_sentence(s, phrases)]
-    if len(actions) != 1:
-        problems.append(("S5 one action", "Motion: has %d action sentences; it must have exactly "
-                         "one, optionally followed by a camera sentence" % len(actions)))
+    if not 1 <= len(actions) <= max_actions:
+        if max_actions == 1:
+            problems.append(("S5 one action", "Motion: has %d action sentences; it must have "
+                             "exactly one, optionally followed by a camera sentence"
+                             % len(actions)))
+        else:
+            problems.append(("S5 one action", "Motion: has %d action sentences; a speaking shot "
+                             "has one, or one and the speaker's reaction, optionally followed by "
+                             "a camera sentence" % len(actions)))
     if ";" in motion:
         problems.append(("S5 one action", "Motion: contains a semicolon"))
     chain = _CHAIN_WORD_RE.search(motion)
@@ -1145,7 +1151,8 @@ def motion_problems(motion, phrases=()):
     return problems
 
 
-def shots_violations(text, panels, expected_panels, members, narration=True, ignore_facing=False):
+def shots_violations(text, panels, expected_panels, members, narration=True, ignore_facing=False,
+                     speaking_actions=1):
     """Every shot-rule violation of a shots-mode story.md (shots spec 4.3; shots rules v2 spec 4),
     in this order: S1, S2, then per panel S3, S5, S6, S7, S8 (Motion:, then Image:), S9, S10,
     S11 (Image:, then Motion:), S12. text is the whole file; panels are bin/ltx-story-manifest
@@ -1185,7 +1192,8 @@ def shots_violations(text, panels, expected_panels, members, narration=True, ign
             out += ["panel %d: %s: %s" % (num, rule, detail)
                     for rule, detail in motion_problems(
                         _drop_facing(p["motion"], humans + animals) if ignore_facing
-                        else p["motion"], humans + animals)]
+                        else p["motion"], humans + animals,
+                        max_actions=speaking_actions if p.get("dialogue", "").strip() else 1)]
         names = []
         if members:
             names = sorted(set(cast_text(p["image"], members)[1])
@@ -1249,25 +1257,25 @@ def shots_violations(text, panels, expected_panels, members, narration=True, ign
     return out
 
 
-def motion_length_advisory(motion):
+def motion_length_advisory(motion, lo=SHOTS_MOTION_MIN_WORDS, hi=SHOTS_MOTION_MAX_WORDS):
     """The S4 detail when a shots-mode Motion: is more than SHOTS_MOTION_WORD_TOLERANCE outside
     its word range, else None (word counts are advisory)."""
     words = len(motion.split())
-    lo, hi = SHOTS_MOTION_MIN_WORDS, SHOTS_MOTION_MAX_WORDS
     if (words < lo * (1 - SHOTS_MOTION_WORD_TOLERANCE)
             or words > hi * (1 + SHOTS_MOTION_WORD_TOLERANCE)):
         return "Motion: is %d words; aim for %d-%d" % (words, lo, hi)
     return None
 
 
-def shots_advisories(panels, members):
+def shots_advisories(panels, members, motion_words=None):
     """Non-fatal shots-mode warnings (shots spec 4.4; its W1 is the fatal S9 since shots rules v2),
     per panel in order: S4 when Motion: is well outside its word range, then W2 when the shot
     names a cast character but its Image: states no shot type, or a wide one (W2 only with
     members)."""
     out = []
     for p in panels:
-        length = motion_length_advisory(p["motion"]) if p["motion"].strip() else None
+        length = ((motion_length_advisory(p["motion"], *motion_words) if motion_words
+                   else motion_length_advisory(p["motion"])) if p["motion"].strip() else None)
         if length:
             out.append("panel %d: S4 motion length: %s" % (p["number"], length))
     if not members:

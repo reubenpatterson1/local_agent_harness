@@ -1525,6 +1525,200 @@ def _moves_camera(ctx, plan, text):
                for s in _sentences(text))
 
 
+# Shot prompt format spec SF9, D5: a panel has exactly one camera direction, a camera sentence
+# that names its camera.
+STATIC_CAMERA_WORDS = ("static", "still", "locked-off")
+CAMERA_MOVE_WORDS = {
+    "slow push-in": ("push in", "pushes in", "push-in", "dolly", "dollies", "zoom", "zooms"),
+    "slow pull-back": ("pull back", "pulls back", "pull-back", "dolly", "dollies", "zoom",
+                       "zooms"),
+    "tracking": ("track", "tracks", "tracking", "follow", "follows", "dolly", "dollies"),
+    "handheld": ("handheld",),
+    "slow pan left": ("pan", "pans"),
+    "slow pan right": ("pan", "pans"),
+    "slow tilt up": ("tilt", "tilts"),
+    "slow tilt down": ("tilt", "tilts"),
+    "static": ("static", "still", "hold", "holds", "locked-off"),
+}
+CAMERA_CLAUSE_RE = re.compile(
+    r"\bcamera\s+(?:[a-z]+ly\s+)?(?:stays|remains|is|holds?|moves?|push(?:es)?|pulls?|pans?|"
+    r"tilts?|tracks?|follows?|zooms?|dollies|orbits?|cranes?|circles?|swings?|glides?|drifts?|"
+    r"sweeps?|rises?|lowers?)\b", re.IGNORECASE)
+_CUT_RE = re.compile(r"\s*[,;:—–]\s*(?:(?:and|then|while|as|before|after|until|so)\s+)?|\s+-\s+"
+                     r"|\s+(?:and|then|while|as|before|after|until|so)\s+", re.IGNORECASE)
+REPAIR_NOTE = "panel %d: %s %s: %s: the pipeline removed %s"
+
+
+def _camera_words(sentence):
+    """The CAMERA_MOTION_RE words of a sentence, lower case, whitespace collapsed, in order."""
+    return [" ".join(m.group(0).lower().split()) for m in CAMERA_MOTION_RE.finditer(sentence)]
+
+
+def camera_directions(lib, text, phrases):
+    """[(index, kind)] of the camera directions among _sentences(text) (SF9): "sentence" for a
+    camera sentence (lib._is_camera_sentence with phrases) that has a CAMERA_MOTION_RE word,
+    "clause" for any other sentence with a CAMERA_CLAUSE_RE match."""
+    out = []
+    for i, sentence in enumerate(_sentences(text)):
+        if lib._is_camera_sentence(sentence, phrases):
+            if _camera_words(sentence):
+                out.append((i, "sentence"))
+        elif CAMERA_CLAUSE_RE.search(sentence):
+            out.append((i, "clause"))
+    return out
+
+
+def _mixed_camera(sentence):
+    """True when a camera sentence both keeps the camera still and moves it."""
+    words = _camera_words(sentence)
+    return (any(w in STATIC_CAMERA_WORDS for w in words)
+            and any(w not in CAMERA_MOVE_WORDS["static"] for w in words))
+
+
+def _names_camera(sentence, key):
+    return any(w in CAMERA_MOVE_WORDS[key] for w in _camera_words(sentence))
+
+
+def camera_problem(lib, text, phrases, key):
+    """The N20 detail of an assembled action field, or None (SF9). key is the panel's camera
+    (panel_camera); a key not in CAMERA_MOVE_WORDS (None, "") skips the planned-move test."""
+    sentences = _sentences(text)
+    found = camera_directions(lib, text, phrases)
+    hint = ("; write one camera sentence in which the camera %s" % CAMERA_WRITER_FORMS[key][0]
+            if key in CAMERA_WRITER_FORMS else "")
+    if len(found) > 1:
+        return ("has %d camera directions (%s); a panel has exactly one camera sentence%s"
+                % (len(found), "; ".join(_q(sentences[i]) for i, _kind in found), hint))
+    if not found:
+        return None
+    i, kind = found[0]
+    if kind == "clause":
+        return ("puts the camera direction inside the action sentence %s; write it as its own "
+                "sentence that begins with 'The camera'%s" % (_q(sentences[i]), hint))
+    if _mixed_camera(sentences[i]):
+        return "the camera sentence %s has the camera both stay still and move%s" % (
+            _q(sentences[i]), hint)
+    if key in CAMERA_MOVE_WORDS and not _names_camera(sentences[i], key):
+        return "the camera sentence %s does not move the camera the planned way%s" % (
+            _q(sentences[i]), hint)
+    return None
+
+
+def _cut_clause(sentence, at):
+    """(head, tail) of a sentence cut at the last clause boundary (_CUT_RE) that ends at or
+    before index at: head is the text before the boundary with a full stop, tail the text from
+    the boundary on without its leading punctuation; None when no boundary ends at or before at,
+    or when head would have fewer than 3 words."""
+    start = None
+    for match in _CUT_RE.finditer(sentence, 0, at + 1):
+        if match.end() <= at:
+            start = match.start()
+    if start is None:
+        return None
+    head = sentence[:start].rstrip(" ,;:—–-")
+    if len(head.split()) < 3:
+        return None
+    return head + ".", sentence[start:].strip(" ,;:—–-")
+
+
+# Shot prompt format spec SF10, D7: a speaker never leaves, and nobody else acts after the line.
+EXIT_RE = re.compile(
+    r"\b(?:(?:walk|walks|walking|skate|skates|skating|run|runs|running|ride|rides|riding|drive|"
+    r"drives|driving|glide|glides|gliding|stride|strides|striding|head|heads|heading|hurry|"
+    r"hurries|hurrying|wander|wanders|wandering|march|marches|marching|drift|drifts|drifting|"
+    r"fly|flies|flying|swim|swims|swimming|limp|limps|limping|move|moves|moving|step|steps|"
+    r"stepping|back|backs|backing)\s+(?:away|off)|(?:turn|turns|turning|pull|pulls|pulling)\s+"
+    r"away|leav(?:e|es|ing)\s+(?:the\s+)?(?:frame|shot|scene|room|rink|ice)|exit(?:s|ing)|"
+    r"depart(?:s|ing)|disappear(?:s|ing)?\s+(?:from|into|behind|through)|retreat(?:s|ing)|"
+    r"reced(?:es|ing)|out\s+of\s+(?:the\s+)?(?:frame|shot|view|sight)|into\s+the\s+distance|"
+    r"turn(?:s|ing)?\s+(?:her|his|their)\s+back)\b", re.IGNORECASE)
+
+
+def post_line_sentences(lib, text, phrases):
+    """The action sentences of a speaking panel's writer action text that compose_motion puts
+    after the spoken line (SF10): every action sentence (not a camera sentence, not a pasted
+    facing sentence) after the first."""
+    return [s for s in _sentences(text) if not lib._is_camera_sentence(s, phrases)
+            and not lib.is_facing_sentence(s, phrases)][1:]
+
+
+def _other_actor(sentence, others, own):
+    """The words of the first other-character clause subject of a sentence, or None (SF10): a
+    mention in others ([(cast id, words)], as _mentions), or a GROUP_NOUNS word with at most one
+    article, that starts a _CLAUSE_BREAK_RE piece or follows a CLAUSE_STOP_WORDS word, and is
+    not where a mention in own (the speaker's) starts."""
+    for piece in _CLAUSE_BREAK_RE.split(sentence):
+        words = line_words(piece)
+        for p in range(len(words)):
+            if (p and words[p - 1] not in CLAUSE_STOP_WORDS) or _mentions_at(words, own, start=p):
+                continue
+            hits = _mentions_at(words, others, start=p)
+            if hits:
+                return " ".join(words[p:p + max(hits.values())])
+            q = p + 1 if words[p] in ("the", "a", "an") else p
+            if q < len(words) and words[q] in GROUP_NOUNS:
+                return " ".join(words[p:q + 1])
+    return None
+
+
+def _apply_drops(lib, sentences, drop, phrases):
+    """(kept sentences, dropped sentences): the indices in drop are removed when at least one
+    action sentence (not a camera sentence, not a facing sentence) remains; otherwise only the
+    camera sentences among them are removed (SF11)."""
+    def action(s):
+        return not lib._is_camera_sentence(s, phrases) and not lib.is_facing_sentence(s, phrases)
+    drop = set(drop)
+    if not any(action(s) for i, s in enumerate(sentences) if i not in drop):
+        drop = set(i for i in drop if not action(sentences[i]))
+    return ([s for i, s in enumerate(sentences) if i not in drop],
+            [s for i, s in enumerate(sentences) if i in drop])
+
+
+def repair_action_text(ctx, plan, k, text):
+    """(text, notes): panel k's writer Motion or Prompt after the SF11 speaking-verb cut and the
+    SF9 camera repair, with one REPAIR_NOTE advisory per removed piece. When the result would be
+    empty the text is returned unchanged with no notes."""
+    lib = _character_lib(ctx.ws)
+    phrases = cast_phrases(ctx, plan)
+    label = "Prompt" if ctx.mode == "no_stills" else "Motion"
+    sentences, notes, drop = [], [], []
+    for sentence in _sentences(text):
+        found = DIALOGUE_RE.search(sentence)
+        cut = _cut_clause(sentence, found.start()) if found else None
+        if cut:
+            sentences.append(cut[0])
+            notes.append(REPAIR_NOTE % (k, "N7", "dialogue and text", label, _q(cut[1])))
+        else:
+            if found:
+                drop.append(len(sentences))
+            sentences.append(sentence)
+    sentences, dropped = _apply_drops(lib, sentences, drop, phrases)
+    notes += [REPAIR_NOTE % (k, "N7", "dialogue and text", label, _q(s)) for s in dropped]
+    key = panel_camera(ctx, plan, k)
+    found = camera_directions(lib, " ".join(sentences), phrases)
+    valid = [i for i, kind in found if kind == "sentence" and not _mixed_camera(sentences[i])
+             and (key not in CAMERA_MOVE_WORDS or _names_camera(sentences[i], key))]
+    if found and not (len(found) == 1 and valid):
+        keep, kinds, out = (valid[0] if valid else None), dict(found), []
+        for i, sentence in enumerate(sentences):
+            kind = kinds.get(i)
+            if kind is None or i == keep:
+                out.append(sentence)
+            elif kind == "sentence":
+                notes.append(REPAIR_NOTE % (k, "N20", "camera direction", label, _q(sentence)))
+            else:
+                start = CAMERA_CLAUSE_RE.search(sentence).start()
+                if sentence[:start].lower().endswith("the "):
+                    start -= 4
+                cut = _cut_clause(sentence, start)
+                out.append(cut[0] if cut else sentence)
+                if cut:
+                    notes.append(REPAIR_NOTE % (k, "N20", "camera direction", label, _q(cut[1])))
+        sentences = out
+    repaired = " ".join(sentences)
+    return (repaired, notes) if repaired else (text, [])
+
+
 def panel_camera(ctx, plan, k):
     """The camera key panel k uses (shot prompt format spec SF6): speaking_camera(beat) on a
     chained k >= 2 speaking panel, else the beat's planned camera."""
@@ -1990,6 +2184,59 @@ FORMAT_REFERENCE = (
     "feet. The camera stays static, holding her face, her knuckles and the ribbed steel tight in "
     "the frame as her eyelids drop shut and the shutter stops trembling. The audio is the "
     "natural ambient sound of the place, with no music.\n\n")
+# Shot prompt format spec SF12, D11: the reference's own names, props and wording.
+REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
+                   "market hall", "fish market", "harbour doors", "meltwater",
+                   "forty years of mornings")
+REFERENCE_COPY_SEGMENTS = (
+    "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
+    "the market hall toward the half-open shutter",
+    "her heavy steps splashing through shallow puddles that hold the first glow from the "
+    "harbour doors",
+    "she reaches the shutter at frame centre, the long rows of bare zinc counters stretching "
+    "away behind her",
+    "The old fishmonger looks up from the empty ice trays to the camera, drying her knuckles on "
+    "a folded cloth at the zinc counter",
+    "The old fishmonger lets the folded cloth drop onto the counter, her shoulders sinking",
+    "her face fills the frame from chin to brow, the bare counters soft behind her",
+    "The old fishmonger presses her forehead against the cold ribs of the half-closed steel "
+    "shutter",
+    "both palms flat on the metal, her breath fogging the ribbed steel as a thin trickle of "
+    "meltwater runs past her knuckles and drips onto the wet concrete at her feet",
+    "holding her face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
+    "shut and the shutter stops trembling",
+    "Forty years of mornings. Not one more.",
+)
+
+
+def _six_grams(words):
+    return set(tuple(words[i:i + 6]) for i in range(len(words) - 5))
+
+
+REFERENCE_SIX_GRAMS = frozenset(g for s in REFERENCE_COPY_SEGMENTS for g in _six_grams(line_words(s)))
+
+
+def reference_copies(narrative, plan, text, goal=None):
+    """The REFERENCE_TERMS terms and the six-word REFERENCE_COPY_SEGMENTS runs that text copies
+    from FORMAT_REFERENCE, in that order (SF12), leaving out any that the narrative, the goal or
+    the plan (cast phrases and descriptors, settings, prop names, beat actions) already has."""
+    own = [narrative or "", goal or ""]
+    if plan:
+        own += ([c.get("phrase") or "" for c in plan["cast"]]
+                + [c.get("descriptor") or "" for c in plan["cast"]]
+                + [l.get("setting") or "" for l in plan["locations"]]
+                + [p.get("name") or "" for p in plan["props"]]
+                + [b.get("action") or "" for b in plan["beats"]])
+    own_words = [line_words(t) for t in own]
+    own_line = " " + " | ".join(" ".join(w) for w in own_words) + " "
+    own_grams = set(g for w in own_words for g in _six_grams(w))
+    words = line_words(text or "")
+    line = " " + " ".join(words) + " "
+    hits = [t for t in REFERENCE_TERMS
+            if (" %s " % " ".join(line_words(t))) in line
+            and (" %s " % " ".join(line_words(t))) not in own_line]
+    return hits + [" ".join(g) for g in sorted((_six_grams(words) & REFERENCE_SIX_GRAMS)
+                                               - own_grams)]
 _LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration|dialogue)\s*:\s*",
                        re.IGNORECASE)
 _QUOTE_PAIRS = (('"', '"'), ("“", "”"))
@@ -2299,7 +2546,12 @@ def parse_panel_reply(ctx, plan, k, answer):
     title = clean_writer(lib, obj.get("title"))
     if not title or _words(title) > 6:
         title = title_fallback(plan["beats"][k - 1]["action"]) or "Panel %d" % k
-    return dict({"title": title}, **parts)
+    action = "prompt" if ctx.mode == "no_stills" else "motion"
+    parts[action], repairs = repair_action_text(ctx, plan, k, parts[action])
+    out = dict({"title": title}, **parts)
+    if repairs:
+        out["repairs"] = repairs
+    return out
 
 
 def _clean_dialogue(lib, text, phrase):
@@ -2430,10 +2682,11 @@ def _valid_phrases(lib, plan):
     return phrases
 
 
-def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
+def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, generating=False):
     """(hard, advisory) of one panel: the RS15 checks named in ids, plus N15 when in ids. Hard:
-    N11 (Narration: empty with no Dialogue:), N18, T1, T2, T3; every other N rule is advisory
-    (dialogue spec 6.3, D6).
+    N11 (Narration: empty with no Dialogue:), N18, T1, T2, T3, and with generating (shot prompt
+    format spec SF11-SF12) N7 on the Motion or Prompt, N20, N21 (exits and other actors) and
+    N22; every other N rule is advisory (dialogue spec 6.3, D6).
     fields: [(Label, assembled text)]; writers: {Label: writer text}; plan may be None (then
     every check that needs the plan is skipped)."""
     hard, advisory = [], []
@@ -2513,10 +2766,16 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                         break
         if label in action_fields:
             if "N7" in ids:
-                if any(q in writer for q in ('"', "“", "”")):
+                speech = _first(DIALOGUE_RE, writer)
+                if (generating and speech
+                        and label == ("Prompt" if ctx.mode == "no_stills" else "Motion")):
+                    add(hard, "N7", "dialogue and text", label,
+                        "says %s; the pipeline adds the spoken line itself, so write only what "
+                        "the speaker physically does, with no speaking verb" % _q(speech))
+                elif any(q in writer for q in ('"', "“", "”")):
                     add(advisory, "N7", "dialogue and text", label, "contains a double quote")
                 else:
-                    word = _first(DIALOGUE_RE, writer) or _first(ONSCREEN_TEXT_RE, writer)
+                    word = speech or _first(ONSCREEN_TEXT_RE, writer)
                     if word:
                         add(advisory, "N7", "dialogue and text", label, "says %s" % _q(word))
             if "N8" in ids and ctx.mode != "shots":
@@ -2685,6 +2944,51 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared):
                 add(advisory, "N14", "narration form", "Narration",
                     "is %d words; it should be one sentence of %d-%d words"
                     % (_words(narration), lo, hi))
+    # Shot prompt format spec SF9-SF12: the writer-format checks (generation only, D12).
+    if plan and beat is not None and action_label in dict(fields):
+        if "N20" in ids:
+            detail = camera_problem(lib, dict(fields)[action_label], known,
+                                    panel_camera(ctx, plan, k))
+            if detail:
+                hard.append("%s N20 camera direction: %s: %s" % (prefix, action_label, detail))
+        if "N21" in ids and panel_speaks(ctx, plan, k):
+            writer = writers.get(action_label, "")
+            speaker = speaker_phrase(plan, k)
+            for sentence in _sentences(writer):
+                found = EXIT_RE.search(sentence)
+                if found:
+                    hard.append("%s N21 after the line: %s: %s has a character leave the frame or "
+                                "turn away (%s); %s speaks in this panel, so end it with %s still "
+                                "in frame, face toward the camera"
+                                % (prefix, action_label, _q(sentence),
+                                   _q(" ".join(found.group(0).lower().split())), _q(speaker),
+                                   _q(speaker)))
+                    break
+            if ctx.mode != "no_stills":
+                post = post_line_sentences(lib, writer, known)
+                mentions = _mentions(plan["cast"])
+                others = [m for m in mentions if m[0] != beat["speaker"]]
+                own = [m for m in mentions if m[0] == beat["speaker"]]
+                for sentence in post:
+                    actor = _other_actor(sentence, others, own)
+                    if actor:
+                        hard.append("%s N21 after the line: %s: %s has %s act after the spoken "
+                                    "line; after the line only %s reacts, and nobody else acts"
+                                    % (prefix, action_label, _q(sentence), _q(actor),
+                                       _q(speaker)))
+                        break
+                if len(post) > 1:
+                    advisory.append("%s N21 after the line: %s: has %d sentences after the first "
+                                    "one, which the spoken line follows; after the line write at "
+                                    "most one short sentence of how %s reacts"
+                                    % (prefix, action_label, len(post), _q(speaker)))
+        if "N22" in ids:
+            for label, text in writers.items():
+                hits = reference_copies(ctx.narrative, plan, text, ctx.goal)
+                if hits:
+                    hard.append("%s N22 reference copy: %s: copies the format reference (%s); "
+                                "describe only this movie's own people, places, objects and "
+                                "words" % (prefix, label, ", ".join(_q(h) for h in hits[:3])))
     return hard, advisory
 
 
@@ -2830,7 +3134,8 @@ def free_line_problems(ctx, lib, plan, dialogues, speakers):
 
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
-                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
+                     "Q1", "N19")
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -2851,7 +3156,8 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
                    if key != "title"}
         writers_by_panel.append(writers)
         h, a = _field_checks(ctx, lib, plan, k, parts[k - 1]["title"], fields, writers,
-                             GENERATION_CHECKS, undeclared)
+                             GENERATION_CHECKS, undeclared, generating=True)
+        a = a + parts[k - 1].get("repairs", [])
         hard += h
         advisory += a
         if (ctx.mode == "chained" and k >= 2 and not _facing(ctx, plan, k)
@@ -2874,9 +3180,11 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
     if ctx.mode == "shots":
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
         shots_hard, shots_other = split_shots(lib.shots_violations(
-            text, panels, ctx.panels, ctx.members, ctx.narration is True, ignore_facing=True))
+            text, panels, ctx.panels, ctx.members, ctx.narration is True, ignore_facing=True,
+            speaking_actions=2))
         hard += shots_hard
-        advisory += shots_other + lib.shots_advisories(panels, ctx.members)
+        advisory += shots_other + lib.shots_advisories(
+            panels, ctx.members, motion_words=WORD_RANGES["shots"]["motion"])
     return hard, advisory
 
 
