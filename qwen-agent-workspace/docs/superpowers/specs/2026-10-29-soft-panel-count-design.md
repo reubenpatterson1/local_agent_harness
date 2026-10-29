@@ -1371,3 +1371,11 @@ for arg in sys.argv[1:]:
 ### 8.3 Open
 
 None, beyond confirming C1-C15. C16 is user-approved.
+
+**Implementation errata (coordinator, 2026-10-29).** The shipped code departs from this spec's text by these approved rulings (plan rulings SPR1-SPR5 are in the plan; the rest were made during the build):
+- **SPR6.** `lines_needed` is an exact fewest-panels search over consecutive lines with at most one known speaker that fit one clip (the greedy sum over `speaker_runs` could overstate `lo` and refuse a feasible movie). `speaker_runs` stays for the P20 speaker reason.
+- **SPR7.** P19's exit detection skips exit words inside quotes, accepts an empty subject only in the last line's own sentence, and accepts he/she/they only there or in the next sentence.
+- **SPR8.** P20 names the exit only when `target <= last-line beat < n`, i.e. the target count left no beat after the last line.
+- **FW-a..i.** `story_prompt.txt` is rewritten with the plan's count even when generation returns non-zero; the panel-count note uses the saved `panels_target`; an old plan's `panels_target` defaults to its own `panels`; unreadable or non-UTF-8 story.md makes a plan stale instead of raising; the dry-run STOP line prints only when a story would be generated; the movie UI counts story.md headers line by line like the manifest; `bin/iterate-story` uses `panels_target or panels`; the Regenerate box refuses non-numeric input.
+- **Final review M1, M2.** `--panels` below 1 exits 2 with an error; legacy (`story_legacy`) UI jobs keep the exact target.
+Known limits: a non-UTF-8 story.md can still raise later in recheck's own readers (pre-existing); "1 beats" wording at `--panels 1`; a cancelled Regenerate leaves its target in the UI's last fields.
