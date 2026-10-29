@@ -1450,3 +1450,80 @@ def test_sft14_the_manifest_composes_the_fixed_order(tmp_path, monkeypatch):
         "courier faces the camera. The courier says: \"Go now.\" The camera pushes in.",
         "The shot is a wide shot. The courier walks down the road at real-time speed. The camera "
         "tracks alongside the movement."]
+
+
+# --- Final review fix wave (FW-I1 to FW-I4) ----------------------------------------------------
+
+def test_fw1_old_chained_story_rechecks_without_new_t2(ws, tmp_path, monkeypatch):
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    raw = seu.plan_json("chained", 2)
+    for k, beat in enumerate(raw["beats"]):
+        beat["camera"] = ("tracking", "slow pan left")[k]
+        beat["speaker"] = ""
+    part_1 = seu.panel_json("chained", 1)
+    part_2 = seu.panel_json("chained", 2)
+    part_2["title"] = "Quay"
+    part_2["motion"] = ("The courier pedals steadily along the wet road toward the quay. The courier "
+                        "leans into the bend. The camera pans left across the moored fishing boats.")
+    part_2["narration"] = seu.NARRATIONS[1]
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)],
+                     panel={"1": [seu.answer(part_1)], "2": [seu.answer(part_2)]},
+                     critic=[seu.answer(seu.critic_json())] * 4)
+    made = seu.make_ctx(se, ws, mode="chained", panels=2, story_id="fw1", clip_seconds=121 / 24.0)
+    se.run(made)
+    ctx = seu.make_ctx(se, ws, mode="chained", panels=2, story_id="fw1_r",
+                       clip_seconds=121 / 24.0)
+    for name in ("plan.json", "story.md"):
+        with open(os.path.join(made.story_dir, name), encoding="utf-8") as f:
+            text = f.read()
+        with open(os.path.join(ctx.story_dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+    rc, _advisories = se.recheck(ctx, ltx_movie._validate_story_md)
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert rc == 0
+    assert checks["unresolved"] == []
+    assert checks["hard"] == []
+
+
+def test_fw2_paraphrased_camera_sentence_is_repaired(ws):
+    ctx, plan, _parts = _hockey(ws)
+    plan["beats"][0]["camera"] = "slow push-in"
+    player = "The FuboTV hockey player glides toward the camera at real-time speed."
+    for removed in ("The camera glides closer — as the move completes, his face fills the frame.",
+                    "The camera slowly moves in — as the move completes, his face fills the "
+                    "frame."):
+        repaired, notes = se.repair_action_text(ctx, plan, 1, player + " " + removed)
+        assert repaired == player
+        assert notes == [se.REPAIR_NOTE % (1, "N20", "camera direction", "Motion", se._q(removed))]
+        part = {"title": "t", "image": "A rink.", "motion": repaired, "dialogue": "x"}
+        assembled = dict(se.panel_fields(ctx, plan, [part, {}], 1))["Motion"]
+        assert assembled == (player + " FuboTV hockey player faces the camera. "
+                             "The camera pushes in.")
+        assert [m for m in se.format_problems(ctx, plan, part, 1) if " N20 " in m] == []
+
+
+def test_fw3_merge_repair_takes_new_repairs(ws):
+    ctx, plan, _parts = _hockey(ws)
+    player = "The FuboTV hockey player"
+    old = {"title": "t", "motion": player + " carves a stop at real-time speed. " + player + " nods.",
+           "dialogue": "It's just FuboTV.",
+           "repairs": ["panel 2: N7 dialogue and text: Motion: the pipeline removed 'OLD STALE'"]}
+    new = {"title": "t",
+           "motion": player + " carves a short stop at real-time speed. " + player + " nods.",
+           "dialogue": "It's just FuboTV.",
+           "repairs": ["panel 2: N7 dialogue and text: Motion: the pipeline removed 'NEW'"]}
+    merged = se.merge_repair(ctx, plan, 2, old, new, {"T2"})
+    assert merged["motion"] == new["motion"]
+    assert merged["repairs"] == new["repairs"]
+    bare = dict((key, value) for key, value in new.items() if key != "repairs")
+    merged = se.merge_repair(ctx, plan, 2, old, bare, {"T2"})
+    assert merged["motion"] == bare["motion"]
+    assert "repairs" not in merged
+
+
+def test_fw4_exit_re_ignores_runoff_over_the_body():
+    for text in ("rain running off his hood", "snow drifting off her shoulders"):
+        assert se.EXIT_RE.search("The courier stands, %s." % text) is None, text
+    for text in ("skates off", "walks off", "steps off", "skates off the ice",
+                 "pushes off and skates away"):
+        assert se.EXIT_RE.search("She %s now." % text), text

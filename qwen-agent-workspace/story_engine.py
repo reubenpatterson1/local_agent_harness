@@ -1561,7 +1561,7 @@ def camera_directions(lib, text, phrases):
     out = []
     for i, sentence in enumerate(_sentences(text)):
         if lib._is_camera_sentence(sentence, phrases):
-            if _camera_words(sentence):
+            if _camera_words(sentence) or CAMERA_CLAUSE_RE.search(sentence):
                 out.append((i, "sentence"))
         elif CAMERA_CLAUSE_RE.search(sentence):
             out.append((i, "clause"))
@@ -1627,7 +1627,8 @@ EXIT_RE = re.compile(
     r"drives|driving|glide|glides|gliding|stride|strides|striding|head|heads|heading|hurry|"
     r"hurries|hurrying|wander|wanders|wandering|march|marches|marching|drift|drifts|drifting|"
     r"fly|flies|flying|swim|swims|swimming|limp|limps|limping|move|moves|moving|step|steps|"
-    r"stepping|back|backs|backing)\s+(?:away|off)|(?:turn|turns|turning|pull|pulls|pulling)\s+"
+    r"stepping|back|backs|backing)\s+(?:away|off(?!\s+(?:his|her|their|its)\b))|"
+    r"(?:turn|turns|turning|pull|pulls|pulling)\s+"
     r"away|leav(?:e|es|ing)\s+(?:the\s+)?(?:frame|shot|scene|room|rink|ice)|exit(?:s|ing)|"
     r"depart(?:s|ing)|disappear(?:s|ing)?\s+(?:from|into|behind|through)|retreat(?:s|ing)|"
     r"reced(?:es|ing)|out\s+of\s+(?:the\s+)?(?:frame|shot|view|sight)|into\s+the\s+distance|"
@@ -3987,6 +3988,9 @@ def merge_repair(ctx, plan, k, old, new, ids):
     if (ids & {"T2", "T3"} and new.get(action)
             and guard_problem(ctx, plan, old.get(action, ""), new[action]) is None):
         merged[action] = new[action]
+        merged.pop("repairs", None)
+        if new.get("repairs"):
+            merged["repairs"] = new["repairs"]
     if (ids & {"T1", "N18", "N22"} and new.get("dialogue")
             and line_problem(ctx, _character_lib(ctx.ws), _sentence(new["dialogue"])) is None):
         merged["dialogue"] = new["dialogue"]
@@ -4535,6 +4539,16 @@ def _recheck_writers(ctx, lib, plan, k, fields):
     if k > len(plan["beats"]):
         return dict(fields)
     pasted = pasted_pieces(ctx, plan, k)
+    if ctx.mode == "chained" and k >= 2:
+        # Shot prompt format spec D12 (SK10): the 3970e96 pieces of a chained k >= 2 panel, the
+        # facing sentence and, on a speaking panel only, the camera sentence of the old
+        # speaking_camera (static unless the beat's camera is static, push-in, pull-back or
+        # tracking), so an old story re-checks exactly as before.
+        beat = plan["beats"][k - 1]
+        facing = _facing(ctx, plan, k)
+        old = (beat["camera"] if beat["camera"] in ("static", "slow push-in", "slow pull-back",
+                                                    "tracking") else "static")
+        pasted = {"motion": facing + ([dict(CAMERA_SENTENCES)[old]] if facing else [])}
     return dict((label, clean_writer(lib, text, pasted.get(label.lower(), ())))
                 for label, text in fields)
 
