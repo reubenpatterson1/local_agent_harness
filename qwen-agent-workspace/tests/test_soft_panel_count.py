@@ -243,6 +243,11 @@ def test_spt23_lines_needed():
     mixed = [a, "Wait for me.", "Not yet, stay.", d, "Hurry now.", "I am right here."]
     who = ["c1", None, "c2", "c1", None, "c2"]
     assert se.lines_needed(lib, 145 / 24.0, mixed, who) == 4
+    # Plan ruling SPR8: speaker_runs (the P20 speaker reason's run count); a line with no known
+    # speaker joins the current run.
+    assert se.speaker_runs(["a", "b", "c"], ["c1", None, "c2"]) == [["a", "b"], ["c"]]
+    assert se.speaker_runs(["a", "b"], [None, "c1"]) == [["a", "b"]]
+    assert se.speaker_runs(turns, ["c1", "c2", "c1", "c2"]) == [[line] for line in turns]
 
 
 # --- SPT3: the spoken-lines pre-flight (SPC3; plan ruling SPR2) -------------------------------
@@ -727,6 +732,15 @@ def test_spt12_the_p20_reasons(ws, story_env):
                        narrative='The skater says "Go." The crowd drifts away.')
     assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], []])) == [
         P20_NOTE % (2, 1, 1, P20_OTHER_REASON)]
+    # Plan ruling SPR8: the exit is a reason only when, at the target count, the beat that says
+    # the last line would be the last beat. Here beat 3 of the target already follows line 2.
+    ctx = seu.make_ctx(se, ws, panels=3, narrative=HOCKEY, narration="speech")
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], [2], [], []])) == [
+        P20_NOTE % (4, 1, 3, P20_OTHER_REASON)]
+    # More beats than the target, but the last line's beat is the last beat: no exit reason.
+    ctx = seu.make_ctx(se, ws, panels=3, narrative=EIGHT + " He walks off.")
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], [2], [3], [4]])) == [
+        P20_NOTE % (4, 1, 3, words)]
 
 
 # --- SPT19: the static cap after the ctx swap (D9) --------------------------------------------

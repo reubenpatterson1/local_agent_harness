@@ -1922,7 +1922,9 @@ def panel_count_notes(ctx, plan):
         found = narrative_exit_after_last_line(ctx.narrative, plan["cast"])
         said = [k for k, beat in enumerate(plan["beats"], start=1)
                 if len(lines) in beat.get("lines", [])]
-        if found is not None and said and said[0] < n:
+        # Plan ruling SPR8: the exit explains the added panels only when, at the target count,
+        # the beat that says the last line would be the last beat.
+        if found is not None and said and target <= said[0] < n:
             reasons.append(P20_EXIT_REASON % _q(found))
     if not reasons:
         reasons.append(P20_OTHER_REASON)
