@@ -388,3 +388,234 @@ def test_sft22_no_server_and_no_real_home(story_env, tmp_path):
     assert story_env["home"].startswith(str(tmp_path))
     assert os.environ["QWEN_AGENT_DAEMON_URL"].startswith("http://127.0.0.1:")
     assert "ANTHROPIC_API_KEY" not in os.environ
+
+
+# --- SFT1 (Task 2 part): the writer constants (SF6-SF8) ----------------------------------------
+
+WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (55, 105), "motion": (55, 105)},
+               "no_stills": {"prompt": (150, 220)},
+               "shots": {"image": (80, 170), "motion": (55, 105)}}
+PACING_SENTENCE = se.PACING_SENTENCE
+KEY_LINES = {
+    "chained_motion1": (
+        "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+        "during these @@SECONDS@@ seconds, then the camera sentence. Name each character only by "
+        "their referring phrase, word for word. Describe ONE continuous physical motion, not a "
+        "sequence of separate steps: @@SECONDS@@ seconds is enough for a single gesture, a few "
+        "footsteps or the start of a movement." + PACING_SENTENCE),
+    "chained_motion": (
+        "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+        "during these @@SECONDS@@ seconds, continuing from where the previous panel left them, "
+        "then the camera sentence. Name each character only by their referring phrase, word for "
+        "word. Describe ONE continuous physical motion, not a sequence of separate steps: "
+        "@@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the start of a "
+        "movement." + PACING_SENTENCE + " Do not describe appearance, clothing, setting, "
+        "lighting, colour or style -- all of that is already on screen."),
+    "shots_motion": (
+        "motion: W1 to W2 words: ONE sentence naming ONE character by their referring phrase and "
+        "the ONE physical action they perform during these @@SECONDS@@ seconds, told in concrete "
+        "detail (where in the frame they start, how they move and where they end), then the "
+        "camera sentence. Never chain actions with then, while, meanwhile, simultaneously, "
+        "afterwards, followed by or a comma before and, and never use a semicolon."),
+}
+CAMERA_WRITER_SENTENCE = (" End this field with exactly one camera sentence, for this panel's "
+                          "planned camera, in which the camera @@CAMERA_MOVE@@: begin it with "
+                          "'The camera' and write it like @@CAMERA_FORM@@, with your own words in "
+                          "place of the part in angle brackets. Write no other camera direction "
+                          "anywhere in this field.")
+CAMERA_WRITER_FORMS = {
+    "slow push-in": ("pushes in", "'The camera pushes in — as the move completes, <what then "
+                                  "fills the frame>.'"),
+    "slow pull-back": ("pulls back", "'The camera pulls back — as the move completes, <what the "
+                                     "wider frame then shows>.'"),
+    "tracking": ("tracks the movement", "'The camera tracks <whom it follows> — as the move "
+                                        "completes, <where the frame ends>.'"),
+    "handheld": ("moves handheld", "'The camera follows with handheld movement — as the move "
+                                   "completes, <where the frame ends>.'"),
+    "slow pan left": ("pans left", "'The camera pans left — as the move completes, <what the "
+                                   "frame ends on>.'"),
+    "slow pan right": ("pans right", "'The camera pans right — as the move completes, <what the "
+                                     "frame ends on>.'"),
+    "slow tilt up": ("tilts up", "'The camera tilts up — as the move completes, <what the frame "
+                                 "ends on>.'"),
+    "slow tilt down": ("tilts down", "'The camera tilts down — as the move completes, <what the "
+                                     "frame ends on>.'"),
+    "static": ("stays static", "'The camera stays static, holding <what stays in the frame>.'"),
+}
+# Shot prompt format spec SF7, D7: a shots speaking panel's reaction after the line, and the
+# speaker staying in frame (every mode).
+SPEAKING_REACTION_SENTENCE = (" The pipeline puts the spoken line right after your first "
+                              "sentence. Between that sentence and the camera sentence you may "
+                              "write one short sentence, beginning with @@SPEAKER@@, of how they "
+                              "react once the line is said, such as a nod, a breath or a glance "
+                              "down; nobody else acts in it.")
+SPEAKING_NO_REACTION_SENTENCE = (" The pipeline puts the spoken line right after your first "
+                                 "sentence, so write no other action sentence.")
+SPEAKING_STAY_SENTENCE = (" In this whole panel @@SPEAKER@@ never leaves, turns away or moves "
+                          "out of the frame, even when the beat says so.")
+SPEAKING_CHAINED_MOTION_SENTENCE = (
+    " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
+    "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
+    "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
+    "the dialogue comes before they do anything, it is how they turn or step toward the camera; "
+    "never write only that they face it); after it you may write one short second sentence of "
+    "how @@SPEAKER@@ reacts once the line is said, such as a nod, a breath or a glance down, in "
+    "which nobody else acts. Begin each of these sentences with @@SPEAKER@@, word for word, and "
+    "write nothing about anyone else before the first one. Never put an action from before the "
+    "dialogue and one from after it in the same sentence, and do not write the spoken words or a "
+    "speaking verb; the pipeline adds them.")
+FORMAT_REFERENCE_SHA256 = "d2fe46c687bdaf8ebc75235bdf530d5d751aa1fa62f9bf393bf9855bef7681dd"
+
+
+def test_sft1b_writer_constants():
+    assert se.WORD_RANGES == WORD_RANGES
+    for key, line in KEY_LINES.items():
+        assert se.KEY_LINE_TEMPLATES[key] == line, key
+    for key in ("no_stills_prompt", "no_stills_prompt_speaking"):
+        line = se.KEY_LINE_TEMPLATES[key]
+        assert "you may also state a camera movement" not in line, key
+        assert ("and states the camera viewpoint and the lighting and colour. Name each character "
+                "only by their referring phrase.") in line, key
+    assert se.CAMERA_WRITER_SENTENCE == CAMERA_WRITER_SENTENCE
+    assert se.CAMERA_WRITER_FORMS == CAMERA_WRITER_FORMS
+    assert set(se.CAMERA_WRITER_FORMS) == set(se.CAMERA_KEYS)
+    assert se.SPEAKING_REACTION_SENTENCE == SPEAKING_REACTION_SENTENCE
+    assert se.SPEAKING_NO_REACTION_SENTENCE == SPEAKING_NO_REACTION_SENTENCE
+    assert se.SPEAKING_STAY_SENTENCE == SPEAKING_STAY_SENTENCE
+    assert se.SPEAKING_CHAINED_MOTION_SENTENCE == SPEAKING_CHAINED_MOTION_SENTENCE
+    reference = se.FORMAT_REFERENCE
+    assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == FORMAT_REFERENCE_SHA256
+    assert (len(reference), len(reference.split())) == (2406, 421)
+    assert "@@" not in reference
+    for text in ([reference, se.CAMERA_WRITER_SENTENCE, se.SPEAKING_REACTION_SENTENCE,
+                  se.SPEAKING_NO_REACTION_SENTENCE, se.SPEAKING_STAY_SENTENCE,
+                  se.SPEAKING_CHAINED_MOTION_SENTENCE]
+                 + [se.KEY_LINE_TEMPLATES[key] for key in KEY_LINES]
+                 + [form for _move, form in se.CAMERA_WRITER_FORMS.values()]):
+        assert "slowly" not in text.lower(), text
+
+
+# --- SFT3 (Task 2 part): the chained paste-time speaking camera (SF4, SF6) --------------------
+
+def test_sft3b_a_chained_speaking_pan_pastes_a_push_in(ws, story_env):
+    ctx = seu.make_ctx(se, ws, mode="chained", panels=2, members=_members(story_env),
+                       narration="speech")
+    raw = _raw("chained", 2, [["c1"], ["c1"]], ["", "c1"])
+    raw["beats"][1]["camera"] = "slow pan right"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    assert plan["beats"][1]["camera"] == "slow pan right"
+    assert se.panel_camera(ctx, plan, 2) == "slow push-in"
+    assert se.panel_camera(ctx, plan, 1) == plan["beats"][0]["camera"]
+    assert se.pasted_pieces(ctx, plan, 2)["motion"] == ["The woman in grey faces the camera.",
+                                                        "The camera pushes in."]
+
+
+# --- SFT5: the writer prompt (SF7, SF8, SK9) ---------------------------------------------------
+
+def _sft5(ws, mode="shots", narration="speech", cameras=("tracking", "slow push-in", "static"),
+          speaker_beat=2, **ctx_kw):
+    """(ctx, plan, parts) of a 3-panel movie: beat k's camera cameras[k - 1], the courier (c1)
+    speaking in beat speaker_beat (none when 0), empty writer parts."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=3, narration=narration, **ctx_kw)
+    raw = seu.plan_json(mode, 3)
+    for beat, camera in zip(raw["beats"], cameras):
+        beat["camera"] = camera
+    if speaker_beat:
+        raw["beats"][speaker_beat - 1]["speaker"] = "c1"
+    plan, _shape = se.normalize_plan(ctx, raw)
+    return ctx, plan, [se.empty_parts(mode, k, plan, ctx) for k in (1, 2, 3)]
+
+
+def _key_line(prompt, key):
+    return [line for line in prompt.split("\n") if line.startswith(key + ": ")][0]
+
+
+def _writer_sentence(camera):
+    move, form = se.CAMERA_WRITER_FORMS[camera]
+    return (se.CAMERA_WRITER_SENTENCE.replace("@@CAMERA_MOVE@@", move)
+            .replace("@@CAMERA_FORM@@", form))
+
+
+def test_sft5_the_writer_prompt(ws):
+    ctx, plan, parts = _sft5(ws)
+    first = se.build_panel_prompt(ctx, plan, parts, 1)
+    assert _key_line(first, "motion").endswith(_writer_sentence("tracking"))
+    second = se.build_panel_prompt(ctx, plan, parts, 2)
+    speaking = (se.SPEAKING_ACTION_SENTENCE + se.SPEAKING_REACTION_SENTENCE
+                + se.SPEAKING_STAY_SENTENCE).replace("@@SPEAKER@@", '"the courier"')
+    assert speaking + _writer_sentence("slow push-in") in _key_line(second, "motion")
+    for prompt in (first, second):
+        assert prompt.count(se.FORMAT_REFERENCE) == 1
+        assert (se.FORMAT_REFERENCE + "Write this panel as one JSON object") in prompt
+        assert "@@" not in prompt
+    ctx, plan, parts = _sft5(ws, clip_seconds=5.04)
+    short = _key_line(se.build_panel_prompt(ctx, plan, parts, 2), "motion")
+    no_reaction = (se.SPEAKING_ACTION_SENTENCE + se.SPEAKING_NO_REACTION_SENTENCE
+                   + se.SPEAKING_STAY_SENTENCE).replace("@@SPEAKER@@", '"the courier"')
+    assert no_reaction + _writer_sentence("slow push-in") in short
+    assert "of how they react once the line is said" not in short
+    ctx, plan, parts = _sft5(ws, mode="chained", cameras=("tracking", "static", "static"),
+                             speaker_beat=0)
+    for k in (1, 2):
+        prompt = se.build_panel_prompt(ctx, plan, parts, k)
+        assert prompt.count(se.FORMAT_REFERENCE) == 1, k
+        assert "@@" not in prompt, k
+    assert "in which the camera stays static" in _key_line(
+        se.build_panel_prompt(ctx, plan, parts, 2), "motion")
+    for mode, narration in (("no_stills", "speech"), ("no_stills", True), ("chained", False),
+                            ("shots", False), ("no_stills", False)):
+        ctx, plan, parts = _sft5(ws, mode=mode, narration=narration)
+        for k in (1, 2, 3):
+            prompt = se.build_panel_prompt(ctx, plan, parts, k)
+            assert "FORMAT REFERENCE ONLY" not in prompt, (mode, narration, k)
+            assert "@@" not in prompt, (mode, narration, k)
+    ctx, plan, parts = _sft5(ws, cameras=("", "slow push-in", "static"))
+    assert "End this field with exactly one camera sentence" not in _key_line(
+        se.build_panel_prompt(ctx, plan, parts, 1), "motion")
+
+
+# --- SFT6: the pasted camera is only a fallback (SF6, plan ruling PR1, SK5) ----------------------
+
+SFT6_ACTION = "The courier steps onto the wet quay at real-time speed."
+SFT6_CAMERA = "The camera pushes in — as the move completes, her face fills the frame."
+
+
+def test_sft6_the_pasted_camera_is_only_a_fallback(ws):
+    for mode in ("chained", "shots", "no_stills"):
+        label = "Prompt" if mode == "no_stills" else "Motion"
+        for speaks in (False, True):
+            ctx = seu.make_ctx(se, ws, mode=mode, panels=2, narration="speech")
+            raw = seu.plan_json(mode, 2)
+            for beat in raw["beats"]:
+                beat["camera"] = "slow push-in"
+                beat["speaker"] = "c1" if speaks else ""
+            plan, _shape = se.normalize_plan(ctx, raw)
+            for k in (1, 2):
+                where = (mode, speaks, k)
+                assert se.panel_camera(ctx, plan, k) == "slow push-in", where
+                reply = seu.panel_json(mode, k)
+                if speaks:
+                    reply["dialogue"] = "Go now."
+                for writer in (SFT6_ACTION, SFT6_ACTION + " " + SFT6_CAMERA):
+                    reply[label.lower()] = writer
+                    parts = [se.empty_parts(mode, j, plan, ctx) for j in (1, 2)]
+                    parts[k - 1] = se.parse_panel_reply(ctx, plan, k, json.dumps(reply))
+                    field = dict(se.panel_fields(ctx, plan, parts, k))[label]
+                    assert field.count("The camera") == 1, where
+                    if writer == SFT6_ACTION:
+                        assert field.endswith(" The camera pushes in."), where
+                    else:
+                        assert SFT6_CAMERA in field, where
+                        assert "The camera pushes in." not in field, where
+
+
+# --- SFT21: the prompt budget (SF8) ------------------------------------------------------------
+
+def test_sft21_the_reference_adds_exactly_its_own_length(ws, monkeypatch):
+    ctx, plan, parts = _sft5(ws)
+    reference = se.FORMAT_REFERENCE
+    full = se.build_panel_prompt(ctx, plan, parts, 2)
+    monkeypatch.setattr(se, "FORMAT_REFERENCE", "")
+    bare = se.build_panel_prompt(ctx, plan, parts, 2)
+    assert len(full) - len(bare) == len(reference) == 2406
+    assert len(full) < 9000

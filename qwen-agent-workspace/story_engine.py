@@ -64,9 +64,9 @@ def max_static(panels):
 
 
 ARC_ROLES = ("introduction", "rising", "climax", "falling", "resolution")
-WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (15, 35), "motion": (15, 35)},
+WORD_RANGES = {"chained": {"image1": (120, 170), "motion1": (55, 105), "motion": (55, 105)},
                "no_stills": {"prompt": (150, 220)},
-               "shots": {"image": (80, 170), "motion": (10, 25)}}
+               "shots": {"image": (80, 170), "motion": (55, 105)}}
 NARRATION_WORDS = (3, 30)
 MIN_WRITER_WORDS = {"image": 20, "prompt": 20, "motion": 5}
 # Word counts are advisory: a count is flagged only when it is more than this fraction outside
@@ -1525,30 +1525,49 @@ def _moves_camera(ctx, plan, text):
                for s in _sentences(text))
 
 
+def panel_camera(ctx, plan, k):
+    """The camera key panel k uses (shot prompt format spec SF6): speaking_camera(beat) on a
+    chained k >= 2 speaking panel, else the beat's planned camera."""
+    beat = plan["beats"][k - 1]
+    if ctx.mode == "chained" and k >= 2 and panel_speaks(ctx, plan, k):
+        return speaking_camera(beat)
+    return beat["camera"]
+
+
 def pasted_pieces(ctx, plan, k):
     """{field: [pasted sentences in assembly order]} for panel k (RS14; dialogue spec SP4): the
     pieces of each assembled field that the writer does not write. A speaking panel adds the
-    facing sentence (and, chained k >= 2, the camera sentence of speaking_camera: the planned
-    camera, or "The camera stays static." for a pan or tilt; narrative dialogue fidelity spec
-    SM3). The planned camera sentence is always listed, even when CM4 leaves it out of the
-    assembled field."""
+    facing sentence; every panel, chained k >= 2 included, lists its panel_camera sentence
+    (shot prompt format spec SF6). The planned camera sentence is always listed, even when
+    CM4 leaves it out of the assembled field."""
     beat = plan["beats"][k - 1]
     by_cast = {c["id"]: c for c in plan["cast"]}
     by_location = {l["id"]: l for l in plan["locations"]}
     setting = by_location[beat["location"]]["setting"] if beat["location"] in by_location else ""
     identities = [identity(by_cast[c]) for c in beat["cast"] if c in by_cast]
     shot = shot_sentence(beat) if beat["shot"] in SHOT_TYPES else ""
-    camera = dict(CAMERA_SENTENCES).get(beat["camera"], "")
+    camera = dict(CAMERA_SENTENCES).get(panel_camera(ctx, plan, k), "")
     facing = _facing(ctx, plan, k)
     pieces = [setting] + identities + facing + [shot]
     if ctx.mode == "chained":
         if k == 1:
             return {"image": pieces, "motion": facing + [camera], "narration": []}
-        return {"motion": facing + ([dict(CAMERA_SENTENCES)[speaking_camera(beat)]]
-                                    if facing else []), "narration": []}
+        return {"motion": facing + [camera], "narration": []}
     if ctx.mode == "no_stills":
         return {"prompt": identities + [setting, shot] + facing + [camera], "narration": []}
     return {"image": pieces, "motion": facing + [camera], "narration": []}
+
+
+# Plan ruling PR1 (shot prompt format spec SF6, D4): a writer's camera sentence begins with the
+# planned sentence's words ("The camera pushes in — as the move completes, ..."), so the cleanup
+# of an action field never blanks a CAMERA_SENTENCES sentence; CM4 (panel_fields) then leaves
+# the pasted copy out.
+def cleanup_pieces(pasted, key):
+    """The pasted sentences clean_writer blanks from the writer's key text: pasted[key], without
+    the CAMERA_SENTENCES sentences when key is motion or prompt."""
+    cameras = set(sentence for _key, sentence in CAMERA_SENTENCES)
+    return [p for p in pasted.get(key, ())
+            if key not in ("motion", "prompt") or p not in cameras]
 
 
 def identity(cast_entry):
@@ -1938,6 +1957,39 @@ COPIED_EXAMPLES = (
     "her eyebrows angle down and her lips press together",
     "a charge, a draw and a strike",
 )
+# Shot prompt format spec SF8, D9: three finished shots of an unrelated movie, shown to the
+# chained and shots writer for their order only. Each "Shot N" text is exactly
+# character_lib.panel_prompt of its parts (SFT13).
+FORMAT_REFERENCE = (
+    "FORMAT REFERENCE ONLY — never reuse its people, places, objects or words. These are the "
+    "finished video prompts of three shots from a different movie. They show the order of every "
+    "finished shot: the shot type; the action; when someone speaks, the spoken line and then one "
+    "short reaction by the speaker; the one camera sentence, which says where the move ends; and "
+    "the audio last. The pipeline wrote the sentences that start \"The shot is\", the sentence "
+    "\"The old fishmonger faces the camera.\", the spoken line and the audio sentence; the "
+    "writer wrote every other sentence.\n"
+    "Shot 1 (silent; the camera tracks): The shot is a wide shot. The old fishmonger drags a "
+    "tall stack of empty herring crates across the wet concrete of the market hall toward the "
+    "half-open shutter at real-time speed, her heavy steps splashing through shallow puddles "
+    "that hold the first glow from the harbour doors. The camera tracks alongside her from the "
+    "left — as the move completes, she reaches the shutter at frame centre, the long rows of "
+    "bare zinc counters stretching away behind her. The audio is the natural ambient sound of "
+    "the place, with no music.\n"
+    "Shot 2 (speaking; the camera pushes in): The shot is a medium shot. The old fishmonger "
+    "looks up from the empty ice trays to the camera, drying her knuckles on a folded cloth at "
+    "the zinc counter at real-time speed. The old fishmonger faces the camera. The old "
+    "fishmonger says, \"Forty years of mornings.\" After a breath, \"Not one more.\" The old "
+    "fishmonger lets the folded cloth drop onto the counter, her shoulders sinking. The camera "
+    "pushes in — as the move completes, her face fills the frame from chin to brow, the bare "
+    "counters soft behind her. The audio is clear close-mic dialogue with a subtle natural room "
+    "tone; the dialogue takes priority over the quiet ambience, and there is no music.\n"
+    "Shot 3 (silent; the movie's one deliberate static hold): The shot is a close-up. The old "
+    "fishmonger presses her forehead against the cold ribs of the half-closed steel shutter at "
+    "real-time speed, both palms flat on the metal, her breath fogging the ribbed steel as a "
+    "thin trickle of meltwater runs past her knuckles and drips onto the wet concrete at her "
+    "feet. The camera stays static, holding her face, her knuckles and the ribbed steel tight in "
+    "the frame as her eyelids drop shut and the shutter stops trembling. The audio is the "
+    "natural ambient sound of the place, with no music.\n\n")
 _LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration|dialogue)\s*:\s*",
                        re.IGNORECASE)
 _QUOTE_PAIRS = (('"', '"'), ("“", "”"))
@@ -1961,7 +2013,7 @@ PANEL_PROMPT_TEMPLATE = (
     "Characters on screen in this panel, named only by these exact referring phrases: "
     "@@CAST_PHRASES@@\n"
     "@@RESERVED@@@@PREVIOUS@@\n"
-    "@@SEED_PANEL@@Write this panel as one JSON object with exactly these keys:\n"
+    "@@FORMAT_REFERENCE@@@@SEED_PANEL@@Write this panel as one JSON object with exactly these keys:\n"
     "\n"
     "@@KEY_LINES@@\n"
     "\n"
@@ -1989,27 +2041,26 @@ KEY_LINE_TEMPLATES = {
         "the shot type: the pipeline adds each character's description, the place's setting "
         "sentence and the shot type to this field itself."),
     "chained_motion1": (
-        "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
-        "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, "
-        "word for word. Describe ONE continuous physical motion, not a sequence of separate "
-        "steps: @@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the "
-        "start of a movement." + PACING_SENTENCE + " You may add one camera direction; without "
-        "one, the pipeline adds the planned camera sentence."),
+        "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+        "during these @@SECONDS@@ seconds, then the camera sentence. Name each character only by "
+        "their referring phrase, word for word. Describe ONE continuous physical motion, not a "
+        "sequence of separate steps: @@SECONDS@@ seconds is enough for a single gesture, a few "
+        "footsteps or the start of a movement." + PACING_SENTENCE),
     "chained_motion": (
-        "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
-        "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. "
-        "Name each character only by their referring phrase, word for word. Describe ONE "
-        "continuous physical motion, not a sequence of separate steps: @@SECONDS@@ seconds is "
-        "enough for a single gesture, a few footsteps or the start of a movement."
-        + PACING_SENTENCE + " Do not describe appearance, clothing, setting, lighting, colour or "
-        "style -- all of that is already on screen. You may add one camera direction."),
+        "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+        "during these @@SECONDS@@ seconds, continuing from where the previous panel left them, "
+        "then the camera sentence. Name each character only by their referring phrase, word for "
+        "word. Describe ONE continuous physical motion, not a sequence of separate steps: "
+        "@@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the start of a "
+        "movement." + PACING_SENTENCE + " Do not describe appearance, clothing, setting, "
+        "lighting, colour or style -- all of that is already on screen."),
     "no_stills_prompt": (
         "prompt: W1 to W2 words in the present tense: one flowing paragraph in strict "
         "chronological order that opens with the main action, carries enough separate beats to "
         "fill the full @@SECONDS@@ seconds, links them with temporal connectors (initially, as, "
         "then, while, a moment later), names the ambient and environmental sounds alongside the "
-        "actions that make them, and states the camera viewpoint and the lighting and colour; you "
-        "may also state a camera movement. Name each character only by their referring phrase. Do "
+        "actions that make them, and states the camera viewpoint and the lighting and colour. "
+        "Name each character only by their referring phrase. Do "
         "not describe any character's appearance or clothing, do not write a sentence about the "
         "place itself and do not name the shot type: the pipeline adds each character's "
         "description, the place's setting sentence, the shot type and, unless you state one, the "
@@ -2024,11 +2075,11 @@ KEY_LINE_TEMPLATES = {
         "adds each character's description, the place's setting sentence and the shot type to "
         "this field itself. Never name a person who is not in this shot."),
     "shots_motion": (
-        "motion: ONE sentence of W1 to W2 words naming ONE character by their referring phrase "
-        "and the ONE physical action they perform during these @@SECONDS@@ seconds. Never chain "
-        "actions with then, while, meanwhile, simultaneously, afterwards, followed by or a comma "
-        "before and, and never use a semicolon. You may follow it with one camera sentence; "
-        "without one, the pipeline adds the planned camera sentence."),
+        "motion: W1 to W2 words: ONE sentence naming ONE character by their referring phrase and "
+        "the ONE physical action they perform during these @@SECONDS@@ seconds, told in concrete "
+        "detail (where in the frame they start, how they move and where they end), then the "
+        "camera sentence. Never chain actions with then, while, meanwhile, simultaneously, "
+        "afterwards, followed by or a comma before and, and never use a semicolon."),
     "narration": ("narration: one sentence of 3 to 30 words of voice-over that nobody on screen "
                   "says aloud. Never put a spoken line here."),
     "narration_with_dialogue": ("narration: one sentence of 3 to 30 words of voice-over that "
@@ -2062,19 +2113,18 @@ SPEAKING_ACTION_SENTENCE = (" In this panel @@SPEAKER@@ speaks the dialogue: the
                             "a speaking verb here; the pipeline adds them.")
 # Writer pacing spec WP2, D1, D2: a chained speaking panel's motion is one sentence before the
 # dialogue (which character_lib.insert_speech places after it) and, when the beat goes on, one
-# after it.
+# after it; shot prompt format spec SF7.
 SPEAKING_CHAINED_MOTION_SENTENCE = (
     " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after the "
     "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
     "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
     "the dialogue comes before they do anything, it is how they turn or step toward the camera; "
-    "never write only that they face it); only when the beat has them act after the dialogue, "
-    "write what they do then as a second "
-    "sentence. Begin each of these sentences with @@SPEAKER@@, word for word, and write nothing "
-    "about anyone else before the first one. The action before the dialogue and the action "
-    "after it are the two parts of this one motion: never put an action from before the "
-    "dialogue and one from after it in the same sentence, and do not write the spoken words or "
-    "a speaking verb; the pipeline adds them.")
+    "never write only that they face it); after it you may write one short second sentence of "
+    "how @@SPEAKER@@ reacts once the line is said, such as a nod, a breath or a glance down, in "
+    "which nobody else acts. Begin each of these sentences with @@SPEAKER@@, word for word, and "
+    "write nothing about anyone else before the first one. Never put an action from before the "
+    "dialogue and one from after it in the same sentence, and do not write the spoken words or a "
+    "speaking verb; the pipeline adds them.")
 # Pinned cast presence spec PC8, D3: a chained speaking panel's silent library co-stars
 # (@@SILENT@@ is their quoted phrases).
 SILENT_CAST_MOTION_SENTENCE = (" Also in frame in this panel, and silent: @@SILENT@@. Only "
@@ -2090,6 +2140,43 @@ SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, f
                            "any crowd stays in the background.")
 SPEAKING_SENTENCES = {"image": SPEAKING_IMAGE_SENTENCE, "motion": SPEAKING_ACTION_SENTENCE,
                       "prompt": SPEAKING_PROMPT_SENTENCE}
+# Shot prompt format spec SF7, D4: the writer writes the panel's one camera sentence, with the
+# end frame; CAMERA_WRITER_FORMS maps a camera key to (the move, as said of the camera; the form).
+CAMERA_WRITER_SENTENCE = (" End this field with exactly one camera sentence, for this panel's "
+                          "planned camera, in which the camera @@CAMERA_MOVE@@: begin it with "
+                          "'The camera' and write it like @@CAMERA_FORM@@, with your own words in "
+                          "place of the part in angle brackets. Write no other camera direction "
+                          "anywhere in this field.")
+CAMERA_WRITER_FORMS = {
+    "slow push-in": ("pushes in", "'The camera pushes in — as the move completes, <what then "
+                                  "fills the frame>.'"),
+    "slow pull-back": ("pulls back", "'The camera pulls back — as the move completes, <what the "
+                                     "wider frame then shows>.'"),
+    "tracking": ("tracks the movement", "'The camera tracks <whom it follows> — as the move "
+                                        "completes, <where the frame ends>.'"),
+    "handheld": ("moves handheld", "'The camera follows with handheld movement — as the move "
+                                   "completes, <where the frame ends>.'"),
+    "slow pan left": ("pans left", "'The camera pans left — as the move completes, <what the "
+                                   "frame ends on>.'"),
+    "slow pan right": ("pans right", "'The camera pans right — as the move completes, <what the "
+                                     "frame ends on>.'"),
+    "slow tilt up": ("tilts up", "'The camera tilts up — as the move completes, <what the frame "
+                                 "ends on>.'"),
+    "slow tilt down": ("tilts down", "'The camera tilts down — as the move completes, <what the "
+                                     "frame ends on>.'"),
+    "static": ("stays static", "'The camera stays static, holding <what stays in the frame>.'"),
+}
+# Shot prompt format spec SF7, D7: a shots speaking panel's reaction after the line, and the
+# speaker staying in frame (every mode).
+SPEAKING_REACTION_SENTENCE = (" The pipeline puts the spoken line right after your first "
+                              "sentence. Between that sentence and the camera sentence you may "
+                              "write one short sentence, beginning with @@SPEAKER@@, of how they "
+                              "react once the line is said, such as a nod, a breath or a glance "
+                              "down; nobody else acts in it.")
+SPEAKING_NO_REACTION_SENTENCE = (" The pipeline puts the spoken line right after your first "
+                                 "sentence, so write no other action sentence.")
+SPEAKING_STAY_SENTENCE = (" In this whole panel @@SPEAKER@@ never leaves, turns away or moves "
+                          "out of the frame, even when the beat says so.")
 FIX_INSTRUCTION = ("\nFix only these problems. Keep every camera direction, every descriptive "
                    "sentence and the dialogue word for word, and change only the sentence or "
                    "sentences that cause them.")
@@ -2202,7 +2289,7 @@ def parse_panel_reply(ctx, plan, k, answer):
     for key in panel_keys(ctx, plan, k):
         if key == "title":
             continue
-        value = clean_writer(lib, obj.get(key), pasted.get(key, ()))
+        value = clean_writer(lib, obj.get(key), cleanup_pieces(pasted, key))
         if key == "dialogue":
             value = assigned_dialogue(plan, k) or _clean_dialogue(lib, value,
                                                                   speaker_phrase(plan, k))
@@ -2227,8 +2314,8 @@ def _clean_dialogue(lib, text, phrase):
 def panel_fields(ctx, plan, parts, k):
     """[(Label, assembled text)] of panel k in file order (RS14; dialogue spec SP4): Image: where
     the mode has one (setting, identities, writer image, facing, shot), Motion: or Prompt: (the
-    writer text, then the pasted sentences; on a non-speaking panel the planned camera sentence
-    is left out when the writer text moves the camera, CM4), Dialogue: on a speaking panel
+    writer text, then the pasted sentences; the planned camera sentence is left out when the
+    writer text moves the camera, CM4; shot prompt format spec SF6), Dialogue: on a speaking panel
     ("<phrase>: <line>"), then Narration: when narration is True and the part is non-empty or the
     panel does not speak."""
     p = parts[k - 1]
@@ -2245,7 +2332,7 @@ def panel_fields(ctx, plan, parts, k):
         fields.append(("Image", join(image[:cut] + [p.get("image", "")] + image[cut:])))
     key = "prompt" if ctx.mode == "no_stills" else "motion"
     pieces = pasted[key]
-    if not facing and pieces and _moves_camera(ctx, plan, p.get(key, "")):
+    if pieces and _moves_camera(ctx, plan, p.get(key, "")):
         pieces = pieces[:-1]
     fields.append((LABELS[key], join([p.get(key, "")] + pieces)))
     if facing:
@@ -2767,6 +2854,13 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
                              GENERATION_CHECKS, undeclared)
         hard += h
         advisory += a
+        if (ctx.mode == "chained" and k >= 2 and not _facing(ctx, plan, k)
+                and not writers.get("Motion", "").strip()
+                and dict(fields).get("Motion", "").strip()):
+            # Shot prompt format spec SF6 (R7) pastes a fallback camera sentence into this field,
+            # so an empty writer Motion stays a blocking S3 here (on-camera dialogue spec fix
+            # wave item 1).
+            hard.append("panel %d: S3 fields: missing/empty Motion: field" % k)
     advisory = plan_copied_examples(plan) + _order_by_panel(
         advisory + repeat_advisories(ctx, lib, plan, writers_by_panel))
     if "Q1" in GENERATION_CHECKS:
@@ -2839,6 +2933,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
               if speaks and ctx.mode == "chained" else [])
     words = str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 1)) if speaks else ""
     assigned = assigned_dialogue(plan, k)
+    camera_key = panel_camera(ctx, plan, k)
+    fits_two = max(1, int(engine_seconds(ctx) / ACTION_SECONDS + 1e-9)) >= 2
     key_lines = []
     for key in panel_keys(ctx, plan, k):
         if key == "title":
@@ -2864,12 +2960,21 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
                 line += SPEAKING_IMAGE_SILENT_SENTENCE
             else:
                 line += SPEAKING_SENTENCES.get(key, "")
+        if speaks and key in ("motion", "prompt"):
+            if ctx.mode == "shots":
+                line += SPEAKING_REACTION_SENTENCE if fits_two else SPEAKING_NO_REACTION_SENTENCE
+            line += SPEAKING_STAY_SENTENCE
+        if key in ("motion", "prompt") and camera_key in CAMERA_WRITER_FORMS:
+            line += CAMERA_WRITER_SENTENCE
         if key in targets:
             line = line.replace("W1", str(targets[key][0]), 1).replace("W2", str(targets[key][1]), 1)
         if speaks:
             line = (line.replace("@@SPEAKER@@", '"%s"' % phrase).replace("@@DWORDS@@", words)
                     .replace("@@LINE@@", '"%s"' % assigned)
                     .replace("@@SILENT@@", _and_list(silent) if silent else ""))
+        if camera_key in CAMERA_WRITER_FORMS:
+            move, form = CAMERA_WRITER_FORMS[camera_key]
+            line = line.replace("@@CAMERA_MOVE@@", move).replace("@@CAMERA_FORM@@", form)
         key_lines.append(line)
     fix_block = ""
     if fix is not None:
@@ -2890,6 +2995,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
         ("@@CAST_PHRASES@@", phrases or "nobody"),
         ("@@RESERVED@@", reserved),
         ("@@PREVIOUS@@", previous),
+        ("@@FORMAT_REFERENCE@@", FORMAT_REFERENCE
+         if ctx.mode in ("chained", "shots") and ctx.narration is not False else ""),
         ("@@SEED_PANEL@@", seed),
         ("@@KEY_LINES@@", "\n".join(key_lines)),
         ("@@FIX_BLOCK@@", fix_block),
