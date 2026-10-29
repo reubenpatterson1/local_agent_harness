@@ -475,3 +475,334 @@ def test_spr1b_p19_ignores_an_exit_by_anyone_else(ws):
              [P19_NOTE % ("'skates off'", P19_ROOM_HINT % (3, 2))])):
         ctx, plan = _p19_plan(ws, "chained", 1, [[1]], narrative=narrative)
         assert se.exit_left_out_notes(ctx, plan) == want, narrative
+
+
+# --- SPT1 (Task 3 part): the P20 constants (SPC11) --------------------------------------------
+
+P20_NOTE = ("plan: P20 panel count: this movie has %d panels, %d more than its target of %d, "
+            "because %s")
+P20_LINES_REASON = "the narrative's %d spoken lines need at least %d panels of %s seconds"
+P20_SPEAKER_REASON = ("the narrative's spoken lines come in %d runs by different speakers, which "
+                      "need at least %d panels with one speaker each")
+P20_EXIT_REASON = "the narrative's exit after its last spoken line (%s) has a later beat"
+P20_OTHER_REASON = "the story planner needed them for the narrative's action"
+CAST2 = [{"id": "c1", "phrase": "x", "descriptor": "a woman"},
+         {"id": "c2", "phrase": "y", "descriptor": "a man"}]
+
+
+def test_spt1c_p20_constants():
+    assert se.P20_NOTE == P20_NOTE
+    assert se.P20_LINES_REASON == P20_LINES_REASON
+    assert se.P20_SPEAKER_REASON == P20_SPEAKER_REASON
+    assert se.P20_EXIT_REASON == P20_EXIT_REASON
+    assert se.P20_OTHER_REASON == P20_OTHER_REASON
+    for text in (P20_NOTE, P20_LINES_REASON, P20_SPEAKER_REASON, P20_EXIT_REASON,
+                 P20_OTHER_REASON):
+        assert "--panels" not in text and "--length" not in text
+
+
+def _normalized(ctx, raw):
+    plan, _shape = se.normalize_plan(ctx, raw)
+    return plan
+
+
+def _p1(hard):
+    return [m for m in hard if " P1 " in m]
+
+
+# --- SPT6, SPT7: P1, the beat-range checks and normalize_plan (SPC6, SPC7; plan ruling SPR3) ---
+
+def test_spt6_p1_and_the_beat_range_checks(ws, tmp_path):
+    ctx = seu.make_ctx(se, ws, panels=3)
+    for n in (3, 4, 5):
+        hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", n)))
+        assert [m for m in hard + advisory if " P1 " in m or " P5 " in m or " P6 " in m] == [], n
+    for n in (2, 6):
+        hard = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", n)))[0]
+        assert "plan: P1 beat count: expected 3 to 5 beats, found %d" % n in hard, n
+    eight = seu.make_ctx(se, ws, panels=2, narrative=EIGHT)
+    hard = se.plan_checks(eight, _normalized(eight, seu.plan_json("chained", 3)))[0]
+    assert "plan: P1 beat count: expected exactly 4 beats, found 3" in hard
+    raw = seu.plan_json("chained", 4)
+    raw["beats"][3]["index"] = 7
+    hard = se.plan_checks(ctx, _normalized(ctx, raw))[0]
+    assert _p1(hard) == [
+        "plan: P1 beat count: beat 4 has index 7; beats must be numbered 1 to 4 in order"]
+    files = str(tmp_path / "files")
+    entry = seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion")
+    lctx = seu.make_ctx(se, ws, panels=3, catalog={"schema_version": 1, "entries": [entry]})
+    compatible = dict((e["id"], e) for e in se.compatible_entries(lctx))
+    for key, want in (("5", []), ("6", ["plan: L1 catalog id: per_beat key '6' is not a beat "
+                                        "number from 1 to 5"])):
+        raw = seu.plan_json("chained", 5)
+        raw["loras"] = {"global": [], "per_beat": {key: [{"id": "fast-motion", "strength": 0.7}]},
+                        "stills": []}
+        hard = se.lora_checks(lctx, _normalized(lctx, raw), compatible, {"fast-motion": entry})[0]
+        assert [m for m in hard if " L1 " in m] == want, key
+
+
+def test_spr3_lora_checks_use_the_plans_panel_count(ws, tmp_path):
+    files = str(tmp_path / "files")
+    entry = seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion")
+    ctx = seu.make_ctx(se, ws, panels=3, catalog={"schema_version": 1, "entries": [entry]})
+    compatible = dict((e["id"], e) for e in se.compatible_entries(ctx))
+    saved = {"schema": "ltx-movie.plan.v1", "mode": "chained", "panels": 3, "title": "T",
+             "logline": "x", "cast": [], "locations": [], "props": [], "beats": [],
+             "loras": {"global": [], "per_beat": {"2": [{"id": "fast-motion", "strength": 0.7}]},
+                       "stills": []}}
+    assert se.lora_checks(ctx, saved, compatible, {"fast-motion": entry})[0] == []
+
+
+def test_spt7_normalize_plan(ws):
+    ctx = seu.make_ctx(se, ws, panels=3)
+    plan = _normalized(ctx, seu.plan_json("chained", 4))
+    assert (plan["panels"], plan["panels_target"]) == (4, 3)
+    assert list(plan)[:6] == ["schema", "story_id", "mode", "panels", "panels_target", "seconds"]
+    swapped = seu.make_ctx(se, ws, panels=4, panels_target=3)
+    assert _normalized(swapped, seu.plan_json("chained", 4))["panels_target"] == 3
+
+
+# --- SPT8-SPT10: the run with one beat added, the target met, and out of range (SPC9) --------
+
+def _messages(story_dir, key="advisory"):
+    return [entry["message"] for entry in _read_json(story_dir, "story_checks.json")[key]]
+
+
+def _run_story(ws, tmp_path, monkeypatch, plan, panel, critic=(), **ctx_kw):
+    """(rc, advisories, ctx, agent log) of one se.run with the fake agent scripted."""
+    log = seu.script_agent(monkeypatch, tmp_path, plan=plan, panel=panel, critic=list(critic))
+    ctx = seu.make_ctx(se, ws, **ctx_kw)
+    rc, advisories = se.run(ctx)
+    return rc, advisories, ctx, seu.agent_log(log)
+
+
+def test_spt8_e2e_one_beat_added(ws, tmp_path, monkeypatch, capsys):
+    capsys.readouterr()
+    rc, advisories, ctx, log = _run_story(
+        ws, tmp_path, monkeypatch, [seu.answer(seu.plan_json("chained", 4))],
+        panel_script("chained", 4), story_id="spt8", panels=3)
+    out = capsys.readouterr().out
+    note = P20_NOTE % (4, 1, 3, P20_OTHER_REASON)
+    assert rc == 0
+    assert [r["stage"] for r in log][:5] == ["plan", "panel", "panel", "panel", "panel"]
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "panel_04_prompt_1.txt"),
+              encoding="utf-8") as f:
+        assert "You are writing panel 4 of 4 " in f.read()
+    assert len(manifest._parse_prompts_md(os.path.join(ctx.story_dir, "story.md"))[1]) == 4
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert (plan["panels"], plan["panels_target"]) == (4, 3)
+    assert note in plan["speech_notes"]
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    assert (checks["panels"], checks["panels_target"]) == (4, 3)
+    assert _messages(ctx.story_dir).count(note) == 1
+    run = _read_json(os.path.join(ctx.story_dir, "story_rounds"), "run.json")
+    assert (run["panels"], run["panels_target"]) == (4, 3)
+    assert run["budgets"]["wall_clock_s"] == se.wall_clock_cap(4)
+    assert advisories.count(note) == 1
+    assert ("\n" + note + "\n") in out
+    assert out.index("\n" + note + "\n") < out.index("panel 1/4: call 1")
+
+
+def test_spt9_e2e_the_target_met(ws, tmp_path, monkeypatch, capsys):
+    capsys.readouterr()
+    rc, advisories, ctx, _log = _run_story(
+        ws, tmp_path, monkeypatch, [seu.answer(seu.plan_json("chained", 3))],
+        panel_script("chained", 3), story_id="spt9", panels=3)
+    out = capsys.readouterr().out
+    assert rc == 0
+    plan = _read_json(ctx.story_dir, "plan.json")
+    checks = _read_json(ctx.story_dir, "story_checks.json")
+    run = _read_json(os.path.join(ctx.story_dir, "story_rounds"), "run.json")
+    for doc in (plan, checks, run):
+        assert (doc["panels"], doc["panels_target"]) == (3, 3)
+    assert " P20 " not in out
+    assert [a for a in advisories if " P20 " in a] == []
+    assert [m for m in plan["speech_notes"] if " P20 " in m] == []
+
+
+def test_spt10_e2e_out_of_range(ws, tmp_path, monkeypatch, capsys):
+    six = seu.answer(seu.plan_json("chained", 6))
+    capsys.readouterr()
+    rc, _advisories, _ctx, log = _run_story(ws, tmp_path, monkeypatch, [six, six], {},
+                                            story_id="spt10", panels=3)
+    assert rc == 1
+    line = "  - plan: P1 beat count: expected 3 to 5 beats, found 6"
+    assert capsys.readouterr().err.splitlines()[1] == line
+    assert line.strip()[2:] in log[1]["argv"][-1]
+
+
+# --- SPT11: the hockey exit gets its beat, or P19 says how to keep it ------------------------
+
+def _hockey_panel(k, motion):
+    reply = {"title": "Rink Part %d" % k, "motion": motion}
+    if k == 1:
+        reply["image"] = seu.panel_json("chained", 1)["image"]
+    return seu.answer(reply)
+
+
+def test_spt11_e2e_the_hockey_exit(ws, tmp_path, monkeypatch):
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][0].update(speaker="c1", lines=[1])
+    raw["beats"][1].update(speaker="c1", lines=[2])
+    raw["beats"][2].update(speaker="", lines=[],
+                           action="the hockey player skates away across the ice toward the far "
+                                  "boards")
+    panel = {"1": [_hockey_panel(1, "The courier glides toward the camera at real-time speed, "
+                                    "his face to the lens.")],
+             "2": [_hockey_panel(2, "The courier carves a hard stop at real-time speed, a big "
+                                    "bright spray of ice in the air.")],
+             "3": [_hockey_panel(3, "The courier skates away across the ice toward the far "
+                                    "boards at real-time speed.")]}
+    rc, advisories, ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw)], panel,
+                                           story_id="spt11a", panels=2, narration="speech",
+                                           narrative=HOCKEY)
+    assert rc == 0
+    assert [a for a in advisories if " P20 " in a] == [
+        P20_NOTE % (3, 1, 2, P20_EXIT_REASON % "'skates away'")]
+    assert [a for a in advisories if " P19 " in a] == []
+    raw = seu.plan_json("chained", 2)
+    raw["beats"][0].update(speaker="c1", lines=[1])
+    raw["beats"][1].update(speaker="c1", lines=[2])
+    rc, advisories, ctx, _log = _run_story(
+        ws, tmp_path, monkeypatch, [seu.answer(raw)], {"1": panel["1"], "2": panel["2"]},
+        story_id="spt11b", panels=2, narration="speech", narrative=HOCKEY)
+    assert rc == 0
+    assert [a for a in advisories if " P20 " in a] == []
+    assert [a for a in advisories if " P19 " in a] == [
+        P19_NOTE % ("'skates away'", P19_ROOM_HINT % (4, 3))]
+
+
+# --- SPT12: the P20 reasons (SPC11; plan ruling SPR1) -----------------------------------------
+
+def _lines_plan(ctx, lines, speakers=None, cast=None):
+    """normalize_plan of a plan of len(lines) beats: beat k says lines[k - 1], spoken by
+    speakers[k - 1] (default c1 when it has lines), cast [its speaker] when cast is given."""
+    raw = seu.plan_json(ctx.mode, len(lines), cast=cast)
+    for k, (beat, numbers) in enumerate(zip(raw["beats"], lines)):
+        who = speakers[k] if speakers else ("c1" if numbers else "")
+        beat.update(lines=list(numbers), speaker=who)
+        if cast is not None and who:
+            beat["cast"] = [who]
+    return _normalized(ctx, raw)
+
+
+def test_spt12_the_p20_reasons(ws, story_env):
+    words = P20_LINES_REASON % (4, 4, "6")
+    ctx = seu.make_ctx(se, ws, panels=3, narrative=EIGHT)
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], [2], [3], [4]])) == [
+        P20_NOTE % (4, 1, 3, words)]
+    ctx = seu.make_ctx(se, ws, panels=1, narrative=HOCKEY, narration="speech",
+                       clip_seconds=145 / 24.0)
+    assert se.panels_needed(lib, se.engine_seconds(ctx), se.spoken_lines(HOCKEY)) == 1
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1, 2], [], []])) == [
+        P20_NOTE % (3, 2, 1, P20_EXIT_REASON % "'skates away'")]
+    ctx = seu.make_ctx(se, ws, panels=3, narrative=EIGHT + " He walks off.")
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], [2], [3], [4], []])) == [
+        P20_NOTE % (5, 2, 3, words + " and " + P20_EXIT_REASON % "'walks off'")]
+    ctx = seu.make_ctx(se, ws, panels=2, narrative=TURNS, members=_members(story_env))
+    plan = _lines_plan(ctx, [[1], [2], [3], [4]], ["c1", "c2", "c1", "c2"],
+                       cast=copy.deepcopy(CAST2))
+    assert se.panel_count_notes(ctx, plan) == [P20_NOTE % (4, 2, 2, P20_SPEAKER_REASON % (4, 4))]
+    ctx = seu.make_ctx(se, ws, panels=3)
+    assert se.panel_count_notes(ctx, _normalized(ctx, seu.plan_json("chained", 3))) == []
+    violation = se.parse_violation(P20_NOTE % (4, 1, 3, "x"))
+    assert (violation["id"], violation["name"], violation["scope"], violation["index"]) == (
+        "P20", "panel count", "plan", None)
+    ctx = seu.make_ctx(se, ws, panels=1, narration="speech",
+                       narrative='The skater says "Go." The crowd drifts away.')
+    assert se.panel_count_notes(ctx, _lines_plan(ctx, [[1], []])) == [
+        P20_NOTE % (2, 1, 1, P20_OTHER_REASON)]
+
+
+# --- SPT19: the static cap after the ctx swap (D9) --------------------------------------------
+
+def test_spt19_the_static_cap_uses_the_effective_count(ws, tmp_path, monkeypatch):
+    raw = seu.plan_json("shots", 4)
+    for beat in raw["beats"]:
+        beat["camera"] = "static"
+    rc, _advisories, ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw)],
+                                            panel_script("shots", 4), story_id="spt19",
+                                            mode="shots", panels=3)
+    assert rc == 0
+    plan = _read_json(ctx.story_dir, "plan.json")
+    assert [b["camera"] for b in plan["beats"]] == ["slow push-in", "slow push-in", "static",
+                                                    "static"]
+    assert se.P18_NOTE % (1, 2, 4) in plan["speech_notes"]
+    assert se.P18_NOTE % (2, 2, 4) in plan["speech_notes"]
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "plan_prompt.txt"),
+              encoding="utf-8") as f:
+        assert "so at most 1 in this movie" in f.read()
+
+
+# --- SPT24: the range with speakers, end to end (SPC1, SPC7) ----------------------------------
+
+def test_spt24_e2e_the_range_with_speakers(ws, tmp_path, monkeypatch, capsys, story_env):
+    members = _members(story_env)
+
+    def raw(n):
+        plan = seu.plan_json("shots", n, cast=copy.deepcopy(CAST2))
+        for k, beat in enumerate(plan["beats"]):
+            who = ("c1", "c2")[k % 2]
+            beat.update(cast=[who], speaker=who, lines=[k + 1])
+        return plan
+
+    phrases = ("the woman in grey", "the ronin")
+    capsys.readouterr()
+    rc, _a, _ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw(3))] * 2, {},
+                                    story_id="spt24a", mode="shots", panels=2, members=members,
+                                    narrative=TURNS)
+    assert rc == 1
+    assert "  - plan: P1 beat count: expected exactly 4 beats, found 3" in (
+        capsys.readouterr().err.splitlines())
+    panel = dict((str(k), [seu.answer(seu.panel_json("shots", k, phrases[(k - 1) % 2]))])
+                 for k in range(1, 5))
+    rc, advisories, _ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw(4))],
+                                            panel, story_id="spt24b", mode="shots", panels=2,
+                                            members=members, narrative=TURNS)
+    assert rc == 0
+    assert [a for a in advisories if " P20 " in a] == [
+        P20_NOTE % (4, 2, 2, P20_SPEAKER_REASON % (4, 4))]
+
+
+# --- Review Focus 1, 3, 5: lines that need one more panel, no_stills, an added panel re-asked -
+
+def test_review_focus_1_lines_that_need_one_more_panel_are_planned_not_refused(
+        ws, tmp_path, monkeypatch, capsys):
+    one = seu.plan_json("chained", 1)
+    one["beats"][0].update(speaker="c1", lines=[1, 2, 3])
+    two = seu.plan_json("chained", 2)
+    two["beats"][0].update(speaker="c1", lines=[1, 2])
+    two["beats"][1].update(speaker="c1", lines=[3])
+    capsys.readouterr()
+    rc, advisories, ctx, log = _run_story(ws, tmp_path, monkeypatch,
+                                          [seu.answer(one), seu.answer(two)],
+                                          panel_script("chained", 2), story_id="rf1", panels=1,
+                                          narrative=SIX_WORD_LINES)
+    assert rc == 0
+    assert [r["stage"] for r in log][:4] == ["plan", "plan", "panel", "panel"]
+    assert "- plan: P1 beat count: expected 2 to 3 beats, found 1\n" in log[1]["argv"][-1]
+    assert [a for a in advisories if " P20 " in a] == [
+        P20_NOTE % (2, 1, 1, P20_LINES_REASON % (3, 2, "6"))]
+    assert _read_json(ctx.story_dir, "plan.json")["panels"] == 2
+
+
+def test_review_focus_3_a_no_stills_movie_gets_its_added_panel(ws, tmp_path, monkeypatch):
+    rc, advisories, ctx, log = _run_story(
+        ws, tmp_path, monkeypatch, [seu.answer(seu.plan_json("no_stills", 4))],
+        panel_script("no_stills", 4), story_id="rf3", mode="no_stills", panels=3)
+    assert rc == 0
+    assert [r["panel"] for r in log if r["stage"] == "panel"][:4] == [1, 2, 3, 4]
+    assert len(manifest._parse_prompts_md(os.path.join(ctx.story_dir, "story.md"))[1]) == 4
+    assert [a for a in advisories if " P20 " in a] == [P20_NOTE % (4, 1, 3, P20_OTHER_REASON)]
+
+
+def test_review_focus_5_an_added_panel_can_be_re_asked(ws, tmp_path, monkeypatch):
+    panel = panel_script("chained", 4, p4=[{"answer": "not json"},
+                                           seu.answer(seu.panel_json("chained", 4))])
+    rc, _advisories, ctx, log = _run_story(ws, tmp_path, monkeypatch,
+                                           [seu.answer(seu.plan_json("chained", 4))], panel,
+                                           story_id="rf5", panels=3)
+    assert rc == 0
+    assert len([r for r in log if r["stage"] == "panel" and r["panel"] == 4]) == 2
+    run = _read_json(os.path.join(ctx.story_dir, "story_rounds"), "run.json")
+    assert len([c for c in run["calls"] if c["stage"] == "panel" and c["panel"] == 4]) == 2

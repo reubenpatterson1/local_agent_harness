@@ -797,6 +797,23 @@ def panels_needed(lib, seconds, lines):
     return needed
 
 
+def speaker_runs(lines, speakers):
+    """The spoken lines split into the runs one beat could hold by speaker (soft panel count spec
+    SPC1, D2): a line starts a new run when its speaker is known and differs from a known speaker
+    earlier in the current run; a line with no known speaker (None) joins the current run."""
+    runs, current, who = [], [], None
+    for line, cid in zip(lines, speakers):
+        if current and cid is not None and who is not None and cid != who:
+            runs.append(current)
+            current, who = [], None
+        current.append(line)
+        if cid is not None:
+            who = cid
+    if current:
+        runs.append(current)
+    return runs
+
+
 def lines_needed(lib, seconds, lines, speakers):
     """The fewest panels that speak lines in order (SPC1; plan ruling SPR6): each panel holds
     consecutive lines with at most one known speaker that fit one clip together; a single line
@@ -1217,10 +1234,12 @@ def normalize_plan(ctx, raw):
     """(plan, shape): the Section 2.2 plan built from a parsed plan-writer reply (RS9), and the
     P2 violations for container shapes that normalization had to repair (a missing or non-list
     cast, locations, props or beats; an item that is not an object; a beat cast that is not a
-    list). Wrong-typed string fields become "" and are reported by plan_checks."""
+    list). Wrong-typed string fields become "" and are reported by plan_checks. plan["panels"] is
+    the beat count and plan["panels_target"] the --panels target (soft panel count spec SPC6)."""
     shape = []
     plan = {"schema": PLAN_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
-            "panels": ctx.panels, "seconds": ctx.seconds, "narrative": ctx.narrative,
+            "panels": ctx.panels, "panels_target": target_panels(ctx), "seconds": ctx.seconds,
+            "narrative": ctx.narrative,
             "goal": ctx.goal, "seed_image": ctx.seed_image, "video_model": ctx.video_model,
             "auto_lora": ctx.auto_lora,
             "title": _clean_str(raw.get("title")), "logline": _clean_str(raw.get("logline"))}
@@ -1266,6 +1285,7 @@ def normalize_plan(ctx, raw):
             "speaker": _clean_str(item.get("speaker")),
             "lines": _clean_lines(item.get("lines"))})
     plan["beats"] = beats
+    plan["panels"] = len(beats)
     loras = raw.get("loras")
     if not ctx.auto_lora or not isinstance(loras, dict):
         picks = _empty_loras()
@@ -1840,6 +1860,47 @@ def exit_left_out_notes(ctx, plan):
     return [P19_NOTE % (_q(found), hint)]
 
 
+# Soft panel count spec SPC11, D4: tell the user when the movie has more panels than its target,
+# and why.
+P20_NOTE = ("plan: P20 panel count: this movie has %d panels, %d more than its target of %d, "
+            "because %s")
+P20_LINES_REASON = "the narrative's %d spoken lines need at least %d panels of %s seconds"
+P20_SPEAKER_REASON = ("the narrative's spoken lines come in %d runs by different speakers, which "
+                      "need at least %d panels with one speaker each")
+P20_EXIT_REASON = "the narrative's exit after its last spoken line (%s) has a later beat"
+P20_OTHER_REASON = "the story planner needed them for the narrative's action"
+
+
+def panel_count_notes(ctx, plan):
+    """[P20_NOTE] when the plan has more beats than the target, else [] (SPC11). Reasons, in order
+    and joined with " and ": the lines need more panels than the target by words; the lines need
+    more panels than that because of speaker changes (speakers from plan["cast"]); the narrative's
+    exit after its last spoken line (plan ruling SPR1: its speaker's) follows the beat that says
+    that line. With none, P20_OTHER_REASON."""
+    n, target = len(plan["beats"]), target_panels(ctx)
+    if n <= target:
+        return []
+    reasons = []
+    lines = plan.get("spoken_lines") or []
+    if lines:
+        lib, secs = _character_lib(ctx.ws), engine_seconds(ctx)
+        by_words = panels_needed(lib, secs, lines)
+        if by_words > target:
+            reasons.append(P20_LINES_REASON % (len(lines), by_words, ctx.seconds))
+        speakers = line_speakers(ctx.narrative, plan["cast"])
+        by_speaker = lines_needed(lib, secs, lines, speakers)
+        if by_speaker > max(target, by_words):
+            reasons.append(P20_SPEAKER_REASON % (len(speaker_runs(lines, speakers)), by_speaker))
+        found = narrative_exit_after_last_line(ctx.narrative, plan["cast"])
+        said = [k for k, beat in enumerate(plan["beats"], start=1)
+                if len(lines) in beat.get("lines", [])]
+        if found is not None and said and said[0] < n:
+            reasons.append(P20_EXIT_REASON % _q(found))
+    if not reasons:
+        reasons.append(P20_OTHER_REASON)
+    return [P20_NOTE % (n, n - target, target, " and ".join(reasons))]
+
+
 def post_line_sentences(lib, text, phrases):
     """The action sentences of a speaking panel's writer action text that compose_motion puts
     after the spoken line (SF10): every action sentence (not a camera sentence, not a pasted
@@ -2003,12 +2064,15 @@ def plan_checks(ctx, plan, shape=()):
     and duplicate-phrase messages, P16 (a library character in no beat's cast; pinned cast
     presence spec PC1) and P17 (a spoken line given to a speaker other than the one the narrative
     names; speaker attribution spec SA2); every other P message is advisory (dialogue spec
-    6.3)."""
+    6.3). P1 accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
     hard, advisory = list(shape), []
-    n = ctx.panels
     beats = plan["beats"]
-    if len(beats) != n:
-        hard.append("plan: P1 beat count: expected exactly %d beats, found %d" % (n, len(beats)))
+    n = len(beats)
+    lo, hi = panel_range(ctx)
+    if not lo <= n <= hi:
+        hard.append("plan: P1 beat count: expected exactly %d beats, found %d" % (lo, n)
+                    if lo == hi else
+                    "plan: P1 beat count: expected %d to %d beats, found %d" % (lo, hi, n))
     for i, beat in enumerate(beats):
         if beat["index"] != i + 1:
             hard.append("plan: P1 beat count: beat %d has index %r; beats must be numbered 1 to %d "
@@ -2210,7 +2274,9 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     hard, advisory = [], []
     if not ctx.auto_lora:
         return hard, advisory
-    n = ctx.panels
+    # Soft panel count spec SPC7, plan ruling SPR3: the plan's own panel count, which is its beat
+    # count (normalize_plan) and is also right for a saved plan.json without beats.
+    n = plan["panels"]
     loras = plan["loras"]
     lora_catalog = _lora_catalog(ctx.ws)
 
@@ -4239,7 +4305,8 @@ def final_outcome(states):
 
 def _checks_doc(ctx, state, source="robust"):
     return {"schema": CHECKS_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
-            "panels": ctx.panels, "checked_at": _utc(), "source": source,
+            "panels": ctx.panels, "panels_target": target_panels(ctx), "checked_at": _utc(),
+            "source": source,
             "round": state["round"] if source == "robust" else None,
             "hard": [parse_violation(m) for m in state["hard"]], "unresolved": [],
             "advisory": [parse_violation(m) for m in state["advisory"]],
@@ -4254,7 +4321,7 @@ class _Run(object):
         self.ctx = ctx
         self.rules = no_stills_rules
         self.start = _now()
-        self.cap = wall_clock_cap(ctx.panels)
+        self.cap = wall_clock_cap(most_panels(ctx))
         self.rounds_dir = os.path.join(ctx.story_dir, "story_rounds")
         self.agent_calls = 0
         self.panel_calls = dict((k, 0) for k in range(1, ctx.panels + 1))
@@ -4263,7 +4330,8 @@ class _Run(object):
         self.states = []
         self.critic_rounds_run = 0
         self.doc = {"schema": RUN_SCHEMA, "story_id": ctx.story_id, "mode": ctx.mode,
-                    "panels": ctx.panels, "started_at": _utc(), "finished_at": None,
+                    "panels": ctx.panels, "panels_target": target_panels(ctx),
+                    "started_at": _utc(), "finished_at": None,
                     "budgets": {"plan_calls": PLAN_MAX_CALLS, "panel_calls": PANEL_MAX_CALLS,
                                 "critic_rounds": CRITIC_MAX_ROUNDS,
                                 "critic_calls_per_round": CRITIC_CALLS_PER_ROUND,
@@ -4324,8 +4392,8 @@ class _Run(object):
                 return None, "timeout"
             print("plan: call %d of %d" % (attempt, PLAN_MAX_CALLS))
             started = _now()
-            status, answer = self.agent(text, plan_max_tokens(ctx.panels),
-                                        plan_timeout(ctx.panels), image=ctx.seed_agent_image)
+            status, answer = self.agent(text, plan_max_tokens(most_panels(ctx)),
+                                        plan_timeout(most_panels(ctx)), image=ctx.seed_agent_image)
             self.record("plan", None, 0, attempt, None, status, started)
             _write_text(os.path.join(rdir, "plan_reply_%d.txt" % attempt),
                         _reply_text(status, answer))
@@ -4551,9 +4619,20 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
+        # Soft panel count spec SPC9, D1: from here on the movie has the plan's beat count.
+        ctx = self.ctx = ctx._replace(panels=len(plan["beats"]), panels_target=target_panels(ctx))
+        self.cap = wall_clock_cap(ctx.panels)
+        self.doc["panels"] = ctx.panels
+        self.doc["budgets"]["wall_clock_s"] = self.cap
+        self.panel_calls = dict((k, 0) for k in range(1, ctx.panels + 1))
+        self.write_run()
         plan["speech_notes"] += assign_missing_lines(ctx, plan)
         plan["speech_notes"] += cap_static_cameras(ctx, plan)
         plan["speech_notes"] += exit_left_out_notes(ctx, plan)
+        count_notes = panel_count_notes(ctx, plan)
+        plan["speech_notes"] += count_notes
+        for note in count_notes:
+            print(note)
         parts = [empty_parts(ctx.mode, k, plan, ctx) for k in range(1, ctx.panels + 1)]
         valid = 0
         for k in range(1, ctx.panels + 1):
