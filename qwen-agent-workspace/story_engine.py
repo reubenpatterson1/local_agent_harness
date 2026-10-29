@@ -1806,16 +1806,38 @@ def _bare(words):
     return words[1:] if words[:1] in (["the"], ["a"], ["an"]) else words
 
 
+# Plan ruling SPR7: outside double quotes, a run of these characters ends a sentence.
+_SENTENCE_END_RE = re.compile(r"[.!?…]+")
+
+
+def _sentence_ends(text, quotes, start, end):
+    """The number of sentence ends in text[start:end] (plan ruling SPR7). quotes are the QUOTE_RE
+    matches of text that lie inside text[start:end], in order. A quote ends a sentence when its
+    words end in . ! ? or … and the text after its closing quote does not go on in lower case (as
+    in line_speakers); outside the quotes, every _SENTENCE_END_RE run does."""
+    count, at = 0, start
+    for match in quotes:
+        count += len(_SENTENCE_END_RE.findall(text[at:match.start()]))
+        if (match.group(1).rstrip().endswith((".", "!", "?", "…"))
+                and not re.match(r"\s*[a-z]", text[match.end():])):
+            count += 1
+        at = match.end()
+    return count + len(_SENTENCE_END_RE.findall(text[at:end]))
+
+
 def narrative_exit_after_last_line(narrative, cast=()):
     """The EXIT_RE words (lower case, whitespace collapsed) of the first exit in the narrative
     text after the closing quote of its last spoken line whose subject is that line's speaker,
-    or None (SF-A1; plan ruling SPR1). The quotes are paired as in line_speakers: curly quotes
-    count as straight ones, and classify_quotes decides which quote is spoken. An exit's subject
-    is the _clause_tail of the text from that closing quote to the exit. It is the speaker's when
-    it is empty (the line's own sentence goes on), is he, she or they, or equals, without a
-    leading article, a name of the speaker: the words before the speech verb in the _clause_tail
-    of the text that leads up to the line, or a phrase or library name of the entry of cast (plan
-    cast entries) that line_speakers gives the line."""
+    or None (SF-A1; plan rulings SPR1, SPR7). The quotes are paired as in line_speakers: curly
+    quotes count as straight ones, and classify_quotes decides which quote is spoken. An exit
+    inside a later quote never counts. An exit's subject is the _clause_tail of the text from
+    that closing quote to the exit, and its sentence is the number of _sentence_ends from the
+    line's opening quote to the exit (0: the line's own sentence). It is the speaker's when it is
+    empty and the exit is in the line's own sentence (the line's own sentence goes on), is he, she
+    or they and the exit is in the line's own sentence or the first after it, or equals, without
+    a leading article, a name of the speaker: the words before the speech verb in the
+    _clause_tail of the text that leads up to the line, or a phrase or library name of the entry
+    of cast (plan cast entries) that line_speakers gives the line."""
     text = narrative.replace("“", '"').replace("”", '"')
     matches = list(QUOTE_RE.finditer(text))
     spoken = [i for i, (match, (inner, said)) in enumerate(zip(matches,
@@ -1830,10 +1852,16 @@ def narrative_exit_after_last_line(narrative, cast=()):
     names = [_bare(lead[:verbs[0]])] if verbs and _bare(lead[:verbs[0]]) else []
     who = line_speakers(narrative, list(cast))[-1] if cast else None
     names += [_bare(words) for cid, words in _mentions(list(cast)) if who and cid == who]
-    tail = text[matches[i].end():]
-    for found in EXIT_RE.finditer(tail):
-        subject = _clause_tail(tail[:found.start()])
-        if not subject or subject in EXIT_SUBJECT_PRONOUNS or _bare(subject) in names:
+    after = matches[i].end()
+    for found in EXIT_RE.finditer(text, after):
+        at = found.start()
+        if any(match.start() <= at < match.end() for match in matches[i + 1:]):
+            continue
+        subject = _clause_tail(text[after:at])
+        ends = _sentence_ends(text, [match for match in matches[i:] if match.end() <= at],
+                              matches[i].start(), at)
+        if ((not subject and ends == 0) or (subject in EXIT_SUBJECT_PRONOUNS and ends <= 1)
+                or _bare(subject) in names):
             return " ".join(found.group(0).lower().split())
     return None
 

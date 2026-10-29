@@ -461,6 +461,21 @@ def test_spr1a_the_exit_subject_rule():
         ('Near the top Kyra turns and says, "Go." Kyra walks off.', KYRA_RONIN_CAST, "walks off"),
         ('Kyra says, "Go." The woman in grey walks off.', KYRA_RONIN_CAST, "walks off"),
         ('Kyra says, "Go." The ronin walks off.', KYRA_RONIN_CAST, None),
+        # Plan ruling SPR7: an exit inside a later quote never counts, an empty subject counts
+        # only in the line's own sentence, and he, she or they only there or in the next one.
+        ('The skater says "Go." The crowd cheers, then drifts away.', (), None),
+        ('The skater says "Go." The puck slides, and moves off the ice.', (), None),
+        ('Kyra says, "Go." The ronin nods, then turns away.', (), None),
+        ('Kyra says, "Go." The ronin nods, then turns away.', KYRA_RONIN_CAST, None),
+        ('Kyra says, "Go." A neon sign blinks. "Exiting soon," it reads.', (), None),
+        ('Kyra says, "Go." "Exiting," reads the sign.', (), None),
+        ('Kyra says, "Go." The ronin bows. He walks off.', (), None),
+        ('Kyra says, "Go." The ronin bows. He walks off.', KYRA_RONIN_CAST, None),
+        ('The skater says "Go." The fans cheer. They drift away.', (), None),
+        ('The skater says "Go!" They skate away.', (), "skate away"),
+        ('"Go," Kyra says. She walks off.', (), "walks off"),
+        ('Kyra says, "Go," under a sign that reads "No exit." She walks away.', (), "walks away"),
+        ('Kyra says, "Go." The ronin bows. Kyra walks off.', (), "walks off"),
     )
     for narrative, cast, want in rows:
         assert se.narrative_exit_after_last_line(narrative, cast) == want, (narrative, cast)
