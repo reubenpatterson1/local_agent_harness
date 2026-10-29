@@ -1149,7 +1149,9 @@ import movie_ui_testutil as mt  # noqa: E402
 
 def test_spt1e_movie_ui_constants():
     assert mui.PANELS_EXTRA == se.PANELS_EXTRA
-    assert mui.STORY_PANEL_RE.pattern == manifest._PANEL_HEADER_RE.pattern
+    # Fix FW-f: the pattern and its flags (no re.MULTILINE), so both count line by line.
+    assert (mui.STORY_PANEL_RE.pattern, mui.STORY_PANEL_RE.flags) == (
+        manifest._PANEL_HEADER_RE.pattern, manifest._PANEL_HEADER_RE.flags)
 
 
 def _plan_doc(story_dir):
@@ -1279,5 +1281,178 @@ def test_spt27_the_regenerate_target_is_wired_in_the_static_ui():
     assert 'id="s-regen-panels"' in html and 'min="1"' in html and "Panels (target)" in html
     assert html.index('id="s-regen-panels"') < html.index('id="s-regenerate"')
     for text in ("#s-regen-panels", "with a target of ", "{panels: target, length: null}",
-                 "res.data.last_fields.panels"):
+                 "res.data.last_fields.panels", '$("#s-regen-panels").validity.badInput',
+                 '$("#s-action-status").textContent = "panels must be a whole number"; return;'):
         assert text in js, text
+    # Fix FW-i: inside the Regenerate handler, the refusal comes before the box is read.
+    assert (js.index('$("#s-regenerate").addEventListener("click"')
+            < js.index('$("#s-regen-panels").validity.badInput')
+            < js.index('const target = numberOrNull("#s-regen-panels");'))
+
+
+# --- The pre-rebaseline fix wave FW-a..i (Task 4-6 reviews) ----------------------------------
+
+OVER_CAP = "I carry a sealed letter from the harbour master for the abbot of this temple."
+
+
+def _spy(seen):
+    def validate(path, panels, no_stills=False):
+        seen.append(panels)
+        return []
+    return validate
+
+
+def test_fw_a_a_failed_generate_run_still_rewrites_story_prompt(movie, tmp_path, monkeypatch,
+                                                                capsys):
+    raw = seu.plan_json("chained", 4)
+    for k in (2, 3):
+        raw["beats"][k - 1]["speaker"] = "c1"
+    over = dict((k, seu.answer(dict(seu.panel_json("chained", k), dialogue=OVER_CAP)))
+                for k in (2, 3))
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)],
+                     panel=panel_script("chained", 4, p2=[over[2]] * 2, p3=[over[3]] * 2),
+                     critic=[{"answer": "x"}] * 4)
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "fwa", "--panels", "3", "--story-only",
+                           "--no-review"]) == 2
+    assert "Hand-edit story.md to fix the violations above and rerun" in capsys.readouterr().err
+    story_dir = os.path.join(movie, "generated", "stories", "fwa")
+    assert _read_json(story_dir, "plan.json")["panels"] == 4
+    assert len(manifest._parse_prompts_md(os.path.join(story_dir, "story.md"))[1]) == 4
+    with open(os.path.join(story_dir, "story_prompt.txt"), encoding="utf-8") as f:
+        prompt = f.read()
+    assert "EXACTLY 4 panel sections" in prompt
+    assert "EXACTLY 3 panel sections" not in prompt
+
+
+def test_fw_b_the_note_names_the_saved_target(movie, tmp_path, monkeypatch, capsys):
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 4))],
+                     panel=panel_script("chained", 4))
+    assert ltx_movie.main([NARRATIVE, "--story-id", "fwb", "--panels", "3", "--story-only",
+                           "--no-review"]) == 0
+    args = _args(NARRATIVE, "--story-id", "fwb", "--panels", "2", "--no-review")
+    assert (args.panels, args.panels_target) == (4, 2)
+    capsys.readouterr()
+    assert ltx_movie._phase1_robust(args) == 0
+    out = capsys.readouterr().out
+    assert (PANEL_COUNT_NOTE % (4, 3, "because " + P20_OTHER_REASON) + PANEL_COUNT_PHASES % 4
+            + "\n") in out
+    assert "for a target of 2" not in out
+    # An older plan.json has no panels_target: the note names this run's target.
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 3))],
+                     panel=panel_script("chained", 3))
+    assert ltx_movie.main([NARRATIVE, "--story-id", "fwb0", "--panels", "3", "--story-only",
+                           "--no-review"]) == 0
+    story_dir = os.path.join(movie, "generated", "stories", "fwb0")
+    doc = _read_json(story_dir, "plan.json")
+    del doc["panels_target"]
+    _write_json(story_dir, "plan.json", doc)
+    args = _args(NARRATIVE, "--story-id", "fwb0", "--panels", "2", "--no-review")
+    capsys.readouterr()
+    assert ltx_movie._phase1_robust(args) == 0
+    assert (PANEL_COUNT_NOTE % (3, 2, PANEL_COUNT_NO_REASON) + PANEL_COUNT_PHASES % 3
+            + "\n") in capsys.readouterr().out
+
+
+def test_fw_b_recheck_of_an_old_plan_saves_its_own_count_as_the_target(ws, tmp_path,
+                                                                        monkeypatch):
+    old = save_story(ws, tmp_path, monkeypatch, "fwb1", "chained", 3, 3)
+    doc = _read_json(old.story_dir, "plan.json")
+    del doc["panels_target"]
+    _write_json(old.story_dir, "plan.json", doc)
+    seen = []
+    rc, _advisories = se.recheck(seu.make_ctx(se, ws, story_id="fwb1", panels=2), _spy(seen))
+    assert (rc, seen) == (0, [3])
+    checks = _read_json(old.story_dir, "story_checks.json")
+    assert (checks["panels"], checks["panels_target"], checks["source"]) == (
+        doc["panels"], doc["panels"], "recheck")
+
+
+def test_fw_c_a_story_md_that_is_not_utf8_is_never_adopted(movie, tmp_path, monkeypatch):
+    saved = save_story(movie, tmp_path, monkeypatch, "fwc", "chained", 3, 4)
+    story_md = os.path.join(saved.story_dir, "story.md")
+    with open(story_md, "ab") as f:
+        f.write(b"\nNarration: caf\xe9\n")
+    assert ltx_movie._load_story_panels(story_md) == []
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "fwc", "--panels", "3"])
+    ltx_movie._resolve_story_panels(args)
+    assert (args.panels, args.panels_target) == (3, 3)
+    assert ltx_movie._plan_panels(args) is None
+    # recheck's SPR4 parse: the plan is stale, so story.md is re-checked at the target without
+    # it. The plan-free report would read story.md as UTF-8 too; it is stubbed out here.
+    monkeypatch.setattr(se, "plan_free_report", lambda *a, **kw: ([], []))
+    seen = []
+    rc, _advisories = se.recheck(seu.make_ctx(se, movie, story_id="fwc", panels=3), _spy(seen))
+    assert (rc, seen) == (0, [3])
+
+
+def test_fw_d_the_dry_run_stops_only_a_generate_run(movie, tmp_path, monkeypatch, capsys):
+    save_story(movie, tmp_path, monkeypatch, "fwd", "chained", 1, 3)
+    stop = "Panel count: Phase 1 would stop: the narrative quotes 4 spoken lines"
+    _out, block = _dry([EIGHT, "--story-id", "fwd", "--panels", "1"], capsys)
+    assert [line for line in block if line.startswith(stop)] == []
+    assert DRY_PANELS_STORY % (3, 1, 3) in block
+    _out, block = _dry([EIGHT, "--story-id", "fwd", "--panels", "1", "--force-story"], capsys)
+    assert [line for line in block if line.startswith(stop)]
+    assert DRY_PANELS_STORY % (3, 1, 3) not in block
+
+
+def test_fw_e_story_prompt_override_keeps_the_exact_count(movie, tmp_path, monkeypatch):
+    save_story(movie, tmp_path, monkeypatch, "fwe1", "chained", 3, 4)
+    override = str(tmp_path / "override.txt")
+    with open(override, "w", encoding="utf-8") as f:
+        f.write("Write story.md.\n")
+    args = _args(NARRATIVE, "--story-id", "fwe1", "--panels", "3", "--story-prompt-override",
+                 override)
+    assert (args.panels, args.panels_target) == (3, 3)
+
+
+def test_fw_e_a_length_run_adopts_a_saved_story(movie, tmp_path, monkeypatch, capsys):
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(seu.plan_json("chained", 4))],
+                           panel=panel_script("chained", 4))
+    assert ltx_movie.main([NARRATIVE, "--story-id", "fwe2", "--panels", "3", "--story-only",
+                           "--no-review"]) == 0
+    calls = len(seu.agent_log(log))
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "fwe2", "--length", "18", "--story-only",
+                           "--no-review"]) == 0
+    out, err = capsys.readouterr()
+    assert "re-checking it instead of regenerating it" in out
+    assert (PANEL_COUNT_NOTE % (4, 3, "because " + P20_OTHER_REASON) + "\n") in out
+    assert "mutually exclusive" not in err
+    assert len(seu.agent_log(log)) == calls
+
+
+def test_fw_e_a_bool_panels_never_loads_at_a_target_of_1(movie, tmp_path, monkeypatch):
+    saved = save_story(movie, tmp_path, monkeypatch, "fwe3", "chained", 1, 1)
+    plan = _read_json(saved.story_dir, "plan.json")
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "fwe3", "--panels", "1"])
+    args.panels_target = 1
+    assert se.load_plan(seu.make_ctx(se, movie, story_id="fwe3", panels=1)) is not None
+    assert ltx_movie._plan_panels(args) is not None
+    _write_json(saved.story_dir, "plan.json", dict(plan, panels=True))
+    assert se.load_plan(seu.make_ctx(se, movie, story_id="fwe3", panels=1)) is None
+    assert ltx_movie._plan_panels(args) is None
+
+
+def test_fw_f_the_movie_ui_counts_panels_like_the_manifest(ws, tmp_path, monkeypatch):
+    saved = save_story(ws, tmp_path, monkeypatch, "fwf", "chained", 3, 4)
+    story_md = os.path.join(saved.story_dir, "story.md")
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(THREE_PANELS + "\n##\nPanel 4 — D\nMotion: x\nNarration: y\n")
+    assert len(manifest._parse_prompts_md(story_md)[1]) == 3
+    assert mui.plan_panels(saved.story_dir, "chained") is None
+
+
+def test_fw_g_effective_panels_at_the_top_and_below_the_range(ws, tmp_path, monkeypatch):
+    five = save_story(ws, tmp_path, monkeypatch, "fwg", "chained", 4, 5)
+    for panels, want in ((4, 5), (3, 5), (6, 6)):
+        fields = {"panels": panels, "mode": "chained"}
+        assert mui.effective_panels(fields, five.story_dir) == want, panels
+
+
+def test_fw_h_iterate_story_with_a_null_target():
+    plan = {"narrative": NARRATIVE, "mode": "chained", "panels": 4, "panels_target": None,
+            "cast": [], "loras": {"pinned": []}}
+    cmd = iterate_story.build_engine_cmd("s", plan)
+    assert cmd[cmd.index("--panels") + 1] == "4"

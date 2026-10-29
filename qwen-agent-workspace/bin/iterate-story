@@ -262,7 +262,7 @@ def build_engine_cmd(story_id, plan, goal=None, story_model=None, story_context_
     """The bin/ltx-movie argv that regenerates a default-engine story with the --judge gate
     (robust story spec RS33)."""
     cmd = [sys.executable, os.path.join(WS, "bin", "ltx-movie"), plan["narrative"],
-           "--story-id", story_id, "--panels", str(plan.get("panels_target", plan["panels"]))]
+           "--story-id", story_id, "--panels", str(plan.get("panels_target") or plan["panels"])]
     if plan["mode"] == "shots":
         cmd.append("--shots")
     elif plan["mode"] == "no_stills":

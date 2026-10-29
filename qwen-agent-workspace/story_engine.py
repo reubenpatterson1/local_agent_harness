@@ -4896,18 +4896,24 @@ def recheck(ctx, legacy_validate):
         print(warning)
     lib = _character_lib(ctx.ws)
     plan = load_plan(ctx)
-    if (plan is not None and plan["panels"] != ctx.panels
-            and len(_story_manifest(ctx.ws)._parse_prompts_md(story_md)[1]) != plan["panels"]):
-        # Plan ruling SPR4: a plan whose panel count story.md does not have is stale (a later
-        # --story-legacy run, or a hand edit); re-check story.md without it, as before SPC10.
-        plan = None
+    if plan is not None and plan["panels"] != ctx.panels:
+        try:
+            count = len(_story_manifest(ctx.ws)._parse_prompts_md(story_md)[1])
+        except (OSError, ValueError):
+            count = None
+        if count != plan["panels"]:
+            # Plan ruling SPR4: a plan whose panel count story.md does not have is stale (a
+            # later --story-legacy run, or a hand edit), and so is the plan of a story.md that
+            # cannot be read or decoded (fix FW-c); re-check story.md without it, as before SPC10.
+            plan = None
     if plan is not None:
         # Soft panel count spec SPC10: re-check against the plan's panel count; the saved target
-        # comes from plan.json (an older plan has none: the current target).
+        # comes from plan.json. An older plan has none, and it always had its target's count
+        # (fix FW-b): plan["panels"].
         saved = plan.get("panels_target")
         ctx = ctx._replace(panels=plan["panels"], panels_target=(
             saved if isinstance(saved, int) and not isinstance(saved, bool)
-            else target_panels(ctx)))
+            else plan["panels"]))
     if plan is not None:
         try:
             hard = ([] if ctx.mode == "shots"

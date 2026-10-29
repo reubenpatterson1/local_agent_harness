@@ -752,6 +752,7 @@
     });
     $("#s-regenerate").addEventListener("click", async function () {
       if (!S.story.last_fields) { $("#s-action-status").textContent = "compose this story once before regenerating it"; return; }
+      if ($("#s-regen-panels").validity.badInput) { $("#s-action-status").textContent = "panels must be a whole number"; return; }
       const target = numberOrNull("#s-regen-panels");
       const question = target === null
         ? "Regenerate story.md of " + S.story.id + "? The current one is replaced."

@@ -1225,13 +1225,14 @@ def resolved_panels(fields):
 # _PANEL_HEADER_RE (this module never loads a pipeline module, so both are repeated here and
 # pinned equal by a test).
 PANELS_EXTRA = 2
-STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$", re.MULTILINE)
+STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
 
 
 def plan_panels(sdir, mode):
     """<sdir>/plan.json's "panels" when the file is a JSON object with schema ltx-movie.plan.v1,
     "mode" equal to mode, an int "panels" of at least 1, and <sdir>/story.md has exactly that
-    many STORY_PANEL_RE headers; else None (SPC14)."""
+    many lines that STORY_PANEL_RE matches, line by line as bin/ltx-story-manifest's
+    _parse_prompts_md counts them (fix FW-f); else None (SPC14)."""
     plan = read_json(os.path.join(sdir, "plan.json"))
     if not (isinstance(plan, dict) and plan.get("schema") == "ltx-movie.plan.v1"
             and plan.get("mode") == mode and _is_int(plan.get("panels")) and plan["panels"] >= 1):
@@ -1241,7 +1242,8 @@ def plan_panels(sdir, mode):
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    return plan["panels"] if len(STORY_PANEL_RE.findall(text)) == plan["panels"] else None
+    count = sum(1 for line in text.splitlines() if STORY_PANEL_RE.match(line))
+    return plan["panels"] if count == plan["panels"] else None
 
 
 def effective_panels(fields, sdir):

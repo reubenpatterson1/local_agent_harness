@@ -702,7 +702,8 @@ def _validate_story_md(story_md_path, expected_panels, no_stills=False, no_narra
 
 def _load_story_panels(story_md_path):
     """Panel dicts from story_md_path via bin/ltx-story-manifest's parser, or []
-    when the file cannot be read.
+    when the file cannot be read or decoded (soft panel count fix FW-c: a story.md
+    that is not valid UTF-8 never raises here).
 
     Deliberately separate from _validate_story_md rather than a second return
     value from it: that function's return contract is "the list of FATAL
@@ -715,7 +716,7 @@ def _load_story_panels(story_md_path):
             "ltx_story_manifest_for_movie", manifest_tool_path
         ).load_module()
         _narrative, panels = story_manifest._parse_prompts_md(story_md_path)
-    except OSError:
+    except (OSError, ValueError):
         return []
     return panels
 
@@ -1432,12 +1433,15 @@ DRY_PANELS_STOP = "Panel count: Phase 1 would stop: %s"
 
 
 def _plan_panels(args):
-    """(panels, reason) of plan.json when it is the plan of this story.md (soft panel count spec
-    SPC13, D6): a JSON object with schema ltx-movie.plan.v1, this run's mode, an int panels from
-    the target (args.panels_target, else args.panels) to the target plus
+    """(panels, reason, target) of plan.json when it is the plan of this story.md (soft panel
+    count spec SPC13, D6): a JSON object with schema ltx-movie.plan.v1, this run's mode, an int
+    panels from the target (args.panels_target, else args.panels) to the target plus
     story_engine.PANELS_EXTRA, and story.md parsing to exactly that many panels; else None.
     reason is "because <the text after 'because '>" of the first speech_notes entry that starts
-    "plan: P20 panel count: ", else PANEL_COUNT_NO_REASON."""
+    "plan: P20 panel count: ", else PANEL_COUNT_NO_REASON. target is plan.json's int
+    panels_target when it has one, else this run's target (fix FW-b: the note names the target
+    the story was planned for). A story.md that cannot be read or decoded parses to no panels,
+    so its plan is not adopted (fix FW-c)."""
     target = getattr(args, "panels_target", None) or args.panels
     paths = _story_paths(args.story_id)
     try:
@@ -1456,7 +1460,10 @@ def _plan_panels(args):
     saved = [m for m in notes if isinstance(m, str) and m.startswith("plan: P20 panel count: ")
              and ", because " in m]
     reason = ("because " + saved[0].split(", because ", 1)[1]) if saved else PANEL_COUNT_NO_REASON
-    return panels, reason
+    planned = plan.get("panels_target")
+    if not isinstance(planned, int) or isinstance(planned, bool):
+        planned = target
+    return panels, reason, planned
 
 
 def _resolve_story_panels(args):
@@ -1687,7 +1694,14 @@ def _phase1_robust(args):
         print("=== Phase 1: story ===")
         _write_story_prompt(args, paths["story_dir"])
         rc, advisories = engine.run(ctx, no_stills_rules=_no_stills_rules())
+    target = getattr(args, "panels_target", None) or args.panels
     if rc != 0:
+        # Soft panel count fix FW-a: a generated story that fails its checks is still saved and
+        # the engine says to hand-edit it and rerun, so story_prompt.txt gets the plan's count.
+        found = _plan_panels(args) if generated else None
+        if found is not None and found[0] != target:
+            args.panels = found[0]
+            _write_story_prompt(args, paths["story_dir"])
         return rc
     if not args.no_review:
         with open(story_md, encoding="utf-8") as f:
@@ -1696,14 +1710,13 @@ def _phase1_robust(args):
         print(content)
     for advisory in advisories:
         print("Warning: %s" % advisory)
-    target = getattr(args, "panels_target", None) or args.panels
     found = _plan_panels(args)
     if found is not None:
         args.panels = found[0]
         if args.panels != target:
             if generated:
                 _write_story_prompt(args, paths["story_dir"])
-            print(PANEL_COUNT_NOTE % (args.panels, target, found[1])
+            print(PANEL_COUNT_NOTE % (args.panels, found[2], found[1])
                   + ("" if args.story_only else PANEL_COUNT_PHASES % args.panels))
     members = getattr(args, "cast_members", None) or []
     if members:
@@ -2307,7 +2320,9 @@ def _print_robust_phase1(args, paths):
     problem = engine.spoken_lines_problem(ctx)
     lo, hi = engine.panel_range(ctx)
     target = engine.target_panels(ctx)
-    if problem:
+    # Soft panel count fix FW-d: only a generate run stops on the spoken lines; an existing
+    # story.md is re-checked instead.
+    if problem and (args.force_story or not os.path.exists(paths["story_md"])):
         print(DRY_PANELS_STOP % problem)
     elif ctx.panels != target:
         print(DRY_PANELS_STORY % (ctx.panels, target, ctx.panels))
