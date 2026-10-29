@@ -1634,6 +1634,41 @@ EXIT_RE = re.compile(
     r"turn(?:s|ing)?\s+(?:her|his|their)\s+back)\b", re.IGNORECASE)
 
 
+# Shot prompt format spec amendment SF-A1: the narrative's exit after its last spoken line is
+# left out when that line is in the last beat.
+P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
+            "left out, because that line is in the last beat and a speaking beat never shows its "
+            "speaker leave; rerun with --force-story --panels %d to keep it")
+
+
+def narrative_exit_after_last_line(narrative):
+    """The EXIT_RE words (lower case, whitespace collapsed) of the first exit in the narrative
+    text after the closing quote of its last spoken line, or None (SF-A1). The quotes are paired
+    as in line_speakers: curly quotes count as straight ones, and classify_quotes decides which
+    quote is spoken."""
+    text = narrative.replace("“", '"').replace("”", '"')
+    spoken = [match for match, (inner, said) in zip(QUOTE_RE.finditer(text),
+                                                    classify_quotes(narrative))
+              if said and line_words(inner)]
+    if not spoken:
+        return None
+    found = EXIT_RE.search(text[spoken[-1].end():])
+    return " ".join(found.group(0).lower().split()) if found else None
+
+
+def exit_left_out_notes(ctx, plan):
+    """[P19_NOTE] when the narrative has an exit after its last spoken line and the beat that
+    says that line is the last beat, else [] (SF-A1)."""
+    lines = plan.get("spoken_lines") or []
+    if ctx.narration is False or not lines:
+        return []
+    found = narrative_exit_after_last_line(ctx.narrative)
+    last = plan["beats"][-1] if plan["beats"] else None
+    if found is None or last is None or len(lines) not in last.get("lines", []):
+        return []
+    return [P19_NOTE % (_q(found), ctx.panels + 1)]
+
+
 def post_line_sentences(lib, text, phrases):
     """The action sentences of a speaking panel's writer action text that compose_motion puts
     after the spoken line (SF10): every action sentence (not a camera sentence, not a pasted
@@ -4344,6 +4379,7 @@ class _Run(object):
         plan, self.shape, _hard = found
         plan["speech_notes"] += assign_missing_lines(ctx, plan)
         plan["speech_notes"] += cap_static_cameras(ctx, plan)
+        plan["speech_notes"] += exit_left_out_notes(ctx, plan)
         parts = [empty_parts(ctx.mode, k, plan, ctx) for k in range(1, ctx.panels + 1)]
         valid = 0
         for k in range(1, ctx.panels + 1):

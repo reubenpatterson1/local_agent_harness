@@ -1219,3 +1219,100 @@ def test_review_focus_3_an_end_frame_in_the_references_words_falls_back(ws):
     assert dict(se.panel_fields(ctx, plan, [trimmed], 1))["Motion"] == (
         "The courier turns to the camera at real-time speed. The courier faces the camera. The "
         "camera pushes in.")
+
+
+# --- SFT23, SFT24, SFT25: P19, the exit after the last line (amendment SF-A1) --------------------
+
+P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
+            "left out, because that line is in the last beat and a speaking beat never shows its "
+            "speaker leave; rerun with --force-story --panels %d to keep it")
+
+
+def test_sft23_the_narratives_exit_after_its_last_line():
+    assert HOCKEY_NARRATIVE == _read_json(HOCKEY_FIX, "plan.json")["narrative"]
+    rows = (
+        (HOCKEY_NARRATIVE, "skates away"),
+        (LINES_NARRATIVE, None),
+        ('Kyra says, "Go." She walks off.', "walks off"),
+        ('Kyra walks off. Kyra says, "Go."', None),
+        ('Kyra says, "Go," and the ronin leaves the frame.', "leaves the frame"),
+        ('Kyra says, "Go." Later the crowd says, "Yes." Kyra turns away.', "turns away"),
+        ('A sign reads "Closed". Kyra walks away.', None),
+        ('Kyra says, "Go." She pushes off from the kerb.', None),
+        ('Kyra says, “Go.” She skates away.', "skates away"),
+    )
+    for narrative, want in rows:
+        assert se.narrative_exit_after_last_line(narrative) == want, narrative
+
+
+def _p19_plan(ws, mode, lines, narrative=HOCKEY_NARRATIVE, narration="speech"):
+    """(ctx, normalised plan) of len(lines) beats: beat k says lines[k - 1], spoken by the courier
+    (c1) when it has lines."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=len(lines), narrative=narrative,
+                       narration=narration)
+    raw = seu.plan_json(mode, len(lines))
+    for beat, numbers in zip(raw["beats"], lines):
+        beat.update(lines=list(numbers), speaker="c1" if numbers else "")
+    plan, _shape = se.normalize_plan(ctx, raw)
+    return ctx, plan
+
+
+def test_sft24_when_p19_fires(ws):
+    rows = (
+        ("chained", [[1], [2]], {}, [P19_NOTE % ("'skates away'", 3)]),
+        ("chained", [[1, 2]], {}, [P19_NOTE % ("'skates away'", 2)]),
+        ("shots", [[1], [2], []], {}, []),
+        ("shots", [[1], [], [2]], {}, [P19_NOTE % ("'skates away'", 4)]),
+        ("chained", [[1], [2]], {"narration": False}, []),
+        ("chained", [[1], []], {}, []),
+        ("chained", [[1], [2]], {"narrative": LINES_NARRATIVE}, []),
+        ("shots", [[1], [], [2]], {"narrative": LINES_NARRATIVE}, []),
+    )
+    for mode, lines, kw, want in rows:
+        ctx, plan = _p19_plan(ws, mode, lines, **kw)
+        assert se.exit_left_out_notes(ctx, plan) == want, (mode, lines, kw)
+    assert se.P19_NOTE == P19_NOTE
+    violation = se.parse_violation(P19_NOTE % ("'x'", 3))
+    assert (violation["id"], violation["name"], violation["scope"], violation["index"]) == (
+        "P19", "exit left out", "plan", None)
+
+
+def _sft25_run(ws, tmp_path, monkeypatch, story_id, narrative):
+    """(rc, advisories, ctx) of a chained 2-panel --speech-only run of narrative: beat k says
+    spoken line k, spoken by the courier."""
+    raw = seu.plan_json("chained", 2)
+    raw["beats"][0].update(speaker="c1", lines=[1])
+    raw["beats"][1].update(speaker="c1", lines=[2])
+    panel = {"1": [seu.answer({"title": "Skate In", "image": seu.panel_json("chained", 1)["image"],
+                               "motion": "The courier glides toward the camera at real-time "
+                                         "speed, his face to the lens.",
+                               "dialogue": "x"})],
+             "2": [seu.answer({"title": "The Stop",
+                               "motion": "The courier carves a hard stop at real-time speed, a "
+                                         "big bright spray of ice in the air.",
+                               "dialogue": "x"})]}
+    seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)], panel=panel)
+    ctx = seu.make_ctx(se, ws, mode="chained", panels=2, narration="speech", narrative=narrative,
+                       story_id=story_id)
+    rc, advisories = se.run(ctx)
+    return rc, advisories, ctx
+
+
+def test_sft25_p19_end_to_end(ws, tmp_path, monkeypatch, capsys):
+    note = P19_NOTE % ("'skates away'", 3)
+    rc, advisories, ctx = _sft25_run(ws, tmp_path, monkeypatch, "sf25", HOCKEY_NARRATIVE)
+    assert rc == 0
+    assert [a for a in advisories if " P19 " in a] == [note]
+    assert note.endswith("; rerun with --force-story --panels 3 to keep it")
+    assert [m for m in _messages(ctx, "advisory") if " P19 " in m] == [note]
+    assert note in _read_json(ctx.story_dir, "plan.json")["speech_notes"]
+    capsys.readouterr()
+    rc, advisories = se.recheck(ctx, lambda path, panels, no_stills=False: [])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert [a for a in advisories if "P19" in a] == []
+    assert "P19" not in captured.out + captured.err
+    rc, advisories, ctx = _sft25_run(ws, tmp_path, monkeypatch, "sf25b", LINES_NARRATIVE)
+    assert rc == 0
+    assert [a for a in advisories if "P19" in a] == []
+    assert [m for m in _messages(ctx, "advisory") if "P19" in m] == []
