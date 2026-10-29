@@ -82,11 +82,11 @@ def test_rs4_constants():
     assert se.SHOT_TYPES == ("extreme wide shot", "wide shot", "medium shot", "medium close-up",
                              "close-up", "extreme close-up")
     assert [k for k, _ in se.CAMERA_SENTENCES] == [
-        "static", "slow push-in", "slow pull-back", "slow pan left", "slow pan right",
-        "slow tilt up", "slow tilt down", "tracking"]
+        "slow push-in", "slow pull-back", "tracking", "handheld", "slow pan left",
+        "slow pan right", "slow tilt up", "slow tilt down", "static"]
     assert se.ARC_ROLES == ("introduction", "rising", "climax", "falling", "resolution")
-    assert se.WORD_RANGES["chained"] == {"image1": (120, 170), "motion1": (15, 35),
-                                         "motion": (15, 35)}
+    assert se.WORD_RANGES["chained"] == {"image1": (120, 170), "motion1": (55, 105),
+                                         "motion": (55, 105)}
     assert se.MAX_CAST == {"chained": 4, "no_stills": 4, "shots": 2}
     assert (se.PLAN_MAX_CALLS, se.PANEL_MAX_CALLS, se.CRITIC_MAX_ROUNDS,
             se.CRITIC_CALLS_PER_ROUND, se.MAX_PATCHES) == (2, 2, 2, 2, 8)
@@ -398,9 +398,9 @@ def test_rst14_plan_checks(ws):
         (beat(3, shot="aerial shot"), ["beat 3: P7 shot type: 'aerial shot' is not one of: extreme "
                                        "wide shot, wide shot, medium shot, medium close-up, "
                                        "close-up, extreme close-up"]),
-        (beat(3, camera="zoom"), ["beat 3: P8 camera: 'zoom' is not one of: static, slow push-in, "
-                                  "slow pull-back, slow pan left, slow pan right, slow tilt up, "
-                                  "slow tilt down, tracking"]),
+        (beat(3, camera="zoom"), ["beat 3: P8 camera: 'zoom' is not one of: slow push-in, "
+                                  "slow pull-back, tracking, handheld, slow pan left, slow pan "
+                                  "right, slow tilt up, slow tilt down, static"]),
         (lambda raw: (raw["cast"].append({"id": "c3", "phrase": "the guard",
                                           "descriptor": seu.MONK}),
                       raw["beats"][1].update(cast=["c1", "c2", "c3"])),
@@ -698,6 +698,18 @@ def MEDIUM(raw):   # every beat a medium shot, so N17 (speaking in a wide shot) 
         beat["shot"] = "medium shot"
 
 
+# Shot prompt format spec 4.2 R8 (and R7: the Motion of panels 2 and 3 counts their pasted
+# planned camera sentence): the _story writer's Motion is well under the 55-105 range, so the
+# checks of a chained _story carry these N1 advisories and those of a shots _story these S4 ones.
+FIXTURE_N1 = ["panel 1: N1 word count: Motion: is 33 words; aim for 55-105",
+              "panel 2: N1 word count: Motion: is 30 words; aim for 55-105",
+              "panel 3: N1 word count: Motion: is 30 words; aim for 55-105"]
+FIXTURE_S4 = ["panel 1: S4 motion length: Motion: is 15 words; aim for 55-105",
+              "panel 2: S4 motion length: Motion: is 16 words; aim for 55-105",
+              "panel 3: S4 motion length: Motion: is 12 words; aim for 55-105"]
+FIXTURE_LENGTH = {"chained": FIXTURE_N1, "no_stills": [], "shots": FIXTURE_S4}
+
+
 def test_rst20d_speaking_shot(ws):
     # N17 (advisory): a speaker in a wide shot, or held to a fixed smile, plays as voice-over.
     def speak(k, text, **changes):
@@ -709,16 +721,18 @@ def test_rst20d_speaking_shot(ws):
                "stacked wooden crates toward the old stone pier.")
     assert _story_checks(ws, "shots", part_mut=speak(2, line)) == [
         "panel 2: N17 speaking shot: Narration: 'the courier' speaks in a wide shot, too small to "
-        "read the lips, so it plays as voice-over; use a medium shot or closer"]
-    assert _story_checks(ws, "shots", part_mut=speak(1, line)) == []          # beat 1: medium shot
-    assert _story_checks(ws, "chained", part_mut=speak(2, line)) == []        # shot is panel 1's only
+        "read the lips, so it plays as voice-over; use a medium shot or closer"] + FIXTURE_S4
+    assert _story_checks(ws, "shots", part_mut=speak(1, line)) == FIXTURE_S4  # beat 1: medium shot
+    # shot is panel 1's only
+    assert _story_checks(ws, "chained", part_mut=speak(2, line)) == FIXTURE_N1
     smiling = speak(1, line, motion=SMILING)
     assert _story_checks(ws, "chained", part_mut=smiling) == [
         "panel 1: N17 speaking shot: Narration: 'the courier' speaks, but the panel holds the "
-        "expression 'broad smile', which freezes the mouth; describe the speaking instead"]
+        "expression 'broad smile', which freezes the mouth; describe the speaking instead"
+    ] + FIXTURE_N1[1:]
     voice_over = speak(1, "Rain falls on the harbour town.",
                        motion=SMILING)
-    assert _story_checks(ws, "chained", part_mut=voice_over) == []
+    assert _story_checks(ws, "chained", part_mut=voice_over) == FIXTURE_N1[1:]
 
 
 def test_rst20e_speech_only_framing(ws):
@@ -753,23 +767,27 @@ def test_rst20b_narration_speaker(ws):
 
     for mode in ("chained", "no_stills", "shots"):
         for line in ("the courier: Keep moving, stay low.", "The courier: Keep moving, stay low."):
-            assert _story_checks(ws, mode, part_mut=narration(line), plan_mut=MEDIUM) == [], mode
+            assert (_story_checks(ws, mode, part_mut=narration(line), plan_mut=MEDIUM)
+                    == FIXTURE_LENGTH[mode]), mode
     assert _story_checks(ws, "chained", part_mut=narration("the old monk: Wait for me.")) == [
+        FIXTURE_N1[0], FIXTURE_N1[1],
         "panel 2: N16 speaker: Narration: is spoken by 'the old monk', who is not in this shot; "
         "only a character on screen can speak, so make it voice-over (no prefix) or put "
-        "'the old monk' in the shot"]
+        "'the old monk' in the shot", FIXTURE_N1[2]]
     assert _story_checks(ws, "chained", part_mut=narration("Dawn: the city wakes slowly.")) == [
+        FIXTURE_N1[0], FIXTURE_N1[1],
         "panel 2: N16 speaker: Narration: starts with 'Dawn:', which is no character's referring "
         "phrase, so it is read as voice-over; start a spoken line with the speaker's referring "
-        "phrase, or drop the colon"]
+        "phrase, or drop the colon", FIXTURE_N1[2]]
     # N14 counts the spoken words only: "the courier:" does not push 29 words over 30; the alias
     # line is over the 14-word cap, which is advisory for a Narration: line (dialogue spec 6.2).
     words29 = " ".join(["go"] * 28) + " now."
     assert _story_checks(ws, "chained", part_mut=narration("the courier: " + words29)) == [
+        FIXTURE_N1[0], FIXTURE_N1[1],
         "panel 2: T1 spoken timing: Narration: speaks 29 words in 1 sentences; a 6-second clip "
         "fits at most 14 words in 1 sentences, and a line has at most 3 sentences; shorten the "
         "line, or split it across alternating close-up panels (the speaker, then the listener, "
-        "then the speaker again)"]
+        "then the speaker again)", FIXTURE_N1[2]]
 
 
 def test_rst20c_narration_modes(ws, monkeypatch, capsys):
@@ -782,26 +800,29 @@ def test_rst20c_narration_modes(ws, monkeypatch, capsys):
 
     speech = {"narration": "speech"}
     for mode in ("chained", "no_stills", "shots"):
-        assert _story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech) == [], mode
+        assert (_story_checks(ws, mode, part_mut=narration(""), ctx_kw=speech)
+                == FIXTURE_LENGTH[mode]), mode
         assert _story_checks(ws, mode, part_mut=narration("the courier: Keep moving, stay low."),
-                             ctx_kw=speech, plan_mut=MEDIUM) == [], mode
+                             ctx_kw=speech, plan_mut=MEDIUM) == FIXTURE_LENGTH[mode], mode
     ctx, plan, parts, text, _path = _story(ws, "chained", 3, part_mut=narration(""), ctx_kw=speech)
     assert "Narration:" not in text
     reply = dict(seu.panel_json("chained", 2, plan["cast"][0]["phrase"]), narration="")
     assert "narration" not in se.parse_panel_reply(ctx, plan, 2, json.dumps(reply))
     assert "\nnarration: " not in se.build_panel_prompt(ctx, plan, parts, 2)
     saved, _text = _saved_story(ws, monkeypatch, ctx_kw=dict(speech, story_id="s20c"))
-    motion = "Motion: " + seu.panel_json("chained", 2)["motion"] + "\n"
+    motion = ("Motion: " + seu.panel_json("chained", 2)["motion"]
+              + " The camera tracks alongside the movement.\n")
     _edit_story(saved, motion, motion + "Narration: Rain falls on the harbour town.\n")
     voice_over = ("panel 2: N16 speaker: Narration: is voice-over, but this story is speech-only; "
                   "start it with the referring phrase of the character in the shot who says it "
                   "and a colon, or leave it empty")
     assert se.recheck(saved, lambda path, panels, no_stills=False: ltx_movie._validate_story_md(
-        path, panels, no_stills, no_narration=True)) == (0, [voice_over])
+        path, panels, no_stills, no_narration=True)) == (0, FIXTURE_N1[:2] + [voice_over]
+                                                         + FIXTURE_N1[2:])
     assert capsys.readouterr().err == ""
     off = {"narration": False}
     for mode in ("chained", "no_stills", "shots"):
-        assert _story_checks(ws, mode, ctx_kw=off) == [], mode
+        assert _story_checks(ws, mode, ctx_kw=off) == FIXTURE_LENGTH[mode], mode
         ctx, plan, parts, text, _path = _story(ws, mode, 3, ctx_kw=off)
         assert "Narration:" not in text and "narration" not in se.writer_keys(mode, 1, False)
         prompt = se.build_panel_prompt(ctx, plan, parts, 1)
@@ -820,14 +841,15 @@ def test_rst16_panel_prompt(ws):
     rules = "\n".join(line.strip() for line in rules.split("\n"))
     expected = {
         ("chained", 1): ["image: 27 to 77 words describing the opening frame",
-                         "motion: 11 to 31 words in one or two plain sentences: what the characters "
-                         "physically do during these 6 seconds. Name"],
-        ("chained", 2): ["motion: 15 to 35 words in one or two plain sentences: what the characters "
-                         "physically do during these 6 seconds, continuing"],
+                         "motion: 51 to 101 words: one or two plain sentences of what the "
+                         "characters physically do during these 6 seconds, then the camera "
+                         "sentence. Name"],
+        ("chained", 2): ["motion: 49 to 99 words: one or two plain sentences of what the "
+                         "characters physically do during these 6 seconds, continuing"],
         ("no_stills", 1): ["prompt: 53 to 123 words in the present tense"],
         ("shots", 1): ["image: 20 to 77 words describing this shot's first frame",
-                       "motion: ONE sentence of 6 to 21 words naming ONE character"],
-        ("shots", 2): ["motion: ONE sentence of 5 to 19 words naming ONE character"],
+                       "motion: 51 to 101 words: ONE sentence naming ONE character"],
+        ("shots", 2): ["motion: 49 to 99 words: ONE sentence naming ONE character"],
     }
     for (mode, k), lines in expected.items():
         ctx, plan, parts, _text, _path = _story(ws, mode, 3, plan_mut=fixture,
@@ -854,7 +876,7 @@ def test_rst16_panel_prompt(ws):
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
     previous = dict(se.panel_fields(ctx, plan, parts, 1))["Motion"]
     assert ('referring phrases: "the courier"\nThe previous panel\'s Motion: ' + previous
-            + "\n\nWrite this panel as one JSON object") in prompt
+            + "\n\n" + se.FORMAT_REFERENCE + "Write this panel as one JSON object") in prompt
     fixed = se.build_panel_prompt(ctx, plan, parts, 2, fix=["panel 2: N3 appearance: x",
                                                             "panel 2: N12 one action: y"])
     assert ("\n\nYour previous version of this panel was rejected. Problems:\n- panel 2: N3 "
@@ -898,7 +920,7 @@ Motion: The courier pushes off. The camera stays static.
 Narration: The rain had not stopped.
 
 ## Panel 2 — The Bend
-Motion: The courier leans into the bend.
+Motion: The courier leans into the bend. The camera tracks alongside the movement.
 Narration: Every street led down to the water.
 """
 GOLDEN_NO_STILLS = """# The Sealed Letter
@@ -990,83 +1012,103 @@ def test_rst19_cast_shots_story_has_no_s9_or_s12(ws, story_env):
 
 
 def test_rst20_panel_checks(ws):
+    n1, s4 = FIXTURE_N1, FIXTURE_S4
     for mode in ("chained", "no_stills", "shots"):
-        assert _story_checks(ws, mode) == [], mode
+        assert _story_checks(ws, mode) == FIXTURE_LENGTH[mode], mode
 
     def part(k, **changes):
         return lambda parts: parts[k - 1].update(changes)
 
     forty = " ".join(["The courier pedals onward"] * 10)  # within N1's 25% tolerance
-    fifty_two = " ".join(["The courier pedals onward"] * 13)
+    one_twenty_eight = " ".join(["The courier pedals onward"] * 32)  # over that tolerance
     cases = [
-        ("chained", {"part_mut": part(2, motion=forty)}, []),
-        ("chained", {"part_mut": part(2, motion=fifty_two)},
-         ["panel 2: N1 word count: Motion: is 52 words; aim for 15-35"]),
+        ("chained", {"part_mut": part(2, motion=forty)}, [n1[0], n1[2]]),
+        ("chained", {"part_mut": part(2, motion=one_twenty_eight)},
+         [n1[0], "panel 2: N1 word count: Motion: is 134 words; aim for 55-105", n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier waves at the woman beside the crates "
                                                 "and keeps pedalling forward in the rain.")},
-         ["panel 2: N2 referring phrase: Motion: names 'woman' outside every referring phrase; "
-          "name each character by their exact phrase"]),
+         [n1[0], "panel 2: N1 word count: Motion: is 22 words; aim for 55-105",
+          "panel 2: N2 referring phrase: Motion: names 'woman' outside every referring phrase; "
+          "name each character by their exact phrase", n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier pulls the grey hood tighter and "
                                                 "pedals forward along the road past the boats.")},
-         ["panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
-          "appearance, clothing, setting, lighting, colour or style"]),
+         [n1[0], "panel 2: N1 word count: Motion: is 22 words; aim for 55-105",
+          "panel 2: N3 appearance: Motion: says 'grey'; panels after the first never re-describe "
+          "appearance, clothing, setting, lighting, colour or style", n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier holds the parcel up to the camera and "
-                                                "pedals forward along the road past the boats.")}, []),
+                                                "pedals forward along the road past the boats.")},
+         [n1[0], "panel 2: N1 word count: Motion: is 24 words; aim for 55-105", n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier pedals forward along the road as the "
                                                 "camera slowly pans left past the boats.")},
-         []),
+         ["panel 2: N20 camera direction: Motion: has 2 camera directions ('The courier pedals "
+          "forward along the road as the camera slowly pans left past the boats.'; 'The camera "
+          "tracks alongside the movement.'); a panel has exactly one camera sentence; write one "
+          "camera sentence in which the camera tracks the movement", n1[0],
+          "panel 2: N1 word count: Motion: is 22 words; aim for 55-105", n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier pedals past the old monk beside the "
                                                 "crates and on toward the end of the quay.")},
-         ["panel 2: N4 stray cast: Motion: names 'the old monk', who is not in beat 2's cast"]),
+         [n1[0], "panel 2: N1 word count: Motion: is 24 words; aim for 55-105",
+          "panel 2: N4 stray cast: Motion: names 'the old monk', who is not in beat 2's cast",
+          n1[2]]),
         ("chained", {"part_mut": lambda parts: parts[0].update(
             image=parts[0]["image"][:300] + " " + seu.TEMPLE)},
-         ["panel 1: N5 setting sentence: Image: contains l2's setting sentence; beat 1 is at l1"]),
+         ["panel 1: N5 setting sentence: Image: contains l2's setting sentence; beat 1 is at l1"]
+         + n1),
         ("no_stills", {"part_mut": part(2, prompt=seu.panel_json("no_stills", 2)["prompt"]
                                         + " A fisherman shouts across the water.")},
-         ["panel 2: N7 dialogue and text: Prompt: says 'shouts'"]),
+         ["panel 2: N7 dialogue and text: Prompt: says 'shouts'; the pipeline adds the spoken "
+          "line itself, so write only what the speaker physically does, with no speaking verb"]),
         ("chained", {"part_mut": part(3, motion='The courier reads the "urgent" note and pedals on '
                                                 "toward the end of the quay.")},
-         ["panel 3: N7 dialogue and text: Motion: contains a double quote"]),
+         [n1[0], n1[1], "panel 3: N1 word count: Motion: is 19 words; aim for 55-105",
+          "panel 3: N7 dialogue and text: Motion: contains a double quote"]),
         ("shots", {"part_mut": part(2, image=seu.panel_json("shots", 2)["image"]
                                     + " A caption fills the lower edge.")},
-         ["panel 2: N7 dialogue and text: Image: says 'caption'"]),
+         ["panel 2: N7 dialogue and text: Image: says 'caption'"] + s4),
         ("chained", {"part_mut": part(2, motion="The courier pedals toward a noise off-screen at "
                                                 "the far end of the long quay.")},
-         ["panel 2: N8 off-screen: Motion: says 'off-screen'; describe only what is in the frame"]),
+         [n1[0], "panel 2: N1 word count: Motion: is 21 words; aim for 55-105",
+          "panel 2: N8 off-screen: Motion: says 'off-screen'; describe only what is in the frame",
+          n1[2]]),
         ("chained", {"part_mut": part(2, motion="The courier pedals hard and we cut to the far end "
                                                 "of the quay at once.")},
-         ["panel 2: N9 cut wording: Motion: says 'cut to'; one panel is one continuous shot"]),
+         [n1[0], "panel 2: N1 word count: Motion: is 22 words; aim for 55-105",
+          "panel 2: N9 cut wording: Motion: says 'cut to'; one panel is one continuous shot",
+          n1[2]]),
         ("chained", {"part_mut": part(1, narration="<one sentence of voice-over narration>")},
-         ["panel 1: N10 copied example: Narration: contains template text '<one sentence of "
-          "voice-over narration>'"]),
+         [n1[0], "panel 1: N10 copied example: Narration: contains template text '<one "
+          "sentence of voice-over narration>'", n1[1], n1[2]]),
         ("chained", {"plan_mut": lambda raw: raw["locations"][1].update(
             setting=se.COPIED_EXAMPLES[0] + ".")},
          ["plan: N10 copied example: l2's setting contains template text '%s'"
-          % se.COPIED_EXAMPLES[0]]),
+          % se.COPIED_EXAMPLES[0]] + n1),
         ("chained", {"part_mut": part(2, narration="")},
-         ["panel 2: N11 narration: Narration: is empty"]),
+         ["panel 2: N11 narration: Narration: is empty"] + n1),
         ("chained", {"part_mut": part(2, motion="The courier stops at the crates then pedals "
                                                 "forward along the wet road past the boats.")},
-         ["panel 2: N12 one action: Motion: chains actions with 'then'"]),
+         [n1[0], "panel 2: N12 one action: Motion: chains actions with 'then'",
+          "panel 2: N1 word count: Motion: is 22 words; aim for 55-105", n1[2]]),
         ("chained", {"part_mut": lambda parts: parts[2].update(motion=parts[1]["motion"])},
-         ["panel 3: N13 repeat: Motion: repeats panel 2's action (similarity 1.00)"]),
+         [n1[0], n1[1], "panel 3: N13 repeat: Motion: repeats panel 2's action (similarity 1.00)",
+          "panel 3: N1 word count: Motion: is 28 words; aim for 55-105"]),
         ("chained", {"part_mut": part(2, narration="It rained. It poured.")},
-         ["panel 2: N14 narration form: Narration: is 2 sentences; it should be one sentence of "
-          "3-30 words"]),
+         [n1[0], "panel 2: N14 narration form: Narration: is 2 sentences; it should be one "
+          "sentence of 3-30 words", n1[1], n1[2]]),
         ("chained", {"part_mut": part(2, narration="Rain")},
-         ["panel 2: N14 narration form: Narration: is 1 words; it should be one sentence of 3-30 "
-          "words"]),
+         [n1[0], "panel 2: N14 narration form: Narration: is 1 words; it should be one "
+          "sentence of 3-30 words", n1[1], n1[2]]),
     ]
     for mode, kw, expected in cases:
         assert _story_checks(ws, mode, **kw) == expected, expected
-    shots_long = _story_checks(ws, "shots", part_mut=part(2, motion=forty))
+    shots_long = _story_checks(ws, "shots", part_mut=part(2, motion=one_twenty_eight))
     assert not [v for v in shots_long if " N1 " in v]
     assert [v for v in shots_long if " S4 " in v] == [
-        "panel 2: S4 motion length: Motion: is 46 words; aim for 10-25"]
+        s4[0], "panel 2: S4 motion length: Motion: is 134 words; aim for 55-105", s4[2]]
     offscreen = _story_checks(ws, "shots", part_mut=part(2, motion="The courier turns toward "
                                                                    "a noise off-screen."))
     assert offscreen == ["panel 2: S11 off-screen wording: Motion: says 'off-screen'; use left "
-                         "and right screen direction instead"]
+                         "and right screen direction instead", s4[0],
+                         "panel 2: S4 motion length: Motion: is 13 words; aim for 55-105", s4[2]]
     ctx, plan, parts, _text, _path = _story(ws, "chained", 3)
     lib = se._character_lib(WS)
     fields = [("Image", "The courier stands."), ("Motion", "x"), ("Narration", "y")]
@@ -1085,7 +1127,7 @@ def test_rst21_shots_rules_are_appended_unchanged(ws):
     checks = _story_checks(ws, "shots", plan_mut=contact, part_mut=lambda parts: parts[1].update(
         motion="The courier strikes the old monk with a heavy staff."))
     assert checks == ["panel 2: S8 contact: Motion: 'strikes' acts on 'the old monk'; two people "
-                      "touching on screen"]
+                      "touching on screen"] + FIXTURE_S4
 
 
 def test_rst56_n15_undeclared_character_in_panels(ws, story_env):
@@ -1104,7 +1146,9 @@ def test_rst56_n15_undeclared_character_in_panels(ws, story_env):
         "panel 2: N15 undeclared character: Motion: names library character ronin by its "
         "referring phrase 'The ronin'" + tail,
         "panel 3: N15 undeclared character: Narration: names library character ronin by its name "
-        "'Ronin'" + tail]
+        "'Ronin'" + tail,
+        FIXTURE_S4[0], "panel 2: S4 motion length: Motion: is 15 words; aim for 55-105",
+        FIXTURE_S4[2]]
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     fixed = [{"id": "c1", "phrase": "the ronin", "descriptor": seu.DESC_R}]
     declared = _story_checks(ws, "shots", plan_mut=lambda raw: raw.update(cast=fixed),
@@ -1119,7 +1163,7 @@ def test_rst57_reserved_line_in_the_panel_prompt(ws, story_env):
     assert ('referring phrases: "the courier"\nCharacters who are not in this movie, never to be '
             'named: ronin ("the ronin").\n\nAn image') not in prompt
     assert ('referring phrases: "the courier"\nCharacters who are not in this movie, never to be '
-            'named: ronin ("the ronin").\n\nWrite this panel') in prompt
+            'named: ronin ("the ronin").\n\n' + se.FORMAT_REFERENCE + 'Write this panel') in prompt
     members = se._character_lib(WS).resolve_cast([(None, "ronin")])
     declared = ctx._replace(members=members)
     assert "never to be named" not in se.build_panel_prompt(declared, plan, parts, 1)
@@ -1591,7 +1635,7 @@ def test_rst26b_critic_retry_and_code_only_round(ws, tmp_path, monkeypatch, caps
     assert rc == 0
     out = capsys.readouterr().out
     assert "critic round 1: no valid reply after 2 call(s); code-only round\n" in out
-    assert "round 1: 0 hard, 0 advisory\nstop: passed; best round 1 (0 hard)\n" in out
+    assert "round 1: 0 hard, 4 advisory\nstop: passed; best round 1 (0 hard)\n" in out
     assert [(r["stage"], r["panel"]) for r in log] == [
         ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3), ("critic", None),
         ("critic", None), ("panel", 2)]
@@ -1603,10 +1647,13 @@ def test_rst26b_critic_retry_and_code_only_round(ws, tmp_path, monkeypatch, caps
 
 def test_rst33_stop_passed(ws, tmp_path, monkeypatch, capsys):
     rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch)
-    assert (rc, advisories) == (0, [])
+    assert (rc, advisories) == (0, [
+        "beat 1: P18 static camera: camera 'static' changed to 'slow push-in': at most 1 of the 3 "
+        "beats may be static, and the latest static beats are kept as the deliberate holds"]
+        + FIXTURE_N1)
     assert capsys.readouterr().out == (
         "plan: call 1 of 2\npanel 1/3: call 1\npanel 2/3: call 1\npanel 3/3: call 1\n"
-        "round 0: 0 hard, 0 advisory\nstop: passed; best round 0 (0 hard)\n")
+        "round 0: 0 hard, 4 advisory\nstop: passed; best round 0 (0 hard)\n")
     assert [r["stage"] for r in log].count("critic") == 0
     assert [r["env_preflight"] for r in log] == [None, "1", "1", "1"]
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
@@ -1767,10 +1814,10 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
                             "stop_reason", "rounds", "best_round", "judge"]
     assert checks["source"] == "robust" and checks["best_round"] == 1 and checks["judge"] is None
     assert checks["rounds"] == [
-        {"round": 0, "hard": 1, "advisory": 1, "scores": {"continuity": 6, "story": 6,
+        {"round": 0, "hard": 1, "advisory": 5, "scores": {"continuity": 6, "story": 6,
                                                           "renderability": 6},
          "verdict": "revise"},
-        {"round": 1, "hard": 0, "advisory": 0, "scores": None, "verdict": None}]
+        {"round": 1, "hard": 0, "advisory": 4, "scores": None, "verdict": None}]
     assert sorted(os.listdir(_rounds(ctx, 0))) == [
         "panel_01_prompt_1.txt", "panel_01_reply_1.txt", "panel_02_prompt_1.txt",
         "panel_02_reply_1.txt", "panel_03_prompt_1.txt", "panel_03_reply_1.txt", "parts.json",
@@ -1786,7 +1833,7 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     assert [c["stage"] for c in run_doc["calls"]] == ["plan", "panel", "panel", "panel", "critic"]
     assert run_doc["calls"][4]["route"] == "local" and run_doc["exit"] == 0
     with open(os.path.join(ctx.story_dir, "story.md")) as f:
-        assert "Motion: " + CALM + "\n" in f.read()
+        assert "Motion: " + CALM + " The camera tracks alongside the movement.\n" in f.read()
 
 
 def test_rst43_exit_2_message(ws, tmp_path, monkeypatch, capsys):
@@ -1922,7 +1969,7 @@ def test_story_focus_1_a_non_ascii_phrase_is_repaired_or_reported(ws, tmp_path, 
 def test_story_focus_2_a_one_panel_story(ws, tmp_path, monkeypatch):
     rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch, n=1,
                                     critic=[seu.answer(seu.critic_json())])
-    assert (rc, advisories) == (0, [])
+    assert (rc, advisories) == (0, FIXTURE_N1[:1])
     plan = _read_json(os.path.join(ctx.story_dir, "plan.json"))
     assert [b["arc"] for b in plan["beats"]] == ["climax"]
     with open(os.path.join(ctx.story_dir, "story.md")) as f:
@@ -1981,7 +2028,7 @@ def _edit_story(ctx, old, new):
 def test_rst44_recheck_with_plan(ws, monkeypatch, tmp_path, capsys):
     log = seu.script_agent(monkeypatch, tmp_path)
     ctx, text = _saved_story(ws, monkeypatch)
-    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, FIXTURE_N1)
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert (checks["source"], checks["round"], checks["stop_reason"], checks["rounds"],
             checks["hard"], checks["unresolved"]) == ("recheck", None, None, [], [], [])
@@ -1989,11 +2036,12 @@ def test_rst44_recheck_with_plan(ws, monkeypatch, tmp_path, capsys):
     _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
     story_md = os.path.join(ctx.story_dir, "story.md")
     assert se.recheck(ctx, ltx_movie._validate_story_md) == (
-        0, ["panel 2: N7 dialogue and text: Motion: says 'yells'"])
+        0, [FIXTURE_N1[0], "panel 2: N1 word count: Motion: is 31 words; aim for 55-105",
+            "panel 2: N7 dialogue and text: Motion: says 'yells'", FIXTURE_N1[2]])
     assert capsys.readouterr().err == ""
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert checks["source"] == "recheck" and checks["hard"] == []
-    assert [a["id"] for a in checks["advisory"]] == ["N7"]
+    assert [a["id"] for a in checks["advisory"]] == ["N1", "N1", "N7", "N1"]
     assert seu.agent_log(log) == []
     _edit_story(ctx, "Narration: Every street led down to the water.\n", "Narration:\n")
     assert se.recheck(ctx, ltx_movie._validate_story_md)[0] == 2
@@ -2053,9 +2101,9 @@ def test_rst56b_n15_in_recheck_and_plan_free_report(ws, monkeypatch, capsys, sto
     chained, _t = _saved_story(ws, monkeypatch, ctx_kw={"story_id": "s7"})
     path = os.path.join(chained.story_dir, "story.md")
     assert se.plan_free_report(path, "chained", 3, [], ltx_movie._validate_story_md,
-                               ws=ws) == ([], [])
+                               ws=ws) == ([], FIXTURE_N1)
     assert se.plan_free_report(path, "chained", 4, [], ltx_movie._validate_story_md,
-                               ws=ws) == (["expected exactly 4 panels, found 3"], [])
+                               ws=ws) == (["expected exactly 4 panels, found 3"], FIXTURE_N1)
 
 
 def _plan_path(ctx):
@@ -2134,7 +2182,7 @@ def test_rst44e_recheck_judges_writer_text_like_generation(ws, monkeypatch, caps
     assert "vendors call out" in text
     assert se.panel_checks(ctx, plan, parts, text, path)[0] == []
     ctx, text = _saved_story(ws, monkeypatch, plan_mut=mutate, ctx_kw={"story_id": "s2"})
-    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, [])
+    assert se.recheck(ctx, ltx_movie._validate_story_md) == (0, FIXTURE_N1)
     motion = seu.panel_json("chained", 2)["motion"]
     _edit_story(ctx, "Motion: " + motion, "Motion: The courier yells " + motion[12:])
     rc, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
@@ -2334,9 +2382,11 @@ def test_rst46_review_gate(ws, monkeypatch, capsys, story_env):
         args.cast_members = members
         assert ltx_movie._phase1_robust(args) == 0
         out = capsys.readouterr().out
-        warnings = ("Warning: panel 2: N14 narration form: Narration: is 2 sentences; it should be "
-                    "one sentence of 3-30 words\nWarning: story.md does not use cast phrase 'the "
-                    "woman in grey'; character kyra gets no LoRA in this story\n")
+        warnings = ("Warning: " + FIXTURE_N1[0] + "\nWarning: panel 2: N14 narration form: "
+                    "Narration: is 2 sentences; it should be one sentence of 3-30 words\n"
+                    "Warning: " + FIXTURE_N1[1] + "\nWarning: " + FIXTURE_N1[2] + "\n"
+                    "Warning: story.md does not use cast phrase 'the woman in grey'; character "
+                    "kyra gets no LoRA in this story\n")
         note = ("note: %s already exists; re-checking it instead of regenerating it (pass "
                 "--force-story to regenerate)\n" % os.path.join(ctx.story_dir, "story.md"))
         if no_review:
@@ -2897,11 +2947,12 @@ def test_pacing_camera_sentences_classify_as_before(ws):
     lib = se._character_lib(WS)
     phrases = [c["phrase"] for c in plan["cast"] if c["phrase"]]
     sentences = dict(se.CAMERA_SENTENCES)
-    assert len(sentences) == 8
+    assert len(sentences) == 9
     old = {"slow push-in": "The camera slowly pushes in.", "slow pull-back": "The camera slowly pulls back.",
            "slow pan left": "The camera slowly pans left.", "slow pan right": "The camera slowly pans right.",
            "slow tilt up": "The camera slowly tilts up.", "slow tilt down": "The camera slowly tilts down.",
-           "static": sentences["static"], "tracking": sentences["tracking"]}
+           "static": sentences["static"], "tracking": sentences["tracking"],
+           "handheld": sentences["handheld"]}
     for key, sentence in sentences.items():
         # same classification as the pre-change sentence; "static" is True for all three
         # (CAMERA_MOTION_RE lists static/holds as camera-direction words)
@@ -2924,9 +2975,9 @@ def test_pacing_panel1_prompt_and_no_slowly(ws):
     assert "The motion plays at real-time speed: use fast, concrete action verbs, with no " \
         "words that slow it down, and end the main action with the words 'at real-time " \
         "speed'." in prompt
-    # the 15-35 band less the 4 words of the pasted camera sentence ("The camera stays static.")
-    assert "motion: 11 to 31 words" in prompt
-    assert se.WORD_RANGES["chained"]["motion1"] == (15, 35)
+    # the 55-105 band less the 4 words of the pasted camera sentence ("The camera stays static.")
+    assert "motion: 51 to 101 words" in prompt
+    assert se.WORD_RANGES["chained"]["motion1"] == (55, 105)
     for sentence in dict(se.CAMERA_SENTENCES).values():
         assert "slowly" not in sentence
     texts = [("KEY_LINE_TEMPLATES[%s]" % k, v) for k, v in se.KEY_LINE_TEMPLATES.items()]
@@ -2934,5 +2985,14 @@ def test_pacing_panel1_prompt_and_no_slowly(ws):
     texts += [("SPEAKING_SENTENCES[%s]" % k, v) for k, v in se.SPEAKING_SENTENCES.items()]
     texts += [("SPEECH_FRAMING_SENTENCE", se.SPEECH_FRAMING_SENTENCE),
               ("SHOTS_PANEL_RULES", se.SHOTS_PANEL_RULES)]
+    texts += [("CAMERA_RULE", se.CAMERA_RULE),
+              ("CAMERA_SPEAKING_SENTENCE", se.CAMERA_SPEAKING_SENTENCE),
+              ("CAMERA_WRITER_SENTENCE", se.CAMERA_WRITER_SENTENCE),
+              ("SPEAKING_REACTION_SENTENCE", se.SPEAKING_REACTION_SENTENCE),
+              ("SPEAKING_NO_REACTION_SENTENCE", se.SPEAKING_NO_REACTION_SENTENCE),
+              ("SPEAKING_STAY_SENTENCE", se.SPEAKING_STAY_SENTENCE),
+              ("FORMAT_REFERENCE", se.FORMAT_REFERENCE)]
+    texts += [("CAMERA_WRITER_FORMS[%s]" % k, " ".join(v))
+              for k, v in se.CAMERA_WRITER_FORMS.items()]
     for name, text in texts:
         assert "slowly" not in text.lower(), name

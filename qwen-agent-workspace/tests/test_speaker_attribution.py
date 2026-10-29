@@ -731,7 +731,7 @@ KYRA_SAYS = ["Dialogue: the woman in grey: " + FREE_LINE_1,
 
 def test_q1_a2_constants():
     assert se.N18_LINE_SPEAKER == N18_LINE_SPEAKER
-    assert se.REPAIR_IDS == ("N11", "N18", "T1", "T2", "T3")
+    assert se.REPAIR_IDS == ("N7", "N11", "N18", "N20", "N21", "N22", "T1", "T2", "T3")
     assert se.NON_BLOCKING_IDS == ("T2", "T3")
     violation = se.parse_violation(FREE_WRONG)
     assert (violation["scope"], violation["index"], violation["id"]) == ("panel", 2, "N18")

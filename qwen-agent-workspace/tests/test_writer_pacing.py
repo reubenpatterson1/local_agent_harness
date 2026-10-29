@@ -116,36 +116,34 @@ SPEAKING_CHAINED = (
     "first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
     "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it (if "
     "the dialogue comes before they do anything, it is how they turn or step toward the camera; "
-    "never write only that they face it); only when the beat has them act after the dialogue, "
-    "write what they do then as a second "
-    "sentence. Begin each of these sentences with @@SPEAKER@@, word for word, and write nothing "
-    "about anyone else before the first one. The action before the dialogue and the action "
-    "after it are the two parts of this one motion: never put an action from before the "
-    "dialogue and one from after it in the same sentence, and do not write the spoken words or "
-    "a speaking verb; the pipeline adds them.")
+    "never write only that they face it); after it you may write one short second sentence of "
+    "how @@SPEAKER@@ reacts once the line is said, such as a nod, a breath or a glance down, in "
+    "which nobody else acts. Begin each of these sentences with @@SPEAKER@@, word for word, and "
+    "write nothing about anyone else before the first one. Never put an action from before the "
+    "dialogue and one from after it in the same sentence, and do not write the spoken words or a "
+    "speaking verb; the pipeline adds them.")
 CHAINED_MOTION1 = (
-    "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
-    "during these @@SECONDS@@ seconds. Name each character only by their referring phrase, word "
-    "for word. Describe ONE continuous physical motion, not a sequence of separate steps: "
-    "@@SECONDS@@ seconds is enough for a single gesture, a few footsteps or the start of a "
-    "movement. The motion plays at real-time speed: use fast, concrete action verbs, with no "
-    "words that slow it down, and end the main action with the words 'at real-time speed'. When "
-    "an action throws something up, such as ice, snow, water, dust or sparks, name it in the "
-    "same sentence as a big, bright spray, splash or cloud, and never say how long it lasts, how "
-    "small it is or when it settles. You may add one camera direction; without one, the "
-    "pipeline adds the planned camera sentence.")
+    "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+    "during these @@SECONDS@@ seconds, then the camera sentence. Name each character only by "
+    "their referring phrase, word for word. Describe ONE continuous physical motion, not a "
+    "sequence of separate steps: @@SECONDS@@ seconds is enough for a single gesture, a few "
+    "footsteps or the start of a movement. The motion plays at real-time speed: use fast, "
+    "concrete action verbs, with no words that slow it down, and end the main action with the "
+    "words 'at real-time speed'. When an action throws something up, such as ice, snow, water, "
+    "dust or sparks, name it in the same sentence as a big, bright spray, splash or cloud, and "
+    "never say how long it lasts, how small it is or when it settles.")
 CHAINED_MOTION = (
-    "motion: W1 to W2 words in one or two plain sentences: what the characters physically do "
-    "during these @@SECONDS@@ seconds, continuing from where the previous panel left them. Name "
-    "each character only by their referring phrase, word for word. Describe ONE continuous "
-    "physical motion, not a sequence of separate steps: @@SECONDS@@ seconds is enough for a "
-    "single gesture, a few footsteps or the start of a movement. The motion plays at real-time "
-    "speed: use fast, concrete action verbs, with no words that slow it down, and end the main "
-    "action with the words 'at real-time speed'. When an action throws something up, such as "
-    "ice, snow, water, dust or sparks, name it in the same sentence as a big, bright spray, "
-    "splash or cloud, and never say how long it lasts, how small it is or when it settles. Do "
-    "not describe appearance, clothing, setting, lighting, colour or style -- all of that is "
-    "already on screen. You may add one camera direction.")
+    "motion: W1 to W2 words: one or two plain sentences of what the characters physically do "
+    "during these @@SECONDS@@ seconds, continuing from where the previous panel left them, then "
+    "the camera sentence. Name each character only by their referring phrase, word for word. "
+    "Describe ONE continuous physical motion, not a sequence of separate steps: @@SECONDS@@ "
+    "seconds is enough for a single gesture, a few footsteps or the start of a movement. The "
+    "motion plays at real-time speed: use fast, concrete action verbs, with no words that slow "
+    "it down, and end the main action with the words 'at real-time speed'. When an action "
+    "throws something up, such as ice, snow, water, dust or sparks, name it in the same "
+    "sentence as a big, bright spray, splash or cloud, and never say how long it lasts, how "
+    "small it is or when it settles. Do not describe appearance, clothing, setting, lighting, "
+    "colour or style -- all of that is already on screen.")
 SPEAKING_ACTION = (" In this panel @@SPEAKER@@ speaks the dialogue: they may move as the beat "
                    "says, but write the motion so that their face is toward the camera, in frame "
                    "and lit while they speak -- a speaker who approaches the camera speaks once "
@@ -183,24 +181,36 @@ def test_wt2_pacing_reaches_chained_prompts_only(ws):
         ctx, plan, parts, _t, _p = dlg._story(ws, mode, 3)
         for k in ks:
             prompt = se.build_panel_prompt(ctx, plan, parts, k)
-            assert se.PACING_SENTENCE not in prompt and "at real-time speed" not in prompt, (
+            # the shots prompt's format reference (R10) has the words; its own lines do not
+            body = prompt.replace(se.FORMAT_REFERENCE, "")
+            assert se.PACING_SENTENCE not in prompt and "at real-time speed" not in body, (
                 mode, k)
 
 
 # --- WT3, Review Focus 1, 2: the hockey speaking prompts (WP1-WP3) -----------------------------
 
-def _expected_line(template, w2, seconds):
-    return (se.KEY_LINE_TEMPLATES[template].replace("W1", "5", 1).replace("W2", w2, 1)
+def _camera_line(key):
+    """The writer's camera sentence instruction for camera key (shot prompt format spec SF7)."""
+    move, form = se.CAMERA_WRITER_FORMS[key]
+    return se.CAMERA_WRITER_SENTENCE.replace("@@CAMERA_MOVE@@", move).replace("@@CAMERA_FORM@@",
+                                                                             form)
+
+
+def _expected_line(template, w1, w2, seconds, camera):
+    return (se.KEY_LINE_TEMPLATES[template].replace("W1", w1, 1).replace("W2", w2, 1)
             .replace("@@SECONDS@@", seconds) + se.SPEECH_FRAMING_SENTENCE
-            + se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@", '"%s"' % PHRASE))
+            + se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@", '"%s"' % PHRASE)
+            + se.SPEAKING_STAY_SENTENCE.replace("@@SPEAKER@@", '"%s"' % PHRASE)
+            + _camera_line(camera))
 
 
 def test_wt3_the_hockey_speaking_prompts(ws):
     ctx = _ctx(ws, "hockey-2x145-f")
     plan, parts = _recorded("hockey-2x145-f")
-    for k, template, w2 in ((1, "chained_motion1", "23"), (2, "chained_motion", "25")):
+    for k, template, w1, w2, camera in ((1, "chained_motion1", "43", "93", "tracking"),
+                                        (2, "chained_motion", "45", "95", "static")):
         prompt = se.build_panel_prompt(ctx, plan, parts, k)
-        assert _motion_key_line(prompt) == _expected_line(template, w2, "6"), k
+        assert _motion_key_line(prompt) == _expected_line(template, w1, w2, "6", camera), k
         assert "before the dialogue" in prompt and "speaks once close" not in prompt, k
     assert 'dialogue: exactly "It\'s just FuboTV." -- ' in se.build_panel_prompt(
         ctx, plan, parts, 2)
@@ -211,7 +221,7 @@ def test_review_focus_1_a_writer_re_ask_keeps_one_contract(ws):
     plan, parts = _recorded("hockey-2x145-f")
     fix = ["panel 2: N12 one action: Motion: chains actions with 'then'"]
     prompt = se.build_panel_prompt(ctx, plan, parts, 2, fix=fix)
-    assert "\n" + _expected_line("chained_motion", "25", "6") + "\n" in prompt
+    assert "\n" + _expected_line("chained_motion", "45", "95", "6", "static") + "\n" in prompt
     assert prompt.count(se.PACING_SENTENCE) == 1
     assert prompt.count(se.SPEAKING_CHAINED_MOTION_SENTENCE.replace(
         "@@SPEAKER@@", '"%s"' % PHRASE)) == 1
@@ -224,7 +234,8 @@ def test_review_focus_2_one_ten_second_panel_speaks_both_lines(ws):
     ctx = _ctx(ws, "hockey-1x241-f")
     plan, parts = _recorded("hockey-1x241-f")
     prompt = se.build_panel_prompt(ctx, plan, parts, 1)
-    assert _motion_key_line(prompt) == _expected_line("chained_motion1", "23", "10")
+    assert _motion_key_line(prompt) == _expected_line("chained_motion1", "43", "93", "10",
+                                                      "tracking")
     assert '\ndialogue: exactly "%s %s" -- ' % (LINE1, LINE2) in prompt
     assert "@@" not in prompt and "speaks once close" not in prompt
 
@@ -235,13 +246,18 @@ def test_wt4_shots_and_no_stills_speaking_prompts_are_unchanged(ws):
     ctx, plan, parts, _t, _p = dlg._story(ws, "shots", 3, plan_mut=dlg._speaking(2),
                                           replies={2: {"dialogue": dlg.LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
-    assert ("without one, the pipeline adds the planned camera sentence."
-            + se.SPEAKING_ACTION_SENTENCE.replace("@@SPEAKER@@", '"the courier"') + "\n") in prompt
+    assert ("and never use a semicolon."
+            + se.SPEAKING_ACTION_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
+            + se.SPEAKING_REACTION_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
+            + se.SPEAKING_STAY_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
+            + _camera_line("tracking") + "\n") in prompt
     assert "before the dialogue" not in prompt
     ctx, plan, parts, _t, _p = dlg._story(ws, "no_stills", 3, plan_mut=dlg._speaking(2),
                                           replies={2: {"dialogue": dlg.LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
-    assert "here; the pipeline adds them.\n" in prompt
+    assert ("here; the pipeline adds them."
+            + se.SPEAKING_STAY_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
+            + _camera_line("tracking") + "\n") in prompt
     assert "before the dialogue" not in prompt
 
 
@@ -313,21 +329,55 @@ def test_wt6_the_contract_motion_passes_the_checks(ws, tmp_path):
     path = os.path.join(str(tmp_path), "story.md")
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
+    # Shot prompt format spec: the recorded panel 1's speaking verb is a hard N7 while generating
+    # (R12), the contract's exit after the line a hard N21 (R16), and both Motions are under the
+    # 55-105 range (R8).
     assert se.panel_checks(ctx, plan, parts, text, path) == (
-        [], ["panel 1: N7 dialogue and text: Motion: says 'speaks'"])
+        ["panel 1: N7 dialogue and text: Motion: says 'speaks'; the pipeline adds the spoken line "
+         "itself, so write only what the speaker physically does, with no speaking verb",
+         "panel 2: N21 after the line: Motion: 'The FuboTV hockey player skates away at "
+         "real-time speed.' has a character leave the frame or turn away ('skates away'); "
+         "'FuboTV hockey player' speaks in this panel, so end it with 'FuboTV hockey player' "
+         "still in frame, face toward the camera"],
+        ["panel 1: N1 word count: Motion: is 33 words; aim for 55-105",
+         "panel 2: N1 word count: Motion: is 35 words; aim for 55-105"])
 
 
 # --- WT8, WT9: old stories compose and check unchanged (WK6) -------------------------------------
 
 def _story_fields(text):
-    """[(motion, dialogue)] of each "## Panel" section of a story.md."""
+    """[(image, motion, dialogue)] of each "## Panel" section of a story.md (image is "" on a
+    panel with no Image: line)."""
     fields = []
     for section in text.split("\n## Panel ")[1:]:
         lines = section.split("\n")
+        image = ([line[len("Image: "):] for line in lines if line.startswith("Image: ")] + [""])[0]
         motion = [line[len("Motion: "):] for line in lines if line.startswith("Motion: ")][0]
         dialogue = [line[len("Dialogue: "):] for line in lines if line.startswith("Dialogue: ")][0]
-        fields.append((motion, dialogue))
+        fields.append((image, motion, dialogue))
     return fields
+
+
+# Shot prompt format spec SF15, SF16 (R13): bin/ltx-story-manifest composes a speech movie's
+# chained prompt with character_lib.panel_prompt: panel 1's framing first, the line after the
+# first action, then the other actions and the camera, and the audio sentence last.
+COMPOSED = {
+    "hockey-2x145-f": [
+        ("The shot is a medium shot. The FuboTV hockey player skates forward toward the camera, "
+         "his face toward the lens, in frame and lit as he speaks. FuboTV hockey player faces "
+         "the camera. FuboTV hockey player says, \"Getting the best deal on hockey isn't a hat "
+         "trick...\" The camera tracks alongside the movement. " + dlg.AC),
+        ("The FuboTV hockey player carves a sharp stop, spraying ice mist into the air, his face "
+         "toward the lens, then pushes off and skates away from the camera. FuboTV hockey "
+         'player faces the camera. FuboTV hockey player says, "It\'s just FuboTV." The camera '
+         "holds on him as he recedes. The camera stays static. " + dlg.AC)],
+    "hockey-1x241-f": [
+        ("The shot is a medium shot. The FuboTV hockey player skates toward the camera, stops "
+         "short, and kicks up a spray of ice mist. FuboTV hockey player faces the camera. "
+         "FuboTV hockey player says, \"Getting the best deal on hockey isn't a hat "
+         "trick...\" After a breath, \"It's just FuboTV.\" He then skates away from the "
+         "camera. The camera tracks alongside the movement. " + dlg.AC)],
+}
 
 
 def test_wt8_old_stories_compose_unchanged():
@@ -335,10 +385,11 @@ def test_wt8_old_stories_compose_unchanged():
         panels = _json(name, "manifest.json")["panels"]
         fields = _story_fields(_read(name, "story.md"))
         assert len(fields) == len(panels) == _case(name)["panels"], name
-        for k, (motion, dialogue) in enumerate(fields, start=1):
+        for k, (image, motion, dialogue) in enumerate(fields, start=1):
             phrase, line, _rest = lib.parse_dialogue(dialogue, [PHRASE])
-            assert lib.insert_speech(motion, lib.speech_text(phrase, line, "beats"), [phrase],
-                                     first_action=True) == panels[k - 1]["motion_prompt"], (name, k)
+            framing = lib.framing_sentence(image) if k == 1 else ""
+            assert lib.panel_prompt(motion, framing, phrase, line, "beats", [phrase]) == (
+                COMPOSED[name][k - 1]), (name, k)
 
 
 RECORDED_ADVISORY = {
@@ -347,6 +398,34 @@ RECORDED_ADVISORY = {
                        "panel 2: N1 word count: Motion: is 46 words; aim for 15-35"],
     "hockey-1x241-f": ["panel 1: N12 one action: Motion: chains actions with 'then'"],
 }
+# Shot prompt format spec: the generation checks of the recorded stories now. The speaking verb
+# of 2x145-f's panel 1 is a hard N7 (R12); each exit after the line is a hard N21 (R16); N1 uses
+# the 55-105 range (R8), and 2x145-f's panel 2 no longer counts the dropped pasted camera (R6).
+CURRENT_CHECKS = {
+    "hockey-2x145-f": (
+        ["panel 1: N7 dialogue and text: Motion: says 'speaks'; the pipeline adds the spoken line "
+         "itself, so write only what the speaker physically does, with no speaking verb",
+         "panel 2: N21 after the line: Motion: 'The FuboTV hockey player carves a sharp stop, "
+         "spraying ice mist into the air, his face toward the lens, then pushes off and skates "
+         "away from the camera.' has a character leave the frame or turn away ('skates away'); "
+         "'FuboTV hockey player' speaks in this panel, so end it with 'FuboTV hockey player' "
+         "still in frame, face toward the camera"],
+        ["panel 1: N1 word count: Motion: is 33 words; aim for 55-105",
+         "panel 2: N12 one action: Motion: chains actions with 'then'"]),
+    "hockey-1x241-f": (
+        ["panel 1: N21 after the line: Motion: 'He then skates away from the camera.' has a "
+         "character leave the frame or turn away ('skates away'); 'FuboTV hockey player' speaks "
+         "in this panel, so end it with 'FuboTV hockey player' still in frame, face toward the "
+         "camera"],
+        ["panel 1: N12 one action: Motion: chains actions with 'then'",
+         "panel 1: N1 word count: Motion: is 37 words; aim for 55-105"]),
+}
+# R6 (CM4): on 2x145-f's speaking panel 2 the writer's own camera sentence ("The camera holds on
+# him as he recedes.") now leaves the pasted "The camera stays static." out of the assembly.
+ASSEMBLED = {"hockey-2x145-f": (
+    "FuboTV hockey player faces the camera. The camera stays static.\nDialogue: FuboTV hockey "
+    "player: It's just FuboTV.\n",
+    "FuboTV hockey player faces the camera.\nDialogue: FuboTV hockey player: It's just FuboTV.\n")}
 
 
 def test_wt9_old_stories_check_unchanged(ws, tmp_path):
@@ -354,14 +433,19 @@ def test_wt9_old_stories_check_unchanged(ws, tmp_path):
         ctx = _ctx(ws, name)
         plan, parts = _recorded(name)
         text = se.assemble(ctx, plan, parts)
-        assert text == _read(name, "story.md"), name
+        recorded = _read(name, "story.md")
+        if name in ASSEMBLED:
+            old, new = ASSEMBLED[name]
+            assert recorded.count(old) == 1, name
+            recorded = recorded.replace(old, new)
+        assert text == recorded, name
         path = os.path.join(str(tmp_path), name + ".md")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         rec = _json(name, "story_checks.json")
         expected = ([m["message"] for m in rec["hard"]], [m["message"] for m in rec["advisory"]])
         assert expected == ([], RECORDED_ADVISORY[name]), name
-        assert se.panel_checks(ctx, plan, parts, text, path) == expected, name
+        assert se.panel_checks(ctx, plan, parts, text, path) == CURRENT_CHECKS[name], name
         for filename in ("plan.json", "story.md"):
             shutil.copy(os.path.join(FIX, name, filename), os.path.join(ctx.story_dir, filename))
         rc, _adv = se.recheck(ctx, lambda path, panels, no_stills=False: [])
@@ -374,8 +458,9 @@ MOTION = dlg.MOTION_LINE % ("motion", "Motion")
 CRITIC_CLAUSE = (
     " On a panel with a Dialogue: line, the pipeline inserts the spoken words right after the "
     "first sentence about what the speaker does, so keep everything the speaker does before "
-    "the line in that first sentence and everything they do after it in a later sentence. Begin "
-    "each of those sentences with the speaker's referring phrase.")
+    "the line in that first sentence and at most one short sentence of the speaker's reaction "
+    "after it, in which nobody else acts and the speaker never leaves the frame. Begin each of "
+    "those sentences with the speaker's referring phrase.")
 CATALOG = ["- fast-motion: x"]
 
 

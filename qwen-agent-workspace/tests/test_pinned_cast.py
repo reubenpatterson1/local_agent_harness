@@ -10,7 +10,8 @@ the Anthropic API: every model call goes to the fake bin/qwen-agent of a temp wo
 (story_engine_testutil.make_ws), every ctx lives under tmp_path, and every test runs under the
 autouse story_env fixture (a temporary HOME, character library and LoRA catalog). The fixtures
 under tests/fixtures/pinned_cast/ are byte-exact plan prompts of three uncast runs, generated at
-0c0160d before any edit to story_engine.py (spec 4.2).
+0c0160d before any edit to story_engine.py (spec 4.2), and regenerated for the shot prompt
+format spec (its 4.2: the camera list order, CAMERA_RULE and the speaker rule).
 """
 
 import copy
@@ -123,8 +124,11 @@ SPEAKER_RULE_KEEP_CAST = (
     "the story. A beat with a speaker shows that character facing the camera, in a medium shot, "
     "medium close-up or close-up; its cast is the speaker's id plus the id of every already-cast "
     "character who is still in frame and stays silent, and no character of your own. The speaker "
-    "may move during the beat, and the camera may stay static, push in, pull back or track them, "
-    "as long as their face stays in frame and lit while they speak.")
+    "may move during the beat, as long as their face stays in frame and lit while they speak. "
+    "Write a speaking beat's action as what the speaker physically does, never as speaking, and "
+    "end it with the speaker still in frame: nobody else acts after the line, and when the "
+    "narrative has the speaker leave, or another character act, after a line, give that a later "
+    "beat with no speaker, or leave it out when no later beat is left.")
 LINES_PINNED_SENTENCE = (" A beat with a speaker shows only the speaker, so every already-cast "
                          "character who says none of the lines still needs a beat with no "
                          "speaker, even when two consecutive lines must then share a beat.")
@@ -134,8 +138,12 @@ UNCHANGED = {
         "beat, or an empty string when nobody speaks; give a speaker only where a spoken line "
         "moves the story. A beat with a speaker shows only that character (its cast is just "
         "their id), facing the camera, in a medium shot, medium close-up or close-up; the "
-        "speaker may move during the beat, and the camera may stay static, push in, pull back or "
-        "track them, as long as their face stays in frame and lit while they speak."),
+        "speaker may move during the beat, as long as their face stays in frame and lit while "
+        "they speak. Write a speaking beat's action as what the speaker physically does, never "
+        "as speaking, and end it with the speaker still in frame: nobody else acts after the "
+        "line, and when the narrative has the speaker leave, or another character act, after a "
+        "line, give that a later beat with no speaker, or leave it out when no later beat is "
+        "left."),
     "LINES_RULE": (
         " lines is the list of the numbers of the spoken lines above that the speaker says aloud "
         "during the beat, in order, or an empty list. Every spoken line belongs to exactly one "
@@ -156,13 +164,12 @@ UNCHANGED = {
         "the first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
         "@@SPEAKER@@ does before the dialogue, ending with them near the camera, face toward it "
         "(if the dialogue comes before they do anything, it is how they turn or step toward the "
-        "camera; never write only that they face it); only when the beat has them act after the "
-        "dialogue, write what they do then as a second sentence. Begin each of these sentences "
-        "with @@SPEAKER@@, word for word, and write nothing about anyone else before the first "
-        "one. The action before the dialogue and the action after it are the two parts of this "
-        "one motion: never put an action from before the dialogue and one from after it in the "
-        "same sentence, and do not write the spoken words or a speaking verb; the pipeline adds "
-        "them."),
+        "camera; never write only that they face it); after it you may write one short second "
+        "sentence of how @@SPEAKER@@ reacts once the line is said, such as a nod, a breath or a "
+        "glance down, in which nobody else acts. Begin each of these sentences with @@SPEAKER@@, "
+        "word for word, and write nothing about anyone else before the first one. Never put an "
+        "action from before the dialogue and one from after it in the same sentence, and do not "
+        "write the spoken words or a speaking verb; the pipeline adds them."),
 }
 
 
@@ -525,6 +532,15 @@ def _prompts(ctx, plan, fix=None):
 
 ON_SCREEN_LINE = ('Characters on screen in this panel, named only by these exact referring '
                   'phrases: "the woman in grey"; "the ronin"\n')
+# Shot prompt format spec SF7 (R9): a speaking motion key line ends with the stay sentence, then
+# the writer's camera sentence for the panel's camera (beat 2 tracks).
+STAY_AND_TRACKING = (' In this whole panel "the woman in grey" never leaves, turns away or moves '
+                     "out of the frame, even when the beat says so. End this field with exactly "
+                     "one camera sentence, for this panel's planned camera, in which the camera "
+                     "tracks the movement: begin it with 'The camera' and write it like 'The "
+                     "camera tracks <whom it follows> — as the move completes, <where the frame "
+                     "ends>.', with your own words in place of the part in angle brackets. Write "
+                     "no other camera direction anywhere in this field.")
 
 
 def test_pt11_writer_prompt(ws, story_env):
@@ -534,7 +550,8 @@ def test_pt11_writer_prompt(ws, story_env):
     assert _key_line(prompts[0], "image").endswith(
         se.SPEECH_FRAMING_SENTENCE + _fill(se.SPEAKING_IMAGE_SILENT_SENTENCE))
     assert _key_line(prompts[1], "motion").endswith(
-        _fill(se.SPEAKING_CHAINED_MOTION_SENTENCE + se.SILENT_CAST_MOTION_SENTENCE))
+        _fill(se.SPEAKING_CHAINED_MOTION_SENTENCE + se.SILENT_CAST_MOTION_SENTENCE)
+        + STAY_AND_TRACKING)
     assert ON_SCREEN_LINE in prompts[0] and ON_SCREEN_LINE in prompts[1]
     for text in (se.SILENT_CAST_MOTION_SENTENCE, se.SPEAKING_IMAGE_SILENT_SENTENCE):
         assert text not in prompts[2] and _fill(text) not in prompts[2]
@@ -542,7 +559,8 @@ def test_pt11_writer_prompt(ws, story_env):
     alone = _prompts(ctx, _speaking_plan(ctx, beat2_cast=("c1",)))
     motion = _key_line(alone[1], "motion")
     assert motion.endswith(se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@",
-                                                                       '"the woman in grey"'))
+                                                                       '"the woman in grey"')
+                           + STAY_AND_TRACKING)
     assert "silent" not in motion
     for prompt in prompts + alone:
         assert "@@" not in prompt
@@ -621,7 +639,8 @@ def test_review_focus_5_three_library_characters_in_one_speaking_panel(ws, story
     assert [m for m in se.plan_checks(ctx, plan, shape)[0] if " P16 " in m] == []
     prompt = _prompts(ctx, plan)[1]
     assert _key_line(prompt, "motion").endswith(
-        _fill(se.SILENT_CAST_MOTION_SENTENCE, silent='"the ronin" and "the archer"'))
+        _fill(se.SILENT_CAST_MOTION_SENTENCE, silent='"the ronin" and "the archer"')
+        + STAY_AND_TRACKING)
     assert ('Characters on screen in this panel, named only by these exact referring phrases: '
             '"the ronin"; "the woman in grey"; "the archer"\n') in prompt
 

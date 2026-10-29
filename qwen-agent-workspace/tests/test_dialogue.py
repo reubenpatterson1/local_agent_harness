@@ -39,7 +39,7 @@ ltx_movie = _load("ltx_movie_for_dialogue", "bin/ltx-movie")
 PNG_1X1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
                            "60e6kgAAAABJRU5ErkJggg==")
 AC = ("The audio is clear close-mic dialogue with a subtle natural room tone; the dialogue takes "
-      "priority over the quiet ambience.")
+      "priority over the quiet ambience, and there is no music.")
 SPLIT = (", and a line has at most 3 sentences; shorten the line, or split it across alternating "
          "close-up panels (the speaker, then the listener, then the speaker again)")
 
@@ -396,7 +396,7 @@ def test_dlg7_manifest_goldens(tmp_path, monkeypatch):
     head = "The old monk lowers his broom and lifts his eyes. The old monk faces the camera. "
     expected = {
         "beats": head + 'The old monk says, "You came far." After a breath, "Rest here before the '
-                        'abbot sees you." ' + AC + " The camera stays static.",
+                        'abbot sees you." The camera stays static. ' + AC,
         "plain": head + 'The old monk says: "You came far. Rest here before the abbot sees you." '
                         "The camera stays static.",
         "beats-no-acoustic": head + 'The old monk says, "You came far." After a breath, "Rest here '
@@ -417,8 +417,9 @@ def test_dlg7_manifest_goldens(tmp_path, monkeypatch):
                                               panels=3)) == 0
     panel = _read_manifest(ws, "dlg7s")["panels"][2]
     assert panel["motion_prompt"] == (
-        'The courier raises the sealed letter toward the gate. The courier faces the camera. The '
-        'courier says, "I carry a letter for the abbot." ' + AC + " The camera stays static.")
+        'The shot is a medium close-up. The courier raises the sealed letter toward the gate. The '
+        'courier faces the camera. The courier says, "I carry a letter for the abbot." The camera '
+        'stays static. ' + AC)
     assert (panel["speech_source"], panel["narration"]) == ("dialogue", "The bell had not yet rung.")
     story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg7n", NO_STILLS_DG9,
                                         plan=CAST_PLAN, images=0)
@@ -428,8 +429,8 @@ def test_dlg7_manifest_goldens(tmp_path, monkeypatch):
     assert panel["motion_prompt"] == (
         "The old monk sets down his broom as rain drips from the eaves. The old monk is %s. %s The "
         'shot is a close-up. The old monk faces the camera. The old monk says, "Come in." After a '
-        'breath, "Sit by the fire." After a short pause, "He will see you." %s The camera stays '
-        "static." % (seu.MONK, seu.TEMPLE, AC))
+        'breath, "Sit by the fire." After a short pause, "He will see you." The camera stays '
+        "static. %s" % (seu.MONK, seu.TEMPLE, AC))
     assert panel["speech"] == "Come in. Sit by the fire. He will see you."
 
 
@@ -440,8 +441,8 @@ def test_dlg8_narration_alias(tmp_path, monkeypatch):
         "Motion: The courier runs. The camera tracks alongside the movement.\n"
         "Narration: the courier: Keep moving.")
     for delivery, motion in (
-            ("beats", 'The courier runs. The courier says, "Keep moving." ' + AC
-                      + " The camera tracks alongside the movement."),
+            ("beats", 'The courier runs. The courier says, "Keep moving." The camera tracks '
+                      "alongside the movement. " + AC),
             ("plain", 'The courier runs. The courier says: "Keep moving." The camera tracks '
                       "alongside the movement.")):
         story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, "dlg8", alias, plan=CAST_PLAN)
@@ -495,7 +496,7 @@ def test_dlg10_dialogue_wins_over_a_prefixed_narration(tmp_path, monkeypatch):
     assert (panel["speaker"], panel["speech"], panel["speech_source"], panel["narration"]) == (
         "the courier", "Keep moving.", "dialogue", "the old monk: Wait.")
     assert panel["motion_prompt"] == ('The courier waits at the gate. The courier says, "Keep '
-                                      'moving." ' + AC + " The camera stays static.")
+                                      'moving." The camera stays static. ' + AC)
 
 
 def test_review_focus_2_a_spoken_line_that_names_another_cast_member(tmp_path, monkeypatch,
@@ -520,7 +521,7 @@ Dialogue: the woman in grey: Tell the ronin I am here.
     panels = _read_manifest(ws, "rf2")["panels"]
     assert panels[1]["motion_prompt"] == (
         "The kyrawmn woman in grey lifts her chin. The kyrawmn woman in grey faces the camera. The "
-        'kyrawmn woman in grey says, "Tell the ronin I am here." ' + AC + " The camera stays static.")
+        'kyrawmn woman in grey says, "Tell the ronin I am here." The camera stays static. ' + AC)
     assert [c["name"] for c in panels[1]["characters"]] == ["kyra"]
     assert [c["name"] for c in panels[0]["characters"]] == ["kyra", "ronin"]
 
@@ -533,7 +534,8 @@ def test_review_focus_3_dialogue_with_equal_pace_and_no_narration(tmp_path, monk
                                               extra=["--pace", "equal"])) == 0
     panels = _read_manifest(ws, "rf3")["panels"]
     assert (panels[1]["speech_source"], panels[1]["narration"]) == ("dialogue", "")
-    assert 'The old monk says, "You came far." ' + AC in panels[1]["motion_prompt"]
+    assert ('The old monk says, "You came far." The camera stays static. ' + AC
+            in panels[1]["motion_prompt"])
     assert panels[0]["narration"] == "" and "speaker" not in panels[0]
 
 
@@ -649,8 +651,12 @@ def test_dlg12_plan_prompt_speaker_rule(ws):
               "the beat, or an empty string when nobody speaks; give a speaker only where a spoken "
               "line moves the story. A beat with a speaker shows only that character (its cast is "
               "just their id), facing the camera, in a medium shot, medium close-up or close-up; "
-              "the speaker may move during the beat, and the camera may stay static, push in, pull "
-              "back or track them, as long as their face stays in frame and lit while they speak.")
+              "the speaker may move during the beat, as long as their face stays in frame and lit "
+              "while they speak. Write a speaking beat's action as what the speaker physically "
+              "does, never as speaking, and end it with the speaker still in frame: nobody else "
+              "acts after the line, and when the narrative has the speaker leave, or another "
+              "character act, after a line, give that a later beat with no speaker, or leave it "
+              "out when no later beat is left.")
     silent = " speaker is always an empty string: nobody speaks in this movie."
     for mode in ("chained", "no_stills", "shots"):
         for narration, rule in ((True, spoken), ("speech", spoken), (False, silent)):
@@ -699,8 +705,8 @@ NO_STILLS_PROMPT = (
     "order that opens with the main action, carries enough separate beats to fill the full "
     "@@SECONDS@@ seconds, links them with temporal connectors (initially, as, then, while, a moment "
     "later), names the ambient and environmental sounds alongside the actions that make them, and "
-    "states the camera viewpoint and the lighting and colour; you may also state a camera "
-    "movement. Name each character only by their referring phrase. Do not describe any "
+    "states the camera viewpoint and the lighting and colour. Name each character only by their "
+    "referring phrase. Do not describe any "
     "character's appearance or clothing, do not write a sentence about the place itself and do "
     "not name the shot type: the pipeline adds each character's description, the place's setting "
     "sentence, the shot type and, unless you state one, the camera movement itself. Describe only "
@@ -738,9 +744,16 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
             "sentences; no quotation marks, no speaker name and no description of how the words "
             "are said -- the pipeline adds who says them and how.\n") in prompt
     assert "\n" + se.KEY_LINE_TEMPLATES["narration_with_dialogue"] + "\n" in prompt
-    assert ('already on screen. You may add one camera direction.'
+    stay = (' In this whole panel "the courier" never leaves, turns away or moves out of the '
+            "frame, even when the beat says so.")
+    tracks = (" End this field with exactly one camera sentence, for this panel's planned camera, "
+              "in which the camera tracks the movement: begin it with 'The camera' and write it "
+              "like 'The camera tracks <whom it follows> — as the move completes, <where the "
+              "frame ends>.', with your own words in place of the part in angle brackets. Write "
+              "no other camera direction anywhere in this field.\n")
+    assert ('already on screen.'
             + se.SPEAKING_CHAINED_MOTION_SENTENCE.replace("@@SPEAKER@@", '"the courier"')
-            + "\n") in prompt
+            + stay + tracks) in prompt
     assert "@@" not in prompt
     quiet = se.build_panel_prompt(ctx, plan, parts, 3)
     assert "\ndialogue: " not in quiet
@@ -752,14 +765,14 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
             "beat describes, keeping their face toward the camera while they speak, names the "
             "ambient") in prompt
     assert ("no spoken words and no markdown. Do not write the spoken words or a speaking verb "
-            "here; the pipeline adds them.\n") in prompt
+            "here; the pipeline adds them." + stay + tracks) in prompt
     ctx, plan, parts, _t, _p = _story(ws, "shots", 3, plan_mut=_speaking(2),
                                       replies={2: {"dialogue": LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
     assert ('Never name a person who is not in this shot. "the courier" is the only person in the '
             "foreground, facing the camera; any crowd stays in the background.\n") in prompt
-    assert ('without one, the pipeline adds the planned camera sentence. In this panel "the '
-            'courier" speaks the dialogue:') in prompt
+    assert ('and never use a semicolon. In this panel "the courier" speaks the dialogue:'
+            in prompt)
     ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
                                       replies={2: {"dialogue": LINE}},
                                       ctx_kw={"seconds": "4", "clip_seconds": 97 / 24.0})
@@ -901,8 +914,7 @@ def test_dlg15_assembly_goldens_and_dedupe(ws, tmp_path):
     plan, _shape = se.normalize_plan(ctx, raw)
     parts[1]["motion"] = "The courier turns. The camera slowly pans left."
     assert dict(se.panel_fields(ctx, plan, parts, 2))["Motion"] == (
-        "The courier turns. The camera slowly pans left. The courier faces the camera. The camera "
-        "tracks alongside the movement.")
+        "The courier turns. The camera slowly pans left. The courier faces the camera.")
     assert se.pasted_pieces(ctx, plan, 2)["motion"] == ["The courier faces the camera.",
                                                         "The camera tracks alongside the movement."]
     lib = se._character_lib(WS)
@@ -1190,11 +1202,11 @@ def test_dlg26_judge_gate_is_report_only(tmp_path, monkeypatch, capsys):
 NOT_REPAIRED_REASON = ("not repaired automatically: only spoken timing and the amount of action "
                        "are patched")
 THREE = ("The courier stops at the crates, then turns, then pedals on. The courier glances up at "
-         "the rain. The camera slowly pans left.")
+         "the rain. The camera tracks alongside the movement.")
 ONE_CHANGED = ("The courier stops at the crates and pedals on. The courier glances up at the rain. "
-               "The camera slowly pans left.")
+               "The camera tracks alongside the movement.")
 TWO_CHANGED = ("The courier stops at the crates and pedals on. The courier looks up at the grey "
-               "sky. The camera slowly pans left.")
+               "sky. The camera tracks alongside the movement.")
 
 
 def _patch(target, index, field, replacement):
@@ -1259,8 +1271,8 @@ def test_dlg22_the_critic_rewrites_one_sentence(ws, tmp_path, monkeypatch):
     with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
         after = f.read()
     assert after == before.replace("Motion: " + THREE + " ", "Motion: " + ONE_CHANGED + " ")
-    assert ("Motion: " + ONE_CHANGED + " The courier faces the camera. The camera tracks "
-            "alongside the movement.\n" + "Dialogue: the courier: " + LINE + "\n") in after
+    assert ("Motion: " + ONE_CHANGED + " The courier faces the camera.\n"
+            + "Dialogue: the courier: " + LINE + "\n") in after
     assert _read_json(os.path.join(rounds, "round_1", "critic.json"))["applied"] == [good]
     state0 = {"plan": _read_json(os.path.join(rounds, "round_0", "plan.json")),
               "parts": [dict((key, value) for key, value in p.items() if key != "index")
@@ -1503,13 +1515,13 @@ def test_dlg25_recheck_blocks_only_on_blocking_violations(ws, monkeypatch, capsy
 
 N12_MESSAGE = "panel 1: N12 one action: Motion: chains actions with 'then'"
 MOTION_LINE = ('- target "panel", field "%s", index = the panel number, only for a panel with a '
-               "[hard] T2 or T3 problem: replacement is the panel's whole new %s: writer text, "
-               "identical to the current text except for the sentence or sentences that hold the "
-               "extra or missing action.")
+               "[hard] T2, T3, N7, N20, N21 or N22 problem: replacement is the panel's whole new "
+               "%s: writer text, identical to the current text except for the sentence or "
+               "sentences that cause the problem.")
 DIALOGUE_FIELD_LINE = ('- target "panel", field "dialogue", index = the panel number, only for a '
-                       "panel with a [hard] T1 or N18 problem: replacement is the shortened spoken line, "
-                       "without the speaker's phrase and without quotation marks, within the "
-                       "limit the T1 problem states.")
+                       "panel with a [hard] T1, N18 or N22 problem: replacement is the new spoken "
+                       "line, without the speaker's phrase and without quotation marks, within "
+                       "the limit a T1 problem states.")
 
 
 def test_dlg19_critic_prompt(ws):
@@ -1881,14 +1893,14 @@ def test_ca6_n19_cast_reference(ws, story_env):
 
 DLG_H_TEXT = {
     "chained": ("motion", "The courier leans into the bend while rain streams off the yellow hood. "
-                          "The courier shouts over the rain. The grey harbour wall and the narrow "
-                          "road beside it stay wet and dark under the heavy sky for the whole "
-                          "shot. The camera slowly pans left."),
+                          "The courier passes a sign that reads HARBOUR. The camera tracks "
+                          "alongside the movement."),
     "shots": ("motion", "The courier leans into the bend as rain streams off the yellow hood. The "
-                        "courier shouts over the rain. The camera slowly pans left."),
+                        "courier passes a sign that reads HARBOUR. The camera tracks alongside "
+                        "the movement."),
     "no_stills": ("prompt", seu.panel_json("no_stills", 2, words={"prompt": 300})["prompt"]
-                  + " The courier shouts over the rain. The camera slowly pans left as the yellow "
-                  "hood flaps in the wind."),
+                  + " The courier passes a sign that reads HARBOUR. The camera tracks alongside "
+                  "the movement."),
 }
 # A word count more than 25 percent outside the field's N1 band: the chained Motion and the no_stills
 # Prompt above carry it; shots exempts Motion from N1, so its Image is replaced by a too-long one.
@@ -1915,7 +1927,10 @@ def test_dlg_h_offline_merge_gate(mode, speaking, ws, tmp_path, monkeypatch):
     round_0 = _read_json(os.path.join(rounds, "round_0", "story_checks.json"))
     assert round_0["hard"] == []
     advisory_ids = set(v["id"] for v in round_0["advisory"] if v["index"] == 2)
-    assert DLG_H_ADVISORY[mode] <= advisory_ids, (mode, sorted(advisory_ids))
+    if mode == "shots" and speaking:
+        assert "S5" not in advisory_ids
+    expected =DLG_H_ADVISORY[mode] - ({"S5"} if speaking else set())   # a speaking shot: 2 actions
+    assert expected <= advisory_ids, (mode, sorted(advisory_ids))
     assert not DLG_H_ADVISORY[mode] & set(v["id"] for v in round_0["hard"])
     assert _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["stop_reason"] == "passed"
     assert [r["stage"] for r in log].count("critic") == 0

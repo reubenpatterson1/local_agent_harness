@@ -151,7 +151,7 @@ Dialogue: the FuboTV player: It's just FuboTV.
 
 
 def test_nf35_manifest_places_the_line_after_the_first_action(tmp_path, monkeypatch):
-    beats = STOP_HEAD + ' The FuboTV player says, "It\'s just FuboTV." ' + dlg.AC + " " + STOP_TAIL
+    beats = STOP_HEAD + ' The FuboTV player says, "It\'s just FuboTV." ' + STOP_TAIL + " " + dlg.AC
     plain = STOP_HEAD + ' The FuboTV player says: "It\'s just FuboTV." ' + STOP_TAIL
     for delivery, motion in (("beats", beats), ("plain", plain)):
         story_md, images, mws = dlg._manifest_ws(tmp_path, monkeypatch, "nf35c", CHAINED_STOP,
@@ -165,15 +165,16 @@ def test_nf35_manifest_places_the_line_after_the_first_action(tmp_path, monkeypa
     story_md, images, mws = dlg._manifest_ws(tmp_path, monkeypatch, "nf35s", SHOTS_STOP, images=2)
     assert dlg.story_manifest.main(dlg._manifest_argv("nf35s", story_md, images,
                                                       mode="shots")) == 0
-    assert dlg._read_manifest(mws, "nf35s")["panels"][1]["motion_prompt"] == beats
+    assert dlg._read_manifest(mws, "nf35s")["panels"][1]["motion_prompt"] == (
+        "The shot is a medium close-up. " + beats)
     story_md, images, mws = dlg._manifest_ws(tmp_path, monkeypatch, "nf35n", NO_STILLS_STOP,
                                              plan=HOCKEY_MANIFEST_PLAN, images=0)
     assert dlg.story_manifest.main(dlg._manifest_argv("nf35n", story_md, images,
                                                       mode="no_images")) == 0
     assert dlg._read_manifest(mws, "nf35n")["panels"][1]["motion_prompt"] == (
         "The FuboTV player skates forward. He skates away from the camera. The FuboTV player "
-        'faces the camera. The FuboTV player says, "It\'s just FuboTV." ' + dlg.AC
-        + " The camera stays static.")
+        'faces the camera. The FuboTV player says, "It\'s just FuboTV." The camera stays static. '
+        + dlg.AC)
 
 
 # --- NF1-NF4: the spoken lines of a narrative (QL1-QL4) -----------------------------------------
@@ -340,20 +341,20 @@ def test_nf16_the_speaking_coercion_table(ws):
     shots = {"extreme wide shot": "medium close-up", "wide shot": "medium close-up",
              "medium shot": "medium shot", "medium close-up": "medium close-up",
              "close-up": "close-up", "extreme close-up": "close-up", "": "medium close-up"}
-    kept = ("static", "slow push-in", "slow pull-back", "tracking")
+    kept = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
     assert sorted(shots) == sorted(se.SHOT_TYPES + ("",))
     for shot in se.SHOT_TYPES + ("",):
         for camera in se.CAMERA_KEYS + ("",):
             plan = _speaking_beat(ctx, "shots", 3, 2, shot=shot, camera=camera)
-            want = (shots[shot], camera if camera in kept else "static")
+            want = (shots[shot], camera if camera in kept else "slow push-in")
             assert (plan["beats"][1]["shot"], plan["beats"][1]["camera"]) == want, (shot, camera)
             notes = []
             if want[0] != shot:
                 notes.append("beat 2: P14 speaking beat: shot %s changed to %s so the speaker's "
                              "face stays readable" % (se._q(shot), se._q(want[0])))
             if want[1] != camera:
-                notes.append("beat 2: P14 speaking beat: camera %s changed to 'static' so the "
-                             "speaker's face stays readable" % se._q(camera))
+                notes.append("beat 2: P14 speaking beat: camera %s changed to 'slow push-in' so "
+                             "the speaker's face stays readable" % se._q(camera))
             assert plan["speech_notes"] == notes, (shot, camera)
     plan = _speaking_beat(seu.make_ctx(se, ws), "chained", 3, 3, shot="extreme wide shot",
                           camera="slow pan left")
@@ -361,7 +362,7 @@ def test_nf16_the_speaking_coercion_table(ws):
         "extreme wide shot", "slow pan left")
     assert plan["speech_notes"] == []
     assert se.speaking_camera({"camera": "tracking"}) == "tracking"
-    assert se.speaking_camera({"camera": "slow tilt up"}) == "static"
+    assert se.speaking_camera({"camera": "slow tilt up"}) == "slow push-in"
 
 
 def test_nf17_pasted_pieces_of_a_speaking_panel(ws):
@@ -371,7 +372,7 @@ def test_nf17_pasted_pieces_of_a_speaking_panel(ws):
 
     assert pieces("chained", "tracking", "motion") == [
         FACING, "The camera tracks alongside the movement."]
-    assert pieces("chained", "slow pan left", "motion") == [FACING, "The camera stays static."]
+    assert pieces("chained", "slow pan left", "motion") == [FACING, "The camera pushes in."]
     assert pieces("shots", "slow pull-back", "image")[-2] == FACING
     assert pieces("shots", "slow pull-back", "motion") == [FACING, "The camera pulls back."]
     assert pieces("no_stills", "static", "prompt")[-2:] == [FACING, "The camera stays static."]
@@ -653,9 +654,12 @@ SPEAKER_RULE = (" speaker is the id of the one character who says something alou
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
                 "(its cast is just their id), facing the camera, in a medium shot, medium close-up "
-                "or close-up; the speaker may move during the beat, and the camera may stay static, "
-                "push in, pull back or track them, as long as their face stays in frame and lit "
-                "while they speak.")
+                "or close-up; the speaker may move during the beat, as long as their face stays in "
+                "frame and lit while they speak. Write a speaking beat's action as what the "
+                "speaker physically does, never as speaking, and end it with the speaker still in "
+                "frame: nobody else acts after the line, and when the narrative has the speaker "
+                "leave, or another character act, after a line, give that a later beat with no "
+                "speaker, or leave it out when no later beat is left.")
 LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
               "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
               "exactly one beat, in the narrative's order: give each line to the beat whose action "
@@ -762,6 +766,16 @@ def test_nf20_the_panel_prompt_constants():
 
 T2_2X145 = ("panel 2: T2 action amount: Motion: holds 3 actions; a 6-second clip fits at most 2, "
             "so cut the extra actions and keep every other sentence word for word")
+# Shot prompt format spec SF10 (R16): the recorded writer text has the speaker skate away after
+# the line, which the generation checks block as N21.
+N21_2X145 = ("panel 2: N21 after the line: Motion: 'He holds the pose, then skates away from the "
+             "camera.' has a character leave the frame or turn away ('skates away'); 'the FuboTV "
+             "player' speaks in this panel, so end it with 'the FuboTV player' still in frame, "
+             "face toward the camera")
+N21_1X241 = ("panel 1: N21 after the line: Motion: 'He then skates away from the camera.' has a "
+             "character leave the frame or turn away ('skates away'); 'the FuboTV player' speaks "
+             "in this panel, so end it with 'the FuboTV player' still in frame, face toward the "
+             "camera")
 Q1_MISSING = ("story: Q1 spoken line: the narrative's spoken line %d \"%s\" is in no panel's "
               "Dialogue:; give it word for word to the panel that shows it being said (Dialogue: "
               "<speaker's referring phrase>: <the line>)")
@@ -852,11 +866,11 @@ def test_nf9_replay_the_recorded_1x241_plan(ws):
 
 def test_nf10_replay_the_fixed_plans(ws):
     state, _plan, _notes = _replay(ws, "hockey-2x145", "plan_reply_fixed.json")
-    assert state["hard"] == [T2_2X145] and se.blocking(state["hard"]) == []
+    assert state["hard"] == [T2_2X145, N21_2X145] and se.blocking(state["hard"]) == [N21_2X145]
     assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in state["text"]
     assert state["text"].endswith(PANEL2_FIXED)
     state, plan, _notes = _replay(ws, "hockey-1x241", "plan_reply_fixed.json")
-    assert state["hard"] == [] and plan["speech_notes"] == []
+    assert state["hard"] == [N21_1X241] and plan["speech_notes"] == []
     assert (plan["beats"][0]["shot"], plan["beats"][0]["camera"]) == ("medium shot", "tracking")
     assert ("Motion: The FuboTV player skates forward toward the camera, then stops abruptly in a "
             "hockey stop, spraying ice mist into the air. He then skates away from the camera. The "
@@ -986,13 +1000,13 @@ def test_nf9b_replay_with_the_pipeline_assignment(ws):
     assert [b["lines"] for b in plan["beats"]] == [[1], [2]]
     assert plan["beats"][1]["speaker"] == "c1"
     assert notes == [GIVEN % (1, 1), GIVEN % (2, 2)]
-    assert state["hard"] == [T2_2X145]
+    assert state["hard"] == [T2_2X145, N21_2X145]
     state, plan, notes = _replay(ws, "hockey-1x241", "plan_reply_1.txt", assign=True)
     beat = plan["beats"][0]
     assert (beat["lines"], beat["speaker"], beat["shot"], beat["camera"]) == (
         [1, 2], "c1", "medium shot", "tracking")
     assert notes == [GIVEN % (1, 1), GIVEN % (1, 2)]
-    assert state["hard"] == []
+    assert state["hard"] == [N21_1X241]
 
 
 def test_nf37_assign_missing_lines(ws):
@@ -1027,6 +1041,14 @@ def test_nf37_assign_missing_lines(ws):
 NF28_PATCH = {"target": "panel", "index": 2, "field": "motion", "reason": "r",
               "replacement": "The FuboTV player skates forward, then halts in a sharp hockey stop "
                              "that sprays ice mist into the air. He skates away from the camera."}
+# Shot prompt format spec SF5 (R5) and amendment SF-A1 (R17): the recorded hockey-2x145 plan has
+# two static beats, and the narrative's exit after its last line falls in the last beat.
+P18_2X145 = ("beat 1: P18 static camera: camera 'static' changed to 'slow push-in': at most 1 of "
+             "the 2 beats may be static, and the latest static beats are kept as the deliberate "
+             "holds")
+P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line ('skates "
+            "away') was left out, because that line is in the last beat and a speaking beat never "
+            "shows its speaker leave; rerun with --force-story --panels %d to keep it")
 
 
 def _recorded(case, name):
@@ -1041,23 +1063,27 @@ def test_nf28_engine_the_2x145_failure(ws, tmp_path, monkeypatch):
                        "2": [_recorded("hockey-2x145", "panel_02_reply_1.txt")]},
                       [seu.answer(seu.critic_json((7, 6, 6), "revise", [NF28_PATCH]))])
     assert rc == 0
-    assert _stages(log) == ["plan", "plan", "panel", "panel", "critic"]
+    # R16: panel 2's recorded exit after the line (N21) is re-asked once in round 0, then trimmed,
+    # which also clears its T2, so no critic round runs.
+    assert _stages(log) == ["plan", "plan", "panel", "panel", "panel"]
     round0 = _story_json(ctx, "story_rounds", "round_0", "plan.json")
     assert [b["lines"] for b in round0["beats"]] == [[1], [2]]
     assert (round0["beats"][1]["speaker"], round0["beats"][1]["cast"]) == ("c1", ["c1"])
-    assert round0["speech_notes"] == [GIVEN % (1, 1), GIVEN % (2, 2)]
+    assert round0["speech_notes"] == [GIVEN % (1, 1), GIVEN % (2, 2), P18_2X145, P19_NOTE % 3]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
-    assert [v["id"] for v in checks0["hard"]] == ["T2"]
+    assert [v["id"] for v in checks0["hard"]] == []
+    assert ("panel 2: N21 after the line: Motion: the pipeline removed 'then skates away from the "
+            "camera.'") in [v["message"] for v in checks0["advisory"]]
     assert '\ndialogue: exactly "%s" -- ' % LINE1 in _story_text(
         ctx, "story_rounds", "round_0", "panel_01_prompt_1.txt")
-    assert _story_json(ctx, "story_rounds", "round_1", "critic.json")["applied"] == [NF28_PATCH]
+    assert not os.path.exists(os.path.join(ctx.story_dir, "story_rounds", "round_1"))
     assert _story_json(ctx, "story_checks.json")["stop_reason"] == "passed"
     story = _story_text(ctx, "story.md")
     assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in story
     assert story.endswith(
         "## Panel 2 — The FuboTV Hockey Stop\nMotion: The FuboTV player skates forward, then halts "
-        "in a sharp hockey stop that sprays ice mist into the air. He skates away from the camera. "
-        "The FuboTV player faces the camera. The camera stays static.\n"
+        "in a sharp hockey stop that sprays ice mist into the air. He holds the pose. The FuboTV "
+        "player faces the camera. The camera stays static.\n"
         "Dialogue: the FuboTV player: It's just FuboTV.\n")
 
 
@@ -1067,14 +1093,19 @@ def test_nf29_engine_the_1x241_failure(ws, tmp_path, monkeypatch):
     rc, log = _engine(monkeypatch, tmp_path, ctx, [plan, plan],
                       {"1": [_recorded("hockey-1x241", "panel_01_reply_1.txt")]})
     assert rc == 0
-    assert _stages(log) == ["plan", "plan", "panel"]
-    assert _story_json(ctx, "story_rounds", "round_0", "story_checks.json")["hard"] == []
+    # R16: the recorded exit after the line (N21) is re-asked once in round 0, then trimmed.
+    assert _stages(log) == ["plan", "plan", "panel", "panel"]
+    checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
+    assert checks0["hard"] == []
+    assert ("panel 1: N21 after the line: Motion: the pipeline removed 'He then skates away from "
+            "the camera.'") in [v["message"] for v in checks0["advisory"]]
     assert _story_json(ctx, "story_checks.json")["stop_reason"] == "passed"
-    assert _story_json(ctx, "plan.json")["speech_notes"] == [GIVEN % (1, 1), GIVEN % (1, 2)]
+    assert _story_json(ctx, "plan.json")["speech_notes"] == [GIVEN % (1, 1), GIVEN % (1, 2),
+                                                             P19_NOTE % 2]
     story = _story_text(ctx, "story.md")
     assert ("Motion: The FuboTV player skates forward toward the camera, then stops abruptly in a "
-            "hockey stop, spraying ice mist into the air. He then skates away from the camera. The "
-            "FuboTV player faces the camera. The camera tracks alongside the movement.\n"
+            "hockey stop, spraying ice mist into the air. The FuboTV player faces the camera. The "
+            "camera tracks alongside the movement.\n"
             "Dialogue: the FuboTV player: " + LINE1 + " " + LINE2 + "\n") in story
 
 
@@ -1088,7 +1119,9 @@ def test_nf30_q1_blocks_when_no_beat_is_eligible(ws, tmp_path, monkeypatch, caps
                       dict((str(k), [seu.answer(seu.panel_json("chained", k))]) for k in (1, 2, 3)),
                       [{"answer": "x"}] * 4)
     assert rc == 2
-    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == []
+    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == [
+        "beat 1: P18 static camera: camera 'static' changed to 'slow push-in': at most 1 of the 3 "
+        "beats may be static, and the latest static beats are kept as the deliberate holds"]
     err = capsys.readouterr().err
     for i, line in enumerate(COURIER_SPOKEN, start=1):
         assert ("  - " + Q1_MISSING % (i, line) + "\n") in err
@@ -1117,11 +1150,14 @@ def test_nf33_default_narration_with_the_fixed_plan(ws, tmp_path, monkeypatch, c
                       [{"answer": "x"}] * 4)
     assert rc == 0
     assert _stages(log).count("plan") == 1
-    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == []
+    assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == [
+        P18_2X145, P19_NOTE % 3]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
-    assert [v["id"] for v in checks0["hard"]] == ["T2"]
-    assert ("Warning: unresolved after 2 critic round(s): " + T2_2X145 + "\n"
-            ) in capsys.readouterr().out
+    # R16: panel 2's exit after the line is re-asked once, then trimmed, which clears its T2, so
+    # no critic round runs and nothing is left unresolved.
+    assert [v["id"] for v in checks0["hard"]] == []
+    assert _stages(log) == ["plan", "panel", "panel", "panel"]
+    assert "Warning: unresolved" not in capsys.readouterr().out
     story = _story_text(ctx, "story.md")
     assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in story
     assert "Dialogue: the FuboTV player: " + LINE2 + "\n" in story
@@ -1347,7 +1383,7 @@ def test_review_focus_4_a_retyped_q1_patch_stores_the_narrative_words(ws):
     assert len(applied) == 1 and rejected == []
     assert new["parts"][1]["dialogue"] == LINE2
     state = se._Run(ctx, "").make_state(1, new["plan"], new["parts"])
-    assert state["hard"] == [T2_2X145]
+    assert state["hard"] == [T2_2X145, N21_2X145]
     assert state["text"].endswith("Dialogue: the FuboTV player: It's just FuboTV.\n")
 
 
