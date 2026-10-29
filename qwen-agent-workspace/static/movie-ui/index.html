@@ -51,6 +51,7 @@
         <input id="c-panels" type="number" min="1" max="200" value="15"></label>
       <label data-field="length"><input id="c-size-length" type="radio" name="c-size" value="length"> Seconds
         <input id="c-length" type="number" min="1" max="3600" step="0.5" value="60"></label>
+      <span id="c-size-note" class="muted">Panels is a target: the default story engine may add up to 2 panels to fit the narrative.</span>
     </fieldset>
     <fieldset>
       <legend>Frames</legend>
@@ -147,6 +148,7 @@
     </div>
     <div class="row">
       <button id="s-render" type="button">Render</button>
+      <label>Panels (target) <input id="s-regen-panels" type="number" min="1" max="200" step="1" size="4"></label>
       <button id="s-regenerate" type="button">Regenerate story</button>
       <span id="s-redo-box" hidden><input id="s-redo-panels" type="text" size="12" placeholder="2,5"> <button id="s-redo" type="button">Redo panels</button></span>
       <span id="s-action-status" class="muted"></span>

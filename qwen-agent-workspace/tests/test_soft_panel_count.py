@@ -1140,3 +1140,144 @@ def test_spt18_the_manifest_needs_the_adopted_count(movie, tmp_path, monkeypatch
     capsys.readouterr()
     assert manifest.main(base + ["--target-seconds", repr(3 * 145 / 24.0)]) == 2
     assert "not achievable" in capsys.readouterr().err
+
+
+# --- SPT1 (Task 6 part), SPT20: the movie UI (SPC14) ------------------------------------------
+
+import movie_ui_testutil as mt  # noqa: E402
+
+
+def test_spt1e_movie_ui_constants():
+    assert mui.PANELS_EXTRA == se.PANELS_EXTRA
+    assert mui.STORY_PANEL_RE.pattern == manifest._PANEL_HEADER_RE.pattern
+
+
+def _plan_doc(story_dir):
+    return _read_json(story_dir, "plan.json")
+
+
+def test_spt20_the_movie_ui_uses_the_storys_count(ws, tmp_path, monkeypatch):
+    saved = save_story(ws, tmp_path, monkeypatch, "s1", "chained", 3, 4)
+    sdir = saved.story_dir
+    assert mui.plan_panels(sdir, "chained") == 4
+    assert mui.plan_panels(sdir, "shots") is None
+    plan = _plan_doc(sdir)
+    for bad in ({"schema": "x"}, {"panels": 0}, {"panels": "4"}, {"panels": True}):
+        _write_json(sdir, "plan.json", dict(plan, **bad))
+        assert mui.plan_panels(sdir, "chained") is None, bad
+    os.remove(os.path.join(sdir, "plan.json"))
+    assert mui.plan_panels(sdir, "chained") is None
+    _write_json(sdir, "plan.json", plan)
+    story_md = os.path.join(sdir, "story.md")
+    with open(story_md, encoding="utf-8") as f:
+        text = f.read()
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(THREE_PANELS)
+    assert mui.plan_panels(sdir, "chained") is None
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(text)
+    rows = (({"panels": 3, "mode": "chained"}, sdir, 4), ({"panels": 2, "mode": "chained"}, sdir, 4),
+            ({"panels": 1, "mode": "chained"}, sdir, 1), ({"panels": 3, "mode": "shots"}, sdir, 3),
+            ({"panels": 3, "mode": "chained"}, None, 3))
+    for fields, where, want in rows:
+        assert mui.effective_panels(fields, where) == want, (fields, where)
+    six = save_story(ws, tmp_path, monkeypatch, "s6", "chained", 5, 6)
+    by_length = {"length": 30, "frames": 145, "fps": 24, "mode": "chained"}
+    assert mui.resolved_panels(by_length) == 5
+    assert mui.effective_panels(by_length, six.story_dir) == 6
+    shots = save_story(ws, tmp_path, monkeypatch, "sh4", "shots", 3, 4)
+    state = str(tmp_path / "state")
+    os.makedirs(state)
+    for redo, want in (([4], []), ([5], ["redo panel 5 is out of range (1..4)"])):
+        fields = mui.compose_fields({"story_id": "sh4", "narrative": "x"})
+        fields.update(action="redo", mode="shots", panels=3, redo=redo)
+        errors = mui.validate_fields(fields, ws, state)
+        assert [e for e in errors if e.startswith("redo panel")] == want, redo
+    fields = {"mode": "shots", "panels": 3, "action": "movie", "seed_upload": None}
+    parser = mui.ProgressParser("movie", fields)
+    parser.feed(b"=== Phase 1: story ===\n=== Phase 2: stills ===\n")
+    job = {"id": "20261029-120000-a1b2", "kind": "movie", "workspace": ws, "story_id": "sh4",
+           "fields": fields}
+    assert parser.snapshot(job, None, state)["stills"]["expected"] == 4
+    assert shots.story_dir == os.path.join(ws, "generated", "stories", "sh4")
+    static = os.path.join(WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    assert 'id="c-size-note"' in html and "Panels is a target" in html
+    assert "st.checks.panels_target || st.checks.panels" in js
+
+
+# --- SPT21: bin/iterate-story regenerates with the target (SPC15) -----------------------------
+
+def test_spt21_iterate_story_regenerates_with_the_target():
+    plan = {"narrative": NARRATIVE, "mode": "chained", "panels": 4, "panels_target": 3,
+            "cast": [], "loras": {"pinned": []}}
+    cmd = iterate_story.build_engine_cmd("s", plan)
+    assert cmd[cmd.index("--panels") + 1] == "3"
+    del plan["panels_target"]
+    cmd = iterate_story.build_engine_cmd("s", plan)
+    assert cmd[cmd.index("--panels") + 1] == "4"
+
+
+# --- SPT26, SPT27: a panel target for "Regenerate story" (SPC16) ------------------------------
+
+PY = "/py"
+LTX = "/w/bin/ltx-movie"
+
+
+def _f(**overrides):
+    fields = mui.compose_fields({"story_id": "ronin", "narrative": "  A ronin walks.  "})
+    fields.update(overrides)
+    return fields
+
+
+@pytest.fixture
+def ui_env(monkeypatch, tmp_path):
+    """tests/test_movie_ui_http.py's env fixture: a movie-ui server on 127.0.0.1 under a
+    temporary HOME, with a stub workspace."""
+    state = mt.set_home(monkeypatch, tmp_path)
+    ui_ws = mt.make_stub_workspace(tmp_path)
+    running = mt.Running(state)
+    yield {"state": state, "ws": ui_ws, "tmp": str(tmp_path), "srv": running}
+    running.close()
+    mt.kill_everything(state)
+
+
+def test_spt26_the_regenerate_argv(ui_env):
+    base = [PY, LTX, "A ronin walks.", "--story-id", "ronin"]
+    defaults = ["--fps", "24", "--frames", "145", "--model", mui.DEFAULT_MODEL, "--gemma",
+                mui.DEFAULT_GEMMA]
+    want = base + ["--panels", "4"] + defaults + ["--force-story", "--story-only", "--no-review"]
+    assert mui.build_argv(_f(action="regenerate", panels=4, length=None), "/w", "/s",
+                          py=PY) == want
+    fields = _f(panels=None, length=30)
+    fields.update(action="regenerate", panels=4, length=None)
+    argv = mui.build_argv(fields, "/w", "/s", py=PY)
+    assert argv == want and "--length" not in argv
+    checked = dict(fields, ws=ui_env["ws"])
+    errors = mui.validate_fields(checked, ui_env["ws"], ui_env["state"])
+    assert [e for e in errors if "panels" in e] == []
+    errors = mui.validate_fields(dict(checked, panels=0), ui_env["ws"], ui_env["state"])
+    assert "panels must be an integer from 1 to 200" in errors
+    errors = mui.validate_fields(dict(checked, length=30), ui_env["ws"], ui_env["state"])
+    assert "give exactly one of panels or length" in errors
+    body = mt.fields(ui_env["ws"], action="regenerate", panels=4)
+    status, _headers, preview = mt.api(ui_env["srv"], "POST", "/api/preview", body=body)
+    assert status == 200 and preview["errors"] == []
+    argv = preview["argv"]
+    assert argv[argv.index("--panels") + 1] == "4" and "--force-story" in argv
+
+
+def test_spt27_the_regenerate_target_is_wired_in_the_static_ui():
+    static = os.path.join(WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    assert 'id="s-regen-panels"' in html and 'min="1"' in html and "Panels (target)" in html
+    assert html.index('id="s-regen-panels"') < html.index('id="s-regenerate"')
+    for text in ("#s-regen-panels", "with a target of ", "{panels: target, length: null}",
+                 "res.data.last_fields.panels"):
+        assert text in js, text

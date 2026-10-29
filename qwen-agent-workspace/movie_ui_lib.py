@@ -1221,6 +1221,40 @@ def resolved_panels(fields):
     return None
 
 
+# Soft panel count spec SPC14, D11: story_engine.PANELS_EXTRA and bin/ltx-story-manifest's
+# _PANEL_HEADER_RE (this module never loads a pipeline module, so both are repeated here and
+# pinned equal by a test).
+PANELS_EXTRA = 2
+STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$", re.MULTILINE)
+
+
+def plan_panels(sdir, mode):
+    """<sdir>/plan.json's "panels" when the file is a JSON object with schema ltx-movie.plan.v1,
+    "mode" equal to mode, an int "panels" of at least 1, and <sdir>/story.md has exactly that
+    many STORY_PANEL_RE headers; else None (SPC14)."""
+    plan = read_json(os.path.join(sdir, "plan.json"))
+    if not (isinstance(plan, dict) and plan.get("schema") == "ltx-movie.plan.v1"
+            and plan.get("mode") == mode and _is_int(plan.get("panels")) and plan["panels"] >= 1):
+        return None
+    try:
+        with open(os.path.join(sdir, "story.md"), "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    return plan["panels"] if len(STORY_PANEL_RE.findall(text)) == plan["panels"] else None
+
+
+def effective_panels(fields, sdir):
+    """The story's panel count for fields (SPC14): plan_panels(sdir, fields["mode"]) when it lies
+    in [resolved_panels(fields), resolved_panels(fields) + PANELS_EXTRA], else
+    resolved_panels(fields). sdir None means no story directory."""
+    target = resolved_panels(fields)
+    planned = plan_panels(sdir, fields.get("mode")) if sdir is not None else None
+    if target is not None and planned is not None and target <= planned <= target + PANELS_EXTRA:
+        return planned
+    return target
+
+
 def _argv_safe(value):
     """A str that can be an argv element: no NUL and encodable as UTF-8 (no lone surrogates)."""
     if not isinstance(value, str) or "\x00" in value:
@@ -1382,7 +1416,7 @@ def validate_fields(fields, ws_real, state):
         if not (isinstance(redo, list) and redo and all(_is_int(n) for n in redo)):
             errors.append("redo needs at least one panel number")
         else:
-            total = resolved_panels(fields)
+            total = effective_panels(fields, sdir)
             if total is not None:
                 for n in sorted(set(redo)):
                     if not 1 <= n <= total:
@@ -2129,7 +2163,8 @@ class ProgressParser(object):
                 count = sum(1 for n in os.listdir(images) if STILL_NAME_RE.fullmatch(n))
             except OSError:
                 count = 0
-            expected = resolved_panels(self.fields) if self.fields.get("mode") == "shots" else 1
+            expected = (effective_panels(self.fields, story_dir(job["workspace"], job["story_id"]))
+                        if self.fields.get("mode") == "shots" else 1)
             stills = {"expected": expected, "count": count}
         return {"phase": self.phase, "phase_title": self.phase_title, "rewrite": self.rewrite,
                 "phases": job_phases(self.kind, self.fields), "redo": self.redo,

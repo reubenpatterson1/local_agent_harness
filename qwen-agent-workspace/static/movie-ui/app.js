@@ -714,6 +714,10 @@
     }
     const shots = res.data.plan_mode === "shots" || (res.data.last_fields && res.data.last_fields.mode === "shots");
     show($("#s-redo-box"), Boolean(shots));
+    const regen = $("#s-regen-panels");
+    const lastPanels = res.data.last_fields ? res.data.last_fields.panels : null;
+    regen.value = lastPanels !== null && lastPanels !== undefined ? String(lastPanels) : "";
+    regen.placeholder = res.data.checks && res.data.checks.panels ? String(res.data.checks.panels) : "";
     $("#s-action-status").textContent = res.data.last_fields ? "" : "no earlier job for this story: Render opens Compose with only its ID";
   }
 
@@ -734,7 +738,8 @@
   function storyFields(action) {
     const st = S.story;
     if (st.last_fields) { return Object.assign({}, st.last_fields, {ws: S.ws, action: action}); }
-    const panels = st.checks && st.checks.panels ? st.checks.panels : (S.options ? S.options.defaults.panels : 15);
+    const saved = st.checks ? (st.checks.panels_target || st.checks.panels) : null;
+    const panels = saved ? saved : (S.options ? S.options.defaults.panels : 15);
     return {story_id: st.id, panels: panels, action: action};
   }
 
@@ -747,8 +752,13 @@
     });
     $("#s-regenerate").addEventListener("click", async function () {
       if (!S.story.last_fields) { $("#s-action-status").textContent = "compose this story once before regenerating it"; return; }
-      if (!(await askConfirm("Regenerate story.md of " + S.story.id + "? The current one is replaced."))) { return; }
-      const res = await submit(storyFields("regenerate"));
+      const target = numberOrNull("#s-regen-panels");
+      const question = target === null
+        ? "Regenerate story.md of " + S.story.id + "? The current one is replaced."
+        : "Regenerate story.md of " + S.story.id + " with a target of " + target + " panels? The current one is replaced.";
+      if (!(await askConfirm(question))) { return; }
+      const fields = storyFields("regenerate");
+      const res = await submit(target === null ? fields : Object.assign(fields, {panels: target, length: null}));
       $("#s-action-status").textContent = res.status === 201 ? "queued" : "refused; see Compose checks";
     });
     $("#s-redo").addEventListener("click", async function () {
