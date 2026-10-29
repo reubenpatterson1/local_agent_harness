@@ -345,3 +345,133 @@ def test_spt5_the_arc_rule():
                                        "and at least one beat is climax.")
     assert se._plan_arc_rule(4, 4) == se._arc_rule(4)
     assert se._plan_arc_rule(2, 2) == ARC_COUNT_CLAUSES[2] + "."
+
+
+# --- SPT1 (Task 2 part), SPT13: the P19 hints (SPC12 a; plan ruling SPR2) ---------------------
+
+P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
+            "left out, because that line is in the last beat and a speaking beat never shows its "
+            "speaker leave; %s")
+P19_ROOM_HINT = ("the planner could have added a beat for it (this movie may have up to %d), so "
+                 "rerun with --force-story, or rerun with --force-story --panels %d to keep it")
+P19_CAP_HINT = ("this movie already has the %d panels a target of %d allows, so rerun with "
+                "--force-story --panels %d to keep it")
+P19_ROOM_HINT_LENGTH = ("the planner could have added a beat for it (this movie may have up to "
+                        "%d), so rerun with --force-story, or rerun with --force-story --length "
+                        "%s (a target of %d panels) to keep it")
+P19_CAP_HINT_LENGTH = ("this movie already has the %d panels a target of %d allows, so rerun "
+                       "with --force-story --length %s (a target of %d panels) to keep it")
+
+
+def test_spt1b_p19_constants():
+    assert se.P19_NOTE == P19_NOTE
+    assert se.P19_ROOM_HINT == P19_ROOM_HINT
+    assert se.P19_CAP_HINT == P19_CAP_HINT
+    assert se.P19_ROOM_HINT_LENGTH == P19_ROOM_HINT_LENGTH
+    assert se.P19_CAP_HINT_LENGTH == P19_CAP_HINT_LENGTH
+    assert se.EXIT_SUBJECT_PRONOUNS == (["he"], ["she"], ["they"])
+    for hint in (P19_ROOM_HINT, P19_CAP_HINT):
+        assert "--force-story --panels %d" in hint
+    for hint in (P19_ROOM_HINT_LENGTH, P19_CAP_HINT_LENGTH):
+        assert "--force-story --length %s" in hint and "--panels" not in hint
+    assert "--panels" not in P19_NOTE
+
+
+def _p19_plan(ws, mode, target, lines, narrative=HOCKEY, **kw):
+    """(ctx, normalised plan) for --panels target and len(lines) beats: beat k says lines[k - 1],
+    spoken by the courier (c1) when it has lines."""
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=target, narrative=narrative,
+                       narration=kw.pop("narration", "speech"), **kw)
+    raw = seu.plan_json(mode, len(lines))
+    for beat, numbers in zip(raw["beats"], lines):
+        beat.update(lines=list(numbers), speaker="c1" if numbers else "")
+    plan, _shape = se.normalize_plan(ctx, raw)
+    return ctx, plan
+
+
+def test_spt13_the_p19_hints(ws):
+    skate = "'skates away'"
+    rows = (
+        ("chained", 2, [[1], [2]], [P19_NOTE % (skate, P19_ROOM_HINT % (4, 3))]),
+        ("chained", 1, [[1], [], [2]], [P19_NOTE % (skate, P19_CAP_HINT % (3, 1, 4))]),
+        ("chained", 2, [[1], [2], []], []),
+    )
+    for mode, target, lines, want in rows:
+        ctx, plan = _p19_plan(ws, mode, target, lines)
+        assert se.exit_left_out_notes(ctx, plan) == want, (target, lines)
+    # Every shot prompt format SFT24 row, its expected note rewritten to the SPC12 hint.
+    sft24 = (
+        ("chained", [[1], [2]], {}, [P19_NOTE % (skate, P19_ROOM_HINT % (4, 3))]),
+        ("chained", [[1, 2]], {}, [P19_NOTE % (skate, P19_ROOM_HINT % (3, 2))]),
+        ("shots", [[1], [2], []], {}, []),
+        ("shots", [[1], [], [2]], {}, [P19_NOTE % (skate, P19_ROOM_HINT % (5, 4))]),
+        ("chained", [[1], [2]], {"narration": False}, []),
+        ("chained", [[1], []], {}, []),
+        ("chained", [[1], [2]], {"narrative": LINES_NARRATIVE}, []),
+        ("shots", [[1], [], [2]], {"narrative": LINES_NARRATIVE}, []),
+    )
+    for mode, lines, kw, want in sft24:
+        ctx, plan = _p19_plan(ws, mode, len(lines), lines, **kw)
+        assert se.exit_left_out_notes(ctx, plan) == want, (mode, lines, kw)
+    violation = se.parse_violation(P19_NOTE % ("'x'", "y"))
+    assert (violation["id"], violation["name"], violation["scope"], violation["index"]) == (
+        "P19", "exit left out", "plan", None)
+
+
+def test_spr2b_the_p19_hint_names_length_when_length_sized_the_movie(ws):
+    clip = 145 / 24.0
+    ctx, plan = _p19_plan(ws, "chained", 2, [[1], [2]], length=12.0, clip_seconds=clip)
+    assert se.exit_left_out_notes(ctx, plan) == [
+        P19_NOTE % ("'skates away'", P19_ROOM_HINT_LENGTH % (4, "18.1", 3))]
+    ctx, plan = _p19_plan(ws, "chained", 2, [[1], [], [], [2]], length=12.0, clip_seconds=clip)
+    notes = se.exit_left_out_notes(ctx, plan)
+    assert notes == [P19_NOTE % ("'skates away'", P19_CAP_HINT_LENGTH % (4, 2, "30.2", 5))]
+    assert "--panels" not in notes[0]
+    assert (round(18.1 / clip), round(30.2 / clip)) == (3, 5)
+
+
+# --- Plan ruling SPR1: the exit counts only when its subject is the last line's speaker -------
+
+KYRA_RONIN_CAST = [
+    {"id": "c1", "phrase": "the woman in grey", "descriptor": "a woman", "cast_name": "Kyra"},
+    {"id": "c2", "phrase": "the ronin", "descriptor": "a man", "cast_name": "ronin"}]
+
+
+def test_spr1a_the_exit_subject_rule():
+    rows = (
+        (HOCKEY, (), "skates away"),
+        (LINES_NARRATIVE, (), None),
+        ('Kyra says, "Go." She walks off.', (), "walks off"),
+        ('Kyra walks off. Kyra says, "Go."', (), None),
+        ('Kyra says, "Go," and the ronin leaves the frame.', (), None),
+        ('Kyra says, "Go." Later the crowd says, "Yes." Kyra turns away.', (), "turns away"),
+        ('A sign reads "Closed". Kyra walks away.', (), None),
+        ('Kyra says, "Go." She pushes off from the kerb.', (), None),
+        ('Kyra says, “Go.” She skates away.', (), "skates away"),
+        ('The skater says "Go." The crowd drifts away.', (), None),
+        ('The skater says "Go." The puck moves off the ice.', (), None),
+        ('The skater says "Go." The crowd drifts away, and she skates off.', (), "skates off"),
+        ('The skater says "Go." Then the skater slowly skates away.', (), "skates away"),
+        ('Holly says "Go." Then Molly walks off.', (), None),
+        ('Holly says "Go." Then Holly walks off.', (), "walks off"),
+        ('Kyra says, "Go," and walks off.', (), "walks off"),
+        ('"Go," Kyra says, and she slowly walks off.', (), "walks off"),
+        ('Kyra says, "Go." Her ronin walks off.', (), None),
+        ('Near the top Kyra turns and says, "Go." Kyra walks off.', (), None),
+        ('Near the top Kyra turns and says, "Go." Kyra walks off.', KYRA_RONIN_CAST, "walks off"),
+        ('Kyra says, "Go." The woman in grey walks off.', KYRA_RONIN_CAST, "walks off"),
+        ('Kyra says, "Go." The ronin walks off.', KYRA_RONIN_CAST, None),
+    )
+    for narrative, cast, want in rows:
+        assert se.narrative_exit_after_last_line(narrative, cast) == want, (narrative, cast)
+    assert se.narrative_exit_after_last_line(HOCKEY) == "skates away"
+
+
+def test_spr1b_p19_ignores_an_exit_by_anyone_else(ws):
+    for narrative, want in (
+            ('The skater says "Go." The puck moves off the ice.', []),
+            ('The skater says "Go." The crowd drifts away.', []),
+            ('The skater says "Go." The crowd drifts away, and she skates off.',
+             [P19_NOTE % ("'skates off'", P19_ROOM_HINT % (3, 2))])):
+        ctx, plan = _p19_plan(ws, "chained", 1, [[1]], narrative=narrative)
+        assert se.exit_left_out_notes(ctx, plan) == want, narrative

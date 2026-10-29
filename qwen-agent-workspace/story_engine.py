@@ -1747,38 +1747,97 @@ EXIT_RE = re.compile(
 
 
 # Shot prompt format spec amendment SF-A1: the narrative's exit after its last spoken line is
-# left out when that line is in the last beat.
+# left out when that line is in the last beat; soft panel count spec SPC12.
 P19_NOTE = ("plan: P19 exit left out: the narrative's exit after its last spoken line (%s) was "
             "left out, because that line is in the last beat and a speaking beat never shows its "
-            "speaker leave; rerun with --force-story --panels %d to keep it")
+            "speaker leave; %s")
+P19_ROOM_HINT = ("the planner could have added a beat for it (this movie may have up to %d), so "
+                 "rerun with --force-story, or rerun with --force-story --panels %d to keep it")
+P19_CAP_HINT = ("this movie already has the %d panels a target of %d allows, so rerun with "
+                "--force-story --panels %d to keep it")
+# Plan ruling SPR2: the same hints when --length sized the movie; the panel count is information.
+P19_ROOM_HINT_LENGTH = ("the planner could have added a beat for it (this movie may have up to "
+                        "%d), so rerun with --force-story, or rerun with --force-story --length "
+                        "%s (a target of %d panels) to keep it")
+P19_CAP_HINT_LENGTH = ("this movie already has the %d panels a target of %d allows, so rerun "
+                       "with --force-story --length %s (a target of %d panels) to keep it")
+# Plan ruling SPR1: an exit after the last spoken line counts only when its subject is that
+# line's speaker.
+EXIT_SUBJECT_PRONOUNS = (["he"], ["she"], ["they"])
 
 
-def narrative_exit_after_last_line(narrative):
+def _plain_words(text):
+    """line_words of text without its adverbs: the words that end in "ly" and begin with a
+    lower-case letter (plan ruling SPR1)."""
+    return [w.lower() for w in _LINE_WORD_RE.findall(text.replace("’", "'").replace("‘", "'"))
+            if not (w.endswith("ly") and w[:1].islower())]
+
+
+def _clause_tail(text):
+    """The _plain_words of text's last _CLAUSE_BREAK_RE piece after that piece's last
+    CLAUSE_STOP_WORDS word (plan ruling SPR1)."""
+    words = _plain_words(_CLAUSE_BREAK_RE.split(text)[-1])
+    stops = [j for j, w in enumerate(words) if w in CLAUSE_STOP_WORDS]
+    return words[stops[-1] + 1:] if stops else words
+
+
+def _bare(words):
+    """words without one leading "the", "a" or "an" (plan ruling SPR1)."""
+    return words[1:] if words[:1] in (["the"], ["a"], ["an"]) else words
+
+
+def narrative_exit_after_last_line(narrative, cast=()):
     """The EXIT_RE words (lower case, whitespace collapsed) of the first exit in the narrative
-    text after the closing quote of its last spoken line, or None (SF-A1). The quotes are paired
-    as in line_speakers: curly quotes count as straight ones, and classify_quotes decides which
-    quote is spoken."""
+    text after the closing quote of its last spoken line whose subject is that line's speaker,
+    or None (SF-A1; plan ruling SPR1). The quotes are paired as in line_speakers: curly quotes
+    count as straight ones, and classify_quotes decides which quote is spoken. An exit's subject
+    is the _clause_tail of the text from that closing quote to the exit. It is the speaker's when
+    it is empty (the line's own sentence goes on), is he, she or they, or equals, without a
+    leading article, a name of the speaker: the words before the speech verb in the _clause_tail
+    of the text that leads up to the line, or a phrase or library name of the entry of cast (plan
+    cast entries) that line_speakers gives the line."""
     text = narrative.replace("“", '"').replace("”", '"')
-    spoken = [match for match, (inner, said) in zip(QUOTE_RE.finditer(text),
-                                                    classify_quotes(narrative))
+    matches = list(QUOTE_RE.finditer(text))
+    spoken = [i for i, (match, (inner, said)) in enumerate(zip(matches,
+                                                               classify_quotes(narrative)))
               if said and line_words(inner)]
     if not spoken:
         return None
-    found = EXIT_RE.search(text[spoken[-1].end():])
-    return " ".join(found.group(0).lower().split()) if found else None
+    i = spoken[-1]
+    lead = _clause_tail(text[matches[i - 1].end() if i else 0:matches[i].start()]
+                        .rstrip(_QUOTE_EDGE_CHARS))
+    verbs = [p for p in range(len(lead)) if _speech_verb_at(lead, p)]
+    names = [_bare(lead[:verbs[0]])] if verbs and _bare(lead[:verbs[0]]) else []
+    who = line_speakers(narrative, list(cast))[-1] if cast else None
+    names += [_bare(words) for cid, words in _mentions(list(cast)) if who and cid == who]
+    tail = text[matches[i].end():]
+    for found in EXIT_RE.finditer(tail):
+        subject = _clause_tail(tail[:found.start()])
+        if not subject or subject in EXIT_SUBJECT_PRONOUNS or _bare(subject) in names:
+            return " ".join(found.group(0).lower().split())
+    return None
 
 
 def exit_left_out_notes(ctx, plan):
     """[P19_NOTE] when the narrative has an exit after its last spoken line and the beat that
-    says that line is the last beat, else [] (SF-A1)."""
+    says that line is the last beat, else [] (SF-A1); the hint says whether the movie had room
+    for one more beat, and always names --force-story (soft panel count spec SPC12), and it names
+    --length instead of --panels when --length sized the movie (plan ruling SPR2)."""
     lines = plan.get("spoken_lines") or []
     if ctx.narration is False or not lines:
         return []
-    found = narrative_exit_after_last_line(ctx.narrative)
+    found = narrative_exit_after_last_line(ctx.narrative, plan["cast"])
     last = plan["beats"][-1] if plan["beats"] else None
     if found is None or last is None or len(lines) not in last.get("lines", []):
         return []
-    return [P19_NOTE % (_q(found), ctx.panels + 1)]
+    n, most = len(plan["beats"]), most_panels(ctx)
+    hint = (P19_ROOM_HINT % (most, n + 1) if n < most
+            else P19_CAP_HINT % (most, target_panels(ctx), n + 1))
+    if ctx.length is not None:
+        hint = (P19_ROOM_HINT_LENGTH % (most, length_for(ctx, n + 1), n + 1) if n < most
+                else P19_CAP_HINT_LENGTH % (most, target_panels(ctx), length_for(ctx, n + 1),
+                                            n + 1))
+    return [P19_NOTE % (_q(found), hint)]
 
 
 def post_line_sentences(lib, text, phrases):
