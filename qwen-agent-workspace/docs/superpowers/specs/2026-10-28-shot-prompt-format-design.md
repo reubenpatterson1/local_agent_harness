@@ -1770,3 +1770,10 @@ It is advisory: never hard, never retried, never blocking.
 **Tests:** SFT23-SFT25 (Section 4.1). **Re-baseline code:** R17 (Section 4.2). **Live check:** K8 (Section 5.3).
 
 **SF-A1 erratum (coordinator, 2026-10-29).** The P19 hint reads "rerun with --force-story --panels %d to keep it". Without `--force-story`, a rerun with a different `--panels` re-checks the saved story and exits 1 ("expected exactly n panels"), so the hint must name both flags. Found by the soft-panel-count design review.
+
+**Final-review errata (coordinator, 2026-10-29; implemented in 42f3364).** The whole-branch review found four integration defects; the shipped code departs from the spec text as follows.
+- **FW-I1 (D12/SK10).** `_recheck_writers` blanks the 3970e96 pieces of a chained k >= 2 panel (the facing sentence and, on a speaking panel, the old `speaking_camera` sentence), not SF6's new `pasted_pieces`, so an old chained story re-checks with the same rc, hard list and unresolved list as before.
+- **FW-I2 (D5/SK5).** `camera_directions` also counts a sentence that matches `CAMERA_CLAUSE_RE` ("The camera glides closer — ..."), so a paraphrased camera move is an N20 direction and is repaired, not shipped beside the fallback.
+- **FW-I3.** `merge_repair`'s T2/T3 branch takes the new reply's `repairs` (or none), like the format branch.
+- **FW-I4 (SF10/SK7).** `EXIT_RE` no longer matches "<verb> off his/her/their/its ..." (run-off over a body part or garment, e.g. "rain running off his hood").
+Old-story re-check: rc and the hard list are unchanged; advisories can differ (the 55-105 N1 band on chained recheck and plan_free_report).
