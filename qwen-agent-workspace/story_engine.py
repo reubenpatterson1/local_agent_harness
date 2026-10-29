@@ -93,18 +93,43 @@ SCORE_KEYS = ("continuity", "story", "renderability")
 StoryContext = collections.namedtuple("StoryContext", [
     "ws", "story_id", "story_dir", "mode", "panels", "seconds", "narrative", "goal", "members",
     "seed_image", "seed_agent_image", "story_model", "context_window", "video_model",
-    "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration", "clip_seconds"],
-    defaults=(True, None))
+    "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration", "clip_seconds",
+    "panels_target", "length"],
+    defaults=(True, None, None, None))
 # narration True: Narration: is voice-over or a character's spoken line. "speech"
 # (bin/ltx-movie --speech-only): Narration: is optional and, when present, a character's spoken
 # line. False (--no-narration): panels have no Narration: field and no narration check runs.
 # clip_seconds: the exact clip length (frames / fps) the timing rules use; None means
 # float(seconds) (docs/superpowers/specs/2026-10-24-on-camera-dialogue-design.md 2.4).
+# Soft panel count spec SPC1, D1: panels is the movie's panel count -- the --panels target until
+# the plan is accepted, the plan's beat count after; panels_target is --panels (None: panels).
+# Plan ruling SPR2: length is bin/ltx-movie's --length in seconds when --length sized the movie
+# (None otherwise); the panel-count hints then name --length, never --panels.
 
 
 def engine_seconds(ctx):
     """The clip length in seconds that the timing rules use (dialogue spec 2.4)."""
     return ctx.clip_seconds if ctx.clip_seconds is not None else float(ctx.seconds)
+
+
+# Soft panel count spec SPC1, D2: the planner may add up to PANELS_EXTRA beats to the target.
+PANELS_EXTRA = 2
+
+
+def target_panels(ctx):
+    """The --panels target (soft panel count spec SPC1)."""
+    return ctx.panels if ctx.panels_target is None else ctx.panels_target
+
+
+def most_panels(ctx):
+    """The most beats a plan may have: the target plus PANELS_EXTRA (SPC1)."""
+    return target_panels(ctx) + PANELS_EXTRA
+
+
+def length_for(ctx, panels):
+    """The --length, in seconds to one decimal, that bin/ltx-movie resolves to a target of
+    `panels` clips of this movie's clip length (plan ruling SPR2)."""
+    return "%.1f" % (panels * engine_seconds(ctx))
 
 # Injectable seams (tests replace them with monkeypatch.setattr).
 _now = time.monotonic
@@ -314,9 +339,9 @@ PLAN_PROMPT_TEMPLATE = (
     "props: a list with one object per object that matters to the story, with the keys id and "
     "name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list "
     "when no object matters.\n"
-    "beats: a list of EXACTLY @@PANELS@@ objects, one per panel in order, with the keys index, "
-    "arc, action, shot, camera, location, @@BEAT_KEYS@@. index runs from 1 to @@PANELS@@. arc "
-    "is one of "
+    "beats: a list of @@BEAT_COUNT@@ objects, one per panel in order, with the keys index, "
+    "arc, action, shot, camera, location, @@BEAT_KEYS@@. index runs from 1 to the number of "
+    "beats.@@PANEL_COUNT_RULE@@ arc is one of "
     "introduction, rising, climax, falling, resolution, in story order; @@ARC_RULE@@ action is "
     "one sentence of 6 to 40 words saying what the characters physically do during these "
     "@@SECONDS@@ seconds: one continuous physical action that a camera can film, not a sequence "
@@ -366,7 +391,8 @@ SPEAKING_BEAT_SENTENCE = (" Write a speaking beat's action as what the speaker p
                           "never as speaking, and end it with the speaker still in frame: nobody "
                           "else acts after the line, and when the narrative has the speaker "
                           "leave, or another character act, after a line, give that a later beat "
-                          "with no speaker, or leave it out when no later beat is left.")
+                          "with no speaker, adding that beat when the beat count allows it, and "
+                          "leave it out only when it does not.")
 SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
@@ -391,23 +417,42 @@ SPEAKER_RULE_KEEP_CAST = (
     "character who is still in frame and stays silent, and no character of your own. The speaker "
     "may move during the beat, as long as their face stays in frame and lit while they speak."
     + SPEAKING_BEAT_SENTENCE)
-# Narrative dialogue fidelity spec 7.1 (e): only when the narrative quotes spoken lines.
+# Narrative dialogue fidelity spec 7.1 (e): only when the narrative quotes spoken lines; soft
+# panel count spec SPC2.
 LINES_RULE = (" lines is the list of the numbers of the spoken lines above that the speaker says "
               "aloud during the beat, in order, or an empty list. Every spoken line belongs to "
               "exactly one beat, in the narrative's order: give each line to the beat whose action "
               "surrounds it in the narrative, and give a speaker to every beat with lines and to no "
-              "other beat. A beat may hold two or more consecutive lines only when together they "
-              "are at most @@LINE_WORDS@@ words. Give each line its own beat whenever there are at "
-              "least as many beats as lines.")
+              "other beat. A beat may hold two or more consecutive lines only when one character "
+              "says them all and together they are at most @@LINE_WORDS@@ words. Give each line its "
+              "own beat whenever there are at least as many target beats (@@MIN_BEATS@@) as lines; "
+              "never add a beat only to separate lines that fit together.")
 # Pinned cast presence spec PC6, D3: where a speaking beat shows only the speaker, a declared
-# character with no line needs a beat without a speaker.
+# character with no line needs a beat without a speaker; soft panel count spec SPC2.
 LINES_PINNED_SENTENCE = (" A beat with a speaker shows only the speaker, so every already-cast "
                          "character who says none of the lines still needs a beat with no "
-                         "speaker, even when two consecutive lines must then share a beat.")
+                         "speaker: add a beat for it when the beat count allows it, else let two "
+                         "consecutive lines share one.")
 # Speaker attribution spec SA6, D5: the lines the narrative gives to already-cast characters.
 LINE_SPEAKERS_SENTENCE = (" The narrative gives these lines to already-cast characters: %s. The "
                           "beat that holds one of these lines has that character as its speaker, "
                           "and no other character says it.")
+# Soft panel count spec SPC2, D3: the beat count is a target the planner may exceed by up to
+# PANELS_EXTRA, like a word range.
+PANEL_COUNT_RULE = (" This movie's target length is %d beats%s, and like a word range it is "
+                    "soft: use %d beats when the narrative fits them, and add a beat, up to %d "
+                    "beats in all, only for something the narrative needs that no other beat can "
+                    "hold.")
+PANEL_COUNT_MIN_CLAUSE = ", but its spoken lines need at least %d"
+PANEL_COUNT_LINES_SENTENCE = (" A spoken line that cannot share a beat with the line beside it "
+                              "gets a beat of its own.")
+# Soft panel count spec SPC5: the arc rule for each beat count the range allows.
+ARC_COUNT_CLAUSES = {
+    1: "with 1 beat, use climax",
+    2: "with 2 beats, the first beat is introduction and the last is resolution",
+    3: ("with 3 or more beats, the first beat is introduction, the last is resolution, and at "
+        "least one beat is climax"),
+}
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
 LORA_PICK_PARAGRAPH = (
@@ -752,9 +797,50 @@ def panels_needed(lib, seconds, lines):
     return needed
 
 
+def speaker_runs(lines, speakers):
+    """The spoken lines split into the runs one beat could hold by speaker (soft panel count spec
+    SPC1, D2): a line starts a new run when its speaker is known and differs from a known speaker
+    earlier in the current run; a line with no known speaker (None) joins the current run."""
+    runs, current, who = [], [], None
+    for line, cid in zip(lines, speakers):
+        if current and cid is not None and who is not None and cid != who:
+            runs.append(current)
+            current, who = [], None
+        current.append(line)
+        if cid is not None:
+            who = cid
+    if current:
+        runs.append(current)
+    return runs
+
+
+def lines_needed(lib, seconds, lines, speakers):
+    """The fewest panels that speak lines in order with one speaker each (SPC1): panels_needed
+    summed over speaker_runs."""
+    return sum(panels_needed(lib, seconds, run) for run in speaker_runs(lines, speakers))
+
+
+def declared_speakers(ctx):
+    """line_speakers of the narrative against the declared members, as c1, c2, ... in
+    --character order (the mapping build_plan_prompt gives the planner); one None per line when
+    nothing is declared (SPC1)."""
+    fixed = [{"id": "c%d" % i, "phrase": m.phrase, "cast_name": m.name}
+             for i, m in enumerate(ctx.members, start=1)]
+    return line_speakers(ctx.narrative, fixed)
+
+
+# Plan ruling SPR2: the pre-flight's count hint when --length sized the movie.
+LINES_LENGTH_PROBLEM = (
+    "the narrative quotes %d spoken lines, which need at least %d panels of %s seconds (one panel "
+    "has one speaker and speaks at most %d words), but this movie has at most %d (--length %s "
+    "sets a target of %d, plus up to %d more); rerun with --force-story --length %s or more (a "
+    "target of %d panels), or with longer clips (a larger --frames)")
+
+
 def spoken_lines_problem(ctx):
     """Why the narrative's spoken lines cannot be spoken in this movie, or None (QL5): a line no
-    clip fits, a line this clip length does not fit, or more lines than the panels can hold."""
+    clip fits, a line this clip length does not fit, or more lines than the target plus
+    PANELS_EXTRA panels can hold, one speaker per panel (soft panel count spec SPC3)."""
     lines = required_lines(ctx)
     if not lines:
         return None
@@ -775,14 +861,32 @@ def spoken_lines_problem(ctx):
                     "fits at most %d words in %s; use longer clips (a larger --frames) or split it "
                     "into shorter quoted lines in the narrative"
                     % (i, line, words, _n_sentences(n), ctx.seconds, cap, _n_sentences(n)))
-    needed = panels_needed(lib, secs, lines)
-    if needed > ctx.panels:
+    needed = lines_needed(lib, secs, lines, declared_speakers(ctx))
+    most = most_panels(ctx)
+    if needed > most and ctx.length is not None:
+        return (LINES_LENGTH_PROBLEM
+                % (len(lines), needed, ctx.seconds, lib.dialogue_word_cap(secs, 1), most,
+                   "%.1f" % ctx.length, target_panels(ctx), PANELS_EXTRA,
+                   length_for(ctx, needed - PANELS_EXTRA), needed - PANELS_EXTRA))
+    if needed > most:
         return ("the narrative quotes %d spoken lines, which need at least %d panels of %s seconds "
-                "(one panel speaks at most %d words), but this movie has %d; use --panels %d or "
-                "more, or longer clips (a larger --frames)"
-                % (len(lines), needed, ctx.seconds, lib.dialogue_word_cap(secs, 1), ctx.panels,
-                   needed))
+                "(one panel has one speaker and speaks at most %d words), but this movie has at "
+                "most %d (--panels %d plus up to %d more); rerun with --force-story --panels %d "
+                "or more, or with longer clips (a larger --frames)"
+                % (len(lines), needed, ctx.seconds, lib.dialogue_word_cap(secs, 1), most,
+                   target_panels(ctx), PANELS_EXTRA, needed - PANELS_EXTRA))
     return None
+
+
+def panel_range(ctx):
+    """(fewest, most) beats a plan may have (soft panel count spec SPC1, D2): the target, or the
+    panels the narrative's spoken lines need with one speaker each when that is more; and the
+    target plus PANELS_EXTRA. character_lib is loaded only when the narrative quotes spoken
+    lines."""
+    lines = required_lines(ctx)
+    needed = (lines_needed(_character_lib(ctx.ws), engine_seconds(ctx), lines,
+                           declared_speakers(ctx)) if lines else 0)
+    return max(target_panels(ctx), needed), most_panels(ctx)
 
 
 def catalog_line(entry):
@@ -816,6 +920,14 @@ def _arc_rule(n):
     if n == 2:
         return "the first beat is introduction and the last is resolution."
     return "use climax."
+
+
+def _plan_arc_rule(lo, hi):
+    """The plan prompt's arc rule for a movie of lo to hi beats (soft panel count spec SPC5):
+    _arc_rule(lo) from 3 beats up, else one ARC_COUNT_CLAUSES clause per count from lo up to 3."""
+    if lo >= 3:
+        return _arc_rule(lo)
+    return "; ".join(ARC_COUNT_CLAUSES[k] for k in range(lo, min(hi, 3) + 1)) + "."
 
 
 def library_identities(ws):
@@ -940,8 +1052,11 @@ CAST_FIXED_LINE = '\n- id c%d, name "%s", phrase "%s", descriptor "%s"'
 
 def build_plan_prompt(ctx, compatible, pins):
     """The exact plan prompt of RS7 (narrative dialogue fidelity spec QL6: the spoken-lines block
-    after the narrative, the lines key and LINES_RULE when the narrative quotes spoken lines)."""
+    after the narrative, the lines key and LINES_RULE when the narrative quotes spoken lines).
+    Soft panel count spec SPC4: the beat count is lo to hi of panel_range; @@MIN_BEATS@@ is lo."""
     lines = required_lines(ctx)
+    lo, hi = panel_range(ctx)
+    target = target_panels(ctx)
     undeclared = undeclared_characters(ctx)
     cast_fixed = ""
     if undeclared:
@@ -963,10 +1078,8 @@ def build_plan_prompt(ctx, compatible, pins):
         lora += "\n".join(catalog_line(e) for e in compatible) + _pins_block(pins)
     said = ""
     if lines and ctx.members:
-        fixed = [{"id": "c%d" % i, "phrase": m.phrase, "cast_name": m.name}
-                 for i, m in enumerate(ctx.members, start=1)]
         items = ["line %d to %s" % (n, cid) for n, cid
-                 in enumerate(line_speakers(ctx.narrative, fixed), start=1) if cid]
+                 in enumerate(declared_speakers(ctx), start=1) if cid]
         if items:
             said = LINE_SPEAKERS_SENTENCE % (items[0] if len(items) == 1 else
                                              ", ".join(items[:-1]) + " and " + items[-1])
@@ -979,7 +1092,12 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[ctx.mode]),
         ("@@SEED_PARAGRAPH@@", seed),
         ("@@CAST_FIXED@@", cast_fixed),
-        ("@@ARC_RULE@@", _arc_rule(ctx.panels)),
+        ("@@ARC_RULE@@", _plan_arc_rule(lo, hi)),
+        ("@@BEAT_COUNT@@", "EXACTLY %d" % lo if lo == hi else "%d to %d" % (lo, hi)),
+        ("@@PANEL_COUNT_RULE@@", "" if lo >= hi else (
+            PANEL_COUNT_RULE % (target, PANEL_COUNT_MIN_CLAUSE % lo if lo > target else "", lo,
+                                hi)
+            + (PANEL_COUNT_LINES_SENTENCE if lines else ""))),
         ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
          + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
         ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
@@ -999,9 +1117,9 @@ def build_plan_prompt(ctx, compatible, pins):
     # never loads it (test_rst47, test_s53).
     line_cap = (str(_character_lib(ctx.ws).dialogue_word_cap(engine_seconds(ctx), 2))
                 if lines else "")
-    scalars = [("@@STORY_ID@@", ctx.story_id), ("@@PANELS@@", str(ctx.panels)),
+    scalars = [("@@STORY_ID@@", ctx.story_id), ("@@MIN_BEATS@@", str(lo)),
                ("@@SECONDS@@", ctx.seconds), ("@@MAX_CAST@@", str(MAX_CAST[ctx.mode])),
-               ("@@LINE_WORDS@@", line_cap), ("@@MAX_STATIC@@", str(max_static(ctx.panels)))]
+               ("@@LINE_WORDS@@", line_cap), ("@@MAX_STATIC@@", str(max_static(target)))]
     return _fill(PLAN_PROMPT_TEMPLATE, fragments, scalars,
                  ctx.narrative + spoken_lines_block(lines))
 
