@@ -757,7 +757,7 @@ SPEECH_DELIVERIES = ("beats", "plain", "beats-no-acoustic")
 DEFAULT_SPEECH_DELIVERY = "beats"
 SPEECH_BEATS = ("After a breath", "After a short pause")   # before fragment 2, before fragment 3
 ACOUSTIC_SENTENCE = ("The audio is clear close-mic dialogue with a subtle natural room tone; "
-                     "the dialogue takes priority over the quiet ambience.")
+                     "the dialogue takes priority over the quiet ambience, and there is no music.")
 NO_KNOWN_PHRASES = "none (no --cast, no ## Characters section and no plan.json cast)"
 
 
@@ -839,6 +839,50 @@ def speech_text(phrase, line, delivery=DEFAULT_SPEECH_DELIVERY):
     for i in range(1, len(fragments)):
         text += " " + SPEECH_BEATS[i - 1] + ', "' + fragments[i] + '"'
     return text if delivery == "beats-no-acoustic" else text + " " + ACOUSTIC_SENTENCE
+
+
+# Shot prompt format spec SF15, D6: a speech movie's chained or shots video prompt, in the fixed
+# order framing, first action, facing, line, other actions, camera, audio.
+AMBIENCE_SENTENCE = "The audio is the natural ambient sound of the place, with no music."
+SHOT_SENTENCE_RE = re.compile(r"The shot is an? (?:extreme wide shot|wide shot|medium shot|"
+                              r"medium close-up|close-up|extreme close-up)\.")
+
+
+def framing_sentence(image):
+    """The last robust-engine shot sentence ("The shot is a medium shot.") in an Image: text, or
+    "" (SF15)."""
+    found = SHOT_SENTENCE_RE.findall(image or "")
+    return found[-1] if found else ""
+
+
+def compose_motion(text, speech="", phrases=(), audio="", framing=""):
+    """text's sentences in the SF15 order: framing (unless text already has that shot
+    sentence), text's shot sentences, its first action sentence, its pasted facing sentences
+    (is_facing_sentence with phrases), speech, its other action sentences, its camera sentences
+    (_is_camera_sentence with phrases), audio. Empty pieces are left out."""
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split((text or "").strip()) if s.strip()]
+    shot = [s for s in sentences if SHOT_SENTENCE_RE.fullmatch(s)]
+    facing = [s for s in sentences if s not in shot and is_facing_sentence(s, phrases)]
+    camera = [s for s in sentences if s not in shot and s not in facing
+              and _is_camera_sentence(s, phrases)]
+    actions = [s for s in sentences if s not in shot and s not in facing and s not in camera]
+    lead = [framing] if framing and framing not in shot else []
+    return " ".join(lead + shot + actions[:1] + facing + ([speech] if speech else [])
+                    + actions[1:] + camera + ([audio] if audio else []))
+
+
+def panel_prompt(motion, framing="", speaker=None, line="", delivery=DEFAULT_SPEECH_DELIVERY,
+                 phrases=()):
+    """The final video prompt of one chained or shots panel of a speech movie (SF15): on a
+    speaking panel (speaker set) compose_motion with speech_text's words (no acoustic sentence)
+    and [speaker] as the phrases; with beats delivery the last sentence is ACOUSTIC_SENTENCE on
+    a speaking panel and AMBIENCE_SENTENCE on a silent one; plain and beats-no-acoustic add no
+    audio sentence."""
+    speaks = speaker is not None
+    said = (speech_text(speaker, line, "beats-no-acoustic" if delivery == "beats" else delivery)
+            if speaks else "")
+    audio = "" if delivery != "beats" else ACOUSTIC_SENTENCE if speaks else AMBIENCE_SENTENCE
+    return compose_motion(motion, said, [speaker] if speaks else phrases, audio, framing)
 
 
 def panel_strengths(names, members, character_strength, shots=False):

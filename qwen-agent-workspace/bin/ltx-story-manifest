@@ -182,9 +182,9 @@ def build_parser():
                          choices=["beats", "plain", "beats-no-acoustic"], default="beats",
                          help="how a Dialogue: line (or a spoken Narration: line) is written into "
                               "motion_prompt: beats (default) splits it at sentence ends with "
-                              "short fixed beats and adds a fixed close-mic audio sentence; "
-                              "beats-no-acoustic omits that sentence; plain is '<Speaker> says: "
-                              "\"<line>\"'")
+                              "short fixed beats and ends the prompt with a fixed audio "
+                              "sentence; beats-no-acoustic omits that sentence; plain is "
+                              "'<Speaker> says: \"<line>\"'")
     return parser
 
 
@@ -697,6 +697,12 @@ def main(argv=None):
     if spoken is None:
         return 2
 
+    # Shot prompt format spec SF16, D6: a speech movie's chained or shots prompts use the fixed
+    # order; a movie with no spoken panel composes exactly as before.
+    speech_movie = any(s[0] is not None for s in spoken)
+    order_phrases = (_known_phrases(args, members)
+                     if speech_movie and (args.chain or args.shots) else [])
+
     n_panels = len(prompt_texts) if (args.no_images or args.chain) else len(matched)
 
     # --- frame allocation: either an explicit --frames override, or
@@ -825,11 +831,20 @@ def main(argv=None):
                 narration = ""
         num_frames = frame_counts[i - 1]
         speaker, speech, source = spoken[i - 1] if i <= len(spoken) else (None, narration, None)
-        if speaker is not None and motion_prompt is not None:
+        if motion_prompt is not None and speech_movie and (args.chain or args.shots):
             lib_ = _character_lib()
+            framing = lib_.framing_sentence(pt["image"]) if (args.shots or i == 1) else ""
+            motion_prompt = lib_.panel_prompt(motion_prompt, framing, speaker, speech,
+                                              args.speech_delivery, order_phrases)
+        elif speaker is not None and motion_prompt is not None:
+            lib_ = _character_lib()
+            beats = args.speech_delivery == "beats"
             motion_prompt = lib_.insert_speech(
-                motion_prompt, lib_.speech_text(speaker, speech, args.speech_delivery), [speaker],
+                motion_prompt, lib_.speech_text(speaker, speech, "beats-no-acoustic" if beats
+                                                else args.speech_delivery), [speaker],
                 first_action=bool(args.chain or args.shots))
+            if beats:
+                motion_prompt += " " + lib_.ACOUSTIC_SENTENCE
         panel = {
             "index": i,
             "image_path": None if image_path is None else os.path.abspath(image_path),

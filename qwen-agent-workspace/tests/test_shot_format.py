@@ -1316,3 +1316,137 @@ def test_sft25_p19_end_to_end(ws, tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert [a for a in advisories if "P19" in a] == []
     assert [m for m in _messages(ctx, "advisory") if "P19" in m] == []
+
+
+# --- SFT1 (Task 6 part): the audio sentences (SF15a, SF15b) -------------------------------------
+
+ACOUSTIC_SENTENCE = ("The audio is clear close-mic dialogue with a subtle natural room tone; "
+                     "the dialogue takes priority over the quiet ambience, and there is no music.")
+AMBIENCE_SENTENCE = "The audio is the natural ambient sound of the place, with no music."
+
+
+def test_sft1e_audio_constants():
+    assert lib.ACOUSTIC_SENTENCE == ACOUSTIC_SENTENCE
+    assert lib.AMBIENCE_SENTENCE == AMBIENCE_SENTENCE
+    assert se.FORMAT_REFERENCE.count(ACOUSTIC_SENTENCE) == 1
+    assert se.FORMAT_REFERENCE.count(AMBIENCE_SENTENCE) == 2
+
+
+# --- SFT13: the composition and the reference's self-consistency (SF15, SF8, SK6) ---------------
+
+def test_sft13_the_composition_and_the_reference(ws):
+    shots = ref_shots()
+    assert len(shots) == 3
+    for part, shot in zip(REF_PARTS, shots):
+        assert lib.panel_prompt(part["motion"], part["shot"], part["speaker"], part["line"],
+                                "beats", [REF_PHRASE]) == shot
+    for part, key in zip(REF_PARTS, ("tracking", "slow push-in", "static")):
+        assert se.camera_problem(lib, part["motion"], [REF_PHRASE], key) is None, key
+    post = se.post_line_sentences(lib, REF_PARTS[1]["motion"], [REF_PHRASE])
+    assert post == ["The old fishmonger lets the folded cloth drop onto the counter, her "
+                    "shoulders sinking."]
+    assert se._other_actor(post[0], [], se._mentions([{"id": "c1", "phrase": REF_PHRASE}])) is None
+    assert lib.compose_motion("The camera tracks alongside the movement. A runs.", "S", ["x"]) == (
+        "A runs. S The camera tracks alongside the movement.")
+    assert lib.compose_motion("A. X faces the camera. B. The camera tracks alongside the movement.",
+                              "S", ["x"]) == (
+        "A. X faces the camera. S B. The camera tracks alongside the movement.")
+    assert lib.compose_motion("X faces the camera. The camera tracks alongside the movement.", "S",
+                              ["x"], "AUDIO.", "The shot is a close-up.") == (
+        "The shot is a close-up. X faces the camera. S The camera tracks alongside the movement. "
+        "AUDIO.")
+    assert lib.compose_motion("The shot is a close-up. A runs.", "", ["x"], "",
+                              "The shot is a close-up.") == "The shot is a close-up. A runs."
+    assert lib.framing_sentence("The courier waits. The shot is a wide shot. The shot is a "
+                                "close-up.") == "The shot is a close-up."
+    assert lib.framing_sentence("The courier waits.") == ""
+    assert lib.panel_prompt("A runs.", "", "x", "Go.", "plain") == 'A runs. X says: "Go."'
+    assert lib.panel_prompt("A runs.", "", "x", "Go.", "beats-no-acoustic") == (
+        'A runs. X says, "Go."')
+    assert lib.panel_prompt("A runs.", "", None, "", "beats") == "A runs. " + AMBIENCE_SENTENCE
+    assert lib.panel_prompt("A runs.", "", None, "", "plain") == "A runs."
+
+
+# --- SFT14: the manifest composes a speech movie in the fixed order (SF16, SK6) ----------------
+
+SFT14_SETTING = seu.HARBOUR
+
+
+def _sft14_story(panel_1_speech):
+    """A 2-panel shots story.md: panel 1 a medium shot with panel_1_speech (a Dialogue: or
+    Narration: line), panel 2 a silent wide shot with a Narration: line."""
+    return ("# The Letter\n\nA courier brings a letter.\n\n## Characters\n"
+            "- \"the courier\": %s.\n\n"
+            "## Panel 1 — The Gate\n"
+            "Image: %s The courier stands at the gate. The courier faces the camera. The shot is a "
+            "medium shot.\n"
+            "Motion: The courier lifts the sealed letter at real-time speed. The courier faces the "
+            "camera. The camera pushes in.\n"
+            "%s\n\n"
+            "## Panel 2 — The Road\n"
+            "Image: %s The courier walks down the road. The shot is a wide shot.\n"
+            "Motion: The courier walks down the road at real-time speed. The camera tracks "
+            "alongside the movement.\n"
+            "Narration: The road was long.\n") % (seu.COURIER, SFT14_SETTING, panel_1_speech,
+                                                   SFT14_SETTING)
+
+
+SFT14_CHAIN = """# The Gate
+
+A courier reaches a hilltop temple.
+
+## Panel 1 — The Steps
+Image: %s The courier climbs toward the gate. The shot is a wide shot.
+Motion: The courier climbs the last worn step at real-time speed. The camera tracks alongside the movement.
+Narration: The bell had not yet rung.
+
+## Panel 2 — At the Gate
+Motion: The old monk lifts his eyes at real-time speed. The old monk faces the camera. The camera pushes in.
+Dialogue: the old monk: You came far.
+""" % SFT14_SETTING
+
+
+def _sft14_prompts(tmp_path, monkeypatch, story_id, text, mode, extra=(), plan=None):
+    story_md, images, ws = _manifest_ws(tmp_path, monkeypatch, story_id, text, plan=plan,
+                                        images=1 if mode == "chain" else 2)
+    if mode == "v2":
+        argv = ["--story-id", story_id, "--prompts-md", story_md, "--image", images[0],
+                "--image", images[1], "--fps", "24", "--target-seconds", repr(145 * 2 / 24.0),
+                "--min-frames", "145", "--max-frames", "145", "--force"] + list(extra)
+    else:
+        argv = _manifest_argv(story_id, story_md, images, mode=mode, extra=extra)
+    assert story_manifest.main(argv) == 0
+    return [p["motion_prompt"] for p in _read_manifest(ws, story_id)["panels"]]
+
+
+def test_sft14_the_manifest_composes_the_fixed_order(tmp_path, monkeypatch):
+    speaking = _sft14_story("Dialogue: the courier: Go now.")
+    assert _sft14_prompts(tmp_path, monkeypatch, "sf14a", speaking, "shots") == [
+        "The shot is a medium shot. The courier lifts the sealed letter at real-time speed. The "
+        "courier faces the camera. The courier says, \"Go now.\" The camera pushes in. "
+        + ACOUSTIC_SENTENCE,
+        "The shot is a wide shot. The courier walks down the road at real-time speed. The camera "
+        "tracks alongside the movement. " + AMBIENCE_SENTENCE]
+    assert _sft14_prompts(tmp_path, monkeypatch, "sf14b", SFT14_CHAIN, "chain",
+                          plan=CAST_PLAN) == [
+        "The shot is a wide shot. The courier climbs the last worn step at real-time speed. The "
+        "camera tracks alongside the movement. " + AMBIENCE_SENTENCE,
+        "The old monk lifts his eyes at real-time speed. The old monk faces the camera. The old "
+        "monk says, \"You came far.\" The camera pushes in. " + ACOUSTIC_SENTENCE]
+    silent = _sft14_story("Narration: The gate was shut.")
+    assert _sft14_prompts(tmp_path, monkeypatch, "sf14c", silent, "shots") == [
+        "The courier lifts the sealed letter at real-time speed. The courier faces the camera. The "
+        "camera pushes in.",
+        "The courier walks down the road at real-time speed. The camera tracks alongside the "
+        "movement."]
+    assert _sft14_prompts(tmp_path, monkeypatch, "sf14d", speaking, "v2") == [
+        "The courier lifts the sealed letter at real-time speed. The courier faces the camera. The "
+        "courier says, \"Go now.\" The camera pushes in. " + ACOUSTIC_SENTENCE,
+        "The courier walks down the road at real-time speed. The camera tracks alongside the "
+        "movement."]
+    assert _sft14_prompts(tmp_path, monkeypatch, "sf14e", speaking, "shots",
+                          extra=["--speech-delivery", "plain"]) == [
+        "The shot is a medium shot. The courier lifts the sealed letter at real-time speed. The "
+        "courier faces the camera. The courier says: \"Go now.\" The camera pushes in.",
+        "The shot is a wide shot. The courier walks down the road at real-time speed. The camera "
+        "tracks alongside the movement."]
