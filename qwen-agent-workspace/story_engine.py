@@ -797,27 +797,20 @@ def panels_needed(lib, seconds, lines):
     return needed
 
 
-def speaker_runs(lines, speakers):
-    """The spoken lines split into the runs one beat could hold by speaker (soft panel count spec
-    SPC1, D2): a line starts a new run when its speaker is known and differs from a known speaker
-    earlier in the current run; a line with no known speaker (None) joins the current run."""
-    runs, current, who = [], [], None
-    for line, cid in zip(lines, speakers):
-        if current and cid is not None and who is not None and cid != who:
-            runs.append(current)
-            current, who = [], None
-        current.append(line)
-        if cid is not None:
-            who = cid
-    if current:
-        runs.append(current)
-    return runs
-
-
 def lines_needed(lib, seconds, lines, speakers):
-    """The fewest panels that speak lines in order with one speaker each (SPC1): panels_needed
-    summed over speaker_runs."""
-    return sum(panels_needed(lib, seconds, run) for run in speaker_runs(lines, speakers))
+    """The fewest panels that speak lines in order (SPC1; plan ruling SPR6): each panel holds
+    consecutive lines with at most one known speaker that fit one clip together; a single line
+    always takes one panel, as in panels_needed."""
+    best = [0]
+    for j in range(1, len(lines) + 1):
+        least = best[j - 1] + 1
+        for i in range(j - 2, -1, -1):
+            if (len({s for s in speakers[i:j] if s is not None}) > 1
+                    or not _lines_fit(lib, seconds, lines[i:j])):
+                break
+            least = min(least, best[i] + 1)
+        best.append(least)
+    return best[-1]
 
 
 def declared_speakers(ctx):

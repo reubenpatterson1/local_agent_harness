@@ -233,21 +233,16 @@ def test_spt2_target_most_and_the_range(ws, story_env):
     assert (se.target_panels(plain), se.most_panels(plain)) == (4, 6)
 
 
-def test_spt23_speaker_runs_and_lines_needed():
-    lines = ["a", "b", "c", "d"]
-    rows = (
-        ([None] * 4, [["a", "b", "c", "d"]]),
-        (["c1", "c2", "c1", "c2"], [["a"], ["b"], ["c"], ["d"]]),
-        (["c1", None, "c1", "c2"], [["a", "b", "c"], ["d"]]),
-        ([None, "c2", None, "c1"], [["a", "b", "c"], ["d"]]),
-        (["c1", "c1", "c2", "c2"], [["a", "b"], ["c", "d"]]),
-    )
-    for speakers, want in rows:
-        assert se.speaker_runs(lines, speakers) == want, speakers
+def test_spt23_lines_needed():
     turns = se.spoken_lines(TURNS)
     assert se.lines_needed(lib, 6.0, turns, ["c1", "c2", "c1", "c2"]) == 4
     assert se.lines_needed(lib, 6.0, turns, [None] * 4) == 2
     assert se.panels_needed(lib, 6.0, turns) == 2
+    a = "We should leave before the tide turns and the boats come in."
+    d = "I told you the ferry would not wait for us past the bridge."
+    mixed = [a, "Wait for me.", "Not yet, stay.", d, "Hurry now.", "I am right here."]
+    who = ["c1", None, "c2", "c1", None, "c2"]
+    assert se.lines_needed(lib, 145 / 24.0, mixed, who) == 4
 
 
 # --- SPT3: the spoken-lines pre-flight (SPC3; plan ruling SPR2) -------------------------------
