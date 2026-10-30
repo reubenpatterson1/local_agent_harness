@@ -273,17 +273,16 @@ Coverage: each view 4 times with 4 distinct times; times dawn 5, midday 5, golde
 2. **Copies.** `photos/photo_NN.png` = the oriented RGB image, PNG, full size; `photos[k] = {"path": <absolute input path>, "sha256": <sha256 of the input file bytes>}`.
 3. **Fit.** `stills/loc_NN.png` (NN = 1..P) = `ImageOps.fit(img, (1024, 640), Image.LANCZOS, centering=(0.5, 0.5))`. Photos are kept as-is otherwise.
 4. **Description.** When `--description` is absent, `location_dataset.describe(photo_paths[:5])` drafts it (L1.7) and `create` prints `description (drafted by the vision model; change it with bin/location edit NAME --description TEXT): <text>`.
-5. **Top-up.** When P < 24, `E = 24 - P` edits. Edit j (1..E) is still `n = P + j`; its source is the fitted still of photo `((j - 1) % P) + 1`; its instruction is `EDIT_PROMPT % EDIT_CONDITIONS[j - 1]`. All E edits run in one `character_dataset.run_edit_child(spec, loc_dir, "edit")` (L1.8). Edits change time, weather or season only, never the camera.
+5. **Top-up.** When P < 24, `E = 24 - P` edits. Edit j (1..E) is still `n = P + j`; its source is the fitted still of photo `((j - 1) % P) + 1`; its instruction is `EDIT_PROMPT % ((EDIT_VIEWS[j - 1],) + EDIT_CONDITIONS[j - 1])`. All E edits run in one `character_dataset.run_edit_child(spec, loc_dir, "edit")` (L1.8). Edits move the camera to EDIT_VIEWS[j - 1] and change the time, weather or season.
 6. **Story server.** Text mode, and photo mode with E > 0, stop the story server, wait for `GENERATE_MIN_AVAIL_GIB` (Z-Image) or `EDIT_MIN_AVAIL_GIB` (edits) available, run the child, and restore exactly as `character_dataset.py:980-1008` (detached restore on interrupt; `--wait` plus `wait_for_vlm(VLM_WAIT_S)` otherwise; the restore runs in a `finally`). Photo mode with P = 24 never stops the server.
 
 ```python
-EDIT_PROMPT = ("Show this exact same place: keep its buildings, rooms, structures, furniture, "
-               "fixtures, decor, ground or floor, signs, materials and colours identical. "
-               "Re-shoot it as a %s, %s, %s. Move the camera to match: the viewpoint must clearly "
-               "differ from the original photo, and the time of day and the conditions must be "
-               "clearly visible. If the place is indoors, show the time of day and the weather "
-               "through its windows and in its light. No people anywhere in the image. "
-               "Photorealistic live-action film still, natural light.")
+EDIT_PROMPT = ("Re-shoot this exact place as a %s, %s, %s: move the camera so the viewpoint "
+               "clearly differs from this photo. Keep its buildings, rooms, structures, "
+               "furniture, fixtures, decor, ground or floor, signs, materials and colours the "
+               "same. If the place is indoors, show the time of day and the weather through any "
+               "windows and in its light. No people anywhere in the image. Photorealistic "
+               "live-action film still, natural light.")
 EDIT_CONDITIONS = [
     ("at dusk", "under a clear sky"), ("at night", "in light rain"), ("at dawn", "in thick fog"),
     ("at midday", "under an overcast sky"), ("at golden hour", "under a clear sky"),
@@ -297,22 +296,23 @@ EDIT_CONDITIONS = [
     ("at golden hour", "under an overcast sky"), ("at night", "in heavy rain"),
     ("at midday", "in spring under a clear sky"),
 ]                                                    # 23 entries: P = 1 needs 23 edits
+
 EDIT_VIEWS = [
     "wide shot from further back", "standing-height view from a different spot",
-    "view from the opposite side", "high-angle view from above", "low-angle upward view",
+    "view from a few steps to the left", "high-angle view from above", "low-angle upward view",
     "medium shot of a distinctive feature", "close-up of a characteristic surface or detail",
     "view looking along its length from one end", "wide shot from one corner",
     "three-quarter view from the left", "three-quarter view from the right",
-    "medium shot from a lower position", "wide shot from the far side",
+    "medium shot from a lower position", "view from a few steps to the right",
     "view from a doorway or entrance", "high-angle wide shot from a raised position",
-    "close-up of a sign, fixture or ornament", "medium shot looking across it",
+    "close-up of a characteristic feature", "medium shot looking across it",
     "low-angle view from near the ground or floor", "wide shot from the left edge",
     "wide shot from the right edge", "medium shot of its centre",
-    "view looking back toward the original camera position", "close-up of a material or texture",
+    "wide shot from slightly higher and further back", "close-up of a material or texture",
 ]                                                    # 23 entries, paired with EDIT_CONDITIONS
 ```
 Edit j uses EDIT_VIEWS[j - 1] and EDIT_CONDITIONS[j - 1] (revised 2026-10-30: edits re-shoot from a new viewpoint; the old prompt kept the viewpoint and gave near-copies).
-The CLI help and the UI say: angles come only from the photos; 3-5 photos from different spots are recommended.
+The CLI help and the UI say: edits re-shoot each photo from a new viewpoint but can only guess at unseen parts; 3-5 photos from different spots are recommended.
 
 ### 2.7 VLM describe (L1.7)
 
@@ -792,7 +792,7 @@ New `ROUTES` entries, after the character routes (`:74-79`), using `_NAME`:
 - Compose, after `c-characters` (`:113`): `<label data-field="locations">Locations <select id="c-locations" multiple size="3"></select></label>` with `<span id="c-locations-note" class="muted"></span>`, and `<label data-field="location_strength">Location strength <input id="c-location-strength" type="number" min="0.05" max="1" step="0.05" placeholder="0.8"></label>`. The select lists trained locations only (`name (first 6 words of description...)`). Selecting a 4th deselects it and sets the note to `at most 3 locations`. Field collection adds `locations` (selected values) and `location_strength: numberOrNull("#c-location-strength")`; field restore selects saved names and fills the strength.
 - `<section id="panel-locations" class="panel" hidden>`:
   - `lo-list` table: Name, Status, Source, Video, Stills, Description; a row click opens the detail.
-  - Create form: `lo-name`; `lo-description` (`<textarea rows="3" cols="70">`) with `lo-words` showing `N words (15-40)`; `lo-trigger` (placeholder `blank = auto`); `lo-seed`; `lo-photos` (`<input type="file" multiple accept="image/png,image/jpeg,image/webp">`); the note `<p id="lo-angles-note" class="muted">Angles come only from your photos: every extra still keeps one photo's exact viewpoint and changes only its time of day, weather or season. For a varied dataset, upload 3-5 photos taken from different spots. Without photos, the 24 stills are drawn from the description.</p>`; `lo-create` and `lo-create-status`. Create is disabled while the name is invalid, more than 24 photos are chosen, or the description is non-empty and outside 15-40 words, or there are no photos and the description is outside 15-40 words. Photos upload one by one through the existing `uploadFile` (`:468`), then `POST /api/locations`.
+  - Create form: `lo-name`; `lo-description` (`<textarea rows="3" cols="70">`) with `lo-words` showing `N words (15-40)`; `lo-trigger` (placeholder `blank = auto`); `lo-seed`; `lo-photos` (`<input type="file" multiple accept="image/png,image/jpeg,image/webp">`); the note `<p id="lo-angles-note" class="muted">Every extra still re-shoots one of your photos from a new viewpoint at a new time of day, weather or season. Edits can only guess at what your photos do not show, so for a varied dataset, upload 3-5 photos taken from different spots. Without photos, the 24 stills are drawn from the description.</p>`; `lo-create` and `lo-create-status`. Create is disabled while the name is invalid, more than 24 photos are chosen, or the description is non-empty and outside 15-40 words, or there are no photos and the description is outside 15-40 words. Photos upload one by one through the existing `uploadFile` (`:468`), then `POST /api/locations`.
   - Detail `lo-detail`: `lo-title` (`name (status, source)`); `lo-sheet` (the contact sheet image); `lo-stills`, one card per manifest item with the still, `photo`/`edit`/`generated`, `score N` or `score -`, `people` or `no people`, the caption, and `kept` or `dropped: REASON`; `lo-desc-edit` (textarea, the current description) with `lo-desc-save`, labelled `Save description` (photo mode, PATCH) or `Regenerate with this description` (text mode, POST regenerate with `description` and `force` from `lo-force`); `lo-regen` (`Regenerate (new seed)`, POST regenerate `{new_seed: true, force}`); `lo-force` checkbox `Force` with the title `keeps photos that show people; allows regenerating a trained location, which deletes its LoRAs`; `lo-accept` (`Accept dataset`, shows the train form); `lo-status`.
   - Train form `lo-train-form` (hidden until Accept): `lo-train-video` (checked), `lo-train-stills` (checked), `lo-train-force`, `lo-train`, `lo-train-reason`. Train is disabled with `fewer than 12 stills kept; regenerate the dataset` while the status is `dataset`, and goes through the existing `gate(..., ["render"])`.
   - `lo-tests`: when `tests.video_lora` and `tests.video_control` are set, two `<video controls>` side by side (`fileUrl(path)`), captioned `with the LoRA` and `without (control)`.
@@ -948,7 +948,7 @@ with open(os.path.join(out, "normalized_plan_chained.json"), "w", encoding="utf-
 | LD6 | Photo fit: a 4000x3000 photo becomes a 1024x640 centred crop (pixel-compared with `ImageOps.fit`); `photo_NN.png` is the oriented original; the record's `photos` has the path and the file sha256 |
 | LD7 | Photo size: 512x320 accepted (crop 512x320); 511x320 refused (crop 511x319); 2000x319 refused (crop 510x319); the exact refusal text. LD26: 750x422 accepted with the 1.52x warning; no warning on a refusal |
 | LD8 | Photo describe: without `--description`, `describe` gets the first 5 photos; a 45-word reply triggers `DESCRIBE_SHORTEN` with text only; a 10-word reply triggers `DESCRIBE_RETRY` with images; 3 failures → exit 1 and no location dir |
-| LD9 | **Round robin (LK6).** For P in 1, 3, 5: the edit spec has `24 - P` jobs; job j's `image` is `stills/loc_%02d.png % (((j-1) % P) + 1)`, prompt `EDIT_PROMPT % EDIT_CONDITIONS[j-1]`, output `loc_%02d.png % (P + j)`, `skill == "location_edit"`; P = 24 runs no edit child and never stops the server |
+| LD9 | **Round robin (LK6).** For P in 1, 3, 5: the edit spec has `24 - P` jobs; job j's `image` is `stills/loc_%02d.png % (((j-1) % P) + 1)`, prompt `EDIT_PROMPT % ((EDIT_VIEWS[j-1],) + EDIT_CONDITIONS[j-1])`, output `loc_%02d.png % (P + j)`, `skill == "location_edit"`; P = 24 runs no edit child and never stops the server |
 | LD10 | Edit-model gate: `edit_models_missing()` non-empty → exit 2 before any VLM call or directory |
 | LD11 | Keep rules: generated score 6 → `score 6`; score 9 with people → `people visible`; blocked file → `blocked by the content screen`; user photo with people dropped, and kept with `--force` with the `kept by --force:` reason; a forced unparseable photo captioned `"<trigger>, " + STYLE + "."` |
 | LD12 | Captions: the exact example caption; `empty of people` absent when people are visible |
@@ -1099,7 +1099,7 @@ PR note (in substance): "New location library (`bin/location`, movie-ui Location
 
 ## 9. Risks
 
-- **R1. Photo locations have few angles.** Edits never move the camera, so a 1-photo location is 24 versions of one viewpoint and its LoRA may push every panel toward that framing. The UI and help recommend 3-5 photos from different spots.
+- **R1. Photo locations have few real angles.** Edits move the camera, but the edit model can only guess at parts a photo does not show, so a 1-photo location's new views may invent geometry or drift back to the photo's framing; the photo-scored check (score >= 7 against photo 1) drops the worst. The UI and help recommend 3-5 photos from different spots.
 - **R2. Description vs. narrative.** The planner must place story action in a fixed setting it did not write; P21 forces at least one beat there. A narrative that never mentions the place can still pass P21 with an unnatural beat.
 - **R3. Lock message.** A location job holding the shared lock makes a character create print "another bin/character create/train is running"; the text is accurate about the lock, not the tool.
 - **R4. Character triggers do not check location triggers.** A later `bin/character create --trigger` could reuse a location's trigger; location creates check both ways only on their side (D21).

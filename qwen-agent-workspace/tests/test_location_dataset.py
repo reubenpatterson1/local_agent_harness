@@ -303,11 +303,10 @@ def test_ld1_the_24_variants_and_gen_prompt():
 
 def test_ld2_the_section_2_literals():
     assert ld.EDIT_PROMPT == (
-        "Show this exact same place: keep its buildings, rooms, structures, furniture, fixtures, "
-        "decor, ground or floor, signs, materials and colours identical. Re-shoot it as a %s, %s, "
-        "%s. Move the camera to match: the viewpoint must clearly differ from the original "
-        "photo, and the time of day and the conditions must be clearly visible. If the place is "
-        "indoors, show the time of day and the weather through its windows and in its light. No "
+        "Re-shoot this exact place as a %s, %s, %s: move the camera so the viewpoint clearly "
+        "differs from this photo. Keep its buildings, rooms, structures, furniture, fixtures, "
+        "decor, ground or floor, signs, materials and colours the same. If the place is "
+        "indoors, show the time of day and the weather through any windows and in its light. No "
         "people anywhere in the image. Photorealistic live-action film still, natural light.")
     assert ld.EDIT_CONDITIONS == [
         ("at dusk", "under a clear sky"), ("at night", "in light rain"),
@@ -538,7 +537,8 @@ def test_ld9_the_round_robin_top_up(env, monkeypatch, tmp_path, count):
         character_dataset.EDIT_MODEL, character_dataset.EDIT_LORA_REPO,
         character_dataset.EDIT_LORA_FILE, 8, 1.0)
     assert spec["jobs"] == [{"image": os.path.join(stills, "loc_%02d.png" % (((j - 1) % count) + 1)),
-                             "prompt": ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[j - 1],) + ld.EDIT_CONDITIONS[j - 1]),
+                             "prompt": ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[j - 1],)
+                                                         + ld.EDIT_CONDITIONS[j - 1]),
                              "output_path": os.path.join(stills, "loc_%02d.png" % (count + j)),
                              "seed": 3, "width": 1024, "height": 640}
                             for j in range(1, 25 - count)]
@@ -1156,6 +1156,7 @@ def test_ld26_an_upscaled_photo_is_accepted_with_a_warning(env, monkeypatch, tmp
 
 def test_ld27_edits_reshoot_from_new_viewpoints():
     prompt = ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[0],) + ld.EDIT_CONDITIONS[0])
-    assert "Re-shoot it as a wide shot from further back, at dusk, under a clear sky." in prompt
+    assert prompt.startswith("Re-shoot this exact place as a wide shot from further back, at dusk, "
+                             "under a clear sky: move the camera")
     assert "furniture, fixtures, decor" in prompt
-    assert "same camera position" not in prompt and "Change only" not in prompt
+    assert "same camera position" not in prompt and "identical" not in prompt

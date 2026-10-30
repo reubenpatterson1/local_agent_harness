@@ -372,10 +372,11 @@ def test_lu13_the_static_page():
         'id="tab-actions"')
     assert html.index('id="c-characters"') < html.index('id="c-locations"') < html.index(
         'id="c-actions"')
-    assert ('<p id="lo-angles-note" class="muted">Angles come only from your photos: every extra '
-            "still keeps one photo's exact viewpoint and changes only its time of day, weather or "
-            "season. For a varied dataset, upload 3-5 photos taken from different spots. Without "
-            "photos, the 24 stills are drawn from the description.</p>") in html
+    assert ('<p id="lo-angles-note" class="muted">Every extra still re-shoots one of your photos '
+            "from a new viewpoint at a new time of day, weather or season. Edits can only guess "
+            "at what your photos do not show, so for a varied dataset, upload 3-5 photos taken "
+            "from different spots. Without photos, the 24 stills are drawn from the "
+            "description.</p>") in html
     assert '<select id="c-locations" multiple size="3"></select>' in html
     assert ('<input id="c-location-strength" type="number" min="0.05" max="1" step="0.05" '
             'placeholder="0.8">') in html

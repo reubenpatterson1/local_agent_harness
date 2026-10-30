@@ -3,9 +3,9 @@
 (docs/superpowers/specs/2026-10-29-location-lora-design.md, Sections 2 and 3).
 
 A location's dataset is 24 people-free 1024x640 stills: 24 Z-Image text2img stills of the
-description (text mode), or the user's photos plus Qwen-Image-Edit-2511 edits of them that change
-only the time of day, the weather or the season (photo mode). The vision model checks every
-still; the kept ones get a trigger-led caption and a 1-frame mp4. Training reuses
+description (text mode), or the user's photos plus Qwen-Image-Edit-2511 edits of them that
+re-shoot the place from a new viewpoint at a new time of day, weather or season (photo mode).
+The vision model checks every still; the kept ones get a trigger-led caption and a 1-frame mp4. Training reuses
 character_dataset.train_video_lora and train_stills_lora.
 
 Top-level imports are stdlib, PIL, psutil, character_dataset and location_lib. All
@@ -81,13 +81,12 @@ def gen_prompt(view, time, weather, description):
 
 # Spec 2.6: the photo-mode top-up edits; edit j (1-based) uses EDIT_VIEWS[j - 1] and
 # EDIT_CONDITIONS[j - 1].
-EDIT_PROMPT = ("Show this exact same place: keep its buildings, rooms, structures, furniture, "
-               "fixtures, decor, ground or floor, signs, materials and colours identical. "
-               "Re-shoot it as a %s, %s, %s. Move the camera to match: the viewpoint must clearly "
-               "differ from the original photo, and the time of day and the conditions must be "
-               "clearly visible. If the place is indoors, show the time of day and the weather "
-               "through its windows and in its light. No people anywhere in the image. "
-               "Photorealistic live-action film still, natural light.")
+EDIT_PROMPT = ("Re-shoot this exact place as a %s, %s, %s: move the camera so the viewpoint "
+               "clearly differs from this photo. Keep its buildings, rooms, structures, "
+               "furniture, fixtures, decor, ground or floor, signs, materials and colours the "
+               "same. If the place is indoors, show the time of day and the weather through any "
+               "windows and in its light. No people anywhere in the image. Photorealistic "
+               "live-action film still, natural light.")
 EDIT_CONDITIONS = [
     ("at dusk", "under a clear sky"), ("at night", "in light rain"), ("at dawn", "in thick fog"),
     ("at midday", "under an overcast sky"), ("at golden hour", "under a clear sky"),
@@ -104,16 +103,16 @@ EDIT_CONDITIONS = [
 
 EDIT_VIEWS = [
     "wide shot from further back", "standing-height view from a different spot",
-    "view from the opposite side", "high-angle view from above", "low-angle upward view",
+    "view from a few steps to the left", "high-angle view from above", "low-angle upward view",
     "medium shot of a distinctive feature", "close-up of a characteristic surface or detail",
     "view looking along its length from one end", "wide shot from one corner",
     "three-quarter view from the left", "three-quarter view from the right",
-    "medium shot from a lower position", "wide shot from the far side",
+    "medium shot from a lower position", "view from a few steps to the right",
     "view from a doorway or entrance", "high-angle wide shot from a raised position",
-    "close-up of a sign, fixture or ornament", "medium shot looking across it",
+    "close-up of a characteristic feature", "medium shot looking across it",
     "low-angle view from near the ground or floor", "wide shot from the left edge",
     "wide shot from the right edge", "medium shot of its centre",
-    "view looking back toward the original camera position", "close-up of a material or texture",
+    "wide shot from slightly higher and further back", "close-up of a material or texture",
 ]                                                    # 23 entries, paired with EDIT_CONDITIONS
 
 # Spec 2.7: the vision model drafts a photo location's description.
