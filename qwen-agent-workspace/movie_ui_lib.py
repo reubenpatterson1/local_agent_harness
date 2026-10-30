@@ -421,7 +421,8 @@ def vlm_port():
 def job_vlm(kind, fields, workspace, story_id):
     """The VLM state a job of kind needs: "required", "forbidden" or "any" (VP1). Pure except
     for one os.path.isfile (a movie whose story.md exists renders without the VLM)."""
-    if kind in ("story", "character-create", "character-regenerate"):
+    if kind in ("story", "character-create", "character-regenerate", "location-create",
+                "location-regenerate"):
         return "required"
     if kind == "movie":
         if (fields or {}).get("action") == "redo":
@@ -430,7 +431,7 @@ def job_vlm(kind, fields, workspace, story_id):
             return "required"
         return ("forbidden" if os.path.isfile(os.path.join(story_dir(workspace, story_id), "story.md"))
                 else "required")
-    if kind in ("smoke", "character-train", "action-train"):
+    if kind in ("smoke", "character-train", "action-train", "location-train"):
         return "forbidden"
     return "any"
 
@@ -898,12 +899,13 @@ DEFAULT_FIELDS = {
     "story_model": None,
     "auto_lora": True, "narration": "full",
     "video_loras": [], "stills_loras": [],
-    "characters": [], "action_loras": [],
+    "characters": [], "locations": [], "location_strength": None, "action_loras": [],
     "story_legacy": False, "judge": False, "no_low_ram": False, "panel_timeout": None,
     "overwrite_movie": False, "redo": [],
 }
 NARRATION_MODES = ("full", "speech", "none")   # voice-over and speech / speech only / none
 LIGHT_TIMEOUT = 60
+LOCATION_NAME_RE = re.compile(r"[a-z][a-z0-9-]{1,23}")   # location_lib.NAME_RE
 # MU37: the flags each compose field or action needs; "supported" (MU47) is all-present.
 FIELD_FLAGS = (
     ("story_id", ("--story-id",)), ("panels", ("--panels",)), ("length", ("--length",)),
@@ -912,7 +914,8 @@ FIELD_FLAGS = (
     ("model", ("--model",)), ("gemma", ("--gemma",)), ("story_model", ("--story-model",)),
     ("goal", ("--goal",)), ("shots", ("--shots",)), ("no_stills", ("--no-stills",)),
     ("video_loras", ("--lora",)), ("stills_loras", ("--stills-lora",)),
-    ("characters", ("--character",)), ("action_loras", ("--action",)),
+    ("characters", ("--character",)), ("locations", ("--location",)),
+    ("location_strength", ("--location-strength",)), ("action_loras", ("--action",)),
     ("auto_lora", ("--no-auto-lora",)), ("narration", ("--no-narration", "--speech-only")),
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
@@ -990,6 +993,11 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         argv += ["--stills-lora", lora_arg(item)]
     for name in fields["characters"]:
         argv += ["--character", name]
+    # Location library spec L4.3: the pinned locations, then their strength.
+    for name in fields["locations"]:
+        argv += ["--location", name]
+    if fields["locations"] and fields["location_strength"] is not None:
+        argv += ["--location-strength", repr(float(fields["location_strength"]))]
     for item in fields["action_loras"]:
         argv += ["--action", action_arg(item)]
     if fields["auto_lora"] is False:
@@ -1035,6 +1043,56 @@ def _rule_actions(fields):
     if len(set(names)) != len(names):
         errors.append("actions must be distinct")
     return errors
+
+
+def _rule_locations(fields):
+    """V1 rule 12c (location library spec L4.3): at most 3 distinct location names, a strength
+    in (0, 1] only with a location, and no locations in no_stills mode."""
+    errors = []
+    names = fields.get("locations")
+    if not (isinstance(names, list) and len(names) <= 3 and len(set(map(repr, names))) == len(names)
+            and all(isinstance(n, str) and LOCATION_NAME_RE.fullmatch(n) for n in names)):
+        errors.append("locations must be at most 3 distinct location names")
+    pinned = isinstance(names, list) and len(names) > 0
+    strength = fields.get("location_strength")
+    if strength is not None and not (isinstance(strength, (int, float))
+                                     and not isinstance(strength, bool) and 0 < strength <= 1):
+        errors.append("location strength must be a number in (0, 1]")
+    if strength is not None and not pinned:
+        errors.append("location strength needs at least one location")
+    if pinned and fields.get("mode") == "no_stills":
+        errors.append("locations need chained or shots mode")
+    return errors
+
+
+def location_argv(kind, fields, ws_real, state, py=sys.executable):
+    """The bin/location argv of a location-create, -regenerate or -train job (location library
+    spec L4.1)."""
+    if kind == "location-train":
+        # Like character-train-vlm: stop the VLM for training's memory, always restart it.
+        return ([os.path.join(ws_real, "bin", "location-train-vlm"), py, fields["name"]]
+                + (["--video"] if fields.get("video") else [])
+                + (["--stills"] if fields.get("stills") else [])
+                + (["--force"] if fields.get("force") else []))
+    argv = [py, os.path.join(ws_real, "bin", "location"), "create", fields["name"]]
+    if kind == "location-regenerate":
+        argv.append("--regenerate")
+        if fields.get("seed") is not None:
+            argv += ["--seed", str(fields["seed"])]
+        elif fields.get("new_seed"):
+            argv.append("--new-seed")
+        if fields.get("description"):
+            argv += ["--description", fields["description"]]
+        return argv + (["--force"] if fields.get("force") else [])
+    if fields.get("description"):
+        argv += ["--description", fields["description"]]
+    for upload in fields.get("photo_uploads") or []:
+        argv += ["--photo", os.path.join(state, "uploads", upload)]
+    if fields.get("trigger"):
+        argv += ["--trigger", fields["trigger"]]
+    if fields.get("seed") is not None:
+        argv += ["--seed", str(fields["seed"])]
+    return argv + (["--force"] if fields.get("force") else [])
 
 
 def action_argv(kind, fields, ws_real, py=sys.executable):
@@ -1403,6 +1461,7 @@ def validate_fields(fields, ws_real, state):
             and all(isinstance(c, str) and CHARACTER_NAME_RE.fullmatch(c) for c in chars)):
         errors.append("characters must be distinct character names")
     errors += _rule_actions(fields)                                          # 12b
+    errors += _rule_locations(fields)                                        # 12c
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False

@@ -77,6 +77,14 @@ ROUTES = [
     ("POST", r"/api/characters/" + _NAME + r"/train", "h_character_train", "/api/characters/kyra/train"),
     ("POST", r"/api/characters/" + _NAME + r"/regenerate", "h_character_regenerate",
      "/api/characters/kyra/regenerate"),
+    ("GET", r"/api/locations", "h_locations", "/api/locations"),
+    ("POST", r"/api/locations", "h_location_create", "/api/locations"),
+    ("GET", r"/api/locations/" + _NAME, "h_location", "/api/locations/harbour-street"),
+    ("PATCH", r"/api/locations/" + _NAME, "h_location_patch", "/api/locations/harbour-street"),
+    ("POST", r"/api/locations/" + _NAME + r"/train", "h_location_train",
+     "/api/locations/harbour-street/train"),
+    ("POST", r"/api/locations/" + _NAME + r"/regenerate", "h_location_regenerate",
+     "/api/locations/harbour-street/regenerate"),
     ("GET", r"/api/actions", "h_actions", "/api/actions"),
     ("POST", r"/api/actions", "h_action_create", "/api/actions"),
     ("GET", r"/api/actions/" + _ACTION, "h_action", "/api/actions/roundhouse-kick"),
@@ -375,7 +383,7 @@ class MovieUIHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(405 if matched else 404, {"error": "method not allowed" if matched else "not found"})
             return
         body = None
-        if self.command in ("POST", "PUT") or (self.command == "DELETE" and
+        if self.command in ("POST", "PUT", "PATCH") or (self.command == "DELETE" and
                                                 (self.headers.get("Content-Length") or "0").strip() != "0"):
             body = self._read_body(path)
             if body is None:
@@ -1013,6 +1021,9 @@ def _h_lora_add(self, groups, query, body):
     lo, hi = _typed(body, "strength_range", "pair", "a list of two numbers")
     rank = _typed(body, "rank", "int", "an integer or null", optional=True)
     alpha = _typed(body, "alpha", "int", "an integer or null", optional=True)
+    no_arch_check = body.get("no_arch_check", False)
+    if not isinstance(no_arch_check, bool):
+        raise ApiError(400, "no_arch_check must be true or false")
     if not path.startswith("/"):
         raise ApiError(400, "path must be an absolute path")
     for key, value in (("path", path), ("id", entry_id), ("kind", kind), ("target", target),
@@ -1039,6 +1050,8 @@ def _h_lora_add(self, groups, query, body):
         args += ["--rank", str(rank)]
     if alpha is not None:
         args += ["--alpha", str(alpha)]
+    if no_arch_check:
+        args.append("--no-arch-check")
     return 200, {"run": _lora_action(real, args, timeout=lib.VERIFY_TIMEOUT)}
 
 
@@ -1049,11 +1062,13 @@ def _h_lora_remove(self, groups, query, body):
     return 200, {"run": _lora_action(real, ["remove", entry_id])}
 
 
-VERIFY_LINE_RE = re.compile(r"^(OK|FAIL) (\S+?)(?:: (.*))?$")
+VERIFY_LINE_RE = re.compile(r"^(OK|FAIL|WARN) (\S+?)(?:: (.*))?$")
 
 
 def parse_verify(stdout):
-    """[{"id", "ok", "problems"}] from lora-catalog verify's OK/FAIL lines, in first-seen order."""
+    """[{"id", "ok", "problems"}] from lora-catalog verify's OK/FAIL lines, in first-seen order;
+    an entry named by a WARN line also gets "warnings", which never changes "ok" (location
+    library spec L4.5)."""
     results, by_id = [], {}
     for line in stdout.splitlines():
         m = VERIFY_LINE_RE.match(line)
@@ -1066,6 +1081,8 @@ def parse_verify(stdout):
         if m.group(1) == "FAIL":
             entry["ok"] = False
             entry["problems"].append(m.group(3) or "")
+        elif m.group(1) == "WARN":
+            entry.setdefault("warnings", []).append(m.group(3) or "")
     return results
 
 
@@ -1287,6 +1304,213 @@ MovieUIHandler.h_character = _h_character
 MovieUIHandler.h_character_create = _h_character_create
 MovieUIHandler.h_character_regenerate = _h_character_regenerate
 MovieUIHandler.h_character_train = _h_character_train
+
+
+# ---------------------------------------------------------------------------
+# Locations: the location library (bin/location; location library spec L4.1, L4.2)
+# ---------------------------------------------------------------------------
+
+LOCATION_ROW_RE = re.compile(r"^(\S+)\s+(\S+)\s+(dataset|untrained|trained)\s+(text|photos)\s+"
+                             r"(yes|no)\s+(yes|no)\s+(.+)$")
+LOCATION_MIN_WORDS, LOCATION_MAX_WORDS, LOCATION_MAX_PHOTOS = 15, 40, 24
+
+
+def parse_location_list(stdout):
+    """The rows of bin/location list (spec L4.2)."""
+    out = []
+    for line in stdout.splitlines():
+        if line.startswith("NAME ") or line.startswith("no locations in ") or not line.strip():
+            continue
+        m = INVALID_ROW_RE.match(line)
+        if m:
+            out.append({"name": m.group(1), "invalid": m.group(2)})
+            continue
+        m = LOCATION_ROW_RE.match(line)
+        if m:
+            out.append({"name": m.group(1), "trigger": m.group(2), "status": m.group(3),
+                        "source": m.group(4), "video": m.group(5) == "yes",
+                        "stills": m.group(6) == "yes", "description": m.group(7),
+                        "invalid": None})
+    return out
+
+
+def location_description_errors(description):
+    """The errors of one description string (spec L4.2); [] when it may be passed on."""
+    if not isinstance(description, str):
+        return ["description must be a string"]
+    if not lib._argv_safe(description):
+        return ["description contains invalid characters"]
+    if description.strip().startswith("-"):
+        return ["description must not start with '-'"]
+    if "\n" in description or "\r" in description:
+        return ["description must be one line"]
+    if not LOCATION_MIN_WORDS <= len(description.split()) <= LOCATION_MAX_WORDS:
+        return ["description must be 15 to 40 words"]
+    return []
+
+
+def _seed_errors(seed):
+    if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool)
+                                 and 0 <= seed <= 2147483647):
+        return ["seed must be an integer from 0 to 2147483647"]
+    return []
+
+
+def location_create_errors(body, state):
+    """The field rules of POST /api/locations, in order (spec L4.2); [] when they pass."""
+    errors = []
+    name, photos, description = body.get("name"), body.get("photo_uploads"), body.get("description")
+    if not (isinstance(name, str) and lib.LOCATION_NAME_RE.fullmatch(name)):
+        errors.append("location name must match [a-z][a-z0-9-]{1,23}")
+    if photos is None:
+        photos = []
+    if not (isinstance(photos, list) and all(isinstance(p, str) for p in photos)):
+        errors.append("photo_uploads must be a list of upload IDs")
+        photos = []
+    elif len(photos) > LOCATION_MAX_PHOTOS:
+        errors.append("give at most 24 photos")
+    else:
+        for upload in photos:
+            if not (lib.UPLOAD_ID_RE.fullmatch(upload)
+                    and os.path.isfile(os.path.join(state, "uploads", upload))):
+                errors.append("photo upload %s not found" % _fs_text(upload))
+    if description not in (None, ""):
+        errors += location_description_errors(description)
+    if not photos and description in (None, ""):
+        errors.append("give a description or at least one photo")
+    trigger = body.get("trigger")
+    if trigger not in (None, "") and not (isinstance(trigger, str)
+                                          and re.fullmatch(r"[a-z][a-z0-9]{3,15}", trigger)):
+        errors.append("trigger must match [a-z][a-z0-9]{3,15}")
+    errors += _seed_errors(body.get("seed"))
+    if not isinstance(body.get("force", False), bool):
+        errors.append("force must be true or false")
+    return errors
+
+
+def create_location_job(server, kind, real, fields):
+    with STORE_LOCK:
+        job_id = lib.new_job_id(server.state)
+        argv = lib.location_argv(kind, fields, real, server.state)
+        lib.create_job(server.state, job_id, kind, real, None, fields["name"], argv, fields)
+    return 201, {"job": job_summary(server, job_id, lib.read_queue(server.state))}
+
+
+def _h_locations(self, groups, query, body):
+    real = self.ws(query.get("ws"))
+    run = tool_result("location", lib.run_light(lib.tool_argv(real, "location", "list"), real))
+    return 200, {"locations": parse_location_list(run["stdout"])}
+
+
+def _h_location(self, groups, query, body):
+    real, name = self.ws(query.get("ws")), groups[0]
+    run = tool_result("location", lib.run_light(lib.tool_argv(real, "location", "show", name), real))
+    try:
+        data, end = json.JSONDecoder().raw_decode(run["stdout"].lstrip())
+    except ValueError:
+        raise ApiError(502, "location printed unparsable output", run=run)
+    rest = run["stdout"].lstrip()[end:]
+    files = [{"status": m.group(1), "path": m.group(2)}
+             for m in (FILE_LINE_RE.match(line) for line in rest.splitlines()) if m]
+    loc_dir = next((os.path.dirname(f["path"]) for f in files
+                    if f["path"].endswith("/location.json")), None)
+    manifest, stills, sheet = None, [], None
+    tests = {"video_lora": None, "video_control": None}
+    if loc_dir is not None:
+        try:
+            with open(os.path.join(loc_dir, "manifest.json"), encoding="utf-8") as f:
+                items = json.load(f).get("items")
+            manifest = items if isinstance(items, list) else None
+        except (OSError, ValueError, AttributeError):
+            manifest = None
+        for item in manifest or []:
+            n = item.get("n") if isinstance(item, dict) else None
+            if isinstance(n, int) and not isinstance(n, bool):
+                path = os.path.join(loc_dir, "stills", "loc_%02d.png" % n)
+                if os.path.isfile(path):
+                    stills.append(path)
+        path = os.path.join(loc_dir, "contact_sheet.jpg")
+        sheet = path if os.path.isfile(path) else None
+        for key, filename in (("video_lora", "video_lora.mp4"), ("video_control", "video_control.mp4")):
+            path = os.path.join(loc_dir, "tests", filename)
+            tests[key] = path if os.path.isfile(path) else None
+    job = newest_job(self.server, ("location-create",), real, "character", name)
+    return 200, {"location": data, "files": files, "manifest": manifest, "contact_sheet": sheet,
+                 "stills": stills, "tests": tests,
+                 "last_create_fields": job["fields"] if job is not None else None}
+
+
+def _h_location_create(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    errors = location_create_errors(body, self.server.state)
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    fields = {"ws": real, "name": body["name"], "photo_uploads": list(body.get("photo_uploads") or []),
+              "description": body.get("description") or None, "trigger": body.get("trigger") or None,
+              "seed": body.get("seed"), "force": body.get("force", False)}
+    return create_location_job(self.server, "location-create", real, fields)
+
+
+def _h_location_patch(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    errors = location_description_errors(body.get("description"))
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    run = lib.run_light(lib.tool_argv(real, "location", "edit", groups[0], "--description",
+                                      body["description"]), real)
+    if run["timed_out"]:
+        raise ApiError(504, "location timed out after %d s" % lib.LIGHT_TIMEOUT, run=run)
+    if run["exit_code"] == 0:
+        return 200, {"run": run}
+    if run["exit_code"] == 2:
+        message = lib.last_line(run["stderr"])
+        raise ApiError(400, message[len("Error: "):] if message.startswith("Error: ") else message,
+                       run=run)
+    raise ApiError(502, "location exited %s" % run["exit_code"], run=run)
+
+
+def _h_location_regenerate(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    seed, new_seed = body.get("seed"), body.get("new_seed", False)
+    description, force = body.get("description"), body.get("force", False)
+    errors = []
+    if seed is not None and new_seed is True:
+        errors.append("give seed or new_seed, not both")
+    errors += _seed_errors(seed)
+    if description not in (None, ""):
+        errors += location_description_errors(description)
+    for key, value in (("new_seed", new_seed), ("force", force)):
+        if not isinstance(value, bool):
+            errors.append("%s must be true or false" % key)
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    return create_location_job(self.server, "location-regenerate", real,
+                               {"ws": real, "name": groups[0], "seed": seed, "new_seed": new_seed,
+                                "description": description or None, "force": force})
+
+
+def _h_location_train(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    fields = {"ws": real, "name": groups[0]}
+    errors = []
+    for key in ("video", "stills", "force"):
+        value = body.get(key, False)
+        if not isinstance(value, bool):
+            errors.append("%s must be true or false" % key)
+        fields[key] = value
+    if not errors and not (fields["video"] or fields["stills"]):
+        errors.append("choose video, stills or both")
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    return create_location_job(self.server, "location-train", real, fields)
+
+
+MovieUIHandler.h_locations = _h_locations
+MovieUIHandler.h_location = _h_location
+MovieUIHandler.h_location_create = _h_location_create
+MovieUIHandler.h_location_patch = _h_location_patch
+MovieUIHandler.h_location_regenerate = _h_location_regenerate
+MovieUIHandler.h_location_train = _h_location_train
 
 
 # ---------------------------------------------------------------------------
