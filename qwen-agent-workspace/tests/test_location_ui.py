@@ -415,3 +415,10 @@ def test_lu13b_force_resets_and_regenerate_confirms_lora_loss():
     assert app.count('" Its LoRAs are deleted."') == 1
     assert app.count("loraLossNote(") == 3
     assert 'with this description?" + loraLossNote(loc)' in app
+
+
+def test_lu15_locations_refuse_story_legacy():
+    base = {"locations": ["harbour-street"], "location_strength": None, "mode": "chained"}
+    assert "locations need the story engine; turn off story legacy" in lib._rule_locations(
+        dict(base, story_legacy=True))
+    assert lib._rule_locations(dict(base, story_legacy=False)) == []

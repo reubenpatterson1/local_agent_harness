@@ -1062,6 +1062,8 @@ def _rule_locations(fields):
         errors.append("location strength needs at least one location")
     if pinned and fields.get("mode") == "no_stills":
         errors.append("locations need chained or shots mode")
+    if pinned and fields.get("story_legacy") is True:
+        errors.append("locations need the story engine; turn off story legacy")
     return errors
 
 
