@@ -176,9 +176,10 @@ def test_spt1a_engine_constants():
     assert se.SPEAKER_RULE.endswith(SPEAKING_BEAT_SENTENCE)
     assert se.SPEAKER_RULE_KEEP_CAST.endswith(SPEAKING_BEAT_SENTENCE)
     assert se.LINES_LENGTH_PROBLEM == LINES_LENGTH_PROBLEM
-    assert se.StoryContext._fields[-2:] == ("panels_target", "length")
+    assert se.StoryContext._fields[-3:] == ("panels_target", "length", "locations")
     assert se.StoryContext._field_defaults == {"narration": True, "clip_seconds": None,
-                                               "panels_target": None, "length": None}
+                                               "panels_target": None, "length": None,
+                                               "locations": ()}
     assert "@@PANELS@@" not in se.PLAN_PROMPT_TEMPLATE
 
 

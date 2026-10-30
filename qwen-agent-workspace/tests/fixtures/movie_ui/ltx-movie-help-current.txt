@@ -88,6 +88,17 @@ options:
                         a panel that names one cast character uses 1.0, except
                         with --shots, where every cast character uses this
                         strength
+  --location NAME       pin a trained location from generated/locations/
+                        (repeatable, at most 3): the story plan sets at least
+                        one beat there with the location's fixed setting, and
+                        only the panels set there render with its LoRAs and
+                        trigger. See
+                        docs/superpowers/specs/2026-10-29-location-lora-
+                        design.md.
+  --location-strength LOCATION_STRENGTH
+                        LoRA strength for each pinned location without its own
+                        location.json strength (default 0.8), on every panel
+                        set there
   --action NAME[:STRENGTH]
                         apply a trained action (motion) LoRA from
                         generated/actions/ to every panel (repeatable); NAME
