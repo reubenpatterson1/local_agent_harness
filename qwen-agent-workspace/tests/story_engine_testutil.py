@@ -44,24 +44,27 @@ STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 
 def set_story_env(monkeypatch, tmp_path):
-    """Section 5.1's environment for one test: HOME, CHARACTER_LIBRARY_DIR and LORA_CATALOG_DIR
-    under tmp_path, QWEN_AGENT_DAEMON_URL at a closed loopback port, STORY_PIPELINE_LOGGED=1,
-    and no ANTHROPIC_API_KEY. Returns {"home", "lib", "catalog"} (paths as str)."""
+    """Section 5.1's environment for one test: HOME, CHARACTER_LIBRARY_DIR, LOCATION_LIBRARY_DIR
+    (location library spec 6.2) and LORA_CATALOG_DIR under tmp_path, QWEN_AGENT_DAEMON_URL at a
+    closed loopback port, STORY_PIPELINE_LOGGED=1, and no ANTHROPIC_API_KEY. Returns {"home",
+    "lib", "catalog", "locations"} (paths as str)."""
     home = os.path.join(str(tmp_path), "home")
     lib = os.path.join(str(tmp_path), "characters")
     catalog = os.path.join(str(tmp_path), "loras")
-    for path in (home, lib, catalog):
+    locations = os.path.join(str(tmp_path), "locations")
+    for path in (home, lib, catalog, locations):
         os.makedirs(path, exist_ok=True)
     monkeypatch.setenv("HOME", home)
     monkeypatch.setenv("CHARACTER_LIBRARY_DIR", lib)
     monkeypatch.setenv("LORA_CATALOG_DIR", catalog)
+    monkeypatch.setenv("LOCATION_LIBRARY_DIR", locations)
     monkeypatch.setenv("QWEN_AGENT_DAEMON_URL", "http://127.0.0.1:%d" % fleet_testutil.free_port())
     monkeypatch.setenv("STORY_PIPELINE_LOGGED", "1")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("QWEN_AGENT_PREFLIGHT_DONE", raising=False)
     for name in ("HF_HOME", "Z_IMAGE_HF_HOME", "QWEN_AGENT_WORKSPACE"):   # bin/lora-check's search
         monkeypatch.delenv(name, raising=False)
-    return {"home": home, "lib": lib, "catalog": catalog}
+    return {"home": home, "lib": lib, "catalog": catalog, "locations": locations}
 
 
 def fake_safetensors(path, rank, alpha, pairs=True, metadata=None, data=b"\x00" * 16):
@@ -180,7 +183,7 @@ def make_untrained(lib, name):
 # --- the temp workspace and the fake bin/qwen-agent (spec 5.1, 5.2) ------------------------
 
 LINKED_FILES = ("character_lib.py", "story_engine.py", "lora_catalog.py", "fleet_lib.py",
-                "pipeline_log.py", "ltx_image_fit.py", "ltx2_mlx_video_skill.py")
+                "pipeline_log.py", "ltx_image_fit.py", "ltx2_mlx_video_skill.py", "location_lib.py")
 
 FAKE_AGENT_SOURCE = r'''#!/usr/bin/env python3
 """Fake bin/qwen-agent for the story engine tests (spec 5.2). Pops the next scripted reply for
