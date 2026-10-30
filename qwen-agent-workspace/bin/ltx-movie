@@ -978,10 +978,12 @@ def _check_story_locations(args, names):
                   "LoRAs attach only to planned beats)" % os.path.join(story_dir, "plan.json"))
         return 0
     if found != set(names):
-        print("Error: story %s was planned with the locations [%s], not --location [%s]; pass "
-              "the same --location flags, or --force-story to plan a new story"
+        no_location = args.no_stills or args.story_legacy or args.story_prompt_override is not None
+        fix = ("--force-story to plan a new story (this run cannot take --location)" if no_location
+               else "pass the same --location flags, or --force-story to plan a new story")
+        print("Error: story %s was planned with the locations [%s], not --location [%s]; %s"
               % (args.story_id, ", ".join(sorted(found)) or "none",
-                 ", ".join(sorted(set(names))) or "none"), file=sys.stderr)
+                 ", ".join(sorted(set(names))) or "none", fix), file=sys.stderr)
         return 2
     return 0
 

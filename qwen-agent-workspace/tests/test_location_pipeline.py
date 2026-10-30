@@ -726,3 +726,15 @@ def test_lp20_iterate_story_passes_the_pinned_locations():
     old = dict(plan)
     del old["locations"]
     assert "--location" not in iterate_story.build_engine_cmd("s", old)
+
+
+def test_lp21_reuse_advice_under_the_legacy_engine(movie, capsys, story_env):
+    lt.harbour(story_env["locations"])
+    lt.temple(story_env["locations"])
+    _existing_story(movie, "lp3", (("l1", "harbour-street"),))
+    capsys.readouterr()
+    args = _movie_args(NARRATIVE, "--story-id", "lp3", "--story-legacy")
+    assert ltx_movie._resolve_locations(args) == 2
+    err = capsys.readouterr().err
+    assert "this run cannot take --location" in err
+    assert "pass the same --location flags" not in err
