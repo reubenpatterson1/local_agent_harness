@@ -1107,3 +1107,21 @@ def test_ld23_a_retrain_needs_force(env, monkeypatch, tmp_path, capsys):
     assert ld.train(_train_args(video=True, force=True)) == 0
     assert calls == ["video"]
     assert ll.load_location("harbour-street")["loras"]["stills"] == data["loras"]["stills"]
+
+
+def test_ld25_regenerate_refuses_a_missing_photo_copy(env, monkeypatch, tmp_path, capsys):
+    _Fakes(monkeypatch)
+    paths = _photos(tmp_path, 2)
+    assert ld.create(_create_args(name="old-mill", photos=paths, description=lt.MILL_DESC)) == 0
+    mdir = os.path.join(env["locations"], "old-mill")
+    os.remove(os.path.join(mdir, "photos", "photo_01.png"))
+    with open(os.path.join(mdir, "location.json"), "rb") as f:
+        before = f.read()
+    stills_before = sorted(os.listdir(os.path.join(mdir, "stills")))
+    capsys.readouterr()
+    _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", regenerate=True, new_seed=True)) == 2
+    assert "is missing its photo copy" in capsys.readouterr().err
+    with open(os.path.join(mdir, "location.json"), "rb") as f:
+        assert f.read() == before
+    assert sorted(os.listdir(os.path.join(mdir, "stills"))) == stills_before

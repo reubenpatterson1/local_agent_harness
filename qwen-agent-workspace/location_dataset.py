@@ -432,7 +432,7 @@ def build_dataset(data, force=False):
     RuntimeError, printed, or an abort; status stays "dataset") or 3 (fewer than MIN_KEEP kept)."""
     try:
         return _build_dataset(data, force)
-    except (DatasetError, RuntimeError) as e:
+    except (DatasetError, RuntimeError, OSError) as e:
         print("Error: %s" % e, file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
@@ -689,6 +689,12 @@ def _regenerate(args):
         problem = _edit_models_problem()
         if problem:
             return _error(problem)
+    if data["source"] == "photos":
+        for k in range(1, len(data["photos"]) + 1):
+            copy = photo_copy_path(location_lib.location_dir(name), k)
+            if not os.path.isfile(copy):
+                return _error("location %s is missing its photo copy %s; delete %s and create the "
+                              "location again" % (name, copy, location_lib.location_dir(name)))
     old_seed = data["seed"]
     if args.new_seed:
         new_seed = 0 if old_seed >= SEED_MAX else old_seed + 1
