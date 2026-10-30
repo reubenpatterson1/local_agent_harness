@@ -378,3 +378,119 @@ def test_review_focus_2_an_accented_place_name_round_trips(env, monkeypatch, cap
                               env=c_locale, timeout=60)
         assert proc.returncode == 0, proc.stderr
         assert CAFE_DESC in proc.stdout.decode("utf-8"), argv
+
+
+# --- LT9, LT10: bin/location-train-vlm and train's kinds (L2.1, L2.2) -------------------------
+
+def test_lt1b_train_help(env):
+    proc = _subprocess(["train", "--help"])
+    assert proc.returncode == 0
+    for flag in ("--video", "--stills", "--force"):
+        assert flag in proc.stdout, flag
+
+
+def _vlm_wrapper_bin(tmp_path, location_body):
+    """A temporary bin/ holding a copy of bin/location-train-vlm and stub story-server,
+    story-server-restore and location scripts that log their arguments to calls.log."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    shutil.copy2(os.path.join(WS, "bin", "location-train-vlm"), str(bindir / "location-train-vlm"))
+    log = tmp_path / "calls.log"
+    for name, body in (("story-server", 'echo "story-server $*" >> %s\n' % log),
+                       ("story-server-restore", 'echo "story-server-restore $*" >> %s\n' % log),
+                       ("location", 'echo "location $*" >> %s\n%s' % (log, location_body))):
+        path = bindir / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+    return str(bindir / "location-train-vlm"), log
+
+
+def test_lt9_location_train_vlm(env, tmp_path):
+    with open(os.path.join(WS, "bin", "location-train-vlm"), encoding="utf-8") as f:
+        script = f.read().split("\n")
+    with open(os.path.join(WS, "bin", "character-train-vlm"), encoding="utf-8") as f:
+        character = f.read().split("\n")
+    assert script[1].startswith("# location-train-vlm -- run a location training")
+    assert script[5:] == [line.replace("character-train-vlm", "location-train-vlm").replace(
+        '"$PY" "$DIR/character" train "$@"', '"$PY" "$DIR/location" train "$@"')
+        for line in character[5:]]
+    assert os.access(os.path.join(WS, "bin", "location-train-vlm"), os.X_OK)
+    for rc in (0, 1):
+        case = tmp_path / ("rc%d" % rc)
+        case.mkdir()
+        wrapper, log = _vlm_wrapper_bin(case, "exit %d\n" % rc)
+        proc = subprocess.run(["/bin/bash", wrapper, "/bin/sh", "harbour-street", "--video"],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == rc, proc.stderr
+        assert log.read_text().splitlines() == ["story-server stop",
+                                                "location train harbour-street --video",
+                                                "story-server-restore mlx-vision --wait"]
+        assert "location-train-vlm: training exited %d" % rc in proc.stderr
+    case = tmp_path / "signal"
+    case.mkdir()
+    marker = case / "running"
+    wrapper, log = _vlm_wrapper_bin(case, "touch %s\nsleep 30\n" % marker)
+    proc = subprocess.Popen(["/bin/bash", wrapper, "/bin/sh", "harbour-street"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            start_new_session=True)
+    try:
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
+        os.killpg(proc.pid, signal.SIGTERM)
+        _out, err = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+    assert proc.returncode == 130
+    assert "location-train-vlm: interrupted; restarting the VLM in the background" in err
+    assert log.read_text().splitlines() == ["story-server stop", "location train harbour-street",
+                                            "story-server-restore mlx-vision"]
+
+
+def test_lt10_train_with_neither_flag_trains_both(env, monkeypatch, tmp_path, capsys):
+    lt.harbour(env["locations"], status="untrained")
+    ldir = os.path.join(env["locations"], "harbour-street")
+    with open(os.path.join(ldir, "manifest.json"), "w") as f:
+        json.dump({"items": [{"n": n, "kept": n <= 21} for n in range(1, 25)]}, f)
+    dev = tmp_path / "dev-model"
+    dev.mkdir()
+    (dev / "transformer-dev.safetensors").write_bytes(b"dev")
+    stub = tmp_path / "stub-bin"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(character_dataset, "busy_process", lambda: None)
+    monkeypatch.setattr(character_dataset, "story_server_state", lambda: "STOPPED")
+    monkeypatch.setattr(character_dataset.psutil, "virtual_memory",
+                        lambda: type("M", (), {"available": 64.0 * 2 ** 30})())
+    monkeypatch.setattr(character_dataset, "TRAIN_MODEL_DIR", str(dev))
+    monkeypatch.setattr(character_dataset, "TEST_MODEL_DIR", str(tmp_path))
+    monkeypatch.setattr(character_dataset.SKILL, "LTX2_MLX_BIN", str(stub))
+    monkeypatch.setattr(character_dataset, "MFLUX_TRAIN", str(stub))
+    calls = []
+
+    def _video_core(owner_dir, videos, captions, prompt, note, recorded, tested):
+        calls.append("video")
+        if len(calls) == 1:
+            return "failed"
+        path = os.path.join(owner_dir, "lora", "video.safetensors")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"lora")
+        recorded({"path": path, "sha256": "0" * 64, "rank": 32, "alpha": 32, "steps": 1000})
+        return "test_failed"
+
+    monkeypatch.setattr(character_dataset, "train_video_lora", _video_core)
+    monkeypatch.setattr(character_dataset, "train_stills_lora",
+                        lambda *args: calls.append("stills") or "ok")
+    monkeypatch.setattr(character_dataset, "free_gib", lambda path: 15.9)
+    assert tool.main(["train", "harbour-street"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: only 15.9 GiB free at %s; training video and stills needs 16 GiB\n" % ldir)
+    assert tool.main(["train", "harbour-street", "--video"]) == 1
+    assert calls == ["video"]
+    monkeypatch.setattr(character_dataset, "free_gib", lambda path: 16.0)
+    assert tool.main(["train", "harbour-street"]) == 1
+    assert calls == ["video", "video", "stills"]
+    assert ll.load_location("harbour-street")["status"] == "trained"

@@ -8,7 +8,7 @@ only the time of day, the weather or the season (photo mode). The vision model c
 still; the kept ones get a trigger-led caption and a 1-frame mp4. Training reuses
 character_dataset.train_video_lora and train_stills_lora.
 
-Top-level imports are stdlib, PIL, character_dataset and location_lib. All
+Top-level imports are stdlib, PIL, psutil, character_dataset and location_lib. All
 image work runs in character_dataset's own child processes (run_zimage_child, run_edit_child),
 so character_dataset.busy_process's markers cover location work. Every gate, VLM call and child
 is called through the character_dataset module, so a test fake there applies here too.
@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 
+import psutil
 from PIL import Image, ImageDraw, ImageOps
 
 WS = os.path.dirname(os.path.realpath(__file__))
@@ -152,6 +153,10 @@ REASON_GROUPS = (("people visible", "people visible"), ("score ", "score below 7
                  ("unparseable", "unparseable"))
 BLOCKED = "blocked by the content screen"
 FORCE_HINT = " (pass --force to keep it)"
+# Spec 3.3, 3.4: the trigger-only test prompt of both LoRAs.
+TEST_PROMPT = "%s, wide establishing shot at dusk, empty of people."
+SKIP_INSTALL_HINT = ("install mflux as described in "
+                     "docs/superpowers/specs/2026-10-05-character-library-design.md section 4.10")
 
 
 def _error(message):
@@ -743,3 +748,145 @@ def edit(args):
         location_lib.write_location(data)
     print("description: %s" % description)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# train (spec 3.1-3.4)
+# ---------------------------------------------------------------------------
+
+def _train_video(data):
+    """The video LoRA through character_dataset.train_video_lora (spec 3.3). Returns its
+    outcome."""
+    name = data["name"]
+    loc_dir = location_lib.location_dir(name)
+    clips = {}
+
+    def recorded(entry):
+        data["loras"]["video"] = {"path": entry["path"], "sha256": entry["sha256"],
+                                  "base_model": location_lib.VIDEO_BASE_MODEL,
+                                  "rank": entry["rank"], "alpha": entry["alpha"],
+                                  "steps": entry["steps"]}
+        data["trained_at"] = location_lib.utc_now()
+        data["status"] = "trained"
+        location_lib.write_location(data)
+
+    def tested(key, path):
+        clips[key] = path
+
+    outcome = character_dataset.train_video_lora(
+        loc_dir, os.path.join(loc_dir, "videos"), os.path.join(loc_dir, "captions"),
+        TEST_PROMPT % data["trigger"], "location %s stays %s" % (name, data["status"]),
+        recorded, tested)
+    if outcome == "failed":
+        return outcome
+    entry = data["loras"]["video"]
+    print("video LoRA: %s (sha256 %s)" % (entry["path"], entry["sha256"]))
+    print("trigger-only A/B (compare by eye; the LoRA clip should show the place, the control a "
+          "different place):")
+    print("  with LoRA: %s" % clips.get("sample_path"))
+    print("  control:   %s" % clips.get("control_path"))
+    return outcome
+
+
+def _train_stills(data):
+    """The stills LoRA through character_dataset.train_stills_lora (spec 3.4). Returns its
+    outcome."""
+    loc_dir = location_lib.location_dir(data["name"])
+    with open(os.path.join(loc_dir, "manifest.json"), encoding="utf-8") as f:
+        kept_ns = [item["n"] for item in json.load(f)["items"] if item["kept"]]
+    pairs = [(still_path(loc_dir, n), os.path.join(loc_dir, "captions", "loc_%02d.txt" % n))
+             for n in kept_ns]
+
+    def kept_ok(entry, sample_path, control_path):
+        data["loras"]["stills"] = {"path": entry["path"], "sha256": entry["sha256"],
+                                   "base_model": location_lib.STILLS_BASE_MODEL,
+                                   "rank": entry["rank"], "alpha": entry["alpha"],
+                                   "steps": entry["steps"]}
+        data["stills_skip_reason"] = None
+        location_lib.write_location(data)
+
+    def skipped(reason):
+        data["stills_skip_reason"] = reason
+        location_lib.write_location(data)
+
+    return character_dataset.train_stills_lora(loc_dir, pairs, TEST_PROMPT % data["trigger"],
+                                               data["seed"], kept_ok, skipped)
+
+
+def train(args):
+    """bin/location train NAME (spec 3.2). Returns 0, 1 or 2."""
+    name = args.name
+    try:
+        data = location_lib.load_location(name)
+    except location_lib.LocationError as e:
+        return _error(e)
+    if data["status"] == "dataset":
+        kept = data["dataset"]["kept"] if data["dataset"] else 0
+        return _error("location %s has no accepted dataset (status dataset, %d of 24 stills kept, "
+                      "need 12); fix it with bin/location create %s --regenerate"
+                      % (name, kept, name))
+    requested = [k for k in ("video", "stills") if getattr(args, k)] or ["video", "stills"]
+    explicit_stills = args.stills
+    for kind in requested:
+        if data["loras"][kind] is not None and not args.force:
+            return _error("location %s already has a %s LoRA (%s); pass --force to retrain it"
+                          % (name, kind, data["loras"][kind]["path"]))
+    loc_dir = location_lib.location_dir(name)
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(character_dataset.library_lock())
+        except DatasetError as e:
+            return _error(e)
+        busy = character_dataset.busy_process()
+        if busy is not None:
+            return _error("a render or training process is running (pid %d: %s); bin/location "
+                          "never trains or generates concurrently with a render" % busy)
+        state = character_dataset.story_server_state()
+        if state != "STOPPED":
+            return _error("the story server is %s; stop it first with bin/story-server stop "
+                          "(training needs its memory)" % state)
+        avail = psutil.virtual_memory().available / 2 ** 30
+        if avail < character_dataset.TRAIN_MIN_AVAIL_GIB:
+            return _error("only %.1f GiB of memory is available; training needs 30 GiB (quit "
+                          "memory-heavy apps and retry)" % avail)
+        need = character_dataset.TRAIN_MIN_FREE_GIB_PER_KIND * len(requested)
+        free = character_dataset.free_gib(loc_dir)
+        if free < need:
+            return _error("only %.1f GiB free at %s; training %s needs %d GiB"
+                          % (free, loc_dir, " and ".join(requested), need))
+        if "video" in requested:
+            model_dir = character_dataset.TRAIN_MODEL_DIR
+            if (not os.path.isfile(os.path.join(model_dir, "transformer-dev.safetensors"))
+                    or os.path.exists(os.path.join(model_dir, "transformer.safetensors"))
+                    or os.path.exists(os.path.join(model_dir,
+                                                   "transformer-distilled.safetensors"))):
+                return _error("%s must contain transformer-dev.safetensors and neither "
+                              "transformer.safetensors nor transformer-distilled.safetensors "
+                              "(the trainer would pick those first)" % model_dir)
+            if not os.path.isdir(character_dataset.TEST_MODEL_DIR):
+                return _error("test-render model not found: %s" % character_dataset.TEST_MODEL_DIR)
+            binary = character_dataset.SKILL.LTX2_MLX_BIN
+            if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+                return _error("ltx-2-mlx binary not found or not executable: %s" % binary)
+
+        stills_outcome = "ok"
+        mflux = character_dataset.MFLUX_TRAIN
+        if "stills" in requested and not (os.path.isfile(mflux) and os.access(mflux, os.X_OK)):
+            data["stills_skip_reason"] = "mflux-train not found at %s" % mflux
+            location_lib.write_location(data)
+            print("stills LoRA skipped: %s; %s" % (data["stills_skip_reason"], SKIP_INSTALL_HINT))
+            requested.remove("stills")
+            stills_outcome = "skipped"
+
+        video_outcome = "ok"
+        if "video" in requested:
+            video_outcome = _train_video(data)
+            if video_outcome == "failed":
+                return 1
+        if "stills" in requested:
+            stills_outcome = _train_stills(data)
+        if (video_outcome == "test_failed" or stills_outcome == "failed"
+                or (stills_outcome == "skipped" and explicit_stills)):
+            return 1
+        return 0

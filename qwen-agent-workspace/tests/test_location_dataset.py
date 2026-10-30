@@ -793,3 +793,317 @@ def test_ld24_regenerate(env, monkeypatch, tmp_path, capsys):
     assert ld.create(_create_args(name="old-mill", regenerate=True, new_seed=True)) == 0
     assert sorted(os.listdir(os.path.join(mdir, "photos"))) == ["photo_01.png", "photo_02.png"]
     assert fakes.child_specs[0][0]["jobs"][0]["image"] == os.path.join(mdir, "stills", "loc_01.png")
+
+
+# --- Task 5 helpers: a location ready to train, and the training fakes ------------------------
+
+def _untrained_location(env, kept=21):
+    """An untrained harbour-street with a real dataset layout: 24 tiny stills, and captions,
+    1-frame "videos" and manifest items for the kept ones (n 1..kept)."""
+    ldir = os.path.join(env["locations"], "harbour-street")
+    for sub in ("stills", "captions", "videos"):
+        os.makedirs(os.path.join(ldir, sub), exist_ok=True)
+    items = []
+    for n in range(1, 25):
+        Image.new("RGB", (8, 8), (n, n, n)).save(os.path.join(ldir, "stills", "loc_%02d.png" % n))
+        if n <= kept:
+            with open(os.path.join(ldir, "captions", "loc_%02d.txt" % n), "w") as f:
+                f.write("harboplc, wide shot, n %d" % n)
+            with open(os.path.join(ldir, "videos", "loc_%02d.mp4" % n), "wb") as f:
+                f.write(b"mp4")
+        items.append({"n": n, "kept": n <= kept})
+    with open(os.path.join(ldir, "manifest.json"), "w") as f:
+        json.dump({"items": items}, f)
+    data = lt.harbour(env["locations"], status="untrained")
+    data["dataset"]["kept"] = kept
+    ll.write_location(data)
+    return data
+
+
+def _fake_video_tools(monkeypatch, preprocess_rc=0):
+    """run_logged and SKILL.generate_video fakes (tests/test_character_dataset.py:579-614);
+    returns the recorded calls."""
+    record = {"run": [], "generate": []}
+
+    def _run(cmd, log_path, cwd, env, timeout_s):
+        record["run"].append({"cmd": cmd, "cwd": cwd, "env": env})
+        if cmd[1] == "preprocess":
+            out_dir = cmd[cmd.index("-o") + 1]
+            latent_dir = os.path.join(out_dir, ".precomputed", "latents")
+            os.makedirs(latent_dir)
+            for i in range(len(os.listdir(cmd[cmd.index("--videos") + 1]))):
+                open(os.path.join(latent_dir, "l%02d.safetensors" % i), "wb").close()
+            return preprocess_rc
+        ckpt_dir = os.path.join(os.path.dirname(cmd[cmd.index("--config") + 1]), "out",
+                                "checkpoints")
+        os.makedirs(ckpt_dir)
+        with open(os.path.join(ckpt_dir, character_dataset.VIDEO_FINAL_CKPT), "wb") as f:
+            f.write(b"lora")
+        return 0
+
+    def _generate(prompt, output_path, **kwargs):
+        record["generate"].append(dict(kwargs, prompt=prompt, output_path=output_path))
+        with open(output_path, "wb") as f:
+            f.write(b"mp4")
+        return output_path
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run)
+    monkeypatch.setattr(character_dataset.SKILL, "generate_video", _generate)
+    return record
+
+
+def _fake_stills_tools(monkeypatch, injected=2):
+    """run_logged (mflux-train) and run_zimage_child fakes (tests/test_character_dataset.py:
+    968-998); returns the recorded calls."""
+    import struct
+    import zipfile
+    record = {"run": [], "children": []}
+    keys = ["layers.0.attention.to_q.lora_A.weight", "layers.0.attention.to_q.lora_B.weight",
+            "layers.0.attention.to_k.lora_A.weight", "layers.0.attention.to_k.lora_B.weight"]
+    header = {"__metadata__": {"format": "pt"}}
+    for i, key in enumerate(keys):
+        header[key] = {"dtype": "F32", "shape": [1], "data_offsets": [4 * i, 4 * i + 4]}
+    raw = json.dumps(header).encode("utf-8")
+    adapter = struct.pack("<Q", len(raw)) + raw + b"\0" * 16
+
+    def _run(cmd, log_path, cwd, env, timeout_s):
+        record["run"].append({"cmd": cmd, "cwd": cwd, "env": env})
+        with open(cmd[cmd.index("--config") + 1]) as f:
+            config = json.load(f)
+        out = config["checkpoint"]["output_path"]
+        zip_path = os.path.join(out, "checkpoints",
+                                "%07d_checkpoint.zip" % config["checkpoint"]["save_frequency"])
+        os.makedirs(os.path.dirname(zip_path))
+        with zipfile.ZipFile(zip_path, "w") as archive:
+            archive.writestr("0000672_adapter.safetensors", adapter)
+        return 0
+
+    def _child(spec, loc_dir, step):
+        record["children"].append((spec, step))
+        for job in spec["jobs"]:
+            Image.new("RGB", (16, 10), (1, 2, 3)).save(job["output_path"])
+        return {"jobs": [{"output_path": j["output_path"], "status": "ok", "seconds": 1.0}
+                         for j in spec["jobs"]],
+                "injected_lora_modules": injected if spec["loras"] else None}
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run)
+    monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
+    return record
+
+
+class _Memory(object):
+    def __init__(self, available):
+        self.available = available
+
+
+def _train_ready(monkeypatch, tmp_path):
+    """Every train preflight passes: no busy process, server STOPPED, 64 GiB available, 100 GiB
+    free, a valid dev-model dir, a test-model dir and executable stub binaries."""
+    dev = tmp_path / "dev-model"
+    dev.mkdir(parents=True)
+    (dev / "transformer-dev.safetensors").write_bytes(b"dev")
+    test_model = tmp_path / "test-model"
+    test_model.mkdir(parents=True)
+    stub = tmp_path / "stub-bin"
+    stub.write_text("#!/bin/sh\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(character_dataset, "busy_process", lambda: None)
+    monkeypatch.setattr(character_dataset, "story_server_state", lambda: "STOPPED")
+    monkeypatch.setattr(character_dataset.psutil, "virtual_memory", lambda: _Memory(64.0 * 2 ** 30))
+    monkeypatch.setattr(character_dataset, "free_gib", lambda path: 100.0)
+    monkeypatch.setattr(character_dataset, "TRAIN_MODEL_DIR", str(dev))
+    monkeypatch.setattr(character_dataset, "TEST_MODEL_DIR", str(test_model))
+    monkeypatch.setattr(character_dataset.SKILL, "LTX2_MLX_BIN", str(stub))
+    monkeypatch.setattr(character_dataset, "MFLUX_TRAIN", str(stub))
+    monkeypatch.setattr(ll, "utc_now", lambda: "2026-10-29T12:34:56Z")
+    return dev
+
+
+def _train_args(video=False, stills=False, force=False):
+    return argparse.Namespace(command="train", name="harbour-street", video=video, stills=stills,
+                              force=force)
+
+
+# --- LD19-LD23: training (L2.2-L2.4) ----------------------------------------------------------
+
+def test_ld19_the_train_preflight_order(env, monkeypatch, tmp_path, capsys):
+    _untrained_location(env)
+    ldir = os.path.join(env["locations"], "harbour-street")
+
+    def _never(*args):
+        raise AssertionError("a training core ran")
+
+    def _case(name, override, message):
+        with monkeypatch.context() as m:
+            dev = _train_ready(m, tmp_path / name)
+            m.setattr(character_dataset, "train_video_lora", _never)
+            m.setattr(character_dataset, "train_stills_lora", _never)
+            override(m, dev)
+            assert ld.train(_train_args()) == 2, name
+        assert capsys.readouterr().err == "Error: " + message + "\n", name
+
+    lock = os.path.join(env["lib"], ".lock")
+
+    def _hold_lock(m, dev):
+        os.makedirs(env["lib"], exist_ok=True)
+        with open(lock, "w") as f:
+            f.write(str(os.getppid()))
+
+    _case("lock", _hold_lock, "another bin/character create/train is running (pid %d); run one "
+          "at a time" % os.getppid())
+    os.remove(lock)
+    _case("busy", lambda m, dev: m.setattr(character_dataset, "busy_process",
+                                           lambda: (4242, "python3 bin/ltx-mlx-render m.json")),
+          "a render or training process is running (pid 4242: python3 bin/ltx-mlx-render "
+          "m.json); bin/location never trains or generates concurrently with a render")
+    _case("server", lambda m, dev: m.setattr(character_dataset, "story_server_state",
+                                             lambda: "SERVING mlx-vision"),
+          "the story server is SERVING mlx-vision; stop it first with bin/story-server stop "
+          "(training needs its memory)")
+
+    def _server_and_memory(m, dev):
+        m.setattr(character_dataset, "story_server_state", lambda: "UNKNOWN")
+        m.setattr(character_dataset.psutil, "virtual_memory", lambda: _Memory(29.9 * 2 ** 30))
+
+    _case("order", _server_and_memory, "the story server is UNKNOWN; stop it first with "
+          "bin/story-server stop (training needs its memory)")
+    _case("memory", lambda m, dev: m.setattr(character_dataset.psutil, "virtual_memory",
+                                             lambda: _Memory(29.9 * 2 ** 30)),
+          "only 29.9 GiB of memory is available; training needs 30 GiB (quit memory-heavy apps "
+          "and retry)")
+    _case("disk", lambda m, dev: m.setattr(character_dataset, "free_gib", lambda path: 15.9),
+          "only 15.9 GiB free at %s; training video and stills needs 16 GiB" % ldir)
+    _case("dev", lambda m, dev: (dev / "transformer-distilled.safetensors").write_bytes(b"x"),
+          "%s must contain transformer-dev.safetensors and neither transformer.safetensors nor "
+          "transformer-distilled.safetensors (the trainer would pick those first)"
+          % (tmp_path / "dev" / "dev-model"))
+    _case("test-model", lambda m, dev: m.setattr(character_dataset, "TEST_MODEL_DIR",
+                                                 str(tmp_path / "nowhere")),
+          "test-render model not found: %s" % (tmp_path / "nowhere"))
+    _case("binary", lambda m, dev: m.setattr(character_dataset.SKILL, "LTX2_MLX_BIN",
+                                             str(tmp_path / "no-bin")),
+          "ltx-2-mlx binary not found or not executable: %s" % (tmp_path / "no-bin"))
+    assert not os.path.exists(lock)
+    data = ll.load_location("harbour-street")
+    data["status"], data["dataset"] = "dataset", None
+    ll.write_location(data)
+    assert ld.train(_train_args()) == 2
+    assert capsys.readouterr().err == (
+        "Error: location harbour-street has no accepted dataset (status dataset, 0 of 24 stills "
+        "kept, need 12); fix it with bin/location create harbour-street --regenerate\n")
+    data["dataset"] = {"kept": 9, "total": 24, "min_score": 7,
+                       "contact_sheet": os.path.join(ldir, "contact_sheet.jpg")}
+    ll.write_location(data)
+    assert ld.train(_train_args()) == 2
+    assert "(status dataset, 9 of 24 stills kept, need 12)" in capsys.readouterr().err
+
+
+def test_ld20_the_video_lora(env, monkeypatch, tmp_path, capsys):
+    _untrained_location(env)
+    ldir = os.path.join(env["locations"], "harbour-street")
+    _train_ready(monkeypatch, tmp_path)
+    record = _fake_video_tools(monkeypatch)
+    assert ld.train(_train_args(video=True)) == 0
+    data = ll.load_location("harbour-street")
+    lora = os.path.join(ldir, "lora", "video.safetensors")
+    assert data["loras"]["video"] == {"path": lora, "sha256": ld._sha256(lora),
+                                      "base_model": "dgrauet/ltx-2.3-mlx-q8", "rank": 32,
+                                      "alpha": 32, "steps": 1000}
+    assert (data["status"], data["trained_at"], data["loras"]["stills"]) == (
+        "trained", "2026-10-29T12:34:56Z", None)
+    preprocess, train = record["run"]
+    assert preprocess["cmd"][preprocess["cmd"].index("--videos") + 1] == os.path.join(ldir, "videos")
+    assert preprocess["cmd"][preprocess["cmd"].index("--captions") + 1] == os.path.join(ldir,
+                                                                                    "captions")
+    with open(os.path.join(ldir, "train", "video", "train.yaml")) as f:
+        assert '"harboplc, wide establishing shot at dusk, empty of people."' in f.read()
+    first, second = record["generate"]
+    prompt = "harboplc, wide establishing shot at dusk, empty of people."
+    assert (first["prompt"], first["loras"], first["width"], first["height"], first["num_frames"],
+            first["seed"], first["model"]) == (prompt, [(lora, 1.0)], 512, 320, 25, 42,
+                                               character_dataset.TEST_MODEL_DIR)
+    assert first["output_path"] == os.path.join(ldir, "tests", "video_lora.mp4")
+    assert "loras" not in second and second["output_path"] == os.path.join(ldir, "tests",
+                                                                            "video_control.mp4")
+    out = capsys.readouterr().out
+    assert ("video LoRA: %s (sha256 %s)\ntrigger-only A/B (compare by eye; the LoRA clip should "
+            "show the place, the control a different place):\n  with LoRA: %s\n  control:   %s\n"
+            % (lora, ld._sha256(lora), first["output_path"], second["output_path"])) in out
+    _fake_video_tools(monkeypatch, preprocess_rc=1)
+    assert ld.train(_train_args(video=True, force=True)) == 1
+    err = capsys.readouterr().err
+    assert "Error: video LoRA training failed at preprocess (exit 1); log: " in err
+    assert err.endswith("; location harbour-street stays trained\n")
+
+
+def test_ld21_the_stills_lora(env, monkeypatch, tmp_path):
+    data = _untrained_location(env, kept=21)
+    data["stills_skip_reason"] = "mflux-train not found at /x"
+    ll.write_location(data)
+    ldir = os.path.join(env["locations"], "harbour-street")
+    _train_ready(monkeypatch, tmp_path)
+    record = _fake_stills_tools(monkeypatch)
+    assert ld.train(_train_args(stills=True)) == 0
+    data = ll.load_location("harbour-street")
+    stills = os.path.join(ldir, "lora", "stills.safetensors")
+    steps = character_dataset.stills_epochs(21)[1]
+    assert data["loras"]["stills"] == {"path": stills, "sha256": ld._sha256(stills),
+                                       "base_model": "Tongyi-MAI/Z-Image-Turbo", "rank": 16,
+                                       "alpha": 16, "steps": steps}
+    assert (data["stills_skip_reason"], data["status"]) == (None, "untrained")
+    data_dir = os.path.join(ldir, "train", "stills", "data")
+    assert sorted(os.listdir(data_dir)) == sorted(
+        ["loc_%02d.png" % n for n in range(1, 22)] + ["loc_%02d.txt" % n for n in range(1, 22)]
+        + ["preview_1.txt"])
+    with open(os.path.join(ldir, "train", "stills", "train.json")) as f:
+        assert json.load(f) == character_dataset.stills_train_config(
+            data_dir, os.path.join(ldir, "train", "stills", "out"), 0, 21)
+    (gate, gate_step), (control, control_step) = record["children"]
+    assert (gate_step, control_step) == ("test-stills-lora", "test-stills-control")
+    assert gate["jobs"][0]["prompt"] == "harboplc, wide establishing shot at dusk, empty of people."
+    assert os.path.isfile(os.path.join(ldir, "tests", "stills_lora.png"))
+
+
+def test_ld22_a_compat_reject_keeps_the_location_usable(env, monkeypatch, tmp_path, capsys):
+    _untrained_location(env)
+    ldir = os.path.join(env["locations"], "harbour-street")
+    _train_ready(monkeypatch, tmp_path)
+    _fake_video_tools(monkeypatch)
+    video_run = character_dataset.run_logged
+    _fake_stills_tools(monkeypatch, injected=1)
+    stills_run = character_dataset.run_logged
+    monkeypatch.setattr(character_dataset, "run_logged", lambda cmd, *rest: (
+        stills_run if cmd[1] == "--config" else video_run)(cmd, *rest))
+    assert ld.train(_train_args()) == 0
+    data = ll.load_location("harbour-street")
+    assert os.path.isfile(os.path.join(ldir, "lora", "stills.rejected.safetensors"))
+    assert not os.path.exists(os.path.join(ldir, "lora", "stills.safetensors"))
+    assert data["stills_skip_reason"] == (
+        "mflux adapter incompatible with z_image_skill: only 1 of 2 LoRA modules in the adapter "
+        "matched the Z-Image transformer")
+    assert (data["status"], data["loras"]["stills"]) == ("trained", None)
+    assert data["loras"]["video"] is not None
+    assert ("stills LoRA skipped: %s; the video LoRA is unaffected" % data["stills_skip_reason"]
+            in capsys.readouterr().out)
+    pin = ll.resolve_locations(["harbour-street"])[0]
+    assert (pin.stills_lora, pin.stills_skip_reason) == (None, data["stills_skip_reason"])
+    assert ld.train(_train_args(stills=True)) == 1
+
+
+def test_ld23_a_retrain_needs_force(env, monkeypatch, tmp_path, capsys):
+    data = lt.harbour(env["locations"], stills=True)
+    _train_ready(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(character_dataset, "train_video_lora",
+                        lambda *args: calls.append("video") or "ok")
+    monkeypatch.setattr(character_dataset, "train_stills_lora",
+                        lambda *args: calls.append("stills") or "ok")
+    assert ld.train(_train_args(video=True)) == 2
+    assert capsys.readouterr().err == (
+        "Error: location harbour-street already has a video LoRA (%s); pass --force to retrain "
+        "it\n" % data["loras"]["video"]["path"])
+    assert ld.train(_train_args()) == 2 and calls == []
+    capsys.readouterr()
+    assert ld.train(_train_args(video=True, force=True)) == 0
+    assert calls == ["video"]
+    assert ll.load_location("harbour-street")["loras"]["stills"] == data["loras"]["stills"]

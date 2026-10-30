@@ -4,6 +4,7 @@
   bin/location create NAME [--description TEXT] [--photo PATH ...] [--trigger WORD] [--seed N]
                            [--force]
   bin/location create NAME --regenerate [--seed N | --new-seed] [--description TEXT] [--force]
+  bin/location train NAME [--video] [--stills] [--force]
   bin/location edit NAME --description TEXT
   bin/location list
   bin/location show NAME
@@ -13,13 +14,15 @@ Without --photo the 24 stills are drawn from --description by Z-Image. With --ph
 the stills are the photos plus Qwen-Image-Edit-2511 edits of them that change only the time of
 day, the weather or the season: angles come only from the photos, so 3-5 photos taken from
 different spots are recommended; without --description the vision model drafts one from the first
-5 photos. edit saves a photo location's new description. list and show read the library only. A
-trained location is pinned in a movie with bin/ltx-movie --location NAME.
+5 photos. train trains the video LoRA (ltx-2-mlx) and, when mflux is installed and its adapter
+passes the compat gate, the stills LoRA; neither flag means both. edit saves a photo location's
+new description. list and show read the library only. A trained location is pinned in a movie
+with bin/ltx-movie --location NAME.
 
 Exit codes: 0 success, 1 runtime failure, 2 argument or precondition failure, 3 create kept fewer
 than 12 stills.
 
-list/show import location_lib only (stdlib); create and edit import location_dataset, which needs
+list/show import location_lib only (stdlib); create, train and edit import location_dataset, which needs
 PIL and psutil: without them bin/location re-executes itself under $CHARACTER_PYTHON (default
 ~/img-gen/bin/python). See docs/superpowers/specs/2026-10-29-location-lora-design.md.
 """
@@ -65,6 +68,11 @@ def build_parser():
                    help="rebuild an existing location's dataset")
     p.add_argument("--new-seed", dest="new_seed", action="store_true",
                    help="with --regenerate: use the stored seed + 1")
+    t = sub.add_parser("train", help="train the video LoRA and/or the stills LoRA")
+    t.add_argument("name", metavar="NAME")
+    t.add_argument("--video", action="store_true")
+    t.add_argument("--stills", action="store_true")
+    t.add_argument("--force", action="store_true", help="retrain a LoRA that already exists")
     e = sub.add_parser("edit", help="save a photo location's new description")
     e.add_argument("name", metavar="NAME")
     e.add_argument("--description", required=True, metavar="TEXT")
@@ -125,7 +133,9 @@ def main(argv=None):
     import location_dataset
     if args.command == "create":
         return location_dataset.create(args)
-    return location_dataset.edit(args)
+    if args.command == "edit":
+        return location_dataset.edit(args)
+    return location_dataset.train(args)
 
 
 def _interrupt(signum, frame):
