@@ -33,6 +33,7 @@
   <button id="tab-compose" type="button" class="tab active">Compose</button>
   <button id="tab-stories" type="button" class="tab">Stories</button>
   <button id="tab-characters" type="button" class="tab">Characters</button>
+  <button id="tab-locations" type="button" class="tab">Locations</button>
   <button id="tab-actions" type="button" class="tab">Actions</button>
   <button id="tab-loras" type="button" class="tab">LoRAs &amp; Models</button>
   <button id="tab-jobs" type="button" class="tab">Jobs</button>
@@ -111,6 +112,8 @@
     </div>
     <div class="wide muted">LoRA order: <span id="c-lora-order"></span></div>
     <label data-field="characters">Cast <select id="c-characters" multiple size="4"></select></label>
+    <label data-field="locations">Locations <select id="c-locations" multiple size="3"></select> <span id="c-locations-note" class="muted"></span></label>
+    <label data-field="location_strength">Location strength <input id="c-location-strength" type="number" min="0.05" max="1" step="0.05" placeholder="0.8"></label>
     <label data-field="action_loras" title="Trained action (motion) LoRAs, fused into every panel so the cast performs the move">Actions <select id="c-actions" multiple size="4"></select>
       Strength <input id="c-action-strength" type="number" min="0.05" max="2" step="0.05" placeholder="default"></label>
     <details class="wide">
@@ -194,6 +197,42 @@
   </div>
 </section>
 
+<section id="panel-locations" class="panel" hidden>
+  <table id="lo-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Source</th><th>Video</th><th>Stills</th><th>Description</th></tr></thead><tbody></tbody></table>
+  <h3>New location</h3>
+  <div class="grid">
+    <label>Name <input id="lo-name" type="text" size="24" placeholder="harbour-street"></label>
+    <label class="wide">Description <textarea id="lo-description" rows="3" cols="70"></textarea> <span id="lo-words" class="muted">0 words (15-40)</span></label>
+    <label>Trigger <input id="lo-trigger" type="text" size="16" placeholder="blank = auto"></label>
+    <label>Seed <input id="lo-seed" type="number" min="0"></label>
+    <label class="wide">Photos <input id="lo-photos" type="file" multiple accept="image/png,image/jpeg,image/webp"></label>
+  </div>
+  <p id="lo-angles-note" class="muted">Angles come only from your photos: every extra still keeps one photo's exact viewpoint and changes only its time of day, weather or season. For a varied dataset, upload 3-5 photos taken from different spots. Without photos, the 24 stills are drawn from the description.</p>
+  <div class="row"><button id="lo-create" type="button" disabled>Create</button> <span id="lo-create-status" class="muted"></span></div>
+  <div id="lo-detail" hidden>
+    <h2 id="lo-title"></h2>
+    <div class="gallery"><img id="lo-sheet" class="sheet" alt="contact sheet" hidden></div>
+    <div id="lo-stills" class="gallery"></div>
+    <div class="row">
+      <label class="wide">Description <textarea id="lo-desc-edit" rows="3" cols="70"></textarea></label>
+      <button id="lo-desc-save" type="button">Save description</button>
+    </div>
+    <div class="row">
+      <button id="lo-regen" type="button">Regenerate (new seed)</button>
+      <label title="keeps photos that show people; allows regenerating a trained location, which deletes its LoRAs"><input id="lo-force" type="checkbox"> Force</label>
+      <button id="lo-accept" type="button">Accept dataset</button>
+      <span id="lo-status" class="muted"></span>
+    </div>
+    <div id="lo-train-form" hidden>
+      <label><input id="lo-train-video" type="checkbox" checked> Video LoRA</label>
+      <label><input id="lo-train-stills" type="checkbox" checked> Stills LoRA</label>
+      <label><input id="lo-train-force" type="checkbox"> Force</label>
+      <button id="lo-train" type="button">Train</button> <span id="lo-train-reason" class="muted"></span>
+    </div>
+    <div id="lo-tests" class="gallery"></div>
+  </div>
+</section>
+
 <section id="panel-actions" class="panel" hidden>
   <table id="a-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Clips</th><th>Trigger</th></tr></thead><tbody></tbody></table>
   <h3>New action</h3>
@@ -237,6 +276,7 @@
     <label>Range <input id="l-range-lo" type="number" step="0.05" value="0.5"> to <input id="l-range-hi" type="number" step="0.05" value="1.0"></label>
     <label>Rank <input id="l-rank" type="number" min="1"></label>
     <label>Alpha <input id="l-alpha" type="number" min="1"></label>
+    <label><input id="l-no-arch-check" type="checkbox"> Skip architecture check</label> <span class="muted">The LoRA is cataloged even if bin/lora-check says it does not fit the base model; a mismatched LoRA fails or does nothing at render.</span>
   </div>
   <button id="l-add" type="button">Add to catalog</button>
   <pre id="l-output"></pre>

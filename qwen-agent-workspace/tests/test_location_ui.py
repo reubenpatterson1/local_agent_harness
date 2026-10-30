@@ -13,6 +13,8 @@ dispatched.
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -344,3 +346,62 @@ def test_lu14_a_location_job_reports_elapsed_and_last_line(env):
                            now=lib.parse_utc(started) + 5)
     assert (snap["kind"], snap["elapsed_s"], snap["last_line"]) == ("location-create", 5,
                                                                    "=== check ===")
+
+
+# --- LU13: the static page (L4.4, L4.5) --------------------------------------------------------
+
+LO_IDS = ("lo-list", "lo-name", "lo-description", "lo-words", "lo-trigger", "lo-seed", "lo-photos",
+          "lo-angles-note", "lo-create", "lo-create-status", "lo-detail", "lo-title", "lo-sheet",
+          "lo-stills", "lo-desc-edit", "lo-desc-save", "lo-regen", "lo-force", "lo-accept",
+          "lo-status", "lo-train-form", "lo-train-video", "lo-train-stills", "lo-train-force",
+          "lo-train", "lo-train-reason", "lo-tests")
+
+
+def test_lu13_the_static_page():
+    static = os.path.join(WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    for element in ("tab-locations", "panel-locations", "c-locations", "c-locations-note",
+                    "c-location-strength", "l-no-arch-check") + LO_IDS:
+        assert html.count('id="%s"' % element) == 1, element
+        if element not in ("panel-locations", "tab-locations", "lo-angles-note"):
+            assert '"#%s' % element in js, element
+    assert html.index('id="tab-characters"') < html.index('id="tab-locations"') < html.index(
+        'id="tab-actions"')
+    assert html.index('id="c-characters"') < html.index('id="c-locations"') < html.index(
+        'id="c-actions"')
+    assert ('<p id="lo-angles-note" class="muted">Angles come only from your photos: every extra '
+            "still keeps one photo's exact viewpoint and changes only its time of day, weather or "
+            "season. For a varied dataset, upload 3-5 photos taken from different spots. Without "
+            "photos, the 24 stills are drawn from the description.</p>") in html
+    assert '<select id="c-locations" multiple size="3"></select>' in html
+    assert ('<input id="c-location-strength" type="number" min="0.05" max="1" step="0.05" '
+            'placeholder="0.8">') in html
+    assert '<textarea id="lo-description" rows="3" cols="70"></textarea>' in html
+    assert ('<input id="lo-photos" type="file" multiple accept="image/png,image/jpeg,image/webp">'
+            in html)
+    assert ('<label><input id="l-no-arch-check" type="checkbox"> Skip architecture check</label> '
+            '<span class="muted">The LoRA is cataloged even if bin/lora-check says it does not fit '
+            'the base model; a mismatched LoRA fails or does nothing at render.</span>') in html
+    assert ('const TABS = ["compose", "stories", "characters", "locations", "actions", "loras", '
+            '"jobs", "traces"];') in js
+    assert ("loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), "
+            "loadModels()") in js
+    for text in ('"at most 3 locations"', '"with the LoRA"', '"without (control)"',
+                 '"Save description"', '"Regenerate with this description"',
+                 '"fewer than 12 stills kept; regenerate the dataset"', '" words (15-40)"',
+                 "no_arch_check: $(\"#l-no-arch-check\").checked",
+                 'location_strength: numberOrNull("#c-location-strength")',
+                 '(r.ok ? "ok" : r.problems.join("; ")) + (r.warnings && r.warnings.length ? " | '
+                 'warning: " + r.warnings.join("; ") : "")', "setupLocations();",
+                 'if (name === "locations") { loadLocations(); }'):
+        assert text in js, text
+    for pattern in (r"\son[a-z]+=", r"style=", r"<script>"):
+        assert not re.search(pattern, html), pattern
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
