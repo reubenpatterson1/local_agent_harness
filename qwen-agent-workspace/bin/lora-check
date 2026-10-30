@@ -158,6 +158,13 @@ def base_linear_map(base_dir):
     out = {}
     for key in merged:
         if not key.endswith(".weight"):
+            # Location library spec L4.7: a bare 2-D parameter (a scale/shift table) is a base
+            # target too, as the ltx-2-mlx fuser treats it (fuse_loras.py:103-105); a .weight
+            # entry is never replaced by one.
+            if not key.endswith(_QUANT_SUFFIXES + (".bias",)):
+                bshape = _shape(merged, key)
+                if bshape and len(bshape) == 2:
+                    out.setdefault(_core(key), (bshape[0], bshape[1], False))
             continue
         core = _core(key)
         wshape = _shape(merged, key)
@@ -176,6 +183,27 @@ def base_linear_map(base_dir):
                 in_f = ssh[1] * group
         out[core] = (out_f, in_f, quantized)
     return out
+
+
+# Location library spec L4.8: the ltx-2-mlx low-RAM path loads only transformer_blocks.* LoRA keys
+# (BlockLoraSource with block_prefix LTXV_LORA_BLOCK_PREFIX), so it skips every other module.
+LOW_RAM_WARNING = ("%d of %d modules are outside the transformer blocks and are skipped in low-RAM "
+                   "mode; render with --no-low-ram to use them")
+
+
+def low_ram_skipped(header):
+    """(outside, total): how many of the LoRA's target modules (lora_targets) lie outside the
+    transformer blocks, and how many there are."""
+    targets = lora_targets(header)
+    outside = sum(1 for module in targets if not module.startswith("transformer_blocks."))
+    return outside, len(targets)
+
+
+def low_ram_warning(header):
+    """LOW_RAM_WARNING for a LoRA that the low-RAM path skips in part (some, not all, of its
+    modules outside the transformer blocks), else None."""
+    outside, total = low_ram_skipped(header)
+    return LOW_RAM_WARNING % (outside, total) if 0 < outside < total else None
 
 
 def _match_base(base_map, module):
@@ -392,6 +420,14 @@ def main(argv=None):
                 status = "FAIL"
             elif dstatus == "PASS" and status == "PARTIAL":
                 status = "PASS"
+        warnings = []
+        if target == "video":
+            try:
+                warning = low_ram_warning(lc.read_safetensors_header(path))
+            except lc.CatalogError:
+                warning = None
+            if warning:
+                warnings.append(warning)
         quarantined = False
         if status == "FAIL":
             any_fail = True
@@ -399,7 +435,7 @@ def main(argv=None):
                 quarantined = bool(quarantine_catalog_entry(path))
         results.append({"path": path, "target": target, "source": source,
                         "status": status, "problems": problems,
-                        "quarantined": quarantined})
+                        "quarantined": quarantined, "warnings": warnings})
 
     if args.json:
         print(json.dumps({"results": results}, indent=2))
@@ -410,6 +446,8 @@ def main(argv=None):
             print("[%s] %s  (%s, %s)" % (r["status"], r["path"], r["target"], r["source"]))
             for p in r["problems"]:
                 print("    - " + p)
+            for w in r["warnings"]:
+                print("    ! " + w)
             if r["quarantined"]:
                 print("    -> quarantined and removed from the catalog")
         n_fail = sum(1 for r in results if r["status"] == "FAIL")

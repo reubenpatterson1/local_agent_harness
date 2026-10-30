@@ -40,6 +40,15 @@ def _load_checker():
         "lora_check", os.path.join(WS, "bin", "lora-check")).load_module()
 
 
+def _checker_or_none():
+    """bin/lora-check as a module, or None when it cannot be loaded (the low-RAM warning is then
+    skipped; location library spec L4.8)."""
+    try:
+        return _load_checker()
+    except Exception:  # noqa: BLE001 - tooling problem must not block cataloging
+        return None
+
+
 def _arch_gate(path, target, base_models):
     """Architecture gate for `add`: for every declared base model that can be
     located on disk, the LoRA must statically match it. Returns (ok, messages).
@@ -146,6 +155,11 @@ def cmd_add(args):
             if not ok:
                 return _error("refusing to catalog %s: it does not match the base architecture "
                               "(use --no-arch-check to override)" % args.path)
+        if args.target == "video":
+            checker = _checker_or_none()
+            warning = checker.low_ram_warning(header) if checker is not None else None
+            if warning:
+                print("warning: %s" % warning, file=sys.stderr)
         try:
             catalog = lora_catalog.load_catalog(path)
         except lora_catalog.CatalogError as e:
@@ -274,6 +288,7 @@ def cmd_verify(args):
             return _error("no catalog entry %s" % entry_id)
     selected = [by_id[i] for i in args.entry_ids] if args.entry_ids else entries
     char_triggers = lora_catalog.character_triggers(WS)
+    checker = _checker_or_none()
     problems = 0
     for entry in selected:
         found = lora_catalog.verify_entry(entry, entries, char_triggers)
@@ -282,6 +297,14 @@ def cmd_verify(args):
         for problem in found:
             print("FAIL %s: %s" % (entry["id"], problem))
         problems += len(found)
+        if checker is not None and entry["target"] == "video":
+            try:
+                warning = checker.low_ram_warning(
+                    lora_catalog.read_safetensors_header(entry["path"]))
+            except lora_catalog.CatalogError:
+                warning = None
+            if warning:
+                print("WARN %s: %s" % (entry["id"], warning))
     owners = {}
     for entry in selected:
         for trigger in entry["triggers"]:

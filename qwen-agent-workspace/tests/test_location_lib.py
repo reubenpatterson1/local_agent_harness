@@ -390,3 +390,29 @@ def test_ll13_location_lib_is_stdlib_only(env, tmp_path):
                           env=dict(os.environ), cwd=str(tmp_path), timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.splitlines() == ["[]", "[]", "['character_lib']"]
+
+
+# --- LL1: every new and changed file compiles under both Pythons (LK3) ------------------------
+
+COMPILED = ("location_lib.py", "location_dataset.py", "bin/location", "story_engine.py",
+            "character_dataset.py", "bin/ltx-movie", "bin/ltx-story-manifest",
+            "bin/ltx-story-images", "bin/ltx-mlx-render", "bin/iterate-story", "bin/lora-check",
+            "bin/lora-catalog", "movie_ui_lib.py", "movie_ui_server.py")
+
+
+@pytest.mark.parametrize("python", ["/usr/bin/python3", sys.executable])
+def test_ll1_every_new_and_changed_file_compiles(python, tmp_path):
+    if not os.path.isfile(python):
+        pytest.skip("%s is not installed" % python)
+    script = ("import os, py_compile, sys\n"
+              "out = sys.argv[1]\n"
+              "for k, path in enumerate(sys.argv[2:]):\n"
+              "    py_compile.compile(path, cfile=os.path.join(out, '%d.pyc' % k), doraise=True)\n"
+              "print('compiled %d' % (len(sys.argv) - 2))\n")
+    proc = subprocess.run([python, "-B", "-c", script, str(tmp_path)]
+                          + [os.path.join(WS, rel) for rel in COMPILED],
+                          capture_output=True, text=True, timeout=300)
+    assert (proc.returncode, proc.stdout) == (0, "compiled 14\n"), proc.stderr
+    bash = subprocess.run(["bash", "-n", os.path.join(WS, "bin", "location-train-vlm")],
+                          capture_output=True, text=True, timeout=60)
+    assert bash.returncode == 0, bash.stderr
