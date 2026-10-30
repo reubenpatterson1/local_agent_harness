@@ -74,6 +74,15 @@ name them); under --shots it is the character's own strength or --character-stre
 schema_version stays 3, because the key is optional. character_lib.py is loaded by path
 only when --cast is given, a Narration: line has a colon or a panel has a Dialogue: line.
 
+--location NAME (repeatable, --chain or --shots only) pins a trained location from the location
+library (generated/locations/NAME, see docs/superpowers/specs/2026-10-29-location-lora-design.md
+L3.7). Every panel whose plan.json beat is set at that location gets an optional "locations" list
+with one {"name", "video_lora", "strength"} entry (the location's own location.json strength,
+else --location-strength, default 0.8), and the location's trigger is prefixed to its
+motion_prompt after the cast triggers and before the catalog triggers; every other panel gets an
+empty list. Without a usable plan.json no panel gets one, and a note says why. location_lib.py is
+loaded by path only when --location is given.
+
 Spoken narration: a Narration: line is voice-over (not sent to the video model) unless it
 starts with a known referring phrase and a colon -- "the courier: Keep moving." The known
 phrases are the --cast phrases, a shots story's "## Characters" phrases and the story's
@@ -174,6 +183,16 @@ def build_parser():
                          help="LoRA strength for each cast character without its own "
                               "character.json strength (default 0.8, provisional), the same in "
                               "every panel")
+    parser.add_argument("--location", dest="location", action="append", default=None,
+                         metavar="NAME",
+                         help="pin a trained location (generated/locations/NAME; repeatable, "
+                              "--chain or --shots only): every panel whose plan.json beat is set "
+                              "there gets a 'locations' entry with its video LoRA and strength, "
+                              "and its trigger is prefixed to the panel's motion_prompt")
+    parser.add_argument("--location-strength", dest="location_strength", type=float,
+                         default=None,
+                         help="LoRA strength for each location without its own location.json "
+                              "strength (default 0.8)")
     parser.add_argument("--catalog-loras", dest="catalog_loras", default=None, metavar="PATH",
                          help="per-panel catalog LoRAs (bin/ltx-movie's catalog_loras.json): each "
                               "panel gets a catalog_loras list and its triggers are prefixed to its "
@@ -196,6 +215,11 @@ def _character_lib():
 def _lora_catalog():
     return importlib.machinery.SourceFileLoader(
         "lora_catalog", os.path.join(WS, "lora_catalog.py")).load_module()
+
+
+def _location_lib():
+    return importlib.machinery.SourceFileLoader(
+        "location_lib", os.path.join(WS, "location_lib.py")).load_module()
 
 
 _CATALOG_ID_RE = re.compile(r"[a-z][a-z0-9-]{1,31}")
@@ -575,6 +599,10 @@ def main(argv=None):
         parser.error("--catalog-loras requires --chain, --shots or --no-images")
     if args.character_strength is not None and not args.cast:
         parser.error("--character-strength requires --cast")
+    if args.location and not (args.chain or args.shots):
+        parser.error("--location requires --chain or --shots")
+    if args.location_strength is not None and not args.location:
+        parser.error("--location-strength requires --location")
 
     if args.no_images:
         if args.glob or args.image:
@@ -893,6 +921,43 @@ def main(argv=None):
                       "that character gets no LoRA"
                       % (m.phrase, m.name, "Image: or Motion:" if args.shots else "Motion:"))
 
+    if args.location:
+        # Location library spec L3.7: only the panels whose plan.json beat is set at a pinned
+        # location get its video LoRA and trigger.
+        location_lib = _location_lib()
+        try:
+            pins = location_lib.resolve_locations(args.location)
+        except location_lib.LocationError as e:
+            print("Error: %s" % e, file=sys.stderr)
+            return 2
+        location_strength = (args.location_strength if args.location_strength is not None
+                             else location_lib.DEFAULT_LOCATION_STRENGTH)
+        if not 0 < location_strength <= 1.0:
+            print("Error: --location-strength must be in (0, 1], got %r" % location_strength,
+                  file=sys.stderr)
+            return 2
+        by_pin = dict((pin.name, pin) for pin in pins)
+        per_panel, note = location_lib.plan_panel_locations(
+            os.path.join(WS, "generated", "stories", args.story_id), n_panels,
+            [pin.name for pin in pins])
+        if note is not None:
+            print(note)
+        for p, name in zip(panels, per_panel):
+            if name is None:
+                p["locations"] = []
+                continue
+            pin = by_pin[name]
+            p["locations"] = [{"name": name, "video_lora": pin.video_lora,
+                               "strength": (pin.strength if pin.strength is not None
+                                            else location_strength)}]
+            p["motion_prompt"] = location_lib.prefix_location_trigger(p["motion_prompt"],
+                                                                      pin.trigger)
+        if note is None:
+            for pin in pins:
+                if pin.name not in per_panel:
+                    print("WARNING: location %s is the location of no panel's beat in plan.json; "
+                          "it gets no LoRA" % pin.name)
+
     if args.catalog_loras:
         lists, error = _read_catalog_loras(args.catalog_loras, n_panels)
         if error:
@@ -949,6 +1014,11 @@ def main(argv=None):
             if p["characters"]:
                 print("cast: panel %d: %s" % (p["index"], ", ".join(
                     "%s@%s" % (c["name"], repr(c["strength"])) for c in p["characters"])))
+    if args.location:
+        for p in panels:
+            for entry in p["locations"]:
+                print("location: panel %d: %s@%s" % (p["index"], entry["name"],
+                                                     repr(float(entry["strength"]))))
     if args.catalog_loras:
         for p in panels:
             if p["catalog_loras"]:
