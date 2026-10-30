@@ -269,7 +269,7 @@ Coverage: each view 4 times with 4 distinct times; times dawn 5, midday 5, golde
 
 ### 2.6 Photo mode (L1.6)
 
-1. **Inputs.** 1 to `MAX_PHOTOS = 24` photos. Each must exist and load with `ltx_image_fit.load_oriented_rgb`. Its centred 16:10 crop, `crop_w = min(w, h * 16 // 10)` and `crop_h = min(h, w * 10 // 16)`, must be at least `768x480` **[spec choice]**. Two inputs with the same sha256 are refused.
+1. **Inputs.** 1 to `MAX_PHOTOS = 24` photos. Each must exist and load with `ltx_image_fit.load_oriented_rgb`. Its centred 16:10 crop, `crop_w = min(w, h * 16 // 10)` and `crop_h = min(h, w * 10 // 16)`, must be at least `512x320` **[spec choice; lowered from 768x480 on 2026-10-30]**. A crop below 768x480 is accepted with the stdout line `warning: --photo PATH: its CWxCH crop is upscaled F.FFx to 1024x640; stills built from it will be softer`. Two inputs with the same sha256 are refused.
 2. **Copies.** `photos/photo_NN.png` = the oriented RGB image, PNG, full size; `photos[k] = {"path": <absolute input path>, "sha256": <sha256 of the input file bytes>}`.
 3. **Fit.** `stills/loc_NN.png` (NN = 1..P) = `ImageOps.fit(img, (1024, 640), Image.LANCZOS, centering=(0.5, 0.5))`. Photos are kept as-is otherwise.
 4. **Description.** When `--description` is absent, `location_dataset.describe(photo_paths[:5])` drafts it (L1.7) and `create` prints `description (drafted by the vision model; change it with bin/location edit NAME --description TEXT): <text>`.
@@ -823,7 +823,7 @@ In `base_linear_map` (`:158-177`), the loop also takes a key that does not end w
 | more than 24 photos | create | `at most 24 --photo, got N` | 2 |
 | unreadable photo | create | `--photo is not a readable image: PATH: <error>` | 2 |
 | missing photo | create | `--photo not found: PATH` | 2 |
-| too-small photo | create | `--photo PATH is WxH; its centred 16:10 crop is CWxCH, smaller than the 768x480 minimum` | 2 |
+| too-small photo | create | `--photo PATH is WxH; its centred 16:10 crop is CWxCH, smaller than the 512x320 minimum` | 2 |
 | duplicate photo | create | `--photo PATH is the same file as photo K` | 2 |
 | trigger taken / bad / description word | create | `trigger T is already used by NAME; triggers are never reused` / the TRIGGER_RE message / `trigger T must not be a word of the description` | 2 |
 | editor not cached | create, regenerate (photo, P < 24) | `the photo editor is not downloaded: REPOS; download it with: hf download ...` | 2 |
@@ -927,7 +927,7 @@ with open(os.path.join(out, "normalized_plan_chained.json"), "w", encoding="utf-
 | LD4 | Check retries: an unparseable first reply → the second call carries `CHECK_RETRY` with the error and reply; three unparseable → `(None, "unparseable: ...")`; a RuntimeError propagates |
 | LD5 | **Text create (LK6).** Fakes record one Z-Image child spec with the 24 `gen_prompt` jobs, `seed`, 1024x640, `loras: None`, step `generate`; `story_server("stop")` once; restore with `wait=True`; 24 text-scored checks; with 20 passes and 4 fails → `untrained`, `dataset.kept == 20`, exit 0, `next:` line printed |
 | LD6 | Photo fit: a 4000x3000 photo becomes a 1024x640 centred crop (pixel-compared with `ImageOps.fit`); `photo_NN.png` is the oriented original; the record's `photos` has the path and the file sha256 |
-| LD7 | Photo size: 768x480 accepted (crop 768x480); 767x480 refused (crop 767x479); 2000x479 refused (crop 766x479); the exact refusal text |
+| LD7 | Photo size: 512x320 accepted (crop 512x320); 511x320 refused (crop 511x319); 2000x319 refused (crop 510x319); the exact refusal text. LD26: 750x422 accepted with the 1.52x warning; no warning on a refusal |
 | LD8 | Photo describe: without `--description`, `describe` gets the first 5 photos; a 45-word reply triggers `DESCRIBE_SHORTEN` with text only; a 10-word reply triggers `DESCRIBE_RETRY` with images; 3 failures → exit 1 and no location dir |
 | LD9 | **Round robin (LK6).** For P in 1, 3, 5: the edit spec has `24 - P` jobs; job j's `image` is `stills/loc_%02d.png % (((j-1) % P) + 1)`, prompt `EDIT_PROMPT % EDIT_CONDITIONS[j-1]`, output `loc_%02d.png % (P + j)`, `skill == "location_edit"`; P = 24 runs no edit child and never stops the server |
 | LD10 | Edit-model gate: `edit_models_missing()` non-empty → exit 2 before any VLM call or directory |
@@ -1098,7 +1098,7 @@ PR note (in substance): "New location library (`bin/location`, movie-ui Location
 4. **Prompt wording.** View phrases read as "<View> of <description>"; time and weather placeholders are phrases ("at dusk", "in fog"); STYLE is the character STYLE.
 5. **The 24 variants** (table L1.5): each view 4 times with 4 distinct times; times 5/5/5/4/5; each weather 6.
 6. **Edits.** The exact EDIT_PROMPT, 23 EDIT_CONDITIONS (with 5 season variants), sources are the fitted photo stills, round robin `((j-1) % P) + 1`.
-7. **Photo limits.** At most 24 photos; the 16:10 crop must be at least 768x480; duplicate files are refused.
+7. **Photo limits.** At most 24 photos; the 16:10 crop must be at least 512x320 (below 768x480 it is upscaled with a warning); duplicate files are refused.
 8. **Three check prompts** (text-scored, photo-scored against photo 1, tag-only for user photos); vocabularies TIMES and WEATHERS (with snow) and their aliases.
 9. **Keep and caption details.** `--force` also keeps unparseable user photos; `empty of people` is dropped from a caption when people are visible.
 10. **Describe.** Uses the first 5 photos; 3 attempts with shorten/retry as the character describe.

@@ -34,7 +34,8 @@ DatasetError = character_dataset.DatasetError
 STYLE = character_dataset.STYLE        # "photorealistic live-action film still, natural light"
 WIDTH, HEIGHT = 1024, 640
 SEED_MAX = 2147483647
-MIN_CROP_W, MIN_CROP_H = 768, 480
+MIN_CROP_W, MIN_CROP_H = 512, 320
+WARN_CROP_W, WARN_CROP_H = 768, 480
 DESCRIBE_PHOTOS = 5
 
 # Spec 2.5: the 24 text-mode stills.
@@ -516,7 +517,7 @@ def _load_photos(paths):
     import ltx_image_fit
     if len(paths) > location_lib.MAX_PHOTOS:
         return None, "at most 24 --photo, got %d" % len(paths)
-    loaded, seen = [], {}
+    loaded, seen, warnings = [], {}, []
     for k, given in enumerate(paths, start=1):
         path = os.path.abspath(given)
         if not os.path.isfile(path):
@@ -529,12 +530,18 @@ def _load_photos(paths):
         crop_w, crop_h = min(w, h * 16 // 10), min(h, w * 10 // 16)
         if crop_w < MIN_CROP_W or crop_h < MIN_CROP_H:
             return None, ("--photo %s is %dx%d; its centred 16:10 crop is %dx%d, smaller than the "
-                          "768x480 minimum" % (path, w, h, crop_w, crop_h))
+                          "512x320 minimum" % (path, w, h, crop_w, crop_h))
+        if crop_w < WARN_CROP_W or crop_h < WARN_CROP_H:
+            warnings.append("warning: --photo %s: its %dx%d crop is upscaled %.2fx to %dx%d; stills "
+                            "built from it will be softer"
+                            % (path, crop_w, crop_h, max(WIDTH / crop_w, HEIGHT / crop_h), WIDTH, HEIGHT))
         sha = _sha256(path)
         if sha in seen:
             return None, "--photo %s is the same file as photo %d" % (path, seen[sha])
         seen[sha] = k
         loaded.append((path, img, sha))
+    for line in warnings:
+        print(line, flush=True)
     return loaded, None
 
 

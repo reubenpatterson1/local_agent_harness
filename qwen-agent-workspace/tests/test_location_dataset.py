@@ -473,14 +473,14 @@ def test_ld6_a_photo_is_fitted_and_copied_oriented(env, monkeypatch, tmp_path):
 
 def test_ld7_the_photo_size_rule(env, monkeypatch, tmp_path, capsys):
     _Fakes(monkeypatch, vlm_up=False)
-    ok = _photos(tmp_path, 1, size=(768, 480))
+    ok = _photos(tmp_path, 1, size=(512, 320))
     assert ld.create(_create_args(photos=ok, description=lt.HARBOUR_DESC)) == 2
     assert _err_line(capsys).startswith("Error: the vision model ")
-    for size, crop in (((767, 480), "767x479"), ((2000, 479), "766x479")):
+    for size, crop in (((511, 320), "511x319"), ((2000, 319), "510x319")):
         path = _photos(tmp_path, 1, size=size, start=size[0])[0]
         assert ld.create(_create_args(photos=[path], description=lt.HARBOUR_DESC)) == 2
         assert _err_line(capsys) == (
-            "Error: --photo %s is %dx%d; its centred 16:10 crop is %s, smaller than the 768x480 "
+            "Error: --photo %s is %dx%d; its centred 16:10 crop is %s, smaller than the 512x320 "
             "minimum" % (path, size[0], size[1], crop))
     assert os.listdir(env["locations"]) == []
 
@@ -1125,3 +1125,21 @@ def test_ld25_regenerate_refuses_a_missing_photo_copy(env, monkeypatch, tmp_path
     with open(os.path.join(mdir, "location.json"), "rb") as f:
         assert f.read() == before
     assert sorted(os.listdir(os.path.join(mdir, "stills"))) == stills_before
+
+
+def test_ld26_an_upscaled_photo_is_accepted_with_a_warning(env, monkeypatch, tmp_path, capsys):
+    _Fakes(monkeypatch, vlm_up=False)
+    small = _photos(tmp_path, 1, size=(750, 422))[0]
+    big = _photos(tmp_path, 1, size=(768, 480), start=1)[0]
+    assert ld.create(_create_args(photos=[small, big], description=lt.HARBOUR_DESC)) == 2
+    captured = capsys.readouterr()
+    assert captured.out.count("warning: --photo ") == 1
+    assert ("warning: --photo %s: its 675x422 crop is upscaled 1.52x to 1024x640; stills built "
+            "from it will be softer\n" % small) in captured.out
+    assert "Error: the vision model " in captured.err
+    tiny = _photos(tmp_path, 1, size=(500, 400), start=2)[0]
+    assert ld.create(_create_args(photos=[small, tiny], description=lt.HARBOUR_DESC)) == 2
+    captured = capsys.readouterr()
+    assert "warning: --photo " not in captured.out
+    assert "smaller than the 512x320 minimum" in captured.err
+    assert os.listdir(env["locations"]) == []

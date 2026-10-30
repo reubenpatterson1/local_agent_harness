@@ -173,7 +173,7 @@ def test_lt4_create_argument_refusals(env, monkeypatch, tmp_path, capsys):
     text = str(tmp_path / "notes.png")
     with open(text, "w") as f:
         f.write("not an image")
-    small = _photo(tmp_path, "small.png", size=(600, 400))
+    small = _photo(tmp_path, "small.png", size=(500, 400))
     missing = str(tmp_path / "missing.png")
     d = ["--description", lt.MILL_DESC]
     cases = [
@@ -192,7 +192,7 @@ def test_lt4_create_argument_refusals(env, monkeypatch, tmp_path, capsys):
         (["create", "old-mill"] + ["--photo", a] * 25, "at most 24 --photo, got 25"),
         (["create", "old-mill", "--photo", missing], "--photo not found: %s" % missing),
         (["create", "old-mill", "--photo", small],
-         "--photo %s is 600x400; its centred 16:10 crop is 600x375, smaller than the 768x480 "
+         "--photo %s is 500x400; its centred 16:10 crop is 500x312, smaller than the 512x320 "
          "minimum" % small),
         (["create", "old-mill", "--photo", a, "--photo", copy],
          "--photo %s is the same file as photo 1" % copy),
