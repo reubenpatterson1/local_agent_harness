@@ -52,6 +52,14 @@ images.json entry then gains a "loras" list. z_image_skill loads one LoRA set pe
 process, so the selected panels must all need the same set. character_lib.py is loaded by
 path only when --cast is given.
 
+Locations: --location NAME (repeatable) pins a trained location from the location library
+(docs/superpowers/specs/2026-10-29-location-lora-design.md L3.8). A selected generated panel whose
+plan.json beat (the plan.json beside --story-md) is set at a pinned location that has a stills
+LoRA gets that LoRA, between the global and the character LoRAs, at the location's own strength
+or --location-strength (default 0.8), and the location's trigger in front of its prompt. A pinned
+location without a stills LoRA gets a warning and no trigger. location_lib.py is loaded by path
+only when --location is given.
+
 --shots (bin/ltx-movie --shots) pins every generated panel's seed to --seed and gives
 every cast character's stills LoRA, alone or paired, its character.json strength or
 --character-strength (default 0.8).
@@ -134,6 +142,15 @@ def build_parser():
                              "exactly (pinned, as in grounded mode), and every cast character's "
                              "stills LoRA, alone or with another, uses its character.json strength "
                              "or --character-strength (default 0.8)")
+    parser.add_argument("--location", dest="location", action="append", default=None,
+                        metavar="NAME",
+                        help="pin a trained location (generated/locations/NAME, repeatable): a "
+                             "panel whose plan.json beat is set there is generated with its "
+                             "stills LoRA and its trigger in front of the prompt")
+    parser.add_argument("--location-strength", dest="location_strength", type=float,
+                        default=None,
+                        help="stills LoRA strength for each location without its own "
+                             "location.json strength (default 0.8)")
     parser.add_argument("--lora-trigger", dest="lora_trigger", action="append", default=None,
                         metavar="WORD",
                         help="a catalog stills LoRA's trigger (repeatable, from bin/ltx-movie): "
@@ -144,6 +161,11 @@ def build_parser():
 def _character_lib():
     return importlib.machinery.SourceFileLoader(
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
+
+
+def _location_lib():
+    return importlib.machinery.SourceFileLoader(
+        "location_lib", os.path.join(WS, "location_lib.py")).load_module()
 
 
 def _parse_only(only, n_panels):
@@ -271,6 +293,45 @@ def main(argv=None):
         except lib.CharacterError as e:
             print("Error: %s" % e, file=sys.stderr)
             return 2
+    # Location library spec L3.8: (trigger, stills LoRA entry) for each selected generated panel
+    # whose plan.json beat is set at a pinned location with a stills LoRA.
+    location_lib, loc_plans = None, {}
+    if args.location_strength is not None and not args.location:
+        print("Error: --location-strength requires --location", file=sys.stderr)
+        return 2
+    if args.location:
+        location_lib = _location_lib()
+        try:
+            pins = location_lib.resolve_locations(args.location)
+        except location_lib.LocationError as e:
+            print("Error: %s" % e, file=sys.stderr)
+            return 2
+        location_strength = (args.location_strength if args.location_strength is not None
+                             else location_lib.DEFAULT_LOCATION_STRENGTH)
+        if not 0 < location_strength <= 1.0:
+            print("Error: --location-strength must be in (0, 1], got %r" % location_strength,
+                  file=sys.stderr)
+            return 2
+        per_panel, note = location_lib.plan_panel_locations(
+            os.path.dirname(os.path.abspath(args.story_md)), len(panels),
+            [pin.name for pin in pins])
+        if note is not None:
+            print(note)
+        for pin in pins:
+            if not pin.stills_lora:
+                print("WARNING: location %s has no stills LoRA (%s); its trigger is not added to "
+                      "Image: prompts and its panels render without it"
+                      % (pin.name, pin.stills_skip_reason or "not trained"))
+        by_pin = dict((pin.name, pin) for pin in pins)
+        for i in selected_indices:
+            if args.seed_image is not None and i == 1:
+                continue
+            pin = by_pin.get(per_panel[i - 1])
+            if pin is not None and pin.stills_lora:
+                loc_plans[i] = (pin.trigger, {"kind": "location", "name": pin.name,
+                                              "path": pin.stills_lora,
+                                              "strength": (pin.strength if pin.strength is not None
+                                                           else location_strength)})
     import ltx2_mlx_video_skill
     try:
         parsed = [ltx2_mlx_video_skill.parse_lora_spec(v)
@@ -310,7 +371,8 @@ def main(argv=None):
             char_plans[i] = (prompt, [{"kind": "character", "name": n, "path": by_name[n].stills_lora,
                                        "strength": strengths[n]} for n in names])
     global_stills = []
-    if len(parsed) == 1 and parsed[0][1] == 1.0 and not any(v[1] for v in char_plans.values()):
+    if (len(parsed) == 1 and parsed[0][1] == 1.0 and not any(v[1] for v in char_plans.values())
+            and not loc_plans):
         args.lora_path = parsed[0][0]                       # legacy route (spec 5.7.2)
     elif parsed:
         args.lora_path = None
@@ -331,12 +393,22 @@ def main(argv=None):
                 print("Error: --lora %s is also character %s's stills LoRA; pass it once"
                       % (seen[os.path.realpath(m.stills_lora)], m.name), file=sys.stderr)
                 return 2
-    if members or global_stills:
+        for _trigger, entry in loc_plans.values():
+            if os.path.realpath(entry["path"]) in seen:
+                print("Error: --lora %s is also location %s's stills LoRA; pass it once"
+                      % (seen[os.path.realpath(entry["path"])], entry["name"]), file=sys.stderr)
+                return 2
+    if members or global_stills or loc_plans:
         for i in selected_indices:
             if args.seed_image is not None and i == 1:
                 continue
             prompt, chars = char_plans.get(i, (compose(panels[i - 1]["image"], style), []))
-            plans[i] = (prompt, global_stills + chars)
+            if i in loc_plans:
+                trigger, entry = loc_plans[i]
+                plans[i] = (location_lib.prefix_location_trigger(prompt, trigger),
+                            global_stills + [entry] + chars)
+            else:
+                plans[i] = (prompt, global_stills + chars)
     lora_sets = sorted({tuple((l["path"], l["strength"]) for l in v[1]) for v in plans.values()})
     if len(lora_sets) > 1:
         print("Error: the selected panels need different stills LoRA sets (z_image_skill loads one "

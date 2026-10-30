@@ -244,3 +244,104 @@ def test_review_focus_4_a_plan_with_more_beats_than_the_target(tmp_path, monkeyp
     argv[argv.index("--target-seconds") + 1] = "24.167"
     assert manifest.main(argv) == 0
     assert [bool(p["locations"]) for p in _panels(story_dir)] == [False, True, False, True]
+
+
+# --- LP10-LP12: bin/ltx-story-images (L3.8) ---------------------------------------------------
+
+images = _load("ltx_story_images_for_location", os.path.join("bin", "ltx-story-images"))
+IMAGES_STORY = """# The Harbour
+
+A courier crosses a harbour town.
+
+## Panel 1 — Quay
+Image: A wide shot of the woman in grey on a stone quay.
+Motion: The woman in grey walks along the quay.
+
+## Panel 2 — Gate
+Image: A wide shot of the woman in grey at a temple gate.
+Motion: The woman in grey climbs the temple steps.
+
+## Panel 3 — Return
+Image: A wide shot of the woman in grey on the quay again.
+Motion: The woman in grey runs back along the quay.
+"""
+
+
+def _images_story(tmp_path, beats=("l1", "l2", "l1"), pinned=(("l1", "harbour-street"),)):
+    story_dir = str(tmp_path / "story")
+    os.makedirs(story_dir)
+    story_md = os.path.join(story_dir, "story.md")
+    with open(story_md, "w", encoding="utf-8") as f:
+        f.write(IMAGES_STORY)
+    lt.write_plan(story_dir, list(beats), pinned=pinned)
+    return story_md, os.path.join(story_dir, "images")
+
+
+def _images(story_md, out_dir, *extra):
+    return images.main(["--story-md", story_md, "--out-dir", out_dir, "--dry-run"] + list(extra))
+
+
+def test_lp10_chained_panel_1_gets_the_stills_lora(tmp_path, capsys, story_env):
+    harbour = lt.harbour(story_env["locations"], stills=True)
+    story_md, out = _images_story(tmp_path)
+    capsys.readouterr()
+    assert _images(story_md, out, "--only", "1", "--location", "harbour-street") == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == ["1 | %s | %r" % (os.path.join(out, "panel_01.png"),
+                                      "harboplc. A wide shot of the woman in grey on a stone quay."),
+                     "    loras: harbour-street=%s@0.8" % harbour["loras"]["stills"]["path"]]
+    seed = str(tmp_path / "seed.png")
+    Image.new("RGB", (64, 64)).save(seed)
+    assert _images(story_md, out, "--only", "1", "--seed-image", seed, "--location",
+                   "harbour-street", "--location-strength", "0.5") == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "1 | %s | seed: %s" % (os.path.join(out, "panel_01.png"), seed)]
+
+
+def test_lp11_shots_order_warning_one_set_and_duplicates(tmp_path, capsys, story_env):
+    harbour = lt.harbour(story_env["locations"], stills=True)
+    temple = lt.temple(story_env["locations"])
+    seu.kyra(story_env["lib"])
+    kyra_stills = os.path.join(story_env["lib"], "kyra", "lora", "stills.safetensors")
+    glob_lora = seu.lora_file(str(tmp_path / "files"), "grain")
+    story_md, out = _images_story(tmp_path, pinned=(("l1", "harbour-street"),
+                                                    ("l2", "temple-gate")))
+    capsys.readouterr()
+    common = ["--shots", "--cast", "the woman in grey=kyra", "--lora", glob_lora + ":0.5",
+              "--location", "harbour-street", "--location", "temple-gate"]
+    assert _images(story_md, out, "--only", "1", *common) == 0
+    out_lines = capsys.readouterr().out.splitlines()
+    assert ("WARNING: location temple-gate has no stills LoRA (not trained); its trigger is not "
+            "added to Image: prompts and its panels render without it") in out_lines
+    assert out_lines[-1] == "    loras: global=%s@0.5, harbour-street=%s@0.8, kyra=%s@0.8" % (
+        os.path.abspath(glob_lora), harbour["loras"]["stills"]["path"], kyra_stills)
+    assert "'harboplc. A wide shot of the kyrawmn woman in grey on a stone quay." in out_lines[-2]
+    assert _images(story_md, out, "--only", "2", *common) == 0
+    out_lines = capsys.readouterr().out.splitlines()
+    assert "templplc" not in out_lines[-2]
+    assert out_lines[-1] == "    loras: global=%s@0.5, kyra=%s@0.8" % (
+        os.path.abspath(glob_lora), kyra_stills)
+    assert _images(story_md, out, "--only", "1,2", *common) == 2
+    assert capsys.readouterr().err == (
+        "Error: the selected panels need different stills LoRA sets (z_image_skill loads one set "
+        "per process); run one --only panel per invocation\n")
+    assert _images(story_md, out, "--only", "1,3", *common) == 0
+    capsys.readouterr()
+    for given in (harbour["loras"]["stills"]["path"] + ":0.5", harbour["loras"]["stills"]["path"]):
+        assert _images(story_md, out, "--only", "1", "--lora", given, "--location",
+                       "harbour-street") == 2
+        assert capsys.readouterr().err == (
+            "Error: --lora %s is also location harbour-street's stills LoRA; pass it once\n"
+            % harbour["loras"]["stills"]["path"])
+    assert _images(story_md, out, "--only", "1", "--location-strength", "0.5") == 2
+    assert capsys.readouterr().err == "Error: --location-strength requires --location\n"
+    assert _images(story_md, out, "--only", "1", "--location", "nowhere") == 2
+    assert capsys.readouterr().err.startswith("Error: unknown location: nowhere (no ")
+    assert temple["loras"]["stills"] is None
+
+
+def test_lp12_the_i20_source_counts_hold():
+    with open(os.path.join(WS, "bin", "ltx-story-images"), encoding="utf-8") as f:
+        source = f.read()
+    assert source.count("_compose_prompt(") == 3
+    assert source.count("_panel_seed(args.seed, i, grounded)") == 2
