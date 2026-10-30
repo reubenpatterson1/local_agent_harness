@@ -1404,88 +1404,108 @@ def train_argv(config_path):
     return [SKILL.LTX2_MLX_BIN, "train", "--config", config_path, "--low-ram"]
 
 
-def _video_failed(data, step, rc, log):
-    print("Error: video LoRA training failed at %s (exit %s); log: %s; character %s stays %s"
-          % (step, rc, log, data["name"], data["status"]), file=sys.stderr)
+def _video_failed(failed_note, step, rc, log):
+    print("Error: video LoRA training failed at %s (exit %s); log: %s; %s"
+          % (step, rc, log, failed_note), file=sys.stderr)
     return "failed"
 
 
-def train_video(data):
-    """Preprocess, train, record and A/B-test the video LoRA (spec 4.8). Returns "ok",
-    "failed" (nothing recorded) or "test_failed" (the LoRA is recorded; a test render
-    failed)."""
-    name = data["name"]
-    char_dir = character_lib.character_dir(name)
-    vdir = os.path.join(char_dir, "train", "video")
+def train_video_lora(owner_dir, videos_dir, captions_dir, prompt, failed_note, recorded, tested):
+    """Preprocess, train, copy and A/B-test a video LoRA (character library spec 4.8; location
+    library spec L2.10). Returns "ok", "failed" or "test_failed". recorded(entry) is called once,
+    after the final checkpoint is copied to <owner_dir>/lora/video.safetensors, with
+    {"path", "sha256", "rank", "alpha", "steps"}; tested(key, path) after each successful test
+    clip ("sample_path" then "control_path"). failed_note ends the failure line."""
+    vdir = os.path.join(owner_dir, "train", "video")
     if os.path.exists(vdir):
         shutil.rmtree(vdir)
     os.makedirs(vdir)
     for sub in ("lora", "tests", "logs"):
-        os.makedirs(os.path.join(char_dir, sub), exist_ok=True)
-    prompt = trigger_test_prompt(data["trigger"], data["class_noun"])
+        os.makedirs(os.path.join(owner_dir, sub), exist_ok=True)
     config_path = os.path.join(vdir, "train.yaml")
     with open(config_path, "w", encoding="utf-8") as f:
         f.write(video_train_config(os.path.join(vdir, "preprocessed"), prompt,
                                    os.path.join(vdir, "out")))
     env = dict(os.environ, HF_HOME=SKILL.LTX2_MLX_HF_HOME)
-    videos = os.path.join(char_dir, "dataset", "videos")
 
-    log = step_log_path(char_dir, "preprocess")
-    rc = run_logged(preprocess_argv(videos, os.path.join(char_dir, "dataset", "captions"),
-                                    os.path.join(vdir, "preprocessed")),
+    log = step_log_path(owner_dir, "preprocess")
+    rc = run_logged(preprocess_argv(videos_dir, captions_dir, os.path.join(vdir, "preprocessed")),
                     log, SKILL.LTX2_MLX_DIR, env, PREPROCESS_TIMEOUT_S)
     if rc != 0:
-        return _video_failed(data, "preprocess", rc, log)
+        return _video_failed(failed_note, "preprocess", rc, log)
     latents = os.path.join(vdir, "preprocessed", ".precomputed", "latents")
     n_lat = len(os.listdir(latents)) if os.path.isdir(latents) else 0
-    n_vid = len(glob.glob(os.path.join(videos, "*.mp4")))
+    n_vid = len(glob.glob(os.path.join(videos_dir, "*.mp4")))
     if n_lat != n_vid:
         print("Error: preprocess wrote %d latents for %d videos; log: %s" % (n_lat, n_vid, log),
               file=sys.stderr)
         return "failed"
 
-    log = step_log_path(char_dir, "train")
+    log = step_log_path(owner_dir, "train")
     rc = run_logged(train_argv(config_path), log, SKILL.LTX2_MLX_DIR, env, VIDEO_TRAIN_TIMEOUT_S)
     final = os.path.join(vdir, "out", "checkpoints", VIDEO_FINAL_CKPT)
     if rc != 0 or not os.path.isfile(final) or os.path.getsize(final) == 0:
-        return _video_failed(data, "train", rc, log)
+        return _video_failed(failed_note, "train", rc, log)
 
-    lora_path = os.path.join(char_dir, "lora", "video.safetensors")
+    lora_path = os.path.join(owner_dir, "lora", "video.safetensors")
     shutil.copy2(final, lora_path + ".tmp")
     os.replace(lora_path + ".tmp", lora_path)
-    data["loras"]["video"] = {"path": lora_path, "sha256": _sha256(lora_path),
-                              "base_model": TRAIN_MODEL_DIR, "rank": VIDEO_RANK,
-                              "alpha": VIDEO_RANK, "steps": VIDEO_STEPS,
-                              "trained_at": character_lib.utc_now(),
-                              "sample_path": None, "control_path": None}
-    data["status"] = "trained"
-    character_lib.write_character(data)
+    recorded({"path": lora_path, "sha256": _sha256(lora_path), "rank": VIDEO_RANK,
+              "alpha": VIDEO_RANK, "steps": VIDEO_STEPS})
 
     test_failed = False
     for key, filename, step, extra in (
             ("sample_path", "video_lora.mp4", "test-video-lora", {"loras": [(lora_path, 1.0)]}),
             ("control_path", "video_control.mp4", "test-video-control", {})):
-        out = os.path.join(char_dir, "tests", filename)
+        out = os.path.join(owner_dir, "tests", filename)
         try:
             SKILL.generate_video(prompt, out, image_path=None, width=512, height=320,
                                  num_frames=25, frame_rate=24, seed=TEST_SEED,
                                  model=TEST_MODEL_DIR, gemma=SKILL.GEMMA_MODEL_ID, low_ram=True,
-                                 log_path=step_log_path(char_dir, step),
+                                 log_path=step_log_path(owner_dir, step),
                                  timeout_s=TEST_RENDER_TIMEOUT_S, force=True, **extra)
         except (ValueError, SKILL.Ltx2MlxError) as e:
             print("Error: video test render failed: %s" % e, file=sys.stderr)
             test_failed = True
             continue
-        data["loras"]["video"][key] = out
+        tested(key, out)
+    return "test_failed" if test_failed else "ok"
+
+
+def train_video(data):
+    """Preprocess, train, record and A/B-test the video LoRA (spec 4.8). Returns "ok",
+    "failed" (nothing recorded) or "test_failed" (the LoRA is recorded; a test render
+    failed). The work is train_video_lora's (location library spec L2.10)."""
+    name = data["name"]
+    char_dir = character_lib.character_dir(name)
+
+    def recorded(entry):
+        data["loras"]["video"] = {"path": entry["path"], "sha256": entry["sha256"],
+                                  "base_model": TRAIN_MODEL_DIR, "rank": entry["rank"],
+                                  "alpha": entry["alpha"], "steps": entry["steps"],
+                                  "trained_at": character_lib.utc_now(),
+                                  "sample_path": None, "control_path": None}
+        data["status"] = "trained"
         character_lib.write_character(data)
 
+    def tested(key, path):
+        data["loras"]["video"][key] = path
+        character_lib.write_character(data)
+
+    outcome = train_video_lora(char_dir, os.path.join(char_dir, "dataset", "videos"),
+                               os.path.join(char_dir, "dataset", "captions"),
+                               trigger_test_prompt(data["trigger"], data["class_noun"]),
+                               "character %s stays %s" % (name, data["status"]), recorded, tested)
+    if outcome == "failed":
+        return outcome
+    lora_path = data["loras"]["video"]["path"]
     entry = data["loras"]["video"]
     print("video LoRA: %s (sha256 %s)" % (lora_path, entry["sha256"]))
     print("trigger-only A/B (compare by eye; the LoRA clip should show the character, the "
           "control a stranger):")
     print("  with LoRA: %s" % entry["sample_path"])
     print("  control:   %s" % entry["control_path"])
-    return "test_failed" if test_failed else "ok"
+    return outcome
 
 
 def train(args):
@@ -1638,25 +1658,21 @@ def extract_mflux_adapter(out_dir, dest, total_steps):
                        "*_adapter.safetensors under %s" % checkpoints)
 
 
-def train_stills(data):
-    """Train the stills LoRA with mflux and keep it only if it passes the compat gate (spec
-    4.9). Returns "ok", "skipped" (incompatible; the reason is recorded) or "failed"."""
-    name = data["name"]
-    char_dir = character_lib.character_dir(name)
-    sdir = os.path.join(char_dir, "train", "stills")
+def train_stills_lora(owner_dir, pairs, prompt, seed, kept_ok, skipped):
+    """Train a stills LoRA with mflux on pairs [(png, txt)] and keep it only if it passes the
+    compat gate (character library spec 4.9; location library spec L2.10). Returns "ok",
+    "skipped" or "failed". kept_ok(entry, sample_path, control_path) with {"path", "sha256",
+    "rank", "alpha", "steps"}; skipped(reason) with the full stills_skip_reason."""
+    sdir = os.path.join(owner_dir, "train", "stills")
     if os.path.exists(sdir):
         shutil.rmtree(sdir)
     os.makedirs(os.path.join(sdir, "data"))
     out = os.path.join(sdir, "out")
     for sub in ("lora", "tests", "logs"):
-        os.makedirs(os.path.join(char_dir, sub), exist_ok=True)
-    with open(os.path.join(char_dir, "dataset", "manifest.json"), encoding="utf-8") as f:
-        kept_ns = [item["n"] for item in json.load(f)["items"] if item["kept"]]
-    for n in kept_ns:
-        for sub, ext in (("stills", "png"), ("captions", "txt")):
-            shutil.copy2(os.path.join(char_dir, "dataset", sub, "char_%02d.%s" % (n, ext)),
-                         os.path.join(sdir, "data", "char_%02d.%s" % (n, ext)))
-    prompt = trigger_test_prompt(data["trigger"], data["class_noun"])
+        os.makedirs(os.path.join(owner_dir, sub), exist_ok=True)
+    for png, txt in pairs:
+        for src in (png, txt):
+            shutil.copy2(src, os.path.join(sdir, "data", os.path.basename(src)))
     with open(os.path.join(sdir, "data", "preview_1.txt"), "w", encoding="utf-8") as f:
         f.write(prompt)
     if os.path.lexists(out):
@@ -1666,18 +1682,18 @@ def train_stills(data):
         return "failed"
     config_path = os.path.join(sdir, "train.json")
     with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(stills_train_config(os.path.join(sdir, "data"), out, data["seed"],
-                                      len(kept_ns)), f, indent=2)
-    _num_epochs, total_steps, _save = stills_epochs(len(kept_ns))
+        json.dump(stills_train_config(os.path.join(sdir, "data"), out, seed, len(pairs)), f,
+                  indent=2)
+    _num_epochs, total_steps, _save = stills_epochs(len(pairs))
 
-    log = step_log_path(char_dir, "train-stills")
+    log = step_log_path(owner_dir, "train-stills")
     rc = run_logged([MFLUX_TRAIN, "--config", config_path], log, sdir,
                     dict(os.environ, HF_HOME=MFLUX_HF_HOME), STILLS_TRAIN_TIMEOUT_S)
     if rc != 0:
         print("Error: stills LoRA training failed: mflux-train exited %d; log: %s" % (rc, log),
               file=sys.stderr)
         return "failed"
-    candidate = os.path.join(char_dir, "lora", "stills.candidate.safetensors")
+    candidate = os.path.join(owner_dir, "lora", "stills.candidate.safetensors")
     try:
         extract_mflux_adapter(out, candidate, total_steps)
     except DatasetError as e:
@@ -1688,12 +1704,12 @@ def train_stills(data):
     except (ValueError, struct.error):
         expected = 0
 
-    sample = os.path.join(char_dir, "tests", "stills_lora.png")
+    sample = os.path.join(owner_dir, "tests", "stills_lora.png")
     job = {"prompt": prompt, "output_path": sample, "seed": TEST_SEED, "width": 1024,
            "height": 640}
     report = child_error = None
     try:
-        report = run_zimage_child({"jobs": [job], "loras": [[candidate, 1.0]]}, char_dir,
+        report = run_zimage_child({"jobs": [job], "loras": [[candidate, 1.0]]}, owner_dir,
                                   "test-stills-lora")
     except DatasetError as e:
         child_error = e
@@ -1709,36 +1725,61 @@ def train_stills(data):
         reason = None
 
     if reason is not None:
-        os.replace(candidate, os.path.join(char_dir, "lora", "stills.rejected.safetensors"))
-        data["stills_skip_reason"] = "mflux adapter incompatible with z_image_skill: " + reason
-        character_lib.write_character(data)
-        print("stills LoRA skipped: %s; the video LoRA is unaffected" % data["stills_skip_reason"])
+        os.replace(candidate, os.path.join(owner_dir, "lora", "stills.rejected.safetensors"))
+        full_reason = "mflux adapter incompatible with z_image_skill: " + reason
+        skipped(full_reason)
+        print("stills LoRA skipped: %s; the video LoRA is unaffected" % full_reason)
         return "skipped"
 
-    stills_path = os.path.join(char_dir, "lora", "stills.safetensors")
+    stills_path = os.path.join(owner_dir, "lora", "stills.safetensors")
     os.replace(candidate, stills_path)
-    control = os.path.join(char_dir, "tests", "stills_control.png")
+    control = os.path.join(owner_dir, "tests", "stills_control.png")
     control_path = None
     try:
         control_report = run_zimage_child({"jobs": [dict(job, output_path=control)],
-                                           "loras": None}, char_dir, "test-stills-control")
+                                           "loras": None}, owner_dir, "test-stills-control")
         if control_report["jobs"][0]["status"] == "ok":
             control_path = control
     except DatasetError as e:
         print("Error: stills control render failed: %s" % e, file=sys.stderr)
-    data["loras"]["stills"] = {"path": stills_path, "sha256": _sha256(stills_path),
-                               "base_model": "Tongyi-MAI/Z-Image-Turbo", "rank": STILLS_RANK,
-                               "alpha": STILLS_RANK, "steps": total_steps,
-                               "trained_at": character_lib.utc_now(),
-                               "sample_path": (sample if report["jobs"][0]["status"] == "ok"
-                                               else None),
-                               "control_path": control_path}
-    data["stills_skip_reason"] = None
-    character_lib.write_character(data)
+    sample_path = sample if report["jobs"][0]["status"] == "ok" else None
+    kept_ok({"path": stills_path, "sha256": _sha256(stills_path), "rank": STILLS_RANK,
+             "alpha": STILLS_RANK, "steps": total_steps}, sample_path, control_path)
     print("stills LoRA: %s" % stills_path)
-    print("  with LoRA: %s" % data["loras"]["stills"]["sample_path"])
+    print("  with LoRA: %s" % sample_path)
     print("  control:   %s" % control_path)
     return "ok"
+
+
+def train_stills(data):
+    """Train the stills LoRA with mflux and keep it only if it passes the compat gate (spec
+    4.9). Returns "ok", "skipped" (incompatible; the reason is recorded) or "failed". The work
+    is train_stills_lora's (location library spec L2.10)."""
+    name = data["name"]
+    char_dir = character_lib.character_dir(name)
+    with open(os.path.join(char_dir, "dataset", "manifest.json"), encoding="utf-8") as f:
+        kept_ns = [item["n"] for item in json.load(f)["items"] if item["kept"]]
+    pairs = [(os.path.join(char_dir, "dataset", "stills", "char_%02d.png" % n),
+              os.path.join(char_dir, "dataset", "captions", "char_%02d.txt" % n))
+             for n in kept_ns]
+
+    def kept_ok(entry, sample_path, control_path):
+        data["loras"]["stills"] = {"path": entry["path"], "sha256": entry["sha256"],
+                                   "base_model": "Tongyi-MAI/Z-Image-Turbo",
+                                   "rank": entry["rank"], "alpha": entry["alpha"],
+                                   "steps": entry["steps"],
+                                   "trained_at": character_lib.utc_now(),
+                                   "sample_path": sample_path, "control_path": control_path}
+        data["stills_skip_reason"] = None
+        character_lib.write_character(data)
+
+    def skipped(reason):
+        data["stills_skip_reason"] = reason
+        character_lib.write_character(data)
+
+    return train_stills_lora(char_dir, pairs,
+                             trigger_test_prompt(data["trigger"], data["class_noun"]),
+                             data["seed"], kept_ok, skipped)
 
 
 # --- Z-Image child process (spec 4.9) ---
@@ -1797,7 +1838,9 @@ def exit_with_parent(poll_s=2.0):
 
 def child_qwenedit(spec_path):
     """The child side of run_edit_child: load the editor and its Lightning LoRA from the local
-    cache, edit spec["image"] into every job, screen each result, write the report."""
+    cache, edit each job's image (job["image"], else spec["image"]; location library spec L1.8)
+    into every job, screen each result with spec["skill"] (default "character_edit"), write the
+    report."""
     exit_with_parent()
     import torch
     from diffusers import QwenImageEditPlusPipeline
@@ -1812,17 +1855,22 @@ def child_qwenedit(spec_path):
     pipe.load_lora_weights(hf_hub_download(spec["lora_repo"], spec["lora_file"],
                                            local_files_only=True))
     pipe.set_progress_bar_config(disable=True)
-    with Image.open(spec["image"]) as img:
-        source = img.convert("RGB")
+    sources = {}
     jobs = []
     for job in spec["jobs"]:
+        path = job.get("image", spec["image"])
+        if path not in sources:
+            with Image.open(path) as img:
+                sources[path] = img.convert("RGB")
+        source = sources[path]
         started = time.monotonic()
         image = pipe(image=[source], prompt=job["prompt"], negative_prompt=" ",
                      true_cfg_scale=spec["true_cfg"], guidance_scale=1.0,
                      num_inference_steps=spec["steps"], width=job["width"], height=job["height"],
                      generator=torch.Generator("cpu").manual_seed(job["seed"])).images[0]
         try:
-            content_safety.assert_image_safe(image, skill="character_edit", prompt=job["prompt"])
+            content_safety.assert_image_safe(image, skill=spec.get("skill", "character_edit"),
+                                             prompt=job["prompt"])
             image.save(job["output_path"])
             status = "ok"
         except content_safety.ContentSafetyError:

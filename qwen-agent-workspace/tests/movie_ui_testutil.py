@@ -128,7 +128,8 @@ def kill_everything(state):
 # The stub workspace
 # ---------------------------------------------------------------------------
 
-STUB_TOOLS = ("ltx-movie", "lora-catalog", "character", "ltx-mlx-render", "story-server")
+STUB_TOOLS = ("ltx-movie", "lora-catalog", "character", "ltx-mlx-render", "story-server",
+              "location")
 
 STUB_SOURCE = r'''
 import json
@@ -223,6 +224,9 @@ if TOOL == "lora-catalog" and sub == "verify":
 if TOOL == "character" and sub == "list":
     emit("no characters in %s\n" % os.path.join(WS, "generated", "characters"))
     sys.exit(0)
+if TOOL == "location" and sub == "list":
+    emit("no locations in %s\n" % os.path.join(WS, "generated", "locations"))
+    sys.exit(0)
 if TOOL == "story-server" and sub == "status":
     emit("story-server status  2026-10-19T00:00:00Z\n  state:          SERVING vision\n")
     sys.exit(0)
@@ -237,8 +241,9 @@ def _write_exec(path, text):
 
 
 def make_stub_workspace(tmp):
-    """<tmp>/ws with executable stubs of ltx-movie, lora-catalog, character, ltx-mlx-render (Python)
-    and story-server (sh, running bin/.story-server.py); returns the workspace realpath.
+    """<tmp>/ws with executable stubs of ltx-movie, lora-catalog, character, ltx-mlx-render,
+    location (Python) and story-server (sh, running bin/.story-server.py); returns the workspace
+    realpath.
 
     Each stub appends {"tool", "sub", "argv", "cwd", "env"} as one JSON line to
     <ws>/stub_calls.jsonl and obeys <ws>/stub_config.json: {key: {"exit", "stdout", "stderr",
@@ -247,7 +252,8 @@ def make_stub_workspace(tmp):
     ltx-mlx-render "--help", "--dry-run" or "run". Without a
     config entry: ltx-movie --help prints the current help fixture; ltx-movie runs write story.md
     (--story-only) or stills, clips and movie.mp4 with the real progress markers; lora-catalog list
-    prints an empty catalog; story-server status reports SERVING vision; everything else exits 0.
+    prints an empty catalog; location list prints an empty location library; story-server status
+    reports SERVING vision; everything else exits 0.
     """
     ws = os.path.join(str(tmp), "ws")
     os.makedirs(os.path.join(ws, "bin"), exist_ok=True)

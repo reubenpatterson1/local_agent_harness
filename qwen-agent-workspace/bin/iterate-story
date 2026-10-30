@@ -270,6 +270,10 @@ def build_engine_cmd(story_id, plan, goal=None, story_model=None, story_context_
     for entry in plan["cast"]:
         if entry.get("cast_name"):
             cmd += ["--character", entry["cast_name"]]
+    # Location library spec L3.11: the plan's pinned locations, at the default strength.
+    for entry in plan.get("locations") or []:
+        if isinstance(entry, dict) and entry.get("location_name"):
+            cmd += ["--location", entry["location_name"]]
     if plan.get("seed_image"):
         cmd += ["--seed-image", plan["seed_image"]]
     for pin in plan["loras"].get("pinned", []):

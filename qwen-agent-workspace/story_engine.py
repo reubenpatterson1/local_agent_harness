@@ -94,8 +94,8 @@ StoryContext = collections.namedtuple("StoryContext", [
     "ws", "story_id", "story_dir", "mode", "panels", "seconds", "narrative", "goal", "members",
     "seed_image", "seed_agent_image", "story_model", "context_window", "video_model",
     "auto_lora", "catalog", "pinned", "stills_pinned", "judge", "narration", "clip_seconds",
-    "panels_target", "length"],
-    defaults=(True, None, None, None))
+    "panels_target", "length", "locations"],
+    defaults=(True, None, None, None, ()))
 # narration True: Narration: is voice-over or a character's spoken line. "speech"
 # (bin/ltx-movie --speech-only): Narration: is optional and, when present, a character's spoken
 # line. False (--no-narration): panels have no Narration: field and no narration check runs.
@@ -105,6 +105,9 @@ StoryContext = collections.namedtuple("StoryContext", [
 # the plan is accepted, the plan's beat count after; panels_target is --panels (None: panels).
 # Plan ruling SPR2: length is bin/ltx-movie's --length in seconds when --length sized the movie
 # (None otherwise); the panel-count hints then name --length, never --panels.
+# Location library spec L3.3: locations is the pinned location_lib.LocationPin list of
+# bin/ltx-movie --location ((): none); this module reads only their name, description and
+# attach_video.
 
 
 def engine_seconds(ctx):
@@ -335,7 +338,7 @@ PLAN_PROMPT_TEMPLATE = (
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
     'so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names '
     "the period, the place, the ground, the light and any crowd or other group of people in the "
-    "background.\n"
+    "background.@@LOCATION_FIXED@@\n"
     "props: a list with one object per object that matters to the story, with the keys id and "
     "name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list "
     "when no object matters.\n"
@@ -1058,6 +1061,14 @@ CAST_FIXED_INTRO = (" The following characters are already cast; list them first
                     "cast of at least one beat. When the narrative calls one of them by their "
                     "name, it means that character, whom the movie names only by their phrase:")
 CAST_FIXED_LINE = '\n- id c%d, name "%s", phrase "%s", descriptor "%s"'
+# Location library spec L3.3: the pinned places, by library name, each set in a beat.
+LOCATION_FIXED_INTRO = (" The following places are already set; list them first in locations "
+                        "with exactly these ids and settings, and give your own places the next "
+                        "ids. Every one of them is in this movie: give each one's id as the "
+                        "location of at least one beat. When the narrative names or describes "
+                        "one of them, it means that place:")
+LOCATION_FIXED_LINE = '\n- id l%d, name "%s", setting "%s"'
+FIXED_SETTING = "The setting is %s."
 
 
 def build_plan_prompt(ctx, compatible, pins):
@@ -1076,6 +1087,11 @@ def build_plan_prompt(ctx, compatible, pins):
         cast_fixed += CAST_FIXED_INTRO
         for i, member in enumerate(ctx.members, start=1):
             cast_fixed += CAST_FIXED_LINE % (i, member.name, member.phrase, member.descriptor)
+    location_fixed = ""
+    if ctx.locations:
+        location_fixed = LOCATION_FIXED_INTRO
+        for i, pin in enumerate(ctx.locations, start=1):
+            location_fixed += LOCATION_FIXED_LINE % (i, pin.name, FIXED_SETTING % pin.description)
     if not ctx.auto_lora or not compatible:
         lora = LORA_EMPTY_PARAGRAPH
     else:
@@ -1102,6 +1118,7 @@ def build_plan_prompt(ctx, compatible, pins):
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[ctx.mode]),
         ("@@SEED_PARAGRAPH@@", seed),
         ("@@CAST_FIXED@@", cast_fixed),
+        ("@@LOCATION_FIXED@@", location_fixed),
         ("@@ARC_RULE@@", _plan_arc_rule(lo, hi)),
         ("@@BEAT_COUNT@@", "EXACTLY %d" % lo if lo == hi else "%d to %d" % (lo, hi)),
         ("@@PANEL_COUNT_RULE@@", "" if lo >= hi else (
@@ -1265,6 +1282,18 @@ def normalize_plan(ctx, raw):
         if setting and not setting.endswith((".", "!", "?")):
             setting += "."
         locations.append({"id": _clean_str(item.get("id")), "setting": setting})
+    # Location library spec L3.4: pinned locations are l1..lK with their library setting.
+    if ctx.locations:
+        for entry in locations:
+            entry["location_name"] = None
+        for i, pin in enumerate(ctx.locations, start=1):
+            fixed = {"id": "l%d" % i, "setting": FIXED_SETTING % pin.description,
+                     "location_name": pin.name}
+            at = [j for j, entry in enumerate(locations) if entry["id"] == fixed["id"]]
+            if at:
+                locations[at[0]] = fixed
+            else:
+                locations.insert(i - 1, fixed)
     plan["locations"] = locations
     plan["props"] = [{"id": _clean_str(item.get("id")), "name": _clean_str(item.get("name"))}
                      for item in _list_of_objects(raw, "props", shape)]
@@ -1284,6 +1313,10 @@ def normalize_plan(ctx, raw):
             "cast": [_clean_str(c) if isinstance(c, str) else json.dumps(c) for c in beat_cast],
             "speaker": _clean_str(item.get("speaker")),
             "lines": _clean_lines(item.get("lines"))})
+    if ctx.locations:
+        by_name = dict((pin.name, "l%d" % i) for i, pin in enumerate(ctx.locations, start=1))
+        for beat in beats:
+            beat["location"] = by_name.get(beat["location"].lower(), beat["location"])
     plan["beats"] = beats
     plan["panels"] = len(beats)
     loras = raw.get("loras")
@@ -2092,8 +2125,9 @@ def plan_checks(ctx, plan, shape=()):
     """(hard, advisory) violation strings for a normalized plan (RS10). shape holds
     normalize_plan's container-shape P2 violations, reported first. Hard: P1, P2, P3's normalize
     and duplicate-phrase messages, P16 (a library character in no beat's cast; pinned cast
-    presence spec PC1) and P17 (a spoken line given to a speaker other than the one the narrative
-    names; speaker attribution spec SA2); every other P message is advisory (dialogue spec
+    presence spec PC1), P17 (a spoken line given to a speaker other than the one the narrative
+    names; speaker attribution spec SA2) and P21 (a library location that is the location of no
+    beat; location library spec L3.5); every other P message is advisory (dialogue spec
     6.3). P1 accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
     hard, advisory = list(shape), []
     beats = plan["beats"]
@@ -2243,6 +2277,14 @@ def plan_checks(ctx, plan, shape=()):
                 message += ("; a beat with a speaker shows only the speaker, so that beat has no "
                             "speaker or %s is its speaker" % entry["id"])
             hard.append(message)
+    # Location library spec L3.5: every library location is the location of some beat.
+    used = set(beat["location"] for beat in beats)
+    for entry in plan["locations"]:
+        if entry.get("location_name") and entry["id"] not in used:
+            hard.append("plan: P21 location presence: %s (library location %s) is the location "
+                        "of no beat; every already-set place is in this movie, so give at least "
+                        "one beat the location %s" % (entry["id"], entry["location_name"],
+                                                       entry["id"]))
     # Speaker attribution spec SA2, D3: a spoken line keeps the speaker the narrative names.
     if plan["spoken_lines"]:
         said_by = line_speakers(ctx.narrative, plan["cast"])
@@ -2373,11 +2415,16 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     by_cast = {c["id"]: c for c in plan["cast"]}
     reported_dupes = set()
     pin_paths = {os.path.realpath(p["path"]) for p in pins}
+    # Location library spec L3.6: an attached pinned location's video LoRA counts for L4.
+    by_location = {l["id"]: l for l in plan["locations"]}
+    attached = set(pin.name for pin in ctx.locations if pin.attach_video)
     for k in range(1, n + 1):
         beat = plan["beats"][k - 1] if k <= len(plan["beats"]) else {"cast": []}
+        loc = by_location.get(beat.get("location"), {}).get("location_name")
         loras_k = ([(pin_label(p), p.get("kind"), p.get("catalog_id"), None) for p in pins]
                    + [(e["id"], e["kind"], e["id"], e["path"]) for e in global_picks]
                    + [(e["id"], e["kind"], e["id"], e["path"]) for e in per_beat.get(k, [])]
+                   + ([("location " + loc, "location", None, None)] if loc in attached else [])
                    + [("character " + by_cast[c]["cast_name"], "character", None, None)
                       for c in beat["cast"] if c in by_cast and by_cast[c]["cast_name"]])
         motion = [label for label, kind, _i, _p in loras_k if kind in ("motion", "physics")]
@@ -4636,8 +4683,10 @@ class _Run(object):
         if why == "timeout":
             return self.round0_timeout()
         # Pinned cast presence spec PC2, speaker attribution spec SA3: a plan that drops a library
-        # character or gives a spoken line to the wrong speaker is not usable.
-        fatal = ([h for h in found[2] if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17")]
+        # character or gives a spoken line to the wrong speaker, or sets no beat at a library
+        # location (location library spec L3.5), is not usable.
+        fatal = ([h for h in found[2]
+                  if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17", "P21")]
                  if found else ["the reply is not one JSON object"])
         if fatal:
             calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])

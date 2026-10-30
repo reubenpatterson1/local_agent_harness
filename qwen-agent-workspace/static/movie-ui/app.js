@@ -8,7 +8,7 @@
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
+    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
 
@@ -211,6 +211,7 @@
     if (!key) { $("#c-judge").checked = false; }
     updateComposeButtons();
     updateCharacterButtons();
+    updateLocationButtons();
   }
 
   async function loadHost(refresh) {
@@ -260,7 +261,7 @@
   async function selectWorkspace(path) {
     S.ws = path;
     await loadOptions();
-    await Promise.all([loadCatalog(), loadCharacters(), loadActions(), loadStories(), loadModels()]);
+    await Promise.all([loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), loadModels()]);
     preview();
   }
 
@@ -281,7 +282,7 @@
 
   // --- tabs (MU79) ---------------------------------------------------------------------
 
-  const TABS = ["compose", "stories", "characters", "actions", "loras", "jobs", "traces"];
+  const TABS = ["compose", "stories", "characters", "locations", "actions", "loras", "jobs", "traces"];
 
   function showTab(name) {
     TABS.forEach(function (tab) {
@@ -290,6 +291,7 @@
     });
     if (name === "stories") { loadStories(); }
     if (name === "characters") { loadCharacters(); }
+    if (name === "locations") { loadLocations(); }
     if (name === "actions") { loadActions(); }
     if (name === "traces") { loadTraceAgents(); loadRecent(); loadSaved(); }
     if (name === "loras") { loadCatalogTable(); loadModels(); }
@@ -382,6 +384,8 @@
       narration: $("#c-narration").value,
       video_loras: collectLoras("video"), stills_loras: collectLoras("stills"),
       characters: Array.prototype.map.call($("#c-characters").selectedOptions, function (o) { return o.value; }),
+      locations: Array.prototype.map.call($("#c-locations").selectedOptions, function (o) { return o.value; }),
+      location_strength: numberOrNull("#c-location-strength"),
       action_loras: Array.prototype.map.call($("#c-actions").selectedOptions, function (o) {
         return {name: o.value, strength: numberOrNull("#c-action-strength")};
       }),
@@ -518,6 +522,12 @@
     Array.prototype.forEach.call($("#c-characters").options, function (o) {
       o.selected = (f.characters || []).indexOf(o.value) >= 0;
     });
+    Array.prototype.forEach.call($("#c-locations").options, function (o) {
+      o.selected = (f.locations || []).indexOf(o.value) >= 0;
+    });
+    S.locationPick = (f.locations || []).slice();
+    $("#c-location-strength").value = f.location_strength === null || f.location_strength === undefined
+      ? "" : f.location_strength;
     const actionNames = (f.action_loras || []).map(function (a) { return a.name; });
     Array.prototype.forEach.call($("#c-actions").options, function (o) {
       o.selected = actionNames.indexOf(o.value) >= 0;
@@ -878,6 +888,177 @@
     });
   }
 
+  // --- locations (location library spec L4.4) ------------------------------------------
+
+  function wordCount(text) { return String(text || "").split(/\s+/).filter(Boolean).length; }
+
+  function firstWords(text, n) {
+    const words = String(text || "").split(/\s+/).filter(Boolean);
+    return words.slice(0, n).join(" ") + (words.length > n ? "..." : "");
+  }
+
+  function oneLine(selector) { return $(selector).value.replace(/\s+/g, " ").trim(); }
+
+  function errorText(res) {
+    return (res.data && (res.data.errors || [res.data.error]).join("; ")) || ("http " + res.status);
+  }
+
+  async function loadLocations() {
+    if (!S.ws) { return; }
+    const res = await api("GET", "/api/locations" + wsQuery());
+    S.locations = res.status === 200 ? res.data.locations : [];
+    const body = clear($("#lo-list tbody"));
+    const pick = $("#c-locations");
+    const chosen = Array.prototype.map.call(pick.selectedOptions, function (o) { return o.value; });
+    clear(pick);
+    S.locations.forEach(function (l) {
+      const row = el("tr", {data: {location: l.name}, cls: "clickable"}, l.invalid ?
+        [el("td", {text: l.name}), el("td", {text: "invalid: " + l.invalid}), el("td"), el("td"), el("td"), el("td")] :
+        [el("td", {text: l.name}), el("td", {text: l.status}), el("td", {text: l.source}),
+         el("td", {text: l.video ? "yes" : "no"}), el("td", {text: l.stills ? "yes" : "no"}),
+         el("td", {text: l.description})]);
+      row.addEventListener("click", function () { openLocation(l.name); });
+      body.appendChild(row);
+      if (l.status === "trained") {
+        const option = el("option", {value: l.name, text: l.name + " (" + firstWords(l.description, 6) + ")"});
+        option.selected = chosen.indexOf(l.name) >= 0;
+        pick.appendChild(option);
+      }
+    });
+    S.locationPick = Array.prototype.map.call(pick.selectedOptions, function (o) { return o.value; });
+  }
+
+  function onLocationPick() {
+    const pick = $("#c-locations");
+    if (pick.selectedOptions.length > 3) {
+      Array.prototype.forEach.call(pick.options, function (o) {
+        if (o.selected && S.locationPick.indexOf(o.value) < 0) { o.selected = false; }
+      });
+      $("#c-locations-note").textContent = "at most 3 locations";
+    } else {
+      $("#c-locations-note").textContent = "";
+    }
+    S.locationPick = Array.prototype.map.call(pick.selectedOptions, function (o) { return o.value; });
+    preview();
+  }
+
+  function loraLossNote(loc) {
+    return loc.status === "trained" && $("#lo-force").checked ? " Its LoRAs are deleted." : "";
+  }
+
+  async function openLocation(name) {
+    const res = await api("GET", "/api/locations/" + enc(name) + wsQuery());
+    if (res.status !== 200) { $("#lo-status").textContent = errorText(res); return; }
+    S.location = res.data;
+    const loc = res.data.location;
+    $("#lo-force").checked = false;
+    $("#lo-train-force").checked = false;
+    show($("#lo-detail"), true);
+    $("#lo-title").textContent = name + " (" + loc.status + ", " + loc.source + ")";
+    const sheet = $("#lo-sheet");
+    if (res.data.contact_sheet) { sheet.src = fileUrl(res.data.contact_sheet); }
+    show(sheet, Boolean(res.data.contact_sheet));
+    const byN = {};
+    res.data.stills.forEach(function (p) {
+      const m = /loc_(\d+)\.png$/.exec(p);
+      if (m) { byN[Number(m[1])] = p; }
+    });
+    const stills = clear($("#lo-stills"));
+    (res.data.manifest || []).forEach(function (item) {
+      const parts = [];
+      if (byN[item.n]) { parts.push(el("img", {src: fileUrl(byN[item.n]), alt: "still " + item.n})); }
+      const people = item.people_visible === null ? "people -" : (item.people_visible ? "people" : "no people");
+      parts.push(el("figcaption", {text: [item.source, item.match_score === null ? "score -" : "score " + item.match_score,
+        people, item.caption || "", item.kept ? "kept" : "dropped: " + (item.reason || "")].join("; ")}));
+      stills.appendChild(el("figure", {}, parts));
+    });
+    $("#lo-desc-edit").value = loc.description || "";
+    $("#lo-desc-save").textContent = loc.source === "photos" ? "Save description" : "Regenerate with this description";
+    show($("#lo-train-form"), false);
+    const tests = clear($("#lo-tests"));
+    if (res.data.tests.video_lora && res.data.tests.video_control) {
+      [["video_lora", "with the LoRA"], ["video_control", "without (control)"]].forEach(function (t) {
+        tests.appendChild(el("figure", {}, [el("video", {src: fileUrl(res.data.tests[t[0]]), controls: ""}),
+          el("figcaption", {text: t[1]})]));
+      });
+    }
+    $("#lo-status").textContent = "";
+    updateLocationButtons();
+  }
+
+  function updateLocationButtons() {
+    const words = wordCount($("#lo-description").value);
+    const photos = $("#lo-photos").files.length;
+    const okWords = words >= 15 && words <= 40;
+    $("#lo-words").textContent = words + " words (15-40)";
+    $("#lo-create").disabled = !/^[a-z][a-z0-9-]{1,23}$/.test($("#lo-name").value.trim()) || photos > 24
+      || (words > 0 && !okWords) || (photos === 0 && !okWords);
+    gate($("#lo-train"), $("#lo-train-reason"), ["render"]);
+    if (S.location && S.location.location.status === "dataset") {
+      $("#lo-train").disabled = true;
+      $("#lo-train-reason").textContent = "fewer than 12 stills kept; regenerate the dataset";
+    }
+  }
+
+  async function createLocation() {
+    const status = $("#lo-create-status");
+    const files = Array.prototype.slice.call($("#lo-photos").files);
+    const uploads = [];
+    try {
+      for (let i = 0; i < files.length; i += 1) {
+        status.textContent = "uploading photo " + (i + 1) + " of " + files.length + "...";
+        uploads.push(await uploadFile(files[i]));
+      }
+    } catch (err) {
+      status.textContent = String(err.message);
+      return;
+    }
+    const res = await api("POST", "/api/locations", {ws: S.ws, name: $("#lo-name").value.trim(),
+      description: oneLine("#lo-description") || null, photo_uploads: uploads, trigger: textOrNull("#lo-trigger"),
+      seed: numberOrNull("#lo-seed"), force: false});
+    status.textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
+    if (res.status === 201) { pollJobs(); }
+  }
+
+  function setupLocations() {
+    $("#lo-name").addEventListener("input", updateLocationButtons);
+    $("#lo-description").addEventListener("input", updateLocationButtons);
+    $("#lo-photos").addEventListener("change", updateLocationButtons);
+    $("#lo-create").addEventListener("click", createLocation);
+    $("#c-locations").addEventListener("change", onLocationPick);
+    $("#lo-accept").addEventListener("click", function () { show($("#lo-train-form"), true); });
+    $("#lo-desc-save").addEventListener("click", async function () {
+      const loc = S.location.location;
+      if (loc.source !== "photos" &&
+          !(await askConfirm("Regenerate the dataset of " + loc.name + " with this description?" + loraLossNote(loc)))) { return; }
+      const res = loc.source === "photos"
+        ? await api("PATCH", "/api/locations/" + enc(loc.name), {ws: S.ws, description: oneLine("#lo-desc-edit")})
+        : await api("POST", "/api/locations/" + enc(loc.name) + "/regenerate",
+                    {ws: S.ws, description: oneLine("#lo-desc-edit"), force: $("#lo-force").checked});
+      $("#lo-status").textContent = res.status === 200 ? "description saved"
+        : res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
+      if (res.status === 200) { await openLocation(loc.name); $("#lo-status").textContent = "description saved"; loadLocations(); }
+      if (res.status === 201) { pollJobs(); }
+    });
+    $("#lo-regen").addEventListener("click", async function () {
+      const name = S.location.location.name;
+      if (!(await askConfirm("Regenerate the dataset of " + name + " with a new seed?" + loraLossNote(S.location.location)))) { return; }
+      const res = await api("POST", "/api/locations/" + enc(name) + "/regenerate",
+                            {ws: S.ws, new_seed: true, force: $("#lo-force").checked});
+      $("#lo-status").textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
+      if (res.status === 201) { pollJobs(); }
+    });
+    $("#lo-train").addEventListener("click", async function () {
+      const name = S.location.location.name;
+      const res = await api("POST", "/api/locations/" + enc(name) + "/train",
+                            {ws: S.ws, video: $("#lo-train-video").checked, stills: $("#lo-train-stills").checked,
+                             force: $("#lo-train-force").checked});
+      $("#lo-train-reason").textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
+      if (res.status === 201) { pollJobs(); }
+    });
+    updateLocationButtons();
+  }
+
   // --- actions (motion LoRAs, bin/action) ----------------------------------------------
 
   async function loadActions() {
@@ -1013,7 +1194,9 @@
       return;
     }
     const verdicts = {};
-    (results || []).forEach(function (r) { verdicts[r.id] = r.ok ? "ok" : r.problems.join("; "); });
+    (results || []).forEach(function (r) {
+      verdicts[r.id] = (r.ok ? "ok" : r.problems.join("; ")) + (r.warnings && r.warnings.length ? " | warning: " + r.warnings.join("; ") : "");
+    });
     res.data.entries.forEach(function (e) {
       const remove = el("button", {type: "button", text: "Remove"});
       remove.addEventListener("click", async function () {
@@ -1057,7 +1240,8 @@
         use_when: $("#l-use-when").value.trim(), avoid_when: $("#l-avoid-when").value.trim(),
         default_strength: Number($("#l-default-strength").value),
         strength_range: [Number($("#l-range-lo").value), Number($("#l-range-hi").value)],
-        rank: numberOrNull("#l-rank"), alpha: numberOrNull("#l-alpha")};
+        rank: numberOrNull("#l-rank"), alpha: numberOrNull("#l-alpha"),
+        no_arch_check: $("#l-no-arch-check").checked};
       const res = await api("POST", "/api/loras", body);
       $("#l-output").textContent = res.data && res.data.run ? runText(res.data.run) : (res.data && res.data.error);
       loadCatalogTable();
@@ -1491,6 +1675,7 @@
     setupSmoke();
     setupStories();
     setupCharacters();
+    setupLocations();
     setupActions();
     setupLoras();
     setupJobs();

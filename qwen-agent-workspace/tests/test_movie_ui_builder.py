@@ -114,7 +114,7 @@ def test_mu36_compose_fields_defaults_and_unknown_keys():
 
 ALL_MU37_FLAGS = {"--story-id", "--panels", "--length", "--fps", "--frames", "--video-width", "--video-height",
                   "--seed-image", "--model", "--gemma", "--story-model", "--goal", "--shots", "--no-stills",
-                  "--lora", "--stills-lora", "--character", "--action", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
+                  "--lora", "--stills-lora", "--character", "--location", "--location-strength", "--action", "--no-auto-lora", "--no-narration", "--speech-only", "--story-legacy", "--judge",
                   "--no-low-ram", "--panel-timeout", "--force", "--force-story", "--redo", "--story-only",
                   "--no-review"}
 
@@ -128,12 +128,13 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
     assert ALL_MU37_FLAGS <= current
     assert {"--story-server-stop-after-story", "--no-story-server-stop-after-story", "--help"} <= current
     assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma",
-                             "--no-narration", "--speech-only", "--action"}
+                             "--no-narration", "--speech-only", "--action", "--location",
+                             "--location-strength"}
     real, error = lib.help_flags(mt.WS)
     assert error is None and ALL_MU37_FLAGS <= real
     supported = lib.supported_map(old)
     assert supported["judge"] is False and supported["story_only"] is False and supported["panels"] is True
-    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 28
+    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 30
     assert lib.supported_map(None)["panels"] is False
     ws = mt.make_stub_workspace(tmp_path)
     flags, error = lib.help_flags(ws)
@@ -280,9 +281,9 @@ def test_mut26_pipeline_files_are_unchanged():
     # 1f5aa2c36cefe38567d76230c9e3e342c8f14869 (on-camera dialogue), then to
     # 5cda31ecc94ca568f8a5ec587b00ee7393532809 (panel-1 pacing: story_engine.py camera
     # sentences and chained panel-1 template), then to
-    # 6a0b3035bdf3f6eb20833372436fd5e64af1f67b (panel-1 pacing instruction reworded), then to e25f58f5103ae1f703ab135a00a5d51b664b8124 (VLM lifecycle + panel-1 pacing), then to 75d914b9d128434b9fa0ac25cf0482e6f9b5ca7a (character_dataset.py: regenerate with a new seed), then to 5903089fe272c03933d31ca4af105c4aec42b823 (the seed is persisted under the library lock after the preflights), then to ac23105738adee0b26ea9d391681f3abbaa26ab0 (narrative dialogue fidelity), then to cf0a0e684ea4f9ca09f7e7d45dc0e33544242971 (writer pacing), then to 05ba1792b7e1620f96b1e50ba5a83f6349620529 (pinned cast presence), then to f7a38afc6d6ae9622b63dbf4ce939e362a05a7ad (speaker attribution), then to 42f33640cd008021a32dc0f8f948d0e8da04de2b (shot prompt format), then to ff757afbc0a801f2029628871c684ce4d98b4811 (soft panel count).
+    # 6a0b3035bdf3f6eb20833372436fd5e64af1f67b (panel-1 pacing instruction reworded), then to e25f58f5103ae1f703ab135a00a5d51b664b8124 (VLM lifecycle + panel-1 pacing), then to 75d914b9d128434b9fa0ac25cf0482e6f9b5ca7a (character_dataset.py: regenerate with a new seed), then to 5903089fe272c03933d31ca4af105c4aec42b823 (the seed is persisted under the library lock after the preflights), then to ac23105738adee0b26ea9d391681f3abbaa26ab0 (narrative dialogue fidelity), then to cf0a0e684ea4f9ca09f7e7d45dc0e33544242971 (writer pacing), then to 05ba1792b7e1620f96b1e50ba5a83f6349620529 (pinned cast presence), then to f7a38afc6d6ae9622b63dbf4ce939e362a05a7ad (speaker attribution), then to 42f33640cd008021a32dc0f8f948d0e8da04de2b (shot prompt format), then to ff757afbc0a801f2029628871c684ce4d98b4811 (soft panel count), then to 44beb3d67ad5af05093e29e1c6fc088330b41386 (location library).
     # This invariant holds from the new baseline.
-    BASELINE = "ff757afbc0a801f2029628871c684ce4d98b4811"
+    BASELINE = "44beb3d67ad5af05093e29e1c6fc088330b41386"
     root = subprocess.run(["git", "-C", mt.WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")

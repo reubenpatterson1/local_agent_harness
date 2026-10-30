@@ -256,6 +256,30 @@ def load_manifest(path):
                     raise ValueError("panel %d: character %s's strength must be a number in (0, 1], "
                                      "got %r" % (index, name, strength))
 
+        # Location library spec L3.9: an optional list of at most one pinned location.
+        if "locations" in panel:
+            locations = panel["locations"]
+            if not isinstance(locations, list):
+                raise ValueError("panel %d: locations must be a list" % index)
+            for entry in locations:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not name:
+                    raise ValueError("panel %d: every locations entry needs a non-empty name"
+                                     % index)
+            if len(locations) > 1:
+                raise ValueError("panel %d: at most one location per panel" % index)
+            for entry in locations:
+                lora = entry.get("video_lora")
+                if (not isinstance(lora, str) or not os.path.isabs(lora) or not os.path.isfile(lora)
+                        or not os.access(lora, os.R_OK)):
+                    raise ValueError("panel %d: location %s's video_lora is not a readable file: %s"
+                                     % (index, entry["name"], lora))
+                strength = entry.get("strength")
+                if (isinstance(strength, bool) or not isinstance(strength, (int, float))
+                        or not 0 < strength <= 1.0):
+                    raise ValueError("panel %d: location %s's strength must be a number in (0, 1], "
+                                     "got %r" % (index, entry["name"], strength))
+
         if "catalog_loras" in panel:
             entries = panel["catalog_loras"]
             if not isinstance(entries, list):
@@ -358,6 +382,8 @@ def build_units(panels, seed, clips_dir, run_root=None, global_loras=()):
         loras += [{"kind": "global", "name": None, "path": g["path"], "strength": g["strength"]}
                   for g in global_loras]
         loras += catalog_units[n_lead:]
+        loras += [{"kind": "location", "name": l["name"], "path": l["video_lora"],
+                   "strength": float(l["strength"])} for l in (panel.get("locations") or [])]
         loras += [{"kind": "character", "name": c["name"], "path": c["video_lora"],
                    "strength": float(c["strength"])} for c in (panel.get("characters") or [])]
         if loras:
@@ -521,10 +547,11 @@ def video_only_lora(path):
 
 
 def use_video_only_character_loras(units):
-    """Point every character LoRA of units at its video_only_lora copy (in place)."""
+    """Point every character and location LoRA of units at its video_only_lora copy (in place;
+    location library spec L3.9)."""
     for unit in units:
         for lora in unit.get("loras") or ():
-            if lora["kind"] == "character":
+            if lora["kind"] in ("character", "location"):
                 lora["path"] = video_only_lora(lora["path"])
 
 
@@ -1207,8 +1234,10 @@ def main(argv=None):
         return 2
     cast_entries = [(p["index"], c) for p in panels for c in (p.get("characters") or [])]
     catalog_entries = [(p["index"], e) for p in panels for e in (p.get("catalog_loras") or [])]
+    location_entries = [(p["index"], l) for p in panels for l in (p.get("locations") or [])]
     args.global_loras = []
-    if len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries and not catalog_entries:
+    if (len(parsed) == 1 and parsed[0][1] == 1.0 and not cast_entries and not catalog_entries
+            and not location_entries):
         args.lora_path = parsed[0][0]                       # legacy route (5.7.2)
     elif parsed:
         args.lora_path = None
@@ -1229,6 +1258,12 @@ def main(argv=None):
                 print("Error: --lora %s is also character %s's video LoRA (panel %d); pass it "
                       "once" % (seen[real], c["name"], index), file=sys.stderr)
                 return 2
+        for index, l in location_entries:
+            real = os.path.realpath(l["video_lora"])
+            if real in seen:
+                print("Error: --lora %s is also location %s's video LoRA (panel %d); pass it "
+                      "once" % (seen[real], l["name"], index), file=sys.stderr)
+                return 2
     if catalog_entries:
         global_reals = set(os.path.realpath(g["path"]) for g in args.global_loras)
         by_index = dict((p["index"], p) for p in panels)
@@ -1242,6 +1277,11 @@ def main(argv=None):
                 if os.path.realpath(c["video_lora"]) == real:
                     print("Error: catalog LoRA %s (panel %d) is also character %s's video LoRA"
                           % (entry["id"], index, c["name"]), file=sys.stderr)
+                    return 2
+            for l in by_index[index].get("locations") or []:
+                if os.path.realpath(l["video_lora"]) == real:
+                    print("Error: catalog LoRA %s (panel %d) is also location %s's video LoRA"
+                          % (entry["id"], index, l["name"]), file=sys.stderr)
                     return 2
         checked = set()
         for index, entry in catalog_entries:

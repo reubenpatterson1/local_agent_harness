@@ -40,7 +40,7 @@ def test_mu13_query_parsing():
 
 def test_mut18_every_api_route_needs_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 40
+    assert len(srv.ROUTES) == 46
     for method, regex, name, sample in srv.ROUTES:
         assert re.fullmatch(regex, sample), sample
         body = {} if method in ("POST", "PUT") else None
@@ -221,7 +221,7 @@ def test_mu14_ws_parameter_errors_and_options(env):
     assert status == 200
     assert payload["workspace"] == env["ws"] and payload["help_ok"] is True and payload["help_error"] is None
     assert payload["flags"] == sorted(payload["flags"]) and "--judge" in payload["flags"]
-    assert all(payload["supported"].values()) and len(payload["supported"]) == 28
+    assert all(payload["supported"].values()) and len(payload["supported"]) == 30
     assert payload["defaults"] == {"panels": 15, "fps": 24, "frames": 145, "model": lib.DEFAULT_MODEL,
                                    "gemma": lib.DEFAULT_GEMMA, "panel_timeout": 7200}
     with open(os.path.join(mt.FIXTURES, "ltx-movie-help-old.txt"), encoding="utf-8") as f:
