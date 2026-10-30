@@ -534,3 +534,195 @@ def test_lp19_provenance_changes_only_for_the_location_panel(tmp_path):
     assert after[1] != before[1]
     assert [l["kind"] for l in after[1]["loras"]] == ["catalog", "catalog", "location", "character"]
     assert after[1]["loras"][2]["sha256"] == seu.sha256_file(located[1]["locations"][0]["video_lora"])
+
+
+# --- LP1-LP4, LP13: bin/ltx-movie (L3.1, L3.2, L3.8) --------------------------------------------
+
+ltx_movie = _load("ltx_movie_for_location", os.path.join("bin", "ltx-movie"))
+NARRATIVE = "A courier carries a sealed letter across a rainy harbour town to a temple gate."
+
+
+@pytest.fixture
+def movie(tmp_path, monkeypatch):
+    """A temp workspace with the fake agent; ltx_movie.WS points at it; no sudo check."""
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    monkeypatch.setattr(ltx_movie, "_check_sudo_and_start_keepalive", lambda: None)
+    return ws
+
+
+def _movie_args(*argv):
+    """bin/ltx-movie's args after every resolver that runs before _resolve_locations."""
+    args = ltx_movie.build_parser().parse_args(list(argv))
+    args.video_width, args.video_height = 704, 448
+    for resolve in (ltx_movie._resolve_shots, ltx_movie._resolve_casting,
+                    ltx_movie._resolve_global_loras, ltx_movie._resolve_story_engine):
+        assert resolve(args) == 0
+    return args
+
+
+def test_lp1_resolve_locations(movie, capsys, story_env):
+    harbour = lt.harbour(story_env["locations"])
+    args = _movie_args(NARRATIVE, "--story-id", "lp1")
+    assert ltx_movie._resolve_locations(args) == 0 and args.location_pins == []
+    args = _movie_args(NARRATIVE, "--story-id", "lp1", "--location", "harbour-street")
+    assert ltx_movie._resolve_locations(args) == 0
+    assert [p.name for p in args.location_pins] == ["harbour-street"]
+    assert args.location_pins[0].attach_video is True and args.location_strength == 0.8
+    assert args.location_pins[0].video_lora == harbour["loras"]["video"]["path"]
+    capsys.readouterr()
+    for extra, message in (
+            (["--location-strength", "0.5"], "Error: --location-strength requires --location"),
+            (["--location", "harbour-street", "--no-stills"],
+             "Error: --location is not supported with --no-stills: location LoRAs attach to "
+             "chained or shots panels"),
+            (["--location", "harbour-street", "--location-strength", "1.5"],
+             "Error: --location-strength must be in (0, 1], got 1.5"),
+            (["--location", "harbour-street", "--story-legacy"],
+             "Error: --location needs the default story engine; it cannot be combined with "
+             "--story-legacy")):
+        assert ltx_movie.main([NARRATIVE, "--story-id", "lp1", "--dry-run"] + extra) == 2, extra
+        assert capsys.readouterr().err == message + "\n", extra
+    assert ltx_movie.main([NARRATIVE, "--story-id", "lp1", "--dry-run", "--location",
+                           "nowhere"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: unknown location: nowhere (no %s)\navailable locations: harbour-street\n"
+        % os.path.join(story_env["locations"], "nowhere", "location.json"))
+    seu.kyra(story_env["lib"])
+    lt.make_location(story_env["locations"], "kyra-quay", "kyrawmn", lt.MILL_DESC)
+    assert ltx_movie.main([NARRATIVE, "--story-id", "lp1", "--dry-run", "--character", "kyra",
+                           "--location", "kyra-quay"]) == 2
+    assert capsys.readouterr().err == (
+        "Error: location kyra-quay and character kyra share the trigger kyrawmn\n")
+
+
+def test_lp2_a_model_mismatch_drops_only_the_video_lora(movie, capsys, story_env):
+    lt.harbour(story_env["locations"], stills=True)
+    model = "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"
+    args = _movie_args(NARRATIVE, "--story-id", "lp2", "--location", "harbour-street",
+                       "--model", model)
+    capsys.readouterr()
+    assert ltx_movie._resolve_locations(args) == 0
+    assert capsys.readouterr().err == (
+        "Warning: location harbour-street's video LoRA was trained for dgrauet/ltx-2.3-mlx-q8, "
+        "not --model %s; it is not attached, and the panels set there render without it (its "
+        "setting and stills LoRA still apply)\n" % model)
+    assert args.location_pins[0].attach_video is False
+    assert ltx_movie._location_flags(args, video=True) == []
+    assert ltx_movie._location_flags(args) == ["--location", "harbour-street",
+                                               "--location-strength", "0.8"]
+    assert ltx_movie._story_context(args).locations == args.location_pins
+
+
+def _existing_story(movie, story_id, pinned):
+    story_dir = os.path.join(movie, "generated", "stories", story_id)
+    os.makedirs(story_dir)
+    with open(os.path.join(story_dir, "story.md"), "w") as f:
+        f.write("# T\n\n## Panel 1 — A\nImage: x\nMotion: y\n")
+    if pinned is not None:
+        lt.write_plan(story_dir, ["l1"], pinned=pinned)
+    return story_dir
+
+
+def test_lp3_an_existing_story_keeps_its_locations(movie, capsys, story_env):
+    lt.harbour(story_env["locations"])
+    lt.temple(story_env["locations"])
+    _existing_story(movie, "lp3", (("l1", "harbour-street"),))
+    args = _movie_args(NARRATIVE, "--story-id", "lp3", "--location", "harbour-street")
+    assert ltx_movie._resolve_locations(args) == 0
+    capsys.readouterr()
+    for flags, given in ((["--location", "temple-gate"], "temple-gate"),
+                         (["--location", "harbour-street", "--location", "temple-gate"],
+                          "harbour-street, temple-gate"), ([], "none")):
+        args = _movie_args(NARRATIVE, "--story-id", "lp3", *flags)
+        assert ltx_movie._resolve_locations(args) == 2, flags
+        assert capsys.readouterr().err == (
+            "Error: story lp3 was planned with the locations [harbour-street], not --location "
+            "[%s]; pass the same --location flags, or --force-story to plan a new story\n" % given)
+    _existing_story(movie, "lp3b", ())
+    args = _movie_args(NARRATIVE, "--story-id", "lp3b", "--location", "harbour-street")
+    assert ltx_movie._resolve_locations(args) == 2
+    assert "planned with the locations [none], not --location [harbour-street]" in (
+        capsys.readouterr().err)
+    args = _movie_args(NARRATIVE, "--story-id", "lp3b")
+    assert ltx_movie._resolve_locations(args) == 0 and args.location_pins == []
+    args = _movie_args(NARRATIVE, "--story-id", "lp3", "--location", "temple-gate",
+                       "--force-story")
+    assert ltx_movie._resolve_locations(args) == 0
+    story_dir = _existing_story(movie, "lp3c", None)
+    args = _movie_args(NARRATIVE, "--story-id", "lp3c", "--location", "harbour-street")
+    assert ltx_movie._resolve_locations(args) == 0
+    assert capsys.readouterr().out == (
+        "note: %s is not a usable plan; --location gets no LoRA in this story (location LoRAs "
+        "attach only to planned beats)\n" % os.path.join(story_dir, "plan.json"))
+    assert ltx_movie._resolve_locations(_movie_args(NARRATIVE, "--story-id", "lp3c")) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_lp4_the_dry_run_lists_the_locations(movie, capsys, story_env):
+    harbour = lt.harbour(story_env["locations"])
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "lp4", "--panels", "3", "--dry-run",
+                           "--no-review", "--location", "harbour-street",
+                           "--location-strength", "0.7"]) == 0
+    out = capsys.readouterr().out
+    assert ("--- Locations ---\nlocation: harbour-street (trigger harboplc; video LoRA %s; stills "
+            "LoRA none: not trained; strength 0.7)\n\n" % harbour["loras"]["video"]["path"]) in out
+    phase2 = [l for l in out.splitlines() if "ltx-story-images" in l and l.startswith("Command:")]
+    phase3 = [l for l in out.splitlines() if "ltx-story-manifest" in l and l.startswith("Command:")]
+    assert len(phase2) == 1 and phase2[0].endswith(
+        " --location harbour-street --location-strength 0.7")
+    assert len(phase3) == 1 and phase3[0].endswith(
+        " --force --location harbour-street --location-strength 0.7")
+    assert not os.path.exists(os.path.join(movie, "generated", "stories", "lp4"))
+    assert ltx_movie.main([NARRATIVE, "--story-id", "lp4", "--panels", "3", "--dry-run",
+                           "--no-review", "--location", "harbour-street", "--model",
+                           "MLXBits/ltx-2.3-10eros-v1.2-dmd-mlx-q8"]) == 0
+    out = capsys.readouterr().out
+    assert "strength 0.8) -- video LoRA not attached: trained for dgrauet/ltx-2.3-mlx-q8\n" in out
+    phase3 = [l for l in out.splitlines() if "ltx-story-manifest" in l and l.startswith("Command:")]
+    assert "--location" not in phase3[0]
+    plain = ltx_movie.main([NARRATIVE, "--story-id", "lp4", "--panels", "3", "--dry-run",
+                            "--no-review"])
+    assert plain == 0 and "Locations" not in capsys.readouterr().out
+
+
+def test_lp13_shots_stills_groups_split_by_location(movie, tmp_path, story_env):
+    lt.harbour(story_env["locations"], stills=True)
+    lt.temple(story_env["locations"])
+    story_md, _out = _images_story(tmp_path, pinned=(("l1", "harbour-street"),
+                                                     ("l2", "temple-gate")))
+    pins = ltx_movie._location_lib().resolve_locations(["harbour-street", "temple-gate"])
+    assert ltx_movie._shots_stills_groups(story_md, []) == [((), [1, 2, 3])]
+    assert ltx_movie._shots_stills_groups(story_md, [], []) == [((), [1, 2, 3])]
+    assert ltx_movie._shots_stills_groups(story_md, [], pins) == [
+        ((), [2]), (("location harbour-street",), [1, 3])]
+    seu.kyra(story_env["lib"])
+    members = ltx_movie._character_lib().resolve_cast([(None, "kyra")])
+    assert ltx_movie._shots_stills_groups(story_md, members, pins) == [
+        (("kyra",), [2]), (("kyra", "location harbour-street"), [1, 3])]
+
+
+# --- LP20: bin/iterate-story regenerates with the plan's locations (L3.11) ---------------------
+
+iterate_story = _load("iterate_story_for_location", os.path.join("bin", "iterate-story"))
+
+
+def test_lp20_iterate_story_passes_the_pinned_locations():
+    plan = {"narrative": NARRATIVE, "panels": 3, "mode": "chained", "seed_image": None,
+            "goal": None, "cast": [{"id": "c1", "phrase": "the woman in grey",
+                                    "cast_name": "kyra"}],
+            "locations": [{"id": "l1", "setting": "x", "location_name": "harbour-street"},
+                          {"id": "l2", "setting": "y", "location_name": None},
+                          {"id": "l3", "setting": "z", "location_name": "temple-gate"}],
+            "loras": {"pinned": []}}
+    cmd = iterate_story.build_engine_cmd("s", plan)
+    assert cmd[cmd.index("--character"):cmd.index("--force-story")] == [
+        "--character", "kyra", "--location", "harbour-street", "--location", "temple-gate"]
+    for locations in ([{"id": "l1", "setting": "x", "location_name": None}], [{"id": "l1"}],
+                      ["l1"]):
+        assert "--location" not in iterate_story.build_engine_cmd("s", dict(plan,
+                                                                            locations=locations))
+    old = dict(plan)
+    del old["locations"]
+    assert "--location" not in iterate_story.build_engine_cmd("s", old)

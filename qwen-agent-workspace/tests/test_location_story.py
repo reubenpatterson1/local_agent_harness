@@ -292,3 +292,39 @@ def test_ls12_recheck_never_runs_plan_checks(ws, tmp_path, monkeypatch):
     monkeypatch.setattr(se, "plan_checks", refuse)
     rc, _advisories = se.recheck(ctx, lambda path, panels, no_stills=False: [])
     assert rc == 0
+
+
+# --- LS7: the plan retry end to end through bin/ltx-movie (L3.5) -------------------------------
+
+ltx_movie = _load("ltx_movie_for_location_story", os.path.join("bin", "ltx-movie"))
+
+
+@pytest.fixture
+def movie(tmp_path, monkeypatch):
+    """A temp workspace with the fake agent; ltx_movie.WS points at it; no sudo check."""
+    ws = seu.make_ws(tmp_path)
+    monkeypatch.setattr(ltx_movie, "WS", ws)
+    monkeypatch.setattr(ltx_movie, "_check_sudo_and_start_keepalive", lambda: None)
+    return ws
+
+
+def test_ls7_a_plan_without_the_location_is_retried(movie, tmp_path, monkeypatch, story_env):
+    lt.harbour(story_env["locations"])
+    log = seu.script_agent(
+        monkeypatch, tmp_path,
+        plan=[seu.answer(_raw("chained", 3, ["l2", "l2", "l2"])),
+              seu.answer(_raw("chained", 3, ["l1", "l2", "l1"]))],
+        panel=dict((str(k), [seu.answer(seu.panel_json("chained", k))]) for k in range(1, 4)))
+    rc = ltx_movie.main(["A courier carries a sealed letter across a rainy harbour town.",
+                         "--story-id", "ls7", "--panels", "3",
+                         "--location", "harbour-street", "--story-only", "--no-review"])
+    log = seu.agent_log(log)
+    assert rc == 0
+    assert [r["stage"] for r in log][:3] == ["plan", "plan", "panel"]
+    assert ("YOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- "
+            + P21 % ("l1", "harbour-street", "l1") + "\n") in log[1]["argv"][-1]
+    with open(os.path.join(movie, "generated", "stories", "ls7", "plan.json")) as f:
+        plan = json.load(f)
+    assert plan["locations"][0] == {"id": "l1", "setting": se.FIXED_SETTING % lt.HARBOUR_DESC,
+                                    "location_name": "harbour-street"}
+    assert [b["location"] for b in plan["beats"]] == ["l1", "l2", "l1"]

@@ -358,6 +358,17 @@ def build_parser():
                               "character.json strength (default 0.8, provisional): the same in "
                               "every clip of the story, alone or with others; a panel still of "
                               "exactly one character uses 1.0")
+    parser.add_argument("--location", dest="locations", action="append", default=None,
+                         metavar="NAME",
+                         help="pin a trained location from generated/locations/ (repeatable, at "
+                              "most 3): the story plan sets at least one beat there with the "
+                              "location's fixed setting, and only the panels set there render "
+                              "with its LoRAs and trigger. See docs/superpowers/specs/"
+                              "2026-10-29-location-lora-design.md.")
+    parser.add_argument("--location-strength", dest="location_strength", type=float,
+                         default=None,
+                         help="LoRA strength for each pinned location without its own "
+                              "location.json strength (default 0.8), on every panel set there")
     parser.add_argument("--action", dest="actions", action="append", default=None,
                          metavar="NAME[:STRENGTH]",
                          help="apply a trained action (motion) LoRA from generated/actions/ to "
@@ -794,6 +805,15 @@ def _character_lib():
         "character_lib", os.path.join(WS, "character_lib.py")).load_module()
 
 
+def _location_lib():
+    """location_lib.py, loaded by path and only when --location is given or an existing story is
+    reused (location library spec 1.2, L3.2). It comes from this tool's own workspace, which is WS
+    except under a test that points WS at a partial copy of the workspace."""
+    return importlib.machinery.SourceFileLoader(
+        "location_lib", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                     "location_lib.py")).load_module()
+
+
 def _ltx2_skill():
     """ltx2_mlx_video_skill.py, loaded by path, for the host-aware autotune helper."""
     return importlib.machinery.SourceFileLoader(
@@ -890,6 +910,79 @@ def _resolve_casting(args):
                 return 2
     args.character_strength = strength
     args.cast_members = members
+    return 0
+
+
+def _resolve_locations(args):
+    """Validate and resolve --location/--location-strength into args.location_pins (the
+    location_lib.LocationPin list) and args.location_strength (location library spec L3.1,
+    L3.2). Returns 0, or 2 after one Error: line. Touches nothing."""
+    names = args.locations or []
+    args.location_pins = []
+    if not names:
+        if args.location_strength is not None:
+            print("Error: --location-strength requires --location", file=sys.stderr)
+            return 2
+        return _check_story_locations(args, names)
+    if args.no_stills:
+        print("Error: --location is not supported with --no-stills: location LoRAs attach to "
+              "chained or shots panels", file=sys.stderr)
+        return 2
+    lib = _location_lib()
+    strength = (args.location_strength if args.location_strength is not None
+                else lib.DEFAULT_LOCATION_STRENGTH)
+    if not 0 < strength <= 1.0:
+        print("Error: --location-strength must be in (0, 1], got %r" % strength, file=sys.stderr)
+        return 2
+    try:
+        pins = lib.resolve_locations(names)
+    except lib.UnusableLocationError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        print(lib.format_available_line(lib.usable_locations()), file=sys.stderr)
+        return 2
+    except lib.LocationError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    cast_triggers = dict((m.trigger, m.name) for m in (getattr(args, "cast_members", None) or []))
+    for pin in pins:
+        if pin.trigger in cast_triggers:
+            print("Error: location %s and character %s share the trigger %s"
+                  % (pin.name, cast_triggers[pin.trigger], pin.trigger), file=sys.stderr)
+            return 2
+    for k, pin in enumerate(pins):
+        if not lib.model_compatible(pin.base_model, args.model):
+            pins[k] = pin._replace(attach_video=False)
+            print("Warning: location %s's video LoRA was trained for %s, not --model %s; it is not "
+                  "attached, and the panels set there render without it (its setting and stills "
+                  "LoRA still apply)" % (pin.name, pin.base_model, args.model), file=sys.stderr)
+    rc = _check_story_locations(args, names)
+    if rc:
+        return rc
+    args.location_pins = pins
+    args.location_strength = strength
+    return 0
+
+
+def _check_story_locations(args, names):
+    """Location library spec L3.2: a reused story.md keeps the locations its plan.json pinned,
+    in both directions. Returns 0, or 2 after one Error: line; a story without a usable
+    plan.json gets a note when --location is given."""
+    story_md = _story_paths(args.story_id)["story_md"]
+    if args.force_story or not os.path.exists(story_md):
+        return 0
+    story_dir = os.path.dirname(story_md)
+    found = _location_lib().plan_location_names(story_dir)
+    if found is None:
+        if names:
+            print("note: %s is not a usable plan; --location gets no LoRA in this story (location "
+                  "LoRAs attach only to planned beats)" % os.path.join(story_dir, "plan.json"))
+        return 0
+    if found != set(names):
+        print("Error: story %s was planned with the locations [%s], not --location [%s]; pass "
+              "the same --location flags, or --force-story to plan a new story"
+              % (args.story_id, ", ".join(sorted(found)) or "none",
+                 ", ".join(sorted(set(names))) or "none"), file=sys.stderr)
+        return 2
     return 0
 
 
@@ -1044,7 +1137,8 @@ def _resolve_story_engine(args):
         for flag, given in (("--judge", args.judge), ("--no-auto-lora", args.no_auto_lora),
                             ("--goal", args.goal is not None),
                             ("--no-narration", args.no_narration),
-                            ("--speech-only", args.speech_only)):
+                            ("--speech-only", args.speech_only),
+                            ("--location", bool(args.locations))):
             if given:
                 print("Error: %s needs the default story engine; it cannot be combined with %s"
                       % (flag, reason), file=sys.stderr)
@@ -1142,6 +1236,19 @@ def _cast_flags(args):
     for m in members:
         flags += ["--cast", "%s=%s" % (m.phrase, m.name)]
     return flags + ["--character-strength", repr(float(args.character_strength))]
+
+
+def _location_flags(args, video=False):
+    """--location NAME per pinned location (with video, only those whose video LoRA attaches),
+    then --location-strength; [] when none qualifies (location library spec L3.8)."""
+    pins = [pin for pin in (getattr(args, "location_pins", None) or [])
+            if pin.attach_video or not video]
+    if not pins:
+        return []
+    flags = []
+    for pin in pins:
+        flags += ["--location", pin.name]
+    return flags + ["--location-strength", repr(float(args.location_strength))]
 
 
 def _seed_cell_budget():
@@ -1520,7 +1627,8 @@ def _story_context(args, dry_run=False):
         stills_pinned=stills, judge=args.judge,
         narration=False if args.no_narration else "speech" if args.speech_only else True,
         clip_seconds=args.frames / float(args.fps),
-        panels_target=getattr(args, "panels_target", None), length=getattr(args, "length", None))
+        panels_target=getattr(args, "panels_target", None), length=getattr(args, "length", None),
+        locations=list(getattr(args, "location_pins", None) or []))
 
 
 def _no_stills_rules():
@@ -1927,6 +2035,7 @@ def phase2_stills(args):
         return 2
     cmd += catalog_flags
     cmd += _cast_flags(args)
+    cmd += _location_flags(args)
     if getattr(args, "shots", False):
         return _phase2_shots(args, cmd)
     panel_01 = os.path.join(paths["images_dir"], "panel_01.png")
@@ -1948,12 +2057,13 @@ def _panel_list(panels):
     return ",".join(str(i) for i in panels)
 
 
-def _shots_stills_groups(story_md_path, members):
+def _shots_stills_groups(story_md_path, members, locations=()):
     """[(names, [panel numbers])]: shots-mode panels grouped by the cast characters whose stills
     LoRAs bin/ltx-story-images will load for them -- the same _compose_prompt(Image:, Style:) +
     cast_text(insert=members with a stills LoRA) match it performs, so every group is one LoRA
     set (shots spec 5.5). Sorted by (len(names), names); panels ascending, 1-based by position.
-    Uncast: one group of every panel."""
+    Uncast: one group of every panel. A panel whose plan.json beat is set at a pinned location
+    with a stills LoRA adds "location NAME" to its names (location library spec L3.8)."""
     panels = _load_story_panels(story_md_path)
     by_panel = {i: () for i in range(1, len(panels) + 1)}
     if members:
@@ -1965,6 +2075,13 @@ def _shots_stills_groups(story_md_path, members):
         for i, p in enumerate(panels, start=1):
             by_panel[i] = tuple(lib.cast_text(images._compose_prompt(p["image"], style), members,
                                               insert=insert)[1])
+    names = [pin.name for pin in locations if pin.stills_lora]
+    if names:
+        per_panel, _note = _location_lib().plan_panel_locations(os.path.dirname(story_md_path),
+                                                                len(panels), names)
+        for i, name in enumerate(per_panel, start=1):
+            if name is not None:
+                by_panel[i] += ("location " + name,)
     groups = {}
     for i, names in sorted(by_panel.items()):
         groups.setdefault(names, []).append(i)
@@ -1987,7 +2104,8 @@ def _phase2_shots(args, cmd):
     not stop the rest: every group runs, then one error lists each failed group and Phase 2
     returns 1. Stills already written are kept."""
     paths = _story_paths(args.story_id)
-    groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [])
+    groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [],
+                                  getattr(args, "location_pins", None) or [])
     os.makedirs(paths["images_dir"], exist_ok=True)
     failed = []
     for k, (names, panels) in enumerate(groups, start=1):
@@ -2116,6 +2234,7 @@ def phase3_manifest(args):
     if getattr(args, "speech_delivery", "beats") != "beats":
         cmd_manifest += ["--speech-delivery", args.speech_delivery]
     cmd_manifest += _cast_flags(args)
+    cmd_manifest += _location_flags(args, video=True)
     error, catalog_lists = _catalog_panel_loras(args)
     if error:
         print(error, file=sys.stderr)
@@ -2342,7 +2461,8 @@ def _print_shots_stills_plan(args, cmd):
               "cast stills LoRAs, each with --only <PANELS> (that group's panels):")
         print("Command: %s" % shlex.join(group_cmd))
         return
-    groups = _shots_stills_groups(story_md, getattr(args, "cast_members", None) or [])
+    groups = _shots_stills_groups(story_md, getattr(args, "cast_members", None) or [],
+                                  getattr(args, "location_pins", None) or [])
     for k, (names, panels) in enumerate(groups, start=1):
         group_cmd = list(cmd)
         group_cmd[group_cmd.index("--only") + 1] = _panel_list(panels)
@@ -2389,6 +2509,19 @@ def _print_dry_run_plan(args):
             print('cast: %s as "%s" (trigger %s; video LoRA %s; stills LoRA %s)'
                   % (m.name, m.phrase, m.trigger, m.video_lora,
                      m.stills_lora or "none: " + (m.stills_skip_reason or "not trained")))
+        print()
+
+    if getattr(args, "location_pins", None):
+        print("--- Locations ---")
+        for pin in args.location_pins:
+            strength = pin.strength if pin.strength is not None else args.location_strength
+            line = ("location: %s (trigger %s; video LoRA %s; stills LoRA %s; strength %s)"
+                    % (pin.name, pin.trigger, pin.video_lora,
+                       pin.stills_lora or "none: " + (pin.stills_skip_reason or "not trained"),
+                       repr(float(strength))))
+            if not pin.attach_video:
+                line += " -- video LoRA not attached: trained for %s" % pin.base_model
+            print(line)
         print()
 
     if getattr(args, "seed_image", None):
@@ -2445,6 +2578,7 @@ def _print_dry_run_plan(args):
             return 2
         phase2_cmd += catalog_flags
         phase2_cmd += _cast_flags(args)
+        phase2_cmd += _location_flags(args)
         if getattr(args, "shots", False):
             _print_shots_stills_plan(args, phase2_cmd)
         else:
@@ -2470,6 +2604,7 @@ def _print_dry_run_plan(args):
     if getattr(args, "speech_delivery", "beats") != "beats":
         phase3_manifest_cmd += ["--speech-delivery", args.speech_delivery]
     phase3_manifest_cmd += _cast_flags(args)
+    phase3_manifest_cmd += _location_flags(args, video=True)
     error, catalog_lists = _catalog_panel_loras(args, dry_run=True)
     if error:
         print(error, file=sys.stderr)
@@ -2586,6 +2721,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_story_engine(args)
+    if rc:
+        return rc
+    rc = _resolve_locations(args)
     if rc:
         return rc
 
