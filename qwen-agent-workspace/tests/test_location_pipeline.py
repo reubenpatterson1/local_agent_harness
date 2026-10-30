@@ -738,3 +738,15 @@ def test_lp21_reuse_advice_under_the_legacy_engine(movie, capsys, story_env):
     err = capsys.readouterr().err
     assert "this run cannot take --location" in err
     assert "pass the same --location flags" not in err
+
+
+def test_lp22_location_strength_reaches_the_manifest(tmp_path, monkeypatch, capsys, story_env):
+    harbour = lt.harbour(story_env["locations"])
+    ws, story_dir, story_md, images = _manifest_story(tmp_path, monkeypatch, text=CHAIN_STORY)
+    capsys.readouterr()
+    assert manifest.main(_manifest_argv("lp", story_md, images, False, "--location", "harbour-street",
+                                        "--location-strength", "0.9")) == 0
+    out = capsys.readouterr().out
+    entry = {"name": "harbour-street", "video_lora": harbour["loras"]["video"]["path"], "strength": 0.9}
+    assert [p["locations"] for p in _panels(story_dir)] == [[entry], [], [entry]]
+    assert "location: panel 1: harbour-street@0.9\n" in out
