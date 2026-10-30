@@ -416,3 +416,19 @@ def test_ll1_every_new_and_changed_file_compiles(python, tmp_path):
     bash = subprocess.run(["bash", "-n", os.path.join(WS, "bin", "location-train-vlm")],
                           capture_output=True, text=True, timeout=60)
     assert bash.returncode == 0, bash.stderr
+
+
+def test_ll15_an_unreadable_record_is_a_location_error(env):
+    if os.geteuid() == 0:
+        pytest.skip("root reads anything")
+    lt.harbour(env["locations"])
+    path = os.path.join(env["locations"], "harbour-street", "location.json")
+    os.chmod(path, 0)
+    try:
+        assert _raises(ll.load_location, "harbour-street").startswith(
+            "invalid location.json for harbour-street:")
+        names = ll.usable_locations()
+        assert isinstance(names, list)
+        assert "harbour-street" not in names
+    finally:
+        os.chmod(path, 0o644)

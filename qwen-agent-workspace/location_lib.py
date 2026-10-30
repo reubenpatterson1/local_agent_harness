@@ -292,7 +292,7 @@ def load_location(name):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         validate_location(data, name=name)
-    except (ValueError, LocationError) as e:
+    except (ValueError, LocationError, OSError) as e:
         raise LocationError("invalid location.json for %s: %s" % (name, e))
     return data
 
