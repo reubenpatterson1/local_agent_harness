@@ -1,0 +1,95 @@
+{
+  "auto_lora": true,
+  "beats": [
+    {
+      "action": "the courier pedals a bicycle along the wet harbour road past the moored fishing boats",
+      "arc": "introduction",
+      "camera": "static",
+      "cast": [
+        "c1"
+      ],
+      "index": 1,
+      "lines": [],
+      "location": "l1",
+      "shot": "medium shot",
+      "speaker": ""
+    },
+    {
+      "action": "the courier swerves around a stack of fishing crates on the slippery quay",
+      "arc": "climax",
+      "camera": "tracking",
+      "cast": [
+        "c1"
+      ],
+      "index": 2,
+      "lines": [],
+      "location": "l1",
+      "shot": "wide shot",
+      "speaker": ""
+    },
+    {
+      "action": "the courier rides hard up the narrow lane between the shuttered shops",
+      "arc": "resolution",
+      "camera": "static",
+      "cast": [
+        "c1"
+      ],
+      "index": 3,
+      "lines": [],
+      "location": "l1",
+      "shot": "medium shot",
+      "speaker": ""
+    }
+  ],
+  "cast": [
+    {
+      "cast_name": null,
+      "descriptor": "a young man with short brown hair and a lean build wearing a yellow rain jacket and grey trousers",
+      "id": "c1",
+      "phrase": "the courier"
+    },
+    {
+      "cast_name": null,
+      "descriptor": "an old man with a shaved head and a calm face wearing a saffron robe and wooden sandals",
+      "id": "c2",
+      "phrase": "the old monk"
+    }
+  ],
+  "cast_notes": [],
+  "goal": null,
+  "locations": [
+    {
+      "id": "l1",
+      "setting": "The setting is a rainy harbour town in modern Japan, wet cobblestones underfoot, fishing boats behind, under grey afternoon light."
+    },
+    {
+      "id": "l2",
+      "setting": "The setting is a hilltop temple gate in modern Japan, worn stone steps underfoot, pine trees behind, under warm sunset light."
+    }
+  ],
+  "logline": "A courier carries a sealed letter through a rainy harbour town and delivers it at the temple gate.",
+  "loras": {
+    "global": [],
+    "per_beat": {},
+    "pinned": [],
+    "stills": []
+  },
+  "mode": "chained",
+  "narrative": "A courier carries a sealed letter across a rainy harbour town.",
+  "panels": 3,
+  "panels_target": 3,
+  "props": [
+    {
+      "id": "p1",
+      "name": "the sealed letter"
+    }
+  ],
+  "schema": "ltx-movie.plan.v1",
+  "seconds": "6",
+  "seed_image": null,
+  "speech_notes": [],
+  "spoken_lines": [],
+  "story_id": "s1",
+  "title": "The Sealed Letter",
+  "video_model": "dgrauet/ltx-2.3-mlx-q8"
+}
