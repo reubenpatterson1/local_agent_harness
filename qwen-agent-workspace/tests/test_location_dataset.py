@@ -303,10 +303,12 @@ def test_ld1_the_24_variants_and_gen_prompt():
 
 def test_ld2_the_section_2_literals():
     assert ld.EDIT_PROMPT == (
-        "Keep this exact place and viewpoint: the same buildings, structures, ground, signs, "
-        "materials and colours, seen from the same camera position with the same framing. Change "
-        "only the time of day and the conditions: show it %s, %s. No people anywhere in the "
-        "image. Photorealistic live-action film still, natural light.")
+        "Show this exact same place: keep its buildings, rooms, structures, furniture, fixtures, "
+        "decor, ground or floor, signs, materials and colours identical. Re-shoot it as a %s, %s, "
+        "%s. Move the camera to match: the viewpoint must clearly differ from the original "
+        "photo, and the time of day and the conditions must be clearly visible. If the place is "
+        "indoors, show the time of day and the weather through its windows and in its light. No "
+        "people anywhere in the image. Photorealistic live-action film still, natural light.")
     assert ld.EDIT_CONDITIONS == [
         ("at dusk", "under a clear sky"), ("at night", "in light rain"),
         ("at dawn", "in thick fog"), ("at midday", "under an overcast sky"),
@@ -321,18 +323,23 @@ def test_ld2_the_section_2_literals():
         ("at dusk", "in fog"), ("at golden hour", "under an overcast sky"),
         ("at night", "in heavy rain"), ("at midday", "in spring under a clear sky")]
     assert len(ld.EDIT_CONDITIONS) == 23
+    assert ld.EDIT_VIEWS[0] == "wide shot from further back"
+    assert ld.EDIT_VIEWS[22] == "close-up of a material or texture"
+    assert len(ld.EDIT_VIEWS) == 23 and len(set(ld.EDIT_VIEWS)) == 23
+    assert not any(v[0] in "aeiou" for v in ld.EDIT_VIEWS)      # "as a %s" reads correctly
     assert ld.DESCRIBE_PROMPT == (
         'These photos show one place. Describe it for an image generator that must redraw the '
         'same place recognisably from many viewpoints, at any time of day and in any weather. '
         'Reply with only a JSON object with one key. "description": one noun phrase of 15 to 40 '
         'words that starts with "a", "an" or "the" and captures only the place\'s persistent '
-        'features: its architecture and structures, materials and surfaces, signage, colour '
-        'palette, era and the ground. Leave out people, vehicles, animals, the time of day, the '
-        'weather, the lighting, the season, the camera and the image style. Use commas, not full '
-        'stops.')
+        'features: its architecture and structures, furniture, fixtures and decor, materials '
+        'and surfaces, signage, colour palette, era and the ground or floor. Leave out people, '
+        'vehicles, animals, the time of day, the weather, the lighting, the season, the camera '
+        'and the image style. Use commas, not full stops.')
     assert ld.DESCRIBE_SHORTEN == (
         'Shorten this place description to one noun phrase of 20 to 35 words that starts with '
-        '"a", "an" or "the". Keep the architecture, materials, signage, palette, era and ground; '
+        '"a", "an" or "the". Keep the architecture, furniture and decor, materials, signage, '
+        'palette, era and ground or floor; '
         'drop repetition and the least distinctive details; use commas and no full stops. Reply '
         'with only a JSON object with one key, "description": the shortened phrase.\n\n'
         'Description: %s')
@@ -348,15 +355,17 @@ def test_ld2_the_section_2_literals():
     assert ld.CHECK_TEXT_PROMPT == (
         'The image is a candidate picture of this place: @@DESCRIPTION@@. Reply with only a JSON '
         'object with five keys. "match_score": an integer from 1 to 10 for how clearly the image '
-        'shows this place, with its architecture, materials, signage, palette, era and ground, '
+        'shows this place, with its architecture, furniture, fixtures and decor, materials, '
+        'signage, palette, era and ground or floor, '
         'where 10 is unmistakably this place and 1 is a different place. ' + keys)
     assert ld.CHECK_PHOTO_PROMPT == (
         'The first image shows the reference place. The second image is a candidate picture, '
         'which may show the same place from another viewpoint, at another time of day, in other '
         'weather or in another season. Reply with only a JSON object with five keys. '
         '"match_score": an integer from 1 to 10 for how clearly the candidate shows the same '
-        'place as the reference, comparing its architecture, materials, signage, palette and '
-        'ground and ignoring the time of day, weather and season, where 10 is unmistakably the '
+        'place as the reference, comparing its architecture, furniture, fixtures and decor, '
+        'materials, signage, palette and ground or floor and ignoring the viewpoint, the time '
+        'of day, weather and season, where 10 is unmistakably the '
         'same place and 1 is a different place. ' + keys)
     assert ld.TAG_PROMPT == 'Reply with only a JSON object with four keys describing this image. ' + keys
     assert ld.CHECK_RETRY == (
@@ -529,7 +538,7 @@ def test_ld9_the_round_robin_top_up(env, monkeypatch, tmp_path, count):
         character_dataset.EDIT_MODEL, character_dataset.EDIT_LORA_REPO,
         character_dataset.EDIT_LORA_FILE, 8, 1.0)
     assert spec["jobs"] == [{"image": os.path.join(stills, "loc_%02d.png" % (((j - 1) % count) + 1)),
-                             "prompt": ld.EDIT_PROMPT % ld.EDIT_CONDITIONS[j - 1],
+                             "prompt": ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[j - 1],) + ld.EDIT_CONDITIONS[j - 1]),
                              "output_path": os.path.join(stills, "loc_%02d.png" % (count + j)),
                              "seed": 3, "width": 1024, "height": 640}
                             for j in range(1, 25 - count)]
@@ -623,7 +632,7 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
     assert (photo["source"], photo["photo"], photo["prompt"], photo["match_score"]) == (
         "photo", 2, None, None)
     assert (edit["source"], edit["photo"], edit["prompt"], edit["match_score"]) == (
-        "edit", 1, ld.EDIT_PROMPT % ld.EDIT_CONDITIONS[0], 9)
+        "edit", 1, ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[0],) + ld.EDIT_CONDITIONS[0]), 9)
     assert list(edit) == ["n", "source", "photo", "prompt", "match_score", "people_visible",
                           "shot", "time_of_day", "weather", "kept", "reason", "caption"]
 
@@ -1143,3 +1152,10 @@ def test_ld26_an_upscaled_photo_is_accepted_with_a_warning(env, monkeypatch, tmp
     assert "warning: --photo " not in captured.out
     assert "smaller than the 512x320 minimum" in captured.err
     assert os.listdir(env["locations"]) == []
+
+
+def test_ld27_edits_reshoot_from_new_viewpoints():
+    prompt = ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[0],) + ld.EDIT_CONDITIONS[0])
+    assert "Re-shoot it as a wide shot from further back, at dusk, under a clear sky." in prompt
+    assert "furniture, fixtures, decor" in prompt
+    assert "same camera position" not in prompt and "Change only" not in prompt

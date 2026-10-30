@@ -79,12 +79,15 @@ def gen_prompt(view, time, weather, description):
         view, description, TIME_PHRASES[time], WEATHER_PHRASES[weather], STYLE)
 
 
-# Spec 2.6: the photo-mode top-up edits; edit j (1-based) uses EDIT_CONDITIONS[j - 1].
-EDIT_PROMPT = ("Keep this exact place and viewpoint: the same buildings, structures, ground, "
-               "signs, materials and colours, seen from the same camera position with the same "
-               "framing. Change only the time of day and the conditions: show it %s, %s. No "
-               "people anywhere in the image. Photorealistic live-action film still, natural "
-               "light.")
+# Spec 2.6: the photo-mode top-up edits; edit j (1-based) uses EDIT_VIEWS[j - 1] and
+# EDIT_CONDITIONS[j - 1].
+EDIT_PROMPT = ("Show this exact same place: keep its buildings, rooms, structures, furniture, "
+               "fixtures, decor, ground or floor, signs, materials and colours identical. "
+               "Re-shoot it as a %s, %s, %s. Move the camera to match: the viewpoint must clearly "
+               "differ from the original photo, and the time of day and the conditions must be "
+               "clearly visible. If the place is indoors, show the time of day and the weather "
+               "through its windows and in its light. No people anywhere in the image. "
+               "Photorealistic live-action film still, natural light.")
 EDIT_CONDITIONS = [
     ("at dusk", "under a clear sky"), ("at night", "in light rain"), ("at dawn", "in thick fog"),
     ("at midday", "under an overcast sky"), ("at golden hour", "under a clear sky"),
@@ -99,6 +102,20 @@ EDIT_CONDITIONS = [
     ("at midday", "in spring under a clear sky"),
 ]                                                    # 23 entries: P = 1 needs 23 edits
 
+EDIT_VIEWS = [
+    "wide shot from further back", "standing-height view from a different spot",
+    "view from the opposite side", "high-angle view from above", "low-angle upward view",
+    "medium shot of a distinctive feature", "close-up of a characteristic surface or detail",
+    "view looking along its length from one end", "wide shot from one corner",
+    "three-quarter view from the left", "three-quarter view from the right",
+    "medium shot from a lower position", "wide shot from the far side",
+    "view from a doorway or entrance", "high-angle wide shot from a raised position",
+    "close-up of a sign, fixture or ornament", "medium shot looking across it",
+    "low-angle view from near the ground or floor", "wide shot from the left edge",
+    "wide shot from the right edge", "medium shot of its centre",
+    "view looking back toward the original camera position", "close-up of a material or texture",
+]                                                    # 23 entries, paired with EDIT_CONDITIONS
+
 # Spec 2.7: the vision model drafts a photo location's description.
 DESCRIBE_ATTEMPTS = 3
 DESCRIBE_PROMPT = (
@@ -106,14 +123,16 @@ DESCRIBE_PROMPT = (
     'place recognisably from many viewpoints, at any time of day and in any weather. Reply with '
     'only a JSON object with one key. "description": one noun phrase of 15 to 40 words that '
     'starts with "a", "an" or "the" and captures only the place\'s persistent features: its '
-    'architecture and structures, materials and surfaces, signage, colour palette, era and the '
-    'ground. Leave out people, vehicles, animals, the time of day, the weather, the lighting, the '
-    'season, the camera and the image style. Use commas, not full stops.')
+    'architecture and structures, furniture, fixtures and decor, materials and surfaces, '
+    'signage, colour palette, era and the ground or floor. Leave out people, vehicles, animals, '
+    'the time of day, the weather, the lighting, the season, the camera and the image style. '
+    'Use commas, not full stops.')
 DESCRIBE_SHORTEN = (
     'Shorten this place description to one noun phrase of 20 to 35 words that starts with "a", '
-    '"an" or "the". Keep the architecture, materials, signage, palette, era and ground; drop '
-    'repetition and the least distinctive details; use commas and no full stops. Reply with only '
-    'a JSON object with one key, "description": the shortened phrase.\n\nDescription: %s')
+    '"an" or "the". Keep the architecture, furniture and decor, materials, signage, '
+    'palette, era and ground or floor; drop repetition and the least distinctive details; use '
+    'commas and no full stops. Reply with only a JSON object with one key, "description": the '
+    'shortened phrase.\n\nDescription: %s')
 DESCRIBE_RETRY = (
     'Your previous reply was rejected: %s. Previous reply: %s\n'
     'Reply again with only the JSON object. Keep "description" one noun phrase of 15 to 40 words '
@@ -128,16 +147,17 @@ _KEYS = ('"people_visible": true when any person or part of a person is visible 
 CHECK_TEXT_PROMPT = (
     'The image is a candidate picture of this place: @@DESCRIPTION@@. Reply with only a JSON '
     'object with five keys. "match_score": an integer from 1 to 10 for how clearly the image '
-    'shows this place, with its architecture, materials, signage, palette, era and ground, where '
-    '10 is unmistakably this place and 1 is a different place. ' + _KEYS)
+    'shows this place, with its architecture, furniture, fixtures and decor, materials, '
+    'signage, palette, era and ground or floor, where 10 is unmistakably this place and 1 is a '
+    'different place. ' + _KEYS)
 CHECK_PHOTO_PROMPT = (
     'The first image shows the reference place. The second image is a candidate picture, which '
     'may show the same place from another viewpoint, at another time of day, in other weather or '
     'in another season. Reply with only a JSON object with five keys. "match_score": an integer '
     'from 1 to 10 for how clearly the candidate shows the same place as the reference, comparing '
-    'its architecture, materials, signage, palette and ground and ignoring the time of day, '
-    'weather and season, where 10 is unmistakably the same place and 1 is a different place. '
-    + _KEYS)
+    'its architecture, furniture, fixtures and decor, materials, signage, palette and ground or '
+    'floor and ignoring the viewpoint, the time of day, weather and season, where 10 is '
+    'unmistakably the same place and 1 is a different place. ' + _KEYS)
 TAG_PROMPT = 'Reply with only a JSON object with four keys describing this image. ' + _KEYS
 CHECK_RETRY = ('Your previous reply was rejected: %s. Previous reply: %s\n'
                'Reply again with only the JSON object, using exactly the listed values for '
@@ -356,7 +376,7 @@ def _plan(data, loc_dir):
     plan = [{"n": k, "source": "photo", "photo": k, "prompt": None} for k in range(1, p + 1)]
     for j in range(1, location_lib.TOTAL_STILLS - p + 1):
         plan.append({"n": p + j, "source": "edit", "photo": ((j - 1) % p) + 1,
-                     "prompt": EDIT_PROMPT % EDIT_CONDITIONS[j - 1]})
+                     "prompt": EDIT_PROMPT % ((EDIT_VIEWS[j - 1],) + EDIT_CONDITIONS[j - 1])})
     edits = [e for e in plan if e["source"] == "edit"]
     if not edits:
         return plan, (None, None)

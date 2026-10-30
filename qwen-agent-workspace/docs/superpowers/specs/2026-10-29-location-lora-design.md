@@ -277,11 +277,13 @@ Coverage: each view 4 times with 4 distinct times; times dawn 5, midday 5, golde
 6. **Story server.** Text mode, and photo mode with E > 0, stop the story server, wait for `GENERATE_MIN_AVAIL_GIB` (Z-Image) or `EDIT_MIN_AVAIL_GIB` (edits) available, run the child, and restore exactly as `character_dataset.py:980-1008` (detached restore on interrupt; `--wait` plus `wait_for_vlm(VLM_WAIT_S)` otherwise; the restore runs in a `finally`). Photo mode with P = 24 never stops the server.
 
 ```python
-EDIT_PROMPT = ("Keep this exact place and viewpoint: the same buildings, structures, ground, "
-               "signs, materials and colours, seen from the same camera position with the same "
-               "framing. Change only the time of day and the conditions: show it %s, %s. No "
-               "people anywhere in the image. Photorealistic live-action film still, natural "
-               "light.")
+EDIT_PROMPT = ("Show this exact same place: keep its buildings, rooms, structures, furniture, "
+               "fixtures, decor, ground or floor, signs, materials and colours identical. "
+               "Re-shoot it as a %s, %s, %s. Move the camera to match: the viewpoint must clearly "
+               "differ from the original photo, and the time of day and the conditions must be "
+               "clearly visible. If the place is indoors, show the time of day and the weather "
+               "through its windows and in its light. No people anywhere in the image. "
+               "Photorealistic live-action film still, natural light.")
 EDIT_CONDITIONS = [
     ("at dusk", "under a clear sky"), ("at night", "in light rain"), ("at dawn", "in thick fog"),
     ("at midday", "under an overcast sky"), ("at golden hour", "under a clear sky"),
@@ -295,7 +297,21 @@ EDIT_CONDITIONS = [
     ("at golden hour", "under an overcast sky"), ("at night", "in heavy rain"),
     ("at midday", "in spring under a clear sky"),
 ]                                                    # 23 entries: P = 1 needs 23 edits
+EDIT_VIEWS = [
+    "wide shot from further back", "standing-height view from a different spot",
+    "view from the opposite side", "high-angle view from above", "low-angle upward view",
+    "medium shot of a distinctive feature", "close-up of a characteristic surface or detail",
+    "view looking along its length from one end", "wide shot from one corner",
+    "three-quarter view from the left", "three-quarter view from the right",
+    "medium shot from a lower position", "wide shot from the far side",
+    "view from a doorway or entrance", "high-angle wide shot from a raised position",
+    "close-up of a sign, fixture or ornament", "medium shot looking across it",
+    "low-angle view from near the ground or floor", "wide shot from the left edge",
+    "wide shot from the right edge", "medium shot of its centre",
+    "view looking back toward the original camera position", "close-up of a material or texture",
+]                                                    # 23 entries, paired with EDIT_CONDITIONS
 ```
+Edit j uses EDIT_VIEWS[j - 1] and EDIT_CONDITIONS[j - 1] (revised 2026-10-30: edits re-shoot from a new viewpoint; the old prompt kept the viewpoint and gave near-copies).
 The CLI help and the UI say: angles come only from the photos; 3-5 photos from different spots are recommended.
 
 ### 2.7 VLM describe (L1.7)
@@ -312,14 +328,16 @@ DESCRIBE_PROMPT = (
     'place recognisably from many viewpoints, at any time of day and in any weather. Reply with '
     'only a JSON object with one key. "description": one noun phrase of 15 to 40 words that '
     'starts with "a", "an" or "the" and captures only the place\'s persistent features: its '
-    'architecture and structures, materials and surfaces, signage, colour palette, era and the '
-    'ground. Leave out people, vehicles, animals, the time of day, the weather, the lighting, the '
-    'season, the camera and the image style. Use commas, not full stops.')
+    'architecture and structures, furniture, fixtures and decor, materials and surfaces, '
+    'signage, colour palette, era and the ground or floor. Leave out people, vehicles, animals, '
+    'the time of day, the weather, the lighting, the season, the camera and the image style. '
+    'Use commas, not full stops.')
 DESCRIBE_SHORTEN = (
     'Shorten this place description to one noun phrase of 20 to 35 words that starts with "a", '
-    '"an" or "the". Keep the architecture, materials, signage, palette, era and ground; drop '
-    'repetition and the least distinctive details; use commas and no full stops. Reply with only '
-    'a JSON object with one key, "description": the shortened phrase.\n\nDescription: %s')
+    '"an" or "the". Keep the architecture, furniture and decor, materials, signage, '
+    'palette, era and ground or floor; drop repetition and the least distinctive details; use '
+    'commas and no full stops. Reply with only a JSON object with one key, "description": the '
+    'shortened phrase.\n\nDescription: %s')
 DESCRIBE_RETRY = (
     'Your previous reply was rejected: %s. Previous reply: %s\n'
     'Reply again with only the JSON object. Keep "description" one noun phrase of 15 to 40 words '
@@ -353,16 +371,17 @@ _KEYS = ('"people_visible": true when any person or part of a person is visible 
 CHECK_TEXT_PROMPT = (
     'The image is a candidate picture of this place: @@DESCRIPTION@@. Reply with only a JSON '
     'object with five keys. "match_score": an integer from 1 to 10 for how clearly the image '
-    'shows this place, with its architecture, materials, signage, palette, era and ground, where '
-    '10 is unmistakably this place and 1 is a different place. ' + _KEYS)
+    'shows this place, with its architecture, furniture, fixtures and decor, materials, '
+    'signage, palette, era and ground or floor, where 10 is unmistakably this place and 1 is a '
+    'different place. ' + _KEYS)
 CHECK_PHOTO_PROMPT = (
     'The first image shows the reference place. The second image is a candidate picture, which '
     'may show the same place from another viewpoint, at another time of day, in other weather or '
     'in another season. Reply with only a JSON object with five keys. "match_score": an integer '
     'from 1 to 10 for how clearly the candidate shows the same place as the reference, comparing '
-    'its architecture, materials, signage, palette and ground and ignoring the time of day, '
-    'weather and season, where 10 is unmistakably the same place and 1 is a different place. '
-    + _KEYS)
+    'its architecture, furniture, fixtures and decor, materials, signage, palette and ground or '
+    'floor and ignoring the viewpoint, the time of day, weather and season, where 10 is '
+    'unmistakably the same place and 1 is a different place. ' + _KEYS)
 TAG_PROMPT = 'Reply with only a JSON object with four keys describing this image. ' + _KEYS
 CHECK_RETRY = ('Your previous reply was rejected: %s. Previous reply: %s\n'
                'Reply again with only the JSON object, using exactly the listed values for '
@@ -922,7 +941,7 @@ with open(os.path.join(out, "normalized_plan_chained.json"), "w", encoding="utf-
 | ID | Covers |
 |---|---|
 | LD1 | `VARIANTS` equals the L1.5 table written out in the test; the time/weather counts and per-view distinct times; `gen_prompt` for n 1, 11 and 24 equals the literal strings |
-| LD2 | `EDIT_PROMPT`, `EDIT_CONDITIONS` (23 entries), `DESCRIBE_*`, `CHECK_*`, `TAG_PROMPT`, `CHECK_RETRY` equal the Section 2 literals written out in the test |
+| LD2 | `EDIT_PROMPT`, `EDIT_CONDITIONS` and `EDIT_VIEWS` (23 entries each), `DESCRIBE_*`, `CHECK_*`, `TAG_PROMPT`, `CHECK_RETRY` equal the Section 2 literals written out in the test |
 | LD3 | `validate_location_check`: scored and unscored; each alias; bool score refused; bad shot/time/weather refused |
 | LD4 | Check retries: an unparseable first reply → the second call carries `CHECK_RETRY` with the error and reply; three unparseable → `(None, "unparseable: ...")`; a RuntimeError propagates |
 | LD5 | **Text create (LK6).** Fakes record one Z-Image child spec with the 24 `gen_prompt` jobs, `seed`, 1024x640, `loras: None`, step `generate`; `story_server("stop")` once; restore with `wait=True`; 24 text-scored checks; with 20 passes and 4 fails → `untrained`, `dataset.kept == 20`, exit 0, `next:` line printed |
@@ -1097,7 +1116,7 @@ PR note (in substance): "New location library (`bin/location`, movie-ui Location
 3. **Layout.** The approved list gains `photos/`, `captions/`, `videos/`, `train/`, `lora/`, `tests/`; stills are `loc_NN.png`, n 1-24.
 4. **Prompt wording.** View phrases read as "<View> of <description>"; time and weather placeholders are phrases ("at dusk", "in fog"); STYLE is the character STYLE.
 5. **The 24 variants** (table L1.5): each view 4 times with 4 distinct times; times 5/5/5/4/5; each weather 6.
-6. **Edits.** The exact EDIT_PROMPT, 23 EDIT_CONDITIONS (with 5 season variants), sources are the fitted photo stills, round robin `((j-1) % P) + 1`.
+6. **Edits.** The exact EDIT_PROMPT, 23 EDIT_VIEWS and 23 EDIT_CONDITIONS (with 5 season variants), sources are the fitted photo stills, round robin `((j-1) % P) + 1`.
 7. **Photo limits.** At most 24 photos; the 16:10 crop must be at least 512x320 (below 768x480 it is upscaled with a warning); duplicate files are refused.
 8. **Three check prompts** (text-scored, photo-scored against photo 1, tag-only for user photos); vocabularies TIMES and WEATHERS (with snow) and their aliases.
 9. **Keep and caption details.** `--force` also keeps unparseable user photos; `empty of people` is dropped from a caption when people are visible.
