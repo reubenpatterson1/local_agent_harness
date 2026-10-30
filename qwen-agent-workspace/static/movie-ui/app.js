@@ -942,11 +942,17 @@
     preview();
   }
 
+  function loraLossNote(loc) {
+    return loc.status === "trained" && $("#lo-force").checked ? " Its LoRAs are deleted." : "";
+  }
+
   async function openLocation(name) {
     const res = await api("GET", "/api/locations/" + enc(name) + wsQuery());
     if (res.status !== 200) { $("#lo-status").textContent = errorText(res); return; }
     S.location = res.data;
     const loc = res.data.location;
+    $("#lo-force").checked = false;
+    $("#lo-train-force").checked = false;
     show($("#lo-detail"), true);
     $("#lo-title").textContent = name + " (" + loc.status + ", " + loc.source + ")";
     const sheet = $("#lo-sheet");
@@ -1023,18 +1029,20 @@
     $("#lo-accept").addEventListener("click", function () { show($("#lo-train-form"), true); });
     $("#lo-desc-save").addEventListener("click", async function () {
       const loc = S.location.location;
+      if (loc.source !== "photos" &&
+          !(await askConfirm("Regenerate the dataset of " + loc.name + " with this description?" + loraLossNote(loc)))) { return; }
       const res = loc.source === "photos"
         ? await api("PATCH", "/api/locations/" + enc(loc.name), {ws: S.ws, description: oneLine("#lo-desc-edit")})
         : await api("POST", "/api/locations/" + enc(loc.name) + "/regenerate",
                     {ws: S.ws, description: oneLine("#lo-desc-edit"), force: $("#lo-force").checked});
       $("#lo-status").textContent = res.status === 200 ? "description saved"
         : res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
-      if (res.status === 200) { openLocation(loc.name); loadLocations(); }
+      if (res.status === 200) { await openLocation(loc.name); $("#lo-status").textContent = "description saved"; loadLocations(); }
       if (res.status === 201) { pollJobs(); }
     });
     $("#lo-regen").addEventListener("click", async function () {
       const name = S.location.location.name;
-      if (!(await askConfirm("Regenerate the dataset of " + name + " with a new seed?"))) { return; }
+      if (!(await askConfirm("Regenerate the dataset of " + name + " with a new seed?" + loraLossNote(S.location.location)))) { return; }
       const res = await api("POST", "/api/locations/" + enc(name) + "/regenerate",
                             {ws: S.ws, new_seed: true, force: $("#lo-force").checked});
       $("#lo-status").textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);

@@ -405,3 +405,13 @@ def test_lu13_the_static_page():
         proc = subprocess.run([node, "--check", os.path.join(static, "app.js")],
                               capture_output=True, text=True, timeout=60)
         assert proc.returncode == 0, proc.stderr
+
+
+def test_lu13b_force_resets_and_regenerate_confirms_lora_loss():
+    with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        app = f.read()
+    assert app.count('$("#lo-force").checked = false;') == 1
+    assert app.count('$("#lo-train-force").checked = false;') == 1
+    assert app.count('" Its LoRAs are deleted."') == 1
+    assert app.count("loraLossNote(") == 3
+    assert 'with this description?" + loraLossNote(loc)' in app
