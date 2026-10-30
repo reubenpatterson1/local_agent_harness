@@ -345,3 +345,192 @@ def test_lp12_the_i20_source_counts_hold():
         source = f.read()
     assert source.count("_compose_prompt(") == 3
     assert source.count("_panel_seed(args.seed, i, grounded)") == 2
+
+
+# --- LP14-LP19: bin/ltx-mlx-render (L3.9) ------------------------------------------------------
+
+render = _load("ltx_mlx_render_for_location", os.path.join("bin", "ltx-mlx-render"))
+
+
+def _render_at_d210c26(tmp_path):
+    """bin/ltx-mlx-render as it was at d210c26, loaded from git show (skips outside a git
+    checkout that has d210c26)."""
+    old = subprocess.run(["git", "-C", WS, "show", "d210c26:./bin/ltx-mlx-render"],
+                         capture_output=True, text=True)
+    if old.returncode != 0:
+        pytest.skip("not a git checkout with d210c26")
+    path = str(tmp_path / "ltx_mlx_render_d210c26.py")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(old.stdout)
+    return importlib.machinery.SourceFileLoader("ltx_mlx_render_d210c26", path).load_module()
+
+
+def _lora(tmp_path, name):
+    return seu.lora_file(str(tmp_path / "loras"), name)
+
+
+def _render_panels(tmp_path, with_location=True):
+    """Three t2v panels: panel 2 has a character, a catalog style and a catalog motion LoRA and,
+    with_location, a location."""
+    character, style, motion, place = (_lora(tmp_path, n) for n in ("kyra", "grain", "fast",
+                                                                     "harbour"))
+    catalog = [{"id": "film-grain", "kind": "style", "path": style,
+                "sha256": seu.sha256_file(style), "strength": 0.6, "triggers": []},
+               {"id": "fast-motion", "kind": "motion", "path": motion,
+                "sha256": seu.sha256_file(motion), "strength": 0.7, "triggers": []}]
+    panels = [{"index": k, "image_path": None, "panel_text": "text %d" % k,
+               "motion_prompt": "motion %d" % k, "conditioning": "t2v"} for k in (1, 2, 3)]
+    panels[1]["characters"] = [{"name": "kyra", "phrase": "the woman in grey",
+                                "trigger": "kyrawmn", "video_lora": character, "strength": 0.8}]
+    panels[1]["catalog_loras"] = catalog
+    if with_location:
+        panels[1]["locations"] = [{"name": "harbour-street", "video_lora": place,
+                                   "strength": 0.8}]
+    return panels, place
+
+
+def test_lp14_the_render_unit_order(tmp_path):
+    panels, place = _render_panels(tmp_path)
+    globals_ = [{"path": _lora(tmp_path, "global"), "strength": 1.0}]
+    units = render.build_units(json.loads(json.dumps(panels)), 0, "/clips", global_loras=globals_)
+    assert [(l["kind"], l["name"]) for l in units[1]["loras"]] == [
+        ("catalog", "fast-motion"), ("global", None), ("catalog", "film-grain"),
+        ("location", "harbour-street"), ("character", "kyra")]
+    assert units[1]["loras"][3] == {"kind": "location", "name": "harbour-street", "path": place,
+                                    "strength": 0.8}
+    assert "loras" in units[0] and [l["kind"] for l in units[0]["loras"]] == ["global"]
+    old = _render_at_d210c26(tmp_path)
+    plain, _place = _render_panels(tmp_path, with_location=False)
+    assert render.build_units(json.loads(json.dumps(plain)), 0, "/clips",
+                              global_loras=globals_) == old.build_units(
+        json.loads(json.dumps(plain)), 0, "/clips", global_loras=globals_)
+
+
+def _manifest_file(tmp_path, panels, name="manifest.json"):
+    path = str(tmp_path / name)
+    with open(path, "w") as f:
+        json.dump({"schema_version": 3, "story_id": "location-lp", "panels": panels}, f)
+    return path
+
+
+def test_lp15_load_manifest_location_errors(tmp_path):
+    panels, place = _render_panels(tmp_path)
+    assert render.load_manifest(_manifest_file(tmp_path, panels))["panels"][1]["locations"] == [
+        {"name": "harbour-street", "video_lora": place, "strength": 0.8}]
+    good = {"name": "harbour-street", "video_lora": place, "strength": 0.8}
+    for value, message in (
+            ("harbour-street", "panel 2: locations must be a list"),
+            ([dict(good, name="")], "panel 2: every locations entry needs a non-empty name"),
+            (["harbour-street"], "panel 2: every locations entry needs a non-empty name"),
+            ([good, dict(good, name="temple-gate")], "panel 2: at most one location per panel"),
+            ([dict(good, video_lora="relative.safetensors")],
+             "panel 2: location harbour-street's video_lora is not a readable file: "
+             "relative.safetensors"),
+            ([dict(good, video_lora=str(tmp_path / "missing.safetensors"))],
+             "panel 2: location harbour-street's video_lora is not a readable file: %s"
+             % (tmp_path / "missing.safetensors")),
+            ([dict(good, strength=1.5)],
+             "panel 2: location harbour-street's strength must be a number in (0, 1], got 1.5"),
+            ([dict(good, strength=True)],
+             "panel 2: location harbour-street's strength must be a number in (0, 1], got True")):
+        bad = json.loads(json.dumps(panels))
+        bad[1]["locations"] = value
+        with pytest.raises(ValueError) as info:
+            render.load_manifest(_manifest_file(tmp_path, bad))
+        assert str(info.value) == message, value
+    empty = json.loads(json.dumps(panels))
+    empty[1]["locations"] = []
+    render.load_manifest(_manifest_file(tmp_path, empty))
+
+
+def _render_dry_run(tmp_path, panels, *extra):
+    model = tmp_path / "model"
+    model.mkdir(exist_ok=True)
+    return render.main([_manifest_file(tmp_path, panels), str(tmp_path / "out.mp4"), "--dry-run",
+                        "--model", str(model), "--clips-dir", str(tmp_path / "clips")]
+                       + list(extra))
+
+
+def test_lp16_render_refuses_a_location_lora_given_twice(tmp_path, capsys):
+    panels, place = _render_panels(tmp_path)
+    assert _render_dry_run(tmp_path, panels, "--lora", place + ":0.5") == 2
+    assert capsys.readouterr().err == (
+        "Error: --lora %s is also location harbour-street's video LoRA (panel 2); pass it once\n"
+        % place)
+    twice = json.loads(json.dumps(panels))
+    twice[1]["catalog_loras"][0]["path"] = place
+    twice[1]["catalog_loras"][0]["sha256"] = seu.sha256_file(place)
+    assert _render_dry_run(tmp_path, twice) == 2
+    assert capsys.readouterr().err == (
+        "Error: catalog LoRA film-grain (panel 2) is also location harbour-street's video LoRA\n")
+
+
+def test_lp17_a_location_panel_takes_the_merged_route(tmp_path, capsys):
+    panels = [{"index": 1, "image_path": None, "panel_text": "text", "motion_prompt": "motion",
+               "conditioning": "t2v",
+               "locations": [{"name": "harbour-street", "video_lora": _lora(tmp_path, "place"),
+                              "strength": 0.8}]}]
+    one = _lora(tmp_path, "global")
+    assert _render_dry_run(tmp_path, panels, "--lora", one) == 0
+    out = capsys.readouterr().out
+    assert "            lora: %s @ 1.0 (global)\n" % one in out
+    assert "            lora: %s @ 0.8 (harbour-street)\n" % panels[0]["locations"][0][
+        "video_lora"] in out
+    plain = [dict(panels[0])]
+    del plain[0]["locations"]
+    assert _render_dry_run(tmp_path, plain, "--lora", one) == 0
+    assert "(global)" not in capsys.readouterr().out
+
+
+def _audio_lora(path):
+    """A safetensors LoRA with one video and one audio-stream module (tests/
+    test_video_only_lora.py's layout)."""
+    import struct
+    header, data = {"__metadata__": {"lora_alpha": "8"}}, b""
+    for i, module in enumerate(("attn1.to_q", "audio_attn1.to_q")):
+        for j, part in enumerate(("lora_A", "lora_B")):
+            name = "diffusion_model.transformer_blocks.0." + module + "." + part + ".weight"
+            header[name] = {"dtype": "F32", "shape": [1], "data_offsets": [len(data), len(data) + 4]}
+            data += struct.pack("<f", float(10 * i + j + 1))
+    blob = json.dumps(header).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(blob)) + blob + data)
+    return path
+
+
+def test_lp18_location_loras_render_without_audio_modules(tmp_path, monkeypatch):
+    monkeypatch.setattr(render, "VIDEO_ONLY_LORA_DIR", str(tmp_path / "cache"))
+    src = _audio_lora(str(tmp_path / "place.safetensors"))
+    units = [{"loras": [{"kind": "location", "path": src}, {"kind": "global", "path": src},
+                        {"kind": "character", "path": src}]}]
+    render.use_video_only_character_loras(units)
+    location, global_lora, character = [l["path"] for l in units[0]["loras"]]
+    assert location == character != src and global_lora == src
+    assert os.path.dirname(location) == str(tmp_path / "cache")
+    with open(location, "rb") as f:
+        import struct
+        header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+    assert sorted(k for k in header if k != "__metadata__") == [
+        "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight",
+        "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight"]
+
+
+def test_lp19_provenance_changes_only_for_the_location_panel(tmp_path):
+    old = _render_at_d210c26(tmp_path)
+    model = tmp_path / "model"
+    model.mkdir()
+    args = render.build_parser().parse_args([str(tmp_path / "m.json"), str(tmp_path / "o.mp4"),
+                                             "--model", str(model)])
+    plain, _place = _render_panels(tmp_path, with_location=False)
+    located, _place = _render_panels(tmp_path)
+    before = [old.build_clip_provenance(u, args)
+              for u in old.build_units(json.loads(json.dumps(plain)), 0, "/clips")]
+    after = [render.build_clip_provenance(u, args)
+             for u in render.build_units(json.loads(json.dumps(located)), 0, "/clips")]
+    unchanged = [render.build_clip_provenance(u, args)
+                 for u in render.build_units(json.loads(json.dumps(plain)), 0, "/clips")]
+    assert unchanged == before
+    assert (after[0], after[2]) == (before[0], before[2])
+    assert after[1] != before[1]
+    assert [l["kind"] for l in after[1]["loras"]] == ["catalog", "catalog", "location", "character"]
+    assert after[1]["loras"][2]["sha256"] == seu.sha256_file(located[1]["locations"][0]["video_lora"])
