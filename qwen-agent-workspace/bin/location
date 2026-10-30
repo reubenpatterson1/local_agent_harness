@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""location -- build, train and inspect the location LoRA library (generated/locations/).
+
+  bin/location create NAME [--description TEXT] [--photo PATH ...] [--trigger WORD] [--seed N]
+                           [--force]
+  bin/location create NAME --regenerate [--seed N | --new-seed] [--description TEXT] [--force]
+  bin/location edit NAME --description TEXT
+  bin/location list
+  bin/location show NAME
+
+create builds a location's 24-still people-free dataset and stops for review (contact_sheet.jpg).
+Without --photo the 24 stills are drawn from --description by Z-Image. With --photo (1-24 photos)
+the stills are the photos plus Qwen-Image-Edit-2511 edits of them that change only the time of
+day, the weather or the season: angles come only from the photos, so 3-5 photos taken from
+different spots are recommended; without --description the vision model drafts one from the first
+5 photos. edit saves a photo location's new description. list and show read the library only. A
+trained location is pinned in a movie with bin/ltx-movie --location NAME.
+
+Exit codes: 0 success, 1 runtime failure, 2 argument or precondition failure, 3 create kept fewer
+than 12 stills.
+
+list/show import location_lib only (stdlib); create and edit import location_dataset, which needs
+PIL and psutil: without them bin/location re-executes itself under $CHARACTER_PYTHON (default
+~/img-gen/bin/python). See docs/superpowers/specs/2026-10-29-location-lora-design.md.
+"""
+
+import argparse
+import json
+import os
+import signal
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import location_lib  # noqa: E402
+
+ANGLES_NOTE = ("Angles come only from the photos: every extra still keeps one photo's exact "
+               "viewpoint and changes only its time of day, weather or season, so 3-5 photos "
+               "taken from different spots are recommended.")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="location",
+        description="Build, train and inspect the location LoRA library (generated/locations/).")
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    sub.required = True
+    p = sub.add_parser("create", help="build a location's 24-still dataset and stop for review",
+                       description="Build a location's 24-still people-free dataset. "
+                                   + ANGLES_NOTE)
+    p.add_argument("name", metavar="NAME")
+    p.add_argument("--description", default=None, metavar="TEXT",
+                   help="the place's persistent features: one noun phrase of 15-40 words that "
+                        "starts with a, an or the (required without --photo; drafted by the "
+                        "vision model from the first 5 photos when omitted)")
+    p.add_argument("--photo", dest="photos", action="append", default=None, metavar="PATH",
+                   help="a photo of the place (repeatable, 1-24). " + ANGLES_NOTE)
+    p.add_argument("--trigger", default=None, metavar="WORD")
+    p.add_argument("--seed", type=int, default=None, metavar="N")
+    p.add_argument("--force", action="store_true",
+                   help="keep user photos that show people or whose check is unparseable; with "
+                        "--regenerate, also regenerate a trained location, deleting its LoRAs")
+    p.add_argument("--regenerate", action="store_true",
+                   help="rebuild an existing location's dataset")
+    p.add_argument("--new-seed", dest="new_seed", action="store_true",
+                   help="with --regenerate: use the stored seed + 1")
+    e = sub.add_parser("edit", help="save a photo location's new description")
+    e.add_argument("name", metavar="NAME")
+    e.add_argument("--description", required=True, metavar="TEXT")
+    sub.add_parser("list", help="list every location")
+    s = sub.add_parser("show", help="print one location's record and file status")
+    s.add_argument("name", metavar="NAME")
+    return parser
+
+
+def cmd_list():
+    print("\n".join(location_lib.location_table_lines()))
+    return 0
+
+
+def cmd_show(name):
+    try:
+        data = location_lib.load_location(name)
+    except location_lib.LocationError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+    print("files:")
+    loc_dir = location_lib.location_dir(name)
+    paths = [location_lib.location_json_path(name)]
+    paths += [os.path.join(loc_dir, "photos", "photo_%02d.png" % k)
+              for k in range(1, len(data["photos"]) + 1)]
+    if data["dataset"] is not None:
+        paths.append(data["dataset"]["contact_sheet"])
+    for kind in ("video", "stills"):
+        if data["loras"][kind] is not None:
+            paths.append(data["loras"][kind]["path"])
+    if data["loras"]["video"] is not None:
+        paths += [os.path.join(loc_dir, "tests", "video_lora.mp4"),
+                  os.path.join(loc_dir, "tests", "video_control.mp4")]
+    for p in paths:
+        print("  %-8s %s" % ("ok" if os.path.isfile(p) else "MISSING", p))
+    return 0
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.command == "list":
+        return cmd_list()
+    if args.command == "show":
+        return cmd_show(args.name)
+    try:
+        import PIL  # noqa: F401
+        import psutil  # noqa: F401
+    except ImportError:
+        # A venv's python is a symlink to its base interpreter, so the marker (not a path
+        # comparison) is what stops a second re-exec.
+        py = os.environ.get("CHARACTER_PYTHON", os.path.expanduser("~/img-gen/bin/python"))
+        if os.access(py, os.X_OK) and not os.environ.get("LOCATION_REEXEC"):
+            os.environ["LOCATION_REEXEC"] = "1"
+            os.execv(py, [py, os.path.realpath(__file__)]
+                     + (sys.argv[1:] if argv is None else list(argv)))
+        raise
+    import location_dataset
+    if args.command == "create":
+        return location_dataset.create(args)
+    return location_dataset.edit(args)
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+def run(argv=None):
+    """The command-line entry: SIGINT, SIGTERM and SIGHUP raise KeyboardInterrupt (as
+    bin/character), so the image child is killed and the story server restored; an interrupt
+    that reaches this level prints "location: interrupted" and returns 130."""
+    # SIGINT too: a job started in the background by a script inherits SIGINT ignored, and
+    # Python then never installs its own Ctrl-C handler.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print("location: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(run())
