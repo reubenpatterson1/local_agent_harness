@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -249,6 +250,28 @@ def test_lg1_the_character_golden_record_is_unchanged():
     assert golden_record() == expected
     assert hashlib.sha256(expected.encode("utf-8")).hexdigest() == hashlib.sha256(
         golden_record().encode("utf-8")).hexdigest()
+
+
+def test_lg2_the_training_cores_and_their_wrappers():
+    import inspect
+    assert list(inspect.signature(character_dataset.train_video_lora).parameters) == [
+        "owner_dir", "videos_dir", "captions_dir", "prompt", "failed_note", "recorded", "tested"]
+    assert list(inspect.signature(character_dataset.train_stills_lora).parameters) == [
+        "owner_dir", "pairs", "prompt", "seed", "kept_ok", "skipped"]
+    assert list(inspect.signature(character_dataset.train_video).parameters) == ["data"]
+    assert list(inspect.signature(character_dataset.train_stills).parameters) == ["data"]
+
+
+def test_lg3_the_character_tests_pass_unedited(tmp_path):
+    proc = subprocess.run([sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                           "-rf", "tests/test_character_dataset.py", "tests/test_character_tool.py"],
+                          cwd=WS, capture_output=True, text=True, timeout=1800,
+                          env=dict(os.environ))
+    failed = sorted(line.split()[1] for line in proc.stdout.splitlines()
+                    if line.startswith("FAILED "))
+    assert failed in ([], ["tests/test_character_dataset.py::test_d2_copied_literals_match_the_spike"]), (
+        proc.stdout[-3000:])
+    assert " passed" in proc.stdout.splitlines()[-1], proc.stdout[-3000:]
 
 
 def main(argv):
