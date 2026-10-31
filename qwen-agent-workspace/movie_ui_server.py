@@ -110,6 +110,9 @@ ROUTES = [
     ("POST", r"/api/batches/preview", "h_batch_preview", "/api/batches/preview"),
     ("GET", r"/api/batches/stories", "h_batch_stories", "/api/batches/stories"),
     ("GET", r"/api/batches/" + _ID, "h_batch", "/api/batches/" + _SAMPLE_ID),
+    ("DELETE", r"/api/batches/" + _ID, "h_batch_delete", "/api/batches/" + _SAMPLE_ID),
+    ("POST", r"/api/batches/" + _ID + r"/cancel", "h_batch_cancel", "/api/batches/" + _SAMPLE_ID + "/cancel"),
+    ("POST", r"/api/batches/" + _ID + r"/resume", "h_batch_resume", "/api/batches/" + _SAMPLE_ID + "/resume"),
     ("GET", r"/api/stories", "h_stories", "/api/stories"),
     ("GET", r"/api/stories/" + _STORY, "h_story", "/api/stories/ronin-rescue"),
     ("PUT", r"/api/stories/" + _STORY + r"/story\.md", "h_story_save", "/api/stories/ronin-rescue/story.md"),
@@ -692,6 +695,7 @@ def main(argv):
         return 2
     with STORE_LOCK:
         lib.startup_recovery(state)
+    batch_recovery(state)
     stop = start_threads(server)
     signal.signal(signal.SIGTERM, _raise_interrupt)
     sys.stdout.write("movie-ui: http://127.0.0.1:%d/?t=%s\n" % (server.port, token))
@@ -866,6 +870,7 @@ def _h_job_cancel(self, groups, query, body):
     with STORE_LOCK:
         result = lib.cancel_job(self.server.state, job_id)
     if result == "cancelled":
+        _batch_job_cancelled(self.server, job_id)
         return 200, {"state": "cancelled"}
     if result == "cancelling":
         return 202, {"state": "cancelling"}
@@ -2408,6 +2413,137 @@ def _h_batch(self, groups, query, body):
 MovieUIHandler.h_batches = _h_batches
 MovieUIHandler.h_batch_create = _h_batch_create
 MovieUIHandler.h_batch = _h_batch
+
+
+# ---------------------------------------------------------------------------
+# Batch forks: cancel, restart, submit remaining and delete
+# (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Section 4.4)
+# ---------------------------------------------------------------------------
+
+ACTIVE_JOB_STATES = ("queued", "starting", "running")
+
+
+def _batch_job_cancelled(server, job_id):
+    """BF30: reconcile the batch whose cells hold job_id, if there is one."""
+    for batch_id in list_batch_ids(server.state):
+        rec = read_batch(server.state, batch_id)
+        if rec is not None and any(c.get("job_id") == job_id for c in rec.get("cells", [])):
+            reconcile(server, batch_id)
+            return
+
+
+def batch_recovery(state):
+    """BF32 at startup, before the server serves: every waiting or submitting batch becomes
+    interrupted. A forking cell whose fork has a movie job created at or after the batch becomes
+    queued with that job (and its fields); any other forking cell loses its fork and, like every
+    pending cell, becomes interrupted. One stderr line per recovered batch; nothing otherwise."""
+    for batch_id in list_batch_ids(state):
+        rec = read_batch(state, batch_id)
+        if rec is None or rec.get("status") not in ("waiting", "submitting"):
+            continue
+        jobs = {}
+        for job_id in lib.list_job_ids(state):
+            job = lib.read_job(lib.job_dir(state, job_id)) or {}
+            if (job.get("kind") == "movie" and job.get("workspace") == rec["workspace"]
+                    and isinstance(job.get("created"), str) and job["created"] >= rec["created"]):
+                jobs[job.get("story_id")] = (job_id, job)
+        now = lib.utc_now()
+        for cell in rec["cells"]:
+            if cell.get("status") == "forking" and cell["fork_id"] in jobs:
+                job_id, job = jobs[cell["fork_id"]]
+                cell.update(status="queued", reason=None, job_id=job_id, fields=job.get("fields"), updated=now)
+            elif cell.get("status") == "forking":
+                remove_unused_fork(state, rec["workspace"], lib.story_dir(rec["workspace"], cell["fork_id"]),
+                                   batch_id)
+                cell.update(status="interrupted", reason="the server stopped while this fork was being made",
+                            updated=now)
+            elif cell.get("status") == "pending":
+                cell.update(status="interrupted", reason="the server stopped before this fork was made", updated=now)
+        rec["status"] = "interrupted"
+        write_batch(state, rec)
+        sys.stderr.write("movie-ui: batch %s: interrupted (%d cell(s) to submit again)\n"
+                         % (batch_id, sum(1 for c in rec["cells"] if c.get("status") == "interrupted")))
+
+
+def _h_batch_cancel(self, groups, query, body):
+    """BF31: stop the batch's pending cells, cancel its forks' jobs, reconcile, mark it cancelled."""
+    server, batch_id = self.server, groups[0]
+    state = server.state
+    _known_batch(server, batch_id)
+    with BATCH_LOCK:
+        rec = read_batch(state, batch_id)
+        if rec is None:
+            raise ApiError(404, "unknown batch %s" % batch_id)
+        queue = lib.read_queue(state)
+        jobs = [c["job_id"] for c in rec["cells"] if c.get("status") == "queued"
+                and isinstance(c.get("job_id"), str) and lib.JOB_ID_RE.fullmatch(c["job_id"])]
+        if not (any(c.get("status") in ("pending", "forking") for c in rec["cells"])
+                or any(lib.job_state(state, j, queue) in ACTIVE_JOB_STATES for j in jobs)):
+            raise ApiError(409, "batch %s has nothing to cancel" % batch_id)
+        if batch_id in server.batch_queue:
+            server.batch_queue.remove(batch_id)
+        rec["cancel_requested"] = True
+        for cell in rec["cells"]:
+            if cell.get("status") == "pending":
+                cell.update(status="cancelled", reason="batch cancelled", updated=lib.utc_now())
+        write_batch(state, rec)
+    cancelled, cancelling = [], []
+    for job_id in jobs:
+        with STORE_LOCK:
+            result = lib.cancel_job(state, job_id)
+        if result == "cancelled":
+            cancelled.append(job_id)
+        elif result == "cancelling":
+            cancelling.append(job_id)
+    reconcile(server, batch_id)
+    with BATCH_LOCK:
+        rec = read_batch(state, batch_id)
+        if rec is not None:
+            rec["status"] = "cancelled"
+            write_batch(state, rec)
+    return 200, {"status": "cancelled", "cancelled": cancelled, "cancelling": cancelling}
+
+
+def _h_batch_resume(self, groups, query, body):
+    """BF33: an interrupted batch's interrupted cells go back to pending and the batch is queued."""
+    server, batch_id = self.server, groups[0]
+    _known_batch(server, batch_id)
+    with BATCH_LOCK:
+        rec = read_batch(server.state, batch_id)
+        if rec is None:
+            raise ApiError(404, "unknown batch %s" % batch_id)
+        if rec.get("status") != "interrupted":
+            raise ApiError(409, "batch %s was not interrupted" % batch_id)
+        for cell in rec["cells"]:
+            if cell.get("status") == "interrupted":
+                cell.update(status="pending", reason=None, updated=lib.utc_now())
+        rec["status"] = "waiting"
+        write_batch(server.state, rec)
+        server.batch_queue.append(batch_id)
+        _batch_kick(server)
+    return 200, {"status": "waiting", "pending": sum(1 for c in rec["cells"] if c["status"] == "pending")}
+
+
+def _h_batch_delete(self, groups, query, body):
+    """BF34: remove the batch record (never its forks or their jobs) unless it is still submitting."""
+    server, batch_id = self.server, groups[0]
+    _known_batch(server, batch_id)
+    with BATCH_LOCK:
+        rec = read_batch(server.state, batch_id)
+        if rec is None:
+            raise ApiError(404, "unknown batch %s" % batch_id)
+        if rec.get("status") in ("waiting", "submitting"):
+            raise ApiError(409, "batch %s is still submitting; cancel it first" % batch_id)
+        try:
+            shutil.rmtree(os.path.dirname(batch_path(server.state, batch_id)))
+        except OSError as e:
+            raise ApiError(500, "cannot delete batch %s: %s" % (batch_id, e.strerror or e))
+    return 200, {"deleted": batch_id}
+
+
+MovieUIHandler.h_batch_cancel = _h_batch_cancel
+MovieUIHandler.h_batch_resume = _h_batch_resume
+MovieUIHandler.h_batch_delete = _h_batch_delete
 
 
 # ---------------------------------------------------------------------------

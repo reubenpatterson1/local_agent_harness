@@ -1515,6 +1515,162 @@ def test_batch_review_focus_4_batches_are_per_workspace(env, monkeypatch, tmp_pa
     assert mt.api(s, "GET", "/api/batches")[:3:2] == (400, {"error": "missing ws"})
 
 
+BATCH_ROUTES = [("GET", "/api/batches"), ("POST", "/api/batches"), ("POST", "/api/batches/preview"),
+                ("GET", "/api/batches/stories"), ("GET", "/api/batches/" + srv._SAMPLE_ID),
+                ("DELETE", "/api/batches/" + srv._SAMPLE_ID), ("POST", "/api/batches/%s/cancel" % srv._SAMPLE_ID),
+                ("POST", "/api/batches/%s/resume" % srv._SAMPLE_ID)]
+
+
+def test_bt14_every_batch_route_needs_the_token(env):
+    s = env["srv"]
+    assert [(m, sample) for m, _r, _n, sample in srv.ROUTES if sample.startswith("/api/batches")] == BATCH_ROUTES
+    for method, regex, name, sample in srv.ROUTES:
+        if (method, sample) not in BATCH_ROUTES:
+            continue
+        assert re.fullmatch(regex, sample) and hasattr(srv.MovieUIHandler, name), name
+        for token in (None, "wrong-token"):
+            status, _h, payload = mt.api(s, method, sample, body={} if method == "POST" else None, token=token)
+            assert (status, payload) == (401, {"error": "missing or invalid token"}), (method, sample, token)
+    for method, sample in BATCH_ROUTES[4:]:
+        assert mt.api(s, method, sample, body={} if method == "POST" else None)[:3:2] == (
+            404, {"error": "unknown batch %s" % srv._SAMPLE_ID}), (method, sample)
+    assert mt.api(s, "PUT", "/api/batches", body={})[:3:2] == (405, {"error": "method not allowed"})
+
+
+def test_bt20_cancel_batch(env, monkeypatch):
+    import fcntl
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gate = threading.Event()
+    calls = bt.passing_checks(monkeypatch, gate={"ronin-rescue-b1-v3": gate})
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v%d" % m, {"model": "/models/m%d" % m})
+                                                   for m in range(1, 5)])
+    mt.wait_until(lambda: "ronin-rescue-b1-v3" in calls, 30)
+    cells = bt.record(state, batch_id)["cells"]
+    assert [c["status"] for c in cells] == ["queued", "queued", "forking", "pending"]
+    forks = [lib.story_dir(ws, c["fork_id"]) for c in cells]
+    running, queued = cells[0]["job_id"], cells[1]["job_id"]
+    jdir = lib.job_dir(state, running)
+    lib.write_queue(state, [queued])
+    lib.write_status(jdir, {"state": "running", "dispatched": lib.utc_now(), "runner_pid": os.getpid(),
+                            "pgid": None, "started": lib.utc_now()})
+    holder = os.open(os.path.join(jdir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        status, _h, payload = mt.api(s, "POST", "/api/batches/%s/cancel" % batch_id, body={})
+        assert (status, payload) == (200, {"status": "cancelled", "cancelled": [queued], "cancelling": [running]})
+        gate.set()
+        mt.wait_until(lambda: s.server.batch_thread is None, 30)
+    finally:
+        os.close(holder)
+    rec = bt.record(state, batch_id)
+    assert [(c["status"], c["reason"]) for c in rec["cells"]] == [
+        ("queued", None), ("cancelled", "cancelled before it started"), ("cancelled", "batch cancelled"),
+        ("cancelled", "batch cancelled")]
+    assert (rec["status"], rec["cancel_requested"]) == ("cancelled", True)
+    assert os.path.isdir(forks[0]) and not any(os.path.lexists(f) for f in forks[1:])
+    assert os.path.exists(os.path.join(jdir, "cancel")) and calls == [c["fork_id"] for c in cells[:3]]
+    lib.write_status(jdir, {"state": "cancelled", "dispatched": lib.utc_now(), "runner_pid": os.getpid(),
+                            "pgid": None, "started": lib.utc_now(), "exit_code": -15, "ended": lib.utc_now()})
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % batch_id, body={})[:3:2] == (
+        409, {"error": "batch %s has nothing to cancel" % batch_id})
+    assert mt.api(s, "GET", "/api/batches/" + batch_id)[2]["view"]["cells"][0]["state"] == "cancelled"
+    assert os.path.isdir(forks[0])
+
+
+def test_bt21_delete_batch(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gate = threading.Event()
+    calls = bt.passing_checks(monkeypatch, gate={"ronin-rescue-b1-v1": gate})
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"gemma": bt.OTHER_GEMMA})])
+    mt.wait_until(lambda: "ronin-rescue-b1-v1" in calls, 30)
+    try:
+        assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (
+            409, {"error": "batch %s is still submitting; cancel it first" % batch_id})
+    finally:
+        gate.set()
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (200, {"deleted": batch_id})
+    assert not os.path.exists(os.path.join(state, "batches", batch_id))
+    assert mt.api(s, "GET", "/api/batches/" + batch_id)[:3:2] == (404, {"error": "unknown batch %s" % batch_id})
+    for cell in cells:
+        assert os.path.isfile(os.path.join(lib.story_dir(ws, cell["fork_id"]), "fork.json"))
+        assert os.path.isfile(os.path.join(lib.job_dir(state, cell["job_id"]), "job.json"))
+
+
+def test_bt27_cancelling_a_fork_job_removes_its_folder(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"gemma": bt.OTHER_GEMMA})])
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    forks = [lib.story_dir(ws, c["fork_id"]) for c in cells]
+    queued, starting = cells[0]["job_id"], cells[1]["job_id"]
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % queued, body={})[:3:2] == (200, {"state": "cancelled"})
+    cell = bt.record(state, batch_id)["cells"][0]
+    assert (cell["status"], cell["reason"]) == ("cancelled", "cancelled before it started")
+    assert not os.path.lexists(forks[0])
+    jdir = lib.job_dir(state, starting)
+    lib.write_queue(state, [])
+    lib.write_status(jdir, {"state": "starting", "dispatched": lib.utc_now()})
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % starting, body={})[:3:2] == (202, {"state": "cancelling"})
+    proc = subprocess.run([sys.executable, os.path.join(mt.WS, "bin", "movie-ui-job"), jdir],
+                          capture_output=True, text=True, timeout=30)
+    assert (proc.returncode, proc.stdout) == (0, "[movie-ui] cancelled before start\n")
+    assert os.path.isdir(forks[1])
+    payload = mt.api(s, "GET", "/api/batches/" + batch_id)[2]
+    assert (payload["batch"]["cells"][1]["status"], payload["batch"]["cells"][1]["reason"]) == (
+        "cancelled", "cancelled before it started")
+    assert payload["view"]["cells"][1] == {"state": "cancelled", "job": None, "movie": None, "dir": False}
+    assert not os.path.lexists(forks[1])
+
+
+def test_bt29_resume_submits_the_interrupted_cells(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    clean = {"ws": ws, "stories": ["ronin-rescue"],
+             "variants": [bt.variant("v1", bt.RENDER), bt.variant("v2", {"gemma": bt.OTHER_GEMMA})]}
+    batch_id = srv.new_batch_id(state)
+    rec = srv.make_batch_record(clean, batch_id, 1, srv.plan_batch(s.server, clean, 1)[0])
+    rec["status"] = "submitting"
+    rec["cells"][0]["status"] = "forking"
+    fork = lib.story_dir(ws, rec["cells"][0]["fork_id"])
+    os.makedirs(fork)
+    lib.write_json_atomic(os.path.join(fork, "fork.json"), {"schema": "movie-ui.fork.v1",
+                                                            "fork_id": rec["cells"][0]["fork_id"],
+                                                            "batch": batch_id})
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    srv.write_batch(state, rec)
+    srv.batch_recovery(state)
+    assert bt.record(state, batch_id)["status"] == "interrupted" and not os.path.lexists(fork)
+    assert mt.api(s, "POST", "/api/batches/%s/resume" % batch_id, body={})[:3:2] == (
+        200, {"status": "waiting", "pending": 2})
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    assert [c["status"] for c in cells] == ["queued", "queued"]
+    assert lib.read_json(os.path.join(fork, "fork.json"))["label"] == "v1"
+    assert mt.api(s, "POST", "/api/batches/%s/resume" % batch_id, body={})[:3:2] == (
+        409, {"error": "batch %s was not interrupted" % batch_id})
+
+
+def test_bt35_a_deleted_batch_leaves_its_job_less_forks_ineligible(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    batch_id, fork, _job = _fallback_fork(env, monkeypatch)
+    assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (200, {"deleted": batch_id})
+    assert _stories(env)[fork] == {
+        "id": fork, "eligible": False, "busy_job": None, "fields_source": None, "fields_batch": None,
+        "reason": "Its job and its batch %s were deleted: no saved Compose settings to fork" % batch_id}
+    req = bt.body(ws, [fork], [bt.variant("v1", {"gemma": bt.OTHER_GEMMA})])
+    cell = mt.api(s, "POST", "/api/batches/preview", body=req)[2]["cells"][0]
+    assert (cell["status"], cell["reason"]) == ("refused", "story %s has no saved Compose settings (its job and "
+                                                           "its batch %s were deleted)" % (fork, batch_id))
+    status, _h, payload = mt.api(s, "POST", "/api/batches", body=req)
+    assert status == 409 and payload["error"] == "every cell was refused"
+
+
 def test_batch_fix_reconcile_keeps_a_fork_a_later_job_uses(env, monkeypatch):
     s, state, ws = env["srv"], env["state"], env["ws"]
     bt.passing_checks(monkeypatch)
