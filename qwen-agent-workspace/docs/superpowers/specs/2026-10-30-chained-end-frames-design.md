@@ -953,20 +953,23 @@ The Motion fields are 80, 83 and 68 words, inside `WORD_RANGES` (55, 105). Verif
 
 **CLI.** `bin/seam-report STORY_ID [--port N]`.
 - `STORY_ID` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$` and contain no `..`; otherwise exit 2 with `Error: invalid story id: <id>`.
-- `--port` defaults to `int(os.environ.get("STORY_SERVER_PORT") or 8177)` **[spec choice: the variable `bin/story-server` reads]**.
+- `--port` defaults to `STORY_SERVER_PORT`, else 8177 **[spec choice: the variable `bin/story-server` reads]**. Its type is `_port`, an int; any other text raises `argparse.ArgumentTypeError("%r is not an integer (from --port or STORY_SERVER_PORT)" % text)`. The default is the string `os.environ.get("STORY_SERVER_PORT") or "8177"`, and argparse applies the type to a string default, so a non-integer `STORY_SERVER_PORT` is a usage error when `--port` is not given (Task 5 fix round 1, M3).
 - Argparse usage errors exit 2.
+- **The embed port.** A port equal to `EMBED_PORT` (8178), from either source, is refused before anything else, with no connection: exit 2 `Error: port 8178 is the embed server's port, not the story server's; nothing was changed. Pass --port with the story server's port (8177 by default) or unset STORY_SERVER_PORT.` This follows `movie_ui_lib.py:617-618` (fix round 1, I2).
 
 **Constants.**
 ```python
 SCHEMA = "ltx-movie.seam-report.v1"
 MISS_BELOW = 6          # a score below 6 is "missed" (notes, Section 3)
 ATTEMPTS = 3            # VLM calls per panel before "unparseable"
-MAX_TOKENS = 400
+MAX_TOKENS = 600         # character_dataset.vlm_call's value, with thinking switched off
 TEMPERATURE = 0
 CALL_TIMEOUT_S = 300
 MODELS_TIMEOUT_S = 10
 MAX_BODY = 1048576
 VERDICTS = ("ok", "missed", "no clip", "unparseable")
+EMBED_PORT = 8178       # the embed server's port: never contacted (movie_ui_lib.py:617-618)
+TEXT_MODEL_ID = "qwen38-6bit"   # bin/story-server:41 MODEL_ID, served by its text mode (:493)
 ```
 
 **Order of work** (the first exit wins):
@@ -983,16 +986,23 @@ VERDICTS = ("ok", "missed", "no clip", "unparseable")
    - No panel has a source: print `seam-report: no clips to check in <clips_dir>` and exit 0. No server is contacted and no file is written.
 6. A clip source exists but `shutil.which("ffmpeg")` or `shutil.which("ffprobe")` is None: exit 2 `Error: ffmpeg and ffprobe must be on PATH to read the clips in <clips_dir>`.
 7. **Probe.** `vlm_models(port)` is `GET /v1/models`, with timeout `MODELS_TIMEOUT_S`.
-   - It needs a 200 reply whose `data` is a non-empty list with a string `data[0]["id"]`; `model = data[0]["id"]`.
+   - It needs a 200 reply whose `data` is a list.
+   - **The loaded model** (fix round 1, C1). `mlx_vlm.server` lists every cached model and flags the active one `"loaded": true`. When any `data` entry has a `loaded` key, `model` is the string `id` of the first entry whose `loaded` is `True` (`bin/story-server:130-139`). When none is, `<what>` is `no model loaded`.
+   - When no entry has a `loaded` key, `data` must be non-empty with a string `data[0]["id"]`, and `model = data[0]["id"]`.
    - Anything else: exit 2 with `Error: the story server is not answering at 127.0.0.1:<port> (<what>); nothing was changed. Start it with bin/story-server mlx-vision and rerun bin/seam-report <id>.`
-   - `<what>` is `HTTP <n>`, `invalid JSON`, `no model listed`, or the exception class name.
+   - `<what>` is `HTTP <n>`, `invalid JSON`, `no model listed`, `no model loaded`, or the exception class name.
+   - **The text model** (fix round 1, I1). `model == TEXT_MODEL_ID` is refused with exit 2: `Error: the story server at 127.0.0.1:<port> serves qwen38-6bit, the text model, not a vision model; nothing was changed. Switch it with bin/story-server stop, then bin/story-server mlx-vision, and rerun bin/seam-report <id>.`
+     - `TEXT_MODEL_ID` is `bin/story-server`'s `MODEL_ID` default (`:41`), which its `text` mode serves (`--model-id`, `:493`), and `bin/qwen-agent`'s `DEFAULT_MODEL` (`:52`).
+     - Its vLLM `vision` mode serves the same alias (`--served-model-name`, `:475`), so `/v1/models` cannot tell the two modes apart and both are refused. `mlx-vision` serves its model path (`:812`) and passes. It is the mode every seam-report message names, and the movie UI's `VLM_MODE` (`movie_ui_lib.py:388`).
+     - No other process is run and no other connection is made.
 8. **Per panel**, in panel order:
-   - **Frame.** A chainseed's bytes are read directly. A clip is read with `last_frame_png(clip, out_png)` into `tempfile.mkdtemp(prefix="seam-report-")`, which is removed in a `finally`.
+   - **Frame.** A chainseed's bytes are read directly; an `OSError` while opening or reading a frame gives the verdict `no clip`, with reason `cannot read <frame>: <exception class name>` and attempts 0 (fix round 1, M2). A clip is read with `last_frame_png(clip, out_png)` into `tempfile.mkdtemp(prefix="seam-report-")`, which is removed in a `finally`.
    - **Extraction.** `last_frame_png` runs `ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames -of json <clip>` (count n from `nb_read_frames`), then `ffmpeg -v error -nostdin -y -i <clip> -vf select=eq(n\,<n-1>) -fps_mode passthrough -frames:v 1 <out_png>`. Both use `capture_output=True` and timeout 120.
    - **Bad clip.** A non-zero exit, unreadable output, n < 1 or no output file raises `SeamError(detail)`. The panel's verdict is then `no clip`, with reason `cannot read the last frame of clips/panel_%02d.mp4: <detail>`.
    - **Call.** `vlm_complete(port, model, prompt, png_bytes)` is called up to `ATTEMPTS` times. Each call is one `POST /v1/chat/completions` with timeout `CALL_TIMEOUT_S`, reading at most `MAX_BODY` bytes. Its body is:
      ```json
-     {"model": "<model>", "max_tokens": 400, "temperature": 0,
+     {"model": "<model>", "max_tokens": 600, "temperature": 0,
+      "chat_template_kwargs": {"enable_thinking": false},
       "messages": [{"role": "user", "content": [
         {"type": "text", "text": "<prompt>"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,<b64>"}}]}]}
@@ -1005,7 +1015,10 @@ VERDICTS = ("ok", "missed", "no clip", "unparseable")
      - stores the whitespace-collapsed reason and the stripped non-empty `missing` items.
      - Else the attempt is unparseable.
    - **Verdict.** `ok` when the score is ≥ `MISS_BELOW`, else `missed`. After `ATTEMPTS` unparseable attempts the verdict is `unparseable`, with score null, reason `the model gave no valid reply in 3 attempts` and missing `[]`.
-9. Write `seam_report.json`, then `seam_report.md`, each to `<path>.tmp` and then `os.replace`. An `OSError`: exit 1 `Error: cannot write <path>: <e>`.
+9. `write_reports` writes the pair (fix round 1, M1):
+   - it writes `seam_report.json` and then `seam_report.md`, each to `<path>.tmp`;
+   - then, after checking that neither path is a directory (else `IsADirectoryError("<path> is a directory")`), it `os.replace`s each `.tmp` into place;
+   - a failure before the replaces leaves the old pair byte for byte. An `OSError` at any step removes every `.tmp` this run created and still present, then exits 1 with `Error: cannot write <path>: <e>`, naming the path that failed.
 10. Print one line per panel, then the summary line (below), and exit 0.
 
 **VLM prompt** (`seam_prompt(plan, k)`; `@@K@@`, `@@END_FRAME@@` and `@@CHARACTERS@@` replaced in that order with `str.replace`):
@@ -1208,8 +1221,11 @@ The [MUI] page rules still hold: no inline handlers or styles, no `prompt(`/`ale
 | seam-report | exit 2 | `Error: invalid story id: ID` / `Error: no story ID in DIR` / `Error: PATH is not a plan.json written by bin/ltx-movie's default story engine` / `Error: ffmpeg and ffprobe must be on PATH to read the clips in CLIPS` | no write |
 | seam-report | exit 2 | `Error: the story server is not answering at 127.0.0.1:PORT (WHAT); nothing was changed. Start it with bin/story-server mlx-vision and rerun bin/seam-report ID.` | no write |
 | seam-report | exit 2 | `Error: the story server stopped answering at 127.0.0.1:PORT (WHAT) while checking panel K; nothing was written. Start it with bin/story-server mlx-vision and rerun bin/seam-report ID.` | no write |
-| seam-report | exit 1 | `Error: cannot write PATH: E` | — |
-| seam-report verdicts | — | `no clip` reasons `clips/panel_NN.mp4 does not exist` / `cannot read the last frame of clips/panel_NN.mp4: D`; `unparseable` reason `the model gave no valid reply in 3 attempts` | in the report |
+| seam-report | exit 2 | `Error: port 8178 is the embed server's port, not the story server's; nothing was changed. Pass --port with the story server's port (8177 by default) or unset STORY_SERVER_PORT.` | no connection, no write |
+| seam-report | exit 2 | `Error: the story server at 127.0.0.1:PORT serves qwen38-6bit, the text model, not a vision model; nothing was changed. Switch it with bin/story-server stop, then bin/story-server mlx-vision, and rerun bin/seam-report ID.` | no write |
+| seam-report | exit 2 | `seam-report: error: argument --port: 'TEXT' is not an integer (from --port or STORY_SERVER_PORT)` (after the usage line) | no write |
+| seam-report | exit 1 | `Error: cannot write PATH: E` | the old pair unchanged, no `.tmp` of this run left |
+| seam-report verdicts | — | `no clip` reasons `clips/panel_NN.mp4 does not exist` / `cannot read the last frame of clips/panel_NN.mp4: D` / `cannot read FRAME: EXCEPTION`; `unparseable` reason `the model gave no valid reply in 3 attempts` | in the report |
 | `POST /api/stories/<id>/seams` | 404 / 409 / 409 | `no story ID in DIR` / `story ID has no end frames to check` / `a seams check of ID is already queued as job J` | — |
 | Stories tab | text | `seams check queued as job J`, `This plan has no end frames; no seam report.`, `No seam report yet: press Check seams.`, `Mean score X over N scored panel(s); M missed (a score below 6).` | — |
 
@@ -1248,11 +1264,11 @@ Each module docstring states that no test renders, reads the real HOME, or conta
 | CT15 | same | **Old stories (CK3).** Copy `tests/fixtures/writer_pacing/hockey-2x145-f` into tmp, and save a chained 3-panel story assembled from `seu.plan_json` and `seu.panel_json` (no end frames). Monkeypatch `se.end_frame_words`, `se.plan_end_frame_problems`, `se.plan_copy_problems` and `se.end_frame_advisories` to raise `AssertionError`. `se.recheck` returns the same rc and the same hard and advisory lists as the same call with `"N23"` removed from `se.RECHECK_IDS`, and leaves `story.md` byte-unchanged; so the manifest, which `bin/ltx-story-manifest` (unchanged) builds from `story.md`, is unchanged too (`test_v2_golden_byte_identical` must pass unchanged) |
 | CT16 | same | **Soft panel count.** Target 3, a 4-beat reply whose beat 4 has no end frame → call 2 re-asks with `P22_MISSING % 4`; a 4-beat reply with 4 end frames → one call |
 | CT17 | `tests/test_seam_report.py` | **Nothing to check.** Shots plan → exit 0, the mode message; chained plan without end frames → exit 0, the no-end-frames message; chained with end frames and an empty `clips/` → exit 0, `seam-report: no clips to check in <clips>`, and `vlm_models` (patched to raise) never called; no report file in any case. Also run as a subprocess (real script in a tmp WS with `story_engine.py` symlinked) for the no-clips case: stdout exact, rc 0 |
-| CT18 | same | **Preconditions.** `bad/../id` → 2; unknown story → 2; missing, non-JSON and wrong-schema `plan.json` → 2 with the message; a clip source with `shutil.which` → None → 2; no file written |
-| CT19 | same | **Server down.** `vlm_models` → `(None, "ConnectionRefusedError")` → exit 2, stderr exact, an existing `seam_report.json` unchanged (bytes). `vlm_complete` raising `TransportError("HTTP 503")` on panel 2 → exit 2, the stopped-answering message, nothing written |
-| CT20 | same | **Verdicts (CK6).** 3-beat chained plan with end frames; `panel_02.chainseed.png` and `panel_03.chainseed.png` newer than clips 1-2, `panel_03.mp4` present, `last_frame_png` stubbed; replies score 8, 5, 6 → `ok`, `missed`, `ok`; sources chainseed, chainseed, clip; `seam_report.json` equals the expected dict (with `_utc` patched); `seam_report.md` equals the expected text; stdout lines exact; rc 0. A chainseed older than its clip → source `clip`. A panel with no clip and no seed → `no clip`, attempts 0. `last_frame_png` raising `SeamError("x")` → `no clip` with the reason |
+| CT18 | same | **Preconditions.** `bad/../id` → 2; unknown story → 2; missing, non-JSON and wrong-schema `plan.json` → 2 with the message; a clip source with `shutil.which` → None → 2; no file written. Port 8178 by `--port` or `STORY_SERVER_PORT` → 2, the embed message, before the story is read; `STORY_SERVER_PORT=abc` → usage exit 2 naming `STORY_SERVER_PORT` |
+| CT19 | same | **Server down.** `vlm_models` → `(None, "ConnectionRefusedError")` → exit 2, stderr exact, an existing `seam_report.json` unchanged (bytes). `vlm_complete` raising `TransportError("HTTP 503")` on panel 2 → exit 2, the stopped-answering message, nothing written. A `/v1/models` that lists only `qwen38-6bit` → 2, the text-model message, after one GET; one whose entries have `loaded` keys but none `true` → 2, the not-answering message with `no model loaded` |
+| CT20 | same | **Verdicts (CK6).** 3-beat chained plan with end frames; `panel_02.chainseed.png` and `panel_03.chainseed.png` newer than clips 1-2, `panel_03.mp4` present, `last_frame_png` stubbed; replies score 8, 5, 6 → `ok`, `missed`, `ok`; sources chainseed, chainseed, clip; `seam_report.json` equals the expected dict (with `_utc` patched); `seam_report.md` equals the expected text; stdout lines exact; rc 0. A chainseed older than its clip → source `clip`. A panel with no clip and no seed → `no clip`, attempts 0. `last_frame_png` raising `SeamError("x")` → `no clip` with the reason. A chainseed that cannot be opened → `no clip`, `cannot read clips/panel_02.chainseed.png: FileNotFoundError`, no VLM call. An `.md.tmp` in the way, or `seam_report.md` a directory → exit 1 naming `seam_report.md`, the old `seam_report.json` unchanged, no `.tmp` of the run left |
 | CT21 | same | **Unparseable.** Replies `["garbage"] * 3` → `unparseable`, attempts 3; `["garbage", valid]` → `ok`, attempts 2; score 11, score `True`, empty reason, `missing` not a list → each retried; `"<think>{\"score\": 1}</think>{\"score\": 7, \"reason\": \"ok\", \"missing\": []}"` → 7 |
-| CT22 | same | **Prompt and request.** `seam_prompt(plan, 2)` equals the expected text, including the `Characters in this panel: "the courier" is <COURIER>.` line; a beat with empty cast → no characters line. `vlm_complete` with `http.client.HTTPConnection` monkeypatched to a fake records `POST /v1/chat/completions`, the body keys of Section 3, `max_tokens == 400`, `temperature == 0`, and an image URL starting `data:image/png;base64,` |
+| CT22 | same | **Prompt and request.** `seam_prompt(plan, 2)` equals the expected text, including the `Characters in this panel: "the courier" is <COURIER>.` line; a beat with empty cast → no characters line. `vlm_complete` with `http.client.HTTPConnection` monkeypatched to a fake records `POST /v1/chat/completions`, the body keys of Section 3, `max_tokens == 600`, `temperature == 0`, `chat_template_kwargs == {"enable_thinking": false}`, and an image URL starting `data:image/png;base64,`. `vlm_models` picks the first `loaded: true` string id, answers `no model loaded` when entries carry `loaded` but none is `true`, and takes `data[0]` when no entry has the key |
 | CT23 | `tests/test_movie_ui_seams.py` | `lib.job_vlm("seams", {}, ws, "s1") == "required"`; `lib.seams_argv(ws, "s1") == [sys.executable, ws + "/bin/seam-report", "s1", "--port", "8177"]` (and `MOVIE_UI_VLM_PORT=9001` → `"9001"`); `plan_has_end_frames` true for a chained plan with one end frame, false for shots, none, `None`, blank strings |
 | CT24 | same | `POST /api/stories/<id>/seams`: 201 with `job.kind == "seams"`, `job.command` ending `seam-report <id> --port 8177`, and the job's `job.json` `vlm` is `"required"`; unknown story 404; a chained plan without end frames 409 `story <id> has no end frames to check`; a second POST while queued 409 `a seams check of <id> is already queued as job <id>`; 401 without the token |
 | CT25 | same | `POST /api/jobs` with valid chained movie fields and `"check_seams": true` → `queue.json` ends `[<movie id>, <seams id>]`, the seams job's argv as CT23; `check_seams` absent, `false` or `"true"` → no seams job; mode shots or action story → no seams job |

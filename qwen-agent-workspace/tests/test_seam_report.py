@@ -235,6 +235,23 @@ def test_ct18_preconditions(ws, monkeypatch, capsys):
     assert seam.build_parser().parse_args(["sr1", "--port", "8188"]).port == 8188
 
 
+def test_ct18_the_embed_port_and_a_bad_port_variable(ws, monkeypatch, capsys):
+    _story(ws, _plan(), files=[("clips/panel_02.chainseed.png", SEED2, 2000)])
+    embed = "Error: " + seam.EMBED % seam.EMBED_PORT + "\n"
+    assert _run(["sr1", "--port", str(seam.EMBED_PORT)], capsys) == (2, "", embed)
+    monkeypatch.setenv("STORY_SERVER_PORT", str(seam.EMBED_PORT))
+    assert _run(["sr1"], capsys) == (2, "", embed)
+    assert _run(["shots-or-not", "--port", str(seam.EMBED_PORT)], capsys) == (2, "", embed)
+    monkeypatch.setenv("STORY_SERVER_PORT", "abc")
+    with pytest.raises(SystemExit) as exit_info:
+        seam.main(["sr1"])
+    assert exit_info.value.code == 2
+    assert capsys.readouterr().err.endswith(
+        "seam-report: error: argument --port: 'abc' is not an integer (from --port or "
+        "STORY_SERVER_PORT)\n")
+    assert seam.build_parser().parse_args(["sr1", "--port", "8188"]).port == 8188
+
+
 # --- CT19: the story server is down (CE13 steps 7, 8) --------------------------------------------
 
 def test_ct19_server_down_at_the_probe(ws, monkeypatch, capsys, isolation):
@@ -256,6 +273,19 @@ def test_ct19_server_stops_while_checking(ws, monkeypatch, capsys, isolation):
     fake = _vlm(monkeypatch, [_reply(8, "Fine."), seam.TransportError("HTTP 503")])
     assert _run(["sr1"], capsys) == (2, "", STOPPED % ("HTTP 503", 2, "sr1"))
     assert len(fake.calls) == 2
+    assert _reports(sdir) == []
+    assert os.listdir(isolation["temp"]) == []
+
+
+def test_ct19_a_text_model_or_no_loaded_model_is_refused(ws, monkeypatch, capsys, isolation):
+    sdir = _story(ws, _plan(), files=[("clips/panel_02.chainseed.png", SEED2, 2000)])
+    made = _connection(monkeypatch, body=json.dumps(
+        {"data": [{"id": seam.TEXT_MODEL_ID, "object": "model"}]}).encode("utf-8"))
+    assert _run(["sr1"], capsys) == (2, "", "Error: " + seam.TEXT_SERVER % (
+        8177, seam.TEXT_MODEL_ID, "sr1") + "\n")
+    assert [(m["method"], m["path"]) for m in made] == [("GET", "/v1/models")]
+    _connection(monkeypatch, body=b'{"data": [{"id": "/m/a", "loaded": false}, {"id": "/m/b"}]}')
+    assert _run(["sr1"], capsys) == (2, "", DOWN % ("no model loaded", "sr1"))
     assert _reports(sdir) == []
     assert os.listdir(isolation["temp"]) == []
 
@@ -385,6 +415,47 @@ def test_ct20_a_report_file_that_cannot_be_written(ws, monkeypatch, capsys):
     rc, out, err = _run(["sr1"], capsys)
     assert rc == 1 and out == ""
     assert err.startswith("Error: cannot write %s: " % os.path.join(sdir, "seam_report.json"))
+    assert sorted(os.listdir(sdir)) == ["clips", "plan.json", "seam_report.json.tmp"]
+
+
+def test_ct20_a_failed_write_leaves_the_old_pair_and_no_tmp_file(ws, monkeypatch, capsys):
+    sdir = _story(ws, _plan(frames=(E1, E2)), files=[("clips/panel_02.chainseed.png", SEED2, 2000)])
+    for name in ("seam_report.json", "seam_report.md"):
+        with open(os.path.join(sdir, name), "wb") as f:
+            f.write(b"old " + name.encode("ascii") + b"\n")
+    os.makedirs(os.path.join(sdir, "seam_report.md.tmp"))
+    _vlm(monkeypatch, [_reply(9, "Fine.")])
+    rc, out, err = _run(["sr1"], capsys)
+    assert rc == 1 and out == ""
+    assert err.startswith("Error: cannot write %s: " % os.path.join(sdir, "seam_report.md"))
+    assert sorted(os.listdir(sdir)) == ["clips", "plan.json", "seam_report.json", "seam_report.md",
+                                        "seam_report.md.tmp"]
+    os.rmdir(os.path.join(sdir, "seam_report.md.tmp"))
+    os.remove(os.path.join(sdir, "seam_report.md"))
+    os.makedirs(os.path.join(sdir, "seam_report.md"))
+    _vlm(monkeypatch, [_reply(9, "Fine.")])
+    rc, out, err = _run(["sr1"], capsys)
+    assert rc == 1 and out == ""
+    assert err.startswith("Error: cannot write %s: " % os.path.join(sdir, "seam_report.md"))
+    assert sorted(os.listdir(sdir)) == ["clips", "plan.json", "seam_report.json", "seam_report.md"]
+    with open(os.path.join(sdir, "seam_report.json"), "rb") as f:
+        assert f.read() == b"old seam_report.json\n"
+
+
+def test_ct20_an_unreadable_chainseed_is_no_clip(ws, monkeypatch, capsys):
+    sdir = _story(ws, _plan(frames=(E1, E2)))
+    gone = os.path.join(sdir, "clips", "panel_02.chainseed.png")
+    monkeypatch.setattr(seam, "frame_sources", lambda plan, clips_dir: [(1, E1, "chainseed", gone)])
+    fake = _vlm(monkeypatch, [])
+    rc, out, _err = _run(["sr1"], capsys)
+    assert rc == 0 and fake.calls == []
+    with open(os.path.join(sdir, "seam_report.json"), encoding="utf-8") as f:
+        panel = json.load(f)["panels"][0]
+    assert (panel["source"], panel["frame"], panel["score"], panel["verdict"], panel["reason"],
+            panel["attempts"]) == ("chainseed", "clips/panel_02.chainseed.png", None, "no clip",
+                                   "cannot read clips/panel_02.chainseed.png: FileNotFoundError", 0)
+    assert out.startswith("panel 1: no clip: cannot read clips/panel_02.chainseed.png: "
+                          "FileNotFoundError\n")
 
 
 # --- CT21: unparseable replies (CE13 step 8) ------------------------------------------------------
@@ -489,8 +560,9 @@ def test_ct22_the_requests(monkeypatch):
     assert (record["method"], record["path"], record["read"], record["closed"]) == (
         "POST", "/v1/chat/completions", 1048576, True)
     body = json.loads(record["body"].decode("utf-8"))
-    assert sorted(body) == ["max_tokens", "messages", "model", "temperature"]
-    assert (body["model"], body["max_tokens"], body["temperature"]) == ("test-vlm", 400, 0)
+    assert sorted(body) == ["chat_template_kwargs", "max_tokens", "messages", "model", "temperature"]
+    assert (body["model"], body["max_tokens"], body["temperature"]) == ("test-vlm", 600, 0)
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
     assert body["messages"][0]["role"] == "user"
     text, image = body["messages"][0]["content"]
     assert text == {"type": "text", "text": "the prompt"}
@@ -520,6 +592,19 @@ def test_ct22_the_requests(monkeypatch):
         assert seam.vlm_models(8177) == (None, what), body
     _connection(monkeypatch, error=http.client.RemoteDisconnected("gone"))
     assert seam.vlm_models(8177) == (None, "RemoteDisconnected")
+    for body, expected in (
+            (b'{"data": [{"id": "/m/cached", "loaded": false}, {"id": "/m/vl", "loaded": true}]}',
+             ("/m/vl", None)),
+            (b'{"data": [{"id": "/m/a", "loaded": true}, {"id": "/m/b", "loaded": true}]}',
+             ("/m/a", None)),
+            (b'{"data": [{"id": 5, "loaded": true}, {"id": "/m/b", "loaded": true}]}',
+             ("/m/b", None)),
+            (b'{"data": [{"id": "/m/a", "loaded": false}]}', (None, "no model loaded")),
+            (b'{"data": [{"id": "/m/a", "loaded": "true"}, {"id": "/m/b"}]}',
+             (None, "no model loaded")),
+            (b'{"data": [{"id": "first"}, {"id": "second"}]}', ("first", None))):
+        _connection(monkeypatch, body=body)
+        assert seam.vlm_models(8177) == expected, body
 
 
 # --- CT30: the script itself (CE13) ---------------------------------------------------------------
@@ -540,7 +625,10 @@ def test_ct30_executable_shebang_and_stdlib_imports():
     assert seam.VERDICTS == ("ok", "missed", "no clip", "unparseable")
     assert (seam.SCHEMA, seam.MISS_BELOW, seam.ATTEMPTS, seam.MAX_TOKENS, seam.TEMPERATURE,
             seam.CALL_TIMEOUT_S, seam.MODELS_TIMEOUT_S, seam.MAX_BODY) == (
-        "ltx-movie.seam-report.v1", 6, 3, 400, 0, 300, 10, 1048576)
+        "ltx-movie.seam-report.v1", 6, 3, 600, 0, 300, 10, 1048576)
+    # The embed server's port is written as 8177 + 1 so the new tests never hold the literal
+    # (plan Task 7 Step 7's check).
+    assert (seam.EMBED_PORT, seam.TEXT_MODEL_ID) == (8177 + 1, "qwen38-6bit")
 
 
 # --- Review Focus 1, 2 -----------------------------------------------------------------------------

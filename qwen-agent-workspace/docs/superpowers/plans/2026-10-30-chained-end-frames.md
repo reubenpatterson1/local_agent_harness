@@ -19,7 +19,7 @@
 - **Tests:**
   - New files: `tests/test_chained_end_frames.py` (CT1-CT16, CT29; Tasks 1-5), `tests/test_seam_report.py` (CT17-CT22, CT30; Task 5) and `tests/test_movie_ui_seams.py` (CT23-CT28; Task 6).
   - Five Review Focus pins.
-  - In all, 63 test cases: 58 CT cases and 5 Review Focus pins.
+  - In all, 67 test cases: 62 CT cases and 5 Review Focus pins.
 
 **Tech Stack:**
 - Python 3.13 (`python3` = `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`, pytest 8.3.4). Python 3.9.6 (`/usr/bin/python3`) is used for the compile check only. Every new and changed Python file runs on both.
@@ -4707,7 +4707,7 @@ node --check static/movie-ui/app.js && echo "app.js parses"
 
 Expected: `app.js parses`.
 
-The gate block with `N=6`. Expected: `GATE PASS`, `lost 35 (listed 35, unexpected 0); new tests 63, not passing 0`, and `offline unchanged`.
+The gate block with `N=6`. Expected: `GATE PASS`, `lost 35 (listed 35, unexpected 0); new tests 67, not passing 0`, and `offline unchanged`.
 
 - [ ] **Step 5: Commit.**
 
@@ -5963,8 +5963,8 @@ diff <(python3 -B tests/test_ltx_movie_offline.py 2>&1 | tail -1) $D/baseline-of
 ```
 
 Expected:
-- the final summary is the baseline's with the pass count higher by exactly 63, the new cases (58 CT cases and 5 Review Focus pins; Plan ruling R20);
-- `lost 0 (listed 0, unexpected 0); new tests 63, not passing 0` and `GATE PASS`;
+- the final summary is the baseline's with the pass count higher by exactly 67, the new cases (62 CT cases and 5 Review Focus pins; Plan ruling R20);
+- `lost 0 (listed 0, unexpected 0); new tests 67, not passing 0` and `GATE PASS`;
 - `same failures, same messages` and `no lost pass` (CK7);
 - `1` (`test_mut26` passes at its new `BASELINE`);
 - `offline unchanged`.
@@ -5995,15 +5995,15 @@ Expected, in order:
 - CK3: `202 passed` (CT15 and the spec's "must pass unchanged" set; the offline script was checked in Step 6);
 - CK4: `3 passed`;
 - CK5: `3 passed`;
-- CK6: `14 passed`;
+- CK6: `18 passed`;
 - no output from the `--stat` (spec 0.3: those files are not changed);
 - `0` (no `DEFAULT_FIELDS` change; [BF] BT1 holds);
 - the changed paths are exactly the 2 docs (the spec and this plan) plus `bin/seam-report`, `movie_ui_lib.py`, `movie_ui_server.py`, `static/movie-ui/app.css`, `static/movie-ui/app.js`, `static/movie-ui/index.html`, `story_engine.py`, the six fixtures of Task 7, `tests/test_chained_end_frames.py`, `tests/test_dialogue.py`, `tests/test_location_ui.py`, `tests/test_movie_ui_builder.py`, `tests/test_movie_ui_http.py`, `tests/test_movie_ui_seams.py`, `tests/test_narrative_fidelity.py`, `tests/test_pinned_cast.py`, `tests/test_seam_report.py`, `tests/test_shot_format.py`, `tests/test_soft_panel_count.py`, `tests/test_speaker_attribution.py` and `tests/test_story_engine.py`, each with the `qwen-agent-workspace/` prefix (28 paths);
-- `no 8178, real HTTP client, private host or real HOME path in the new tests`. The new tests name `8177` only as the default port value they assert; every HTTP connection in them is a monkeypatched fake;
+- `no 8178, real HTTP client, private host or real HOME path in the new tests`. The new tests name `8177` only as the default port value they assert and in `8177 + 1`, the pinned `EMBED_PORT`, so the literal never appears; every HTTP connection in them is a monkeypatched fake;
 - exactly twelve import lines: `+import argparse`, `+import base64`, `+import http.client`, `+import importlib.machinery`, `+import json`, `+import os`, `+import re`, `+import shutil`, `+import subprocess`, `+import sys`, `+import tempfile`, `+import time` (CE13, CT30).
 
 - [ ] **Step 8: Hand-off (controller; not an executor step).**
-  - Report the branch `chain-endframes` and its 9 new commits (6 task commits, the Task 2 and Task 3 fix commits and the re-baseline), with CK1-CK7.
+  - Report the branch `chain-endframes` and its 10 new commits (6 task commits, the Task 2, Task 3 and Task 5 fix commits and the re-baseline), with CK1-CK7.
   - Before any push, run the spec's secret scan (spec 10 step 5) and review every hit by hand.
   - Push, the merge and the live A/B are separate steps that need the user's approval.
 
@@ -6059,11 +6059,11 @@ Steps (spec 10 step 7, unchanged):
 | CT1 (N23 part), CT10, CT11, CT15, Review Focus 3 | 3 | `tests/test_chained_end_frames.py` | 11 (CT11 7) |
 | CT1 (writer part), CT9, CT14 | 4 | `tests/test_chained_end_frames.py` | 4 (CT14 2) |
 | CT1 (compile part) | 5 | `tests/test_chained_end_frames.py` | 1 |
-| CT17-CT22, CT30, Review Focus 1, 2 | 5 | `tests/test_seam_report.py` | 14 (CT17 2, CT19 2, CT20 3, CT22 2) |
+| CT17-CT22, CT30, Review Focus 1, 2 | 5 | `tests/test_seam_report.py` | 18 (CT17 2, CT18 2, CT19 3, CT20 5, CT22 2) |
 | CT23-CT28, Review Focus 4, 5 | 6 | `tests/test_movie_ui_seams.py` | 8 |
 | the Section 7 re-baselines | 7 | the 16 files of Task 7 | (existing tests) |
 
-Totals: 63 new cases, of which 58 are CT cases and 5 are Review Focus pins. Cumulative new cases after each task: 8, 25, 36, 40, 55, 63.
+Totals: 67 new cases, of which 62 are CT cases and 5 are Review Focus pins. Cumulative new cases after each task: 8, 25, 36, 40, 59, 67.
 
 ### KPI → task
 
@@ -6144,7 +6144,7 @@ Totals: 63 new cases, of which 58 are CT cases and 5 are Review Focus pins. Cumu
     - CT24 checks that a finished seams job no longer blocks a new one, and that shots and plan-less stories are refused;
     - CT25 checks that `check_seams: 1` is not `true`.
     None weakens a spec assertion.
-20. **R20 [reading]: CK7's count is the baseline plus the 63 new cases,** 58 CT cases and the 5 Review Focus pins that the plan format requires.
+20. **R20 [reading]: CK7's count is the baseline plus the 67 new cases,** 62 CT cases and the 5 Review Focus pins that the plan format requires.
 21. **R21 [reading]: `END_FRAMES_DROPPED`'s N counts every plan call made,** including a call 2 that got no envelope, as the spec's `len([c for c in self.doc["calls"] if c["stage"] == "plan"])` does.
 22. **R22 [reading]: two values are wrapped at 100 columns.** `SPEAKING_CAMERAS` and the `_mixed_camera` docstring's added sentence keep the spec's exact values.
 

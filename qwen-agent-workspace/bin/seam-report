@@ -12,8 +12,10 @@ when it is not older than its clip, else the last frame of clips/panel_<k>.mp4. 
 re-renders, never starts a server and writes nothing but the two report files.
 
 Exit 0: report written, nothing to check, or no clips to check. 1: a report file cannot be
-written. 2: a usage error, an invalid story id, no story, an invalid plan, ffmpeg or ffprobe
-missing, or the story server not answering. Standard library only; Python 3.9 and 3.13.
+written. 2: a usage error (a non-integer --port or STORY_SERVER_PORT included), the embed server's
+port 8178, an invalid story id, no story, an invalid plan, ffmpeg or ffprobe missing, the story
+server not answering or listing no loaded model, or the story server serving the text model.
+Standard library only; Python 3.9 and 3.13.
 """
 
 import argparse
@@ -34,12 +36,17 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 SCHEMA = "ltx-movie.seam-report.v1"
 MISS_BELOW = 6          # a score below 6 is "missed" (notes, Section 3)
 ATTEMPTS = 3            # VLM calls per panel before "unparseable"
-MAX_TOKENS = 400
+MAX_TOKENS = 600         # character_dataset.vlm_call's value, with thinking switched off
 TEMPERATURE = 0
 CALL_TIMEOUT_S = 300
 MODELS_TIMEOUT_S = 10
 MAX_BODY = 1048576
 VERDICTS = ("ok", "missed", "no clip", "unparseable")
+EMBED_PORT = 8178       # the embed server's port: never contacted (movie_ui_lib.py:617-618)
+# The model id bin/story-server's text mode serves (MODEL_ID, bin/story-server:41, passed as
+# --model-id at :493; bin/qwen-agent's DEFAULT_MODEL, :52). Its vLLM vision mode serves the same
+# alias (:475), so only mlx-vision, which serves its model path (:812), passes the probe.
+TEXT_MODEL_ID = "qwen38-6bit"
 
 PLAN_SCHEMA = "ltx-movie.plan.v1"
 STORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
@@ -61,6 +68,11 @@ DOWN = ("the story server is not answering at 127.0.0.1:%d (%s); nothing was cha
 STOPPED = ("the story server stopped answering at 127.0.0.1:%d (%s) while checking panel %d; "
            "nothing was written. Start it with bin/story-server mlx-vision and rerun "
            "bin/seam-report %s.")
+TEXT_SERVER = ("the story server at 127.0.0.1:%d serves %s, the text model, not a vision model; "
+               "nothing was changed. Switch it with bin/story-server stop, then bin/story-server "
+               "mlx-vision, and rerun bin/seam-report %s.")
+EMBED = ("port %d is the embed server's port, not the story server's; nothing was changed. Pass "
+         "--port with the story server's port (8177 by default) or unset STORY_SERVER_PORT.")
 
 
 class SeamError(Exception):
@@ -86,13 +98,23 @@ def _utc():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _port(text):
+    """The argparse type of --port: an int. argparse also applies it to the string default, so a
+    non-integer STORY_SERVER_PORT is a usage error (exit 2) when --port is not given."""
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("%r is not an integer (from --port or STORY_SERVER_PORT)"
+                                         % text)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="seam-report",
         description="Score each chained panel's last frame against its planned end frame.")
     parser.add_argument("story_id", metavar="STORY_ID")
-    parser.add_argument("--port", type=int,
-                        default=int(os.environ.get("STORY_SERVER_PORT") or 8177),
+    parser.add_argument("--port", type=_port,
+                        default=os.environ.get("STORY_SERVER_PORT") or "8177",
                         help="the story server's port (default: $STORY_SERVER_PORT or 8177)")
     return parser
 
@@ -195,8 +217,11 @@ def _request(port, method, path, body, timeout):
 
 
 def vlm_models(port):
-    """(model, None) from GET /v1/models: the string id of the first listed model; or (None,
-    what): "HTTP <n>", "invalid JSON", "no model listed" or the exception class name."""
+    """(model, None) from GET /v1/models; or (None, what): "HTTP <n>", "invalid JSON", "no model
+    listed", "no model loaded" or the exception class name. mlx_vlm.server lists every cached
+    model and flags the active one "loaded": true (bin/story-server:130-139): when any entry has a
+    "loaded" key, model is the string id of the first entry whose "loaded" is True, else "no
+    model loaded"; when none has the key, model is data[0]'s string id."""
     try:
         status, raw = _request(port, "GET", "/v1/models", None, MODELS_TIMEOUT_S)
     except (OSError, http.client.HTTPException) as e:
@@ -208,6 +233,10 @@ def vlm_models(port):
     except ValueError:
         return None, "invalid JSON"
     data = doc.get("data") if isinstance(doc, dict) else None
+    if isinstance(data, list) and any(isinstance(d, dict) and "loaded" in d for d in data):
+        loaded = [d["id"] for d in data if isinstance(d, dict) and d.get("loaded") is True
+                  and isinstance(d.get("id"), str)]
+        return (loaded[0], None) if loaded else (None, "no model loaded")
     if not (isinstance(data, list) and data and isinstance(data[0], dict)
             and isinstance(data[0].get("id"), str)):
         return None, "no model listed"
@@ -220,6 +249,7 @@ def vlm_complete(port, model, prompt, png):
     a transport failure or a non-200 status."""
     body = json.dumps({
         "model": model, "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE,
+        "chat_template_kwargs": {"enable_thinking": False},
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {
@@ -285,8 +315,12 @@ def _check_panel(port, model, plan, k, end_frame, source, path, tmp):
             panel["reason"] = "cannot read the last frame of clips/panel_%02d.mp4: %s" % (k, e)
             return panel
         path = out_png
-    with open(path, "rb") as f:
-        png = f.read()
+    try:
+        with open(path, "rb") as f:
+            png = f.read()
+    except OSError as e:
+        panel["reason"] = "cannot read %s: %s" % (panel["frame"], e.__class__.__name__)
+        return panel
     prompt = seam_prompt(plan, k)
     for attempt in range(1, ATTEMPTS + 1):
         content = vlm_complete(port, model, prompt, png)
@@ -347,16 +381,38 @@ def _panel_line(p):
     return "panel %d: %s: %s" % (p["panel"], p["verdict"], p["reason"])
 
 
-def _write(path, text):
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(temporary, path)
+def write_reports(pairs):
+    """Write the report pair [(path, text)]: every text to <path>.tmp first, then, once no path is
+    a directory, each .tmp os.replace'd into place, so a failure leaves the old pair as it was.
+    Returns None, or (path, error) for the first OSError, after removing every .tmp this call
+    created that is still there."""
+    created, path = [], None
+    try:
+        for path, text in pairs:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                created.append(path + ".tmp")
+                f.write(text)
+        for path, _text in pairs:
+            if os.path.isdir(path):
+                raise IsADirectoryError("%s is a directory" % path)
+        for path, _text in pairs:
+            os.replace(path + ".tmp", path)
+            created.remove(path + ".tmp")
+    except OSError as e:
+        for temporary in created:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+        return path, e
+    return None
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
     story_id, port = args.story_id, args.port
+    if port == EMBED_PORT:
+        return _error(EMBED % port)
     if not STORY_ID_RE.match(story_id) or ".." in story_id:
         return _error("invalid story id: %s" % story_id)
     stories = os.path.join(WS, "generated", "stories")
@@ -386,6 +442,8 @@ def main(argv=None):
     model, what = vlm_models(port)
     if model is None:
         return _error(DOWN % (port, what, story_id))
+    if model == TEXT_MODEL_ID:
+        return _error(TEXT_SERVER % (port, model, story_id))
     panels = []
     tmp = tempfile.mkdtemp(prefix="seam-report-")
     try:
@@ -400,13 +458,11 @@ def main(argv=None):
            "threshold": MISS_BELOW, "panels": panels, "summary": _summary(panels)}
     json_path = os.path.join(story_dir, "seam_report.json")
     md_path = os.path.join(story_dir, "seam_report.md")
-    for path, text in ((json_path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n"),
-                       (md_path, render_md(doc))):
-        try:
-            _write(path, text)
-        except OSError as e:
-            print("Error: cannot write %s: %s" % (path, e), file=sys.stderr)
-            return 1
+    failed = write_reports([(json_path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n"),
+                            (md_path, render_md(doc))])
+    if failed is not None:
+        print("Error: cannot write %s: %s" % failed, file=sys.stderr)
+        return 1
     for p in panels:
         print(_panel_line(p))
     summary = doc["summary"]
