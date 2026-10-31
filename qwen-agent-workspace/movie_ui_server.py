@@ -2120,6 +2120,28 @@ def remove_fork(fdir, batch_id):
     return False
 
 
+def fork_in_use(state, ws_real, fork_id, own_job=None):
+    """The ID of a job other than own_job whose workspace is ws_real and whose story is fork_id
+    (newest first), or None. Read from each job.json; takes no lock."""
+    for job_id in sorted(lib.list_job_ids(state), reverse=True):
+        if job_id == own_job:
+            continue
+        job = lib.read_job(lib.job_dir(state, job_id)) or {}
+        if job.get("workspace") == ws_real and job.get("story_id") == fork_id:
+            return job_id
+    return None
+
+
+def remove_unused_fork(state, ws_real, fdir, batch_id, own_job=None):
+    """remove_fork, except while another job of ws_real names this fork's story: then the folder
+    is kept and stderr says which job uses it. Returns True when removed."""
+    user = fork_in_use(state, ws_real, os.path.basename(fdir), own_job)
+    if user is not None:
+        sys.stderr.write("movie-ui: batch %s: not removing %s (job %s uses it)\n" % (batch_id, fdir, user))
+        return False
+    return remove_fork(fdir, batch_id)
+
+
 def _batch_kick(server):
     """BF24 step 4: start the batch submitter unless it runs. The caller holds BATCH_LOCK."""
     if server.batch_thread is None or not server.batch_thread.is_alive():
@@ -2184,7 +2206,8 @@ def _submit_cell(server, batch_id, index):
         _fork_cell(server, batch_id, index, made)
     except Exception as e:
         if made:
-            remove_fork(made[0], batch_id)
+            remove_unused_fork(server.state, os.path.dirname(os.path.dirname(os.path.dirname(made[0]))),
+                               made[0], batch_id)
         sys.stderr.write("movie-ui: batch %s: cell %d: internal error: %s: %s\n"
                          % (batch_id, index, type(e).__name__, e))
         _cell_update(server, batch_id, index,
@@ -2220,6 +2243,10 @@ def _fork_cell(server, batch_id, index, made):
         _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes,
                                                "reason": "fork ID %s already exists; it is never overwritten" % fid})
         return
+    except OSError as e:
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason":
+                     "copy failed: %s: %s" % (e.strerror or e, e.filename or fdir)})
+        return
     made.append(fdir)
     fork_rec = {"schema": batch.FORK_SCHEMA, "fork_id": fid, "source_story": story_id, "batch": batch_id,
                 "variant": built["variant"], "label": rec["variants"][built["variant"] - 1]["label"],
@@ -2230,12 +2257,12 @@ def _fork_cell(server, batch_id, index, made):
             target = os.path.join(fdir, rel)
             os.makedirs(os.path.dirname(target), exist_ok=True)
             src = os.path.join(sdir, rel)
-            if os.path.islink(src):  # re-check: copy_plan listed it as a regular file
+            if os.path.islink(src) or os.path.islink(os.path.dirname(src)):  # re-check copy_plan's lstat
                 raise OSError(errno.ELOOP, "a symlink, not copied", src)
             shutil.copy2(src, target)
     except OSError as e:
         if os.path.lexists(os.path.join(fdir, "fork.json")):
-            remove_fork(fdir, batch_id)
+            remove_unused_fork(state, ws_real, fdir, batch_id)
         else:
             os.rmdir(fdir)
         del made[:]
@@ -2244,14 +2271,14 @@ def _fork_cell(server, batch_id, index, made):
         return
     busy = job_index(server, ws_real)[1].get(story_id)                                # 5
     if busy is not None:
-        remove_fork(fdir, batch_id)
+        remove_unused_fork(state, ws_real, fdir, batch_id)
         del made[:]
         _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason":
                      "story %s got a job (%s) while it was being forked; fork it again later" % (story_id, busy)})
         return
     checks = lib.run_checks(built["fields"], ws_real, state)                          # 6, no lock held
     if not lib.checks_pass(checks):
-        remove_fork(fdir, batch_id)
+        remove_unused_fork(state, ws_real, fdir, batch_id)
         del made[:]
         _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason": "\n".join(
             "%s %s: %s" % (c["id"], c["name"], c["detail"]) for c in checks if c["status"] == "fail")})
@@ -2259,7 +2286,7 @@ def _fork_cell(server, batch_id, index, made):
     with BATCH_LOCK:                                                                  # 7
         rec = read_batch(state, batch_id)
         if rec is None or rec.get("cancel_requested"):
-            remove_fork(fdir, batch_id)
+            remove_unused_fork(state, ws_real, fdir, batch_id)
             del made[:]
             if rec is not None:
                 rec["cells"][index].update(status="cancelled", reason="batch cancelled", copy_bytes=copy_bytes,
@@ -2282,7 +2309,7 @@ def _fork_cell(server, batch_id, index, made):
         if rec is not None:
             reconcile(server, batch_id)
         elif result == "cancelled":
-            remove_fork(fdir, batch_id)
+            remove_unused_fork(state, ws_real, fdir, batch_id, own_job=job_id)
 
 
 def reconcile(server, batch_id):
@@ -2300,7 +2327,8 @@ def reconcile(server, batch_id):
                 continue
             status = lib.read_status(lib.job_dir(state, job_id)) or {}
             if status.get("state") == "cancelled" and status.get("started") is None:
-                remove_fork(lib.story_dir(rec["workspace"], cell["fork_id"]), batch_id)
+                remove_unused_fork(state, rec["workspace"], lib.story_dir(rec["workspace"], cell["fork_id"]),
+                                   batch_id, own_job=job_id)
                 cell.update(status="cancelled", reason="cancelled before it started", updated=lib.utc_now())
                 changed = True
         if changed:

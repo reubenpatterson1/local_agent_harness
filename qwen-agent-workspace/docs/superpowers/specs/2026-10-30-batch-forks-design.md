@@ -348,7 +348,7 @@ The preview runs no V2-V6. **[spec choice]** It runs V1 as Compose's own preview
 
 ### 4.4 Cancel, restart, delete (BF29-BF34)
 
-- **BF29 Reconcile.** `reconcile(server, batch_id)` runs under `BATCH_LOCK`. Each `queued` cell whose job `status.json` has `state == "cancelled"` and no non-null `started` gets `remove_fork` and status `cancelled` with reason `cancelled before it started`. It runs from every `/api/batches/<id>*` handler, from `GET /api/batches`, and from the hook below. A job that started keeps its directory and partial output.
+- **BF29 Reconcile.** `reconcile(server, batch_id)` runs under `BATCH_LOCK`. Each `queued` cell whose job `status.json` has `state == "cancelled"` and no non-null `started` gets `remove_fork` and status `cancelled` with reason `cancelled before it started`. It runs from every `/api/batches/<id>*` handler, from `GET /api/batches`, and from the hook below. A job that started keeps its directory and partial output. The fork is kept (and the cell still becomes cancelled) while any other job of the workspace names the fork's story; every batch removal path uses this guard (remove_unused_fork; review fix 2026-10-30).
 - **BF30 Job cancel hook.** After `_h_job_cancel` gets `"cancelled"` from `cancel_job`, it releases `STORE_LOCK`, finds the batch whose cells hold that `job_id` (a scan of `batches/*/batch.json`), and reconciles it.
 - **BF31 Cancel batch.** Steps:
   1. Under `BATCH_LOCK`, take the batch out of `batch_queue`, set `cancel_requested`, and mark the `pending` cells `cancelled`.

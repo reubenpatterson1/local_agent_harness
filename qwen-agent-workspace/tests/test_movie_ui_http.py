@@ -1513,3 +1513,89 @@ def test_batch_review_focus_4_batches_are_per_workspace(env, monkeypatch, tmp_pa
     assert mt.api(s, "GET", "/api/batches?ws=" + ws)[2] == {"batches": [
         {"id": first, "number": 1, "created": created, "status": "submitted", "cells": 1, "done": 0}]}
     assert mt.api(s, "GET", "/api/batches")[:3:2] == (400, {"error": "missing ws"})
+
+
+def test_batch_fix_reconcile_keeps_a_fork_a_later_job_uses(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    fork = lib.story_dir(ws, cell["fork_id"])
+    lib.write_queue(state, [i for i in lib.read_queue(state) if i != cell["job_id"]])
+    lib.write_status(lib.job_dir(state, cell["job_id"]), {"state": "cancelled", "exit_code": None,
+                                                          "ended": lib.utc_now()})
+    later = mt.make_job(state, ["true"], ws, story_id=cell["fork_id"],
+                        status={"state": "running", "started": lib.utc_now()})
+    mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert os.path.isdir(fork)
+    assert bt.record(state, batch_id)["cells"][0]["status"] == "cancelled"
+    assert srv.fork_in_use(state, ws, cell["fork_id"], cell["job_id"]) == later
+
+
+def test_batch_fix_remove_fork_refuses_a_foreign_fork_json(tmp_path, capsys):
+    fdir = tmp_path / "ronin-rescue-b1-v1"
+    fdir.mkdir()
+    for rec in ({"batch": "20261030-120000-0b0b", "fork_id": "ronin-rescue-b1-v1"},
+                {"batch": "20261030-120000-0a0a", "fork_id": "other-b1-v1"}, None):
+        if rec is None:
+            (fdir / "fork.json").unlink()
+        else:
+            (fdir / "fork.json").write_text(json.dumps(rec), encoding="utf-8")
+        assert srv.remove_fork(str(fdir), "20261030-120000-0a0a") is False
+        assert fdir.is_dir()
+    assert "not removing" in capsys.readouterr().err
+
+
+def test_batch_fix_copy_failure_midway_leaves_no_fork(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    sdir, _ = bt.original(state, ws, "ronin-rescue", files=RICH_FILES)
+    real, calls = srv.shutil.copy2, []
+
+    def flaky(src, dst, *args, **kwargs):
+        calls.append(src)
+        if len(calls) == 3:
+            raise OSError(28, "No space left on device", dst)
+        return real(src, dst, *args, **kwargs)
+    monkeypatch.setattr(srv.shutil, "copy2", flaky)
+    before = bt.tree_digests(sdir)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert cell["status"] == "refused" and cell["reason"].startswith("copy failed: No space left on device: ")
+    assert not os.path.lexists(lib.story_dir(ws, cell["fork_id"]))
+    assert bt.tree_digests(sdir) == before
+
+
+def test_batch_fix_fork_json_write_failure_leaves_no_fork(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    real = lib.write_json_atomic
+
+    def failing(path, obj, *args, **kwargs):
+        if path.endswith("fork.json"):
+            raise OSError(28, "No space left on device", path)
+        return real(path, obj, *args, **kwargs)
+    monkeypatch.setattr(lib, "write_json_atomic", failing)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert cell["status"] == "refused" and cell["reason"].startswith("copy failed: No space left on device: ")
+    assert not os.path.lexists(lib.story_dir(ws, cell["fork_id"]))
+
+
+def test_batch_fix_mkdir_error_is_a_copy_failure(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    real = srv.os.mkdir
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith("-b1-v1"):
+            raise PermissionError(13, "Permission denied", path)
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(srv.os, "mkdir", denied)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert (cell["status"], cell["reason"].split(": ")[0]) == ("refused", "copy failed")
+    assert "Permission denied" in cell["reason"]
