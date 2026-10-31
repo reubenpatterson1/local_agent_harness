@@ -335,7 +335,7 @@ def _build(cell, info, variant, labels, ws_real, state, validate, earlier, argvs
     story_id = cell["story_id"]
     try:
         orig, fork, warnings = merge(info["fields"], variant, story_id, cell["fork_id"], ws_real)
-    except (KeyError, TypeError, ValueError) as e:
+    except Exception as e:  # BF12, widened by controller ruling: any odd saved field refuses the cell
         cell["reason"] = _unusable(story_id, e)
         return
     cell["warnings"] = warnings
@@ -355,7 +355,7 @@ def _build(cell, info, variant, labels, ws_real, state, validate, earlier, argvs
                     other["variant"], labels[other["variant"] - 1])
                 return
         level, diff, notes = classify(orig, fork, story_id, ws_real, state, info["has_story"])
-    except (KeyError, TypeError, ValueError) as e:
+    except Exception as e:  # BF12, widened by controller ruling: any odd saved field refuses the cell
         cell["reason"] = _unusable(story_id, e)
         return
     argvs[(story_id, cell["variant"])] = argv

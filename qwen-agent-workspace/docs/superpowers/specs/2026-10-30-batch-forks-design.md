@@ -154,7 +154,7 @@ Let `A(f) = lib.build_argv(dict(f, story_id=story_id), ws_real, state)` be the a
 - **BF9 Level.** The level is the highest-ranked `FIELD_LEVELS[key]` in the diff, with the extra `panels` entry counting as `replan`. When the original has no `story.md`, the level is `replan` and the cell gets the warning `the original has no story.md; this fork writes a new story`. **[spec choice]** The fork would need the VLM, and the group order depends on that.
 - **BF10 Warnings.** When the level is `render` or `stills` and `fork frames/fps < orig frames/fps`, add the warning `shorter clips (X.XX s, was Y.YY s): the copied story.md is re-checked and can fail its spoken-line timing`, with both values to 2 decimals. **[spec choice]** This is risk R2: the dry run cannot catch it.
 - **BF11 Duplicate variant.** A cell whose `A(fork)` equals that of an earlier `ok` cell of the same story (grid order) is refused with `same settings and prompt as variant M (<label>) for this story`.
-- **BF12 Errors.** A `KeyError`, `TypeError` or `ValueError` from `merge` or `A` refuses the cell with `the saved settings of story <id> cannot be used: <Type>: <message>`.
+- **BF12 Errors.** Any exception from `merge`, `A` or the classification refuses the cell (widened 2026-10-30 from KeyError/TypeError/ValueError, because malformed saved fields also raised AttributeError and ZeroDivisionError) with `the saved settings of story <id> cannot be used: <Type>: <message>`.
 
 ### 2.5 Fork IDs (BF13-BF15)
 

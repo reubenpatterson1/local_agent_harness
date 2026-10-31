@@ -413,6 +413,10 @@ def test_bt12_an_original_without_story_md_is_replan():
                   {"ronin-rescue": info(fields=saved(narrative=None))})[0]
     assert broken["reason"] == ("the saved settings of story ronin-rescue cannot be used: TypeError: the "
                                 "saved narrative is not a string")
+    zero = plan(["ronin-rescue"], [variant({"fps": 24})],
+                {"ronin-rescue": info(fields=saved(fps=0))})[0]
+    assert zero["reason"].startswith("the saved settings of story ronin-rescue cannot be used: "
+                                     "ZeroDivisionError: ")
     assert batch.eligibility_reason(None, "job", None) is None
     assert batch.eligibility_reason(None, "ok", BID) is None
 
