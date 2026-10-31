@@ -6,6 +6,8 @@
 (function () {
   const TOKEN_KEY = "movie-ui-token";
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
+  const BATCH_POLL_MS = 2000;   // batch forks spec 1.1: the jobs poll interval
+  const LEVEL_LABELS = {render: "Render", stills: "New stills", replan: "Re-plan"};
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
     characters: [], locations: [], location: null, locationPick: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
@@ -65,7 +67,7 @@
 
   function stopPolling() {
     S.stopped = true;
-    ["jobs", "log", "host"].forEach(function (name) {
+    ["jobs", "log", "host", "batch"].forEach(function (name) {
       if (S.timers[name]) { clearInterval(S.timers[name]); S.timers[name] = null; }
     });
     if (S.timers.traces) { clearTimeout(S.timers.traces); S.timers.traces = null; }
@@ -282,14 +284,16 @@
 
   // --- tabs (MU79) ---------------------------------------------------------------------
 
-  const TABS = ["compose", "stories", "characters", "locations", "actions", "loras", "jobs", "traces"];
+  const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", "jobs", "traces"];
 
   function showTab(name) {
     TABS.forEach(function (tab) {
       $("#tab-" + tab).classList.toggle("active", tab === name);
       show($("#panel-" + tab), tab === name);
     });
+    if (name !== "batches") { stopBatchPoll(); }
     if (name === "stories") { loadStories(); }
+    if (name === "batches") { loadBatches(); }
     if (name === "characters") { loadCharacters(); }
     if (name === "locations") { loadLocations(); }
     if (name === "actions") { loadActions(); }
@@ -299,7 +303,7 @@
 
   // --- compose (MU80) ------------------------------------------------------------------
 
-  function loraRow(target, item) {
+  function loraRow(target, item, container) {
     const entries = S.catalog[target];
     const select = el("select", {cls: "lora-pick"});
     entries.forEach(function (e) { select.appendChild(el("option", {value: e.id, text: e.id + " (" + e.kind + ")"})); });
@@ -340,13 +344,14 @@
     range.addEventListener("input", sync);
     path.addEventListener("input", preview);
     remove.addEventListener("click", function () { row.remove(); preview(); });
-    $(target === "video" ? "#c-video-loras" : "#c-stills-loras").appendChild(row);
+    (container || $(target === "video" ? "#c-video-loras" : "#c-stills-loras")).appendChild(row);
     sync();
   }
 
-  function collectLoras(target) {
+  function collectLoras(target, container) {
     const entries = S.catalog[target];
-    const rows = document.querySelectorAll((target === "video" ? "#c-video-loras" : "#c-stills-loras") + " .lora-row");
+    const rows = container ? container.querySelectorAll(".lora-row")
+      : document.querySelectorAll((target === "video" ? "#c-video-loras" : "#c-stills-loras") + " .lora-row");
     return Array.prototype.map.call(rows, function (row) {
       const id = row.querySelector(".lora-pick").value;
       const entry = entries.find(function (e) { return e.id === id; });
@@ -679,18 +684,23 @@
   async function loadStories() {
     if (!S.ws) { return; }
     const res = await api("GET", "/api/stories" + wsQuery());
+    const picks = await api("GET", "/api/batches/stories" + wsQuery());
+    const keep = pickedStories();
     const body = clear($("#s-list tbody"));
-    if (res.status !== 200) { return; }
+    if (res.status !== 200) { updateNewBatch(); return; }
+    const eligibility = {};
+    if (picks.status === 200) { picks.data.stories.forEach(function (p) { eligibility[p.id] = p; }); }
     res.data.stories.forEach(function (st) {
       const checks = st.checks ? st.checks.hard + " hard, " + st.checks.advisory + " advisory" +
         (st.checks.verdict ? " (" + st.checks.verdict + ")" : "") : "-";
-      const row = el("tr", {data: {storyId: st.id}, cls: "clickable"}, [
+      const row = el("tr", {data: {storyId: st.id}, cls: "clickable"}, [pickCell(st.id, eligibility[st.id], keep.indexOf(st.id) >= 0),
         el("td", {text: st.id}), el("td", {text: st.story_md ? "yes" : "no"}), el("td", {text: checks}),
         el("td", {text: String(st.stills)}), el("td", {text: String(st.clips)}),
         el("td", {text: st.movie ? "yes" : "no"}), el("td", {text: new Date(st.mtime).toLocaleString()})]);
       row.addEventListener("click", function () { openStory(st.id); });
       body.appendChild(row);
     });
+    updateNewBatch();
   }
 
   async function openStory(storyId) {
@@ -755,6 +765,7 @@
 
   function setupStories() {
     $("#s-save").addEventListener("click", saveStory);
+    $("#s-new-batch").addEventListener("click", function () { openBatchEditor(pickedStories()); });
     $("#s-reload").addEventListener("click", function () { openStory(S.story.id); });
     $("#s-render").addEventListener("click", function () {
       fillCompose(storyFields("movie"));
@@ -779,6 +790,643 @@
       const res = await submit(Object.assign(storyFields("redo"), {redo: panels, mode: "shots"}));
       $("#s-action-status").textContent = res.status === 201 ? "queued" : "refused; see Compose checks";
     });
+  }
+
+  // --- batches (batch forks spec Section 5, BF36-BF39) ---------------------------------
+
+  // The editor's "Add setting…" menu, grouped by what a change costs (BF38): [key, label].
+  const BATCH_SETTINGS = [
+    ["Render", [["model", "Video model"], ["gemma", "Gemma"], ["video_loras", "Video LoRAs"],
+                ["action_loras", "Actions"], ["frames", "Frames per panel"], ["fps", "FPS"],
+                ["no_low_ram", "No low-RAM mode"], ["panel_timeout", "Panel timeout (s)"]]],
+    ["New stills", [["resolution", "Resolution"], ["stills_loras", "Stills LoRAs"],
+                    ["location_strength", "Location strength"]]],
+    ["Re-plan", [["size", "Size"], ["goal", "Goal"], ["seed_upload", "Seed image"], ["mode", "Mode"],
+                 ["story_model", "Story model"], ["auto_lora", "Auto-pick catalog LoRAs"], ["narration", "Narration"],
+                 ["characters", "Cast"], ["locations", "Locations"], ["story_legacy", "Legacy story engine"],
+                 ["judge", "Judge with Claude"]]]
+  ];
+  // The Compose control each single-control setting copies (BF38).
+  const BATCH_CONTROLS = {
+    gemma: "#c-gemma", goal: "#c-goal", story_model: "#c-story-model", frames: "#c-frames", fps: "#c-fps",
+    panel_timeout: "#c-panel-timeout", location_strength: "#c-location-strength", no_low_ram: "#c-no-low-ram",
+    auto_lora: "#c-auto-lora", story_legacy: "#c-story-legacy", judge: "#c-judge", mode: "#c-mode",
+    narration: "#c-narration", characters: "#c-characters", locations: "#c-locations"
+  };
+
+  function cloneControl(selector) {
+    const node = $(selector).cloneNode(true);
+    node.removeAttribute("id");
+    node.querySelectorAll("[id]").forEach(function (n) { n.removeAttribute("id"); });
+    return node;
+  }
+
+  function nodeNumber(node) {
+    const value = node.value.trim();
+    return value === "" ? null : Number(value);
+  }
+
+  function nodeText(node) {
+    const value = node.value.trim();
+    return value === "" ? null : value;
+  }
+
+  function selectedValues(node) {
+    return Array.prototype.map.call(node.selectedOptions, function (o) { return o.value; });
+  }
+
+  function selectValues(node, values) {
+    Array.prototype.forEach.call(node.options, function (o) { o.selected = (values || []).indexOf(o.value) >= 0; });
+  }
+
+  function hasOption(node, value) {
+    return Array.prototype.some.call(node.options, function (o) { return o.value === value; });
+  }
+
+  function batchFileUrl(ws, path) {
+    return "/files?ws=" + enc(ws) + "&path=" + enc(path) + "&t=" + enc(S.token);
+  }
+
+  function levelBadge(level) { return el("span", {cls: "badge level-" + level, text: LEVEL_LABELS[level]}); }
+
+  function batchNote(source) {
+    return el("span", {cls: "s-pick-note muted", text: "settings from batch b" + source.number,
+                       title: "This fork's job was deleted; its settings come from batch " + source.id});
+  }
+
+  function diffValue(key, value) {
+    if (value === null || value === undefined) { return "default"; }
+    if (key === "video_loras" || key === "stills_loras") {
+      return value.map(function (i) { return (i.id || String(i.path).split("/").pop()) + " @ " + i.strength; }).join(", ") || "none";
+    }
+    if (key === "action_loras") {
+      return value.map(function (a) { return a.name + (a.strength === null ? "" : " @ " + a.strength); }).join(", ") || "none";
+    }
+    if (Array.isArray(value)) { return value.join(", ") || "none"; }
+    return String(value);
+  }
+
+  function diffLine(d) {
+    if (d.key === "narrative") { return "narrative: prompt edited"; }
+    return d.key + ": " + diffValue(d.key, d.from) + " → " + diffValue(d.key, d.to) + (d.note ? " (" + d.note + ")" : "");
+  }
+
+  // --- the Stories tab's checkboxes (BF36)
+
+  function pickedStories() {
+    return Array.prototype.filter.call(document.querySelectorAll("#s-list .s-pick"), function (b) { return b.checked; })
+      .map(function (b) { return b.dataset.storyId; });
+  }
+
+  function updateNewBatch() {
+    const n = pickedStories().length;
+    $("#s-new-batch").textContent = "New batch (" + n + ")";
+    show($("#s-new-batch"), n >= 1);
+  }
+
+  function pickCell(storyId, info, checked) {
+    const box = el("input", {type: "checkbox", cls: "s-pick", data: {storyId: storyId}});
+    const cell = el("td", {}, [box]);
+    if (!info || !info.eligible) {
+      box.disabled = true;
+      box.title = info ? info.reason : "batch eligibility is not known";
+    } else if (checked) {
+      box.checked = true;
+    }
+    if (info && info.fields_source === "batch") {
+      cell.appendChild(document.createTextNode(" "));
+      cell.appendChild(batchNote(info.fields_batch));
+    }
+    box.addEventListener("click", function (event) { event.stopPropagation(); updateNewBatch(); });
+    return cell;
+  }
+
+  // --- the Batches tab: one box at a time (BF37)
+
+  function stopBatchPoll() {
+    if (S.timers.batch) { clearInterval(S.timers.batch); S.timers.batch = null; }
+  }
+
+  function showBatchBox(name) {
+    show($("#b-list-box"), name === "list");
+    show($("#b-editor"), name === "editor");
+    show($("#b-page"), name === "page");
+    if (name !== "page") { stopBatchPoll(); }
+  }
+
+  async function loadBatches() {
+    showBatchBox("list");
+    if (!S.ws) { return; }
+    const res = await api("GET", "/api/batches" + wsQuery());
+    const body = clear($("#b-list tbody"));
+    if (res.status !== 200) { return; }
+    res.data.batches.forEach(function (b) {
+      const row = el("tr", {data: {batchId: b.id}, cls: "clickable"}, [el("td", {text: b.id}),
+        el("td", {text: new Date(b.created).toLocaleString()}), el("td", {text: b.done + "/" + b.cells}),
+        el("td", {text: b.status})]);
+      row.addEventListener("click", function () { openBatch(b.id); });
+      body.appendChild(row);
+    });
+  }
+
+  // --- the editor (BF38)
+
+  function batchCards() { return Array.prototype.slice.call(document.querySelectorAll("#b-variants .b-variant")); }
+
+  function batchStart() {
+    const ed = S.bEditor;
+    const row = ed && ed.rows.length ? ed.rows[0] : null;
+    return Object.assign({}, S.options ? S.options.defaults : {}, row && row.fields ? row.fields : {});
+  }
+
+  function settingLabel(key) {
+    let label = key;
+    BATCH_SETTINGS.forEach(function (group) {
+      group[1].forEach(function (item) { if (item[0] === key) { label = item[1]; } });
+    });
+    return label;
+  }
+
+  function settingsMenu() {
+    const menu = el("select", {cls: "b-add-setting"}, [el("option", {value: "", text: "Add setting…"})]);
+    BATCH_SETTINGS.forEach(function (group) {
+      menu.appendChild(el("optgroup", {label: group[0]}, group[1].map(function (item) {
+        return el("option", {value: item[0], text: item[1]});
+      })));
+    });
+    return menu;
+  }
+
+  // One setting's control, started at the original's value f[key]; read() gives its settings.
+  function settingControl(key, f) {
+    let node;
+    let read;
+    if (key === "model") {
+      node = cloneControl("#c-model");
+      Array.prototype.slice.call(node.options).forEach(function (o) { if (o.value === "__download__") { o.remove(); } });
+      if (f.model && !hasOption(node, f.model)) { node.appendChild(el("option", {value: f.model, text: f.model})); }
+      node.value = f.model || "";
+      read = function () { return {model: node.value || null}; };
+    } else if (["gemma", "goal", "story_model"].indexOf(key) >= 0) {
+      node = cloneControl(BATCH_CONTROLS[key]);
+      node.value = f[key] === null || f[key] === undefined ? "" : String(f[key]);
+      read = function () { const out = {}; out[key] = nodeText(node); return out; };
+    } else if (["frames", "fps", "panel_timeout", "location_strength"].indexOf(key) >= 0) {
+      node = cloneControl(BATCH_CONTROLS[key]);
+      node.value = f[key] === null || f[key] === undefined ? "" : String(f[key]);
+      read = function () { const out = {}; out[key] = nodeNumber(node); return out; };
+    } else if (["no_low_ram", "auto_lora", "story_legacy", "judge"].indexOf(key) >= 0) {
+      node = cloneControl(BATCH_CONTROLS[key]);
+      node.checked = key === "auto_lora" ? f.auto_lora !== false : Boolean(f[key]);
+      read = function () { const out = {}; out[key] = node.checked; return out; };
+    } else if (key === "mode" || key === "narration") {
+      node = cloneControl(BATCH_CONTROLS[key]);
+      node.value = f[key] || (key === "mode" ? "chained" : "full");
+      read = function () { const out = {}; out[key] = node.value; return out; };
+    } else if (key === "characters" || key === "locations") {
+      node = cloneControl(BATCH_CONTROLS[key]);
+      selectValues(node, f[key]);
+      read = function () { const out = {}; out[key] = selectedValues(node); return out; };
+    } else if (key === "action_loras") {
+      const pick = cloneControl("#c-actions");
+      const strength = cloneControl("#c-action-strength");
+      const items = f.action_loras || [];
+      selectValues(pick, items.map(function (a) { return a.name; }));
+      strength.value = items.length && items[0].strength !== null && items[0].strength !== undefined ? String(items[0].strength) : "";
+      node = el("span", {}, [pick, " Strength ", strength]);
+      read = function () {
+        return {action_loras: selectedValues(pick).map(function (name) { return {name: name, strength: nodeNumber(strength)}; })};
+      };
+    } else if (key === "resolution") {
+      const preset = cloneControl("#c-res-preset");
+      const width = cloneControl("#c-width");
+      const height = cloneControl("#c-height");
+      const lock = function () {
+        const custom = preset.value === "custom";
+        width.readOnly = !custom;
+        height.readOnly = !custom;
+      };
+      width.value = String(f.width || 1024);
+      height.value = String(f.height || 576);
+      preset.value = hasOption(preset, width.value + "x" + height.value) ? width.value + "x" + height.value : "custom";
+      lock();
+      preset.addEventListener("change", function () {
+        if (preset.value !== "custom") {
+          const wh = preset.value.split("x");
+          width.value = wh[0];
+          height.value = wh[1];
+        }
+        lock();
+      });
+      node = el("span", {}, [preset, width, " x ", height]);
+      read = function () { return {width: nodeNumber(width), height: nodeNumber(height)}; };
+    } else if (key === "size") {
+      const kind = el("select", {cls: "b-size-kind"}, [el("option", {value: "panels", text: "Panels"}),
+                                                        el("option", {value: "length", text: "Seconds"})]);
+      const count = cloneControl("#c-panels");
+      const bounds = function () {
+        count.max = kind.value === "length" ? "3600" : "200";
+        count.step = kind.value === "length" ? "0.5" : "1";
+      };
+      const byLength = (f.panels === null || f.panels === undefined) && f.length !== null && f.length !== undefined;
+      kind.value = byLength ? "length" : "panels";
+      count.value = String(byLength ? f.length : (f.panels === null || f.panels === undefined ? 15 : f.panels));
+      bounds();
+      kind.addEventListener("change", bounds);
+      node = el("span", {}, [kind, count]);
+      read = function () { const out = {}; out[kind.value] = nodeNumber(count); return out; };
+    } else if (key === "seed_upload") {
+      const file = cloneControl("#c-seed-file");
+      let upload = f.seed_upload || null;
+      const status = el("span", {cls: "muted", text: upload ? "upload " + upload.slice(0, 12) : "no seed image"});
+      file.addEventListener("change", async function () {
+        const chosen = file.files[0];
+        if (!chosen) { return; }
+        status.textContent = "uploading...";
+        try {
+          upload = await uploadFile(chosen);
+          status.textContent = "uploaded " + upload.slice(0, 12);
+        } catch (err) {
+          status.textContent = String(err.message);
+        }
+        batchPreview();
+      });
+      node = el("span", {}, [file, status]);
+      read = function () { return {seed_upload: upload}; };
+    } else {
+      const target = key === "video_loras" ? "video" : "stills";
+      const box = el("div", {cls: "b-loras"});
+      const add = el("button", {type: "button", text: "Add"});
+      add.addEventListener("click", function () { loraRow(target, null, box); });
+      (f[key] || []).forEach(function (item) { loraRow(target, item, box); });
+      node = el("span", {}, [add, box]);
+      read = function () { const out = {}; out[key] = collectLoras(target, box); return out; };
+    }
+    return {node: node, read: read};
+  }
+
+  function syncMenu(card) {
+    const used = Array.prototype.map.call(card.querySelectorAll(".b-setting"), function (r) { return r.dataset.key; });
+    Array.prototype.forEach.call(card.querySelector(".b-add-setting").options, function (o) {
+      o.disabled = o.value !== "" && used.indexOf(o.value) >= 0;
+    });
+  }
+
+  function addSettingRow(card, key) {
+    const control = settingControl(key, batchStart());
+    const remove = el("button", {type: "button", text: "Remove"});
+    const row = el("div", {cls: "b-setting", data: {key: key}}, [el("span", {text: settingLabel(key)}), control.node, remove]);
+    row.readSetting = control.read;
+    remove.addEventListener("click", function () { row.remove(); syncMenu(card); });
+    card.querySelector(".b-settings").appendChild(row);
+    syncMenu(card);
+  }
+
+  function syncReplaces(card) {
+    card.querySelector(".b-add-replace").disabled = card.querySelectorAll(".b-replace").length >= 10;
+  }
+
+  function addReplaceRow(card) {
+    const box = card.querySelector(".b-replaces");
+    if (box.querySelectorAll(".b-replace").length >= 10) { return; }
+    const remove = el("button", {type: "button", text: "Remove"});
+    const row = el("div", {cls: "b-replace"}, [el("input", {type: "text", cls: "b-find", size: "30", placeholder: "Find"}),
+      el("input", {type: "text", cls: "b-with", size: "30", placeholder: "Replace with"}), remove]);
+    remove.addEventListener("click", function () { row.remove(); syncReplaces(card); });
+    box.appendChild(row);
+    syncReplaces(card);
+  }
+
+  function syncCards() {
+    const cards = batchCards();
+    cards.forEach(function (card) { show(card.querySelector(".b-remove-variant"), cards.length > 1); });
+    $("#b-add-variant").disabled = cards.length >= 6;
+    $("#b-variant-note").textContent = cards.length >= 6 ? "at most 6 variants" : "";
+  }
+
+  function addVariantCard() {
+    const used = batchCards().map(function (c) { return c.querySelector(".b-label").value; });
+    if (used.length >= 6) { return; }
+    let k = 1;
+    while (used.indexOf("v" + k) >= 0) { k += 1; }
+    const menu = settingsMenu();
+    const addReplace = el("button", {type: "button", cls: "b-add-replace", text: "Add find → replace"});
+    const remove = el("button", {type: "button", cls: "b-remove-variant", text: "Remove variant"});
+    const label = el("input", {type: "text", cls: "b-label", maxlength: "24", size: "12", value: "v" + k});
+    const card = el("div", {cls: "b-variant"}, [
+      el("div", {cls: "row"}, [el("label", {}, ["Label ", label]), menu, remove]),
+      el("div", {cls: "b-settings"}),
+      el("textarea", {cls: "b-append", rows: "2", placeholder: "Append to every prompt"}),
+      el("div", {cls: "b-replaces"}, [addReplace])]);
+    card.perStory = {};
+    menu.addEventListener("change", function () {
+      if (menu.value) { addSettingRow(card, menu.value); }
+      menu.value = "";
+    });
+    addReplace.addEventListener("click", function () { addReplaceRow(card); });
+    remove.addEventListener("click", function () { card.remove(); syncCards(); });
+    $("#b-variants").appendChild(card);
+    syncCards();
+  }
+
+  // The request body of the preview and the submit (spec 3.2); a find/replace row with an empty Find is not sent.
+  function batchBody() {
+    const variants = batchCards().map(function (card) {
+      const settings = {};
+      card.querySelectorAll(".b-setting").forEach(function (row) { Object.assign(settings, row.readSetting()); });
+      const replace = Array.prototype.filter.call(card.querySelectorAll(".b-replace"), function (row) {
+        return row.querySelector(".b-find").value !== "";
+      }).map(function (row) {
+        return {"find": row.querySelector(".b-find").value, "with": row.querySelector(".b-with").value};
+      });
+      return {label: card.querySelector(".b-label").value, settings: settings,
+              prompt: {append: card.querySelector(".b-append").value, replace: replace, per_story: Object.assign({}, card.perStory)}};
+    });
+    return {ws: S.ws, stories: S.bEditor.stories, variants: variants};
+  }
+
+  function previewCell(c) {
+    const td = el("td", {}, [el("div", {text: c.fork_id})]);
+    if (c.level) { td.appendChild(levelBadge(c.level)); }
+    c.diff.forEach(function (d) { td.appendChild(el("div", {cls: "muted", text: diffLine(d)})); });
+    const warnings = el("ul", {cls: "warnings"});
+    c.warnings.forEach(function (w) { warnings.appendChild(el("li", {text: w})); });
+    td.appendChild(warnings);
+    if (c.status !== "ok") { td.appendChild(el("div", {cls: "bad", text: c.status + ": " + c.reason})); }
+    const edit = button("Edit prompt", function () { openPromptDialog(c.story_id, c.variant - 1); });
+    edit.className = "b-edit-prompt";
+    td.appendChild(edit);
+    return td;
+  }
+
+  function renderBatchPreview(data) {
+    const labels = batchCards().map(function (c) { return c.querySelector(".b-label").value; });
+    clear($("#b-preview thead")).appendChild(el("tr", {}, [el("th", {text: "Story"})].concat(
+      labels.map(function (label) { return el("th", {text: label}); }))));
+    const body = clear($("#b-preview tbody"));
+    data.rows.forEach(function (row) {
+      const first = el("td", {text: row.story_id});
+      if (row.fields_source === "batch") {
+        first.appendChild(document.createTextNode(" "));
+        first.appendChild(batchNote(row.fields_batch));
+      }
+      body.appendChild(el("tr", {}, [first].concat(data.cells.filter(function (c) { return c.story_id === row.story_id; })
+        .map(previewCell))));
+    });
+    $("#b-totals").textContent = data.totals.text;
+    $("#b-submit").disabled = data.totals.jobs === 0;
+  }
+
+  const batchPreview = debounce(async function () {
+    const ed = S.bEditor;
+    if (!ed) { return; }
+    S.batchSeq = (S.batchSeq || 0) + 1;
+    const seq = S.batchSeq;
+    const res = await api("POST", "/api/batches/preview", batchBody());
+    if (seq !== S.batchSeq || ed !== S.bEditor) { return; }
+    if (res.status !== 200) {
+      $("#b-editor-status").textContent = errorText(res);
+      $("#b-totals").textContent = "";
+      $("#b-submit").disabled = true;
+      return;
+    }
+    ed.rows = res.data.rows;
+    $("#b-editor-status").textContent = "";
+    renderBatchPreview(res.data);
+  }, 300);
+
+  function openBatchEditor(stories) {
+    S.bEditor = {stories: stories.slice(), rows: []};
+    showTab("batches");
+    showBatchBox("editor");
+    $("#b-editor-stories").textContent = "Stories: " + stories.join(", ");
+    clear($("#b-variants"));
+    clear($("#b-preview thead"));
+    clear($("#b-preview tbody"));
+    $("#b-totals").textContent = "";
+    $("#b-editor-status").textContent = "";
+    $("#b-submit").disabled = true;
+    addVariantCard();
+    batchPreview();
+  }
+
+  async function submitBatch() {
+    if (!S.bEditor) { return; }
+    $("#b-submit").disabled = true;
+    $("#b-editor-status").textContent = "submitting...";
+    const res = await api("POST", "/api/batches", batchBody());
+    if (res.status === 201) {
+      S.bEditor = null;
+      openBatch(res.data.batch.id);
+      return;
+    }
+    $("#b-editor-status").textContent = errorText(res);
+    $("#b-submit").disabled = false;
+  }
+
+  function promptCount() { $("#b-prompt-count").textContent = $("#b-prompt-text").value.length + " / 20000 characters"; }
+
+  function closePromptDialog() {
+    S.batchPrompt = null;
+    show($("#b-prompt-dialog"), false);
+  }
+
+  function openPromptDialog(storyId, index) {
+    const card = batchCards()[index];
+    if (!card || !S.bEditor) { return; }
+    const row = S.bEditor.rows.find(function (r) { return r.story_id === storyId; });
+    const original = row && row.fields ? row.fields.narrative : "";
+    S.batchPrompt = {card: card, storyId: storyId};
+    $("#b-prompt-title").textContent = "Prompt for " + storyId + " in " + card.querySelector(".b-label").value;
+    $("#b-prompt-text").value = card.perStory[storyId] !== undefined ? card.perStory[storyId] : original;
+    promptCount();
+    show($("#b-prompt-dialog"), true);
+    $("#b-prompt-text").focus();
+  }
+
+  // --- the batch page (BF39)
+
+  async function useBatchWorkspace(ws) {
+    if (S.ws === ws) { return; }
+    const select = $("#ws-select");
+    if (!hasOption(select, ws)) { select.appendChild(el("option", {value: ws, text: ws})); }
+    select.value = ws;
+    await selectWorkspace(ws);
+  }
+
+  function setVideo(td, ws, path, original) {
+    const box = td.querySelector(".b-video");
+    if (!path) {
+      if (original && !box.firstChild) { box.appendChild(el("span", {cls: "muted", text: "no movie.mp4 yet"})); }
+      return;
+    }
+    if (box.querySelector("video")) { return; }
+    clear(box).appendChild(el("video", {src: batchFileUrl(ws, path), controls: "", preload: "metadata",
+                                        cls: original ? "b-original-video" : "b-fork-video"}));
+  }
+
+  function playRow(tr) {
+    const videos = Array.prototype.slice.call(tr.querySelectorAll("video"));
+    videos.forEach(function (v) {
+      v.pause();
+      v.currentTime = 0;
+      v.muted = !v.classList.contains("b-original-video");
+    });
+    videos.forEach(function (v) {
+      const playing = v.play();
+      if (playing && playing.catch) { playing.catch(function () {}); }
+    });
+  }
+
+  function chipText(cell, view) {
+    const p = view.job && view.job.progress;
+    if ((view.state === "starting" || view.state === "running") && p && p.phase) {
+      return "Phase " + p.phase + ": " + (p.phase_title || "") +
+        (p.panels_total ? ", panels " + p.panels_done + "/" + p.panels_total : "");
+    }
+    if (view.state === "queued" && view.job) { return "queued (#" + view.job.queue_position + ")"; }
+    if (cell.reason && ["refused", "cancelled", "interrupted"].indexOf(view.state) >= 0) { return view.state + ": " + cell.reason; }
+    return view.state;
+  }
+
+  function buildBatchGrid(rec) {
+    clear($("#b-grid thead")).appendChild(el("tr", {}, [el("th", {text: "Story"}), el("th", {text: "Original"})].concat(
+      rec.variants.map(function (v) { return el("th", {text: v.label}); }))));
+    const body = clear($("#b-grid tbody"));
+    S.batchGrid = {id: rec.id, originals: {}, cells: []};
+    rec.stories.forEach(function (storyId, s) {
+      const original = el("td", {}, [el("div", {cls: "b-video"})]);
+      const play = button("Play row", function () { playRow(tr); });
+      play.className = "b-play-row";
+      const tr = el("tr", {}, [el("td", {}, [el("div", {text: storyId}), play]), original]);
+      S.batchGrid.originals[storyId] = original;
+      rec.variants.forEach(function (_v, m) {
+        const td = el("td", {}, [el("div", {cls: "b-video"}), el("div", {cls: "b-info"})]);
+        S.batchGrid.cells[s * rec.variants.length + m] = td;
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    });
+  }
+
+  function fillBatchCell(td, rec, cell, view) {
+    setVideo(td, rec.workspace, view.movie, false);
+    const info = clear(td.querySelector(".b-info"));
+    info.appendChild(el("span", {cls: "chip", text: chipText(cell, view)}));
+    if (cell.level) {
+      info.appendChild(document.createTextNode(" "));
+      info.appendChild(levelBadge(cell.level));
+    }
+    cell.diff.forEach(function (d) { info.appendChild(el("div", {cls: "muted", text: diffLine(d)})); });
+    const actions = el("div", {cls: "row"});
+    if (view.dir) {
+      const open = button("Open story", async function () {
+        await useBatchWorkspace(rec.workspace);
+        openStory(cell.fork_id);
+      });
+      open.className = "b-open";
+      actions.appendChild(open);
+    }
+    if (view.job) {
+      const log = button("Log", function () { selectJob(cell.job_id); showTab("jobs"); });
+      log.className = "b-log";
+      actions.appendChild(log);
+    }
+    if (view.job && ["queued", "starting", "running"].indexOf(view.state) >= 0) {
+      const cancel = button("Cancel", async function () {
+        if (await askConfirm("Cancel the job of fork " + cell.fork_id + "?")) {
+          await api("POST", "/api/jobs/" + cell.job_id + "/cancel", {});
+          pollBatch();
+        }
+      });
+      cancel.className = "b-cancel-cell";
+      actions.appendChild(cancel);
+    }
+    info.appendChild(actions);
+  }
+
+  function renderBatchPage(data) {
+    const rec = data.batch;
+    $("#b-page-title").textContent = "Batch " + rec.id + " (" + rec.status + ")";
+    show($("#b-resume"), rec.status === "interrupted");
+    if (!S.batchGrid || S.batchGrid.id !== rec.id) { buildBatchGrid(rec); }
+    rec.stories.forEach(function (storyId) {
+      setVideo(S.batchGrid.originals[storyId], rec.workspace, data.view.originals[storyId], true);
+    });
+    rec.cells.forEach(function (cell, i) { fillBatchCell(S.batchGrid.cells[i], rec, cell, data.view.cells[i]); });
+  }
+
+  async function pollBatch() {
+    if (S.stopped || !S.batchId) { return; }
+    const id = S.batchId;
+    const res = await api("GET", "/api/batches/" + id);
+    if (id !== S.batchId || $("#b-page").hidden) { return; }
+    if (res.status !== 200) {
+      $("#b-page-status").textContent = errorText(res);
+      return;
+    }
+    renderBatchPage(res.data);
+  }
+
+  async function openBatch(batchId) {
+    S.batchId = batchId;
+    S.batchGrid = null;
+    showTab("batches");
+    showBatchBox("page");
+    clear($("#b-grid thead"));
+    clear($("#b-grid tbody"));
+    $("#b-page-title").textContent = "Batch " + batchId;
+    $("#b-page-status").textContent = "";
+    S.timers.batch = setInterval(pollBatch, BATCH_POLL_MS);
+    await pollBatch();
+  }
+
+  function setupBatches() {
+    const editor = $("#b-editor");
+    editor.addEventListener("input", function () { batchPreview(); });
+    editor.addEventListener("change", function () { batchPreview(); });
+    editor.addEventListener("click", function (event) {
+      if (event.target.tagName === "BUTTON" && event.target.id !== "b-submit" && event.target.id !== "b-discard") { batchPreview(); }
+    });
+    $("#b-add-variant").addEventListener("click", addVariantCard);
+    $("#b-submit").addEventListener("click", submitBatch);
+    $("#b-discard").addEventListener("click", function () { S.bEditor = null; loadBatches(); });
+    $("#b-back").addEventListener("click", function () { S.batchId = null; loadBatches(); });
+    $("#b-cancel").addEventListener("click", async function () {
+      const id = S.batchId;
+      if (!id || !(await askConfirm("Cancel batch " + id + "? Queued forks are removed; running jobs stop and keep their partial output."))) { return; }
+      const res = await api("POST", "/api/batches/" + id + "/cancel", {});
+      $("#b-page-status").textContent = res.status === 200 ? "cancelled" : errorText(res);
+      pollBatch();
+    });
+    $("#b-resume").addEventListener("click", async function () {
+      const res = await api("POST", "/api/batches/" + S.batchId + "/resume", {});
+      $("#b-page-status").textContent = res.status === 200 ? res.data.pending + " fork(s) to submit again" : errorText(res);
+      pollBatch();
+    });
+    $("#b-delete").addEventListener("click", async function () {
+      const id = S.batchId;
+      if (!id || !(await askConfirm("Delete the record of batch " + id + "? The forks stay as ordinary stories."))) { return; }
+      const res = await api("DELETE", "/api/batches/" + id);
+      if (res.status === 200) {
+        S.batchId = null;
+        loadBatches();
+      } else {
+        $("#b-page-status").textContent = errorText(res);
+      }
+    });
+    $("#b-prompt-text").addEventListener("input", promptCount);
+    $("#b-prompt-save").addEventListener("click", function () {
+      if (S.batchPrompt) { S.batchPrompt.card.perStory[S.batchPrompt.storyId] = $("#b-prompt-text").value; }
+      closePromptDialog();
+      batchPreview();
+    });
+    $("#b-prompt-original").addEventListener("click", function () {
+      if (S.batchPrompt) { delete S.batchPrompt.card.perStory[S.batchPrompt.storyId]; }
+      closePromptDialog();
+      batchPreview();
+    });
+    $("#b-prompt-close").addEventListener("click", closePromptDialog);
   }
 
   // --- characters (MU82) ---------------------------------------------------------------
@@ -1674,6 +2322,7 @@
     setupCompose();
     setupSmoke();
     setupStories();
+    setupBatches();
     setupCharacters();
     setupLocations();
     setupActions();

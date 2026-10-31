@@ -212,7 +212,8 @@ def test_mut1b_default_model_mirrors_the_pipeline_pin():
 
 NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui-job", "tests/movie_ui_testutil.py",
           "tests/test_movie_ui_builder.py", "tests/test_movie_ui_checks.py", "tests/test_movie_ui_jobs.py",
-          "tests/test_movie_ui_progress.py", "tests/test_movie_ui_http.py", "tests/test_movie_ui_traces.py")
+          "tests/test_movie_ui_progress.py", "tests/test_movie_ui_http.py", "tests/test_movie_ui_traces.py",
+          "movie_ui_batch.py", "tests/test_movie_ui_batch.py")
 CHANGED_PY = ("fleet_lib.py", "bin/qwen-agentd", "tests/test_fleet_lib.py", "tests/test_fleet_self_update.py")
 PIPELINE_FILES = ("bin/ltx-movie", "bin/ltx-mlx-render", "bin/ltx-story-images", "bin/ltx-story-manifest",
                   "bin/ltx-story-video", "bin/ltx-chain", "bin/ltx-generate", "bin/ltx-host-prep",
@@ -256,7 +257,7 @@ def test_mut25_source_scan_of_new_python_files():
         imported = set(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M))
         allowed = {"argparse", "calendar", "errno", "fcntl", "hashlib", "hmac", "http.client", "http.server",
                    "json", "os", "platform", "re", "secrets", "shlex", "shutil", "signal", "socket", "struct",
-                   "subprocess", "sys", "threading", "time", "fleet_lib", "movie_ui_lib"}
+                   "subprocess", "sys", "threading", "time", "fleet_lib", "movie_ui_lib", "movie_ui_batch"}
         assert imported <= allowed, (rel, imported - allowed)
         for loader in ("importlib", "SourceFileLoader", "runpy", "exec(", "__import__"):
             assert loader not in source, (rel, loader)

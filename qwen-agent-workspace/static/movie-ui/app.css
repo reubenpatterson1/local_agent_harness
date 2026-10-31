@@ -4,12 +4,19 @@
   --accent: #2f6fdb; --ok: #1f8a3b; --bad: #c4312b; --warn: #b26a00; --code: #f1f1f4;
   --on-bad: #ffffff; --on-accent: #ffffff; --warn-bg: rgba(178, 106, 0, 0.12);
 }
+/* batch forks spec BF40: the fork level badges (two classes, so .badge's border does not win) */
+.badge.level-render { border-color: #1f8a3b; }
+.badge.level-stills { border-color: #b26a00; }
+.badge.level-replan { border-color: #8a3fd1; }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161618; --fg: #e8e8ea; --muted: #9a9aa1; --line: #3a3a40; --panel: #1f1f22;
     --accent: #6ea0ff; --ok: #4cc26b; --bad: #ff6b61; --warn: #f0a63a; --code: #26262a;
     --on-bad: #10131a; --on-accent: #10131a; --warn-bg: rgba(240, 166, 58, 0.18);
   }
+  .badge.level-render { border-color: #4cc26b; }
+  .badge.level-stills { border-color: #f0a63a; }
+  .badge.level-replan { border-color: #b98cff; }
 }
 * { box-sizing: border-box; }
 body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
@@ -85,3 +92,7 @@ table.list th, table.list td { border-bottom: 1px solid var(--line); padding: 4p
 
 .preset-locked { opacity: .55; }
 #c-res-preset { margin: 0 .25rem; }
+
+/* batch forks spec BF40: the batch page */
+.chip { display: inline-block; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 12px; }
+#b-grid video { max-width: 320px; }

@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+import batch_testutil as bt
 import movie_ui_testutil as mt
 import movie_ui_lib as lib
 import movie_ui_server as srv
@@ -40,7 +41,7 @@ def test_mu13_query_parsing():
 
 def test_mut18_every_api_route_needs_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 46
+    assert len(srv.ROUTES) == 54
     for method, regex, name, sample in srv.ROUTES:
         assert re.fullmatch(regex, sample), sample
         body = {} if method in ("POST", "PUT") else None
@@ -1147,3 +1148,645 @@ def test_regenerate_seed_field_is_wired_in_the_static_ui():
     assert 'id="ch-regen-seed"' in html and 'max="2147483647"' in html
     assert html.index('id="ch-regen-seed"') < html.index('id="ch-regenerate"')
     assert "seed:" in js and "#ch-regen-seed" in js and "% 2147483648" in js
+
+
+# --- batch forks (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Section 7) ----------
+
+def test_bt15_batch_story_eligibility(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    os.makedirs(lib.story_dir(ws, "cli-story"))
+    with open(os.path.join(lib.story_dir(ws, "cli-story"), "story.md"), "w", encoding="utf-8") as f:
+        f.write(bt.STORY_MD)
+    _sdir, queued = bt.original(state, ws, "queued-story", job_state="queued")
+    _sdir, running = bt.original(state, ws, "running-story", job_state="running")
+    bt.original(state, ws, "ui-story")
+    status, _h, payload = mt.api(s, "GET", "/api/batches/stories?ws=" + ws)
+    assert status == 200
+    rows = dict((r["id"], r) for r in payload["stories"])
+    assert sorted(rows) == ["cli-story", "queued-story", "running-story", "ui-story"]
+    assert rows["cli-story"] == {"id": "cli-story", "eligible": False,
+                                 "reason": "Started from the command line: no saved Compose settings to fork",
+                                 "busy_job": None, "fields_source": None, "fields_batch": None}
+    for story_id, job_id in (("queued-story", queued), ("running-story", running)):
+        assert rows[story_id] == {"id": story_id, "eligible": False,
+                                  "reason": "Job %s is queued or running for this story" % job_id,
+                                  "busy_job": job_id, "fields_source": "job", "fields_batch": None}
+    assert rows["ui-story"] == {"id": "ui-story", "eligible": True, "reason": None, "busy_job": None,
+                                "fields_source": "job", "fields_batch": None}
+    assert mt.api(s, "GET", "/api/batches/stories")[:3:2] == (400, {"error": "missing ws"})
+
+
+def test_batch_review_focus_2_saved_settings_that_no_longer_pass_v1(env):
+    """Review Focus 2: the original's saved seed image is gone from STATE/uploads."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gone = "0" * 64 + ".png"
+    bt.original(state, ws, "seeded", seed_upload=gone)
+    status, _h, payload = mt.api(s, "POST", "/api/batches/preview",
+                                 body=bt.body(ws, ["seeded"], [bt.variant("v1", bt.RENDER)]))
+    assert status == 200
+    assert payload["cells"] == [{"story_id": "seeded", "variant": 1, "fork_id": "seeded-b1-v1",
+                                 "status": "invalid", "reason": "seed image upload %s not found" % gone,
+                                 "level": None, "diff": [], "warnings": []}]
+    assert payload["totals"] == {"jobs": 0, "replan": 0, "stills": 0, "render": 0, "refused": 1,
+                                 "text": "0 jobs: 0 re-plan, 0 new stills, 0 render-only; 1 refused"}
+    assert payload["number"] == 1 and payload["rows"][0]["fields"]["seed_upload"] == gone
+    assert (payload["rows"][0]["fields_source"], payload["rows"][0]["movie"]) == ("job", None)
+    assert os.listdir(os.path.join(state, "batches")) == []
+    assert not os.path.lexists(lib.story_dir(ws, "seeded-b1-v1"))
+    status, _h, payload = mt.api(s, "POST", "/api/batches/preview", body={"ws": ws, "stories": [], "variants": []})
+    assert (status, payload) == (400, {"error": "invalid batch", "errors": [
+        "stories must be a list of 1 to 24 distinct story IDs", "variants must be a list of 1 to 6 variants"]})
+    assert mt.api(s, "POST", "/api/batches/preview", body={"stories": ["seeded"]})[:3:2] == (
+        400, {"error": "missing ws"})
+
+
+RICH_FILES = {"story.md": bt.STORY_MD.encode("utf-8"), "plan.json": b'{"schema": "ltx-movie.plan.v1"}',
+              "story_checks.json": b'{"hard": [], "advisory": []}', "manifest.json": b'{"panels": []}',
+              "images/panel_01.png": mt.PNG, "images/images.json": b"{}",
+              "clips/panel_01.mp4": b"\x00\x00\x00\x18ftypmp42",
+              "clips/panel_01.mp4.provenance.json": b'{"output_sha256": "x"}', "movie.mp4": b"movie"}
+
+
+def test_bt16_preview_equals_submit(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    bt.original(state, ws, "harbour-chase")
+    variants = [bt.variant("v1", bt.RENDER), bt.variant("v2", {"goal": "Keep it tense."}, replace=[("dusk", "dawn")]),
+                bt.variant("v3", {})]
+    req = bt.body(ws, ["ronin-rescue", "harbour-chase"], variants)
+    preview = mt.api(s, "POST", "/api/batches/preview", body=req)[2]
+    batch_id = bt.submit(s, ws, req["stories"], variants)
+    bt.wait_status(s, batch_id)
+    rec = bt.record(state, batch_id)
+    keys = ("fork_id", "level", "diff", "warnings")
+    assert [[c[k] for k in keys] for c in rec["cells"]] == [[c[k] for k in keys] for c in preview["cells"]]
+    assert [c["status"] for c in rec["cells"]] == ["queued", "queued", "refused"] * 2
+    assert preview["cells"][1]["warnings"] == ['find text not in this prompt: "dusk"']
+    assert preview["totals"]["text"] == "4 jobs: 2 re-plan, 0 new stills, 2 render-only; 2 refused"
+    assert rec["number"] == preview["number"] == 1 and rec["workspace"] == ws and rec["cancel_requested"] is False
+    assert rec["schema"] == "movie-ui.batch.v1" and rec["stories"] == req["stories"]
+
+
+def test_bt17_queue_order_after_the_existing_queue(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "s1")
+    bt.original(state, ws, "s2")
+    other = mt.make_job(state, ["true"], ws, story_id="unrelated")
+    variants = [bt.variant("v1", bt.RENDER), bt.variant("v2", {"goal": "Keep it tense."}),
+                bt.variant("v3", {"width": 768, "height": 512})]
+    batch_id = bt.submit(s, ws, ["s1", "s2"], variants)
+    bt.wait_status(s, batch_id)
+    rec = bt.record(state, batch_id)
+    assert [c["level"] for c in rec["cells"]] == ["render", "replan", "stills"] * 2
+    assert rec["order"] == [1, 4, 2, 5, 0, 3]
+    assert lib.read_queue(state) == [other] + [rec["cells"][i]["job_id"] for i in (1, 4, 2, 5, 0, 3)]
+
+
+def test_bt18_a_cell_that_fails_v6_leaves_no_folder(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch, fail={"ronin-rescue-b1-v1": "Error: the dry run failed"})
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"gemma": bt.OTHER_GEMMA})])
+    bt.wait_status(s, batch_id)
+    cells = bt.record(state, batch_id)["cells"]
+    assert (cells[0]["status"], cells[0]["reason"]) == ("refused", "V6 dry run: Error: the dry run failed")
+    assert not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b1-v1"))
+    assert cells[1]["status"] == "queued" and os.path.isdir(lib.story_dir(ws, "ronin-rescue-b1-v2"))
+    assert lib.read_queue(state) == [cells[1]["job_id"]]
+
+
+def test_bt19_a_job_queued_between_preview_and_submit(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    bt.original(state, ws, "harbour-chase")
+    req = bt.body(ws, ["ronin-rescue", "harbour-chase"], [bt.variant("v1", bt.RENDER)])
+    assert [c["status"] for c in mt.api(s, "POST", "/api/batches/preview", body=req)[2]["cells"]] == ["ok", "ok"]
+    late = mt.make_job(state, ["true"], ws, story_id="ronin-rescue",
+                       fields=mt.fields(ws, action="movie", story_id="ronin-rescue"))
+    batch_id = bt.submit(s, ws, req["stories"], req["variants"])
+    bt.wait_status(s, batch_id)
+    cells = bt.record(state, batch_id)["cells"]
+    assert (cells[0]["status"], cells[0]["reason"]) == (
+        "refused", "story ronin-rescue has a job queued or running (job %s)" % late)
+    assert cells[1]["status"] == "queued" and not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b1-v1"))
+
+
+def test_bt22_every_cell_identical_is_409_and_writes_nothing(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.original(state, ws, "ronin-rescue")
+    status, _h, payload = mt.api(s, "POST", "/api/batches", body=bt.body(
+        ws, ["ronin-rescue"], [bt.variant("v1", {}), bt.variant("v2", {}, append="   ")]))
+    assert status == 409 and payload["error"] == "every cell was refused"
+    assert [c["reason"] for c in payload["cells"]] == [
+        "same settings and prompt as the original; nothing to compare"] * 2
+    assert os.listdir(os.path.join(state, "batches")) == []
+
+
+def test_bt23_not_enough_free_space(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+
+    class Usage(object):
+        total, used, free = 100 * 1024 ** 3, 80 * 1024 ** 3, 20 * 1024 ** 3
+    monkeypatch.setattr(srv.shutil, "disk_usage", lambda path: Usage())
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    bt.wait_status(s, batch_id)
+    cell = bt.record(state, batch_id)["cells"][0]
+    assert (cell["status"], cell["reason"]) == ("refused", "not enough free space: 20.0 GiB free, this fork "
+                                                           "copies 0.0 GiB and at least 20 GiB must stay free")
+    assert cell["copy_bytes"] == len(bt.STORY_MD) and not os.path.lexists(lib.story_dir(ws, cell["fork_id"]))
+
+
+def test_bt24_a_render_fork_runs_on_the_copied_story(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    mt.stub_config(ws, {"ltx-movie run": {"stdout": "=== Phase 1: story ===\n"}})
+    sdir, _job = bt.original(state, ws, "ronin-rescue", files=RICH_FILES)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    fork = lib.story_dir(ws, cell["fork_id"])
+    bt.run_job(state, cell["job_id"])
+    copied = bt.tree_digests(fork)
+    fork_json = lib.read_json(os.path.join(fork, "fork.json"))
+    assert copied.pop("fork.json")
+    original = bt.tree_digests(sdir)
+    assert copied == dict((rel, original[rel]) for rel in original if rel != "movie.mp4")
+    assert fork_json == {"schema": "movie-ui.fork.v1", "fork_id": cell["fork_id"], "source_story": "ronin-rescue",
+                         "batch": batch_id, "variant": 1, "label": "v1", "level": "render",
+                         "diff": [{"key": "model", "from": lib.DEFAULT_MODEL, "to": bt.OTHER_MODEL}],
+                         "created": fork_json["created"]}
+    runs = [c["argv"] for c in mt.stub_calls(ws) if c["tool"] == "ltx-movie" and c["sub"] == "run"]
+    expected = lib.build_argv(mt.fields(ws, action="movie", story_id="ronin-rescue"), ws, state)[2:]
+    expected[expected.index("--story-id") + 1] = cell["fork_id"]
+    expected[expected.index("--model") + 1] = bt.OTHER_MODEL
+    assert runs == [expected]
+
+
+def test_bt25_the_original_is_byte_identical_after_its_forks_ran(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    sdir, _job = bt.original(state, ws, "ronin-rescue", files=RICH_FILES)
+    before = bt.tree_digests(sdir)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"width": 768, "height": 512})])
+    for cell in bt.wait_status(s, batch_id)["batch"]["cells"]:
+        bt.run_job(state, cell["job_id"])
+        assert os.path.isfile(os.path.join(lib.story_dir(ws, cell["fork_id"]), "movie.mp4"))
+    assert bt.tree_digests(sdir) == before
+
+
+def test_bt26_checks_run_with_no_lock_held(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    seen = []
+
+    def grab(lock, out):
+        got = lock.acquire(timeout=1)
+        out.append(got)
+        if got:
+            lock.release()
+
+    def wrapped(fields, ws_real, state_dir, py=None):
+        observed = {}
+        for key, lock in (("store_acquired", srv.STORE_LOCK), ("batch_acquired", srv.BATCH_LOCK)):
+            got = []
+            other = threading.Thread(target=grab, args=(lock, got))
+            other.start()
+            other.join(5)
+            observed[key] = got == [True]
+        seen.append(observed)
+        return [lib.check("V1", "fields", "pass")]
+    monkeypatch.setattr(lib, "run_checks", wrapped)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    bt.wait_status(s, batch_id)
+    assert seen == [{"store_acquired": True, "batch_acquired": True}]
+    assert bt.record(state, batch_id)["cells"][0]["status"] == "queued"
+
+
+def _fallback_fork(env, monkeypatch, delete_job=True):
+    """BT32's state: a 1 x 1 Render batch whose fork job ran to done and (delete_job) was deleted.
+    Returns (batch ID, fork ID, the fork's job ID)."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    bt.run_job(state, cell["job_id"])
+    if delete_job:
+        assert mt.api(s, "DELETE", "/api/jobs/" + cell["job_id"])[:3:2] == (200, {"deleted": cell["job_id"]})
+    return batch_id, cell["fork_id"], cell["job_id"]
+
+
+def _stories(env):
+    return dict((r["id"], r) for r in mt.api(env["srv"], "GET", "/api/batches/stories?ws=" + env["ws"])[2]["stories"])
+
+
+def test_bt32_a_fork_whose_job_was_deleted_uses_its_batch_cell(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    batch_id, fork, _job = _fallback_fork(env, monkeypatch)
+    assert _stories(env)[fork] == {"id": fork, "eligible": True, "reason": None, "busy_job": None,
+                                   "fields_source": "batch", "fields_batch": {"id": batch_id, "number": 1}}
+    gemma = [bt.variant("v1", {"gemma": bt.OTHER_GEMMA})]
+    preview = mt.api(s, "POST", "/api/batches/preview", body=bt.body(ws, [fork], gemma))[2]
+    row = preview["rows"][0]
+    assert (row["fields_source"], row["fields_batch"]) == ("batch", {"id": batch_id, "number": 1})
+    assert row["fields"]["model"] == bt.OTHER_MODEL and row["movie"] == os.path.join(lib.story_dir(ws, fork), "movie.mp4")
+    view = mt.api(s, "GET", "/api/batches/" + batch_id)[2]["view"]
+    assert view["cells"] == [{"state": "job deleted", "job": None, "dir": True,
+                              "movie": os.path.join(lib.story_dir(ws, fork), "movie.mp4")}]
+    second = bt.submit(s, ws, [fork], gemma)
+    cell = bt.wait_status(s, second)["batch"]["cells"][0]
+    assert (cell["status"], cell["fork_id"]) == ("queued", fork + "-b2-v1")
+    fields = lib.read_job(lib.job_dir(state, cell["job_id"]))["fields"]
+    assert (fields["model"], fields["gemma"], fields["story_id"]) == (bt.OTHER_MODEL, bt.OTHER_GEMMA, fork + "-b2-v1")
+
+
+def test_bt33_last_fields_win_over_the_batch_cell(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    batch_id, fork, _job = _fallback_fork(env, monkeypatch, delete_job=False)
+    rec = bt.record(state, batch_id)
+    rec["cells"][0]["fields"]["model"] = "/models/rewritten"
+    lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"), rec)
+    assert _stories(env)[fork] == {"id": fork, "eligible": True, "reason": None, "busy_job": None,
+                                   "fields_source": "job", "fields_batch": None}
+    preview = mt.api(s, "POST", "/api/batches/preview",
+                     body=bt.body(ws, [fork], [bt.variant("v1", {"gemma": bt.OTHER_GEMMA})]))[2]
+    assert preview["rows"][0]["fields"]["model"] == bt.OTHER_MODEL
+    assert (preview["rows"][0]["fields_source"], preview["rows"][0]["fields_batch"]) == ("job", None)
+
+
+MISMATCH_REASON = ("Its job was deleted and batch %s has no matching record of this fork: no saved Compose "
+                   "settings to fork")
+
+
+@pytest.mark.parametrize("case", ["no-fork-json", "cell-cancelled", "other-workspace", "variant-2"])
+def test_bt34_a_missing_or_mismatched_record_leaves_the_fork_ineligible(env, monkeypatch, case):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    batch_id, fork, _job = _fallback_fork(env, monkeypatch)
+    fork_json = os.path.join(lib.story_dir(ws, fork), "fork.json")
+    if case == "no-fork-json":
+        os.unlink(fork_json)
+        reason = "Started from the command line: no saved Compose settings to fork"
+        refusal = "story %s has no saved Compose settings (it was started from the command line)" % fork
+    else:
+        path = fork_json if case == "variant-2" else os.path.join(state, "batches", batch_id, "batch.json")
+        data = lib.read_json(path)
+        if case == "cell-cancelled":
+            data["cells"][0]["status"] = "cancelled"
+        elif case == "other-workspace":
+            data["workspace"] = "/elsewhere/qwen-agent-workspace"
+        else:
+            data["variant"] = 2
+        lib.write_json_atomic(path, data)
+        reason = MISMATCH_REASON % batch_id
+        refusal = ("story %s has no saved Compose settings (its job was deleted and batch %s has no matching "
+                   "record of it)" % (fork, batch_id))
+    assert _stories(env)[fork] == {"id": fork, "eligible": False, "reason": reason, "busy_job": None,
+                                   "fields_source": None, "fields_batch": None}
+    preview = mt.api(s, "POST", "/api/batches/preview",
+                     body=bt.body(ws, [fork], [bt.variant("v1", {"gemma": bt.OTHER_GEMMA})]))[2]
+    assert preview["rows"][0]["fields"] is None and preview["rows"][0]["fields_source"] is None
+    assert (preview["cells"][0]["status"], preview["cells"][0]["reason"]) == ("refused", refusal)
+
+
+def test_batch_review_focus_1_non_ascii_labels_and_prompt_edits(env, monkeypatch):
+    """Review Focus 1: a label, find/replace text and an appended paragraph with accents and symbols."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    narrative = "A ronin rescues a child at dusk — before the café burns."
+    bt.original(state, ws, "ronin-rescue", narrative=narrative)
+    label = "café ☕"
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant(label, {}, append="Snow falls on the café.",
+                                                              replace=[("dusk", "l’aube")])])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    edited = "A ronin rescues a child at l’aube — before the café burns.\n\nSnow falls on the café."
+    job = lib.read_job(lib.job_dir(state, cell["job_id"]))
+    assert job["fields"]["narrative"] == edited and job["argv"][2] == edited
+    assert cell["diff"] == [{"key": "narrative", "from": narrative, "to": edited}] and cell["level"] == "replan"
+    assert bt.record(state, batch_id)["variants"][0]["label"] == label
+    assert lib.read_json(os.path.join(lib.story_dir(ws, cell["fork_id"]), "fork.json"))["label"] == label
+
+
+def test_batch_review_focus_3_two_batches_submitted_at_once(env, monkeypatch):
+    """Review Focus 3: a double click, or two tabs, submit a batch of the same story at once."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    results = []
+
+    def post():
+        results.append(mt.api(s, "POST", "/api/batches",
+                              body=bt.body(ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])))
+    threads = [threading.Thread(target=post) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(60)
+    assert sorted(r[0] for r in results) == [201, 201]
+    assert sorted(r[2]["batch"]["number"] for r in results) == [1, 2]
+    forks = []
+    for batch_id in set(r[2]["batch"]["id"] for r in results):
+        cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+        assert cell["status"] == "queued"
+        forks.append(cell["fork_id"])
+    assert sorted(forks) == ["ronin-rescue-b1-v1", "ronin-rescue-b2-v1"] and len(lib.read_queue(state)) == 2
+
+
+def test_batch_review_focus_4_batches_are_per_workspace(env, monkeypatch, tmp_path):
+    """Review Focus 4: the Workspace selector names another workspace (another release)."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    other = mt.make_stub_workspace(tmp_path / "second")
+    bt.original(state, ws, "ronin-rescue")
+    bt.original(state, other, "ronin-rescue")
+    first = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    created = bt.wait_status(s, first)["batch"]["created"]
+    assert mt.api(s, "GET", "/api/batches?ws=" + other)[:3:2] == (200, {"batches": []})
+    second = bt.submit(s, other, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    payload = bt.wait_status(s, second)
+    assert payload["batch"]["number"] == 1 and payload["batch"]["cells"][0]["fork_id"] == "ronin-rescue-b1-v1"
+    assert mt.api(s, "GET", "/api/batches?ws=" + ws)[2] == {"batches": [
+        {"id": first, "number": 1, "created": created, "status": "submitted", "cells": 1, "done": 0}]}
+    assert mt.api(s, "GET", "/api/batches")[:3:2] == (400, {"error": "missing ws"})
+
+
+BATCH_ROUTES = [("GET", "/api/batches"), ("POST", "/api/batches"), ("POST", "/api/batches/preview"),
+                ("GET", "/api/batches/stories"), ("GET", "/api/batches/" + srv._SAMPLE_ID),
+                ("DELETE", "/api/batches/" + srv._SAMPLE_ID), ("POST", "/api/batches/%s/cancel" % srv._SAMPLE_ID),
+                ("POST", "/api/batches/%s/resume" % srv._SAMPLE_ID)]
+
+
+def test_bt14_every_batch_route_needs_the_token(env):
+    s = env["srv"]
+    assert [(m, sample) for m, _r, _n, sample in srv.ROUTES if sample.startswith("/api/batches")] == BATCH_ROUTES
+    for method, regex, name, sample in srv.ROUTES:
+        if (method, sample) not in BATCH_ROUTES:
+            continue
+        assert re.fullmatch(regex, sample) and hasattr(srv.MovieUIHandler, name), name
+        for token in (None, "wrong-token"):
+            status, _h, payload = mt.api(s, method, sample, body={} if method == "POST" else None, token=token)
+            assert (status, payload) == (401, {"error": "missing or invalid token"}), (method, sample, token)
+    for method, sample in BATCH_ROUTES[4:]:
+        assert mt.api(s, method, sample, body={} if method == "POST" else None)[:3:2] == (
+            404, {"error": "unknown batch %s" % srv._SAMPLE_ID}), (method, sample)
+    assert mt.api(s, "PUT", "/api/batches", body={})[:3:2] == (405, {"error": "method not allowed"})
+
+
+def test_bt20_cancel_batch(env, monkeypatch):
+    import fcntl
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gate = threading.Event()
+    calls = bt.passing_checks(monkeypatch, gate={"ronin-rescue-b1-v3": gate})
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v%d" % m, {"model": "/models/m%d" % m})
+                                                   for m in range(1, 5)])
+    mt.wait_until(lambda: "ronin-rescue-b1-v3" in calls, 30)
+    cells = bt.record(state, batch_id)["cells"]
+    assert [c["status"] for c in cells] == ["queued", "queued", "forking", "pending"]
+    forks = [lib.story_dir(ws, c["fork_id"]) for c in cells]
+    running, queued = cells[0]["job_id"], cells[1]["job_id"]
+    jdir = lib.job_dir(state, running)
+    lib.write_queue(state, [queued])
+    lib.write_status(jdir, {"state": "running", "dispatched": lib.utc_now(), "runner_pid": os.getpid(),
+                            "pgid": None, "started": lib.utc_now()})
+    holder = os.open(os.path.join(jdir, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        status, _h, payload = mt.api(s, "POST", "/api/batches/%s/cancel" % batch_id, body={})
+        assert (status, payload) == (200, {"status": "cancelled", "cancelled": [queued], "cancelling": [running]})
+        gate.set()
+        mt.wait_until(lambda: s.server.batch_thread is None, 30)
+    finally:
+        os.close(holder)
+    rec = bt.record(state, batch_id)
+    assert [(c["status"], c["reason"]) for c in rec["cells"]] == [
+        ("queued", None), ("cancelled", "cancelled before it started"), ("cancelled", "batch cancelled"),
+        ("cancelled", "batch cancelled")]
+    assert (rec["status"], rec["cancel_requested"]) == ("cancelled", True)
+    assert os.path.isdir(forks[0]) and not any(os.path.lexists(f) for f in forks[1:])
+    assert os.path.exists(os.path.join(jdir, "cancel")) and calls == [c["fork_id"] for c in cells[:3]]
+    lib.write_status(jdir, {"state": "cancelled", "dispatched": lib.utc_now(), "runner_pid": os.getpid(),
+                            "pgid": None, "started": lib.utc_now(), "exit_code": -15, "ended": lib.utc_now()})
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % batch_id, body={})[:3:2] == (
+        409, {"error": "batch %s has nothing to cancel" % batch_id})
+    assert mt.api(s, "GET", "/api/batches/" + batch_id)[2]["view"]["cells"][0]["state"] == "cancelled"
+    assert os.path.isdir(forks[0])
+
+
+def test_bt21_delete_batch(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gate = threading.Event()
+    calls = bt.passing_checks(monkeypatch, gate={"ronin-rescue-b1-v1": gate})
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"gemma": bt.OTHER_GEMMA})])
+    mt.wait_until(lambda: "ronin-rescue-b1-v1" in calls, 30)
+    try:
+        assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (
+            409, {"error": "batch %s is still submitting; cancel it first" % batch_id})
+    finally:
+        gate.set()
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (200, {"deleted": batch_id})
+    assert not os.path.exists(os.path.join(state, "batches", batch_id))
+    assert mt.api(s, "GET", "/api/batches/" + batch_id)[:3:2] == (404, {"error": "unknown batch %s" % batch_id})
+    for cell in cells:
+        assert os.path.isfile(os.path.join(lib.story_dir(ws, cell["fork_id"]), "fork.json"))
+        assert os.path.isfile(os.path.join(lib.job_dir(state, cell["job_id"]), "job.json"))
+
+
+def test_bt27_cancelling_a_fork_job_removes_its_folder(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER),
+                                                   bt.variant("v2", {"gemma": bt.OTHER_GEMMA})])
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    forks = [lib.story_dir(ws, c["fork_id"]) for c in cells]
+    queued, starting = cells[0]["job_id"], cells[1]["job_id"]
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % queued, body={})[:3:2] == (200, {"state": "cancelled"})
+    cell = bt.record(state, batch_id)["cells"][0]
+    assert (cell["status"], cell["reason"]) == ("cancelled", "cancelled before it started")
+    assert not os.path.lexists(forks[0])
+    jdir = lib.job_dir(state, starting)
+    lib.write_queue(state, [])
+    lib.write_status(jdir, {"state": "starting", "dispatched": lib.utc_now()})
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % starting, body={})[:3:2] == (202, {"state": "cancelling"})
+    proc = subprocess.run([sys.executable, os.path.join(mt.WS, "bin", "movie-ui-job"), jdir],
+                          capture_output=True, text=True, timeout=30)
+    assert (proc.returncode, proc.stdout) == (0, "[movie-ui] cancelled before start\n")
+    assert os.path.isdir(forks[1])
+    payload = mt.api(s, "GET", "/api/batches/" + batch_id)[2]
+    assert (payload["batch"]["cells"][1]["status"], payload["batch"]["cells"][1]["reason"]) == (
+        "cancelled", "cancelled before it started")
+    assert payload["view"]["cells"][1] == {"state": "cancelled", "job": None, "movie": None, "dir": False}
+    assert not os.path.lexists(forks[1])
+
+
+def test_bt29_resume_submits_the_interrupted_cells(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    clean = {"ws": ws, "stories": ["ronin-rescue"],
+             "variants": [bt.variant("v1", bt.RENDER), bt.variant("v2", {"gemma": bt.OTHER_GEMMA})]}
+    batch_id = srv.new_batch_id(state)
+    rec = srv.make_batch_record(clean, batch_id, 1, srv.plan_batch(s.server, clean, 1)[0])
+    rec["status"] = "submitting"
+    rec["cells"][0]["status"] = "forking"
+    fork = lib.story_dir(ws, rec["cells"][0]["fork_id"])
+    os.makedirs(fork)
+    lib.write_json_atomic(os.path.join(fork, "fork.json"), {"schema": "movie-ui.fork.v1",
+                                                            "fork_id": rec["cells"][0]["fork_id"],
+                                                            "batch": batch_id})
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    srv.write_batch(state, rec)
+    srv.batch_recovery(state)
+    assert bt.record(state, batch_id)["status"] == "interrupted" and not os.path.lexists(fork)
+    assert mt.api(s, "POST", "/api/batches/%s/resume" % batch_id, body={})[:3:2] == (
+        200, {"status": "waiting", "pending": 2})
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    assert [c["status"] for c in cells] == ["queued", "queued"]
+    assert lib.read_json(os.path.join(fork, "fork.json"))["label"] == "v1"
+    assert mt.api(s, "POST", "/api/batches/%s/resume" % batch_id, body={})[:3:2] == (
+        409, {"error": "batch %s was not interrupted" % batch_id})
+
+
+def test_bt35_a_deleted_batch_leaves_its_job_less_forks_ineligible(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    batch_id, fork, _job = _fallback_fork(env, monkeypatch)
+    assert mt.api(s, "DELETE", "/api/batches/" + batch_id)[:3:2] == (200, {"deleted": batch_id})
+    assert _stories(env)[fork] == {
+        "id": fork, "eligible": False, "busy_job": None, "fields_source": None, "fields_batch": None,
+        "reason": "Its job and its batch %s were deleted: no saved Compose settings to fork" % batch_id}
+    req = bt.body(ws, [fork], [bt.variant("v1", {"gemma": bt.OTHER_GEMMA})])
+    cell = mt.api(s, "POST", "/api/batches/preview", body=req)[2]["cells"][0]
+    assert (cell["status"], cell["reason"]) == ("refused", "story %s has no saved Compose settings (its job and "
+                                                           "its batch %s were deleted)" % (fork, batch_id))
+    status, _h, payload = mt.api(s, "POST", "/api/batches", body=req)
+    assert status == 409 and payload["error"] == "every cell was refused"
+
+
+def test_batch_fix_reconcile_keeps_a_fork_a_later_job_uses(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    fork = lib.story_dir(ws, cell["fork_id"])
+    lib.write_queue(state, [i for i in lib.read_queue(state) if i != cell["job_id"]])
+    lib.write_status(lib.job_dir(state, cell["job_id"]), {"state": "cancelled", "exit_code": None,
+                                                          "ended": lib.utc_now()})
+    later = mt.make_job(state, ["true"], ws, story_id=cell["fork_id"],
+                        status={"state": "running", "started": lib.utc_now()})
+    mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert os.path.isdir(fork)
+    assert bt.record(state, batch_id)["cells"][0]["status"] == "cancelled"
+    assert srv.fork_in_use(state, ws, cell["fork_id"], cell["job_id"]) == later
+
+
+def test_batch_fix_remove_fork_refuses_a_foreign_fork_json(tmp_path, capsys):
+    fdir = tmp_path / "ronin-rescue-b1-v1"
+    fdir.mkdir()
+    for rec in ({"batch": "20261030-120000-0b0b", "fork_id": "ronin-rescue-b1-v1"},
+                {"batch": "20261030-120000-0a0a", "fork_id": "other-b1-v1"}, None):
+        if rec is None:
+            (fdir / "fork.json").unlink()
+        else:
+            (fdir / "fork.json").write_text(json.dumps(rec), encoding="utf-8")
+        assert srv.remove_fork(str(fdir), "20261030-120000-0a0a") is False
+        assert fdir.is_dir()
+    assert "not removing" in capsys.readouterr().err
+
+
+def test_batch_fix_copy_failure_midway_leaves_no_fork(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    sdir, _ = bt.original(state, ws, "ronin-rescue", files=RICH_FILES)
+    real, calls = srv.shutil.copy2, []
+
+    def flaky(src, dst, *args, **kwargs):
+        calls.append(src)
+        if len(calls) == 3:
+            raise OSError(28, "No space left on device", dst)
+        return real(src, dst, *args, **kwargs)
+    monkeypatch.setattr(srv.shutil, "copy2", flaky)
+    before = bt.tree_digests(sdir)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert cell["status"] == "refused" and cell["reason"].startswith("copy failed: No space left on device: ")
+    assert not os.path.lexists(lib.story_dir(ws, cell["fork_id"]))
+    assert bt.tree_digests(sdir) == before
+
+
+def test_batch_fix_fork_json_write_failure_leaves_no_fork(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    real = lib.write_json_atomic
+
+    def failing(path, obj, *args, **kwargs):
+        if path.endswith("fork.json"):
+            raise OSError(28, "No space left on device", path)
+        return real(path, obj, *args, **kwargs)
+    monkeypatch.setattr(lib, "write_json_atomic", failing)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert cell["status"] == "refused" and cell["reason"].startswith("copy failed: No space left on device: ")
+    assert not os.path.lexists(lib.story_dir(ws, cell["fork_id"]))
+
+
+def test_batch_fix_mkdir_error_is_a_copy_failure(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    real = srv.os.mkdir
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith("-b1-v1"):
+            raise PermissionError(13, "Permission denied", path)
+        return real(path, *args, **kwargs)
+    monkeypatch.setattr(srv.os, "mkdir", denied)
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
+    assert (cell["status"], cell["reason"].split(": ")[0]) == ("refused", "copy failed")
+    assert "Permission denied" in cell["reason"]
+
+
+def test_batch_fix_numbers_are_never_reused_after_cancel_and_delete(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch, fail={})
+    bt.original(state, ws, "ronin-rescue")
+    variants = [bt.variant("v1", bt.RENDER), bt.variant("v2", {"gemma": bt.OTHER_GEMMA})]
+    b1 = bt.submit(s, ws, ["ronin-rescue"], variants)
+    bt.wait_status(s, b1)
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % b1, body={})[0] == 200
+    assert mt.api(s, "DELETE", "/api/batches/" + b1)[0] == 200
+    bt.passing_checks(monkeypatch, fail={"ronin-rescue-b2-v1": "Error: dry run failed"})
+    b2 = bt.submit(s, ws, ["ronin-rescue"], variants)
+    bt.wait_status(s, b2)
+    rec = bt.record(state, b2)
+    assert rec["number"] == 2
+    assert [c["fork_id"] for c in rec["cells"]] == ["ronin-rescue-b2-v1", "ronin-rescue-b2-v2"]
+    assert rec["cells"][0]["status"] == "refused"
+    assert not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b2-v1"))
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % b2, body={})[0] == 200
+    mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b2-v2"))
+
+
+def test_batch_fix_a_malformed_record_does_not_hide_the_list(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    good = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    bt.wait_status(s, good)
+    bad = "20201030-120000-0c0c"
+    lib.make_dir(os.path.join(state, "batches", bad))
+    lib.write_json_atomic(os.path.join(state, "batches", bad, "batch.json"), {"id": bad, "workspace": ws})
+    status, _h, payload = mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert status == 200 and [b["id"] for b in payload["batches"]] == [good]

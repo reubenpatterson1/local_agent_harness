@@ -436,3 +436,99 @@ def test_final2_oversized_orphan_pgid_is_ignored(state, tmp_path):
     finally:
         # mt.kill_everything would os.killpg the oversized pgid and overflow
         lib.write_status(lib.job_dir(state, lost), {"state": "lost", "pgid": None})
+
+
+# --- batch forks BT28 (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Section 7) -----
+
+def _bt28_fork(ws, fork_id, batch_id):
+    sdir = lib.story_dir(ws, fork_id)
+    os.makedirs(sdir)
+    lib.write_json_atomic(os.path.join(sdir, "fork.json"), {"schema": "movie-ui.fork.v1", "fork_id": fork_id,
+                                                            "source_story": "s1", "batch": batch_id})
+    return sdir
+
+
+def test_bt28_batch_recovery_after_a_restart(state, tmp_path, capsys):
+    import movie_ui_server as srv
+    ws = os.path.realpath(str(tmp_path))
+    batch_id = "20261030-120501-ab12"
+    lost, kept = _bt28_fork(ws, "s1-b1-v1", batch_id), _bt28_fork(ws, "s1-b1-v2", batch_id)
+    fields = {"action": "movie", "mode": "chained", "story_id": "s1-b1-v2"}
+    job_id = mt.make_job(state, ["true"], ws, story_id="s1-b1-v2", fields=fields)
+    cells = [{"story_id": "s1", "variant": m, "fork_id": "s1-b1-v%d" % m, "status": status, "reason": None,
+              "level": "render", "diff": [], "warnings": [], "fields": None, "job_id": None, "copy_bytes": 0,
+              "updated": "2020-01-01T00:00:00Z"}
+             for m, status in ((1, "forking"), (2, "forking"), (3, "pending"))]
+    rec = {"schema": "movie-ui.batch.v1", "id": batch_id, "number": 1, "workspace": ws,
+           "created": "2020-01-01T00:00:00Z", "status": "submitting", "cancel_requested": False,
+           "stories": ["s1"], "variants": [{"label": "v%d" % m, "settings": {}, "prompt": {}} for m in (1, 2, 3)],
+           "order": [0, 1, 2], "cells": cells}
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"), rec)
+    srv.batch_recovery(state)
+    assert capsys.readouterr().err == "movie-ui: batch %s: interrupted (2 cell(s) to submit again)\n" % batch_id
+    rec = lib.read_json(os.path.join(state, "batches", batch_id, "batch.json"))
+    assert rec["status"] == "interrupted"
+    assert [(c["status"], c["reason"], c["job_id"]) for c in rec["cells"]] == [
+        ("interrupted", "the server stopped while this fork was being made", None),
+        ("queued", None, job_id),
+        ("interrupted", "the server stopped before this fork was made", None)]
+    assert rec["cells"][1]["fields"] == fields
+    assert not os.path.lexists(lost) and os.path.isfile(os.path.join(kept, "fork.json"))
+    srv.batch_recovery(state)
+    assert capsys.readouterr() == ("", "")
+
+
+def _bt28_record(ws, batch_id, statuses, status, cancel_requested):
+    cells = [{"story_id": "s1", "variant": m, "fork_id": "s1-b1-v%d" % m, "status": st, "reason": None,
+              "level": "render", "diff": [], "warnings": [], "fields": None, "job_id": None, "copy_bytes": 0,
+              "updated": "2020-01-01T00:00:00Z"}
+             for m, st in enumerate(statuses, start=1)]
+    return {"schema": "movie-ui.batch.v1", "id": batch_id, "number": 1, "workspace": ws,
+            "created": "2020-01-01T00:00:00Z", "status": status, "cancel_requested": cancel_requested,
+            "stories": ["s1"], "variants": [{"label": "v%d" % m, "settings": {}, "prompt": {}}
+                                            for m in range(1, len(statuses) + 1)],
+            "order": list(range(len(statuses))), "cells": cells}
+
+
+def test_batch_fix_recovery_finishes_a_cancel_cut_short_by_a_restart(state, tmp_path, capsys):
+    import movie_ui_server as srv
+    ws = os.path.realpath(str(tmp_path))
+    for batch_id, status in (("20261030-120501-ab12", "cancelled"), ("20261030-120502-ab13", "interrupted")):
+        fork = _bt28_fork(ws, "s1-b1-v1", batch_id)
+        rec = _bt28_record(ws, batch_id, ["forking", "pending"], status, True)
+        lib.make_dir(os.path.join(state, "batches", batch_id))
+        lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"), rec)
+        srv.batch_recovery(state)
+        assert capsys.readouterr().err == "movie-ui: batch %s: cancelled (finished at restart)\n" % batch_id
+        rec = lib.read_json(os.path.join(state, "batches", batch_id, "batch.json"))
+        assert rec["status"] == "cancelled"
+        assert [(c["status"], c["reason"]) for c in rec["cells"]] == [("cancelled", "batch cancelled")] * 2
+        assert not os.path.lexists(fork)
+        srv.batch_recovery(state)
+        assert capsys.readouterr() == ("", "")
+
+
+def test_batch_fix_recovery_skips_a_malformed_record(state, tmp_path, capsys):
+    import movie_ui_server as srv
+    batch_id = "20261030-120503-ab14"
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"),
+                          {"id": batch_id, "status": "submitting"})
+    srv.batch_recovery(state)
+    assert capsys.readouterr().err.startswith("movie-ui: batch %s: recovery skipped: KeyError: " % batch_id)
+
+
+def test_batch_fix_recovery_removes_an_empty_fork_folder(state, tmp_path, capsys):
+    import movie_ui_server as srv
+    ws = os.path.realpath(str(tmp_path))
+    batch_id = "20261030-120504-ab15"
+    fdir = lib.story_dir(ws, "s1-b1-v1")
+    os.makedirs(fdir)
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"),
+                          _bt28_record(ws, batch_id, ["forking"], "submitting", False))
+    srv.batch_recovery(state)
+    assert not os.path.lexists(fdir)
+    rec = lib.read_json(os.path.join(state, "batches", batch_id, "batch.json"))
+    assert rec["cells"][0]["status"] == "interrupted"
