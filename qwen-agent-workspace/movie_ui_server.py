@@ -2433,34 +2433,65 @@ def _batch_job_cancelled(server, job_id):
 
 
 def batch_recovery(state):
-    """BF32 at startup, before the server serves: every waiting or submitting batch becomes
-    interrupted. A forking cell whose fork has a movie job created at or after the batch becomes
-    queued with that job (and its fields); any other forking cell loses its fork and, like every
-    pending cell, becomes interrupted. One stderr line per recovered batch; nothing otherwise."""
+    """BF32 at startup, before the server serves. A batch is recovered when it is waiting or
+    submitting, or when any cell is still forking or pending (a restart soon after Cancel batch;
+    review fix). A forking cell whose fork has a movie job created at or after the batch becomes
+    queued with that job (and its fields); any other forking cell loses its fork. Without
+    cancel_requested, those cells and every pending cell become interrupted and so does the batch;
+    with it, they become cancelled ("batch cancelled"), adopted jobs are cancelled, and the batch
+    is cancelled. One stderr line per recovered batch; a record that cannot be recovered is
+    skipped with one stderr line and never stops the server starting."""
     for batch_id in list_batch_ids(state):
-        rec = read_batch(state, batch_id)
-        if rec is None or rec.get("status") not in ("waiting", "submitting"):
-            continue
-        jobs = {}
-        for job_id in lib.list_job_ids(state):
-            job = lib.read_job(lib.job_dir(state, job_id)) or {}
-            if (job.get("kind") == "movie" and job.get("workspace") == rec["workspace"]
-                    and isinstance(job.get("created"), str) and job["created"] >= rec["created"]):
-                jobs[job.get("story_id")] = (job_id, job)
-        now = lib.utc_now()
-        for cell in rec["cells"]:
-            if cell.get("status") == "forking" and cell["fork_id"] in jobs:
-                job_id, job = jobs[cell["fork_id"]]
-                cell.update(status="queued", reason=None, job_id=job_id, fields=job.get("fields"), updated=now)
-            elif cell.get("status") == "forking":
-                remove_unused_fork(state, rec["workspace"], lib.story_dir(rec["workspace"], cell["fork_id"]),
-                                   batch_id)
+        try:
+            _recover_batch(state, batch_id)
+        except Exception as e:
+            sys.stderr.write("movie-ui: batch %s: recovery skipped: %s: %s\n" % (batch_id, type(e).__name__, e))
+
+
+def _recover_batch(state, batch_id):
+    """batch_recovery for one record."""
+    rec = read_batch(state, batch_id)
+    if rec is None:
+        return
+    open_cells = any(c.get("status") in ("forking", "pending") for c in rec["cells"])
+    if rec.get("status") not in ("waiting", "submitting") and not open_cells:
+        return
+    cancelled = bool(rec.get("cancel_requested"))
+    jobs = {}
+    for job_id in lib.list_job_ids(state):
+        job = lib.read_job(lib.job_dir(state, job_id)) or {}
+        if (job.get("kind") == "movie" and job.get("workspace") == rec["workspace"]
+                and isinstance(job.get("created"), str) and job["created"] >= rec["created"]):
+            jobs[job.get("story_id")] = (job_id, job)
+    now = lib.utc_now()
+    adopted = []
+    for cell in rec["cells"]:
+        if cell.get("status") == "forking" and cell["fork_id"] in jobs:
+            job_id, job = jobs[cell["fork_id"]]
+            cell.update(status="queued", reason=None, job_id=job_id, fields=job.get("fields"), updated=now)
+            adopted.append(job_id)
+        elif cell.get("status") == "forking":
+            remove_unused_fork(state, rec["workspace"], lib.story_dir(rec["workspace"], cell["fork_id"]),
+                               batch_id)
+            if cancelled:
+                cell.update(status="cancelled", reason="batch cancelled", updated=now)
+            else:
                 cell.update(status="interrupted", reason="the server stopped while this fork was being made",
                             updated=now)
-            elif cell.get("status") == "pending":
-                cell.update(status="interrupted", reason="the server stopped before this fork was made", updated=now)
-        rec["status"] = "interrupted"
-        write_batch(state, rec)
+        elif cell.get("status") == "pending":
+            if cancelled:
+                cell.update(status="cancelled", reason="batch cancelled", updated=now)
+            else:
+                cell.update(status="interrupted", reason="the server stopped before this fork was made",
+                            updated=now)
+    rec["status"] = "cancelled" if cancelled else "interrupted"
+    write_batch(state, rec)
+    if cancelled:
+        for job_id in adopted:
+            with STORE_LOCK:
+                lib.cancel_job(state, job_id)
+        sys.stderr.write("movie-ui: batch %s: cancelled (finished at restart)\n" % batch_id)
+    else:
         sys.stderr.write("movie-ui: batch %s: interrupted (%d cell(s) to submit again)\n"
                          % (batch_id, sum(1 for c in rec["cells"] if c.get("status") == "interrupted")))
 

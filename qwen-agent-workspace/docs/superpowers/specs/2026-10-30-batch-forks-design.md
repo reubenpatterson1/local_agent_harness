@@ -362,7 +362,7 @@ The preview runs no V2-V6. **[spec choice]** It runs V1 as Compose's own preview
   - any other `forking` cell gets `remove_fork` and becomes `interrupted` (`the server stopped while this fork was being made`);
   - a `pending` cell becomes `interrupted` (`the server stopped before this fork was made`).
 
-  The batch becomes `interrupted`. For each recovered batch it writes one stderr line, `movie-ui: batch <id>: interrupted (<n> cell(s) to submit again)`. It prints nothing when no batch needs recovery (`test_mut15` asserts an empty stderr).
+  The batch becomes `interrupted`. For each recovered batch it writes one stderr line, `movie-ui: batch <id>: interrupted (<n> cell(s) to submit again)`. It prints nothing when no batch needs recovery (`test_mut15` asserts an empty stderr). A batch is also recovered when any cell is still forking or pending; with cancel_requested its open cells and the batch become cancelled ("batch cancelled") and adopted jobs are cancelled. A record that cannot be recovered is skipped with one stderr line (review fix 2026-10-30).
 - **BF33 Submit remaining.** This is only allowed when the status is `interrupted`. `interrupted` cells go back to `pending` (reason `null`), the status becomes `waiting`, the batch is enqueued and kicked, and the stored `order` is kept.
 - **BF34 Delete batch.** It is refused while the status is `waiting` or `submitting`. Otherwise `shutil.rmtree(<STATE>/batches/<id>)`. The forks and their jobs are untouched.
 
