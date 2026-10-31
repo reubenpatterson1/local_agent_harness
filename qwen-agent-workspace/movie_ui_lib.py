@@ -29,7 +29,7 @@ import time
 # ---------------------------------------------------------------------------
 
 STATE_PATH = "~/.local/share/qwen-agent/movie-ui"   # MU2; expanded at every use
-STATE_SUBDIRS = ("jobs", "uploads", "traces", "smoke")
+STATE_SUBDIRS = ("jobs", "uploads", "traces", "smoke", "batches")
 JOB_SCHEMA = "movie-ui.job.v1"
 SAVED_TRACE_SCHEMA = "movie-ui.saved-trace.v1"
 JOB_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")

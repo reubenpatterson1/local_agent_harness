@@ -27,10 +27,13 @@ import threading
 import time
 
 import fleet_lib
+import movie_ui_batch as batch
 import movie_ui_lib as lib
 
 UI_WS = os.path.dirname(os.path.realpath(__file__))
 STORE_LOCK = threading.Lock()   # MU18: guards queue.json, server-side status writes, dispatch
+BATCH_LOCK = threading.Lock()   # batch forks BF2: batch.json read-modify-writes, submit planning;
+                                # never held together with STORE_LOCK
 MAX_BODY = 26214400             # 25 MiB (MU10)
 UPLOAD_MAX = 20971520           # 20 MiB (MU53)
 LOG_CHUNK = 262144              # MU58
@@ -101,6 +104,8 @@ ROUTES = [
     ("POST", r"/api/jobs/" + _ID + r"/kill-orphan", "h_job_kill_orphan",
      "/api/jobs/" + _SAMPLE_ID + "/kill-orphan"),
     ("POST", r"/api/queue/move", "h_queue_move", "/api/queue/move"),
+    ("POST", r"/api/batches/preview", "h_batch_preview", "/api/batches/preview"),
+    ("GET", r"/api/batches/stories", "h_batch_stories", "/api/batches/stories"),
     ("GET", r"/api/stories", "h_stories", "/api/stories"),
     ("GET", r"/api/stories/" + _STORY, "h_story", "/api/stories/ronin-rescue"),
     ("PUT", r"/api/stories/" + _STORY + r"/story\.md", "h_story_save", "/api/stories/ronin-rescue/story.md"),
@@ -188,6 +193,8 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         self.parser_lock = threading.Lock()
         self.parsers = {}
         self.job_cache = {}
+        self.batch_queue = []      # batch forks BF2: IDs of waiting batches, guarded by BATCH_LOCK
+        self.batch_thread = None   # the batch-submitter thread while it runs (BF24, BF25)
 
     def refresh_capabilities(self):
         """Re-run MU60's three probes against probe_ws and store the results."""
@@ -1877,6 +1884,191 @@ MovieUIHandler.h_stories = _h_stories
 MovieUIHandler.h_story = _h_story
 MovieUIHandler.h_story_save = _h_story_save
 MovieUIHandler.h_files = _h_files
+
+
+# ---------------------------------------------------------------------------
+# Batch forks: records, eligibility, planning and the preview
+# (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Sections 3.1-3.6)
+# ---------------------------------------------------------------------------
+
+def batch_path(state, batch_id):
+    return os.path.join(state, "batches", batch_id, "batch.json")
+
+
+def read_batch(state, batch_id):
+    """batch.json of one batch as a dict, or None (spec 3.1)."""
+    rec = lib.read_json(batch_path(state, batch_id))
+    return rec if isinstance(rec, dict) else None
+
+
+def list_batch_ids(state):
+    """Sorted IDs of every batches/<id> directory whose name matches JOB_ID_RE and that has a
+    readable batch.json."""
+    try:
+        names = os.listdir(os.path.join(state, "batches"))
+    except OSError:
+        return []
+    return sorted(n for n in names if lib.JOB_ID_RE.fullmatch(n) and read_batch(state, n) is not None)
+
+
+def next_batch_number(server, ws_real):
+    """BF14 over this STATE's batch records and the workspace's story directory names."""
+    records = [read_batch(server.state, i) for i in list_batch_ids(server.state)]
+    try:
+        names = os.listdir(os.path.join(ws_real, "generated", "stories"))
+    except OSError:
+        names = []
+    return batch.next_number(records, names, ws_real)
+
+
+def _story_listed(ws_real, story_id):
+    """True for a story directory _h_stories lists (spec 3.4: the same directories)."""
+    root = os.path.join(ws_real, "generated", "stories")
+    sdir = os.path.join(root, story_id)
+    return (lib.valid_story_id(story_id) and story_id != lib.SMOKE_STORY_ID and os.path.isdir(sdir)
+            and _inside(sdir, root))
+
+
+def _story_names(ws_real):
+    try:
+        names = os.listdir(os.path.join(ws_real, "generated", "stories"))
+    except OSError:
+        names = []
+    return sorted(n for n in names if _story_listed(ws_real, n))
+
+
+def job_index(server, ws_real):
+    """Spec 3.4's one pass over the jobs, newest first: ({story_id: last_fields}, {story_id:
+    busy job ID}). last_fields is the dict fields of the newest story or movie job of ws_real;
+    the busy job is the newest job of ws_real that is queued, starting or running."""
+    state = server.state
+    queue = lib.read_queue(state)
+    last, busy = {}, {}
+    for job_id in sorted(lib.list_job_ids(state), reverse=True):
+        job = server.job(job_id)
+        if job is None or job.get("workspace") != ws_real:
+            continue
+        story_id = job.get("story_id")
+        if job.get("kind") in ("story", "movie") and isinstance(job.get("fields"), dict) \
+                and story_id not in last:
+            last[story_id] = job["fields"]
+        if story_id not in busy and lib.job_state(state, job_id, queue) in ("queued", "starting", "running"):
+            busy[story_id] = job_id
+    return last, busy
+
+
+def stored_fields(server, ws_real, story_id):
+    """BF41b: (code, fields, batch_id, number) of a story with no last_fields, from its fork.json
+    and that fork's batch record. A fork.json that is not a regular file is ignored (isfile
+    and not islink is the lstat S_ISREG rule of copy_plan)."""
+    path = os.path.join(lib.story_dir(ws_real, story_id), "fork.json")
+    fork_rec = lib.read_json(path, None) if os.path.isfile(path) and not os.path.islink(path) else None
+    batch_rec = None
+    if isinstance(fork_rec, dict) and isinstance(fork_rec.get("batch"), str) \
+            and lib.JOB_ID_RE.fullmatch(fork_rec["batch"]):
+        record = batch_path(server.state, fork_rec["batch"])
+        if os.path.isfile(record):
+            batch_rec = lib.read_json(record, {})
+    return batch.fork_fallback(fork_rec, batch_rec, story_id, ws_real)
+
+
+def originals_info(server, ws_real, story_ids):
+    """{story_id: {"dir", "has_story", "busy_job", "fields", "code", "batch", "number"}}: what
+    batch.plan_cells needs of each original. code is "job" when last_fields exists, else the
+    BF41 code; fields is last_fields, else the BF41 "ok" fields, else None."""
+    last, busy = job_index(server, ws_real)
+    out = {}
+    for story_id in story_ids:
+        sdir = lib.story_dir(ws_real, story_id)
+        info = {"dir": _story_listed(ws_real, story_id),
+                "has_story": os.path.isfile(os.path.join(sdir, "story.md")),
+                "busy_job": busy.get(story_id), "fields": None, "code": "job", "batch": None, "number": None}
+        if story_id in last:
+            info["fields"] = last[story_id]
+        else:
+            code, fields, batch_id, number = stored_fields(server, ws_real, story_id)
+            info.update(code=code, fields=fields, batch=batch_id, number=number)
+        out[story_id] = info
+    return out
+
+
+def _fields_source(info):
+    """("job" or "batch" or None, fields_batch) of spec 3.4."""
+    source = {"job": "job", "ok": "batch"}.get(info["code"])
+    return source, ({"id": info["batch"], "number": info["number"]} if source == "batch" else None)
+
+
+def story_status(server, ws_real):
+    """GET /api/batches/stories rows (spec 3.4) for the story directories _h_stories lists."""
+    names = _story_names(ws_real)
+    infos = originals_info(server, ws_real, names)
+    rows = []
+    for story_id in names:
+        info = infos[story_id]
+        reason = batch.eligibility_reason(info["busy_job"], info["code"], info["batch"])
+        source, source_batch = _fields_source(info)
+        rows.append({"id": story_id, "eligible": reason is None, "reason": reason,
+                     "busy_job": info["busy_job"], "fields_source": source, "fields_batch": source_batch})
+    return rows
+
+
+def plan_batch(server, clean, number):
+    """BF23: (cells, originals) of clean ({"ws", "stories", "variants"}) planned as batch number;
+    the one planning function behind preview, submit and each cell's turn."""
+    ws_real, state = clean["ws"], server.state
+    originals = originals_info(server, ws_real, clean["stories"])
+    cells = batch.plan_cells(clean["stories"], clean["variants"], number, ws_real, state, originals,
+                             lambda fields: lib.validate_fields(fields, ws_real, state),
+                             lambda fork: os.path.lexists(lib.story_dir(ws_real, fork)))
+    return cells, originals
+
+
+PREVIEW_CELL_KEYS = ("story_id", "variant", "fork_id", "status", "reason", "level", "diff", "warnings")
+
+
+def preview_cell(cell):
+    return dict((key, cell[key]) for key in PREVIEW_CELL_KEYS)
+
+
+def _movie_path(ws_real, story_id):
+    path = os.path.join(lib.story_dir(ws_real, story_id), "movie.mp4")
+    return path if os.path.isfile(path) else None
+
+
+def preview_row(ws_real, story_id, info):
+    source, source_batch = _fields_source(info)
+    fields = info["fields"]
+    return {"story_id": story_id,
+            "fields": batch.original_fields(fields, story_id, ws_real) if fields is not None else None,
+            "fields_source": source, "fields_batch": source_batch, "movie": _movie_path(ws_real, story_id)}
+
+
+def _batch_request(body):
+    """The clean request of a preview or submit body; 400 for a bad ws, then 400 invalid batch."""
+    real = resolve_ws(body.get("ws"))
+    clean, errors = batch.validate_request(body)
+    if errors:
+        raise ApiError(400, "invalid batch", errors=errors)
+    clean["ws"] = real
+    return clean
+
+
+def _h_batch_stories(self, groups, query, body):
+    return 200, {"stories": story_status(self.server, self.ws(query.get("ws")))}
+
+
+def _h_batch_preview(self, groups, query, body):
+    server = self.server
+    clean = _batch_request(body)
+    number = next_batch_number(server, clean["ws"])
+    cells, originals = plan_batch(server, clean, number)
+    return 200, {"number": number,
+                 "rows": [preview_row(clean["ws"], s, originals[s]) for s in clean["stories"]],
+                 "cells": [preview_cell(c) for c in cells], "totals": batch.totals(cells)}
+
+
+MovieUIHandler.h_batch_stories = _h_batch_stories
+MovieUIHandler.h_batch_preview = _h_batch_preview
 
 
 # ---------------------------------------------------------------------------

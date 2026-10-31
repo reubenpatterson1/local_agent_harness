@@ -15,6 +15,7 @@ import time
 
 import pytest
 
+import batch_testutil as bt
 import movie_ui_testutil as mt
 import movie_ui_lib as lib
 import movie_ui_server as srv
@@ -1147,3 +1148,53 @@ def test_regenerate_seed_field_is_wired_in_the_static_ui():
     assert 'id="ch-regen-seed"' in html and 'max="2147483647"' in html
     assert html.index('id="ch-regen-seed"') < html.index('id="ch-regenerate"')
     assert "seed:" in js and "#ch-regen-seed" in js and "% 2147483648" in js
+
+
+# --- batch forks (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Section 7) ----------
+
+def test_bt15_batch_story_eligibility(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    os.makedirs(lib.story_dir(ws, "cli-story"))
+    with open(os.path.join(lib.story_dir(ws, "cli-story"), "story.md"), "w", encoding="utf-8") as f:
+        f.write(bt.STORY_MD)
+    _sdir, queued = bt.original(state, ws, "queued-story", job_state="queued")
+    _sdir, running = bt.original(state, ws, "running-story", job_state="running")
+    bt.original(state, ws, "ui-story")
+    status, _h, payload = mt.api(s, "GET", "/api/batches/stories?ws=" + ws)
+    assert status == 200
+    rows = dict((r["id"], r) for r in payload["stories"])
+    assert sorted(rows) == ["cli-story", "queued-story", "running-story", "ui-story"]
+    assert rows["cli-story"] == {"id": "cli-story", "eligible": False,
+                                 "reason": "Started from the command line: no saved Compose settings to fork",
+                                 "busy_job": None, "fields_source": None, "fields_batch": None}
+    for story_id, job_id in (("queued-story", queued), ("running-story", running)):
+        assert rows[story_id] == {"id": story_id, "eligible": False,
+                                  "reason": "Job %s is queued or running for this story" % job_id,
+                                  "busy_job": job_id, "fields_source": "job", "fields_batch": None}
+    assert rows["ui-story"] == {"id": "ui-story", "eligible": True, "reason": None, "busy_job": None,
+                                "fields_source": "job", "fields_batch": None}
+    assert mt.api(s, "GET", "/api/batches/stories")[:3:2] == (400, {"error": "missing ws"})
+
+
+def test_batch_review_focus_2_saved_settings_that_no_longer_pass_v1(env):
+    """Review Focus 2: the original's saved seed image is gone from STATE/uploads."""
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    gone = "0" * 64 + ".png"
+    bt.original(state, ws, "seeded", seed_upload=gone)
+    status, _h, payload = mt.api(s, "POST", "/api/batches/preview",
+                                 body=bt.body(ws, ["seeded"], [bt.variant("v1", bt.RENDER)]))
+    assert status == 200
+    assert payload["cells"] == [{"story_id": "seeded", "variant": 1, "fork_id": "seeded-b1-v1",
+                                 "status": "invalid", "reason": "seed image upload %s not found" % gone,
+                                 "level": None, "diff": [], "warnings": []}]
+    assert payload["totals"] == {"jobs": 0, "replan": 0, "stills": 0, "render": 0, "refused": 1,
+                                 "text": "0 jobs: 0 re-plan, 0 new stills, 0 render-only; 1 refused"}
+    assert payload["number"] == 1 and payload["rows"][0]["fields"]["seed_upload"] == gone
+    assert (payload["rows"][0]["fields_source"], payload["rows"][0]["movie"]) == ("job", None)
+    assert os.listdir(os.path.join(state, "batches")) == []
+    assert not os.path.lexists(lib.story_dir(ws, "seeded-b1-v1"))
+    status, _h, payload = mt.api(s, "POST", "/api/batches/preview", body={"ws": ws, "stories": [], "variants": []})
+    assert (status, payload) == (400, {"error": "invalid batch", "errors": [
+        "stories must be a list of 1 to 24 distinct story IDs", "variants must be a list of 1 to 6 variants"]})
+    assert mt.api(s, "POST", "/api/batches/preview", body={"stories": ["seeded"]})[:3:2] == (
+        400, {"error": "missing ws"})
