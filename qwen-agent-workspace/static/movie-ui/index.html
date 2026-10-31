@@ -134,6 +134,7 @@
     <button id="c-validate" type="button">Validate</button>
     <button id="c-write-story" type="button">Write story</button> <span id="c-write-story-reason" class="muted"></span>
     <button id="c-run-all" type="button">Run all</button> <span id="c-run-all-reason" class="muted"></span>
+    <label id="c-check-seams-box"><input id="c-check-seams" type="checkbox" checked> Check seams after render</label>
     <button id="c-smoke" type="button">Smoke render</button> <span id="c-smoke-reason" class="muted"></span>
   </div>
   <ul id="c-checks" class="checks"></ul>
@@ -155,11 +156,17 @@
       <button id="s-render" type="button">Render</button>
       <label>Panels (target) <input id="s-regen-panels" type="number" min="1" max="200" step="1" size="4"></label>
       <button id="s-regenerate" type="button">Regenerate story</button>
+      <button id="s-seams" type="button" hidden>Check seams</button>
       <span id="s-redo-box" hidden><input id="s-redo-panels" type="text" size="12" placeholder="2,5"> <button id="s-redo" type="button">Redo panels</button></span>
       <span id="s-action-status" class="muted"></span>
     </div>
     <h3>Checks</h3>
     <div id="s-checks"></div>
+    <div id="s-seams-box" hidden>
+      <h3>Seams</h3>
+      <p id="s-seams-summary" class="muted"></p>
+      <table id="s-seams-table" class="list"><thead><tr><th>Panel</th><th>Score</th><th>Verdict</th><th>Reason</th></tr></thead><tbody></tbody></table>
+    </div>
     <h3>LoRA picks</h3>
     <pre id="s-picks"></pre>
     <h3>Gallery</h3>

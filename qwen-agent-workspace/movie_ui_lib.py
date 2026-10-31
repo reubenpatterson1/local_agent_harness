@@ -422,7 +422,7 @@ def job_vlm(kind, fields, workspace, story_id):
     """The VLM state a job of kind needs: "required", "forbidden" or "any" (VP1). Pure except
     for one os.path.isfile (a movie whose story.md exists renders without the VLM)."""
     if kind in ("story", "character-create", "character-regenerate", "location-create",
-                "location-regenerate"):
+                "location-regenerate", "seams"):
         return "required"
     if kind == "movie":
         if (fields or {}).get("action") == "redo":
@@ -443,6 +443,21 @@ def effective_vlm(job):
         return job_vlm("movie", job.get("fields"), job.get("workspace"), job.get("story_id"))
     vlm = job.get("vlm")
     return vlm if vlm in VLM_POLICIES else "any"
+
+
+# Chained end frames spec CE14: the seams job and the plans that have something to check.
+def seams_argv(ws_real, story_id, py=sys.executable):
+    """The bin/seam-report argv of a seams job, on the port the VLM preflight checks."""
+    return [py, os.path.join(ws_real, "bin", "seam-report"), story_id, "--port", str(vlm_port())]
+
+
+def plan_has_end_frames(plan):
+    """True when plan (a parsed plan.json, or None) is chained and a beat has a non-empty string
+    end_frame. Pure."""
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    return (isinstance(plan, dict) and plan.get("mode") == "chained" and isinstance(beats, list)
+            and any(isinstance(b, dict) and isinstance(b.get("end_frame"), str)
+                    and b["end_frame"].strip() for b in beats))
 
 
 def next_queued_job(state):
