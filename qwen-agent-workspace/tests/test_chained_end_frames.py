@@ -161,7 +161,7 @@ CAMERA_MOVE_WORDS = {
     "slow tilt down": ("tilt", "tilts"),
     "slow crane up": ("crane", "cranes"),
     "slow crane down": ("crane", "cranes"),
-    "slow orbit": ("orbit", "orbits"),
+    "slow orbit": ("orbit", "orbits", "arc", "arcs"),
     "static": ("static", "still", "hold", "holds", "locked-off"),
 }
 NEW_WRITER_FORMS = {
@@ -244,6 +244,21 @@ def test_ct12_static_holding_and_the_head_rule(ws):
               "still at the right edge.")
     assert "does not move the camera the planned way" in se.camera_problem(lib, pushed, phrases,
                                                                            "static")
+
+
+def test_ct12_an_arcs_around_sentence_is_the_orbit_move(ws):
+    ctx, plan = _ronin_plan(ws, "slow orbit")
+    phrases = se.cast_phrases(ctx, plan)
+    sentence = ("The camera arcs around the ronin — as the move completes, the ronin stands at "
+                "frame centre facing the camera.")
+    text = "The ronin turns to the boats. " + sentence
+    assert se._moves_camera(ctx, plan, text) and se._names_camera(sentence, "slow orbit")
+    assert se.camera_directions(lib, text, phrases) == [(1, "sentence")]
+    assert se.camera_problem(lib, text, phrases, "slow orbit") is None
+    assert se.repair_action_text(ctx, plan, 1, text) == (text, [])
+    parts = [dict(seu.panel_json("chained", 1), motion=text)]
+    assert dict(se.panel_fields(ctx, plan, parts, 1))["Motion"] == text
+    assert se.CAMERA_MOTION_RE.search(dict(se.CAMERA_SENTENCES)["slow orbit"]).group(0) == "arcs"
 
 
 # --- CT13: quotes reserved for spoken lines (CE10, CK5) ----------------------------------------
@@ -1111,8 +1126,9 @@ def ref_shots():
 def test_ct14_the_format_reference_is_pinned(ws):
     reference = se.FORMAT_REFERENCE
     assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == (
-        "990aeb28a929b910786b30cef2288cb16ed9910b88a3d7011778d31f4ca96efe")
+        "fec731a3cedadf6578a511e10d93698039ad075729b208bed2903061faa8b12b")
     assert (len(reference), len(reference.split())) == (3538, 618)
+    assert re.findall(r'"[^"]*"', reference) == ['"Forty years of mornings."', '"Not one more."']
     assert "@@" not in reference and "{" not in reference
     shots = ref_shots()
     assert len(shots) == 3

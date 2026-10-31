@@ -19,7 +19,7 @@
 - **Tests:**
   - New files: `tests/test_chained_end_frames.py` (CT1-CT16, CT29; Tasks 1-5), `tests/test_seam_report.py` (CT17-CT22, CT30; Task 5) and `tests/test_movie_ui_seams.py` (CT23-CT28; Task 6).
   - Five Review Focus pins.
-  - In all, 71 test cases: 66 CT cases and 5 Review Focus pins.
+  - In all, 74 test cases: 69 CT cases and 5 Review Focus pins.
 
 **Tech Stack:**
 - Python 3.13 (`python3` = `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`, pytest 8.3.4). Python 3.9.6 (`/usr/bin/python3`) is used for the compile check only. Every new and changed Python file runs on both.
@@ -4746,7 +4746,7 @@ cd /private/tmp/claude-502/-Users-reubenpatterson/19c452c6-34f7-42df-83ac-562127
 git log -1 --format='%H %s' -- bin/ltx-movie bin/ltx-mlx-render bin/ltx-story-images bin/ltx-story-manifest bin/ltx-story-video bin/ltx-chain bin/ltx-generate bin/ltx-host-prep bin/ltx-host-restore bin/character bin/lora-catalog bin/judge-story bin/judge-clips bin/judge-stills bin/iterate-story bin/qwen-agent story_engine.py character_lib.py character_dataset.py lora_catalog.py pipeline_log.py z_image_skill.py ltx2_mlx_video_skill.py
 ```
 
-Expected: one line. It is a 40-character SHA, then the subject of Task 4's commit, or of a Step 1 fix commit if that commit touched `story_engine.py`. `bin/seam-report` is not a `PIPELINE_FILES` entry (Plan ruling R17). In Step 3, **SHA** means exactly those 40 characters, typed in place of the word `SHA` in edits 3.51 and 3.52.
+Expected: one line. It is a 40-character SHA, then the subject of the final-review fix-wave commit (`fix(chained end frames): the final review wave ...`), the last commit that touches `story_engine.py` (Plan ruling R17). `bin/seam-report` is not a `PIPELINE_FILES` entry (Plan ruling R17). In Step 3, **SHA** means exactly those 40 characters, typed in place of the word `SHA` in edits 3.51 and 3.52.
 
 - [ ] **Step 3: The re-baseline edits (spec Section 7; test-only).**
 
@@ -5110,7 +5110,7 @@ FORMAT_REFERENCE_SHA256 = "d2fe46c687bdaf8ebc75235bdf530d5d751aa1fa62f9bf393bf98
 with:
 
 ```python
-FORMAT_REFERENCE_SHA256 = "990aeb28a929b910786b30cef2288cb16ed9910b88a3d7011778d31f4ca96efe"
+FORMAT_REFERENCE_SHA256 = "fec731a3cedadf6578a511e10d93698039ad075729b208bed2903061faa8b12b"
 ```
 
 **3.23.** `test_sft1b_writer_constants`: the reference length (CR2). Edit `tests/test_shot_format.py`: replace this text, which occurs exactly once:
@@ -5963,8 +5963,8 @@ diff <(python3 -B tests/test_ltx_movie_offline.py 2>&1 | tail -1) $D/baseline-of
 ```
 
 Expected:
-- the final summary is the baseline's with the pass count higher by exactly 71, the new cases (66 CT cases and 5 Review Focus pins; Plan ruling R20);
-- `lost 0 (listed 0, unexpected 0); new tests 71, not passing 0` and `GATE PASS`;
+- the final summary is the baseline's with the pass count higher by exactly 74, the new cases (69 CT cases and 5 Review Focus pins; Plan ruling R20);
+- `lost 0 (listed 0, unexpected 0); new tests 74, not passing 0` and `GATE PASS`;
 - `same failures, same messages` and `no lost pass` (CK7);
 - `1` (`test_mut26` passes at its new `BASELINE`);
 - `offline unchanged`.
@@ -5995,7 +5995,7 @@ Expected, in order:
 - CK3: `202 passed` (CT15 and the spec's "must pass unchanged" set; the offline script was checked in Step 6);
 - CK4: `3 passed`;
 - CK5: `3 passed`;
-- CK6: `18 passed`;
+- CK6: `19 passed`;
 - no output from the `--stat` (spec 0.3: those files are not changed);
 - `0` (no `DEFAULT_FIELDS` change; [BF] BT1 holds);
 - the changed paths are exactly the 2 docs (the spec and this plan) plus `bin/seam-report`, `movie_ui_lib.py`, `movie_ui_server.py`, `static/movie-ui/app.css`, `static/movie-ui/app.js`, `static/movie-ui/index.html`, `story_engine.py`, the six fixtures of Task 7, `tests/test_chained_end_frames.py`, `tests/test_dialogue.py`, `tests/test_location_ui.py`, `tests/test_movie_ui_builder.py`, `tests/test_movie_ui_http.py`, `tests/test_movie_ui_seams.py`, `tests/test_narrative_fidelity.py`, `tests/test_pinned_cast.py`, `tests/test_seam_report.py`, `tests/test_shot_format.py`, `tests/test_soft_panel_count.py`, `tests/test_speaker_attribution.py` and `tests/test_story_engine.py`, each with the `qwen-agent-workspace/` prefix (28 paths);
@@ -6003,7 +6003,7 @@ Expected, in order:
 - exactly twelve import lines: `+import argparse`, `+import base64`, `+import http.client`, `+import importlib.machinery`, `+import json`, `+import os`, `+import re`, `+import shutil`, `+import subprocess`, `+import sys`, `+import tempfile`, `+import time` (CE13, CT30).
 
 - [ ] **Step 8: Hand-off (controller; not an executor step).**
-  - Report the branch `chain-endframes` and its 11 new commits (6 task commits, the Task 2, Task 3, Task 5 and Task 6 fix commits and the re-baseline), with CK1-CK7.
+  - Report the branch `chain-endframes` and its 12 new commits (6 task commits, the Task 2, Task 3, Task 5 and Task 6 fix commits, the final-review fix-wave commit and the re-baseline), with CK1-CK7.
   - Before any push, run the spec's secret scan (spec 10 step 5) and review every hit by hand.
   - Push, the merge and the live A/B are separate steps that need the user's approval.
 
@@ -6054,16 +6054,16 @@ Steps (spec 10 step 7, unchanged):
 
 | IDs | Task | File | Cases |
 |---|---|---|---|
-| CT1 (camera part), CT12, CT13, CT29 | 1 | `tests/test_chained_end_frames.py` | 8 (CT12 3, CT13 3) |
+| CT1 (camera part), CT12, CT13, CT29 | 1 | `tests/test_chained_end_frames.py` | 9 (CT12 4, CT13 3) |
 | CT1 (planner part), CT2-CT8, CT16 | 2 | `tests/test_chained_end_frames.py` | 17 (CT2 2, CT3 2, CT8 7) |
 | CT1 (N23 part), CT10, CT11, CT15, Review Focus 3 | 3 | `tests/test_chained_end_frames.py` | 11 (CT11 7) |
 | CT1 (writer part), CT9, CT14 | 4 | `tests/test_chained_end_frames.py` | 4 (CT14 2) |
 | CT1 (compile part) | 5 | `tests/test_chained_end_frames.py` | 1 |
-| CT17-CT22, CT30, Review Focus 1, 2 | 5 | `tests/test_seam_report.py` | 18 (CT17 2, CT18 2, CT19 3, CT20 5, CT22 2) |
-| CT23-CT28, Review Focus 4, 5 | 6 | `tests/test_movie_ui_seams.py` | 12 (CT25 5) |
+| CT17-CT22, CT30, Review Focus 1, 2 | 5 | `tests/test_seam_report.py` | 19 (CT17 2, CT18 2, CT19 3, CT20 6, CT22 2) |
+| CT23-CT28, Review Focus 4, 5 | 6 | `tests/test_movie_ui_seams.py` | 13 (CT25 6) |
 | the Section 7 re-baselines | 7 | the 16 files of Task 7 | (existing tests) |
 
-Totals: 71 new cases, of which 66 are CT cases and 5 are Review Focus pins. Cumulative new cases after each task: 8, 25, 36, 40, 59, 71.
+Totals: 74 new cases, of which 69 are CT cases and 5 are Review Focus pins (the final-review wave's three counted with their owning tasks). Cumulative new cases after each task: 9, 26, 37, 41, 61, 74.
 
 ### KPI → task
 
@@ -6144,7 +6144,7 @@ Totals: 71 new cases, of which 66 are CT cases and 5 are Review Focus pins. Cumu
     - CT24 checks that a finished seams job no longer blocks a new one, and that shots and plan-less stories are refused;
     - CT25 checks that `check_seams: 1` is not `true`.
     None weakens a spec assertion.
-20. **R20 [reading]: CK7's count is the baseline plus the 71 new cases,** 66 CT cases and the 5 Review Focus pins that the plan format requires.
+20. **R20 [reading]: CK7's count is the baseline plus the 74 new cases,** 69 CT cases and the 5 Review Focus pins that the plan format requires.
 21. **R21 [reading]: `END_FRAMES_DROPPED`'s N counts every plan call made,** including a call 2 that got no envelope, as the spec's `len([c for c in self.doc["calls"] if c["stage"] == "plan"])` does.
 22. **R22 [reading]: two values are wrapped at 100 columns.** `SPEAKING_CAMERAS` and the `_mixed_camera` docstring's added sentence keep the spec's exact values.
 

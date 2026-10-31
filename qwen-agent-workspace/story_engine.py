@@ -1820,7 +1820,8 @@ SPEAKING_CAMERA = "The camera stays static."
 # the place of the planned camera sentence in the assembled field.
 CAMERA_MOTION_RE = re.compile(r"\b(?:static|still|holds?|locked-off|push(?:es)?\s+in|push-in|"
                               r"pull(?:s)?\s+back|pull-back|pans?|tilts?|tracks?|tracking|dolly|"
-                              r"dollies|zooms?|orbits?|cranes?|handheld|follows?)\b", re.IGNORECASE)
+                              r"dollies|zooms?|orbits?|arcs?|cranes?|handheld|follows?)\b",
+                              re.IGNORECASE)
 
 
 def _sentences(text):
@@ -1864,7 +1865,7 @@ CAMERA_MOVE_WORDS = {
     "slow tilt down": ("tilt", "tilts"),
     "slow crane up": ("crane", "cranes"),
     "slow crane down": ("crane", "cranes"),
-    "slow orbit": ("orbit", "orbits"),
+    "slow orbit": ("orbit", "orbits", "arc", "arcs"),
     "static": ("static", "still", "hold", "holds", "locked-off"),
 }
 CAMERA_CLAUSE_RE = re.compile(
@@ -2694,8 +2695,8 @@ FORMAT_REFERENCE = (
     "finished video prompts of three shots from a different movie. They show the order of "
     "every finished shot: the shot type; the action; when someone speaks, the spoken line and "
     "then one short reaction by the speaker; the one camera sentence, which says where the "
-    "move ends; and the audio last. The pipeline wrote the sentences that start \"The shot "
-    "is\", the sentence \"The old fishmonger faces the camera.\", the spoken line and the "
+    "move ends; and the audio last. The pipeline wrote the sentences that start 'The shot "
+    "is', the sentence 'The old fishmonger faces the camera.', the spoken line and the "
     "audio sentence; the writer wrote every other sentence. Each label names the frame its "
     "shot opens on and the frame it ends on: the action starts from the opening frame without "
     "describing it, and the words after 'as the move completes,' or 'holding' in the camera "

@@ -463,13 +463,18 @@ def plan_has_end_frames(plan):
 def seams_skip_reason(state, job, queue):
     """Why dispatch_tick skips job, else None (chained end frames spec CE14, Task 6 fix round 1):
     a seams job whose fields name an "after" movie job (Compose's check_seams) runs only when that
-    job ended "done". queue is the queue job_state reads. Reads only status files and queue."""
+    job ended "done" and the story's plan.json has end frames (plan_has_end_frames; final review
+    I1). queue is the queue job_state reads. Reads only status files, the queue and the story's
+    plan.json."""
     fields = job.get("fields") if job.get("kind") == "seams" else None
     after = fields.get("after") if isinstance(fields, dict) else None
     if not isinstance(after, str):
         return None
     current = job_state(state, after, queue)
     if current == "done":
+        plan = read_json(os.path.join(story_dir(job["workspace"], job["story_id"]), "plan.json"))
+        if not plan_has_end_frames(plan):
+            return "skipped: story %s has no end frames to check" % job["story_id"]
         return None
     if current == "queued":
         return "skipped: movie %s has not run yet" % after

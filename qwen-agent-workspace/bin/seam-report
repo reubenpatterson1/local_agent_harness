@@ -274,7 +274,7 @@ def seam_prompt(plan, k):
     order, with its descriptor, or is "" when there is none."""
     beat = plan["beats"][k - 1]
     ids = beat.get("cast") if isinstance(beat.get("cast"), list) else []
-    people = ['"%s" is %s' % (c.get("phrase"), c.get("descriptor"))
+    people = ["'%s' is %s" % (c.get("phrase"), c.get("descriptor"))
               for c in plan.get("cast") or [] if isinstance(c, dict) and c.get("id") in ids]
     characters = "Characters in this panel: " + "; ".join(people) + "." if people else ""
     return (SEAM_PROMPT.replace("@@K@@", str(k)).replace("@@END_FRAME@@", _end_frame(beat))
@@ -384,8 +384,8 @@ def _panel_line(p):
 def write_reports(pairs):
     """Write the report pair [(path, text)]: every text to <path>.tmp first, then, once no path is
     a directory, each .tmp os.replace'd into place, so a failure leaves the old pair as it was.
-    Returns None, or (path, error) for the first OSError, after removing every .tmp this call
-    created that is still there."""
+    Returns None, or (path, error) for the first OSError or ValueError (a UnicodeEncodeError of
+    a lone surrogate), after removing every .tmp this call created that is still there."""
     created, path = [], None
     try:
         for path, text in pairs:
@@ -398,7 +398,7 @@ def write_reports(pairs):
         for path, _text in pairs:
             os.replace(path + ".tmp", path)
             created.remove(path + ".tmp")
-    except OSError as e:
+    except (OSError, ValueError) as e:
         for temporary in created:
             try:
                 os.remove(temporary)

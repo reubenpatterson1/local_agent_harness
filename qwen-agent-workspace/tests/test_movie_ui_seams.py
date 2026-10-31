@@ -267,6 +267,25 @@ def test_ct25_a_done_movie_runs_its_seams_job(env):
         "seam-report: no clips to check in %s" % os.path.join(sdir, "clips"))
 
 
+def test_ct25_a_done_movie_without_end_frames_skips_its_seams_job(env, monkeypatch):
+    ws, state = env["ws"], env["state"]
+    sdir = _story(ws, plan=_plan(end_frames=False))
+    movie = mt.make_job(state, ["true"], ws, story_id="ronin-rescue",
+                        status={"state": "done", "exit_code": 0, "ended": lib.utc_now()})
+    seams = _after_seams(state, ws, movie)
+    other = mt.make_job(state, mt.py_argv("print('next')"), ws, kind="smoke")
+    calls = _record_vlm(monkeypatch, env["tmp"])
+    assert lib.next_queued_job(state)[0] == other
+    launched = _record_launches(monkeypatch)
+    assert _tick(state) == other
+    _skipped(state, seams, "skipped: story ronin-rescue has no end frames to check")
+    assert launched == [other] and not os.path.exists(calls)
+    os.remove(os.path.join(sdir, "plan.json"))
+    again = _after_seams(state, ws, movie)
+    assert lib.seams_skip_reason(state, lib.read_job(lib.job_dir(state, again)), []) == (
+        "skipped: story ronin-rescue has no end frames to check")
+
+
 def test_ct25_a_seams_job_never_runs_ahead_of_its_movie(env, monkeypatch):
     ws, state = env["ws"], env["state"]
     movie = mt.make_job(state, mt.py_argv("print('render')"), ws, story_id="ronin-rescue")

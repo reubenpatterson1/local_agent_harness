@@ -458,6 +458,22 @@ def test_ct20_an_unreadable_chainseed_is_no_clip(ws, monkeypatch, capsys):
                           "FileNotFoundError\n")
 
 
+def test_ct20_a_lone_surrogate_in_a_reply_is_a_failed_write(ws, monkeypatch, capsys):
+    sdir = _story(ws, _plan(frames=(E1, E2)), files=[("clips/panel_02.chainseed.png", SEED2, 2000)])
+    for name in ("seam_report.json", "seam_report.md"):
+        with open(os.path.join(sdir, name), "wb") as f:
+            f.write(b"old " + name.encode("ascii") + b"\n")
+    _vlm(monkeypatch, [_reply(9, "bad \ud800 reason")])
+    rc, out, err = _run(["sr1"], capsys)
+    assert rc == 1 and out == ""
+    assert err.startswith("Error: cannot write %s: 'utf-8' codec can't encode character '\\ud800'"
+                          % os.path.join(sdir, "seam_report.json"))
+    assert sorted(os.listdir(sdir)) == ["clips", "plan.json", "seam_report.json", "seam_report.md"]
+    for name in ("seam_report.json", "seam_report.md"):
+        with open(os.path.join(sdir, name), "rb") as f:
+            assert f.read() == b"old " + name.encode("ascii") + b"\n"
+
+
 # --- CT21: unparseable replies (CE13 step 8) ------------------------------------------------------
 
 def _one_panel(ws, monkeypatch, replies, capsys):
@@ -536,8 +552,8 @@ def test_ct22_the_prompt(ws):
     plan = _plan(casts={2: ["c1", "c2"], 3: []})
     assert seam.seam_prompt(plan, 2) == (
         "This image is the last frame of panel 2 of a movie. The story plan says the panel ends "
-        "on this frame:\n" + E2 + "\nCharacters in this panel: \"the courier\" is " + COURIER
-        + "; \"the old monk\" is an old man in a robe.\nScore how well the image matches the "
+        "on this frame:\n" + E2 + "\nCharacters in this panel: 'the courier' is " + COURIER
+        + "; 'the old monk' is an old man in a robe.\nScore how well the image matches the "
         "planned end frame, from 1 (nothing matches) to 10 (everything matches). Judge only who "
         "or what is in frame, where each one is (left, centre or right; foreground or "
         "background), which way they face and how tight the shot is; ignore image quality, "
@@ -548,7 +564,8 @@ def test_ct22_the_prompt(ws):
     empty = seam.seam_prompt(plan, 3)
     assert "Characters in this panel" not in empty
     assert ("ends on this frame:\n" + E3 + "\n\nScore how well") in empty
-    assert seam.seam_prompt(plan, 1).count("Characters in this panel: \"the courier\" is ") == 1
+    assert seam.seam_prompt(plan, 1).count("Characters in this panel: 'the courier' is ") == 1
+    assert '"' not in seam.seam_prompt(plan, 2)
 
 
 def test_ct22_the_requests(monkeypatch):
