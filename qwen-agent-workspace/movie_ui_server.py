@@ -116,6 +116,7 @@ ROUTES = [
     ("GET", r"/api/stories", "h_stories", "/api/stories"),
     ("GET", r"/api/stories/" + _STORY, "h_story", "/api/stories/ronin-rescue"),
     ("PUT", r"/api/stories/" + _STORY + r"/story\.md", "h_story_save", "/api/stories/ronin-rescue/story.md"),
+    ("POST", r"/api/stories/" + _STORY + r"/seams", "h_story_seams", "/api/stories/ronin-rescue/seams"),
     ("GET", r"/api/traces/agents", "h_trace_agents", "/api/traces/agents"),
     ("GET", r"/api/traces/recent", "h_traces_recent", "/api/traces/recent"),
     ("GET", r"/api/traces/saved", "h_traces_saved", "/api/traces/saved"),
@@ -761,8 +762,24 @@ def _h_validate(self, groups, query, body):
                  "command": shlex.join(argv) if argv else None}
 
 
-def create_compose_job(server, fields):
-    """Create the queued job of a validated compose submission; returns its ID."""
+# Chained end frames spec CE14, D12: the seams job of a story; the caller holds STORE_LOCK.
+def _create_seams_job(state, real, story_id, after=None):
+    """Create and queue the seams job of story_id; returns its ID (CE14). after, the ID of the
+    movie job it checks (Compose's check_seams), joins its fields; dispatch_tick skips the job
+    unless that movie ended done (lib.seams_skip_reason)."""
+    job_id = lib.new_job_id(state)
+    fields = {"ws": real, "story_id": story_id}
+    if after is not None:
+        fields["after"] = after
+    lib.create_job(state, job_id, "seams", real, story_id, None, lib.seams_argv(real, story_id),
+                   fields)
+    return job_id
+
+
+def create_compose_job(server, fields, seams=False):
+    """Create the queued job of a validated compose submission; returns its ID. With seams, a
+    chained movie's seams job is queued right behind it under the same STORE_LOCK hold, with the
+    movie as its "after" (chained end frames spec CE14, D12)."""
     state, real = server.state, fields["ws"]
     with STORE_LOCK:
         job_id = lib.new_job_id(state)
@@ -771,8 +788,11 @@ def create_compose_job(server, fields):
             argv = lib.build_smoke_argv(fields, real, state, job_id)
             return lib.create_job(state, job_id, "smoke", real, None, None, argv, fields)["id"]
         argv = lib.build_argv(fields, real, state)
-        return lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"], None,
-                              argv, fields)["id"]
+        job_id = lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"],
+                                None, argv, fields)["id"]
+        if seams and fields["action"] == "movie" and fields["mode"] == "chained":
+            _create_seams_job(state, real, fields["story_id"], after=job_id)
+        return job_id
 
 
 def _h_job_create(self, groups, query, body):
@@ -780,7 +800,8 @@ def _h_job_create(self, groups, query, body):
     checks = lib.run_checks(fields, fields["ws"], self.server.state)
     if not lib.checks_pass(checks):
         raise ApiError(409, "validation failed", checks=checks)
-    job_id = create_compose_job(self.server, fields)
+    job_id = create_compose_job(self.server, fields,
+                                seams=isinstance(body, dict) and body.get("check_seams") is True)
     return 201, {"job": job_summary(self.server, job_id, lib.read_queue(self.server.state)), "checks": checks}
 
 
@@ -1770,7 +1791,9 @@ def _h_story(self, groups, query, body):
                  "clips": [_fs_text(p) for p in _matching(os.path.join(sdir, "clips"), PANEL_CLIP_RE, sdir)],
                  "movie": _fs_text(movie) if _isfile_in(sdir, movie) else None,
                  "summary": _json_in(sdir, os.path.join(runs, run_names[0], "story_summary.json")) if run_names else None,
-                 "last_fields": job["fields"] if job is not None else None}
+                 "last_fields": job["fields"] if job is not None else None,
+                 "end_frames": lib.plan_has_end_frames(plan),
+                 "seams": _json_in(sdir, os.path.join(sdir, "seam_report.json"))}
 
 
 def _h_story_save(self, groups, query, body):
@@ -1808,6 +1831,27 @@ def _h_story_save(self, groups, query, body):
             lib.write_bytes_atomic(backup, raw)
         lib.write_bytes_atomic(path, data)
     return 200, {"sha256": hashlib.sha256(data).hexdigest(), "backup": backup}
+
+
+def _h_story_seams(self, groups, query, body):
+    """POST /api/stories/<id>/seams: queue a seams check (bin/seam-report) of a story whose plan
+    has end frames (chained end frames spec CE14, D12); a second one is refused while one is
+    queued or running."""
+    real, story_id, sdir = _story_dir(self, groups, body.get("ws"))
+    if not lib.plan_has_end_frames(_json_in(sdir, os.path.join(sdir, "plan.json"))):
+        raise ApiError(409, "story %s has no end frames to check" % story_id)
+    state = self.server.state
+    with STORE_LOCK:
+        queue = lib.read_queue(state)
+        for job_id in lib.list_job_ids(state):
+            job = self.server.job(job_id)
+            if (job is not None and job["kind"] == "seams" and job["workspace"] == real
+                    and job["story_id"] == story_id
+                    and lib.job_state(state, job_id, queue) in ("queued",) + lib.ACTIVE_STATES):
+                raise ApiError(409, "a seams check of %s is already queued as job %s"
+                               % (story_id, job_id))
+        job_id = _create_seams_job(state, real, story_id)
+    return 201, {"job": job_summary(self.server, job_id, lib.read_queue(state))}
 
 
 def _range_num(digits):
@@ -1892,6 +1936,7 @@ def _h_files(self, groups, query, body):
 MovieUIHandler.h_stories = _h_stories
 MovieUIHandler.h_story = _h_story
 MovieUIHandler.h_story_save = _h_story_save
+MovieUIHandler.h_story_seams = _h_story_seams
 MovieUIHandler.h_files = _h_files
 
 

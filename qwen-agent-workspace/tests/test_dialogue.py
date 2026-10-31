@@ -663,8 +663,10 @@ def test_dlg12_plan_prompt_speaker_rule(ws):
             prompt = se.build_plan_prompt(seu.make_ctx(se, ws, mode=mode, narration=narration),
                                           [], [])
             where = (mode, narration)
-            assert ("at most %d.%s\n" % (se.MAX_CAST[mode], rule)) in prompt, where
-            assert ("with the keys index, arc, action, shot, camera, location, cast and speaker."
+            end = se.END_FRAME_RULE if mode == "chained" else ""
+            keys = "cast, speaker and end_frame" if mode == "chained" else "cast and speaker"
+            assert ("at most %d.%s%s\n" % (se.MAX_CAST[mode], rule, end)) in prompt, where
+            assert ("with the keys index, arc, action, shot, camera, location, %s." % keys
                     in prompt), where
             assert "not a sequence of steps, with no on-screen text." in prompt, where
             assert "no dialogue" not in prompt and "@@" not in prompt, where
@@ -1460,7 +1462,8 @@ def test_dlg21_an_advisory_only_round_0_passes_untouched(tmp_path, monkeypatch, 
                              "--no-review"] + flags)
         out = capsys.readouterr().out
         assert rc == 0, mode
-        assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "panel", "panel", "panel"]
+        assert [r["stage"] for r in seu.agent_log(log)] == (
+            ["plan"] * (2 if mode == "chained" else 1) + ["panel", "panel", "panel"]), mode
         story_dir = os.path.join(ws, "generated", "stories", story_id)
         with open(os.path.join(story_dir, "story.md"), "rb") as f:
             final = f.read()

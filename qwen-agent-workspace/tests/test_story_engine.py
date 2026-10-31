@@ -82,8 +82,9 @@ def test_rs4_constants():
     assert se.SHOT_TYPES == ("extreme wide shot", "wide shot", "medium shot", "medium close-up",
                              "close-up", "extreme close-up")
     assert [k for k, _ in se.CAMERA_SENTENCES] == [
-        "slow push-in", "slow pull-back", "tracking", "handheld", "slow pan left",
-        "slow pan right", "slow tilt up", "slow tilt down", "static"]
+        "slow push-in", "slow pull-back", "tracking", "slow tracking left", "slow tracking right",
+        "handheld", "slow pan left", "slow pan right", "slow tilt up", "slow tilt down",
+        "slow crane up", "slow crane down", "slow orbit", "static"]
     assert se.ARC_ROLES == ("introduction", "rising", "climax", "falling", "resolution")
     assert se.WORD_RANGES["chained"] == {"image1": (120, 170), "motion1": (55, 105),
                                          "motion": (55, 105)}
@@ -230,7 +231,11 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
                                        auto_lora=state != "off")
                     prompt = se.build_plan_prompt(ctx, se.compatible_entries(ctx), [])
                     where = (mode, len(cast), state, seed)
-                    assert "{" not in prompt and "}" not in prompt, where
+                    rest = prompt
+                    if mode == "chained":
+                        assert prompt.count("FORMAT REFERENCE ONLY") == 1, where
+                        rest = prompt.replace(se.plan_reference(False), "")
+                    assert "{" not in rest and "}" not in rest, where
                     assert "@@" not in prompt, where
                     assert prompt.startswith(
                         'You are planning a short narrated movie (story-id "s1").\n'), where
@@ -404,8 +409,10 @@ def test_rst14_plan_checks(ws):
                                        "wide shot, wide shot, medium shot, medium close-up, "
                                        "close-up, extreme close-up"]),
         (beat(3, camera="zoom"), ["beat 3: P8 camera: 'zoom' is not one of: slow push-in, "
-                                  "slow pull-back, tracking, handheld, slow pan left, slow pan "
-                                  "right, slow tilt up, slow tilt down, static"]),
+                                  "slow pull-back, tracking, slow tracking left, slow tracking "
+                                  "right, handheld, slow pan left, slow pan right, slow tilt up, "
+                                  "slow tilt down, slow crane up, slow crane down, slow orbit, "
+                                  "static"]),
         (lambda raw: (raw["cast"].append({"id": "c3", "phrase": "the guard",
                                           "descriptor": seu.MONK}),
                       raw["beats"][1].update(cast=["c1", "c2", "c3"])),
@@ -612,7 +619,8 @@ def test_rst57_reserved_sentence_in_the_plan_prompt(ws, story_env):
     sentence = (" Never use these names or referring phrases, which belong to characters who are "
                 'not in this movie: kyra ("the woman in grey"), ronin ("the ronin").\n')
     assert "accessories." + sentence in prompt
-    assert "{" not in prompt and "}" not in prompt
+    rest = prompt.replace(se.plan_reference(False), "")
+    assert "{" not in rest and "}" not in rest
     members = se._character_lib(WS).resolve_cast([(None, "kyra")])
     cast = seu.make_ctx(se, ws, mode="shots", members=members)
     prompt = se.build_plan_prompt(cast, [], [])
@@ -1642,10 +1650,10 @@ def test_rst26b_critic_retry_and_code_only_round(ws, tmp_path, monkeypatch, caps
     assert "critic round 1: no valid reply after 2 call(s); code-only round\n" in out
     assert "round 1: 0 hard, 4 advisory\nstop: passed; best round 1 (0 hard)\n" in out
     assert [(r["stage"], r["panel"]) for r in log] == [
-        ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3), ("critic", None),
-        ("critic", None), ("panel", 2)]
-    assert log[5]["argv"][-1].endswith(se.CRITIC_RETRY_SUFFIX)
-    assert "- " + _t2(2) + "\n" in log[6]["argv"][-1]
+        ("plan", None), ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3),
+        ("critic", None), ("critic", None), ("panel", 2)]
+    assert log[6]["argv"][-1].endswith(se.CRITIC_RETRY_SUFFIX)
+    assert "- " + _t2(2) + "\n" in log[7]["argv"][-1]
     critic1 = _read_json(os.path.join(_rounds(ctx, 1), "critic.json"))
     assert critic1 == {"route": "local", "calls": 2, "reply": None, "applied": [], "rejected": []}
 
@@ -1657,10 +1665,11 @@ def test_rst33_stop_passed(ws, tmp_path, monkeypatch, capsys):
         "beats may be static, and the latest static beats are kept as the deliberate holds"]
         + FIXTURE_N1)
     assert capsys.readouterr().out == (
-        "plan: call 1 of 2\npanel 1/3: call 1\npanel 2/3: call 1\npanel 3/3: call 1\n"
+        "plan: call 1 of 2\nplan: call 2 of 2\nWarning: end frames dropped after 2 attempts; "
+        "this story has no seam report\npanel 1/3: call 1\npanel 2/3: call 1\npanel 3/3: call 1\n"
         "round 0: 0 hard, 4 advisory\nstop: passed; best round 0 (0 hard)\n")
     assert [r["stage"] for r in log].count("critic") == 0
-    assert [r["env_preflight"] for r in log] == [None, "1", "1", "1"]
+    assert [r["env_preflight"] for r in log] == [None, "1", "1", "1", "1"]
     checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
     assert (checks["stop_reason"], checks["best_round"], checks["round"]) == ("passed", 0, 0)
     assert checks["scores"] is None and checks["unresolved"] == []
@@ -1826,7 +1835,8 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     assert sorted(os.listdir(_rounds(ctx, 0))) == [
         "panel_01_prompt_1.txt", "panel_01_reply_1.txt", "panel_02_prompt_1.txt",
         "panel_02_reply_1.txt", "panel_03_prompt_1.txt", "panel_03_reply_1.txt", "parts.json",
-        "plan.json", "plan_prompt.txt", "plan_reply_1.txt", "story.md", "story_checks.json"]
+        "plan.json", "plan_prompt.txt", "plan_reply_1.txt", "plan_reply_2.txt", "story.md",
+        "story_checks.json"]
     assert sorted(os.listdir(_rounds(ctx, 1))) == [
         "critic.json", "critic_prompt_1.txt", "critic_reply_1.txt", "parts.json", "plan.json",
         "story.md", "story_checks.json"]
@@ -1835,8 +1845,9 @@ def test_rst39_outputs_and_layout(ws, tmp_path, monkeypatch):
     assert (round1["round"], round1["stop_reason"], round1["best_round"], round1["rounds"],
             round1["unresolved"]) == (1, None, None, [], [])
     run_doc = _read_json(os.path.join(_rounds(ctx), "run.json"))
-    assert [c["stage"] for c in run_doc["calls"]] == ["plan", "panel", "panel", "panel", "critic"]
-    assert run_doc["calls"][4]["route"] == "local" and run_doc["exit"] == 0
+    assert [c["stage"] for c in run_doc["calls"]] == ["plan", "plan", "panel", "panel", "panel",
+                                                      "critic"]
+    assert run_doc["calls"][5]["route"] == "local" and run_doc["exit"] == 0
     with open(os.path.join(ctx.story_dir, "story.md")) as f:
         assert "Motion: " + CALM + " The camera tracks alongside the movement.\n" in f.read()
 
@@ -1867,7 +1878,7 @@ def test_rst55b_p13_forces_plan_call_2(ws, tmp_path, monkeypatch, story_env):
     bad = seu.plan_json("chained", 3)
     bad["cast"][1]["phrase"] = "the ronin"
     rc, advisories, ctx, log = _run(ws, tmp_path, monkeypatch, plan=[seu.answer(bad)])
-    assert rc == 0 and [r["stage"] for r in log][:2] == ["plan", "panel"]
+    assert rc == 0 and [r["stage"] for r in log][:3] == ["plan", "plan", "panel"]
     assert ("plan: P13 undeclared character: c2's phrase names library character ronin by its "
             "referring phrase 'the ronin'; " + _p13()) in advisories
 
@@ -2453,7 +2464,7 @@ def test_rst51_e2e_chained(movie, tmp_path, monkeypatch):
     with open(os.path.join(story_dir, "story_prompt.txt")) as f:
         assert f.read() == ltx_movie.build_story_prompt(NARRATIVE, "e1", 3, False, False,
                                                         seconds="6")
-    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "panel"]
     assert all("--max-rounds" in r["argv"] and r["argv"][r["argv"].index("--max-rounds") + 1] == "1"
                for r in log)
 
@@ -2624,9 +2635,13 @@ def test_rst47_robust_dry_run(tmp_path, story_env, monkeypatch):
             assert argv[argv.index("--image") + 1] == os.path.join(story_dir, "seed_downscaled.png")
         assert argv[-1].startswith('You are planning a short narrated movie (story-id "rst47-')
         assert block[block.index("Rendered plan prompt:") + 1].startswith("You are planning")
-        assert not [line for line in proc.stdout.splitlines() if "{" in line or "}" in line]
+        chained = "--no-stills" not in flags and "--shots" not in flags
+        assert (se.plan_reference(False) in proc.stdout) == chained, flags
+        reference = set(se.plan_reference(False).splitlines()) if chained else set()
+        assert not [line for line in proc.stdout.splitlines()
+                    if ("{" in line or "}" in line) and line not in reference], flags
         phase1 = "\n".join(block)
-        assert not [s for s in FORBIDDEN_IN_PHASE1 if s in phase1], flags
+        assert not [s for s in FORBIDDEN_IN_PHASE1 if s not in ("{", "}") and s in phase1], flags
     assert not os.path.exists(story_dir)
     os.remove(catalog_path)
     proc = _dry_run("rst47b-%d" % os.getpid())
@@ -2954,12 +2969,16 @@ def test_pacing_camera_sentences_classify_as_before(ws):
     lib = se._character_lib(WS)
     phrases = [c["phrase"] for c in plan["cast"] if c["phrase"]]
     sentences = dict(se.CAMERA_SENTENCES)
-    assert len(sentences) == 9
+    assert len(sentences) == 14
     old = {"slow push-in": "The camera slowly pushes in.", "slow pull-back": "The camera slowly pulls back.",
            "slow pan left": "The camera slowly pans left.", "slow pan right": "The camera slowly pans right.",
            "slow tilt up": "The camera slowly tilts up.", "slow tilt down": "The camera slowly tilts down.",
            "static": sentences["static"], "tracking": sentences["tracking"],
-           "handheld": sentences["handheld"]}
+           "handheld": sentences["handheld"],
+           "slow tracking left": sentences["slow tracking left"],
+           "slow tracking right": sentences["slow tracking right"],
+           "slow crane up": sentences["slow crane up"],
+           "slow crane down": sentences["slow crane down"], "slow orbit": sentences["slow orbit"]}
     for key, sentence in sentences.items():
         # same classification as the pre-change sentence; "static" is True for all three
         # (CAMERA_MOTION_RE lists static/holds as camera-direction words)

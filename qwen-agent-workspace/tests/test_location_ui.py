@@ -63,7 +63,7 @@ def _upload(s, data):
 
 def test_lu1_the_location_routes_need_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 54
+    assert len(srv.ROUTES) == 55
     assert [(m, sample) for m, _r, _n, sample in srv.ROUTES if "/locations" in sample] == NEW_ROUTES
     for method, regex, name, sample in srv.ROUTES:
         if (method, sample) not in NEW_ROUTES:

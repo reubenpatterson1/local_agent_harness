@@ -472,6 +472,7 @@
     gate($("#c-run-all"), $("#c-run-all-reason"), mode === "no_stills" ? ["render"] : ["render", "stills"]);
     gate($("#c-write-story"), $("#c-write-story-reason"), []);
     gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
+    show($("#c-check-seams-box"), mode === "chained");
   }
 
   async function uploadFile(file) {
@@ -578,7 +579,11 @@
     });
     $("#c-validate").addEventListener("click", validate);
     $("#c-write-story").addEventListener("click", function () { S.composeAction = "story"; submit(composeFields("story")); });
-    $("#c-run-all").addEventListener("click", function () { S.composeAction = "movie"; submit(composeFields("movie")); });
+    $("#c-run-all").addEventListener("click", function () {
+      S.composeAction = "movie";
+      submit(Object.assign(composeFields("movie"),
+                           {check_seams: $("#c-mode").value === "chained" && $("#c-check-seams").checked}));
+    });
     $("#c-model").addEventListener("change", loadCatalog);
   }
 
@@ -703,6 +708,27 @@
     updateNewBatch();
   }
 
+  function showSeams(data) {
+    const chained = data.plan_mode === "chained";
+    show($("#s-seams"), Boolean(data.end_frames));
+    show($("#s-seams-box"), chained);
+    const body = clear($("#s-seams-table tbody"));
+    const report = data.end_frames ? data.seams : null;
+    show($("#s-seams-table"), Boolean(report));
+    if (!chained) { return; }
+    if (!data.end_frames) { $("#s-seams-summary").textContent = "This plan has no end frames; no seam report."; return; }
+    if (!report) { $("#s-seams-summary").textContent = "No seam report yet: press Check seams."; return; }
+    const s = report.summary || {};
+    $("#s-seams-summary").textContent = "Mean score " + (s.mean_score === null || s.mean_score === undefined ? "n/a" : s.mean_score)
+      + " over " + s.scored + " scored panel(s); " + s.missed + " missed (a score below " + report.threshold + ").";
+    (Array.isArray(report.panels) ? report.panels : []).forEach(function (p) {
+      if (!p || typeof p !== "object") { return; }
+      body.appendChild(el("tr", {cls: p.verdict === "missed" ? "seam-missed" : ""}, [
+        el("td", {text: String(p.panel)}), el("td", {text: p.score === null ? "-" : String(p.score)}),
+        el("td", {text: p.verdict}), el("td", {text: p.reason})]));
+    });
+  }
+
   async function openStory(storyId) {
     showTab("stories");
     const res = await api("GET", "/api/stories/" + enc(storyId) + wsQuery());
@@ -739,6 +765,7 @@
     regen.value = lastPanels !== null && lastPanels !== undefined ? String(lastPanels) : "";
     regen.placeholder = res.data.checks && res.data.checks.panels ? String(res.data.checks.panels) : "";
     $("#s-action-status").textContent = res.data.last_fields ? "" : "no earlier job for this story: Render opens Compose with only its ID";
+    showSeams(res.data);
   }
 
   async function saveStory() {
@@ -789,6 +816,12 @@
         .filter(function (n) { return Number.isInteger(n) && n > 0; });
       const res = await submit(Object.assign(storyFields("redo"), {redo: panels, mode: "shots"}));
       $("#s-action-status").textContent = res.status === 201 ? "queued" : "refused; see Compose checks";
+    });
+    $("#s-seams").addEventListener("click", async function () {
+      const res = await api("POST", "/api/stories/" + enc(S.story.id) + "/seams", {ws: S.ws});
+      $("#s-action-status").textContent = res.status === 201 ? "seams check queued as job " + res.data.job.id
+        : ((res.data && res.data.error) || ("http " + res.status));
+      if (res.status === 201) { pollJobs(); }
     });
   }
 

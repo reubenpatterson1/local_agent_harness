@@ -41,20 +41,28 @@ SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each
 
 def shot_types(narration):
     return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
-# Shot prompt format spec SF1, D1: moves first, static last; the pasted sentence is the fallback
-# when the writer writes no camera sentence (SF6).
+# Shot prompt format spec SF1, D1; chained end frames spec CE1, D2: moves first, static last; the
+# pasted sentence is the fallback when the writer writes no camera sentence (SF6).
 CAMERA_SENTENCES = (
     ("slow push-in", "The camera pushes in."),
     ("slow pull-back", "The camera pulls back."),
     ("tracking", "The camera tracks alongside the movement."),
+    ("slow tracking left", "The camera tracks left alongside the movement."),
+    ("slow tracking right", "The camera tracks right alongside the movement."),
     ("handheld", "The camera is handheld, with slight natural movement."),
     ("slow pan left", "The camera pans left."),
     ("slow pan right", "The camera pans right."),
     ("slow tilt up", "The camera tilts up."),
     ("slow tilt down", "The camera tilts down."),
+    ("slow crane up", "The camera cranes up."),
+    ("slow crane down", "The camera cranes down."),
+    ("slow orbit", "The camera arcs around the subject in a partial orbit."),
     ("static", "The camera stays static."),
 )
 CAMERA_KEYS = tuple(key for key, _ in CAMERA_SENTENCES)
+# Chained end frames spec CE1, D2: the plan prompt offers every key but plain "tracking", so a
+# new plan names the tracking direction; "tracking" stays valid for P8 and old plans.
+PLAN_CAMERA_KEYS = tuple(key for key in CAMERA_KEYS if key != "tracking")
 
 
 def max_static(panels):
@@ -351,10 +359,10 @@ PLAN_PROMPT_TEMPLATE = (
     "of steps, with no on-screen text. shot is exactly one of: @@SHOT_LIST@@. "
     "camera is exactly one of: @@CAMERA_LIST@@.@@CAMERA_RULE@@ location is the id of the place where the beat "
     "happens. cast is the list of ids of the characters on screen in the beat, at most "
-    "@@MAX_CAST@@.@@SPEAKER_RULE@@@@LINES_RULE@@\n"
+    "@@MAX_CAST@@.@@SPEAKER_RULE@@@@LINES_RULE@@@@END_FRAME_RULE@@\n"
     "loras: @@LORA_PARAGRAPH@@\n"
     "\n"
-    "@@MODE_RULES@@" + NO_TOOL_SENTENCE)
+    "@@MODE_RULES@@@@PLAN_REFERENCE@@" + NO_TOOL_SENTENCE)
 
 MODE_PARAGRAPHS = {
     "chained": ("it is ONE continuous take, built @@SECONDS@@ seconds at a time. Panel 1 starts "
@@ -408,8 +416,18 @@ CAMERA_RULE = (" Give every beat one camera move from this list, and use static 
                "deliberate hold: at most one beat in three may be static, so at most "
                "@@MAX_STATIC@@ in this movie.")
 CAMERA_SPEAKING_SENTENCE = (" On a beat with a speaker, prefer slow push-in, slow pull-back, "
-                            "tracking or handheld, and never use a pan or a tilt, which sweeps "
-                            "the speaker's face out of the frame.")
+                            "slow tracking left, slow tracking right or handheld, and never use a "
+                            "pan, a tilt, a crane or an orbit, which sweep the speaker's face out "
+                            "of the frame.")
+# Chained end frames spec CE4, D1: the planner's end frame of every chained beat.
+END_FRAME_RULE = (" end_frame is one sentence of 8 to 30 words, in the present tense, of the "
+                  "frame the beat ends on: who or what is in frame, where each one is (left, "
+                  "centre or right; foreground or background), which way they face and how tight "
+                  "the shot is. It never names a camera move, the lighting, a colour or a style, "
+                  "has no spoken words and no double quotes, and names only characters in the "
+                  "beat's cast. Beat k's end frame is exactly where beat k+1 begins; write beat "
+                  "k+1's action so it starts from that composition. The last beat's end frame "
+                  "closes the story.")
 # Pinned cast presence spec PC5, D3: in chained mode a declared character still in frame stays
 # in a speaking beat, silent.
 SPEAKER_RULE_KEEP_CAST = (
@@ -666,6 +684,17 @@ def _mentions_at(words, mentions, end=None, start=None):
         if span == tokens:
             hits[cid] = max(hits.get(cid, 0), n)
     return hits
+
+
+def _named_ids(words, mentions):
+    """The cast ids, in mention order without repeats, whose mention ([(cast id, words)], as
+    _mentions) occurs as consecutive words of words (chained end frames spec CE6, CE9)."""
+    out = []
+    for cid, tokens in mentions:
+        n = len(tokens)
+        if cid not in out and any(words[i:i + n] == tokens for i in range(len(words) - n + 1)):
+            out.append(cid)
+    return out
 
 
 def _speaker_before(words, mentions):
@@ -1113,6 +1142,9 @@ def build_plan_prompt(ctx, compatible, pins):
     if ctx.seed_agent_image:
         seed = (SEED_PARAGRAPH[:-2] + SEED_CAST_SENTENCE + "\n\n" if ctx.members
                 else SEED_PARAGRAPH)
+    beat_keys = "cast, speaker and lines" if lines else "cast and speaker"
+    if ctx.mode == "chained":
+        beat_keys = "cast, speaker, lines and end_frame" if lines else "cast, speaker and end_frame"
     fragments = [
         ("@@GOAL_PARAGRAPH@@", _goal_paragraph(ctx.goal)),
         ("@@MODE_PARAGRAPH@@", MODE_PARAGRAPHS[ctx.mode]),
@@ -1127,18 +1159,21 @@ def build_plan_prompt(ctx, compatible, pins):
             + (PANEL_COUNT_LINES_SENTENCE if lines else ""))),
         ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
          + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
-        ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
+        ("@@CAMERA_LIST@@", ", ".join(PLAN_CAMERA_KEYS)),
         ("@@CAMERA_RULE@@", CAMERA_RULE + ("" if ctx.narration is False
                                            else CAMERA_SPEAKING_SENTENCE)),
         ("@@LORA_PARAGRAPH@@", lora),
         ("@@MODE_RULES@@", MODE_RULES[ctx.mode]),
         ("@@SPEAKER_RULE@@", SILENT_SPEAKER_RULE if ctx.narration is False
          else SPEAKER_RULE_KEEP_CAST if ctx.mode == "chained" and ctx.members else SPEAKER_RULE),
-        ("@@BEAT_KEYS@@", "cast, speaker and lines" if lines else "cast and speaker"),
+        ("@@BEAT_KEYS@@", beat_keys),
         ("@@LINES_RULE@@", (LINES_RULE + (LINES_PINNED_SENTENCE
                                           if ctx.members and ctx.mode != "chained" else "")
                          + said)
          if lines else ""),
+        ("@@END_FRAME_RULE@@", END_FRAME_RULE if ctx.mode == "chained" else ""),
+        ("@@PLAN_REFERENCE@@", plan_reference(bool(lines))
+         if ctx.mode == "chained" and ctx.narration is not False else ""),
     ]
     # character_lib is loaded only for a narrative with spoken lines, so an uncast dry run still
     # never loads it (test_rst47, test_s53).
@@ -1313,6 +1348,11 @@ def normalize_plan(ctx, raw):
             "cast": [_clean_str(c) if isinstance(c, str) else json.dumps(c) for c in beat_cast],
             "speaker": _clean_str(item.get("speaker")),
             "lines": _clean_lines(item.get("lines"))})
+        # Chained end frames spec CE3, D1: a chained beat keeps its end frame; the key is present
+        # only when the planner wrote one.
+        end_frame = _clean_str(item.get("end_frame")) if ctx.mode == "chained" else ""
+        if end_frame:
+            beats[-1]["end_frame"] = end_frame
     if ctx.locations:
         by_name = dict((pin.name, "l%d" % i) for i, pin in enumerate(ctx.locations, start=1))
         for beat in beats:
@@ -1342,7 +1382,8 @@ def normalize_plan(ctx, raw):
 # Narrative dialogue fidelity spec SM1; shot prompt format spec SF4, D2: a speaking beat may be
 # a medium shot, and its camera pushes in, pulls back, tracks, is handheld or stays static.
 SPEAKING_SHOTS = ("medium shot", "medium close-up", "close-up")
-SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
+SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "slow tracking left",
+                    "slow tracking right", "handheld", "static")
 
 
 def speaking_camera(beat):
@@ -1447,6 +1488,121 @@ def line_assignment_problems(plan):
             "lines of the beat whose action surrounds it in the narrative, and give that beat a "
             "speaker" % (n, line, n)
             for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
+
+
+# Chained end frames spec CE6, D3, D4: the end frame checks. P22 and P24 make the plan call
+# retry and never enter a state; P23 is a plan_checks advisory.
+END_FRAME_WORDS = (8, 30)
+P22_MISSING = ("beat %d: P22 end frame: end_frame is missing or empty; write one sentence of 8 "
+               "to 30 words of the frame this beat ends on: who or what is in frame, where (left, "
+               "centre or right; foreground or background), which way they face and how tight "
+               "the shot is")
+P22_LENGTH = "beat %d: P22 end frame: end_frame is %d words; write one sentence of 8 to 30 words"
+P24_MESSAGE = ("plan: P24 reference copy: %s copies the plan reference (%s); write only this "
+               "movie's own people, places, objects and words")
+END_FRAMES_DROPPED = ("Warning: end frames dropped after %d attempts; this story has no seam "
+                      "report")
+
+
+def plan_end_frame_problems(ctx, plan):
+    """The P22 messages of a chained plan, in beat order (CE6): a beat with no end frame, or one
+    whose word count (_words) is outside END_FRAME_WORDS. [] in shots and no_stills."""
+    if ctx.mode != "chained":
+        return []
+    out = []
+    for k, beat in enumerate(plan["beats"], start=1):
+        text = beat.get("end_frame", "")
+        if not text:
+            out.append(P22_MISSING % k)
+        elif not END_FRAME_WORDS[0] <= _words(text) <= END_FRAME_WORDS[1]:
+            out.append(P22_LENGTH % (k, _words(text)))
+    return out
+
+
+def end_frame_advisories(ctx, lib, plan):
+    """The P23 advisories of a chained plan's end frames, in beat order, at most one of each kind
+    per beat (CE6, D4): a cast entry outside the beat's cast; a camera word (a CAMERA_CLAUSE_RE
+    match, else a CAMERA_MOTION_RE word other than the static words and follow/follows); an N3
+    word (_APPEARANCE_RE with the cast phrases and prop names blanked); a speaking verb
+    (DIALOGUE_RE); a straight or curly double quote."""
+    if ctx.mode != "chained":
+        return []
+    still = CAMERA_MOVE_WORDS["static"] + ("follow", "follows")
+    mentions = _mentions(plan["cast"])
+    names = cast_phrases(ctx, plan) + [p["name"] for p in plan["props"] if p.get("name")]
+    out = []
+    for k, beat in enumerate(plan["beats"], start=1):
+        text = beat.get("end_frame", "")
+        if not text:
+            continue
+        prefix = "beat %d: P23 end frame content:" % k
+        stray = [c for c in _named_ids(line_words(text), mentions) if c not in beat["cast"]]
+        if stray:
+            out.append("%s names %s, who is not in beat %d's cast"
+                       % (prefix, _q(speaker_phrase_of(plan, stray[0])), k))
+        clause = CAMERA_CLAUSE_RE.search(text)
+        word = (" ".join(clause.group(0).lower().split()) if clause else
+                next((w for w in _camera_words(text) if w not in still), None))
+        if word:
+            out.append("%s says %s; an end frame describes the frame, never a camera move"
+                       % (prefix, _q(word)))
+        word = _first(_APPEARANCE_RE, lib._blank(text, lib._passage_spans(text, names)))
+        if word:
+            out.append("%s says %s; an end frame never describes appearance, clothing, setting, "
+                       "lighting, colour or style" % (prefix, _q(word)))
+        word = _first(DIALOGUE_RE, text)
+        if word:
+            out.append("%s says %s; an end frame has no spoken words" % (prefix, _q(word)))
+        if any(q in text for q in _DOUBLE_QUOTES):
+            out.append("%s contains a double quote; double quotes are kept for spoken lines"
+                       % prefix)
+    return out
+
+
+def plan_copy_problems(ctx, plan, end_frames=True):
+    """The P24 messages of a chained plan shown PLAN_REFERENCE (CE6): every model-written field
+    (title, logline, a non-library cast entry's phrase and descriptor, a non-library location's
+    setting, prop names, beat actions and, with end_frames, beat end frames) that contains a
+    REFERENCE_TERMS term or a PLAN_REFERENCE_SIX_GRAMS run, leaving out any the narrative, the
+    goal, a library character's phrase or descriptor or a library location's description already
+    has. [] unless ctx.mode is chained and ctx.narration is not False."""
+    if ctx.mode != "chained" or ctx.narration is False:
+        return []
+    own = ([ctx.narrative or "", ctx.goal or ""] + [m.phrase for m in ctx.members]
+           + [m.descriptor for m in ctx.members] + [pin.description for pin in ctx.locations])
+    own_words = [line_words(t) for t in own]
+    own_line = " " + " | ".join(" ".join(w) for w in own_words) + " "
+    own_grams = set(g for w in own_words for g in _six_grams(w))
+    texts = [("the title", plan["title"]), ("the logline", plan["logline"])]
+    for c in plan["cast"]:
+        if not c.get("cast_name"):
+            texts += [("%s's phrase" % c["id"], c["phrase"]),
+                      ("%s's descriptor" % c["id"], c["descriptor"])]
+    texts += [("%s's setting" % l["id"], l["setting"]) for l in plan["locations"]
+              if not l.get("location_name")]
+    texts += [("%s's name" % p["id"], p["name"]) for p in plan["props"]]
+    texts += [("beat %d's action" % k, b["action"]) for k, b in enumerate(plan["beats"], start=1)]
+    if end_frames:
+        texts += [("beat %d's end frame" % k, b.get("end_frame", ""))
+                  for k, b in enumerate(plan["beats"], start=1)]
+    out = []
+    for where, text in texts:
+        words = line_words(text or "")
+        line = " " + " ".join(words) + " "
+        hits = [t for t in REFERENCE_TERMS
+                if (" %s " % " ".join(line_words(t))) in line
+                and (" %s " % " ".join(line_words(t))) not in own_line]
+        hits += [" ".join(g) for g in sorted((_six_grams(words) & PLAN_REFERENCE_SIX_GRAMS)
+                                             - own_grams)]
+        if hits:
+            out.append(P24_MESSAGE % (where, ", ".join(_q(h) for h in hits[:3])))
+    return out
+
+
+def drop_end_frames(plan):
+    """Remove every beat's end frame, in place (CE7)."""
+    for beat in plan["beats"]:
+        beat.pop("end_frame", None)
 
 
 def assign_missing_lines(ctx, plan):
@@ -1664,7 +1820,8 @@ SPEAKING_CAMERA = "The camera stays static."
 # the place of the planned camera sentence in the assembled field.
 CAMERA_MOTION_RE = re.compile(r"\b(?:static|still|holds?|locked-off|push(?:es)?\s+in|push-in|"
                               r"pull(?:s)?\s+back|pull-back|pans?|tilts?|tracks?|tracking|dolly|"
-                              r"dollies|zooms?|orbits?|cranes?|handheld|follows?)\b", re.IGNORECASE)
+                              r"dollies|zooms?|orbits?|arcs?|cranes?|handheld|follows?)\b",
+                              re.IGNORECASE)
 
 
 def _sentences(text):
@@ -1697,11 +1854,18 @@ CAMERA_MOVE_WORDS = {
     "slow pull-back": ("pull back", "pulls back", "pull-back", "dolly", "dollies", "zoom",
                        "zooms"),
     "tracking": ("track", "tracks", "tracking", "follow", "follows", "dolly", "dollies"),
+    "slow tracking left": ("track", "tracks", "tracking", "follow", "follows", "dolly",
+                           "dollies"),
+    "slow tracking right": ("track", "tracks", "tracking", "follow", "follows", "dolly",
+                            "dollies"),
     "handheld": ("handheld",),
     "slow pan left": ("pan", "pans"),
     "slow pan right": ("pan", "pans"),
     "slow tilt up": ("tilt", "tilts"),
     "slow tilt down": ("tilt", "tilts"),
+    "slow crane up": ("crane", "cranes"),
+    "slow crane down": ("crane", "cranes"),
+    "slow orbit": ("orbit", "orbits", "arc", "arcs"),
     "static": ("static", "still", "hold", "holds", "locked-off"),
 }
 CAMERA_CLAUSE_RE = re.compile(
@@ -1716,6 +1880,25 @@ REPAIR_NOTE = "panel %d: %s %s: %s: the pipeline removed %s"
 def _camera_words(sentence):
     """The CAMERA_MOTION_RE words of a sentence, lower case, whitespace collapsed, in order."""
     return [" ".join(m.group(0).lower().split()) for m in CAMERA_MOTION_RE.finditer(sentence)]
+
+
+# Chained end frames spec CE2, D6 (M1): the words after "as the move completes" or "holding"
+# describe the subject at the end frame, not the camera.
+END_CLAUSE_RE = re.compile(r"\bas\s+the\s+move\s+completes\b|\bholding\b", re.IGNORECASE)
+
+
+def camera_head(sentence):
+    """The part of a camera sentence before its first END_CLAUSE_RE match, or the whole sentence
+    when it has none (CE2)."""
+    match = END_CLAUSE_RE.search(sentence)
+    return sentence[:match.start()] if match else sentence
+
+
+def end_clause(sentence):
+    """The words of a camera sentence after its first END_CLAUSE_RE match, stripped of the
+    characters " ,;:—–-.!?" at both ends, or "" when it has none (CE2, CE9)."""
+    match = END_CLAUSE_RE.search(sentence)
+    return sentence[match.end():].strip(" ,;:—–-.!?") if match else ""
 
 
 def camera_directions(lib, text, phrases):
@@ -1733,14 +1916,15 @@ def camera_directions(lib, text, phrases):
 
 
 def _mixed_camera(sentence):
-    """True when a camera sentence both keeps the camera still and moves it."""
-    words = _camera_words(sentence)
+    """True when a camera sentence both keeps the camera still and moves it. Only the words before
+    the end clause count (CE2, M1)."""
+    words = _camera_words(camera_head(sentence))
     return (any(w in STATIC_CAMERA_WORDS for w in words)
             and any(w not in CAMERA_MOVE_WORDS["static"] for w in words))
 
 
 def _names_camera(sentence, key):
-    return any(w in CAMERA_MOVE_WORDS[key] for w in _camera_words(sentence))
+    return any(w in CAMERA_MOVE_WORDS[key] for w in _camera_words(camera_head(sentence)))
 
 
 def camera_problem(lib, text, phrases, key):
@@ -2265,6 +2449,8 @@ def plan_checks(ctx, plan, shape=()):
                 if c in valid["cast"] and c not in opening:
                     advisory.append("beat %d: P12 new character: %s is not in the opening frame; "
                                     "their look is left to the video model" % (k, c))
+    # Chained end frames spec CE6, D4: P23, the end frame content (advisory).
+    advisory += end_frame_advisories(ctx, lib, plan)
     # Pinned cast presence spec PC1, D1: every library character is in some beat's cast.
     on_screen = set(c for beat in beats for c in beat["cast"])
     for entry in plan["cast"]:
@@ -2502,58 +2688,67 @@ COPIED_EXAMPLES = (
 )
 # Shot prompt format spec SF8, D9: three finished shots of an unrelated movie, shown to the
 # chained and shots writer for their order only. Each "Shot N" text is exactly
-# character_lib.panel_prompt of its parts (SFT13).
+# character_lib.panel_prompt of its parts (SFT13); chained end frames spec CE11: the finished
+# shots of PLAN_REFERENCE's beats, with opens-on and ends-on labels.
 FORMAT_REFERENCE = (
     "FORMAT REFERENCE ONLY — never reuse its people, places, objects or words. These are the "
-    "finished video prompts of three shots from a different movie. They show the order of every "
-    "finished shot: the shot type; the action; when someone speaks, the spoken line and then one "
-    "short reaction by the speaker; the one camera sentence, which says where the move ends; and "
-    "the audio last. The pipeline wrote the sentences that start \"The shot is\", the sentence "
-    "\"The old fishmonger faces the camera.\", the spoken line and the audio sentence; the "
-    "writer wrote every other sentence.\n"
-    "Shot 1 (silent; the camera tracks): The shot is a wide shot. The old fishmonger drags a "
-    "tall stack of empty herring crates across the wet concrete of the market hall toward the "
+    "finished video prompts of three shots from a different movie. They show the order of "
+    "every finished shot: the shot type; the action; when someone speaks, the spoken line and "
+    "then one short reaction by the speaker; the one camera sentence, which says where the "
+    "move ends; and the audio last. The pipeline wrote the sentences that start 'The shot "
+    "is', the sentence 'The old fishmonger faces the camera.', the spoken line and the "
+    "audio sentence; the writer wrote every other sentence. Each label names the frame its "
+    "shot opens on and the frame it ends on: the action starts from the opening frame without "
+    "describing it, and the words after 'as the move completes,' or 'holding' in the camera "
+    "sentence describe the end frame. Double quotes appear only around the spoken line.\n"
+    "Shot 1 (silent; the camera tracks right; ends on: The old fishmonger stands beside the "
+    "half-open shutter at frame centre, facing left toward the hall, seen from the knees up, "
+    "the empty crates at her feet): The shot is a medium shot. The old fishmonger drags a tall "
+    "stack of empty herring crates across the wet concrete of the market hall toward the "
     "half-open shutter at real-time speed, her heavy steps splashing through shallow puddles "
-    "that hold the first glow from the harbour doors. The camera tracks alongside her from the "
-    "left — as the move completes, she reaches the shutter at frame centre, the long rows of "
-    "bare zinc counters stretching away behind her. The audio is the natural ambient sound of "
-    "the place, with no music.\n"
-    "Shot 2 (speaking; the camera pushes in): The shot is a medium shot. The old fishmonger "
-    "looks up from the empty ice trays to the camera, drying her knuckles on a folded cloth at "
-    "the zinc counter at real-time speed. The old fishmonger faces the camera. The old "
-    "fishmonger says, \"Forty years of mornings.\" After a breath, \"Not one more.\" The old "
-    "fishmonger lets the folded cloth drop onto the counter, her shoulders sinking. The camera "
-    "pushes in — as the move completes, her face fills the frame from chin to brow, the bare "
-    "counters soft behind her. The audio is clear close-mic dialogue with a subtle natural room "
-    "tone; the dialogue takes priority over the quiet ambience, and there is no music.\n"
-    "Shot 3 (silent; the movie's one deliberate static hold): The shot is a close-up. The old "
-    "fishmonger presses her forehead against the cold ribs of the half-closed steel shutter at "
-    "real-time speed, both palms flat on the metal, her breath fogging the ribbed steel as a "
-    "thin trickle of meltwater runs past her knuckles and drips onto the wet concrete at her "
-    "feet. The camera stays static, holding her face, her knuckles and the ribbed steel tight in "
-    "the frame as her eyelids drop shut and the shutter stops trembling. The audio is the "
-    "natural ambient sound of the place, with no music.\n\n")
+    "that hold the first glow from the harbour doors. The camera tracks right alongside her — "
+    "as the move completes, the old fishmonger stands beside the half-open shutter at frame "
+    "centre, facing left toward the hall, seen from the knees up, the empty crates at her "
+    "feet. The audio is the natural ambient sound of the place, with no music.\n"
+    "Shot 2 (speaking; the camera pushes in; opens on: The old fishmonger stands beside the "
+    "half-open shutter at frame centre, facing left toward the hall, seen from the knees up, "
+    "the empty crates at her feet; ends on: The old fishmonger stands behind the zinc counter "
+    "at frame centre, facing forward, her face filling the frame from chin to brow): The shot "
+    "is a medium shot. The old fishmonger turns back from the shutter and walks to the zinc "
+    "counter at real-time speed, laying her folded cloth beside the empty ice trays and "
+    "lifting her face to the camera. The old fishmonger faces the camera. The old fishmonger "
+    "says, \"Forty years of mornings.\" After a breath, \"Not one more.\" The old fishmonger "
+    "presses both palms flat on the folded cloth, her shoulders sinking. The camera pushes in "
+    "— as the move completes, the old fishmonger stands behind the zinc counter at frame "
+    "centre, facing forward, her face filling the frame from chin to brow. The audio is clear "
+    "close-mic dialogue with a subtle natural room tone; the dialogue takes priority over the "
+    "quiet ambience, and there is no music.\n"
+    "Shot 3 (silent; the movie's one deliberate static hold; opens on: The old fishmonger "
+    "stands behind the zinc counter at frame centre, facing forward, her face filling the "
+    "frame from chin to brow; ends on: The old fishmonger rests her forehead on her folded "
+    "hands at frame centre, eyes closed, her head and hands filling the frame in a close-up): "
+    "The shot is a close-up. The old fishmonger lowers her forehead onto her folded hands on "
+    "the cold zinc counter at real-time speed, her breath fogging the metal as a thin trickle "
+    "of meltwater runs past her knuckles and drips to the wet floor. The camera stays static, "
+    "holding the old fishmonger as she rests her forehead on her folded hands at frame centre, "
+    "eyes closed, her head and hands filling the frame. The audio is the natural ambient sound "
+    "of the place, with no music.\n"
+    "\n")
 # Shot prompt format spec SF12, D11: the reference's own names, props and wording.
 REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
                    "market hall", "fish market", "harbour doors", "meltwater",
-                   "forty years of mornings")
+                   "forty years of mornings", "half-open shutter")
 REFERENCE_COPY_SEGMENTS = (
     "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
     "the market hall toward the half-open shutter",
     "her heavy steps splashing through shallow puddles that hold the first glow from the "
     "harbour doors",
-    "she reaches the shutter at frame centre, the long rows of bare zinc counters stretching "
-    "away behind her",
-    "The old fishmonger looks up from the empty ice trays to the camera, drying her knuckles on "
-    "a folded cloth at the zinc counter",
-    "The old fishmonger lets the folded cloth drop onto the counter, her shoulders sinking",
-    "her face fills the frame from chin to brow, the bare counters soft behind her",
-    "The old fishmonger presses her forehead against the cold ribs of the half-closed steel "
-    "shutter",
-    "both palms flat on the metal, her breath fogging the ribbed steel as a thin trickle of "
-    "meltwater runs past her knuckles and drips onto the wet concrete at her feet",
-    "holding her face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
-    "shut and the shutter stops trembling",
+    "The old fishmonger turns back from the shutter and walks to the zinc counter",
+    "laying her folded cloth beside the empty ice trays",
+    "The old fishmonger presses both palms flat on the folded cloth, her shoulders sinking",
+    "The old fishmonger lowers her forehead onto her folded hands on the cold zinc counter",
+    "her breath fogging the metal as a thin trickle of meltwater runs past her knuckles and "
+    "drips to the wet floor",
     "Forty years of mornings. Not one more.",
 )
 
@@ -2568,14 +2763,16 @@ REFERENCE_SIX_GRAMS = frozenset(g for s in REFERENCE_COPY_SEGMENTS for g in _six
 def reference_copies(narrative, plan, text, goal=None):
     """The REFERENCE_TERMS terms and the six-word REFERENCE_COPY_SEGMENTS runs that text copies
     from FORMAT_REFERENCE, in that order (SF12), leaving out any that the narrative, the goal or
-    the plan (cast phrases and descriptors, settings, prop names, beat actions) already has."""
+    the plan (cast phrases and descriptors, settings, prop names, beat actions and end frames;
+    chained end frames spec CE11) already has."""
     own = [narrative or "", goal or ""]
     if plan:
         own += ([c.get("phrase") or "" for c in plan["cast"]]
                 + [c.get("descriptor") or "" for c in plan["cast"]]
                 + [l.get("setting") or "" for l in plan["locations"]]
                 + [p.get("name") or "" for p in plan["props"]]
-                + [b.get("action") or "" for b in plan["beats"]])
+                + [b.get("action") or "" for b in plan["beats"]]
+                + [b.get("end_frame") or "" for b in plan["beats"]])
     own_words = [line_words(t) for t in own]
     own_line = " " + " | ".join(" ".join(w) for w in own_words) + " "
     own_grams = set(g for w in own_words for g in _six_grams(w))
@@ -2586,6 +2783,99 @@ def reference_copies(narrative, plan, text, goal=None):
             and (" %s " % " ".join(line_words(t))) not in own_line]
     return hits + [" ".join(g) for g in sorted((_six_grams(words) & REFERENCE_SIX_GRAMS)
                                                - own_grams)]
+
+
+# Chained end frames spec CE5, D9: a complete three-beat planner reply of the FORMAT_REFERENCE
+# movie, shown to the chained planner for its format only.
+PLAN_REFERENCE_INTRO = ("FORMAT REFERENCE ONLY — never reuse its people, places, objects or "
+                        "words. This is the complete plan of a three-beat movie made as one "
+                        "continuous take, a different story from this one.%s It shows the format "
+                        "of every plan: each beat's end_frame says exactly where the beat ends, "
+                        "the next beat's action starts from that end frame, and the last end "
+                        "frame closes the story.\n")
+PLAN_REFERENCE_LINES_CLAUSE = (' Its narrative quoted two spoken lines: 1 "Forty years of '
+                               'mornings." and 2 "Not one more."')
+PLAN_REFERENCE_PLAN = {
+    "title": "The Last Morning at the Market",
+    "logline": ("At dawn an old fishmonger closes her market hall for the last time and says "
+                "goodbye to forty years of work."),
+    "cast": [{"id": "c1", "phrase": "the old fishmonger",
+              "descriptor": ("an old woman with a stooped build, weathered pale skin and short "
+                             "grey hair under a knitted cap, wearing a rubber apron over a thick "
+                             "wool jumper and tall rubber boots")}],
+    "locations": [{"id": "l1", "setting": (
+        "The setting is a covered fish market hall in a northern harbour town at dawn, wet "
+        "concrete underfoot, rows of bare zinc counters behind, under grey first light from the "
+        "harbour doors.")}],
+    "props": [{"id": "p1", "name": "the herring crates"}, {"id": "p2", "name": "the folded cloth"}],
+    "beats": [
+        {"index": 1, "arc": "introduction",
+         "action": ("The old fishmonger drags a tall stack of empty herring crates across the wet "
+                    "market hall to the half-open shutter."),
+         "shot": "medium shot", "camera": "slow tracking right", "location": "l1", "cast": ["c1"],
+         "speaker": "", "lines": [],
+         "end_frame": ("The old fishmonger stands beside the half-open shutter at frame centre, "
+                       "facing left toward the hall, seen from the knees up, the empty crates at "
+                       "her feet.")},
+        {"index": 2, "arc": "climax",
+         "action": ("From the shutter, the old fishmonger turns back into the hall and walks to "
+                    "the zinc counter, laying her folded cloth on it."),
+         "shot": "medium shot", "camera": "slow push-in", "location": "l1", "cast": ["c1"],
+         "speaker": "c1", "lines": [1, 2],
+         "end_frame": ("The old fishmonger stands behind the zinc counter at frame centre, "
+                       "facing forward, her face filling the frame from chin to brow.")},
+        {"index": 3, "arc": "resolution",
+         "action": ("The old fishmonger lowers her forehead onto her folded hands on the cold "
+                    "zinc counter and closes her eyes."),
+         "shot": "close-up", "camera": "static", "location": "l1", "cast": ["c1"],
+         "speaker": "", "lines": [],
+         "end_frame": ("The old fishmonger rests her forehead on her folded hands at frame "
+                       "centre, eyes closed, her head and hands filling the frame in a "
+                       "close-up.")},
+    ],
+    "loras": {"global": [], "per_beat": {}, "stills": []},
+}
+
+
+def _plan_reference_json(plan):
+    """The reference plan as JSON (CE5): title and logline on the first line, then one line each
+    for cast, locations and props, one line per beat, and loras; json.dumps defaults with
+    ensure_ascii=False, keys in dict order."""
+    def dump(value):
+        return json.dumps(value, ensure_ascii=False)
+    lines = ['{"title": %s, "logline": %s,' % (dump(plan["title"]), dump(plan["logline"]))]
+    lines += [' "%s": %s,' % (key, dump(plan[key])) for key in ("cast", "locations", "props")]
+    lines.append(' "beats": [')
+    last = len(plan["beats"]) - 1
+    lines += ["  " + dump(beat) + ("," if i < last else "],") for i, beat in enumerate(plan["beats"])]
+    lines.append(' "loras": %s}' % dump(plan["loras"]))
+    return "\n".join(lines)
+
+
+def plan_reference(lines):
+    """The @@PLAN_REFERENCE@@ text (CE5): with lines, the plan as written; without, every beat's
+    "lines" key and the spoken-lines sentence are left out, matching a prompt with no lines key."""
+    plan = copy.deepcopy(PLAN_REFERENCE_PLAN)
+    if not lines:
+        for beat in plan["beats"]:
+            del beat["lines"]
+    return ((PLAN_REFERENCE_INTRO % (PLAN_REFERENCE_LINES_CLAUSE if lines else ""))
+            + _plan_reference_json(plan) + "\n\n")
+
+
+# Chained end frames spec CE6, D9: P24 counts a six-word run only when it holds one of these.
+PLAN_REFERENCE_KEY_WORDS = frozenset(("fishmonger", "fishmongers", "herring", "herrings",
+                                      "crates", "zinc", "shutter", "cloth"))
+PLAN_REFERENCE_SEGMENTS = tuple(
+    [PLAN_REFERENCE_PLAN["title"], PLAN_REFERENCE_PLAN["logline"]]
+    + [c["descriptor"] for c in PLAN_REFERENCE_PLAN["cast"]]
+    + [l["setting"] for l in PLAN_REFERENCE_PLAN["locations"]]
+    + [p["name"] for p in PLAN_REFERENCE_PLAN["props"]]
+    + [b["action"] for b in PLAN_REFERENCE_PLAN["beats"]]
+    + [b["end_frame"] for b in PLAN_REFERENCE_PLAN["beats"]])
+PLAN_REFERENCE_SIX_GRAMS = frozenset(g for s in PLAN_REFERENCE_SEGMENTS
+                                     for g in _six_grams(line_words(s))
+                                     if set(g) & PLAN_REFERENCE_KEY_WORDS)
 _LABEL_RE = re.compile(r"^(?:title|image|motion|prompt|narration|dialogue)\s*:\s*",
                        re.IGNORECASE)
 _QUOTE_PAIRS = (('"', '"'), ("“", "”"))
@@ -2750,6 +3040,11 @@ CAMERA_WRITER_FORMS = {
                                      "wider frame then shows>.'"),
     "tracking": ("tracks the movement", "'The camera tracks <whom it follows> — as the move "
                                         "completes, <where the frame ends>.'"),
+    "slow tracking left": ("tracks left", "'The camera tracks left alongside <whom it follows> — "
+                                         "as the move completes, <where the frame ends>.'"),
+    "slow tracking right": ("tracks right", "'The camera tracks right alongside <whom it "
+                                            "follows> — as the move completes, <where the frame "
+                                            "ends>.'"),
     "handheld": ("moves handheld", "'The camera follows with handheld movement — as the move "
                                    "completes, <where the frame ends>.'"),
     "slow pan left": ("pans left", "'The camera pans left — as the move completes, <what the "
@@ -2760,6 +3055,13 @@ CAMERA_WRITER_FORMS = {
                                  "ends on>.'"),
     "slow tilt down": ("tilts down", "'The camera tilts down — as the move completes, <what the "
                                      "frame ends on>.'"),
+    "slow crane up": ("cranes up", "'The camera cranes up — as the move completes, <what the "
+                                   "frame ends on>.'"),
+    "slow crane down": ("cranes down", "'The camera cranes down — as the move completes, <what "
+                                       "the frame ends on>.'"),
+    "slow orbit": ("arcs around the subject in a partial orbit", "'The camera arcs around <whom "
+                   "it circles> in a partial orbit — as the move completes, <where the frame "
+                   "ends>.'"),
     "static": ("stays static", "'The camera stays static, holding <what stays in the frame>.'"),
 }
 # Shot prompt format spec SF7, D7: a shots speaking panel's reaction after the line, and the
@@ -2773,6 +3075,13 @@ SPEAKING_NO_REACTION_SENTENCE = (" The pipeline puts the spoken line right after
                                  "sentence, so write no other action sentence.")
 SPEAKING_STAY_SENTENCE = (" In this whole panel @@SPEAKER@@ never leaves, turns away or moves "
                           "out of the frame, even when the beat says so.")
+# Chained end frames spec CE8, D5: writer k starts from end frame k-1 and lands on end frame k.
+OPENS_ON_LINE = ("This panel opens on: %s Start the action from exactly this composition; do "
+                 "not describe it.\n")
+ENDS_ON_LINE = ("This panel ends on: %s The clause after 'as the move completes,' in your camera "
+                "sentence must describe this end frame.\n")
+ENDS_ON_STATIC_LINE = ("This panel ends on: %s The words after 'holding' in your camera "
+                       "sentence must describe this end frame.\n")
 FIX_INSTRUCTION = ("\nFix only these problems. Keep every camera direction, every descriptive "
                    "sentence and the dialogue word for word, and change only the sentence or "
                    "sentences that cause them.")
@@ -2912,13 +3221,26 @@ def _clean_dialogue(lib, text, phrase):
     return lib.clean_line(text)
 
 
+# Chained end frames spec CE10, D8: double quotes in a final video prompt are kept for the
+# spoken line, so the writer's action text is written with apostrophes.
+_DOUBLE_QUOTES = ('"', "“", "”")
+
+
+def reserve_quotes(text):
+    """text with every straight or curly double quote turned into an apostrophe (CE10)."""
+    for quote in _DOUBLE_QUOTES:
+        text = text.replace(quote, "'")
+    return text
+
+
 def panel_fields(ctx, plan, parts, k):
     """[(Label, assembled text)] of panel k in file order (RS14; dialogue spec SP4): Image: where
     the mode has one (setting, identities, writer image, facing, shot), Motion: or Prompt: (the
     writer text, then the pasted sentences; the planned camera sentence is left out when the
     writer text moves the camera, CM4; shot prompt format spec SF6), Dialogue: on a speaking panel
     ("<phrase>: <line>"), then Narration: when narration is True and the part is non-empty or the
-    panel does not speak."""
+    panel does not speak; the writer's action text has its double quotes turned into apostrophes
+    (chained end frames spec CE10)."""
     p = parts[k - 1]
     pasted = pasted_pieces(ctx, plan, k)
     facing = _facing(ctx, plan, k)
@@ -2935,7 +3257,7 @@ def panel_fields(ctx, plan, parts, k):
     pieces = pasted[key]
     if pieces and _moves_camera(ctx, plan, p.get(key, "")):
         pieces = pieces[:-1]
-    fields.append((LABELS[key], join([p.get(key, "")] + pieces)))
+    fields.append((LABELS[key], join([reserve_quotes(p.get(key, ""))] + pieces)))
     if facing:
         line = _sentence(assigned_dialogue(plan, k)
                          or _character_lib(ctx.ws).clean_line(p.get("dialogue", "")))
@@ -3037,7 +3359,8 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, ge
     format spec SF11-SF12) N7 on the Motion or Prompt, N20, N21 (exits and other actors) and
     N22; every other N rule is advisory (dialogue spec 6.3, D6).
     fields: [(Label, assembled text)]; writers: {Label: writer text}; plan may be None (then
-    every check that needs the plan is skipped)."""
+    every check that needs the plan is skipped). N23 is always advisory here (chained end frames
+    spec CE9)."""
     hard, advisory = [], []
     beat = plan["beats"][k - 1] if plan and k <= len(plan["beats"]) else None
     phrases = _valid_phrases(lib, plan) if plan else {}
@@ -3338,6 +3661,11 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, ge
                     hard.append("%s N22 reference copy: %s: copies the format reference (%s); "
                                 "describe only this movie's own people, places, objects and "
                                 "words" % (prefix, label, ", ".join(_q(h) for h in hits[:3])))
+        if "N23" in ids and ctx.mode == "chained":
+            detail = end_frame_detail(lib, plan, k, dict(fields)[action_label], known)
+            if detail:
+                advisory.append("%s N23 end frame landing: %s: %s"
+                                % (prefix, action_label, detail))
     return hard, advisory
 
 
@@ -3484,7 +3812,7 @@ def free_line_problems(ctx, lib, plan, dialogues, speakers):
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
                      "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
-                     "Q1", "N19")
+                     "N23", "Q1", "N19")
 
 
 # Shot prompt format spec SF13, D8: the writer-format ids.
@@ -3564,6 +3892,78 @@ def trim_format(ctx, plan, k, part):
     if notes:
         new["repairs"] = notes
     return new
+
+
+# Chained end frames spec CE9, D7: N23, the camera sentence lands on the planned end frame.
+END_FRAME_STOP_WORDS = frozenset("""
+    a an the and or but nor of to in on at by for from with without into onto off over under up
+    down out about across along around through toward towards behind beside between near past
+    against as is are be being it its he she they him her them his hers their theirs this that
+    these those there here who whom which what while where when one each both all every
+    some""".split())
+
+
+def end_frame_words(text, mention_words):
+    """The content words of text (N23): its line_words that are neither END_FRAME_STOP_WORDS nor
+    in mention_words (every word of every cast mention), as a set."""
+    return set(w for w in line_words(text) if w not in END_FRAME_STOP_WORDS
+               and w not in mention_words)
+
+
+def end_frame_detail(lib, plan, k, text, phrases):
+    """The N23 detail of panel k's assembled Motion text, or None (CE9). None when beat k has no
+    end frame. The clause is end_clause of the first camera sentence (lib._is_camera_sentence with
+    phrases) that has one. It fails when there is no such clause; when it does not name every cast
+    entry the end frame names (_named_ids over _mentions); or when it shares fewer than
+    (n + 1) // 2 of the end frame's n content words (end_frame_words)."""
+    end_frame = plan["beats"][k - 1].get("end_frame", "")
+    if not end_frame:
+        return None
+    clause = next((end_clause(s) for s in _sentences(text)
+                   if lib._is_camera_sentence(s, phrases) and end_clause(s)), "")
+    if not clause:
+        return ("has no camera sentence whose words after 'as the move completes,' (or after "
+                "'holding' for a static camera) describe the planned end frame %s"
+                % _q(end_frame))
+    mentions = _mentions(plan["cast"])
+    named = _named_ids(line_words(clause), mentions)
+    missing = [c for c in _named_ids(line_words(end_frame), mentions) if c not in named]
+    if missing:
+        return ("the camera sentence ends %s, which does not name %s, whom the planned end frame "
+                "%s names" % (_q(clause), " and ".join(_q(speaker_phrase_of(plan, c))
+                                                      for c in missing), _q(end_frame)))
+    mention_words = set(w for _cid, words in mentions for w in words)
+    want = end_frame_words(end_frame, mention_words)
+    shared = len(want & end_frame_words(clause, mention_words))
+    need = (len(want) + 1) // 2
+    if shared < need:
+        return ("the camera sentence ends %s, which shares %d of the %d content words of the "
+                "planned end frame %s; it needs at least %d"
+                % (_q(clause), shared, len(want), _q(end_frame), need))
+    return None
+
+
+def end_frame_landing_problems(ctx, plan, part, k):
+    """[the hard N23 message] of panel k with writer parts part, or [] (CE9; round 0 only)."""
+    if ctx.mode != "chained" or not plan["beats"][k - 1].get("end_frame"):
+        return []
+    parts = [{}] * (k - 1) + [part]
+    motion = dict(panel_fields(ctx, plan, parts, k)).get("Motion", "")
+    detail = end_frame_detail(_character_lib(ctx.ws), plan, k, motion, cast_phrases(ctx, plan))
+    return ["panel %d: N23 end frame landing: Motion: %s" % (k, detail)] if detail else []
+
+
+def panel_hard_problems(ctx, plan, part, k):
+    """The hard _field_checks messages of panel k with writer parts part, with the ids and
+    undeclared characters panel_checks uses (GENERATION_CHECKS, generating): the panel's hard
+    problems a round-0 state would hold. A chained round-0 re-ask keeps its reply only when this
+    list does not grow (chained end frames spec CE9)."""
+    parts = [{}] * (k - 1) + [part]
+    writers = {LABELS[key]: part.get(key, "") for key in panel_keys(ctx, plan, k)
+               if key != "title"}
+    return _field_checks(ctx, _character_lib(ctx.ws), plan, k, part.get("title", ""),
+                         panel_fields(ctx, plan, parts, k), writers, GENERATION_CHECKS,
+                         undeclared_characters(ctx), generating=True)[0]
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -3662,6 +4062,14 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     if ctx.mode == "chained" and k >= 2:
         previous = ("The previous panel's Motion: "
                     + dict(panel_fields(ctx, plan, parts, k - 1))["Motion"] + "\n")
+    if ctx.mode == "chained":
+        opens = plan["beats"][k - 2].get("end_frame", "") if k >= 2 else ""
+        ends = beat.get("end_frame", "")
+        if opens:
+            previous += OPENS_ON_LINE % _sentence(opens)
+        if ends:
+            previous += ((ENDS_ON_STATIC_LINE if panel_camera(ctx, plan, k) == "static"
+                          else ENDS_ON_LINE) % _sentence(ends))
     seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
     speaks = panel_speaks(ctx, plan, k)
     phrase = speaker_phrase(plan, k) if speaks else None
@@ -4458,15 +4866,25 @@ class _Run(object):
 
     # -- plan ------------------------------------------------------------------------------
 
+    def plan_fatal(self, found):
+        """The problems that make found = (plan, shape, hard) unusable even with its end frames
+        dropped (chained end frames spec CE7): its P1, P2, P16, P17 and P21 hard problems and a
+        P24 copy outside the end frames. go and plan_round's fallback share this one list."""
+        return ([h for h in found[2]
+                 if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17", "P21")]
+                + plan_copy_problems(self.ctx, found[0], end_frames=False))
+
     def plan_round(self):
         ctx = self.ctx
         rdir = self.round_dir(0)
         prompt = build_plan_prompt(ctx, self.compatible, ctx.pinned)
         _write_text(os.path.join(rdir, "plan_prompt.txt"), prompt)
-        text, found, problems = prompt, None, []
+        # Chained end frames spec CE7: fallback is the latest chained reply that go can use
+        # once its end frames are dropped; a fatal last reply or a timeout falls back to it.
+        text, found, fallback, problems = prompt, None, None, []
         for attempt in range(1, PLAN_MAX_CALLS + 1):
             if self.expired():
-                return None, "timeout"
+                return (fallback, None) if fallback else (None, "timeout")
             print("plan: call %d of %d" % (attempt, PLAN_MAX_CALLS))
             started = _now()
             status, answer = self.agent(text, plan_max_tokens(most_panels(ctx)),
@@ -4482,7 +4900,10 @@ class _Run(object):
                 hard = (plan_checks(ctx, plan, shape)[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
-                problems = hard + line_assignment_problems(plan)
+                if ctx.mode == "chained" and not self.plan_fatal(found):
+                    fallback = found
+                problems = (hard + plan_end_frame_problems(ctx, plan)
+                            + plan_copy_problems(ctx, plan) + line_assignment_problems(plan))
             if not problems:
                 break
             text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
@@ -4490,7 +4911,7 @@ class _Run(object):
                     + "\nPrevious reply:\n"
                     + (answer[:20000] if answer is not None else "<no answer: %s>" % status)
                     + "\n\nReply with the complete corrected JSON object only.")
-        return found, None
+        return fallback or found, None
 
     # -- panels ----------------------------------------------------------------------------
 
@@ -4684,10 +5105,9 @@ class _Run(object):
             return self.round0_timeout()
         # Pinned cast presence spec PC2, speaker attribution spec SA3: a plan that drops a library
         # character or gives a spoken line to the wrong speaker, or sets no beat at a library
-        # location (location library spec L3.5), is not usable.
-        fatal = ([h for h in found[2]
-                  if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17", "P21")]
-                 if found else ["the reply is not one JSON object"])
+        # location (location library spec L3.5), is not usable; chained end frames spec CE7: a P24
+        # copy outside the end frames too.
+        fatal = self.plan_fatal(found) if found else ["the reply is not one JSON object"]
         if fatal:
             calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])
             print("Error: the story model did not return a usable plan after %d call(s)" % calls,
@@ -4698,6 +5118,11 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
+        # Chained end frames spec CE7, D3: end frames that still fail after the last plan call
+        # are dropped; the story never fails because of them.
+        if plan_end_frame_problems(ctx, plan) or plan_copy_problems(ctx, plan):
+            drop_end_frames(plan)
+            print(END_FRAMES_DROPPED % len([c for c in self.doc["calls"] if c["stage"] == "plan"]))
         # Soft panel count spec SPC9, D1: from here on the movie has the plan's beat count.
         ctx = self.ctx = ctx._replace(panels=len(plan["beats"]), panels_target=target_panels(ctx))
         self.cap = wall_clock_cap(ctx.panels)
@@ -4726,13 +5151,21 @@ class _Run(object):
             if new is not None:
                 parts[k - 1] = new
                 # Shot prompt format spec SF13, D8: one re-ask for a writer-format problem while
-                # the panel has a call left, then the deterministic trim.
-                problems = format_problems(ctx, plan, new, k)
+                # the panel has a call left, then the deterministic trim; chained end frames spec
+                # CE9: N23 joins the same single re-ask, and a chained reply to it is kept only
+                # when it also adds no hard problem to the panel.
+                problems = (format_problems(ctx, plan, new, k)
+                            + end_frame_landing_problems(ctx, plan, new, k))
                 if (problems and self.panel_calls[k] < PANEL_MAX_CALLS
                         and not self.expired()):
                     again = self.panel_call(plan, parts, k, 0, problems)
                     if (again is not None
-                            and len(format_problems(ctx, plan, again, k)) <= len(problems)):
+                            and len(format_problems(ctx, plan, again, k)
+                                    + end_frame_landing_problems(ctx, plan, again, k))
+                            <= len(problems)
+                            and (ctx.mode != "chained"
+                                 or len(panel_hard_problems(ctx, plan, again, k))
+                                 <= len(panel_hard_problems(ctx, plan, new, k)))):
                         parts[k - 1] = again
                 parts[k - 1] = trim_format(ctx, plan, k, parts[k - 1])
                 valid += 1
@@ -4817,7 +5250,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
+               "N16", "N17", "N18", "T1", "T2", "T3", "N23", "Q1", "N19")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 

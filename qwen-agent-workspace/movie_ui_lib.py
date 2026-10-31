@@ -422,7 +422,7 @@ def job_vlm(kind, fields, workspace, story_id):
     """The VLM state a job of kind needs: "required", "forbidden" or "any" (VP1). Pure except
     for one os.path.isfile (a movie whose story.md exists renders without the VLM)."""
     if kind in ("story", "character-create", "character-regenerate", "location-create",
-                "location-regenerate"):
+                "location-regenerate", "seams"):
         return "required"
     if kind == "movie":
         if (fields or {}).get("action") == "redo":
@@ -445,15 +445,55 @@ def effective_vlm(job):
     return vlm if vlm in VLM_POLICIES else "any"
 
 
+# Chained end frames spec CE14: the seams job and the plans that have something to check.
+def seams_argv(ws_real, story_id, py=sys.executable):
+    """The bin/seam-report argv of a seams job, on the port the VLM preflight checks."""
+    return [py, os.path.join(ws_real, "bin", "seam-report"), story_id, "--port", str(vlm_port())]
+
+
+def plan_has_end_frames(plan):
+    """True when plan (a parsed plan.json, or None) is chained and a beat has a non-empty string
+    end_frame. Pure."""
+    beats = plan.get("beats") if isinstance(plan, dict) else None
+    return (isinstance(plan, dict) and plan.get("mode") == "chained" and isinstance(beats, list)
+            and any(isinstance(b, dict) and isinstance(b.get("end_frame"), str)
+                    and b["end_frame"].strip() for b in beats))
+
+
+def seams_skip_reason(state, job, queue):
+    """Why dispatch_tick skips job, else None (chained end frames spec CE14, Task 6 fix round 1):
+    a seams job whose fields name an "after" movie job (Compose's check_seams) runs only when that
+    job ended "done" and the story's plan.json has end frames (plan_has_end_frames; final review
+    I1). queue is the queue job_state reads. Reads only status files, the queue and the story's
+    plan.json."""
+    fields = job.get("fields") if job.get("kind") == "seams" else None
+    after = fields.get("after") if isinstance(fields, dict) else None
+    if not isinstance(after, str):
+        return None
+    current = job_state(state, after, queue)
+    if current == "done":
+        plan = read_json(os.path.join(story_dir(job["workspace"], job["story_id"]), "plan.json"))
+        if not plan_has_end_frames(plan):
+            return "skipped: story %s has no end frames to check" % job["story_id"]
+        return None
+    if current == "queued":
+        return "skipped: movie %s has not run yet" % after
+    if current == "unknown":
+        return "skipped: movie %s no longer exists" % after
+    return "skipped: movie %s ended %s" % (after, current)
+
+
 def next_queued_job(state):
-    """(job_id, job) of the first queued ID without a status.json and with a readable job.json
-    (the dispatcher's skip rule, MU30), else (None, None). Never writes (VP3)."""
-    for job_id in read_queue(state):
+    """(job_id, job) of the first queued ID without a status.json, with a readable job.json and
+    not a seams job that seams_skip_reason skips (the dispatcher's skip rule, MU30; CE14), else
+    (None, None). Never writes (VP3)."""
+    queue = read_queue(state)
+    for job_id in queue:
         jdir = job_dir(state, job_id)
         if os.path.lexists(os.path.join(jdir, "status.json")):
             continue
         job = read_job(jdir)
-        if job is not None:
+        if job is not None and seams_skip_reason(state, job, queue) is None:
             return job_id, job
     return None, None
 
@@ -771,6 +811,16 @@ def dispatch_tick(state, ui_ws):
         if not os.path.isdir(job["workspace"]):
             write_status(jdir, {"state": "failed", "exit_code": None, "ended": utc_now(),
                                 "error": "workspace no longer exists (removed by self-update)"})
+            write_queue(state, queue)
+            continue
+        # Chained end frames spec CE14 (Task 6 fix round 1): a check_seams job whose movie did not
+        # end done is cancelled here, before any preflight, VLM step or subprocess.
+        skip = seams_skip_reason(state, job, queue)
+        if skip is not None:
+            with open(os.path.join(jdir, "log.txt"), "ab") as log:
+                log.write(("[movie-ui] %s\n" % skip).encode("utf-8"))
+            write_status(jdir, {"state": "cancelled", "exit_code": None, "ended": utc_now(),
+                                "error": skip})
             write_queue(state, queue)
             continue
         dispatched = utc_now()

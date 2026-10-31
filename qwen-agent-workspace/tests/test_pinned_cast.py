@@ -681,7 +681,7 @@ def _pt16_run(ws, tmp_path, monkeypatch, story_env):
 def test_pt16_two_pinned_chained_every_line_spoken_by_c1(ws, tmp_path, monkeypatch, story_env):
     rc, ctx, log = _pt16_run(ws, tmp_path, monkeypatch, story_env)
     assert rc == 0
-    assert [r["stage"] for r in log] == ["plan", "panel", "panel", "panel"]
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "panel"]
     plan = _read_json(ctx.story_dir, "plan.json")
     assert [beat["cast"] for beat in plan["beats"]][1:] == [["c1", "c2"], ["c1", "c2"]]
     with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
