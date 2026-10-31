@@ -231,8 +231,10 @@ def test_rst8_plan_prompt_matrix(ws, tmp_path, story_env):
                                        auto_lora=state != "off")
                     prompt = se.build_plan_prompt(ctx, se.compatible_entries(ctx), [])
                     where = (mode, len(cast), state, seed)
-                    rest = prompt.replace(se.plan_reference(True), "").replace(
-                        se.plan_reference(False), "")
+                    rest = prompt
+                    if mode == "chained":
+                        assert prompt.count("FORMAT REFERENCE ONLY") == 1, where
+                        rest = prompt.replace(se.plan_reference(False), "")
                     assert "{" not in rest and "}" not in rest, where
                     assert "@@" not in prompt, where
                     assert prompt.startswith(
@@ -2633,12 +2635,13 @@ def test_rst47_robust_dry_run(tmp_path, story_env, monkeypatch):
             assert argv[argv.index("--image") + 1] == os.path.join(story_dir, "seed_downscaled.png")
         assert argv[-1].startswith('You are planning a short narrated movie (story-id "rst47-')
         assert block[block.index("Rendered plan prompt:") + 1].startswith("You are planning")
-        reference = set(se.plan_reference(True).splitlines()
-                        + se.plan_reference(False).splitlines())
+        chained = "--no-stills" not in flags and "--shots" not in flags
+        assert (se.plan_reference(False) in proc.stdout) == chained, flags
+        reference = set(se.plan_reference(False).splitlines()) if chained else set()
         assert not [line for line in proc.stdout.splitlines()
-                    if ("{" in line or "}" in line) and line not in reference]
-        phase1 = "\n".join(line for line in block if line not in reference)
-        assert not [s for s in FORBIDDEN_IN_PHASE1 if s in phase1], flags
+                    if ("{" in line or "}" in line) and line not in reference], flags
+        phase1 = "\n".join(block)
+        assert not [s for s in FORBIDDEN_IN_PHASE1 if s not in ("{", "}") and s in phase1], flags
     assert not os.path.exists(story_dir)
     os.remove(catalog_path)
     proc = _dry_run("rst47b-%d" % os.getpid())
