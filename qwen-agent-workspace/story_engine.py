@@ -41,20 +41,28 @@ SPEECH_FRAMING_SENTENCE = (" Characters speak on screen in this movie: keep each
 
 def shot_types(narration):
     return SPEECH_SHOT_TYPES if narration == "speech" else SHOT_TYPES
-# Shot prompt format spec SF1, D1: moves first, static last; the pasted sentence is the fallback
-# when the writer writes no camera sentence (SF6).
+# Shot prompt format spec SF1, D1; chained end frames spec CE1, D2: moves first, static last; the
+# pasted sentence is the fallback when the writer writes no camera sentence (SF6).
 CAMERA_SENTENCES = (
     ("slow push-in", "The camera pushes in."),
     ("slow pull-back", "The camera pulls back."),
     ("tracking", "The camera tracks alongside the movement."),
+    ("slow tracking left", "The camera tracks left alongside the movement."),
+    ("slow tracking right", "The camera tracks right alongside the movement."),
     ("handheld", "The camera is handheld, with slight natural movement."),
     ("slow pan left", "The camera pans left."),
     ("slow pan right", "The camera pans right."),
     ("slow tilt up", "The camera tilts up."),
     ("slow tilt down", "The camera tilts down."),
+    ("slow crane up", "The camera cranes up."),
+    ("slow crane down", "The camera cranes down."),
+    ("slow orbit", "The camera arcs around the subject in a partial orbit."),
     ("static", "The camera stays static."),
 )
 CAMERA_KEYS = tuple(key for key, _ in CAMERA_SENTENCES)
+# Chained end frames spec CE1, D2: the plan prompt offers every key but plain "tracking", so a
+# new plan names the tracking direction; "tracking" stays valid for P8 and old plans.
+PLAN_CAMERA_KEYS = tuple(key for key in CAMERA_KEYS if key != "tracking")
 
 
 def max_static(panels):
@@ -408,8 +416,9 @@ CAMERA_RULE = (" Give every beat one camera move from this list, and use static 
                "deliberate hold: at most one beat in three may be static, so at most "
                "@@MAX_STATIC@@ in this movie.")
 CAMERA_SPEAKING_SENTENCE = (" On a beat with a speaker, prefer slow push-in, slow pull-back, "
-                            "tracking or handheld, and never use a pan or a tilt, which sweeps "
-                            "the speaker's face out of the frame.")
+                            "slow tracking left, slow tracking right or handheld, and never use a "
+                            "pan, a tilt, a crane or an orbit, which sweep the speaker's face out "
+                            "of the frame.")
 # Pinned cast presence spec PC5, D3: in chained mode a declared character still in frame stays
 # in a speaking beat, silent.
 SPEAKER_RULE_KEEP_CAST = (
@@ -1127,7 +1136,7 @@ def build_plan_prompt(ctx, compatible, pins):
             + (PANEL_COUNT_LINES_SENTENCE if lines else ""))),
         ("@@SHOT_LIST@@", ", ".join(shot_types(ctx.narration))
          + (SPEECH_SHOT_NOTE if ctx.narration == "speech" else "")),
-        ("@@CAMERA_LIST@@", ", ".join(CAMERA_KEYS)),
+        ("@@CAMERA_LIST@@", ", ".join(PLAN_CAMERA_KEYS)),
         ("@@CAMERA_RULE@@", CAMERA_RULE + ("" if ctx.narration is False
                                            else CAMERA_SPEAKING_SENTENCE)),
         ("@@LORA_PARAGRAPH@@", lora),
@@ -1342,7 +1351,8 @@ def normalize_plan(ctx, raw):
 # Narrative dialogue fidelity spec SM1; shot prompt format spec SF4, D2: a speaking beat may be
 # a medium shot, and its camera pushes in, pulls back, tracks, is handheld or stays static.
 SPEAKING_SHOTS = ("medium shot", "medium close-up", "close-up")
-SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
+SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "slow tracking left",
+                    "slow tracking right", "handheld", "static")
 
 
 def speaking_camera(beat):
@@ -1697,11 +1707,18 @@ CAMERA_MOVE_WORDS = {
     "slow pull-back": ("pull back", "pulls back", "pull-back", "dolly", "dollies", "zoom",
                        "zooms"),
     "tracking": ("track", "tracks", "tracking", "follow", "follows", "dolly", "dollies"),
+    "slow tracking left": ("track", "tracks", "tracking", "follow", "follows", "dolly",
+                           "dollies"),
+    "slow tracking right": ("track", "tracks", "tracking", "follow", "follows", "dolly",
+                            "dollies"),
     "handheld": ("handheld",),
     "slow pan left": ("pan", "pans"),
     "slow pan right": ("pan", "pans"),
     "slow tilt up": ("tilt", "tilts"),
     "slow tilt down": ("tilt", "tilts"),
+    "slow crane up": ("crane", "cranes"),
+    "slow crane down": ("crane", "cranes"),
+    "slow orbit": ("orbit", "orbits"),
     "static": ("static", "still", "hold", "holds", "locked-off"),
 }
 CAMERA_CLAUSE_RE = re.compile(
@@ -1716,6 +1733,25 @@ REPAIR_NOTE = "panel %d: %s %s: %s: the pipeline removed %s"
 def _camera_words(sentence):
     """The CAMERA_MOTION_RE words of a sentence, lower case, whitespace collapsed, in order."""
     return [" ".join(m.group(0).lower().split()) for m in CAMERA_MOTION_RE.finditer(sentence)]
+
+
+# Chained end frames spec CE2, D6 (M1): the words after "as the move completes" or "holding"
+# describe the subject at the end frame, not the camera.
+END_CLAUSE_RE = re.compile(r"\bas\s+the\s+move\s+completes\b|\bholding\b", re.IGNORECASE)
+
+
+def camera_head(sentence):
+    """The part of a camera sentence before its first END_CLAUSE_RE match, or the whole sentence
+    when it has none (CE2)."""
+    match = END_CLAUSE_RE.search(sentence)
+    return sentence[:match.start()] if match else sentence
+
+
+def end_clause(sentence):
+    """The words of a camera sentence after its first END_CLAUSE_RE match, stripped of the
+    characters " ,;:—–-.!?" at both ends, or "" when it has none (CE2, CE9)."""
+    match = END_CLAUSE_RE.search(sentence)
+    return sentence[match.end():].strip(" ,;:—–-.!?") if match else ""
 
 
 def camera_directions(lib, text, phrases):
@@ -1733,14 +1769,15 @@ def camera_directions(lib, text, phrases):
 
 
 def _mixed_camera(sentence):
-    """True when a camera sentence both keeps the camera still and moves it."""
-    words = _camera_words(sentence)
+    """True when a camera sentence both keeps the camera still and moves it. Only the words before
+    the end clause count (CE2, M1)."""
+    words = _camera_words(camera_head(sentence))
     return (any(w in STATIC_CAMERA_WORDS for w in words)
             and any(w not in CAMERA_MOVE_WORDS["static"] for w in words))
 
 
 def _names_camera(sentence, key):
-    return any(w in CAMERA_MOVE_WORDS[key] for w in _camera_words(sentence))
+    return any(w in CAMERA_MOVE_WORDS[key] for w in _camera_words(camera_head(sentence)))
 
 
 def camera_problem(lib, text, phrases, key):
@@ -2750,6 +2787,11 @@ CAMERA_WRITER_FORMS = {
                                      "wider frame then shows>.'"),
     "tracking": ("tracks the movement", "'The camera tracks <whom it follows> — as the move "
                                         "completes, <where the frame ends>.'"),
+    "slow tracking left": ("tracks left", "'The camera tracks left alongside <whom it follows> — "
+                                         "as the move completes, <where the frame ends>.'"),
+    "slow tracking right": ("tracks right", "'The camera tracks right alongside <whom it "
+                                            "follows> — as the move completes, <where the frame "
+                                            "ends>.'"),
     "handheld": ("moves handheld", "'The camera follows with handheld movement — as the move "
                                    "completes, <where the frame ends>.'"),
     "slow pan left": ("pans left", "'The camera pans left — as the move completes, <what the "
@@ -2760,6 +2802,13 @@ CAMERA_WRITER_FORMS = {
                                  "ends on>.'"),
     "slow tilt down": ("tilts down", "'The camera tilts down — as the move completes, <what the "
                                      "frame ends on>.'"),
+    "slow crane up": ("cranes up", "'The camera cranes up — as the move completes, <what the "
+                                   "frame ends on>.'"),
+    "slow crane down": ("cranes down", "'The camera cranes down — as the move completes, <what "
+                                       "the frame ends on>.'"),
+    "slow orbit": ("arcs around the subject in a partial orbit", "'The camera arcs around <whom "
+                   "it circles> in a partial orbit — as the move completes, <where the frame "
+                   "ends>.'"),
     "static": ("stays static", "'The camera stays static, holding <what stays in the frame>.'"),
 }
 # Shot prompt format spec SF7, D7: a shots speaking panel's reaction after the line, and the
@@ -2912,13 +2961,26 @@ def _clean_dialogue(lib, text, phrase):
     return lib.clean_line(text)
 
 
+# Chained end frames spec CE10, D8: double quotes in a final video prompt are kept for the
+# spoken line, so the writer's action text is written with apostrophes.
+_DOUBLE_QUOTES = ('"', "“", "”")
+
+
+def reserve_quotes(text):
+    """text with every straight or curly double quote turned into an apostrophe (CE10)."""
+    for quote in _DOUBLE_QUOTES:
+        text = text.replace(quote, "'")
+    return text
+
+
 def panel_fields(ctx, plan, parts, k):
     """[(Label, assembled text)] of panel k in file order (RS14; dialogue spec SP4): Image: where
     the mode has one (setting, identities, writer image, facing, shot), Motion: or Prompt: (the
     writer text, then the pasted sentences; the planned camera sentence is left out when the
     writer text moves the camera, CM4; shot prompt format spec SF6), Dialogue: on a speaking panel
     ("<phrase>: <line>"), then Narration: when narration is True and the part is non-empty or the
-    panel does not speak."""
+    panel does not speak; the writer's action text has its double quotes turned into apostrophes
+    (chained end frames spec CE10)."""
     p = parts[k - 1]
     pasted = pasted_pieces(ctx, plan, k)
     facing = _facing(ctx, plan, k)
@@ -2935,7 +2997,7 @@ def panel_fields(ctx, plan, parts, k):
     pieces = pasted[key]
     if pieces and _moves_camera(ctx, plan, p.get(key, "")):
         pieces = pieces[:-1]
-    fields.append((LABELS[key], join([p.get(key, "")] + pieces)))
+    fields.append((LABELS[key], join([reserve_quotes(p.get(key, ""))] + pieces)))
     if facing:
         line = _sentence(assigned_dialogue(plan, k)
                          or _character_lib(ctx.ws).clean_line(p.get("dialogue", "")))
