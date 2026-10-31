@@ -1154,3 +1154,22 @@ def test_ct14_no_fixture_copies_either_reference():
             assert [t for t in se.REFERENCE_TERMS
                     if " %s " % " ".join(se.line_words(t)) in line] == [], name
     assert seen >= 40
+
+
+# --- CT1 (Task 5 part): the new and changed Python files compile under both Pythons ------------
+
+def test_ct1e_the_changed_files_compile_under_both_pythons():
+    script = ("import sys\n"
+              "for path in sys.argv[1:]:\n"
+              "    with open(path, encoding='utf-8') as f:\n"
+              "        compile(f.read(), path, 'exec')\n"
+              "print('compiled %d' % (len(sys.argv) - 1))\n")
+    files = [os.path.join(WS, name) for name in
+             ("story_engine.py", os.path.join("bin", "seam-report"), "movie_ui_lib.py",
+              "movie_ui_server.py")]
+    pythons = [sys.executable] + (["/usr/bin/python3"] if os.path.exists("/usr/bin/python3")
+                                  else [])
+    for python in pythons:
+        proc = subprocess.run([python, "-B", "-c", script] + files, capture_output=True,
+                              text=True)
+        assert (proc.returncode, proc.stdout) == (0, "compiled 4\n"), (python, proc.stderr)

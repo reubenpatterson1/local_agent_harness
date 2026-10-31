@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""seam-report -- score each chained panel's last frame against its planned end frame
+(docs/superpowers/specs/2026-10-30-chained-end-frames-design.md, Section 3, CE13).
+
+    bin/seam-report STORY_ID [--port N]
+
+Reads generated/stories/<STORY_ID>/plan.json and its clips/, asks the story server's VLM
+(loopback HTTP to 127.0.0.1:<port>, /v1/models and /v1/chat/completions) to score the last frame
+of every panel whose beat has an end frame, and writes seam_report.json and seam_report.md next
+to plan.json. A panel's frame is clips/panel_<k+1>.chainseed.png (the exact last frame of clip k)
+when it is not older than its clip, else the last frame of clips/panel_<k>.mp4. It never
+re-renders, never starts a server and writes nothing but the two report files.
+
+Exit 0: report written, nothing to check, or no clips to check. 1: a report file cannot be
+written. 2: a usage error, an invalid story id, no story, an invalid plan, ffmpeg or ffprobe
+missing, or the story server not answering. Standard library only; Python 3.9 and 3.13.
+"""
+
+import argparse
+import base64
+import http.client
+import importlib.machinery
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+SCHEMA = "ltx-movie.seam-report.v1"
+MISS_BELOW = 6          # a score below 6 is "missed" (notes, Section 3)
+ATTEMPTS = 3            # VLM calls per panel before "unparseable"
+MAX_TOKENS = 400
+TEMPERATURE = 0
+CALL_TIMEOUT_S = 300
+MODELS_TIMEOUT_S = 10
+MAX_BODY = 1048576
+VERDICTS = ("ok", "missed", "no clip", "unparseable")
+
+PLAN_SCHEMA = "ltx-movie.plan.v1"
+STORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+THINK_RE = re.compile(r"(?s)<think>.*?</think>")
+FFMPEG_TIMEOUT_S = 120
+UNPARSEABLE_REASON = "the model gave no valid reply in %d attempts" % ATTEMPTS
+SEAM_PROMPT = (
+    "This image is the last frame of panel @@K@@ of a movie. The story plan says the panel ends "
+    "on this frame:\n@@END_FRAME@@\n@@CHARACTERS@@\n"
+    "Score how well the image matches the planned end frame, from 1 (nothing matches) to 10 "
+    "(everything matches). Judge only who or what is in frame, where each one is (left, centre "
+    "or right; foreground or background), which way they face and how tight the shot is; ignore "
+    "image quality, lighting, colour and style.\n"
+    "Reply with one JSON object only, with exactly these keys: score (an integer from 1 to 10), "
+    "reason (one sentence of at most 25 words) and missing (a list of the short phrases of the "
+    "planned end frame that the image does not show, or an empty list).")
+DOWN = ("the story server is not answering at 127.0.0.1:%d (%s); nothing was changed. Start it "
+        "with bin/story-server mlx-vision and rerun bin/seam-report %s.")
+STOPPED = ("the story server stopped answering at 127.0.0.1:%d (%s) while checking panel %d; "
+           "nothing was written. Start it with bin/story-server mlx-vision and rerun "
+           "bin/seam-report %s.")
+
+
+class SeamError(Exception):
+    """A clip whose last frame cannot be read; the message is the detail."""
+
+
+class TransportError(Exception):
+    """The story server stopped answering; the message is what went wrong."""
+
+
+_ENGINE = []
+
+
+def _engine():
+    """story_engine.py of WS, loaded by path on first use (only for extract_json)."""
+    if not _ENGINE:
+        _ENGINE.append(importlib.machinery.SourceFileLoader(
+            "story_engine_for_seam_report", os.path.join(WS, "story_engine.py")).load_module())
+    return _ENGINE[0]
+
+
+def _utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="seam-report",
+        description="Score each chained panel's last frame against its planned end frame.")
+    parser.add_argument("story_id", metavar="STORY_ID")
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("STORY_SERVER_PORT") or 8177),
+                        help="the story server's port (default: $STORY_SERVER_PORT or 8177)")
+    return parser
+
+
+def _error(message):
+    print("Error: %s" % message, file=sys.stderr)
+    return 2
+
+
+def _end_frame(beat):
+    """beat's end_frame when it is a string with a non-space character, else ""."""
+    value = beat.get("end_frame") if isinstance(beat, dict) else None
+    return value if isinstance(value, str) and value.strip() else ""
+
+
+def _nonempty(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def _read_plan(path):
+    """The plan.json at path when it is a dict with the plan schema, a string mode and a list of
+    beats, else None."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (isinstance(plan, dict) and plan.get("schema") == PLAN_SCHEMA
+            and isinstance(plan.get("mode"), str) and isinstance(plan.get("beats"), list)):
+        return plan
+    return None
+
+
+def frame_sources(plan, clips_dir):
+    """[(k, end frame, source, path)] for every beat k (1-based) with an end frame, in order.
+    source is "chainseed" (path: clips/panel_<k+1>.chainseed.png, used when it is a non-empty
+    file and the clip is missing or not newer), "clip" (path: clips/panel_<k>.mp4, a non-empty
+    file) or None (path None). The last panel always comes from its clip."""
+    beats = plan["beats"]
+    out = []
+    for k, beat in enumerate(beats, start=1):
+        end_frame = _end_frame(beat)
+        if not end_frame:
+            continue
+        clip = os.path.join(clips_dir, "panel_%02d.mp4" % k)
+        seed = os.path.join(clips_dir, "panel_%02d.chainseed.png" % (k + 1))
+        if (k < len(beats) and _nonempty(seed)
+                and (not os.path.exists(clip) or os.path.getmtime(seed) >= os.path.getmtime(clip))):
+            out.append((k, end_frame, "chainseed", seed))
+        elif _nonempty(clip):
+            out.append((k, end_frame, "clip", clip))
+        else:
+            out.append((k, end_frame, None, None))
+    return out
+
+
+def _run(argv):
+    """The stdout of argv (capture_output, timeout FFMPEG_TIMEOUT_S); SeamError when it cannot
+    run or exits non-zero."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=FFMPEG_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise SeamError("%s did not run (%s)" % (argv[0], e.__class__.__name__))
+    if proc.returncode != 0:
+        lines = [line.strip() for line in proc.stderr.decode("utf-8", "replace").splitlines()
+                 if line.strip()]
+        raise SeamError("%s exited %d: %s" % (argv[0], proc.returncode,
+                                              lines[-1] if lines else "(no error output)"))
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def last_frame_png(clip, out_png):
+    """Write the last decoded frame of clip to out_png (bin/judge-clips' ffprobe and ffmpeg
+    argv); raises SeamError(detail) when it cannot."""
+    probe = _run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+                  "-show_entries", "stream=nb_read_frames", "-of", "json", clip])
+    try:
+        n = int(json.loads(probe)["streams"][0]["nb_read_frames"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        raise SeamError("ffprobe gave no frame count")
+    if n < 1:
+        raise SeamError("the clip has no frames")
+    _run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", clip, "-vf",
+          "select=eq(n\\,%d)" % (n - 1), "-fps_mode", "passthrough", "-frames:v", "1", out_png])
+    if not _nonempty(out_png):
+        raise SeamError("ffmpeg wrote no frame")
+
+
+def _request(port, method, path, body, timeout):
+    """(status, at most MAX_BODY bytes of the reply) of one loopback request; raises OSError or
+    http.client.HTTPException."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        headers = {"Content-Type": "application/json"} if body is not None else {}
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read(MAX_BODY)
+    finally:
+        conn.close()
+
+
+def vlm_models(port):
+    """(model, None) from GET /v1/models: the string id of the first listed model; or (None,
+    what): "HTTP <n>", "invalid JSON", "no model listed" or the exception class name."""
+    try:
+        status, raw = _request(port, "GET", "/v1/models", None, MODELS_TIMEOUT_S)
+    except (OSError, http.client.HTTPException) as e:
+        return None, e.__class__.__name__
+    if status != 200:
+        return None, "HTTP %d" % status
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None, "invalid JSON"
+    data = doc.get("data") if isinstance(doc, dict) else None
+    if not (isinstance(data, list) and data and isinstance(data[0], dict)
+            and isinstance(data[0].get("id"), str)):
+        return None, "no model listed"
+    return data[0]["id"], None
+
+
+def vlm_complete(port, model, prompt, png):
+    """The content string of one POST /v1/chat/completions with prompt and the PNG bytes png, or
+    None when the 200 reply is not JSON or has no string content; raises TransportError(what) on
+    a transport failure or a non-200 status."""
+    body = json.dumps({
+        "model": model, "max_tokens": MAX_TOKENS, "temperature": TEMPERATURE,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}}]}]})
+    try:
+        status, raw = _request(port, "POST", "/v1/chat/completions", body.encode("utf-8"),
+                               CALL_TIMEOUT_S)
+    except (OSError, http.client.HTTPException) as e:
+        raise TransportError(e.__class__.__name__)
+    if status != 200:
+        raise TransportError("HTTP %d" % status)
+    try:
+        content = json.loads(raw.decode("utf-8"))["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    return content if isinstance(content, str) else None
+
+
+def seam_prompt(plan, k):
+    """The VLM prompt of panel k: SEAM_PROMPT with @@K@@, @@END_FRAME@@ and @@CHARACTERS@@
+    replaced in that order; @@CHARACTERS@@ names each plan cast entry of the beat's cast, in cast
+    order, with its descriptor, or is "" when there is none."""
+    beat = plan["beats"][k - 1]
+    ids = beat.get("cast") if isinstance(beat.get("cast"), list) else []
+    people = ['"%s" is %s' % (c.get("phrase"), c.get("descriptor"))
+              for c in plan.get("cast") or [] if isinstance(c, dict) and c.get("id") in ids]
+    characters = "Characters in this panel: " + "; ".join(people) + "." if people else ""
+    return (SEAM_PROMPT.replace("@@K@@", str(k)).replace("@@END_FRAME@@", _end_frame(beat))
+            .replace("@@CHARACTERS@@", characters))
+
+
+def parse_reply(content):
+    """{"score", "reason", "missing"} of a VLM reply, or None: <think> blocks removed, then
+    story_engine.extract_json; score an int (not a bool) from 1 to 10, reason a string that is
+    not empty once its whitespace is collapsed, missing a list of strings (kept stripped and
+    non-empty)."""
+    raw = _engine().extract_json(THINK_RE.sub("", content))
+    if raw is None:
+        return None
+    score, reason, missing = raw.get("score"), raw.get("reason"), raw.get("missing")
+    if not (isinstance(score, int) and not isinstance(score, bool) and 1 <= score <= 10):
+        return None
+    reason = " ".join(reason.split()) if isinstance(reason, str) else ""
+    if not reason or not (isinstance(missing, list) and all(isinstance(m, str) for m in missing)):
+        return None
+    return {"score": score, "reason": reason,
+            "missing": [m.strip() for m in missing if m.strip()]}
+
+
+def _check_panel(port, model, plan, k, end_frame, source, path, tmp):
+    """The report entry of panel k; raises TransportError from vlm_complete."""
+    panel = {"panel": k, "end_frame": end_frame, "source": source,
+             "frame": None if path is None else "clips/" + os.path.basename(path),
+             "score": None, "verdict": "no clip", "reason": "", "missing": [], "attempts": 0}
+    if source is None:
+        panel["reason"] = "clips/panel_%02d.mp4 does not exist" % k
+        return panel
+    if source == "clip":
+        out_png = os.path.join(tmp, "panel_%02d.png" % k)
+        try:
+            last_frame_png(path, out_png)
+        except SeamError as e:
+            panel["reason"] = "cannot read the last frame of clips/panel_%02d.mp4: %s" % (k, e)
+            return panel
+        path = out_png
+    with open(path, "rb") as f:
+        png = f.read()
+    prompt = seam_prompt(plan, k)
+    for attempt in range(1, ATTEMPTS + 1):
+        content = vlm_complete(port, model, prompt, png)
+        reply = parse_reply(content) if content is not None else None
+        if reply is not None:
+            panel.update(score=reply["score"], reason=reply["reason"], missing=reply["missing"],
+                         attempts=attempt,
+                         verdict="ok" if reply["score"] >= MISS_BELOW else "missed")
+            return panel
+    panel.update(verdict="unparseable", reason=UNPARSEABLE_REASON, attempts=ATTEMPTS)
+    return panel
+
+
+def _summary(panels):
+    scored = [p["score"] for p in panels if p["score"] is not None]
+    return {"panels": len(panels), "scored": len(scored),
+            "ok": len([p for p in panels if p["verdict"] == "ok"]),
+            "missed": len([p for p in panels if p["verdict"] == "missed"]),
+            "no_clip": len([p for p in panels if p["verdict"] == "no clip"]),
+            "unparseable": len([p for p in panels if p["verdict"] == "unparseable"]),
+            "mean_score": round(sum(scored) / float(len(scored)), 2) if scored else None}
+
+
+def _mean(summary):
+    return "n/a" if summary["mean_score"] is None else str(summary["mean_score"])
+
+
+def _cell(text):
+    """A table cell: every | escaped as \\| and its whitespace collapsed."""
+    return " ".join(str(text).replace("|", "\\|").split())
+
+
+def render_md(doc):
+    """The seam_report.md text of a seam_report.json document."""
+    summary = doc["summary"]
+    lines = ["# Seam report: %s" % doc["story_id"], "",
+             "Created %s with %s. A score below %d is missed." % (doc["created"], doc["model"],
+                                                                 doc["threshold"]), "",
+             "| Panel | Score | Verdict | Reason | Missing |", "|---|---|---|---|---|"]
+    for p in doc["panels"]:
+        lines.append("| %d | %s | %s | %s | %s |" % (
+            p["panel"], "-" if p["score"] is None else p["score"], _cell(p["verdict"]),
+            _cell(p["reason"]), _cell("; ".join(p["missing"])) if p["missing"] else "-"))
+    lines += ["", "Mean score %s over %d scored panel(s); %d missed, %d without a clip, %d "
+              "unparseable." % (_mean(summary), summary["scored"], summary["missed"],
+                                summary["no_clip"], summary["unparseable"]),
+              "", "## Planned end frames", ""]
+    lines += ["- panel %d: %s" % (p["panel"], p["end_frame"]) for p in doc["panels"]]
+    return "\n".join(lines) + "\n"
+
+
+def _panel_line(p):
+    if p["verdict"] in ("ok", "missed"):
+        line = "panel %d: %s (%d/10): %s" % (p["panel"], p["verdict"], p["score"], p["reason"])
+        if p["verdict"] == "missed" and p["missing"]:
+            line += "; missing: " + "; ".join(p["missing"])
+        return line
+    return "panel %d: %s: %s" % (p["panel"], p["verdict"], p["reason"])
+
+
+def _write(path, text):
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(temporary, path)
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    story_id, port = args.story_id, args.port
+    if not STORY_ID_RE.match(story_id) or ".." in story_id:
+        return _error("invalid story id: %s" % story_id)
+    stories = os.path.join(WS, "generated", "stories")
+    story_dir = os.path.join(stories, story_id)
+    clips_dir = os.path.join(story_dir, "clips")
+    if not os.path.isdir(story_dir):
+        return _error("no story %s in %s" % (story_id, stories))
+    plan_path = os.path.join(story_dir, "plan.json")
+    plan = _read_plan(plan_path)
+    if plan is None:
+        return _error("%s is not a plan.json written by bin/ltx-movie's default story engine"
+                      % plan_path)
+    if plan["mode"] != "chained":
+        print("seam-report: nothing to check: %s is a %s story; seams are checked only in "
+              "chained stories" % (story_id, plan["mode"]))
+        return 0
+    sources = frame_sources(plan, clips_dir)
+    if not sources:
+        print("seam-report: nothing to check: this plan has no end frames; no seam report")
+        return 0
+    if not [s for s in sources if s[2] is not None]:
+        print("seam-report: no clips to check in %s" % clips_dir)
+        return 0
+    if ([s for s in sources if s[2] == "clip"]
+            and not (shutil.which("ffmpeg") and shutil.which("ffprobe"))):
+        return _error("ffmpeg and ffprobe must be on PATH to read the clips in %s" % clips_dir)
+    model, what = vlm_models(port)
+    if model is None:
+        return _error(DOWN % (port, what, story_id))
+    panels = []
+    tmp = tempfile.mkdtemp(prefix="seam-report-")
+    try:
+        for k, end_frame, source, path in sources:
+            try:
+                panels.append(_check_panel(port, model, plan, k, end_frame, source, path, tmp))
+            except TransportError as e:
+                return _error(STOPPED % (port, e, k, story_id))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    doc = {"schema": SCHEMA, "story_id": story_id, "created": _utc(), "model": model,
+           "threshold": MISS_BELOW, "panels": panels, "summary": _summary(panels)}
+    json_path = os.path.join(story_dir, "seam_report.json")
+    md_path = os.path.join(story_dir, "seam_report.md")
+    for path, text in ((json_path, json.dumps(doc, indent=2, ensure_ascii=False) + "\n"),
+                       (md_path, render_md(doc))):
+        try:
+            _write(path, text)
+        except OSError as e:
+            print("Error: cannot write %s: %s" % (path, e), file=sys.stderr)
+            return 1
+    for p in panels:
+        print(_panel_line(p))
+    summary = doc["summary"]
+    print("seam-report: wrote %s and %s: %d of %d panel(s) missed, mean score %s"
+          % (json_path, md_path, summary["missed"], summary["panels"], _mean(summary)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
