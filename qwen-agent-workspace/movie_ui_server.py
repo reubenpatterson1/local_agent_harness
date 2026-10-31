@@ -19,6 +19,7 @@ import platform
 import re
 import secrets
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -104,8 +105,11 @@ ROUTES = [
     ("POST", r"/api/jobs/" + _ID + r"/kill-orphan", "h_job_kill_orphan",
      "/api/jobs/" + _SAMPLE_ID + "/kill-orphan"),
     ("POST", r"/api/queue/move", "h_queue_move", "/api/queue/move"),
+    ("GET", r"/api/batches", "h_batches", "/api/batches"),
+    ("POST", r"/api/batches", "h_batch_create", "/api/batches"),
     ("POST", r"/api/batches/preview", "h_batch_preview", "/api/batches/preview"),
     ("GET", r"/api/batches/stories", "h_batch_stories", "/api/batches/stories"),
+    ("GET", r"/api/batches/" + _ID, "h_batch", "/api/batches/" + _SAMPLE_ID),
     ("GET", r"/api/stories", "h_stories", "/api/stories"),
     ("GET", r"/api/stories/" + _STORY, "h_story", "/api/stories/ronin-rescue"),
     ("PUT", r"/api/stories/" + _STORY + r"/story\.md", "h_story_save", "/api/stories/ronin-rescue/story.md"),
@@ -2069,6 +2073,313 @@ def _h_batch_preview(self, groups, query, body):
 
 MovieUIHandler.h_batch_stories = _h_batch_stories
 MovieUIHandler.h_batch_preview = _h_batch_preview
+
+
+# ---------------------------------------------------------------------------
+# Batch forks: submit, the batch submitter, reconcile and the batch page
+# (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Sections 3.1, 4.1-4.5)
+# ---------------------------------------------------------------------------
+
+GIB = float(1024 ** 3)
+
+
+def write_batch(state, rec):
+    lib.write_json_atomic(batch_path(state, rec["id"]), rec)
+
+
+def new_batch_id(state):
+    """A fresh batch ID in the job-ID format, drawn again while batches/<id> exists (spec 3.1)."""
+    while True:
+        batch_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + secrets.token_hex(2)
+        if not os.path.lexists(os.path.join(state, "batches", batch_id)):
+            return batch_id
+
+
+def make_batch_record(clean, batch_id, number, cells):
+    """The batch.json of a submit (spec 3.1, BF24): "ok" cells are pending, the others refused,
+    and order is the BF27 submit order."""
+    now = lib.utc_now()
+    rcells = [{"story_id": c["story_id"], "variant": c["variant"], "fork_id": c["fork_id"],
+               "status": "pending" if c["status"] == "ok" else "refused", "reason": c["reason"],
+               "level": c["level"], "diff": c["diff"], "warnings": c["warnings"], "fields": None,
+               "job_id": None, "copy_bytes": 0, "updated": now} for c in cells]
+    return {"schema": batch.BATCH_SCHEMA, "id": batch_id, "number": number, "workspace": clean["ws"],
+            "created": now, "status": "waiting", "cancel_requested": False,
+            "stories": list(clean["stories"]), "variants": clean["variants"],
+            "order": batch.submit_order(rcells, clean["stories"]), "cells": rcells}
+
+
+def remove_fork(fdir, batch_id):
+    """BF19: shutil.rmtree(fdir) only when <fdir>/fork.json names batch_id and fdir's own name;
+    otherwise leave it and say so on stderr. Returns True when removed."""
+    rec = lib.read_json(os.path.join(fdir, "fork.json"), None)
+    if isinstance(rec, dict) and rec.get("batch") == batch_id and rec.get("fork_id") == os.path.basename(fdir):
+        shutil.rmtree(fdir)
+        return True
+    sys.stderr.write("movie-ui: batch %s: not removing %s (no matching fork.json)\n" % (batch_id, fdir))
+    return False
+
+
+def _batch_kick(server):
+    """BF24 step 4: start the batch submitter unless it runs. The caller holds BATCH_LOCK."""
+    if server.batch_thread is None or not server.batch_thread.is_alive():
+        server.batch_thread = threading.Thread(target=_batch_submitter, args=(server,),
+                                               name="batch-submitter", daemon=True)
+        server.batch_thread.start()
+
+
+def _batch_submitter(server):
+    """BF25: submit the queued batches one at a time, each cell in the batch's order."""
+    state = server.state
+    while True:
+        with BATCH_LOCK:
+            if not server.batch_queue:
+                server.batch_thread = None
+                return
+            batch_id = server.batch_queue.pop(0)
+            rec = read_batch(state, batch_id)
+            if rec is None or rec.get("status") != "waiting":
+                continue
+            rec["status"] = "submitting"
+            write_batch(state, rec)
+        for index in rec["order"]:
+            try:
+                _submit_cell(server, batch_id, index)
+            except Exception as e:  # BF26: a failed fork never stops the batch
+                sys.stderr.write("movie-ui: batch %s cell %d: %s: %s\n"
+                                 % (batch_id, index, type(e).__name__, e))
+        with BATCH_LOCK:
+            rec = read_batch(state, batch_id)
+            if rec is not None:
+                rec["status"] = "cancelled" if rec.get("cancel_requested") else "submitted"
+                write_batch(state, rec)
+
+
+def _cell_update(server, batch_id, index, changes):
+    """Under BATCH_LOCK: apply changes to one cell of batch.json with a new "updated"; returns the
+    record, or None when it is gone."""
+    with BATCH_LOCK:
+        rec = read_batch(server.state, batch_id)
+        if rec is None:
+            return None
+        rec["cells"][index].update(changes, updated=lib.utc_now())
+        write_batch(server.state, rec)
+        return rec
+
+
+def _submit_cell(server, batch_id, index):
+    """BF28 step 1, then steps 2-9; an exception refuses the cell and removes its fork (BF26)."""
+    with BATCH_LOCK:
+        rec = read_batch(server.state, batch_id)
+        if rec is None or rec["cells"][index].get("status") != "pending":
+            return
+        if rec.get("cancel_requested"):
+            rec["cells"][index].update(status="cancelled", reason="batch cancelled", updated=lib.utc_now())
+            write_batch(server.state, rec)
+            return
+        rec["cells"][index].update(status="forking", reason=None, updated=lib.utc_now())
+        write_batch(server.state, rec)
+    made = []
+    try:
+        _fork_cell(server, batch_id, index, made)
+    except Exception as e:
+        if made:
+            remove_fork(made[0], batch_id)
+        sys.stderr.write("movie-ui: batch %s: cell %d: internal error: %s: %s\n"
+                         % (batch_id, index, type(e).__name__, e))
+        _cell_update(server, batch_id, index,
+                     {"status": "refused", "reason": "internal error: %s: %s" % (type(e).__name__, e)})
+
+
+def _fork_cell(server, batch_id, index, made):
+    """BF28 steps 2-9 for one forking cell. made holds the fork directory while an exception
+    should remove it."""
+    state = server.state
+    rec = read_batch(state, batch_id)
+    if rec is None:
+        return
+    ws_real = rec["workspace"]
+    clean = {"ws": ws_real, "stories": rec["stories"], "variants": rec["variants"]}
+    built = plan_batch(server, clean, rec["number"])[0][index]                       # 2
+    if built["status"] != "ok":
+        _cell_update(server, batch_id, index, {"status": "refused", "reason": built["reason"]})
+        return
+    story_id, fid, level = built["story_id"], built["fork_id"], built["level"]
+    sdir, fdir = lib.story_dir(ws_real, story_id), lib.story_dir(ws_real, fid)
+    plan = batch.copy_plan(sdir, level)                                               # 3
+    copy_bytes = sum(n for _rel, n in plan)
+    free = shutil.disk_usage(os.path.join(ws_real, "generated", "stories")).free
+    if free - copy_bytes < batch.MIN_FREE_BYTES:
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason":
+                     "not enough free space: %.1f GiB free, this fork copies %.1f GiB and at least 20 GiB "
+                     "must stay free" % (free / GIB, copy_bytes / GIB)})
+        return
+    try:                                                                              # 4
+        os.mkdir(fdir)
+    except FileExistsError:
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes,
+                                               "reason": "fork ID %s already exists; it is never overwritten" % fid})
+        return
+    made.append(fdir)
+    fork_rec = {"schema": batch.FORK_SCHEMA, "fork_id": fid, "source_story": story_id, "batch": batch_id,
+                "variant": built["variant"], "label": rec["variants"][built["variant"] - 1]["label"],
+                "level": level, "diff": built["diff"], "created": lib.utc_now()}
+    try:
+        lib.write_json_atomic(os.path.join(fdir, "fork.json"), fork_rec)
+        for rel, _n in plan:
+            target = os.path.join(fdir, rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            src = os.path.join(sdir, rel)
+            if os.path.islink(src):  # re-check: copy_plan listed it as a regular file
+                raise OSError(errno.ELOOP, "a symlink, not copied", src)
+            shutil.copy2(src, target)
+    except OSError as e:
+        if os.path.lexists(os.path.join(fdir, "fork.json")):
+            remove_fork(fdir, batch_id)
+        else:
+            os.rmdir(fdir)
+        del made[:]
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason":
+                     "copy failed: %s: %s" % (e.strerror or e, e.filename or fdir)})
+        return
+    busy = job_index(server, ws_real)[1].get(story_id)                                # 5
+    if busy is not None:
+        remove_fork(fdir, batch_id)
+        del made[:]
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason":
+                     "story %s got a job (%s) while it was being forked; fork it again later" % (story_id, busy)})
+        return
+    checks = lib.run_checks(built["fields"], ws_real, state)                          # 6, no lock held
+    if not lib.checks_pass(checks):
+        remove_fork(fdir, batch_id)
+        del made[:]
+        _cell_update(server, batch_id, index, {"status": "refused", "copy_bytes": copy_bytes, "reason": "\n".join(
+            "%s %s: %s" % (c["id"], c["name"], c["detail"]) for c in checks if c["status"] == "fail")})
+        return
+    with BATCH_LOCK:                                                                  # 7
+        rec = read_batch(state, batch_id)
+        if rec is None or rec.get("cancel_requested"):
+            remove_fork(fdir, batch_id)
+            del made[:]
+            if rec is not None:
+                rec["cells"][index].update(status="cancelled", reason="batch cancelled", copy_bytes=copy_bytes,
+                                           updated=lib.utc_now())
+                write_batch(state, rec)
+            return
+    job_id = create_compose_job(server, built["fields"])                              # 8
+    del made[:]
+    with BATCH_LOCK:                                                                  # 9
+        rec = read_batch(state, batch_id)
+        if rec is not None:
+            rec["cells"][index].update(status="queued", reason=None, job_id=job_id, fields=built["fields"],
+                                       level=level, diff=built["diff"], warnings=built["warnings"],
+                                       copy_bytes=copy_bytes, updated=lib.utc_now())
+            write_batch(state, rec)
+        late = rec is None or bool(rec.get("cancel_requested"))
+    if late:
+        with STORE_LOCK:
+            result = lib.cancel_job(state, job_id)
+        if rec is not None:
+            reconcile(server, batch_id)
+        elif result == "cancelled":
+            remove_fork(fdir, batch_id)
+
+
+def reconcile(server, batch_id):
+    """BF29 under BATCH_LOCK: every queued cell whose job was cancelled before it started loses its
+    fork directory and becomes cancelled. Returns the record, or None when it is gone."""
+    state = server.state
+    with BATCH_LOCK:
+        rec = read_batch(state, batch_id)
+        if rec is None:
+            return None
+        changed = False
+        for cell in rec["cells"]:
+            job_id = cell.get("job_id")
+            if cell.get("status") != "queued" or not (isinstance(job_id, str) and lib.JOB_ID_RE.fullmatch(job_id)):
+                continue
+            status = lib.read_status(lib.job_dir(state, job_id)) or {}
+            if status.get("state") == "cancelled" and status.get("started") is None:
+                remove_fork(lib.story_dir(rec["workspace"], cell["fork_id"]), batch_id)
+                cell.update(status="cancelled", reason="cancelled before it started", updated=lib.utc_now())
+                changed = True
+        if changed:
+            write_batch(state, rec)
+        return rec
+
+
+def batch_view(server, rec):
+    """The "view" of GET /api/batches/<id> (BF35): the originals' movies and, parallel to
+    rec["cells"], each cell's display state, job summary, movie and whether its directory exists."""
+    state, ws_real = server.state, rec["workspace"]
+    queue = lib.read_queue(state)
+    cells = []
+    for cell in rec["cells"]:
+        shown, job = cell["status"], None
+        job_id = cell.get("job_id")
+        if shown == "queued" and isinstance(job_id, str) and lib.JOB_ID_RE.fullmatch(job_id):
+            if os.path.isdir(lib.job_dir(state, job_id)):
+                job = job_summary(server, job_id, queue)
+            shown = job["state"] if job is not None else "job deleted"
+        cells.append({"state": shown, "job": job, "movie": _movie_path(ws_real, cell["fork_id"]),
+                      "dir": os.path.isdir(lib.story_dir(ws_real, cell["fork_id"]))})
+    return {"originals": dict((s, _movie_path(ws_real, s)) for s in rec["stories"]), "cells": cells}
+
+
+def _known_batch(server, batch_id):
+    """Reconcile batch_id (BF29) and return its record, or ApiError(404)."""
+    rec = reconcile(server, batch_id)
+    if rec is None:
+        raise ApiError(404, "unknown batch %s" % batch_id)
+    return rec
+
+
+def _h_batches(self, groups, query, body):
+    server = self.server
+    real = self.ws(query.get("ws"))
+    queue = lib.read_queue(server.state)
+    out = []
+    for batch_id in sorted(list_batch_ids(server.state), reverse=True):
+        rec = read_batch(server.state, batch_id)
+        if rec is None or rec.get("workspace") != real:
+            continue
+        rec = reconcile(server, batch_id) or rec
+        done = sum(1 for c in rec["cells"] if isinstance(c.get("job_id"), str)
+                   and lib.JOB_ID_RE.fullmatch(c["job_id"])
+                   and lib.job_state(server.state, c["job_id"], queue) == "done")
+        out.append({"id": rec["id"], "number": rec["number"], "created": rec["created"],
+                    "status": rec["status"], "cells": len(rec["cells"]), "done": done})
+    return 200, {"batches": out}
+
+
+def _h_batch_create(self, groups, query, body):
+    server = self.server
+    state = server.state
+    clean = _batch_request(body)
+    with BATCH_LOCK:
+        batch_id = new_batch_id(state)
+        number = next_batch_number(server, clean["ws"])
+        cells, _originals = plan_batch(server, clean, number)
+        if not any(c["status"] == "ok" for c in cells):
+            raise ApiError(409, "every cell was refused", cells=[preview_cell(c) for c in cells])
+        rec = make_batch_record(clean, batch_id, number, cells)
+        lib.make_dir(os.path.dirname(batch_path(state, batch_id)))
+        write_batch(state, rec)
+        server.batch_queue.append(batch_id)
+        _batch_kick(server)
+    pending = sum(1 for c in rec["cells"] if c["status"] == "pending")
+    return 201, {"batch": {"id": batch_id, "number": number, "status": "waiting"}, "pending": pending,
+                 "refused": len(rec["cells"]) - pending}
+
+
+def _h_batch(self, groups, query, body):
+    rec = _known_batch(self.server, groups[0])
+    return 200, {"batch": rec, "view": batch_view(self.server, rec)}
+
+
+MovieUIHandler.h_batches = _h_batches
+MovieUIHandler.h_batch_create = _h_batch_create
+MovieUIHandler.h_batch = _h_batch
 
 
 # ---------------------------------------------------------------------------

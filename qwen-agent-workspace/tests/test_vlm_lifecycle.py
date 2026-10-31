@@ -24,6 +24,7 @@ import time
 
 import pytest
 
+import batch_testutil as bt
 import movie_ui_testutil as mt
 import movie_ui_lib as lib
 
@@ -1111,3 +1112,23 @@ def test_vl22_cancel_and_kill_orphan_never_reach_a_started_server(state, tmp_pat
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except OSError:
                 pass
+
+
+# --- batch forks BT30 (docs/superpowers/specs/2026-10-30-batch-forks-design.md, Section 7) -----
+
+def test_bt30_fork_jobs_record_their_vlm_policy(http_env, monkeypatch):
+    s, ws, state = http_env["srv"], http_env["ws"], http_env["state"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    variants = [bt.variant("v1", bt.RENDER), bt.variant("v2", {"width": 768, "height": 512}),
+                bt.variant("v3", {"goal": "Keep it tense."})]
+    batch_id = bt.submit(s, ws, ["ronin-rescue"], variants)
+    cells = bt.wait_status(s, batch_id)["batch"]["cells"]
+    render, stills, replan = (c["job_id"] for c in cells)
+    assert [lib.read_job(lib.job_dir(state, j))["vlm"] for j in (render, stills, replan)] == [
+        "forbidden", "forbidden", "required"]
+    assert lib.read_queue(state) == [replan, stills, render]
+    assert lib.vlm_restore_wanted(state) == (True, "next job %s needs it" % replan)
+    lib.write_status(lib.job_dir(state, replan), {"state": "done", "exit_code": 0, "ended": lib.utc_now()})
+    lib.write_queue(state, [render])
+    assert lib.vlm_restore_wanted(state) == (False, "next job %s runs without it" % render)
