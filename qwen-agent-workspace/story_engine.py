@@ -3340,7 +3340,8 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, ge
     format spec SF11-SF12) N7 on the Motion or Prompt, N20, N21 (exits and other actors) and
     N22; every other N rule is advisory (dialogue spec 6.3, D6).
     fields: [(Label, assembled text)]; writers: {Label: writer text}; plan may be None (then
-    every check that needs the plan is skipped)."""
+    every check that needs the plan is skipped). N23 is always advisory here (chained end frames
+    spec CE9)."""
     hard, advisory = [], []
     beat = plan["beats"][k - 1] if plan and k <= len(plan["beats"]) else None
     phrases = _valid_phrases(lib, plan) if plan else {}
@@ -3641,6 +3642,11 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, ge
                     hard.append("%s N22 reference copy: %s: copies the format reference (%s); "
                                 "describe only this movie's own people, places, objects and "
                                 "words" % (prefix, label, ", ".join(_q(h) for h in hits[:3])))
+        if "N23" in ids and ctx.mode == "chained":
+            detail = end_frame_detail(lib, plan, k, dict(fields)[action_label], known)
+            if detail:
+                advisory.append("%s N23 end frame landing: %s: %s"
+                                % (prefix, action_label, detail))
     return hard, advisory
 
 
@@ -3787,7 +3793,7 @@ def free_line_problems(ctx, lib, plan, dialogues, speakers):
 
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
                      "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
-                     "Q1", "N19")
+                     "N23", "Q1", "N19")
 
 
 # Shot prompt format spec SF13, D8: the writer-format ids.
@@ -3867,6 +3873,65 @@ def trim_format(ctx, plan, k, part):
     if notes:
         new["repairs"] = notes
     return new
+
+
+# Chained end frames spec CE9, D7: N23, the camera sentence lands on the planned end frame.
+END_FRAME_STOP_WORDS = frozenset("""
+    a an the and or but nor of to in on at by for from with without into onto off over under up
+    down out about across along around through toward towards behind beside between near past
+    against as is are be being it its he she they him her them his hers their theirs this that
+    these those there here who whom which what while where when one each both all every
+    some""".split())
+
+
+def end_frame_words(text, mention_words):
+    """The content words of text (N23): its line_words that are neither END_FRAME_STOP_WORDS nor
+    in mention_words (every word of every cast mention), as a set."""
+    return set(w for w in line_words(text) if w not in END_FRAME_STOP_WORDS
+               and w not in mention_words)
+
+
+def end_frame_detail(lib, plan, k, text, phrases):
+    """The N23 detail of panel k's assembled Motion text, or None (CE9). None when beat k has no
+    end frame. The clause is end_clause of the first camera sentence (lib._is_camera_sentence with
+    phrases) that has one. It fails when there is no such clause; when it does not name every cast
+    entry the end frame names (_named_ids over _mentions); or when it shares fewer than
+    (n + 1) // 2 of the end frame's n content words (end_frame_words)."""
+    end_frame = plan["beats"][k - 1].get("end_frame", "")
+    if not end_frame:
+        return None
+    clause = next((end_clause(s) for s in _sentences(text)
+                   if lib._is_camera_sentence(s, phrases) and end_clause(s)), "")
+    if not clause:
+        return ("has no camera sentence whose words after 'as the move completes,' (or after "
+                "'holding' for a static camera) describe the planned end frame %s"
+                % _q(end_frame))
+    mentions = _mentions(plan["cast"])
+    named = _named_ids(line_words(clause), mentions)
+    missing = [c for c in _named_ids(line_words(end_frame), mentions) if c not in named]
+    if missing:
+        return ("the camera sentence ends %s, which does not name %s, whom the planned end frame "
+                "%s names" % (_q(clause), " and ".join(_q(speaker_phrase_of(plan, c))
+                                                      for c in missing), _q(end_frame)))
+    mention_words = set(w for _cid, words in mentions for w in words)
+    want = end_frame_words(end_frame, mention_words)
+    shared = len(want & end_frame_words(clause, mention_words))
+    need = (len(want) + 1) // 2
+    if shared < need:
+        return ("the camera sentence ends %s, which shares %d of the %d content words of the "
+                "planned end frame %s; it needs at least %d"
+                % (_q(clause), shared, len(want), _q(end_frame), need))
+    return None
+
+
+def end_frame_landing_problems(ctx, plan, part, k):
+    """[the hard N23 message] of panel k with writer parts part, or [] (CE9; round 0 only)."""
+    if ctx.mode != "chained" or not plan["beats"][k - 1].get("end_frame"):
+        return []
+    parts = [{}] * (k - 1) + [part]
+    motion = dict(panel_fields(ctx, plan, parts, k)).get("Motion", "")
+    detail = end_frame_detail(_character_lib(ctx.ws), plan, k, motion, cast_phrases(ctx, plan))
+    return ["panel %d: N23 end frame landing: Motion: %s" % (k, detail)] if detail else []
 
 
 def panel_checks(ctx, plan, parts, text, story_md_path):
@@ -5046,13 +5111,17 @@ class _Run(object):
             if new is not None:
                 parts[k - 1] = new
                 # Shot prompt format spec SF13, D8: one re-ask for a writer-format problem while
-                # the panel has a call left, then the deterministic trim.
-                problems = format_problems(ctx, plan, new, k)
+                # the panel has a call left, then the deterministic trim; chained end frames spec
+                # CE9: N23 joins the same single re-ask.
+                problems = (format_problems(ctx, plan, new, k)
+                            + end_frame_landing_problems(ctx, plan, new, k))
                 if (problems and self.panel_calls[k] < PANEL_MAX_CALLS
                         and not self.expired()):
                     again = self.panel_call(plan, parts, k, 0, problems)
                     if (again is not None
-                            and len(format_problems(ctx, plan, again, k)) <= len(problems)):
+                            and len(format_problems(ctx, plan, again, k)
+                                    + end_frame_landing_problems(ctx, plan, again, k))
+                            <= len(problems)):
                         parts[k - 1] = again
                 parts[k - 1] = trim_format(ctx, plan, k, parts[k - 1])
                 valid += 1
@@ -5137,7 +5206,7 @@ def run_judge(ctx, round_dir):
 # ---------------------------------------------------------------------------
 
 RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-               "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
+               "N16", "N17", "N18", "T1", "T2", "T3", "N23", "Q1", "N19")
 PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 

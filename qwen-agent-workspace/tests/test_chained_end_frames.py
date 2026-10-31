@@ -733,3 +733,233 @@ def test_ct16_an_added_beat_needs_its_own_end_frame(ws, tmp_path, monkeypatch, c
     assert [c["stage"] for c in log].count("plan") == 1
     assert len(plan["beats"]) == 4
     _assert_p22_clean(plan)
+
+
+# --- CT1 (Task 3 part): the N23 constants and check ids (CE9, CE12) ------------------------------
+
+END_FRAME_STOP_WORDS = frozenset("""
+    a an the and or but nor of to in on at by for from with without into onto off over under up
+    down out about across along around through toward towards behind beside between near past
+    against as is are be being it its he she they him her them his hers their theirs this that
+    these those there here who whom which what while where when one each both all every
+    some""".split())
+GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
+                     "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
+                     "N23", "Q1", "N19")
+RECHECK_IDS = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15", "N16",
+               "N17", "N18", "T1", "T2", "T3", "N23", "Q1", "N19")
+
+
+def test_ct1c_the_n23_constants_and_check_ids():
+    assert se.END_FRAME_STOP_WORDS == END_FRAME_STOP_WORDS
+    assert se.GENERATION_CHECKS == GENERATION_CHECKS
+    assert se.GENERATION_CHECKS[16:20] == ("N18", "T1", "T2", "T3")
+    assert se.GENERATION_CHECKS[-2:] == ("Q1", "N19") and se.GENERATION_CHECKS[-1] == "N19"
+    assert se.RECHECK_IDS == RECHECK_IDS
+    assert se.RECHECK_IDS[14:18] == ("N18", "T1", "T2", "T3")
+    assert se.RECHECK_IDS[-2:] == ("Q1", "N19")
+    assert se.FORMAT_IDS == ("N7", "N20", "N21", "N22")
+    assert se.PLAN_FREE_IDS == ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
+
+
+# --- CT10: N23 detection (CE9, CK2) ---------------------------------------------------------------
+
+E2 = END_FRAME % 2
+E2_QUOTED = "'" + E2 + "'"
+REF_MOTIONS = (
+    "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of the "
+    "market hall toward the half-open shutter at real-time speed, her heavy steps splashing "
+    "through shallow puddles that hold the first glow from the harbour doors. The camera tracks "
+    "right alongside her — as the move completes, the old fishmonger stands beside the half-open "
+    "shutter at frame centre, facing left toward the hall, seen from the knees up, the empty "
+    "crates at her feet.",
+    "The old fishmonger turns back from the shutter and walks to the zinc counter at real-time "
+    "speed, laying her folded cloth beside the empty ice trays and lifting her face to the "
+    "camera. The old fishmonger presses both palms flat on the folded cloth, her shoulders "
+    "sinking. The camera pushes in — as the move completes, the old fishmonger stands behind the "
+    "zinc counter at frame centre, facing forward, her face filling the frame from chin to brow. "
+    "The old fishmonger faces the camera.",
+    "The old fishmonger lowers her forehead onto her folded hands on the cold zinc counter at "
+    "real-time speed, her breath fogging the metal as a thin trickle of meltwater runs past her "
+    "knuckles and drips to the wet floor. The camera stays static, holding the old fishmonger as "
+    "she rests her forehead on her folded hands at frame centre, eyes closed, her head and hands "
+    "filling the frame.",
+)
+
+
+def _detail(ws, camera, plan=None):
+    ctx = seu.make_ctx(se, ws)
+    plan = plan or _normalized(ctx, ef_plan(3))
+    return se.end_frame_detail(lib, plan, 2, "The courier runs. " + camera, ["the courier"])
+
+
+def test_ct10_n23_detection_rows(ws):
+    assert _detail(ws, "The camera tracks the movement.") == (
+        "has no camera sentence whose words after 'as the move completes,' (or after 'holding' "
+        "for a static camera) describe the planned end frame " + E2_QUOTED)
+    assert _detail(ws, "The camera tracks him — as the move completes, he stands at frame centre "
+                       "on the wet quay.") == (
+        "the camera sentence ends 'he stands at frame centre on the wet quay', which does not "
+        "name 'the courier', whom the planned end frame " + E2_QUOTED + " names")
+    assert _detail(ws, "The camera tracks him — as the move completes, the courier waits by a "
+                       "lamp.") == (
+        "the camera sentence ends 'the courier waits by a lamp', which shares 0 of the 11 content "
+        "words of the planned end frame " + E2_QUOTED + "; it needs at least 6")
+    assert _detail(ws, "The camera tracks him — as the move completes, the courier stands at frame "
+                       "centre on the wet quay, facing left.") is None
+    assert _detail(ws, "The camera tracks him — as the move completes, the courier stands at frame "
+                       "centre on the wet quay.") == (
+        "the camera sentence ends 'the courier stands at frame centre on the wet quay', which "
+        "shares 5 of the 11 content words of the planned end frame " + E2_QUOTED + "; it needs "
+        "at least 6")
+    assert _detail(ws, "The camera stays static, holding the courier at frame centre on the wet "
+                       "quay, facing the camera.") is None
+    ctx = seu.make_ctx(se, ws)
+    raw = ef_plan(3)
+    del raw["beats"][1]["end_frame"]
+    assert _detail(ws, "The camera tracks the movement.", plan=_normalized(ctx, raw)) is None
+    mentions = se._mentions(_normalized(ctx, ef_plan(3))["cast"])
+    assert sorted(se.end_frame_words(E2, set(w for _c, ws_ in mentions for w in ws_))) == [
+        "2", "beat", "camera", "centre", "facing", "frame", "quay", "seen", "stands", "waist", "wet"]
+    for k, motion in enumerate(REF_MOTIONS, start=1):
+        assert se.end_frame_detail(lib, se.PLAN_REFERENCE_PLAN, k, motion,
+                                   ["the old fishmonger"]) is None, k
+
+
+def test_review_focus_3_curly_apostrophes_and_capitals_still_land(ws):
+    ctx = seu.make_ctx(se, ws, panels=1)
+    raw = seu.plan_json("chained", 1)
+    raw["beats"][0]["end_frame"] = ("The courier's bicycle leans against the harbour wall at frame "
+                                    "centre, the courier beside it facing left.")
+    plan = _normalized(ctx, raw)
+    text = ("The courier runs. The camera tracks him — as the move completes, THE COURIER’S "
+            "bicycle leans against the Harbour Wall at frame centre, the courier beside it facing "
+            "left!")
+    assert se.end_frame_detail(lib, plan, 1, text, ["the courier"]) is None
+    assert se.end_clause("The camera tracks him — as the move completes, THE COURIER’S bicycle "
+                         "leans.") == "THE COURIER’S bicycle leans"
+
+
+# --- CT11: N23 in round 0, end to end (CE9, CK2) -------------------------------------------------
+
+def _clause(end_frame):
+    """end_frame with a lower-case first letter and no full stop."""
+    return end_frame[:1].lower() + end_frame[1:].rstrip(".")
+
+
+def _miss(k):
+    return seu.panel_json("chained", k)
+
+
+def _land(k):
+    """Panel k of EF_PLAN(2) (1 static, 2 tracking) with a camera sentence that lands."""
+    part = seu.panel_json("chained", k)
+    if k == 1:
+        part["motion"] += " The camera stays static, holding " + _clause(END_FRAME % 1) + "."
+    else:
+        part["motion"] += (" The camera tracks the courier — as the move completes, "
+                           + _clause(END_FRAME % 2) + ".")
+    return part
+
+
+def _ct11(ws, tmp_path, monkeypatch, panel1, panel2, story_id="s1"):
+    panel = {"1": [p if "answer" in p else seu.answer(p) for p in panel1],
+             "2": [seu.answer(p) for p in panel2]}
+    rc, log, plan, ctx = _e2e(ws, tmp_path, monkeypatch, [ef_plan(2)], n=2, panel=panel,
+                              story_id=story_id)
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    return rc, log, ctx, checks
+
+
+def _n23(messages):
+    return [m for m in messages if " N23 " in m]
+
+
+def test_ct11_one_re_ask_then_the_landing_reply(ws, tmp_path, monkeypatch):
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [_miss(1), _land(1)], [_land(2)])
+    assert rc == 0
+    assert [c["stage"] for c in log] == ["plan", "panel", "panel", "panel"]
+    with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "panel_01_prompt_2.txt"),
+              encoding="utf-8") as f:
+        assert "- panel 1: N23 end frame landing: Motion: " in f.read()
+    assert _n23([m["message"] for m in checks["hard"] + checks["advisory"]]) == []
+
+
+def test_ct11_a_writer_that_misses_twice_is_kept_with_an_advisory(ws, tmp_path, monkeypatch):
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [_miss(1), _miss(1)], [_land(2)])
+    assert rc == 0
+    assert [c["stage"] for c in log] == ["plan", "panel", "panel", "panel"]
+    advisory = [m["message"] for m in checks["advisory"]]
+    assert len(_n23(advisory)) == 1
+    assert _n23(advisory)[0].startswith("panel 1: N23 end frame landing: Motion: has no camera "
+                                        "sentence whose words after 'as the move completes,'")
+    assert _n23([m["message"] for m in checks["hard"]]) == []
+    hard = checks["hard"]
+    rc2, advisories = se.recheck(ctx, ltx_movie._validate_story_md)
+    assert rc2 == 0
+    assert _n23(advisories) == _n23(advisory)
+    assert _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["hard"] == hard
+
+
+def test_ct11_no_re_ask_without_a_call_left(ws, tmp_path, monkeypatch):
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [{"answer": "not json"}, _miss(1)],
+                                 [_land(2)])
+    assert rc == 0
+    assert [(c["stage"], c["panel"]) for c in log] == [
+        ("plan", None), ("panel", 1), ("panel", 1), ("panel", 2)]
+    assert len(_n23([m["message"] for m in checks["advisory"]])) == 1
+
+
+def test_ct11_writers_that_land_get_no_n23(ws, tmp_path, monkeypatch):
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [_land(1)], [_land(2)])
+    assert rc == 0
+    assert [c["stage"] for c in log] == ["plan", "panel", "panel"]
+    assert _n23([m["message"] for m in checks["hard"] + checks["advisory"]]) == []
+    assert not any("N23" in " ".join(c["argv"]) for c in log)
+
+
+# --- CT15: old stories re-check exactly as before (D10, CK3) --------------------------------------
+
+def _forbid_end_frame_steps(monkeypatch):
+    def forbidden(*_args, **_kw):
+        raise AssertionError("an old story ran an end-frame step")
+    for name in ("end_frame_words", "plan_end_frame_problems", "plan_copy_problems",
+                 "end_frame_advisories"):
+        monkeypatch.setattr(se, name, forbidden)
+
+
+def _recheck_twice(ctx, monkeypatch):
+    """(rc, hard, advisory) of se.recheck with RECHECK_IDS, then without N23."""
+    out = []
+    for ids in (se.RECHECK_IDS, tuple(i for i in se.RECHECK_IDS if i != "N23")):
+        monkeypatch.setattr(se, "RECHECK_IDS", ids)
+        rc, advisory = se.recheck(ctx, ltx_movie._validate_story_md)
+        hard = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))["hard"]
+        out.append((rc, hard, advisory))
+    return out
+
+
+def test_ct15_old_stories_recheck_as_before(ws, monkeypatch):
+    fixture = os.path.join(WS, "tests", "fixtures", "writer_pacing", "hockey-2x145-f")
+    plan = _read_json(os.path.join(fixture, "plan.json"))
+    hockey = seu.make_ctx(se, ws, story_id="hockey-2x145-f", panels=2, seconds="6",
+                          clip_seconds=145 / 24.0, narration="speech", narrative=plan["narrative"],
+                          goal=plan["goal"])
+    for name in ("plan.json", "story.md"):
+        shutil.copy(os.path.join(fixture, name), os.path.join(hockey.story_dir, name))
+    courier = seu.make_ctx(se, ws, story_id="old-courier")
+    old_plan = _normalized(courier, seu.plan_json("chained", 3))
+    parts = [seu.panel_json("chained", k) for k in (1, 2, 3)]
+    with open(os.path.join(courier.story_dir, "plan.json"), "w", encoding="utf-8") as f:
+        json.dump(old_plan, f)
+    with open(os.path.join(courier.story_dir, "story.md"), "w", encoding="utf-8") as f:
+        f.write(se.assemble(courier, old_plan, parts))
+    _forbid_end_frame_steps(monkeypatch)
+    for ctx in (hockey, courier):
+        with open(os.path.join(ctx.story_dir, "story.md"), "rb") as f:
+            before = f.read()
+        with_n23, without = _recheck_twice(ctx, monkeypatch)
+        assert with_n23 == without, ctx.story_id
+        assert with_n23[0] == 0, ctx.story_id
+        with open(os.path.join(ctx.story_dir, "story.md"), "rb") as f:
+            assert f.read() == before, ctx.story_id
