@@ -461,7 +461,8 @@ def copy_ui(tmp):
     movie_ui_server.py, fleet_lib.py, static/movie-ui) plus the stub tools, so a subprocess
     bin/movie-ui probes stubs instead of this checkout's real bin/story-server. Returns its root."""
     root = make_stub_workspace(os.path.join(str(tmp), "ui"))
-    for rel in ("bin/movie-ui", "bin/movie-ui-job", "movie_ui_lib.py", "movie_ui_server.py", "fleet_lib.py"):
+    for rel in ("bin/movie-ui", "bin/movie-ui-job", "movie_ui_lib.py", "movie_ui_server.py", "fleet_lib.py",
+                "movie_ui_batch.py"):
         shutil.copy2(os.path.join(WS, rel), os.path.join(root, rel))
     static = os.path.join(WS, "static", "movie-ui")
     if os.path.isdir(static):

@@ -63,7 +63,7 @@ def _upload(s, data):
 
 def test_lu1_the_location_routes_need_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 46
+    assert len(srv.ROUTES) == 54
     assert [(m, sample) for m, _r, _n, sample in srv.ROUTES if "/locations" in sample] == NEW_ROUTES
     for method, regex, name, sample in srv.ROUTES:
         if (method, sample) not in NEW_ROUTES:
@@ -386,7 +386,7 @@ def test_lu13_the_static_page():
     assert ('<label><input id="l-no-arch-check" type="checkbox"> Skip architecture check</label> '
             '<span class="muted">The LoRA is cataloged even if bin/lora-check says it does not fit '
             'the base model; a mismatched LoRA fails or does nothing at render.</span>') in html
-    assert ('const TABS = ["compose", "stories", "characters", "locations", "actions", "loras", '
+    assert ('const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", '
             '"jobs", "traces"];') in js
     assert ("loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), "
             "loadModels()") in js
