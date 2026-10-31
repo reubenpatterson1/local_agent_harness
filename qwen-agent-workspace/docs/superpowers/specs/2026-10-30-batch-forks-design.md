@@ -8,7 +8,7 @@ Repository `/Users/reubenpatterson/local_agent_harness`, branch `bulk-rerun`, HE
 
 Builds on **[MUI]** `docs/superpowers/specs/2026-10-19-movie-ui-design.md` (routes, jobs, V1-V6, `/files`) and **[VLM]** `docs/superpowers/specs/2026-10-25-vlm-lifecycle-design.md`.
 
-Terms: an **original** is a story directory `<ws>/generated/stories/<id>`. A **variant** is one set of setting and prompt changes. A **cell** is one original × one variant. A **fork** is the new story a cell creates. Its **level** is `render`, `stills` or `replan` (UI labels `Render`, `New stills`, `Re-plan`). Requirement IDs are BF1-BF40, tests are BT1-BT30, and KPIs are BK1-BK7.
+Terms: an **original** is a story directory `<ws>/generated/stories/<id>`. A **variant** is one set of setting and prompt changes. A **cell** is one original × one variant. A **fork** is the new story a cell creates. Its **level** is `render`, `stills` or `replan` (UI labels `Render`, `New stills`, `Re-plan`). Requirement IDs are BF1-BF41, tests are BT1-BT35, and KPIs are BK1-BK8.
 
 ---
 
@@ -30,8 +30,8 @@ Terms: an **original** is a story directory `<ws>/generated/stories/<id>`. A **v
 
 | # | File | Change |
 |---|---|---|
-| G1 | `movie_ui_batch.py` (new) | constants, request validation, merge, prompt edits, classification, fork IDs, copy plan, order, totals |
-| G2 | `movie_ui_server.py` | 8 routes, `BATCH_LOCK`, submitter thread, recovery, reconcile, cancel hook |
+| G1 | `movie_ui_batch.py` (new) | constants, request validation, merge, prompt edits, classification, fork IDs, copy plan, order, totals, batch-record field fallback check |
+| G2 | `movie_ui_server.py` | 8 routes, `BATCH_LOCK`, submitter thread, recovery, reconcile, cancel hook, `stored_fields` |
 | G3 | `movie_ui_lib.py` | `STATE_SUBDIRS` gains `"batches"` |
 | G4 | `static/movie-ui/index.html`, `app.js`, `app.css` | Stories checkbox, Batches tab, editor, compare page |
 | G5 | tests | Section 7 |
@@ -46,7 +46,6 @@ Untouched: every pipeline file, including `bin/ltx-movie`, `story_engine.py`, `b
 - Forking command-line stories.
 - Diffing story.md between forks.
 - Any VLM scheduling beyond the group order.
-- Falling back to batch-record fields after a fork's job is deleted (Q2).
 - Pipeline changes.
 
 ### 0.4 Must-haves and nice-to-haves
@@ -109,7 +108,7 @@ This table covers every `DEFAULT_FIELDS` key (`movie_ui_lib.py:892-905`). It is 
 | `fps` | render | **[spec choice]** clip timing only, the same as frames |
 | `no_low_ram` | render | **[spec choice]** a render-residency flag (`bin/ltx-movie:419-423`) |
 | `panel_timeout` | render | **[spec choice]** used by Phase 4 only |
-| `width`, `height` | stills | **[spec choice, conflicts with the notes]** the stills are made at 2× the video size (`bin/ltx-movie:2016`), and a copied still with another aspect fails the render (`bin/ltx-mlx-render:1349-1353`). So a resolution change is a stills-size change |
+| `width`, `height` | stills | **user-confirmed 2026-10-30** the stills are made at 2× the video size (`bin/ltx-movie:2016`), and a copied still with another aspect fails the render (`bin/ltx-mlx-render:1349-1353`). So a resolution change is a stills-size change |
 | `stills_loras` | stills | approved |
 | `location_strength` | stills | **[spec choice]** passed to Phase 2 stills and to the manifest (`bin/ltx-movie:1243-1253`, `:2040`) |
 | `narrative`, `goal` | replan | approved (§4 findings) |
@@ -243,8 +242,8 @@ Every route goes through the token check (`_handle`, `:364-374`).
 | Route | Response |
 |---|---|
 | `GET /api/batches?ws=` | 200 `{"batches": [{"id", "number", "created", "status", "cells": T, "done": D}]}`, newest first, this workspace only **[spec choice: tabs are per workspace]**. `D` counts cells whose job state is `done` |
-| `GET /api/batches/stories?ws=` | 200 `{"stories": [{"id", "eligible", "reason", "busy_job"}]}` over the same directories `_h_stories` lists (§3.4) |
-| `POST /api/batches/preview` | 200 `{"number": N, "rows": [{"story_id", "fields": <orig> or null, "movie": path or null}], "cells": [{"story_id", "variant", "fork_id", "status": "ok"/"refused"/"invalid", "reason", "level", "diff", "warnings"}], "totals": {"jobs", "replan", "stills", "render", "refused", "text"}}` |
+| `GET /api/batches/stories?ws=` | 200 `{"stories": [{"id", "eligible", "reason", "busy_job", "fields_source", "fields_batch"}]}` over the same directories `_h_stories` lists (§3.4, §3.5) |
+| `POST /api/batches/preview` | 200 `{"number": N, "rows": [{"story_id", "fields": <orig> or null, "fields_source", "fields_batch", "movie": path or null}], "cells": [{"story_id", "variant", "fork_id", "status": "ok"/"refused"/"invalid", "reason", "level", "diff", "warnings"}], "totals": {"jobs", "replan", "stills", "render", "refused", "text"}}` |
 | `POST /api/batches` | 201 `{"batch": {"id", "number", "status": "waiting"}, "pending": P, "refused": R}`; 409 when `P == 0` (no record is written) |
 | `GET /api/batches/<id>` | 200 `{"batch": <batch.json>, "view": {"originals": {sid: movie path or null}, "cells": [{"state", "job": <job_summary> or null, "movie": path or null, "dir": bool}]}}`, with `view.cells` parallel to `batch.cells` |
 | `POST /api/batches/<id>/cancel` | 200 `{"status": "cancelled", "cancelled": [job IDs], "cancelling": [job IDs]}` |
@@ -260,17 +259,50 @@ Every route goes through the token check (`_handle`, `:364-374`).
 `story_status(server, ws_real)` makes one pass over `sorted(lib.list_job_ids(state), reverse=True)` with `server.job(id)`:
 - **has fields:** the first job of kind `story` or `movie` with `workspace == ws_real` and a dict `fields` defines `last_fields[story_id]`. This is the same rule as `newest_job` (`:1159-1165`).
 - **busy:** any job with `workspace == ws_real`, that `story_id`, and `lib.job_state(state, id, queue)` in `("queued", "starting", "running")`. The first such ID is `busy_job`.
+- **stored fields:** each listed story with no `last_fields` entry gets `stored_fields(server, ws_real, story_id)` (BF41, §3.5).
 
-`reason` is one of:
-- `Started from the command line: no saved Compose settings to fork`, when there are no fields;
-- `Job <id> is queued or running for this story`, when the story is busy (busy wins);
+`reason` is one of (busy wins, then this order):
+- `Job <id> is queued or running for this story`, when the story is busy;
+- `Started from the command line: no saved Compose settings to fork`, when there is no `last_fields` and BF41 gives `none`;
+- `Its job and its batch <batch> were deleted: no saved Compose settings to fork`, when BF41 gives `gone`;
+- `Its job was deleted and batch <batch> has no matching record of this fork: no saved Compose settings to fork`, when BF41 gives `mismatch`;
 - `null`.
 
-### 3.5 Planning (BF23)
+`eligible` is `reason is null`. `fields_source` is `"job"` when `last_fields` has the story, `"batch"` when BF41 gives `ok`, and `null` otherwise. `fields_batch` is `{"id": <batch>, "number": <record number>}` when `fields_source == "batch"`, else `null`. These two keys are computed even for a busy story.
+
+### 3.5 Batch-record field fallback (BF41)
+
+**Finding.** A fork's job can be deleted (`DELETE /api/jobs/<id>`, `movie_ui_server.py:98`; `delete_job` `movie_ui_lib.py:843-853`). The fork then has no `last_fields`, but its cell in `batch.json` keeps the full fork fields that were passed to `create_compose_job` (§4.3 step 9). `fork.json` is never copied (BF17), so each fork directory holds only its own `fork.json`. `lib.read_json(path, default)` returns `default` for a missing or unparseable file (`movie_ui_lib.py:107-111`), and `lib.JOB_ID_RE` is at `:35`. The user confirmed this fallback on 2026-10-30.
+
+- **BF41a Precedence.** `last_fields`, when present, always wins. The fallback runs only for a story with no `last_fields`, and its result is never compared with or merged into a job's fields.
+- **BF41b Reading (server).** `stored_fields(server, ws_real, story_id)` returns `(code, fields, batch_id, number)`:
+  1. `sdir = <ws_real>/generated/stories/<story_id>`. `fork_rec = lib.read_json(<sdir>/fork.json, None)` when `os.lstat(<sdir>/fork.json)` is `S_ISREG`, else `None` (a symlinked `fork.json` is ignored) **[spec choice]**, the same rule as `copy_plan`.
+  2. `path = <STATE>/batches/<fork_rec["batch"]>/batch.json`, read only when `fork_rec` is a dict whose `batch` is a string matching `lib.JOB_ID_RE` (this keeps the path inside `batches/`). `batch_rec = lib.read_json(path, {})` when `os.path.isfile(path)`, else `None`. When `path` is not read, `batch_rec = None`.
+  3. Return `batch.fork_fallback(fork_rec, batch_rec, story_id, ws_real)`.
+
+  It takes no lock **[spec choice]**: both files are written with `write_json_atomic`, so a read sees a whole file.
+- **BF41c Check (pure, `movie_ui_batch.py`).** `fork_fallback(fork_rec, batch_rec, story_id, ws_real)` returns `(code, fields, batch_id, number)`, with the first matching rule winning. Every key is read with `.get`, so a missing key fails its comparison:
+  1. `none`: `fork_rec` is not a dict, or `fork_rec["schema"] != FORK_SCHEMA`, or `fork_rec["fork_id"] != story_id`, or `fork_rec["batch"]` is not a string matching `lib.JOB_ID_RE`. Returns `("none", None, None, None)`. **[spec choice]** Without a usable `fork.json` the story is treated like any story with no saved settings.
+  2. `gone`: `batch_rec is None`. Returns `("gone", None, <batch>, None)`.
+  3. `mismatch`: any of the following fails. Returns `("mismatch", None, <batch>, None)`.
+     - `batch_rec` is a dict with `schema == BATCH_SCHEMA`, `id == fork_rec["batch"]`, `workspace == ws_real`, and `cells` a list;
+     - exactly one cell is a dict whose `fork_id` equals `story_id` **case-insensitively** (BF15), and its `fork_id` equals `story_id` exactly;
+     - that cell has `story_id == fork_rec["source_story"]`, `variant == fork_rec["variant"]`, `status == "queued"`, a string `job_id`, and a dict `fields` whose `story_id == story_id`.
+
+     **[spec choice]** `status == "queued"` is the only cell status whose fork directory survives (refused, cancelled-before-start and interrupted cells have their folder removed), and it is the only status at which `fields` is set (§4.3 step 9).
+  4. `ok`: returns `("ok", json.loads(json.dumps(cell["fields"])), <batch>, batch_rec["number"])`.
+- **BF41d Field source.** The fallback fields are the cell's `fields` exactly as submitted: the fork's effective fields after merge, including the variant's settings and its edited `narrative`. `merge` treats them like `last_fields` (`compose_fields`, then the fixed keys of §2.2 step 1).
+- **BF41e Where it applies.** Everywhere `last_fields` is read for a batch: `story_status` (§3.4), `plan_batch` step 2 (§3.6) and the per-cell recompute (§4.3 step 2). Preview `rows[].fields` holds the fallback fields when they are used, and `rows[].fields_source` / `rows[].fields_batch` follow §3.4.
+- **BF41f Deleted batch.** `DELETE /api/batches/<id>` removes the only copy of the fallback fields. Afterwards every fork of that batch with no job is ineligible with the `gone` reason of §3.4. Nothing warns at delete time: the BF39 delete confirmation text is unchanged.
+
+### 3.6 Planning (BF23)
 
 `plan_batch(server, clean, number)` is the single function behind preview, submit and each cell's turn ("same code as submit"). For each cell in grid order, the steps run in this order and the first refusal wins:
 1. A missing story directory → `story <id> no longer exists in this workspace`.
-2. No fields → `story <id> has no saved Compose settings (it was started from the command line)`.
+2. No fields. The original's fields are `last_fields` when present, else the BF41 fallback fields when `stored_fields` gives `ok`. Otherwise the cell is refused with the text for the BF41 code:
+   - `none` → `story <id> has no saved Compose settings (it was started from the command line)`;
+   - `gone` → `story <id> has no saved Compose settings (its job and its batch <batch> were deleted)`;
+   - `mismatch` → `story <id> has no saved Compose settings (its job was deleted and batch <batch> has no matching record of it)`.
 3. Busy → `story <id> has a job queued or running (job <job>)`.
 4. Fork ID (BF13, BF15).
 5. `merge`.
@@ -305,7 +337,7 @@ The preview runs no V2-V6. **[spec choice]** It runs V1 as Compose's own preview
 **Finding.** `run_checks` takes no lock. `create_compose_job` takes `STORE_LOCK` itself and must not be called while it is held: `threading.Lock` is not re-entrant (`movie_ui_server.py:33`, `:752`). Compose already runs checks unlocked (`:765`).
 
 1. `BATCH_LOCK`: re-read. When `cancel_requested` is set, the cell becomes `cancelled` (reason `batch cancelled`). When its status is not `pending`, skip it. Otherwise set `forking` and write.
-2. Recompute with `plan_batch` over the whole batch, from the **current** `last_fields` and the stored number, and take this cell's result **[spec choice: the latest settings at the cell's turn]**. A refusal ends the cell as `refused`.
+2. Recompute with `plan_batch` over the whole batch, from the **current** `last_fields` (or BF41 fallback fields) and the stored number, and take this cell's result **[spec choice: the latest settings at the cell's turn]**. A refusal ends the cell as `refused`.
 3. `copy_bytes = sum(copy_plan)`. When `shutil.disk_usage(<ws>/generated/stories).free - copy_bytes < MIN_FREE_BYTES`, refuse with `not enough free space: F GiB free, this fork copies C GiB and at least 20 GiB must stay free` (1 decimal).
 4. `os.mkdir`, `fork.json`, the copies (BF18). On `FileExistsError`, refuse with the BF15 "already exists" text. On another `OSError`, call `remove_fork` and refuse with `copy failed: <strerror>: <path>`.
 5. Re-check busy (§3.4). When the original got a job, call `remove_fork` and refuse with `story <id> got a job (<job>) while it was being forked; fork it again later`.
@@ -353,6 +385,7 @@ Rules: no inline handlers or styles, no `prompt(`/`alert(`/`confirm(`/`eval(` an
   - Before `#s-list` add `<div class="row"><button id="s-new-batch" type="button" hidden>New batch (0)</button></div>`.
   - `#s-list` thead gains a first `<th>Pick</th>`.
   - Each row's first cell holds `<input type="checkbox" class="s-pick">`, filled from `GET /api/batches/stories`. It is disabled with `title` = the server's `reason` when it is not eligible. Its click calls `stopPropagation`, so it does not open the story.
+  - When the row's `fields_source` is `"batch"`, the same cell also holds `<span class="s-pick-note muted">settings from batch b<N></span>`, where `N` is `fields_batch.number`, and the span's `title` is `This fork's job was deleted; its settings come from batch <id>`. Rows with `"job"` or `null` get no note.
   - `#s-new-batch` shows when at least 1 box is ticked, with the text `New batch (N)`. Clicking it opens the editor with the ticked IDs in list order.
 - **BF37 Batches tab.** `<button id="tab-batches" type="button" class="tab">Batches</button>` goes right after `tab-stories`. `TABS` becomes `["compose", "stories", "batches", "characters", "locations", "actions", "loras", "jobs", "traces"]`, and `showTab("batches")` calls `loadBatches()`. `<section id="panel-batches" class="panel" hidden>` holds three boxes, one shown at a time:
   - `#b-list-box`: `<table id="b-list" class="list">` with headers `Batch`, `Created`, `Done`, `Status`. Each row holds the ID, the local created time, `D/T` and the status, and a row click opens the batch page.
@@ -389,7 +422,7 @@ Rules: no inline handlers or styles, no `prompt(`/`alert(`/`confirm(`/`eval(` an
     - `judge` `#c-judge`.
 
     The LoRA lists use `loraRow(target, item, container)` and `collectLoras(target, container)`, where the new optional `container` defaults to the Compose container, so existing calls are unchanged. A control starts at `rows[0].fields[key]` from the preview.
-  - `<table id="b-preview" class="list">` has a header row `Story` plus one column per variant label. Each cell shows:
+  - `<table id="b-preview" class="list">` has a header row `Story` plus one column per variant label. The `Story` cell holds the story ID and, when that preview row's `fields_source` is `"batch"`, the same `span.s-pick-note` text and `title` as BF36. Each variant cell shows:
     - the fork ID;
     - `span.badge.level-render|level-stills|level-replan` with the `LEVEL_LABELS` text;
     - one diff line per entry (`key: from → to`, where LoRAs show their `id` or file name and `narrative` shows `prompt edited`);
@@ -415,7 +448,7 @@ Rules: no inline handlers or styles, no `prompt(`/`alert(`/`confirm(`/`eval(` an
     - `button.b-cancel-cell` `Cancel` (when the job is queued, starting or running; it calls `POST /api/jobs/<id>/cancel`).
   - **Play row:** every video in the row is paused, gets `currentTime = 0` and `muted = true` except the original's (`muted = false`), then each `play()` is called in the same click handler.
   - **Polling:** `S.timers.batch = setInterval(pollBatch, BATCH_POLL_MS)` runs while `#b-page` is shown and is cleared on leaving it. `stopPolling` also clears `"batch"`.
-  - **[spec choice]** The page is a section of `index.html` driven by `app.js`. It reuses the session token, workspace, `openStory`, `selectJob` and the poll loop, and keeps the single-script rule of `test_mut24`.
+  - **User-confirmed 2026-10-30:** the page is a section of `index.html` driven by `app.js`, not a second HTML document. It reuses the session token, workspace, `openStory`, `selectJob` and the poll loop, and keeps the single-script rule of `test_mut24`.
 - **BF40 CSS.** `app.css` gains `.level-render`, `.level-stills`, `.level-replan` (three distinct border colours, with dark-mode variants inside the existing `@media (prefers-color-scheme: dark)`), `.chip` and `#b-grid video {max-width: 320px}`.
 
 ---
@@ -447,7 +480,11 @@ Rules: no inline handlers or styles, no `prompt(`/`alert(`/`confirm(`/`eval(` an
 | not interrupted | resume | `batch <id> was not interrupted` | 409 |
 | still submitting | delete | `batch <id> is still submitting; cancel it first` | 409 |
 | delete fails | delete | `cannot delete batch <id>: <strerror>` | 500 |
-| cell refusals | cell `reason` | the texts of BF7, BF11-BF13, BF15, §3.5 and §4.3 | cell `refused`, no folder |
+| no stored fields: batch deleted | `/api/batches/stories` `reason` (checkbox `title`) | `Its job and its batch <batch> were deleted: no saved Compose settings to fork` | ineligible |
+| no stored fields: record mismatch | `/api/batches/stories` `reason` (checkbox `title`) | `Its job was deleted and batch <batch> has no matching record of this fork: no saved Compose settings to fork` | ineligible |
+| no stored fields: batch deleted | preview, submit, cell turn | `story <id> has no saved Compose settings (its job and its batch <batch> were deleted)` | cell `refused` |
+| no stored fields: record mismatch | preview, submit, cell turn | `story <id> has no saved Compose settings (its job was deleted and batch <batch> has no matching record of it)` | cell `refused` |
+| cell refusals | cell `reason` | the texts of BF7, BF11-BF13, BF15, §3.6 and §4.3 | cell `refused`, no folder |
 
 `K` and `J` are 1-based. Several 400 lines are returned together, in table order.
 
@@ -476,7 +513,7 @@ Rules:
 | BT10 | same | **BK4 (unit)**: `order` for 2 stories × {render, replan, stills} variants is `[s1v2, s2v2, s1v3, s2v3, s1v1, s2v1]` |
 | BT11 | same | `totals.text` with and without refused cells |
 | BT12 | same | an original without story.md → `replan` + warning |
-| BT13 | same | static page: `node --check app.js` (when node exists); each §5 ID appears in `index.html` exactly once; the `TABS` string; labels `New batch (`, `Play row`, `Submit remaining`, `Use the original`, `Add setting…`; no forbidden pattern of `test_mut24` |
+| BT13 | same | static page: `node --check app.js` (when node exists); each §5 ID appears in `index.html` exactly once; the `TABS` string; labels `New batch (`, `Play row`, `Submit remaining`, `Use the original`, `Add setting…`, `settings from batch b`; no forbidden pattern of `test_mut24` |
 | BT14 | `tests/test_movie_ui_http.py` | every batch route: 401 without or with a wrong token; 404 for an unknown batch; 405 for `PUT /api/batches` |
 | BT15 | same | `/api/batches/stories`: CLI story ineligible with its exact reason; queued and running originals busy; UI story eligible |
 | BT16 | same | preview equals submit: `fork_id`, `level`, `diff` and `warnings` of every preview cell equal the record's after the submitter runs |
@@ -494,6 +531,11 @@ Rules:
 | BT28 | `tests/test_movie_ui_jobs.py` | **BK5**: `batch_recovery` on a record with a `forking` cell (folder, no job) → folder removed + `interrupted`; a `forking` cell with a job → `queued`; `pending` → `interrupted`; status `interrupted`; prints nothing when nothing needs recovery |
 | BT29 | `tests/test_movie_ui_http.py` | after BT28's state, `resume` → 200 `waiting`, the cells are processed and queued; a second `resume` → 409 |
 | BT30 | `tests/test_vlm_lifecycle.py` | Render and New-stills fork jobs record `vlm` `forbidden` and a Re-plan fork records `required`; `vlm_restore_wanted` after a Re-plan fork with a Render fork next → `(False, ...)` |
+| BT31 | `tests/test_movie_ui_batch.py` | **BK8 (unit)**: `fork_fallback` on a matching pair → `ok`, the cell's `fields` (equal, not the same object) and the record's `number`; each BF41c `none` rule (not a dict, wrong schema, wrong `fork_id`, bad `batch`) → `none`; `batch_rec None` → `gone`; each BF41c `mismatch` rule (parametrised: wrong schema, wrong `id`, other `workspace`, no cell, two cells differing only in case, cell `fork_id` differing only in case, other `source_story`, other `variant`, status `cancelled`, `job_id` null, `fields` null, `fields.story_id` other) → `mismatch` |
+| BT32 | `tests/test_movie_ui_http.py` | **BK8, fallback used**: submit a 1×1 Render batch (model change), `mt.dispatch` the fork job to `done`, then `DELETE /api/jobs/<id>`. `/api/batches/stories` gives the fork `eligible: true`, `reason: null`, `fields_source: "batch"`, `fields_batch: {"id": <batch>, "number": 1}`. A preview with the fork as the story gives `rows[0].fields_source == "batch"` and `rows[0].fields["model"]` = the first batch's variant model. Submitting a second batch (gemma change) queues a job whose `fields` keep that model, change `gemma`, and have `story_id` `<fork>-b2-v1` |
+| BT33 | same | **BK8, last_fields wins**: after the first batch of BT32 with the fork job kept, the cell's `fields.model` in `batch.json` is rewritten on disk to another value. `/api/batches/stories` gives the fork `fields_source: "job"` and `fields_batch: null`, and the preview's `rows[0].fields["model"]` is the job's model |
+| BT34 | same | **BK8, missing or mismatched record**: from BT32's state with the job deleted, (a) remove `fork.json` → ineligible with the `Started from the command line…` reason and `fields_source: null`; (b) parametrised, one edit per case with both files restored between cases: `batch.json` cell `status` to `cancelled`, `batch.json` `workspace` to another path, `fork.json` `variant` to 2 → each ineligible with the exact `mismatch` reason, and a preview cell refused with the exact `mismatch` refusal text |
+| BT35 | same | **BK8, deleted batch**: from BT32's state, `DELETE /api/batches/<id>` → the fork is ineligible with `Its job and its batch <id> were deleted: no saved Compose settings to fork` and `fields_source: null`; a preview cell is refused with `story <fork> has no saved Compose settings (its job and its batch <id> were deleted)`; submitting only that story → 409 `every cell was refused` |
 
 ### 7.1 Existing tests to re-baseline (one test-only commit, after the feature commit)
 
@@ -526,6 +568,7 @@ Checked and unaffected:
 | BK5 | Refused, interrupted and cancelled-before-start cells leave no fork folder | BT18, BT23, BT27, BT28 |
 | BK6 | `test_mut26_pipeline_files_are_unchanged` passes unedited | full run |
 | BK7 | `python3 -m pytest tests/ -q -rA` from `WS` shows exactly the baseline failures recorded at `574303a` before any edit, and the pass count is the baseline plus every BT test. The only edits to existing tests are §7.1, in one test-only commit | full run before and after |
+| BK8 | A fork with no job is eligible exactly when its `fork.json` and batch cell match (BF41c), and then uses the cell's submitted fields; `last_fields` always wins; a deleted batch or a mismatched record leaves it ineligible with the exact §6 texts | BT31, BT32, BT33, BT34, BT35 |
 
 Live check after the merge (not a merge gate): 1 story × 2 Render variants on the user's machine, with both forks playing in the compare page and Play row starting them together. Never on macstudio.
 
@@ -535,7 +578,7 @@ Live check after the merge (not a merge gate): 1 story × 2 Render variants on t
 2. At `574303a`, record the full-suite pass count and failure list.
 3. Make the feature commit: G1-G4 plus the BT tests.
 4. Make the test-only commit (§7.1).
-5. Run BK1-BK7, then an Opus design review of the diff against this spec.
+5. Run BK1-BK8, then an Opus design review of the diff against this spec.
 
 ## 10. Risks
 
@@ -547,8 +590,8 @@ Live check after the merge (not a merge gate): 1 story × 2 Render variants on t
 - **R6 Preview drift.** `number` and `last_fields` can change between preview and submit, and between submit and a cell's turn (BF28 step 2).
 - **R7 Cancel latency.** Cancel batch waits up to one `run_checks` for a forking cell.
 
-## 11. Open questions
+## 11. Resolved questions
 
-- **Q1.** The notes classify a resolution change as Render, and this spec makes it New stills (§2.1) because the stills size is 2× the video size and a mismatched aspect fails the render. Confirm.
-- **Q2.** After a fork's job is deleted, the fork has no `last_fields`, so it cannot be forked again even though `batch.json` keeps its fields. Should eligibility fall back to the batch record? This spec does not.
-- **Q3.** The notes say "the new page goes in static/movie-ui/". This spec reads that as a section of `index.html` and `app.js` (BF39) rather than a second HTML document. Confirm.
+- **Q1 (2026-10-30).** A resolution change is New stills, not Render (§2.1): the user confirmed it.
+- **Q2 (2026-10-30).** A batch fork whose job was deleted stays eligible through its batch record's cell fields; `last_fields` wins when present (BF41, §3.5).
+- **Q3 (2026-10-30).** The compare page is a section of `index.html` and `app.js`, not a second HTML document (BF39): the user confirmed it.
