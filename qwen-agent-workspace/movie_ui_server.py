@@ -1921,12 +1921,18 @@ def list_batch_ids(state):
 
 
 def next_batch_number(server, ws_real):
-    """BF14 over this STATE's batch records and the workspace's story directory names."""
+    """BF14 over this STATE's batch records, the workspace's story directory names and the story
+    IDs of this STATE's jobs of the workspace, so a cancelled-then-deleted batch's number (whose
+    jobs remain) is never reused (final review C1)."""
     records = [read_batch(server.state, i) for i in list_batch_ids(server.state)]
     try:
         names = os.listdir(os.path.join(ws_real, "generated", "stories"))
     except OSError:
         names = []
+    for job_id in lib.list_job_ids(server.state):
+        job = server.job(job_id)
+        if job is not None and job.get("workspace") == ws_real and isinstance(job.get("story_id"), str):
+            names.append(job["story_id"])
     return batch.next_number(records, names, ws_real)
 
 
@@ -2376,12 +2382,15 @@ def _h_batches(self, groups, query, body):
         rec = read_batch(server.state, batch_id)
         if rec is None or rec.get("workspace") != real:
             continue
-        rec = reconcile(server, batch_id) or rec
-        done = sum(1 for c in rec["cells"] if isinstance(c.get("job_id"), str)
-                   and lib.JOB_ID_RE.fullmatch(c["job_id"])
-                   and lib.job_state(server.state, c["job_id"], queue) == "done")
-        out.append({"id": rec["id"], "number": rec["number"], "created": rec["created"],
-                    "status": rec["status"], "cells": len(rec["cells"]), "done": done})
+        try:
+            rec = reconcile(server, batch_id) or rec
+            done = sum(1 for c in rec["cells"] if isinstance(c.get("job_id"), str)
+                       and lib.JOB_ID_RE.fullmatch(c["job_id"])
+                       and lib.job_state(server.state, c["job_id"], queue) == "done")
+            out.append({"id": rec["id"], "number": rec["number"], "created": rec["created"],
+                        "status": rec["status"], "cells": len(rec["cells"]), "done": done})
+        except Exception as e:  # one malformed record never hides the others (final review M3)
+            sys.stderr.write("movie-ui: batch %s: not listed: %s: %s\n" % (batch_id, type(e).__name__, e))
     return 200, {"batches": out}
 
 
@@ -2471,8 +2480,11 @@ def _recover_batch(state, batch_id):
             cell.update(status="queued", reason=None, job_id=job_id, fields=job.get("fields"), updated=now)
             adopted.append(job_id)
         elif cell.get("status") == "forking":
-            remove_unused_fork(state, rec["workspace"], lib.story_dir(rec["workspace"], cell["fork_id"]),
-                               batch_id)
+            fdir = lib.story_dir(rec["workspace"], cell["fork_id"])
+            if os.path.isdir(fdir) and not os.path.islink(fdir) and not os.listdir(fdir):
+                os.rmdir(fdir)  # made by this cell's mkdir; the server stopped before fork.json (BR13)
+            else:
+                remove_unused_fork(state, rec["workspace"], fdir, batch_id)
             if cancelled:
                 cell.update(status="cancelled", reason="batch cancelled", updated=now)
             else:
@@ -2484,12 +2496,13 @@ def _recover_batch(state, batch_id):
             else:
                 cell.update(status="interrupted", reason="the server stopped before this fork was made",
                             updated=now)
-    rec["status"] = "cancelled" if cancelled else "interrupted"
-    write_batch(state, rec)
     if cancelled:
         for job_id in adopted:
             with STORE_LOCK:
                 lib.cancel_job(state, job_id)
+    rec["status"] = "cancelled" if cancelled else "interrupted"
+    write_batch(state, rec)
+    if cancelled:
         sys.stderr.write("movie-ui: batch %s: cancelled (finished at restart)\n" % batch_id)
     else:
         sys.stderr.write("movie-ui: batch %s: interrupted (%d cell(s) to submit again)\n"

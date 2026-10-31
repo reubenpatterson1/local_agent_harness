@@ -685,21 +685,22 @@
     if (!S.ws) { return; }
     const res = await api("GET", "/api/stories" + wsQuery());
     const picks = await api("GET", "/api/batches/stories" + wsQuery());
+    const keep = pickedStories();
     const body = clear($("#s-list tbody"));
-    updateNewBatch();
-    if (res.status !== 200) { return; }
+    if (res.status !== 200) { updateNewBatch(); return; }
     const eligibility = {};
     if (picks.status === 200) { picks.data.stories.forEach(function (p) { eligibility[p.id] = p; }); }
     res.data.stories.forEach(function (st) {
       const checks = st.checks ? st.checks.hard + " hard, " + st.checks.advisory + " advisory" +
         (st.checks.verdict ? " (" + st.checks.verdict + ")" : "") : "-";
-      const row = el("tr", {data: {storyId: st.id}, cls: "clickable"}, [pickCell(st.id, eligibility[st.id]),
+      const row = el("tr", {data: {storyId: st.id}, cls: "clickable"}, [pickCell(st.id, eligibility[st.id], keep.indexOf(st.id) >= 0),
         el("td", {text: st.id}), el("td", {text: st.story_md ? "yes" : "no"}), el("td", {text: checks}),
         el("td", {text: String(st.stills)}), el("td", {text: String(st.clips)}),
         el("td", {text: st.movie ? "yes" : "no"}), el("td", {text: new Date(st.mtime).toLocaleString()})]);
       row.addEventListener("click", function () { openStory(st.id); });
       body.appendChild(row);
     });
+    updateNewBatch();
   }
 
   async function openStory(storyId) {
@@ -883,12 +884,14 @@
     show($("#s-new-batch"), n >= 1);
   }
 
-  function pickCell(storyId, info) {
+  function pickCell(storyId, info, checked) {
     const box = el("input", {type: "checkbox", cls: "s-pick", data: {storyId: storyId}});
     const cell = el("td", {}, [box]);
     if (!info || !info.eligible) {
       box.disabled = true;
       box.title = info ? info.reason : "batch eligibility is not known";
+    } else if (checked) {
+      box.checked = true;
     }
     if (info && info.fields_source === "batch") {
       cell.appendChild(document.createTextNode(" "));

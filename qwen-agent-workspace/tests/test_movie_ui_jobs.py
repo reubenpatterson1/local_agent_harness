@@ -517,3 +517,18 @@ def test_batch_fix_recovery_skips_a_malformed_record(state, tmp_path, capsys):
                           {"id": batch_id, "status": "submitting"})
     srv.batch_recovery(state)
     assert capsys.readouterr().err.startswith("movie-ui: batch %s: recovery skipped: KeyError: " % batch_id)
+
+
+def test_batch_fix_recovery_removes_an_empty_fork_folder(state, tmp_path, capsys):
+    import movie_ui_server as srv
+    ws = os.path.realpath(str(tmp_path))
+    batch_id = "20261030-120504-ab15"
+    fdir = lib.story_dir(ws, "s1-b1-v1")
+    os.makedirs(fdir)
+    lib.make_dir(os.path.join(state, "batches", batch_id))
+    lib.write_json_atomic(os.path.join(state, "batches", batch_id, "batch.json"),
+                          _bt28_record(ws, batch_id, ["forking"], "submitting", False))
+    srv.batch_recovery(state)
+    assert not os.path.lexists(fdir)
+    rec = lib.read_json(os.path.join(state, "batches", batch_id, "batch.json"))
+    assert rec["cells"][0]["status"] == "interrupted"

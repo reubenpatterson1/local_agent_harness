@@ -1755,3 +1755,38 @@ def test_batch_fix_mkdir_error_is_a_copy_failure(env, monkeypatch):
     cell = bt.wait_status(s, batch_id)["batch"]["cells"][0]
     assert (cell["status"], cell["reason"].split(": ")[0]) == ("refused", "copy failed")
     assert "Permission denied" in cell["reason"]
+
+
+def test_batch_fix_numbers_are_never_reused_after_cancel_and_delete(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch, fail={})
+    bt.original(state, ws, "ronin-rescue")
+    variants = [bt.variant("v1", bt.RENDER), bt.variant("v2", {"gemma": bt.OTHER_GEMMA})]
+    b1 = bt.submit(s, ws, ["ronin-rescue"], variants)
+    bt.wait_status(s, b1)
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % b1, body={})[0] == 200
+    assert mt.api(s, "DELETE", "/api/batches/" + b1)[0] == 200
+    bt.passing_checks(monkeypatch, fail={"ronin-rescue-b2-v1": "Error: dry run failed"})
+    b2 = bt.submit(s, ws, ["ronin-rescue"], variants)
+    bt.wait_status(s, b2)
+    rec = bt.record(state, b2)
+    assert rec["number"] == 2
+    assert [c["fork_id"] for c in rec["cells"]] == ["ronin-rescue-b2-v1", "ronin-rescue-b2-v2"]
+    assert rec["cells"][0]["status"] == "refused"
+    assert not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b2-v1"))
+    assert mt.api(s, "POST", "/api/batches/%s/cancel" % b2, body={})[0] == 200
+    mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert not os.path.lexists(lib.story_dir(ws, "ronin-rescue-b2-v2"))
+
+
+def test_batch_fix_a_malformed_record_does_not_hide_the_list(env, monkeypatch):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    bt.passing_checks(monkeypatch)
+    bt.original(state, ws, "ronin-rescue")
+    good = bt.submit(s, ws, ["ronin-rescue"], [bt.variant("v1", bt.RENDER)])
+    bt.wait_status(s, good)
+    bad = "20201030-120000-0c0c"
+    lib.make_dir(os.path.join(state, "batches", bad))
+    lib.write_json_atomic(os.path.join(state, "batches", bad, "batch.json"), {"id": bad, "workspace": ws})
+    status, _h, payload = mt.api(s, "GET", "/api/batches?ws=" + ws)
+    assert status == 200 and [b["id"] for b in payload["batches"]] == [good]
