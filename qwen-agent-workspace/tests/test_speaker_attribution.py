@@ -274,12 +274,12 @@ def test_sat9_plan_prompt(ws, story_env):
     prompt, rule = _plan_prompt(ws, mode="shots", members=members, narrative=LINES_NARRATIVE)
     assert rule + se.LINES_PINNED_SENTENCE + both + "\nloras: " in prompt
     prompt, rule = _plan_prompt(ws, mode="chained", members=members, narrative=LINES_NARRATIVE)
-    assert rule + both + "\nloras: " in prompt
+    assert rule + both + se.END_FRAME_RULE + "\nloras: " in prompt
     prompt, rule = _plan_prompt(ws, mode="shots", members=members, narrative=PRONOUN_NARRATIVE)
     assert rule + se.LINES_PINNED_SENTENCE + "\nloras: " in prompt
     assert "The narrative gives these lines" not in prompt
     prompt, rule = _plan_prompt(ws, mode="chained", members=members, narrative=PRONOUN_NARRATIVE)
-    assert rule + "\nloras: " in prompt
+    assert rule + se.END_FRAME_RULE + "\nloras: " in prompt
     assert "The narrative gives these lines" not in prompt
     prompt, _rule = _plan_prompt(ws, mode="chained", members=members, narrative=(
         'Kyra climbs the steps, and the ronin follows. She says, "Wait." The ronin says, "Go."'))

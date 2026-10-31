@@ -297,7 +297,8 @@ def test_spr2a_the_pre_flight_names_length_when_length_sized_the_movie(ws, story
 
 SPC4_EXAMPLE = (
     "beats: a list of 3 to 5 objects, one per panel in order, with the keys index, arc, action, "
-    "shot, camera, location, cast and speaker. index runs from 1 to the number of beats. This "
+    "shot, camera, location, cast, speaker and end_frame. index runs from 1 to the number of "
+    "beats. This "
     "movie's target length is 3 beats, and like a word range it is soft: use 3 beats when the "
     "narrative fits them, and add a beat, up to 5 beats in all, only for something the narrative "
     "needs that no other beat can hold. arc is one of introduction, rising, climax, falling, "
@@ -605,7 +606,7 @@ def test_spt8_e2e_one_beat_added(ws, tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     note = P20_NOTE % (4, 1, 3, P20_OTHER_REASON)
     assert rc == 0
-    assert [r["stage"] for r in log][:5] == ["plan", "panel", "panel", "panel", "panel"]
+    assert [r["stage"] for r in log][:6] == ["plan", "plan", "panel", "panel", "panel", "panel"]
     with open(os.path.join(ctx.story_dir, "story_rounds", "round_0", "panel_04_prompt_1.txt"),
               encoding="utf-8") as f:
         assert "You are writing panel 4 of 4 " in f.read()

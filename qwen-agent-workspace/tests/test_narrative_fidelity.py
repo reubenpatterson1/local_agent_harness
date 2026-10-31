@@ -348,7 +348,8 @@ def test_nf16_the_speaking_coercion_table(ws):
     shots = {"extreme wide shot": "medium close-up", "wide shot": "medium close-up",
              "medium shot": "medium shot", "medium close-up": "medium close-up",
              "close-up": "close-up", "extreme close-up": "close-up", "": "medium close-up"}
-    kept = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
+    kept = ("slow push-in", "slow pull-back", "tracking", "slow tracking left",
+            "slow tracking right", "handheld", "static")
     assert sorted(shots) == sorted(se.SHOT_TYPES + ("",))
     for shot in se.SHOT_TYPES + ("",):
         for camera in se.CAMERA_KEYS + ("",):
@@ -589,7 +590,7 @@ def test_nf14_the_plan_retry_gate(ws, tmp_path, monkeypatch):
     assert [b["lines"] for b in found[0]["beats"]] == [[1], [2]] and found[2] == []
     log = seu.script_agent(monkeypatch, tmp_path, plan=[fixed])
     found, why = se._Run(ctx, "").plan_round()
-    assert len(seu.agent_log(log)) == 1 and [b["lines"] for b in found[0]["beats"]] == [[1], [2]]
+    assert len(seu.agent_log(log)) == 2 and [b["lines"] for b in found[0]["beats"]] == [[1], [2]]
 
 
 def test_nf26_an_older_plan_json_loads(ws):
@@ -688,21 +689,22 @@ def test_nf12_the_plan_prompt(ws):
     prompt = se.build_plan_prompt(_hockey_ctx(ws, "hockey-2x145"), [], [])
     assert ("Narrative to adapt:\n" + HOCKEY + SPOKEN_BLOCK + "\n\nThe target output goal is "
             ) in prompt
-    assert "location, cast, speaker and lines. index runs from 1 to the number of beats." in prompt
+    assert ("location, cast, speaker, lines and end_frame. index runs from 1 to the number of "
+            "beats.") in prompt
     assert ("at most 4." + SPEAKER_RULE + LINES_RULE.replace("@@LINE_WORDS@@", "13")
-            .replace("@@MIN_BEATS@@", "2") + "\n") in prompt
+            .replace("@@MIN_BEATS@@", "2") + se.END_FRAME_RULE + "\n") in prompt
     assert CAST_LINE in prompt and SETTING_LINE in prompt and "@@" not in prompt
     one = se.build_plan_prompt(_hockey_ctx(ws, "hockey-1x241"), [], [])
     assert "together they are at most 14 words." in one and "@@" not in one
     quiet = se.build_plan_prompt(seu.make_ctx(se, ws), [], [])
     assert "Spoken lines (" not in quiet and "lines is the list" not in quiet
-    assert "location, cast and speaker. index runs" in quiet
-    assert ("at most 4." + SPEAKER_RULE + "\n") in quiet
+    assert "location, cast, speaker and end_frame. index runs" in quiet
+    assert ("at most 4." + SPEAKER_RULE + se.END_FRAME_RULE + "\n") in quiet
     assert CAST_LINE in quiet and SETTING_LINE in quiet and "@@" not in quiet
     silent = se.build_plan_prompt(_hockey_ctx(ws, "hockey-2x145", narration=False), [], [])
     assert "Spoken lines (" not in silent and "lines is the list" not in silent
-    assert "location, cast and speaker. index runs" in silent
-    assert ("at most 4." + se.SILENT_SPEAKER_RULE + "\n") in silent
+    assert "location, cast, speaker and end_frame. index runs" in silent
+    assert ("at most 4." + se.SILENT_SPEAKER_RULE + se.END_FRAME_RULE + "\n") in silent
 
 
 # --- NF15, NF20: the panel writer (QL9, SM4, 7.2) ---------------------------------------------------
@@ -1146,7 +1148,7 @@ def test_nf32_no_narration_keeps_the_movie_silent(ws, tmp_path, monkeypatch):
     ctx = seu.make_ctx(se, ws, narration=False, narrative=HOCKEY)
     rc, log = _engine(monkeypatch, tmp_path, ctx, [seu.answer(seu.plan_json("chained", 3))],
                       dict((str(k), [seu.answer(seu.panel_json("chained", k))]) for k in (1, 2, 3)))
-    assert rc == 0 and _stages(log) == ["plan", "panel", "panel", "panel"]
+    assert rc == 0 and _stages(log) == ["plan", "plan", "panel", "panel", "panel"]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
     assert not [v for v in checks0["hard"] + checks0["advisory"] if v["id"] == "Q1"]
     assert Q2_HOCKEY in [v["message"] for v in checks0["advisory"]]
@@ -1161,14 +1163,14 @@ def test_nf33_default_narration_with_the_fixed_plan(ws, tmp_path, monkeypatch, c
                       {"1": [_recorded("hockey-2x145", "panel_01_reply_1.txt")], "2": [p2, p2]},
                       [{"answer": "x"}] * 4)
     assert rc == 0
-    assert _stages(log).count("plan") == 1
+    assert _stages(log).count("plan") == 2
     assert _story_json(ctx, "story_rounds", "round_0", "plan.json")["speech_notes"] == [
         P18_2X145, P19_NOTE % (4, 3)]
     checks0 = _story_json(ctx, "story_rounds", "round_0", "story_checks.json")
     # R16: panel 2's exit after the line is re-asked once, then trimmed, which clears its T2, so
     # no critic round runs and nothing is left unresolved.
     assert [v["id"] for v in checks0["hard"]] == []
-    assert _stages(log) == ["plan", "panel", "panel", "panel"]
+    assert _stages(log) == ["plan", "plan", "panel", "panel", "panel"]
     assert "Warning: unresolved" not in capsys.readouterr().out
     story = _story_text(ctx, "story.md")
     assert "Dialogue: the FuboTV player: " + LINE1 + "\n" in story

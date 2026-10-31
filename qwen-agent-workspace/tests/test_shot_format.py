@@ -149,29 +149,29 @@ def _read_manifest(ws, story_id):
 
 REF_PHRASE = "the old fishmonger"
 REF_PARTS = (
-    {"shot": "The shot is a wide shot.",
+    {"shot": "The shot is a medium shot.",
      "motion": ("The old fishmonger drags a tall stack of empty herring crates across the wet "
                 "concrete of the market hall toward the half-open shutter at real-time speed, her "
                 "heavy steps splashing through shallow puddles that hold the first glow from the "
-                "harbour doors. The camera tracks alongside her from the left — as the move "
-                "completes, she reaches the shutter at frame centre, the long rows of bare zinc "
-                "counters stretching away behind her."),
+                "harbour doors. The camera tracks right alongside her — as the move completes, "
+                "the old fishmonger stands beside the half-open shutter at frame centre, facing "
+                "left toward the hall, seen from the knees up, the empty crates at her feet."),
      "speaker": None, "line": ""},
     {"shot": "The shot is a medium shot.",
-     "motion": ("The old fishmonger looks up from the empty ice trays to the camera, drying her "
-                "knuckles on a folded cloth at the zinc counter at real-time speed. The old "
-                "fishmonger lets the folded cloth drop onto the counter, her shoulders sinking. "
-                "The camera pushes in — as the move completes, her face fills the frame from "
-                "chin to brow, the bare counters soft behind her. The old fishmonger faces the "
+     "motion": ("The old fishmonger turns back from the shutter and walks to the zinc counter at "
+                "real-time speed, laying her folded cloth beside the empty ice trays and lifting "
+                "her face to the camera. The old fishmonger presses both palms flat on the folded "
+                "cloth, her shoulders sinking. The camera pushes in — as the move completes, the "
+                "old fishmonger stands behind the zinc counter at frame centre, facing forward, "
+                "her face filling the frame from chin to brow. The old fishmonger faces the "
                 "camera."),
      "speaker": "the old fishmonger", "line": "Forty years of mornings. Not one more."},
     {"shot": "The shot is a close-up.",
-     "motion": ("The old fishmonger presses her forehead against the cold ribs of the half-closed "
-                "steel shutter at real-time speed, both palms flat on the metal, her breath "
-                "fogging the ribbed steel as a thin trickle of meltwater runs past her knuckles "
-                "and drips onto the wet concrete at her feet. The camera stays static, holding her "
-                "face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
-                "shut and the shutter stops trembling."),
+     "motion": ("The old fishmonger lowers her forehead onto her folded hands on the cold zinc "
+                "counter at real-time speed, her breath fogging the metal as a thin trickle of "
+                "meltwater runs past her knuckles and drips to the wet floor. The camera stays "
+                "static, holding the old fishmonger as she rests her forehead on her folded hands "
+                "at frame centre, eyes closed, her head and hands filling the frame."),
      "speaker": None, "line": ""},
 )
 # The narrative of the recorded hockey runs ($S/hockey/narrative.txt, written out; it equals the
@@ -214,19 +214,25 @@ CAMERA_SENTENCES = (
     ("slow push-in", "The camera pushes in."),
     ("slow pull-back", "The camera pulls back."),
     ("tracking", "The camera tracks alongside the movement."),
+    ("slow tracking left", "The camera tracks left alongside the movement."),
+    ("slow tracking right", "The camera tracks right alongside the movement."),
     ("handheld", "The camera is handheld, with slight natural movement."),
     ("slow pan left", "The camera pans left."),
     ("slow pan right", "The camera pans right."),
     ("slow tilt up", "The camera tilts up."),
     ("slow tilt down", "The camera tilts down."),
+    ("slow crane up", "The camera cranes up."),
+    ("slow crane down", "The camera cranes down."),
+    ("slow orbit", "The camera arcs around the subject in a partial orbit."),
     ("static", "The camera stays static."),
 )
 CAMERA_RULE = (" Give every beat one camera move from this list, and use static only for a "
                "deliberate hold: at most one beat in three may be static, so at most "
                "@@MAX_STATIC@@ in this movie.")
 CAMERA_SPEAKING_SENTENCE = (" On a beat with a speaker, prefer slow push-in, slow pull-back, "
-                            "tracking or handheld, and never use a pan or a tilt, which sweeps "
-                            "the speaker's face out of the frame.")
+                            "slow tracking left, slow tracking right or handheld, and never use a "
+                            "pan, a tilt, a crane or an orbit, which sweep the speaker's face out "
+                            "of the frame.")
 SPEAKING_BEAT_SENTENCE = (" Write a speaking beat's action as what the speaker physically does, "
                           "never as speaking, and end it with the speaker still in frame: nobody "
                           "else acts after the line, and when the narrative has the speaker "
@@ -250,12 +256,13 @@ SPEAKER_RULE_KEEP_CAST = (
 P18_NOTE = ("beat %d: P18 static camera: camera 'static' changed to 'slow push-in': at most %d "
             "of the %d beats may be static, and the latest static beats are kept as the "
             "deliberate holds")
-SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "handheld", "static")
+SPEAKING_CAMERAS = ("slow push-in", "slow pull-back", "tracking", "slow tracking left",
+                    "slow tracking right", "handheld", "static")
 STILL_CAMERA_MOVES = ("static", "still", "hold", "holds", "locked-off", "push in", "pushes in",
                       "push-in", "pull back", "pulls back", "pull-back", "track", "tracks",
                       "tracking", "follow", "follows", "handheld")
-RECHECK_IDS_3970E96 = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
-                       "N16", "N17", "N18", "T1", "T2", "T3", "Q1", "N19")
+RECHECK_IDS_CE = ("N1", "N2", "N3", "N4", "N7", "N8", "N9", "N10", "N11", "N12", "N14", "N15",
+                  "N16", "N17", "N18", "T1", "T2", "T3", "N23", "Q1", "N19")
 PLAN_FREE_IDS_3970E96 = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 
 
@@ -272,7 +279,7 @@ def test_sft1a_planner_constants():
     assert se.STILL_CAMERA_MOVES == STILL_CAMERA_MOVES
     assert se.STILL_CAMERA_MOVES[-1] == "handheld"
     assert se.P18_NOTE == P18_NOTE
-    assert se.RECHECK_IDS == RECHECK_IDS_3970E96
+    assert se.RECHECK_IDS == RECHECK_IDS_CE
     assert se.PLAN_FREE_IDS == PLAN_FREE_IDS_3970E96
     for text in ([sentence for _key, sentence in se.CAMERA_SENTENCES]
                  + [se.CAMERA_RULE, se.CAMERA_SPEAKING_SENTENCE, se.SPEAKING_BEAT_SENTENCE,
@@ -297,8 +304,9 @@ def test_sft1_the_pipeline_files_compile_under_both_pythons():
 
 # --- SFT2: the plan prompt camera rule (SF2, SK4) ------------------------------------------------
 
-CAMERA_LIST = ("camera is exactly one of: slow push-in, slow pull-back, tracking, handheld, slow "
-               "pan left, slow pan right, slow tilt up, slow tilt down, static.")
+CAMERA_LIST = ("camera is exactly one of: slow push-in, slow pull-back, slow tracking left, slow "
+               "tracking right, handheld, slow pan left, slow pan right, slow tilt up, slow tilt "
+               "down, slow crane up, slow crane down, slow orbit, static.")
 
 
 def test_sft2_the_plan_prompt(ws, story_env):
@@ -431,6 +439,11 @@ CAMERA_WRITER_FORMS = {
                                      "wider frame then shows>.'"),
     "tracking": ("tracks the movement", "'The camera tracks <whom it follows> — as the move "
                                         "completes, <where the frame ends>.'"),
+    "slow tracking left": ("tracks left", "'The camera tracks left alongside <whom it follows> — "
+                                         "as the move completes, <where the frame ends>.'"),
+    "slow tracking right": ("tracks right", "'The camera tracks right alongside <whom it "
+                                            "follows> — as the move completes, <where the frame "
+                                            "ends>.'"),
     "handheld": ("moves handheld", "'The camera follows with handheld movement — as the move "
                                    "completes, <where the frame ends>.'"),
     "slow pan left": ("pans left", "'The camera pans left — as the move completes, <what the "
@@ -441,6 +454,13 @@ CAMERA_WRITER_FORMS = {
                                  "ends on>.'"),
     "slow tilt down": ("tilts down", "'The camera tilts down — as the move completes, <what the "
                                      "frame ends on>.'"),
+    "slow crane up": ("cranes up", "'The camera cranes up — as the move completes, <what the "
+                                   "frame ends on>.'"),
+    "slow crane down": ("cranes down", "'The camera cranes down — as the move completes, <what "
+                                       "the frame ends on>.'"),
+    "slow orbit": ("arcs around the subject in a partial orbit", "'The camera arcs around <whom "
+                   "it circles> in a partial orbit — as the move completes, <where the frame "
+                   "ends>.'"),
     "static": ("stays static", "'The camera stays static, holding <what stays in the frame>.'"),
 }
 # Shot prompt format spec SF7, D7: a shots speaking panel's reaction after the line, and the
@@ -465,7 +485,7 @@ SPEAKING_CHAINED_MOTION_SENTENCE = (
     "write nothing about anyone else before the first one. Never put an action from before the "
     "dialogue and one from after it in the same sentence, and do not write the spoken words or a "
     "speaking verb; the pipeline adds them.")
-FORMAT_REFERENCE_SHA256 = "d2fe46c687bdaf8ebc75235bdf530d5d751aa1fa62f9bf393bf9855bef7681dd"
+FORMAT_REFERENCE_SHA256 = "fec731a3cedadf6578a511e10d93698039ad075729b208bed2903061faa8b12b"
 
 
 def test_sft1b_writer_constants():
@@ -486,7 +506,7 @@ def test_sft1b_writer_constants():
     assert se.SPEAKING_CHAINED_MOTION_SENTENCE == SPEAKING_CHAINED_MOTION_SENTENCE
     reference = se.FORMAT_REFERENCE
     assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == FORMAT_REFERENCE_SHA256
-    assert (len(reference), len(reference.split())) == (2406, 421)
+    assert (len(reference), len(reference.split())) == (3538, 618)
     assert "@@" not in reference
     for text in ([reference, se.CAMERA_WRITER_SENTENCE, se.SPEAKING_REACTION_SENTENCE,
                   se.SPEAKING_NO_REACTION_SENTENCE, se.SPEAKING_STAY_SENTENCE,
@@ -618,7 +638,7 @@ def test_sft21_the_reference_adds_exactly_its_own_length(ws, monkeypatch):
     full = se.build_panel_prompt(ctx, plan, parts, 2)
     monkeypatch.setattr(se, "FORMAT_REFERENCE", "")
     bare = se.build_panel_prompt(ctx, plan, parts, 2)
-    assert len(full) - len(bare) == len(reference) == 2406
+    assert len(full) - len(bare) == len(reference) == 3538
     assert len(full) < 9000
 
 
@@ -626,30 +646,24 @@ def test_sft21_the_reference_adds_exactly_its_own_length(ws, monkeypatch):
 
 REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
                    "market hall", "fish market", "harbour doors", "meltwater",
-                   "forty years of mornings")
+                   "forty years of mornings", "half-open shutter")
 REFERENCE_COPY_SEGMENTS = (
     "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
     "the market hall toward the half-open shutter",
     "her heavy steps splashing through shallow puddles that hold the first glow from the "
     "harbour doors",
-    "she reaches the shutter at frame centre, the long rows of bare zinc counters stretching "
-    "away behind her",
-    "The old fishmonger looks up from the empty ice trays to the camera, drying her knuckles on "
-    "a folded cloth at the zinc counter",
-    "The old fishmonger lets the folded cloth drop onto the counter, her shoulders sinking",
-    "her face fills the frame from chin to brow, the bare counters soft behind her",
-    "The old fishmonger presses her forehead against the cold ribs of the half-closed steel "
-    "shutter",
-    "both palms flat on the metal, her breath fogging the ribbed steel as a thin trickle of "
-    "meltwater runs past her knuckles and drips onto the wet concrete at her feet",
-    "holding her face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
-    "shut and the shutter stops trembling",
+    "The old fishmonger turns back from the shutter and walks to the zinc counter",
+    "laying her folded cloth beside the empty ice trays",
+    "The old fishmonger presses both palms flat on the folded cloth, her shoulders sinking",
+    "The old fishmonger lowers her forehead onto her folded hands on the cold zinc counter",
+    "her breath fogging the metal as a thin trickle of meltwater runs past her knuckles and "
+    "drips to the wet floor",
     "Forty years of mornings. Not one more.",
 )
 REPAIR_NOTE = "panel %d: %s %s: %s: the pipeline removed %s"
 GENERATION_CHECKS = ("N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12",
                      "N14", "N15", "N16", "N17", "N18", "T1", "T2", "T3", "N20", "N21", "N22",
-                     "Q1", "N19")
+                     "N23", "Q1", "N19")
 
 
 def test_sft1c_check_constants():
@@ -660,7 +674,7 @@ def test_sft1c_check_constants():
     assert se.GENERATION_CHECKS[16:20] == ("N18", "T1", "T2", "T3")
     assert se.GENERATION_CHECKS[-2:] == ("Q1", "N19")
     assert se.GENERATION_CHECKS[-1] == "N19"
-    assert len(se.REFERENCE_SIX_GRAMS) == 138
+    assert len(se.REFERENCE_SIX_GRAMS) == 80
     assert set(se.CAMERA_WRITER_FORMS) == set(se.CAMERA_KEYS) == set(se.CAMERA_MOVE_WORDS)
     for key, sentence in se.CAMERA_SENTENCES:
         form = re.sub(r"<[^<>]*>", "x", se.CAMERA_WRITER_FORMS[key][1].strip("'"))
@@ -885,9 +899,9 @@ def test_sft12_reference_copies(ws):
     assert se.reference_copies(narrative, raw, "The courier walks past the zinc counter.") == [
         "zinc"]
     hits = se.reference_copies(narrative, raw,
-                               "The courier looks up from the empty ice trays to the camera")
+                               "The courier lays the folded cloth beside the empty ice trays")
     assert hits[0] == "ice trays"
-    assert "looks up from the empty ice" in hits
+    assert "folded cloth beside the empty ice" in hits
     assert se.reference_copies(narrative, raw, "The courier runs at real-time speed.") == []
     market = "The courier locks the fish market."
     assert se.reference_copies(narrative, raw, market) == ["fish market"]
@@ -902,15 +916,19 @@ def test_sft12_reference_copies(ws):
         f.write(text)
     hard, _advisory = se.panel_checks(ctx, plan, [part], text, path)
     assert [m for m in hard if " N22 " in m] == [
-        "panel 1: N22 reference copy: Motion: copies the format reference ('fishmonger', 'cloth "
-        "drop onto the counter her', 'drop onto the counter her shoulders'); describe only this "
+        "panel 1: N22 reference copy: Motion: copies the format reference ('fishmonger', 'both "
+        "palms flat on the folded', 'fishmonger presses both palms flat on'); describe only this "
         "movie's own people, places, objects and words"]
     fixtures = os.path.join(WS, "tests", "fixtures")
     seen = 0
     for root, _dirs, names in os.walk(fixtures):
         for name in names:
             with open(os.path.join(root, name), encoding="utf-8") as f:
-                words = se.line_words(f.read())
+                text = f.read()
+            # Chained end frames spec CR3: the plan prompt fixtures quote the plan reference whole.
+            for reference in (se.plan_reference(True), se.plan_reference(False)):
+                text = text.replace(reference, "")
+            words = se.line_words(text)
             seen += 1
             line = " " + " ".join(words) + " "
             assert not (se._six_grams(words) & se.REFERENCE_SIX_GRAMS), name
@@ -1203,8 +1221,8 @@ def test_sft20_the_chained_hockey_shape(ws):
 
 
 def test_review_focus_3_an_end_frame_in_the_references_words_falls_back(ws):
-    camera = ("The camera pushes in — as the move completes, her face fills the frame from chin "
-              "to brow.")
+    camera = ("The camera pushes in — as the move completes, she lays her folded cloth beside "
+              "the empty ice trays.")
     ctx, state = _speaking_state(ws, "The courier turns to the camera at real-time speed. "
                                  + camera)
     plan, part = state["plan"], state["parts"][0]
@@ -1343,10 +1361,10 @@ def test_sft13_the_composition_and_the_reference(ws):
     for part, shot in zip(REF_PARTS, shots):
         assert lib.panel_prompt(part["motion"], part["shot"], part["speaker"], part["line"],
                                 "beats", [REF_PHRASE]) == shot
-    for part, key in zip(REF_PARTS, ("tracking", "slow push-in", "static")):
+    for part, key in zip(REF_PARTS, ("slow tracking right", "slow push-in", "static")):
         assert se.camera_problem(lib, part["motion"], [REF_PHRASE], key) is None, key
     post = se.post_line_sentences(lib, REF_PARTS[1]["motion"], [REF_PHRASE])
-    assert post == ["The old fishmonger lets the folded cloth drop onto the counter, her "
+    assert post == ["The old fishmonger presses both palms flat on the folded cloth, her "
                     "shoulders sinking."]
     assert se._other_actor(post[0], [], se._mentions([{"id": "c1", "phrase": REF_PHRASE}])) is None
     assert lib.compose_motion("The camera tracks alongside the movement. A runs.", "S", ["x"]) == (

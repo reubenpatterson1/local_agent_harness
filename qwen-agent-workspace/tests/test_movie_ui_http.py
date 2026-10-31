@@ -41,7 +41,7 @@ def test_mu13_query_parsing():
 
 def test_mut18_every_api_route_needs_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 54
+    assert len(srv.ROUTES) == 55
     for method, regex, name, sample in srv.ROUTES:
         assert re.fullmatch(regex, sample), sample
         body = {} if method in ("POST", "PUT") else None
