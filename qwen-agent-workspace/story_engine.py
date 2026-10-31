@@ -4761,15 +4761,25 @@ class _Run(object):
 
     # -- plan ------------------------------------------------------------------------------
 
+    def plan_fatal(self, found):
+        """The problems that make found = (plan, shape, hard) unusable even with its end frames
+        dropped (chained end frames spec CE7): its P1, P2, P16, P17 and P21 hard problems and a
+        P24 copy outside the end frames. go and plan_round's fallback share this one list."""
+        return ([h for h in found[2]
+                 if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17", "P21")]
+                + plan_copy_problems(self.ctx, found[0], end_frames=False))
+
     def plan_round(self):
         ctx = self.ctx
         rdir = self.round_dir(0)
         prompt = build_plan_prompt(ctx, self.compatible, ctx.pinned)
         _write_text(os.path.join(rdir, "plan_prompt.txt"), prompt)
-        text, found, problems = prompt, None, []
+        # Chained end frames spec CE7: fallback is the latest chained reply that go can use
+        # once its end frames are dropped; a fatal last reply or a timeout falls back to it.
+        text, found, fallback, problems = prompt, None, None, []
         for attempt in range(1, PLAN_MAX_CALLS + 1):
             if self.expired():
-                return None, "timeout"
+                return (fallback, None) if fallback else (None, "timeout")
             print("plan: call %d of %d" % (attempt, PLAN_MAX_CALLS))
             started = _now()
             status, answer = self.agent(text, plan_max_tokens(most_panels(ctx)),
@@ -4785,6 +4795,8 @@ class _Run(object):
                 hard = (plan_checks(ctx, plan, shape)[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
+                if ctx.mode == "chained" and not self.plan_fatal(found):
+                    fallback = found
                 problems = (hard + plan_end_frame_problems(ctx, plan)
                             + plan_copy_problems(ctx, plan) + line_assignment_problems(plan))
             if not problems:
@@ -4794,7 +4806,7 @@ class _Run(object):
                     + "\nPrevious reply:\n"
                     + (answer[:20000] if answer is not None else "<no answer: %s>" % status)
                     + "\n\nReply with the complete corrected JSON object only.")
-        return found, None
+        return fallback or found, None
 
     # -- panels ----------------------------------------------------------------------------
 
@@ -4990,10 +5002,7 @@ class _Run(object):
         # character or gives a spoken line to the wrong speaker, or sets no beat at a library
         # location (location library spec L3.5), is not usable; chained end frames spec CE7: a P24
         # copy outside the end frames too.
-        fatal = ([h for h in found[2]
-                  if parse_violation(h)["id"] in ("P1", "P2", "P16", "P17", "P21")]
-                 + plan_copy_problems(ctx, found[0], end_frames=False)
-                 if found else ["the reply is not one JSON object"])
+        fatal = self.plan_fatal(found) if found else ["the reply is not one JSON object"]
         if fatal:
             calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])
             print("Error: the story model did not return a usable plan after %d call(s)" % calls,

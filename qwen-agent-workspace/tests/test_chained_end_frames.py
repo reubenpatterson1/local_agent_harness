@@ -457,12 +457,15 @@ def test_ct3_the_chained_plan_prompt(ws):
     assert "with the keys index, arc, action, shot, camera, location, cast, speaker and end_frame." in plain
     assert se.END_FRAME_RULE + "\nloras: " in plain
     assert plain.endswith(se.MODE_RULES["chained"] + se.plan_reference(False) + se.NO_TOOL_SENTENCE)
+    for prompt in (lined, plain):
+        assert prompt.count("FORMAT REFERENCE ONLY") == 1
     silent = _plan_prompt(ws, narration=False)
     assert se.END_FRAME_RULE in silent
     assert "FORMAT REFERENCE ONLY" not in silent
     assert silent.endswith(se.MODE_RULES["chained"] + se.NO_TOOL_SENTENCE)
     for prompt, lines in ((lined, True), (plain, False), (silent, None)):
         assert "@@" not in prompt
+        assert "8K" not in prompt
         rest = prompt.replace(se.plan_reference(lines), "") if lines is not None else prompt
         assert "{" not in rest and "}" not in rest
 
@@ -680,6 +683,37 @@ def test_ct8_a_plan_with_end_frames_makes_one_call(ws, tmp_path, monkeypatch, ca
     assert [c["stage"] for c in log].count("plan") == 1
     assert "end frames dropped" not in out
     assert [b["end_frame"] for b in plan["beats"]] == [END_FRAME % k for k in (1, 2, 3)]
+    _assert_p22_clean(plan)
+
+
+def test_ct8_a_fatal_call_2_falls_back_to_a_usable_call_1(ws, tmp_path, monkeypatch, capsys):
+    bad = ef_plan(3)
+    bad["beats"][0]["location"] = "l9"
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [seu.plan_json("chained", 3), bad])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert [c["stage"] for c in log][:3] == ["plan", "plan", "panel"]
+    assert "did not return a usable plan" not in captured.err
+    assert END_FRAMES_DROPPED % 2 + "\n" in captured.out
+    assert [b["location"] for b in plan["beats"]] == ["l1", "l1", "l1"]
+    assert not any("end_frame" in b for b in plan["beats"])
+    _assert_p22_clean(plan)
+
+
+def test_ct8_a_timeout_before_call_2_keeps_a_usable_call_1(ws, tmp_path, monkeypatch, capsys):
+    checks = []
+
+    def expired(self):
+        checks.append(1)
+        return len(checks) == 2
+
+    monkeypatch.setattr(se._Run, "expired", expired)
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [seu.plan_json("chained", 3), ef_plan(3)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert [c["stage"] for c in log][:2] == ["plan", "panel"]
+    assert END_FRAMES_DROPPED % 1 + "\n" in out
+    assert not any("end_frame" in b for b in plan["beats"])
     _assert_p22_clean(plan)
 
 

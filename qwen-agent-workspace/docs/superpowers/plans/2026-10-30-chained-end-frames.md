@@ -19,7 +19,7 @@
 - **Tests:**
   - New files: `tests/test_chained_end_frames.py` (CT1-CT16, CT29; Tasks 1-5), `tests/test_seam_report.py` (CT17-CT22, CT30; Task 5) and `tests/test_movie_ui_seams.py` (CT23-CT28; Task 6).
   - Five Review Focus pins.
-  - In all, 58 test cases: 53 CT cases and 5 Review Focus pins.
+  - In all, 60 test cases: 55 CT cases and 5 Review Focus pins.
 
 **Tech Stack:**
 - Python 3.13 (`python3` = `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`, pytest 8.3.4). Python 3.9.6 (`/usr/bin/python3`) is used for the compile check only. Every new and changed Python file runs on both.
@@ -2251,7 +2251,7 @@ python3 -B -m pytest -q -p no:cacheprovider \
   tests/test_chained_end_frames.py 2>&1 | tail -1
 ```
 
-Expected: `7 failed, 24 passed`. Of the 8 new tests only `test_ct11_writers_that_land_get_no_n23` passes: no N23 message exists yet, and this task must keep landing writers free of one (CK2).
+Expected: `7 failed, 26 passed`. Of the 8 new tests only `test_ct11_writers_that_land_get_no_n23` passes: no N23 message exists yet, and this task must keep landing writers free of one (CK2).
 
 - [ ] **Step 3: Write the implementation.**
 
@@ -2434,11 +2434,11 @@ python3 -B -m pytest -q -p no:cacheprovider \
   tests/test_chained_end_frames.py 2>&1 | tail -1
 ```
 
-Expected: `31 passed`.
+Expected: `33 passed`.
 
 The compile check with `FILES` = `story_engine.py tests/test_chained_end_frames.py`. Expected: `compiled 2` twice.
 
-The gate block with `N=3`. Expected: `GATE PASS`, `lost 29 (listed 29, unexpected 0); new tests 31, not passing 0`, and `offline unchanged`.
+The gate block with `N=3`. Expected: `GATE PASS`, `lost 29 (listed 29, unexpected 0); new tests 33, not passing 0`, and `offline unchanged`.
 
 - [ ] **Step 5: Commit.**
 
@@ -2627,7 +2627,7 @@ python3 -B -m pytest -q -p no:cacheprovider \
   tests/test_chained_end_frames.py 2>&1 | tail -1
 ```
 
-Expected: `3 failed, 32 passed`. Of the 4 new tests only `test_ct14_no_fixture_copies_either_reference` passes: no fixture copies either reference today, and none may after this task.
+Expected: `3 failed, 34 passed`. Of the 4 new tests only `test_ct14_no_fixture_copies_either_reference` passes: no fixture copies either reference today, and none may after this task.
 
 - [ ] **Step 3: Write the implementation.**
 
@@ -2861,11 +2861,11 @@ python3 -B -m pytest -q -p no:cacheprovider \
   tests/test_chained_end_frames.py 2>&1 | tail -1
 ```
 
-Expected: `35 passed`.
+Expected: `37 passed`.
 
 The compile check with `FILES` = `story_engine.py tests/test_chained_end_frames.py`. Expected: `compiled 2` twice.
 
-The gate block with `N=4`. Expected: `GATE PASS`, `lost 33 (listed 33, unexpected 0); new tests 35, not passing 0`, and `offline unchanged`.
+The gate block with `N=4`. Expected: `GATE PASS`, `lost 33 (listed 33, unexpected 0); new tests 37, not passing 0`, and `offline unchanged`.
 
 - [ ] **Step 5: Commit.**
 
@@ -3982,7 +3982,7 @@ Expected: `15 passed` (14 in `tests/test_seam_report.py` and the CT1 compile tes
 
 The compile check with `FILES` = `bin/seam-report tests/test_seam_report.py tests/test_chained_end_frames.py`. Expected: `compiled 3` twice.
 
-The gate block with `N=5`. Expected: `GATE PASS`, `lost 33 (listed 33, unexpected 0); new tests 50, not passing 0`, and `offline unchanged`.
+The gate block with `N=5`. Expected: `GATE PASS`, `lost 33 (listed 33, unexpected 0); new tests 52, not passing 0`, and `offline unchanged`.
 
 - [ ] **Step 5: Commit.**
 
@@ -4707,7 +4707,7 @@ node --check static/movie-ui/app.js && echo "app.js parses"
 
 Expected: `app.js parses`.
 
-The gate block with `N=6`. Expected: `GATE PASS`, `lost 35 (listed 35, unexpected 0); new tests 58, not passing 0`, and `offline unchanged`.
+The gate block with `N=6`. Expected: `GATE PASS`, `lost 35 (listed 35, unexpected 0); new tests 60, not passing 0`, and `offline unchanged`.
 
 - [ ] **Step 5: Commit.**
 
@@ -5963,8 +5963,8 @@ diff <(python3 -B tests/test_ltx_movie_offline.py 2>&1 | tail -1) $D/baseline-of
 ```
 
 Expected:
-- the final summary is the baseline's with the pass count higher by exactly 58, the new cases (53 CT cases and 5 Review Focus pins; Plan ruling R20);
-- `lost 0 (listed 0, unexpected 0); new tests 58, not passing 0` and `GATE PASS`;
+- the final summary is the baseline's with the pass count higher by exactly 60, the new cases (55 CT cases and 5 Review Focus pins; Plan ruling R20);
+- `lost 0 (listed 0, unexpected 0); new tests 60, not passing 0` and `GATE PASS`;
 - `same failures, same messages` and `no lost pass` (CK7);
 - `1` (`test_mut26` passes at its new `BASELINE`);
 - `offline unchanged`.
@@ -5976,7 +5976,7 @@ If a timing-sensitive test failed in one run only, rerun it alone and record bot
 ```bash
 cd /private/tmp/claude-502/-Users-reubenpatterson/19c452c6-34f7-42df-83ac-562127f4caf9/scratchpad/chain-wt/qwen-agent-workspace
 F=tests/test_chained_end_frames.py
-python3 -B -m pytest -q -p no:cacheprovider $F::test_ct5_p22_end_frame_presence_and_length $F::test_ct8_a_plan_without_end_frames_is_asked_again $F::test_ct8_two_plans_without_end_frames_drop_them $F::test_ct8_a_copied_action_after_the_last_call_is_fatal $F::test_ct8_a_copied_end_frame_after_the_last_call_is_dropped $F::test_ct8_a_plan_with_end_frames_makes_one_call $F::test_ct16_an_added_beat_needs_its_own_end_frame 2>&1 | tail -1
+python3 -B -m pytest -q -p no:cacheprovider $F::test_ct5_p22_end_frame_presence_and_length $F::test_ct8_a_plan_without_end_frames_is_asked_again $F::test_ct8_two_plans_without_end_frames_drop_them $F::test_ct8_a_copied_action_after_the_last_call_is_fatal $F::test_ct8_a_copied_end_frame_after_the_last_call_is_dropped $F::test_ct8_a_plan_with_end_frames_makes_one_call $F::test_ct8_a_fatal_call_2_falls_back_to_a_usable_call_1 $F::test_ct8_a_timeout_before_call_2_keeps_a_usable_call_1 $F::test_ct16_an_added_beat_needs_its_own_end_frame 2>&1 | tail -1
 python3 -B -m pytest -q -p no:cacheprovider $F::test_ct10_n23_detection_rows $F::test_ct11_one_re_ask_then_the_landing_reply $F::test_ct11_a_writer_that_misses_twice_is_kept_with_an_advisory $F::test_ct11_no_re_ask_without_a_call_left $F::test_ct11_writers_that_land_get_no_n23 2>&1 | tail -1
 python3 -B -m pytest -q -p no:cacheprovider $F::test_ct15_old_stories_recheck_as_before tests/test_ltx_story_manifest_chain.py tests/test_judge_clips.py tests/test_character_lib.py tests/test_ltx_mlx_render.py tests/test_vlm_lifecycle.py::test_vl1_job_vlm tests/test_location_ui.py::test_lu9_job_vlm_policy tests/test_location_ui.py::test_lu13_the_static_page tests/test_dialogue.py::test_dlg15_assembly_goldens_and_dedupe tests/test_story_engine.py::test_rst16_panel_prompt tests/test_story_engine.py::test_rst18_assembly_goldens tests/test_writer_pacing.py 2>&1 | tail -1
 python3 -B -m pytest -q -p no:cacheprovider $F::test_ct12_a_standing_still_end_frame_survives_the_repair $F::test_ct12_stays_still_and_pushes_in_is_still_mixed $F::test_ct12_static_holding_and_the_head_rule 2>&1 | tail -1
@@ -5990,7 +5990,7 @@ git diff d30c40f..HEAD -- bin/seam-report | grep -E '^\+(import|from) '
 ```
 
 Expected, in order:
-- CK1: `7 passed`;
+- CK1: `9 passed`;
 - CK2: `5 passed`;
 - CK3: `202 passed` (CT15 and the spec's "must pass unchanged" set; the offline script was checked in Step 6);
 - CK4: `3 passed`;
@@ -6003,7 +6003,7 @@ Expected, in order:
 - exactly twelve import lines: `+import argparse`, `+import base64`, `+import http.client`, `+import importlib.machinery`, `+import json`, `+import os`, `+import re`, `+import shutil`, `+import subprocess`, `+import sys`, `+import tempfile`, `+import time` (CE13, CT30).
 
 - [ ] **Step 8: Hand-off (controller; not an executor step).**
-  - Report the branch `chain-endframes` and its 7 new commits (6 task commits and the re-baseline), with CK1-CK7.
+  - Report the branch `chain-endframes` and its 8 new commits (6 task commits, the Task 2 fix commit and the re-baseline), with CK1-CK7.
   - Before any push, run the spec's secret scan (spec 10 step 5) and review every hit by hand.
   - Push, the merge and the live A/B are separate steps that need the user's approval.
 
@@ -6055,7 +6055,7 @@ Steps (spec 10 step 7, unchanged):
 | IDs | Task | File | Cases |
 |---|---|---|---|
 | CT1 (camera part), CT12, CT13, CT29 | 1 | `tests/test_chained_end_frames.py` | 8 (CT12 3, CT13 3) |
-| CT1 (planner part), CT2-CT8, CT16 | 2 | `tests/test_chained_end_frames.py` | 15 (CT2 2, CT3 2, CT8 5) |
+| CT1 (planner part), CT2-CT8, CT16 | 2 | `tests/test_chained_end_frames.py` | 17 (CT2 2, CT3 2, CT8 7) |
 | CT1 (N23 part), CT10, CT11, CT15, Review Focus 3 | 3 | `tests/test_chained_end_frames.py` | 8 (CT11 4) |
 | CT1 (writer part), CT9, CT14 | 4 | `tests/test_chained_end_frames.py` | 4 (CT14 2) |
 | CT1 (compile part) | 5 | `tests/test_chained_end_frames.py` | 1 |
@@ -6063,7 +6063,7 @@ Steps (spec 10 step 7, unchanged):
 | CT23-CT28, Review Focus 4, 5 | 6 | `tests/test_movie_ui_seams.py` | 8 |
 | the Section 7 re-baselines | 7 | the 16 files of Task 7 | (existing tests) |
 
-Totals: 58 new cases, of which 53 are CT cases and 5 are Review Focus pins. Cumulative new cases after each task: 8, 23, 31, 35, 50, 58.
+Totals: 60 new cases, of which 55 are CT cases and 5 are Review Focus pins. Cumulative new cases after each task: 8, 25, 33, 37, 52, 60.
 
 ### KPI → task
 
@@ -6144,7 +6144,7 @@ Totals: 58 new cases, of which 53 are CT cases and 5 are Review Focus pins. Cumu
     - CT24 checks that a finished seams job no longer blocks a new one, and that shots and plan-less stories are refused;
     - CT25 checks that `check_seams: 1` is not `true`.
     None weakens a spec assertion.
-20. **R20 [reading]: CK7's count is the baseline plus the 58 new cases,** 53 CT cases and the 5 Review Focus pins that the plan format requires.
+20. **R20 [reading]: CK7's count is the baseline plus the 60 new cases,** 55 CT cases and the 5 Review Focus pins that the plan format requires.
 21. **R21 [reading]: `END_FRAMES_DROPPED`'s N counts every plan call made,** including a call 2 that got no envelope, as the spec's `len([c for c in self.doc["calls"] if c["stage"] == "plan"])` does.
 22. **R22 [reading]: two values are wrapped at 100 columns.** `SPEAKING_CAMERAS` and the `_mixed_camera` docstring's added sentence keep the spec's exact values.
 
