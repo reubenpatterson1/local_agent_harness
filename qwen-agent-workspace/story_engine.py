@@ -2687,58 +2687,67 @@ COPIED_EXAMPLES = (
 )
 # Shot prompt format spec SF8, D9: three finished shots of an unrelated movie, shown to the
 # chained and shots writer for their order only. Each "Shot N" text is exactly
-# character_lib.panel_prompt of its parts (SFT13).
+# character_lib.panel_prompt of its parts (SFT13); chained end frames spec CE11: the finished
+# shots of PLAN_REFERENCE's beats, with opens-on and ends-on labels.
 FORMAT_REFERENCE = (
     "FORMAT REFERENCE ONLY — never reuse its people, places, objects or words. These are the "
-    "finished video prompts of three shots from a different movie. They show the order of every "
-    "finished shot: the shot type; the action; when someone speaks, the spoken line and then one "
-    "short reaction by the speaker; the one camera sentence, which says where the move ends; and "
-    "the audio last. The pipeline wrote the sentences that start \"The shot is\", the sentence "
-    "\"The old fishmonger faces the camera.\", the spoken line and the audio sentence; the "
-    "writer wrote every other sentence.\n"
-    "Shot 1 (silent; the camera tracks): The shot is a wide shot. The old fishmonger drags a "
-    "tall stack of empty herring crates across the wet concrete of the market hall toward the "
+    "finished video prompts of three shots from a different movie. They show the order of "
+    "every finished shot: the shot type; the action; when someone speaks, the spoken line and "
+    "then one short reaction by the speaker; the one camera sentence, which says where the "
+    "move ends; and the audio last. The pipeline wrote the sentences that start \"The shot "
+    "is\", the sentence \"The old fishmonger faces the camera.\", the spoken line and the "
+    "audio sentence; the writer wrote every other sentence. Each label names the frame its "
+    "shot opens on and the frame it ends on: the action starts from the opening frame without "
+    "describing it, and the words after 'as the move completes,' or 'holding' in the camera "
+    "sentence describe the end frame. Double quotes appear only around the spoken line.\n"
+    "Shot 1 (silent; the camera tracks right; ends on: The old fishmonger stands beside the "
+    "half-open shutter at frame centre, facing left toward the hall, seen from the knees up, "
+    "the empty crates at her feet): The shot is a medium shot. The old fishmonger drags a tall "
+    "stack of empty herring crates across the wet concrete of the market hall toward the "
     "half-open shutter at real-time speed, her heavy steps splashing through shallow puddles "
-    "that hold the first glow from the harbour doors. The camera tracks alongside her from the "
-    "left — as the move completes, she reaches the shutter at frame centre, the long rows of "
-    "bare zinc counters stretching away behind her. The audio is the natural ambient sound of "
-    "the place, with no music.\n"
-    "Shot 2 (speaking; the camera pushes in): The shot is a medium shot. The old fishmonger "
-    "looks up from the empty ice trays to the camera, drying her knuckles on a folded cloth at "
-    "the zinc counter at real-time speed. The old fishmonger faces the camera. The old "
-    "fishmonger says, \"Forty years of mornings.\" After a breath, \"Not one more.\" The old "
-    "fishmonger lets the folded cloth drop onto the counter, her shoulders sinking. The camera "
-    "pushes in — as the move completes, her face fills the frame from chin to brow, the bare "
-    "counters soft behind her. The audio is clear close-mic dialogue with a subtle natural room "
-    "tone; the dialogue takes priority over the quiet ambience, and there is no music.\n"
-    "Shot 3 (silent; the movie's one deliberate static hold): The shot is a close-up. The old "
-    "fishmonger presses her forehead against the cold ribs of the half-closed steel shutter at "
-    "real-time speed, both palms flat on the metal, her breath fogging the ribbed steel as a "
-    "thin trickle of meltwater runs past her knuckles and drips onto the wet concrete at her "
-    "feet. The camera stays static, holding her face, her knuckles and the ribbed steel tight in "
-    "the frame as her eyelids drop shut and the shutter stops trembling. The audio is the "
-    "natural ambient sound of the place, with no music.\n\n")
+    "that hold the first glow from the harbour doors. The camera tracks right alongside her — "
+    "as the move completes, the old fishmonger stands beside the half-open shutter at frame "
+    "centre, facing left toward the hall, seen from the knees up, the empty crates at her "
+    "feet. The audio is the natural ambient sound of the place, with no music.\n"
+    "Shot 2 (speaking; the camera pushes in; opens on: The old fishmonger stands beside the "
+    "half-open shutter at frame centre, facing left toward the hall, seen from the knees up, "
+    "the empty crates at her feet; ends on: The old fishmonger stands behind the zinc counter "
+    "at frame centre, facing forward, her face filling the frame from chin to brow): The shot "
+    "is a medium shot. The old fishmonger turns back from the shutter and walks to the zinc "
+    "counter at real-time speed, laying her folded cloth beside the empty ice trays and "
+    "lifting her face to the camera. The old fishmonger faces the camera. The old fishmonger "
+    "says, \"Forty years of mornings.\" After a breath, \"Not one more.\" The old fishmonger "
+    "presses both palms flat on the folded cloth, her shoulders sinking. The camera pushes in "
+    "— as the move completes, the old fishmonger stands behind the zinc counter at frame "
+    "centre, facing forward, her face filling the frame from chin to brow. The audio is clear "
+    "close-mic dialogue with a subtle natural room tone; the dialogue takes priority over the "
+    "quiet ambience, and there is no music.\n"
+    "Shot 3 (silent; the movie's one deliberate static hold; opens on: The old fishmonger "
+    "stands behind the zinc counter at frame centre, facing forward, her face filling the "
+    "frame from chin to brow; ends on: The old fishmonger rests her forehead on her folded "
+    "hands at frame centre, eyes closed, her head and hands filling the frame in a close-up): "
+    "The shot is a close-up. The old fishmonger lowers her forehead onto her folded hands on "
+    "the cold zinc counter at real-time speed, her breath fogging the metal as a thin trickle "
+    "of meltwater runs past her knuckles and drips to the wet floor. The camera stays static, "
+    "holding the old fishmonger as she rests her forehead on her folded hands at frame centre, "
+    "eyes closed, her head and hands filling the frame. The audio is the natural ambient sound "
+    "of the place, with no music.\n"
+    "\n")
 # Shot prompt format spec SF12, D11: the reference's own names, props and wording.
 REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
                    "market hall", "fish market", "harbour doors", "meltwater",
-                   "forty years of mornings")
+                   "forty years of mornings", "half-open shutter")
 REFERENCE_COPY_SEGMENTS = (
     "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
     "the market hall toward the half-open shutter",
     "her heavy steps splashing through shallow puddles that hold the first glow from the "
     "harbour doors",
-    "she reaches the shutter at frame centre, the long rows of bare zinc counters stretching "
-    "away behind her",
-    "The old fishmonger looks up from the empty ice trays to the camera, drying her knuckles on "
-    "a folded cloth at the zinc counter",
-    "The old fishmonger lets the folded cloth drop onto the counter, her shoulders sinking",
-    "her face fills the frame from chin to brow, the bare counters soft behind her",
-    "The old fishmonger presses her forehead against the cold ribs of the half-closed steel "
-    "shutter",
-    "both palms flat on the metal, her breath fogging the ribbed steel as a thin trickle of "
-    "meltwater runs past her knuckles and drips onto the wet concrete at her feet",
-    "holding her face, her knuckles and the ribbed steel tight in the frame as her eyelids drop "
-    "shut and the shutter stops trembling",
+    "The old fishmonger turns back from the shutter and walks to the zinc counter",
+    "laying her folded cloth beside the empty ice trays",
+    "The old fishmonger presses both palms flat on the folded cloth, her shoulders sinking",
+    "The old fishmonger lowers her forehead onto her folded hands on the cold zinc counter",
+    "her breath fogging the metal as a thin trickle of meltwater runs past her knuckles and "
+    "drips to the wet floor",
     "Forty years of mornings. Not one more.",
 )
 
@@ -2753,14 +2762,16 @@ REFERENCE_SIX_GRAMS = frozenset(g for s in REFERENCE_COPY_SEGMENTS for g in _six
 def reference_copies(narrative, plan, text, goal=None):
     """The REFERENCE_TERMS terms and the six-word REFERENCE_COPY_SEGMENTS runs that text copies
     from FORMAT_REFERENCE, in that order (SF12), leaving out any that the narrative, the goal or
-    the plan (cast phrases and descriptors, settings, prop names, beat actions) already has."""
+    the plan (cast phrases and descriptors, settings, prop names, beat actions and end frames;
+    chained end frames spec CE11) already has."""
     own = [narrative or "", goal or ""]
     if plan:
         own += ([c.get("phrase") or "" for c in plan["cast"]]
                 + [c.get("descriptor") or "" for c in plan["cast"]]
                 + [l.get("setting") or "" for l in plan["locations"]]
                 + [p.get("name") or "" for p in plan["props"]]
-                + [b.get("action") or "" for b in plan["beats"]])
+                + [b.get("action") or "" for b in plan["beats"]]
+                + [b.get("end_frame") or "" for b in plan["beats"]])
     own_words = [line_words(t) for t in own]
     own_line = " " + " | ".join(" ".join(w) for w in own_words) + " "
     own_grams = set(g for w in own_words for g in _six_grams(w))
@@ -3063,6 +3074,13 @@ SPEAKING_NO_REACTION_SENTENCE = (" The pipeline puts the spoken line right after
                                  "sentence, so write no other action sentence.")
 SPEAKING_STAY_SENTENCE = (" In this whole panel @@SPEAKER@@ never leaves, turns away or moves "
                           "out of the frame, even when the beat says so.")
+# Chained end frames spec CE8, D5: writer k starts from end frame k-1 and lands on end frame k.
+OPENS_ON_LINE = ("This panel opens on: %s Start the action from exactly this composition; do "
+                 "not describe it.\n")
+ENDS_ON_LINE = ("This panel ends on: %s The clause after 'as the move completes,' in your camera "
+                "sentence must describe this end frame.\n")
+ENDS_ON_STATIC_LINE = ("This panel ends on: %s The words after 'holding' in your camera "
+                       "sentence must describe this end frame.\n")
 FIX_INSTRUCTION = ("\nFix only these problems. Keep every camera direction, every descriptive "
                    "sentence and the dialogue word for word, and change only the sentence or "
                    "sentences that cause them.")
@@ -4043,6 +4061,14 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
     if ctx.mode == "chained" and k >= 2:
         previous = ("The previous panel's Motion: "
                     + dict(panel_fields(ctx, plan, parts, k - 1))["Motion"] + "\n")
+    if ctx.mode == "chained":
+        opens = plan["beats"][k - 2].get("end_frame", "") if k >= 2 else ""
+        ends = beat.get("end_frame", "")
+        if opens:
+            previous += OPENS_ON_LINE % _sentence(opens)
+        if ends:
+            previous += ((ENDS_ON_STATIC_LINE if panel_camera(ctx, plan, k) == "static"
+                          else ENDS_ON_LINE) % _sentence(ends))
     seed = SEED_PANEL if ctx.mode == "chained" and k == 1 and ctx.seed_agent_image else ""
     speaks = panel_speaks(ctx, plan, k)
     phrase = speaker_phrase(plan, k) if speaks else None

@@ -1021,3 +1021,136 @@ def test_ct15_old_stories_recheck_as_before(ws, monkeypatch):
         assert with_n23[0] == 0, ctx.story_id
         with open(os.path.join(ctx.story_dir, "story.md"), "rb") as f:
             assert f.read() == before, ctx.story_id
+
+
+# --- CT1 (Task 4 part): the writer constants (CE8, CE11) -----------------------------------------
+
+OPENS_ON_LINE = ("This panel opens on: %s Start the action from exactly this composition; do "
+                 "not describe it.\n")
+ENDS_ON_LINE = ("This panel ends on: %s The clause after 'as the move completes,' in your camera "
+                "sentence must describe this end frame.\n")
+ENDS_ON_STATIC_LINE = ("This panel ends on: %s The words after 'holding' in your camera "
+                       "sentence must describe this end frame.\n")
+REFERENCE_COPY_SEGMENTS = (
+    "The old fishmonger drags a tall stack of empty herring crates across the wet concrete of "
+    "the market hall toward the half-open shutter",
+    "her heavy steps splashing through shallow puddles that hold the first glow from the "
+    "harbour doors",
+    "The old fishmonger turns back from the shutter and walks to the zinc counter",
+    "laying her folded cloth beside the empty ice trays",
+    "The old fishmonger presses both palms flat on the folded cloth, her shoulders sinking",
+    "The old fishmonger lowers her forehead onto her folded hands on the cold zinc counter",
+    "her breath fogging the metal as a thin trickle of meltwater runs past her knuckles and "
+    "drips to the wet floor",
+    "Forty years of mornings. Not one more.",
+)
+
+
+def test_ct1d_the_writer_constants():
+    assert se.OPENS_ON_LINE == OPENS_ON_LINE
+    assert se.ENDS_ON_LINE == ENDS_ON_LINE
+    assert se.ENDS_ON_STATIC_LINE == ENDS_ON_STATIC_LINE
+    assert se.REFERENCE_TERMS[-1] == "half-open shutter"
+    assert se.REFERENCE_TERMS[:-1] == ("fishmonger", "fishmongers", "herring", "herrings", "zinc",
+                                       "ice trays", "market hall", "fish market", "harbour doors",
+                                       "meltwater", "forty years of mornings")
+    assert se.REFERENCE_COPY_SEGMENTS == REFERENCE_COPY_SEGMENTS
+    for text in (OPENS_ON_LINE, ENDS_ON_LINE, ENDS_ON_STATIC_LINE, se.FORMAT_REFERENCE):
+        assert "slowly" not in text.lower(), text[:40]
+
+
+# --- CT9: what writer k is told (CE8) --------------------------------------------------------------
+
+def _writer_prompts(ws, raw):
+    """The three panel prompts of a chained 3-panel plan (after the P18 cap) and its plan."""
+    ctx = seu.make_ctx(se, ws)
+    plan = _normalized(ctx, raw)
+    se.cap_static_cameras(ctx, plan)
+    parts = [seu.panel_json("chained", k) for k in (1, 2, 3)]
+    return [se.build_panel_prompt(ctx, plan, parts, k) for k in (1, 2, 3)], plan, ctx, parts
+
+
+def test_ct9_the_writer_is_told_where_it_opens_and_ends(ws):
+    prompts, plan, ctx, parts = _writer_prompts(ws, ef_plan(3))
+    assert [b["camera"] for b in plan["beats"]] == ["slow push-in", "tracking", "static"]
+    ef1, ef2, ef3 = (END_FRAME % k for k in (1, 2, 3))
+    assert ENDS_ON_LINE % ef1 in prompts[0]
+    assert "This panel opens on:" not in prompts[0]
+    motion1 = dict(se.panel_fields(ctx, plan, parts, 1))["Motion"]
+    assert ("The previous panel's Motion: " + motion1 + "\n" + OPENS_ON_LINE % ef1
+            + ENDS_ON_LINE % ef2 + "\n" + se.FORMAT_REFERENCE) in prompts[1]
+    assert OPENS_ON_LINE % ef2 + ENDS_ON_STATIC_LINE % ef3 in prompts[2]
+    assert ENDS_ON_LINE % ef3 not in prompts[2]
+    for prompt in prompts:
+        assert "@@" not in prompt and prompt.count(se.FORMAT_REFERENCE) == 1
+    plain, _plan, _ctx, _parts = _writer_prompts(ws, seu.plan_json("chained", 3))
+    for prompt in plain:
+        assert "This panel opens on:" not in prompt and "This panel ends on:" not in prompt
+        assert "@@" not in prompt and prompt.count(se.FORMAT_REFERENCE) == 1
+    raw = ef_plan(3)
+    raw["beats"][1]["end_frame"] = "  The courier waits at frame centre, facing left, seen from the waist up  "
+    prompts, _plan, _ctx, _parts = _writer_prompts(ws, raw)
+    assert (OPENS_ON_LINE % "The courier waits at frame centre, facing left, seen from the waist up."
+            in prompts[2])
+
+
+# --- CT14: the format reference (CE11) -------------------------------------------------------------
+
+REF_PHRASE = "the old fishmonger"
+REF_SHOTS = ("The shot is a medium shot.", "The shot is a medium shot.", "The shot is a close-up.")
+REF_SPEAKERS = (None, "the old fishmonger", None)
+REF_LINES = ("", "Forty years of mornings. Not one more.", "")
+
+
+def ref_shots():
+    """The three "Shot N" texts of se.FORMAT_REFERENCE: each line's text after its "): "."""
+    return [line.split("): ", 1)[1] for line in se.FORMAT_REFERENCE.split("\n")
+            if line.startswith("Shot ")]
+
+
+def test_ct14_the_format_reference_is_pinned(ws):
+    reference = se.FORMAT_REFERENCE
+    assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == (
+        "990aeb28a929b910786b30cef2288cb16ed9910b88a3d7011778d31f4ca96efe")
+    assert (len(reference), len(reference.split())) == (3538, 618)
+    assert "@@" not in reference and "{" not in reference
+    shots = ref_shots()
+    assert len(shots) == 3
+    for k, shot in enumerate(shots, start=1):
+        assert lib.panel_prompt(REF_MOTIONS[k - 1], REF_SHOTS[k - 1], REF_SPEAKERS[k - 1],
+                                REF_LINES[k - 1], "beats", [REF_PHRASE]) == shot, k
+    for k, key in enumerate(("slow tracking right", "slow push-in", "static"), start=1):
+        assert se.camera_problem(lib, REF_MOTIONS[k - 1], [REF_PHRASE], key) is None, key
+        assert se.end_frame_detail(lib, se.PLAN_REFERENCE_PLAN, k, REF_MOTIONS[k - 1],
+                                   [REF_PHRASE]) is None, k
+    labels = [line.split("): ", 1)[0] for line in reference.split("\n") if line.startswith("Shot ")]
+    frames = [b["end_frame"].rstrip(".") for b in se.PLAN_REFERENCE_PLAN["beats"]]
+    assert "ends on: " + frames[0] in labels[0] and "opens on" not in labels[0]
+    for k in (2, 3):
+        assert "opens on: " + frames[k - 2] + "; ends on: " + frames[k - 1] in labels[k - 1], k
+    for segment in se.REFERENCE_COPY_SEGMENTS[:-1]:
+        assert segment in reference, segment
+    assert len(se.REFERENCE_SIX_GRAMS) == 80
+    assert reference.count(lib.ACOUSTIC_SENTENCE) == 1
+    assert reference.count(lib.AMBIENCE_SENTENCE) == 2
+
+
+def test_ct14_no_fixture_copies_either_reference():
+    """The corpus guard. The plan prompt fixtures re-baselined in the test-only commit (CR3)
+    quote PLAN_REFERENCE whole; that quote is removed first (Plan ruling R13)."""
+    fixtures = os.path.join(WS, "tests", "fixtures")
+    grams = se.REFERENCE_SIX_GRAMS | se.PLAN_REFERENCE_SIX_GRAMS
+    seen = 0
+    for root, _dirs, names in os.walk(fixtures):
+        for name in names:
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                text = f.read()
+            for reference in (se.plan_reference(True), se.plan_reference(False)):
+                text = text.replace(reference, "")
+            words = se.line_words(text)
+            seen += 1
+            line = " " + " ".join(words) + " "
+            assert not (se._six_grams(words) & grams), name
+            assert [t for t in se.REFERENCE_TERMS
+                    if " %s " % " ".join(se.line_words(t)) in line] == [], name
+    assert seen >= 40
