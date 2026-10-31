@@ -763,18 +763,23 @@ def _h_validate(self, groups, query, body):
 
 
 # Chained end frames spec CE14, D12: the seams job of a story; the caller holds STORE_LOCK.
-def _create_seams_job(state, real, story_id):
-    """Create and queue the seams job of story_id; returns its ID (CE14)."""
+def _create_seams_job(state, real, story_id, after=None):
+    """Create and queue the seams job of story_id; returns its ID (CE14). after, the ID of the
+    movie job it checks (Compose's check_seams), joins its fields; dispatch_tick skips the job
+    unless that movie ended done (lib.seams_skip_reason)."""
     job_id = lib.new_job_id(state)
+    fields = {"ws": real, "story_id": story_id}
+    if after is not None:
+        fields["after"] = after
     lib.create_job(state, job_id, "seams", real, story_id, None, lib.seams_argv(real, story_id),
-                   {"ws": real, "story_id": story_id})
+                   fields)
     return job_id
 
 
 def create_compose_job(server, fields, seams=False):
     """Create the queued job of a validated compose submission; returns its ID. With seams, a
-    chained movie's seams job is queued right behind it under the same STORE_LOCK hold (chained
-    end frames spec CE14, D12)."""
+    chained movie's seams job is queued right behind it under the same STORE_LOCK hold, with the
+    movie as its "after" (chained end frames spec CE14, D12)."""
     state, real = server.state, fields["ws"]
     with STORE_LOCK:
         job_id = lib.new_job_id(state)
@@ -786,7 +791,7 @@ def create_compose_job(server, fields, seams=False):
         job_id = lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"],
                                 None, argv, fields)["id"]
         if seams and fields["action"] == "movie" and fields["mode"] == "chained":
-            _create_seams_job(state, real, fields["story_id"])
+            _create_seams_job(state, real, fields["story_id"], after=job_id)
         return job_id
 
 

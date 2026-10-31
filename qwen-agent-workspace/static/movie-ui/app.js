@@ -721,7 +721,8 @@
     const s = report.summary || {};
     $("#s-seams-summary").textContent = "Mean score " + (s.mean_score === null || s.mean_score === undefined ? "n/a" : s.mean_score)
       + " over " + s.scored + " scored panel(s); " + s.missed + " missed (a score below " + report.threshold + ").";
-    (report.panels || []).forEach(function (p) {
+    (Array.isArray(report.panels) ? report.panels : []).forEach(function (p) {
+      if (!p || typeof p !== "object") { return; }
       body.appendChild(el("tr", {cls: p.verdict === "missed" ? "seam-missed" : ""}, [
         el("td", {text: String(p.panel)}), el("td", {text: p.score === null ? "-" : String(p.score)}),
         el("td", {text: p.verdict}), el("td", {text: p.reason})]));

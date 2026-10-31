@@ -460,15 +460,35 @@ def plan_has_end_frames(plan):
                     and b["end_frame"].strip() for b in beats))
 
 
+def seams_skip_reason(state, job, queue):
+    """Why dispatch_tick skips job, else None (chained end frames spec CE14, Task 6 fix round 1):
+    a seams job whose fields name an "after" movie job (Compose's check_seams) runs only when that
+    job ended "done". queue is the queue job_state reads. Reads only status files and queue."""
+    fields = job.get("fields") if job.get("kind") == "seams" else None
+    after = fields.get("after") if isinstance(fields, dict) else None
+    if not isinstance(after, str):
+        return None
+    current = job_state(state, after, queue)
+    if current == "done":
+        return None
+    if current == "queued":
+        return "skipped: movie %s has not run yet" % after
+    if current == "unknown":
+        return "skipped: movie %s no longer exists" % after
+    return "skipped: movie %s ended %s" % (after, current)
+
+
 def next_queued_job(state):
-    """(job_id, job) of the first queued ID without a status.json and with a readable job.json
-    (the dispatcher's skip rule, MU30), else (None, None). Never writes (VP3)."""
-    for job_id in read_queue(state):
+    """(job_id, job) of the first queued ID without a status.json, with a readable job.json and
+    not a seams job that seams_skip_reason skips (the dispatcher's skip rule, MU30; CE14), else
+    (None, None). Never writes (VP3)."""
+    queue = read_queue(state)
+    for job_id in queue:
         jdir = job_dir(state, job_id)
         if os.path.lexists(os.path.join(jdir, "status.json")):
             continue
         job = read_job(jdir)
-        if job is not None:
+        if job is not None and seams_skip_reason(state, job, queue) is None:
             return job_id, job
     return None, None
 
@@ -786,6 +806,16 @@ def dispatch_tick(state, ui_ws):
         if not os.path.isdir(job["workspace"]):
             write_status(jdir, {"state": "failed", "exit_code": None, "ended": utc_now(),
                                 "error": "workspace no longer exists (removed by self-update)"})
+            write_queue(state, queue)
+            continue
+        # Chained end frames spec CE14 (Task 6 fix round 1): a check_seams job whose movie did not
+        # end done is cancelled here, before any preflight, VLM step or subprocess.
+        skip = seams_skip_reason(state, job, queue)
+        if skip is not None:
+            with open(os.path.join(jdir, "log.txt"), "ab") as log:
+                log.write(("[movie-ui] %s\n" % skip).encode("utf-8"))
+            write_status(jdir, {"state": "cancelled", "exit_code": None, "ended": utc_now(),
+                                "error": skip})
             write_queue(state, queue)
             continue
         dispatched = utc_now()

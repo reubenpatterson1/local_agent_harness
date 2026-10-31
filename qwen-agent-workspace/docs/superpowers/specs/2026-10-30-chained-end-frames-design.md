@@ -165,6 +165,7 @@ Recheck runs N23 only for beats with an end frame, and it runs no plan step. So 
 - Its API default is `false`, and only Compose's Run all sends it.
 - **The seams job is created under the same `STORE_LOCK` hold as the movie job [spec choice]**: that is what keeps it directly behind the movie job in `queue.json`.
 - **A second seams job for the same story is refused while one is queued or running [spec choice]**: a double click must not queue two VLM reloads.
+- **A check_seams job runs only after its movie ended done [fix round 1, review I1]**: a cancelled, failed or lost movie would otherwise cost a VLM reload (5-14 minutes) before scoring stale or partial clips and replacing a current `seam_report.json`. Its `after` link makes the dispatcher cancel it with the reason instead. Checks queued by `POST /api/stories/<id>/seams` have no `after` and always run.
 
 ---
 
@@ -1114,20 +1115,37 @@ Mean score <mean> over <scored> scored panel(s); <missed> missed, <no_clip> with
               and any(isinstance(b, dict) and isinstance(b.get("end_frame"), str)
                       and b["end_frame"].strip() for b in beats))
   ```
-- The kind is `"seams"`. Its `fields` are `{"ws": <ws_real>, "story_id": <id>}`. Its progress is the generic snapshot (`:2219-2221`); `job_phases` is not used for it.
+- The kind is `"seams"`. Its `fields` are `{"ws": <ws_real>, "story_id": <id>}`, plus `"after": <movie job ID>` when Compose's `check_seams` created it (Task 6 fix round 1, review I1). `DEFAULT_FIELDS` is unchanged ([BF] BT1).
+- **The `after` rule** (fix round 1). `seams_skip_reason(state, job, queue)`, placed after `plan_has_end_frames`, reads only status files and the queue. It returns None unless `job` is a seams job whose `fields["after"]` is a string, and also None when that job's `job_state` is `done`. Otherwise it returns the reason:
+  - `skipped: movie <id> has not run yet` (queued);
+  - `skipped: movie <id> no longer exists` (unknown);
+  - `skipped: movie <id> ended <state>` (failed, cancelled or lost).
+- **`dispatch_tick`**, after its workspace check and before the `starting` status, cancels such a job:
+  - it appends `[movie-ui] <reason>` to its `log.txt`;
+  - it writes `{"state": "cancelled", "exit_code": null, "ended": <now>, "error": <reason>}`;
+  - it drops the job from the queue and goes on to the next queued job in the same tick.
+
+  No runner, preflight, VLM step or subprocess starts for it. A job cannot be running when dispatch reaches the seams job, because the tick returns early while one is active. So `after` is then finished, missing, or still queued behind it: a user moved the seams job up, and the job is skipped rather than run ahead of its movie.
+- **`next_queued_job`** passes over a job that `seams_skip_reason` skips, so `vlm_restore_wanted` and the postflight never restore the VLM for a seams job that will not run.
+- Both read job records the way the dispatcher already does, under `STORE_LOCK` (the dispatcher) or lock-free from the runner (the postflight). `BATCH_LOCK` is never taken. Its progress is the generic snapshot (`:2219-2221`); `job_phases` is not used for it.
 
 **`movie_ui_server.py`.**
 - **Route.** Append right after the `PUT …/story\.md` route (`:106`): `("POST", r"/api/stories/" + _STORY + r"/seams", "h_story_seams", "/api/stories/ronin-rescue/seams")`. Register `MovieUIHandler.h_story_seams = _h_story_seams` next to `h_story_save` (`:1878`). The route count is the merged base's count plus one; it is read from the merged base at implementation time (54 + 1 = 55 if [BF] lands as specified). No tab is added.
 - **Helper** (caller holds `STORE_LOCK`):
   ```python
-  def _create_seams_job(state, real, story_id):
-      """Create and queue the seams job of story_id; returns its ID (CE14)."""
+  def _create_seams_job(state, real, story_id, after=None):
+      """Create and queue the seams job of story_id; returns its ID (CE14). after, the ID of the
+      movie job it checks (Compose's check_seams), joins its fields; dispatch_tick skips the job
+      unless that movie ended done (lib.seams_skip_reason)."""
       job_id = lib.new_job_id(state)
+      fields = {"ws": real, "story_id": story_id}
+      if after is not None:
+          fields["after"] = after
       lib.create_job(state, job_id, "seams", real, story_id, None, lib.seams_argv(real, story_id),
-                     {"ws": real, "story_id": story_id})
+                     fields)
       return job_id
   ```
-- **`create_compose_job(server, fields, seams=False)`.** The signature gains `seams=False`. In the non-smoke branch, inside the same `with STORE_LOCK:` and right after the compose job is created, it calls `_create_seams_job(state, real, fields["story_id"])` when `seams and fields["action"] == "movie" and fields["mode"] == "chained"`. It still returns the compose job's ID, so other callers ([BF]) are unchanged.
+- **`create_compose_job(server, fields, seams=False)`.** The signature gains `seams=False`. In the non-smoke branch, inside the same `with STORE_LOCK:` and right after the compose job is created, it calls `_create_seams_job(state, real, fields["story_id"], after=job_id)` (`job_id`: the movie's; Task 6 fix round 1) when `seams and fields["action"] == "movie" and fields["mode"] == "chained"`. It still returns the compose job's ID, so other callers ([BF]) are unchanged.
 - **`_h_job_create`.** `create_compose_job(self.server, fields)` becomes `create_compose_job(self.server, fields, seams=isinstance(body, dict) and body.get("check_seams") is True)`. The response shape is unchanged.
 - **`_h_story_seams(self, groups, query, body)`:**
   1. `real, story_id, sdir = _story_dir(self, groups, body.get("ws"))` (404 `no story <id> in <dir>`).
@@ -1175,7 +1193,8 @@ Mean score <mean> over <scored> scored panel(s); <missed> missed, <no_clip> with
     const s = report.summary || {};
     $("#s-seams-summary").textContent = "Mean score " + (s.mean_score === null || s.mean_score === undefined ? "n/a" : s.mean_score)
       + " over " + s.scored + " scored panel(s); " + s.missed + " missed (a score below " + report.threshold + ").";
-    (report.panels || []).forEach(function (p) {
+    (Array.isArray(report.panels) ? report.panels : []).forEach(function (p) {
+      if (!p || typeof p !== "object") { return; }
       body.appendChild(el("tr", {cls: p.verdict === "missed" ? "seam-missed" : ""}, [
         el("td", {text: String(p.panel)}), el("td", {text: p.score === null ? "-" : String(p.score)}),
         el("td", {text: p.verdict}), el("td", {text: p.reason})]));
@@ -1226,6 +1245,7 @@ The [MUI] page rules still hold: no inline handlers or styles, no `prompt(`/`ale
 | seam-report | exit 2 | `seam-report: error: argument --port: 'TEXT' is not an integer (from --port or STORY_SERVER_PORT)` (after the usage line) | no write |
 | seam-report | exit 1 | `Error: cannot write PATH: E` | the old pair unchanged, no `.tmp` of this run left |
 | seam-report verdicts | — | `no clip` reasons `clips/panel_NN.mp4 does not exist` / `cannot read the last frame of clips/panel_NN.mp4: D` / `cannot read FRAME: EXCEPTION`; `unparseable` reason `the model gave no valid reply in 3 attempts` | in the report |
+| a check_seams job at dispatch | cancelled | `skipped: movie J has not run yet` / `skipped: movie J no longer exists` / `skipped: movie J ended STATE` | status `error` and one `[movie-ui] ` log line; no runner |
 | `POST /api/stories/<id>/seams` | 404 / 409 / 409 | `no story ID in DIR` / `story ID has no end frames to check` / `a seams check of ID is already queued as job J` | — |
 | Stories tab | text | `seams check queued as job J`, `This plan has no end frames; no seam report.`, `No seam report yet: press Check seams.`, `Mean score X over N scored panel(s); M missed (a score below 6).` | — |
 
@@ -1271,10 +1291,10 @@ Each module docstring states that no test renders, reads the real HOME, or conta
 | CT22 | same | **Prompt and request.** `seam_prompt(plan, 2)` equals the expected text, including the `Characters in this panel: "the courier" is <COURIER>.` line; a beat with empty cast → no characters line. `vlm_complete` with `http.client.HTTPConnection` monkeypatched to a fake records `POST /v1/chat/completions`, the body keys of Section 3, `max_tokens == 600`, `temperature == 0`, `chat_template_kwargs == {"enable_thinking": false}`, and an image URL starting `data:image/png;base64,`. `vlm_models` picks the first `loaded: true` string id, answers `no model loaded` when entries carry `loaded` but none is `true`, and takes `data[0]` when no entry has the key |
 | CT23 | `tests/test_movie_ui_seams.py` | `lib.job_vlm("seams", {}, ws, "s1") == "required"`; `lib.seams_argv(ws, "s1") == [sys.executable, ws + "/bin/seam-report", "s1", "--port", "8177"]` (and `MOVIE_UI_VLM_PORT=9001` → `"9001"`); `plan_has_end_frames` true for a chained plan with one end frame, false for shots, none, `None`, blank strings |
 | CT24 | same | `POST /api/stories/<id>/seams`: 201 with `job.kind == "seams"`, `job.command` ending `seam-report <id> --port 8177`, and the job's `job.json` `vlm` is `"required"`; unknown story 404; a chained plan without end frames 409 `story <id> has no end frames to check`; a second POST while queued 409 `a seams check of <id> is already queued as job <id>`; 401 without the token |
-| CT25 | same | `POST /api/jobs` with valid chained movie fields and `"check_seams": true` → `queue.json` ends `[<movie id>, <seams id>]`, the seams job's argv as CT23; `check_seams` absent, `false` or `"true"` → no seams job; mode shots or action story → no seams job |
+| CT25 | same | `POST /api/jobs` with valid chained movie fields and `"check_seams": true` → `queue.json` ends `[<movie id>, <seams id>]`, the seams job's argv as CT23; `check_seams` absent, `false` or `"true"` → no seams job; mode shots or action story → no seams job. Fix round 1: the seams job's `fields` are `{"ws", "story_id", "after": <movie id>}` and the 201 body keeps its keys; a movie cancelled while queued, or one that failed → at dispatch its seams job is `cancelled` with `error` and log `skipped: movie <id> ended cancelled|failed`, with no runner launched and no VLM tool called (the lifecycle on, recording stubs); with a failed movie, `vlm_restore_wanted` names the job after the seams job, and the same tick dispatches that job; a done movie's seams job runs; a seams job moved ahead of its movie → `skipped: movie <id> has not run yet`, and the movie is dispatched; a missing movie → `no longer exists`; a lost one → `ended lost`; no `after` → never skipped |
 | CT26 | same | `GET /api/stories/<id>` → `end_frames` true/false and `seams` equal to the saved `seam_report.json` (or null) |
-| CT27 | same | **Static page.** `index.html` contains the three CE15 snippets exactly; `app.js` contains `"/seams"`, `check_seams: $("#c-mode").value === "chained" && $("#c-check-seams").checked`, `"seam-missed"`, `"This plan has no end frames; no seam report."`, `showSeams(res.data);`; `app.css` contains `.seam-missed td { background: var(--warn-bg); }`; the [MUI] page rules hold |
-| CT28 | same | **Failed movie.** A queued chained movie job followed by its seams job, both dispatched with `mt.dispatch` in a stub workspace whose movie stub exits 1 and writes no clips, and whose `bin/seam-report` is a copy of the real script (it loads nothing else on this path) → the seams job ends `done`, its log's last line is `seam-report: no clips to check in <clips>` |
+| CT27 | same | **Static page.** `index.html` contains the three CE15 snippets exactly; `app.js` contains `"/seams"`, `check_seams: $("#c-mode").value === "chained" && $("#c-check-seams").checked`, `"seam-missed"`, `"This plan has no end frames; no seam report."`, `showSeams(res.data);`; `app.css` contains `.seam-missed td { background: var(--warn-bg); }`; the [MUI] page rules hold; `showSeams` iterates `Array.isArray(report.panels) ? report.panels : []` and returns on an entry that is not an object (fix round 1, Minor 5) |
+| CT28 | same | **Failed movie.** A queued chained movie job followed by its seams job created as `POST /api/stories/<id>/seams` creates it (no `after`), both dispatched with `mt.dispatch` in a stub workspace whose movie stub exits 1 and writes no clips, and whose `bin/seam-report` is a copy of the real script (it loads nothing else on this path) → the seams job ends `done`, its log's last line is `seam-report: no clips to check in <clips>` |
 | CT29 | `tests/test_chained_end_frames.py` | **No server, no HOME.** Every E2E uses `seu.script_agent`; `os.path.expanduser("~")` is never the real HOME |
 | CT30 | `tests/test_seam_report.py` | `bin/seam-report` is executable, starts with `#!/usr/bin/env python3`, imports only stdlib modules (AST check: `argparse base64 http.client importlib.machinery json os re shutil subprocess sys tempfile time`) |
 

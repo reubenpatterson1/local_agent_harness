@@ -164,6 +164,132 @@ def test_ct25_run_all_queues_the_seams_job_right_behind_the_movie(env, monkeypat
     assert len(_jobs_of(state, "seams")) == 1
 
 
+# --- CT25, fix round 1: the after link (CE14; Task 6 review I1, Minor 5) -----------------------
+
+def _record_vlm(monkeypatch, tmp):
+    """The VLM lifecycle on, with story-server and story-server-restore stubs that append one line
+    per call to the returned calls file; the dispatcher's own restore queue is empty."""
+    tools = os.path.join(tmp, "vlm-tools")
+    os.makedirs(tools)
+    calls = os.path.join(tools, "calls.txt")
+    for tool in ("story-server", "story-server-restore"):
+        path = os.path.join(tools, tool)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\necho "%s $*" >> "%s"\n' % (tool, calls))
+        os.chmod(path, 0o755)
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "1")
+    monkeypatch.setenv("MOVIE_UI_VLM_TOOLS", tools)
+    monkeypatch.setenv("MOVIE_UI_VLM_PORT", "9")
+    monkeypatch.setattr(lib, "VLM_RECOVERY", [])
+    return calls
+
+
+def _record_launches(monkeypatch):
+    """lib.launch_runner records the job IDs it is asked to start and starts nothing."""
+    launched = []
+    monkeypatch.setattr(lib, "launch_runner", lambda state, job_id, ui_ws: launched.append(job_id))
+    return launched
+
+
+def _tick(state):
+    with srv.STORE_LOCK:
+        return lib.dispatch_tick(state, mt.WS)
+
+
+def _after_seams(state, ws, movie):
+    with srv.STORE_LOCK:
+        return srv._create_seams_job(state, ws, "ronin-rescue", after=movie)
+
+
+def _skipped(state, seams, reason):
+    status = mt.status_of(state, seams)
+    assert (status["state"], status["exit_code"], status["error"]) == ("cancelled", None, reason)
+    assert mt.read_log(state, seams) == "[movie-ui] %s\n" % reason
+    assert seams not in lib.read_queue(state)
+
+
+def test_ct25_a_movie_cancelled_while_queued_skips_its_seams_job(env, monkeypatch):
+    monkeypatch.delenv("MOVIE_UI_VLM_PORT", raising=False)
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    _passing_checks(monkeypatch)
+    created = mt.api(s, "POST", "/api/jobs", body=dict(mt.fields(ws, action="movie",
+                                                                 mode="chained"), check_seams=True))[2]
+    movie, seams = created["job"]["id"], _jobs_of(state, "seams")[0]
+    assert lib.read_queue(state) == [movie, seams]
+    assert lib.read_job(lib.job_dir(state, seams))["fields"] == {
+        "ws": ws, "story_id": "ronin-rescue", "after": movie}
+    assert sorted(created) == ["checks", "job"]
+    assert mt.api(s, "POST", "/api/jobs/%s/cancel" % movie, body={})[::2] == (200, {"state": "cancelled"})
+    calls = _record_vlm(monkeypatch, env["tmp"])
+    launched = _record_launches(monkeypatch)
+    assert _tick(state) is None
+    _skipped(state, seams, "skipped: movie %s ended cancelled" % movie)
+    assert launched == [] and not os.path.exists(calls)
+    assert mt.api(s, "GET", "/api/jobs")[0] == 200
+
+
+def test_ct25_a_failed_movie_skips_its_seams_job_and_the_next_job_runs(env, monkeypatch):
+    ws, state = env["ws"], env["state"]
+    mt.stub_config(ws, {"ltx-movie run": {"exit": 1, "stderr": "render failed\n"}})
+    movie = mt.make_job(state, [os.path.join(ws, "bin", "ltx-movie"), "a narrative", "--story-id",
+                                "ronin-rescue"], ws, story_id="ronin-rescue")
+    seams = _after_seams(state, ws, movie)
+    other = mt.make_job(state, mt.py_argv("print('next')"), ws, kind="smoke")
+    mt.dispatch(state, movie)
+    _wait_finished(state, movie)
+    assert mt.status_of(state, movie)["state"] == "failed"
+    calls = _record_vlm(monkeypatch, env["tmp"])
+    assert lib.next_queued_job(state)[0] == other
+    assert lib.vlm_restore_wanted(state) == (False, "next job %s runs without it" % other)
+    launched = _record_launches(monkeypatch)
+    assert _tick(state) == other
+    _skipped(state, seams, "skipped: movie %s ended failed" % movie)
+    assert launched == [other] and not os.path.exists(calls)
+    assert lib.read_queue(state) == []
+
+
+def test_ct25_a_done_movie_runs_its_seams_job(env):
+    ws, state = env["ws"], env["state"]
+    shutil.copy(os.path.join(WS, "bin", "seam-report"), os.path.join(ws, "bin", "seam-report"))
+    sdir = _story(ws, plan=_plan())
+    movie = mt.make_job(state, ["true"], ws, story_id="ronin-rescue",
+                        status={"state": "done", "exit_code": 0, "ended": lib.utc_now()})
+    seams = _after_seams(state, ws, movie)
+    assert lib.seams_skip_reason(state, lib.read_job(lib.job_dir(state, seams)),
+                                 lib.read_queue(state)) is None
+    assert lib.next_queued_job(state)[0] == seams
+    assert _tick(state) == seams
+    _wait_finished(state, seams)
+    assert (mt.status_of(state, seams)["state"], mt.status_of(state, seams)["exit_code"]) == (
+        "done", 0)
+    lines = mt.read_log(state, seams).splitlines()
+    assert [line for line in lines if not line.startswith("[movie-ui] ")][-1] == (
+        "seam-report: no clips to check in %s" % os.path.join(sdir, "clips"))
+
+
+def test_ct25_a_seams_job_never_runs_ahead_of_its_movie(env, monkeypatch):
+    ws, state = env["ws"], env["state"]
+    movie = mt.make_job(state, mt.py_argv("print('render')"), ws, story_id="ronin-rescue")
+    seams = _after_seams(state, ws, movie)
+    assert lib.read_queue(state) == [movie, seams]
+    with srv.STORE_LOCK:
+        assert lib.move_job(state, seams, "up") == [seams, movie]
+    calls = _record_vlm(monkeypatch, env["tmp"])
+    launched = _record_launches(monkeypatch)
+    assert _tick(state) == movie
+    _skipped(state, seams, "skipped: movie %s has not run yet" % movie)
+    assert launched == [movie] and not os.path.exists(calls)
+    gone = _after_seams(state, ws, "20261031-120000-abcd")
+    assert lib.seams_skip_reason(state, lib.read_job(lib.job_dir(state, gone)), []) == (
+        "skipped: movie 20261031-120000-abcd no longer exists")
+    lost = mt.make_job(state, ["true"], ws, status={"state": "lost", "exit_code": None})
+    assert lib.seams_skip_reason(state, {"kind": "seams", "fields": {"after": lost}}, []) == (
+        "skipped: movie %s ended lost" % lost)
+    for job in ({"kind": "seams", "fields": {"ws": ws, "story_id": "ronin-rescue"}},
+                {"kind": "seams", "fields": None}, {"kind": "movie", "fields": {"after": lost}}):
+        assert lib.seams_skip_reason(state, job, []) is None, job
+
+
 # --- CT26: the Stories tab's data (CE14) ----------------------------------------------------------
 
 def test_ct26_get_story_has_end_frames_and_the_report(env):
@@ -201,6 +327,8 @@ JS_SNIPPETS = (
     '"seam-missed"', '"This plan has no end frames; no seam report."',
     '"No seam report yet: press Check seams."', "showSeams(res.data);",
     '"seams check queued as job "', 'show($("#c-check-seams-box"), mode === "chained");',
+    '(Array.isArray(report.panels) ? report.panels : []).forEach(function (p) {\n'
+    '      if (!p || typeof p !== "object") { return; }\n',
     'const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", '
     '"jobs", "traces"];',
 )
@@ -217,6 +345,7 @@ def test_ct27_the_static_page():
     for snippet in JS_SNIPPETS:
         assert snippet in texts["app.js"], snippet
     assert texts["app.js"].count("function showSeams(data)") == 1
+    assert "(report.panels || [])" not in texts["app.js"]
     assert texts["app.js"].index("function showSeams(data)") < texts["app.js"].index(
         "async function openStory(storyId)")
     assert ".seam-missed td { background: var(--warn-bg); }\n" in texts["app.css"]
