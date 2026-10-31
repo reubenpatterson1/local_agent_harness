@@ -818,6 +818,13 @@ def test_ct10_n23_detection_rows(ws):
     raw = ef_plan(3)
     del raw["beats"][1]["end_frame"]
     assert _detail(ws, "The camera tracks the movement.", plan=_normalized(ctx, raw)) is None
+    assert se.end_frame_landing_problems(ctx, _normalized(ctx, raw), seu.panel_json("chained", 2),
+                                         2) == []
+    for mode in ("shots", "no_stills"):
+        other = seu.make_ctx(se, ws, mode=mode, story_id="n23-" + mode.replace("_", "-"))
+        plan = _normalized(other, seu.plan_json(mode, 3))
+        plan["beats"][1]["end_frame"] = E2
+        assert se.end_frame_landing_problems(other, plan, seu.panel_json(mode, 2), 2) == [], mode
     mentions = se._mentions(_normalized(ctx, ef_plan(3))["cast"])
     assert sorted(se.end_frame_words(E2, set(w for _c, ws_ in mentions for w in ws_))) == [
         "2", "beat", "camera", "centre", "facing", "frame", "quay", "seen", "stands", "waist", "wet"]
@@ -916,6 +923,57 @@ def test_ct11_writers_that_land_get_no_n23(ws, tmp_path, monkeypatch):
     assert [c["stage"] for c in log] == ["plan", "panel", "panel"]
     assert _n23([m["message"] for m in checks["hard"] + checks["advisory"]]) == []
     assert not any("N23" in " ".join(c["argv"]) for c in log)
+
+
+# A 15-word spoken line (a hard T1 on a 6-second clip) and a 3-action Motion (a hard T2), as in
+# tests/test_dialogue.py's OVER_CAP and BUSY; a parse-time repair never removes either.
+T1_LINE = "I carry a sealed letter from the harbour master for the abbot of this temple."
+T2_MOTION = ("The courier stops at the crates, then turns, then pedals on toward the far end of the "
+             "wet road.")
+LAND2 = " The camera tracks the courier — as the move completes, " + _clause(END_FRAME % 2) + "."
+
+
+def _story_md(ctx):
+    with open(os.path.join(ctx.story_dir, "story.md"), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_ct11_a_re_ask_that_adds_a_hard_problem_keeps_reply_1(ws, tmp_path, monkeypatch):
+    raw = ef_plan(2)
+    raw["beats"][0]["speaker"] = "c1"
+    first = dict(_miss(1), dialogue="Keep moving.")
+    second = dict(_land(1), dialogue=T1_LINE)
+    rc, log, _plan, ctx = _e2e(ws, tmp_path, monkeypatch, [raw], n=2, panel={
+        "1": [seu.answer(first), seu.answer(second)], "2": [seu.answer(_land(2))]})
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert rc == 0
+    assert [c["stage"] for c in log] == ["plan", "panel", "panel", "panel"]
+    assert not [m for m in checks["hard"] + checks["unresolved"] + checks["advisory"]
+                if " T1 " in m["message"]]
+    assert len(_n23([m["message"] for m in checks["advisory"]])) == 1
+    assert "Dialogue: the courier: Keep moving." in _story_md(ctx)
+
+
+def test_ct11_a_re_ask_with_an_equal_count_is_accepted(ws, tmp_path, monkeypatch):
+    first = dict(_miss(2), motion=T2_MOTION)
+    second = dict(_miss(2), motion=T2_MOTION + LAND2)
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [_land(1)], [first, second])
+    assert rc == 0
+    assert [c["stage"] for c in log][:4] == ["plan", "panel", "panel", "panel"]
+    assert _n23([m["message"] for m in checks["hard"] + checks["advisory"]]) == []
+    assert [m["message"].split()[2] for m in checks["unresolved"]] == ["T2"]
+    assert LAND2.strip() in _story_md(ctx)
+
+
+def test_ct11_a_re_ask_with_more_format_and_n23_problems_is_rejected(ws, tmp_path, monkeypatch):
+    first = dict(_miss(2), motion=T2_MOTION)
+    second = dict(_miss(2), motion=_miss(2)["motion"] + " Herring crates line the quay.")
+    rc, log, ctx, checks = _ct11(ws, tmp_path, monkeypatch, [_land(1)], [first, second])
+    assert rc == 0
+    assert [c["stage"] for c in log][:4] == ["plan", "panel", "panel", "panel"]
+    assert len(_n23([m["message"] for m in checks["advisory"]])) == 1
+    assert [m["message"].split()[2] for m in checks["unresolved"]] == ["T2"]
+    assert "Herring crates" not in _story_md(ctx)
 
 
 # --- CT15: old stories re-check exactly as before (D10, CK3) --------------------------------------

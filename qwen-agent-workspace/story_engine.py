@@ -3934,6 +3934,19 @@ def end_frame_landing_problems(ctx, plan, part, k):
     return ["panel %d: N23 end frame landing: Motion: %s" % (k, detail)] if detail else []
 
 
+def panel_hard_problems(ctx, plan, part, k):
+    """The hard _field_checks messages of panel k with writer parts part, with the ids and
+    undeclared characters panel_checks uses (GENERATION_CHECKS, generating): the panel's hard
+    problems a round-0 state would hold. A chained round-0 re-ask keeps its reply only when this
+    list does not grow (chained end frames spec CE9)."""
+    parts = [{}] * (k - 1) + [part]
+    writers = {LABELS[key]: part.get(key, "") for key in panel_keys(ctx, plan, k)
+               if key != "title"}
+    return _field_checks(ctx, _character_lib(ctx.ws), plan, k, part.get("title", ""),
+                         panel_fields(ctx, plan, parts, k), writers, GENERATION_CHECKS,
+                         undeclared_characters(ctx), generating=True)[0]
+
+
 def panel_checks(ctx, plan, parts, text, story_md_path):
     """(hard, advisory) of an assembled story (RS15; dialogue spec 6.3): per panel the
     _field_checks classes; plan-scope N10 is advisory; in shots mode S1 and S3 are hard and every
@@ -5112,7 +5125,8 @@ class _Run(object):
                 parts[k - 1] = new
                 # Shot prompt format spec SF13, D8: one re-ask for a writer-format problem while
                 # the panel has a call left, then the deterministic trim; chained end frames spec
-                # CE9: N23 joins the same single re-ask.
+                # CE9: N23 joins the same single re-ask, and a chained reply to it is kept only
+                # when it also adds no hard problem to the panel.
                 problems = (format_problems(ctx, plan, new, k)
                             + end_frame_landing_problems(ctx, plan, new, k))
                 if (problems and self.panel_calls[k] < PANEL_MAX_CALLS
@@ -5121,7 +5135,10 @@ class _Run(object):
                     if (again is not None
                             and len(format_problems(ctx, plan, again, k)
                                     + end_frame_landing_problems(ctx, plan, again, k))
-                            <= len(problems)):
+                            <= len(problems)
+                            and (ctx.mode != "chained"
+                                 or len(panel_hard_problems(ctx, plan, again, k))
+                                 <= len(panel_hard_problems(ctx, plan, new, k)))):
                         parts[k - 1] = again
                 parts[k - 1] = trim_format(ctx, plan, k, parts[k - 1])
                 valid += 1
