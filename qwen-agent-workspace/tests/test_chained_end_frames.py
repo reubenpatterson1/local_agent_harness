@@ -336,3 +336,366 @@ def test_ct13_the_fixture_parts_assemble_with_no_double_quote(ws):
                    if line.startswith("Motion: ")]
         assert motions and not any(q in m for m in motions for q in ('"', "“", "”")), found[-1]
     assert found == ["hockey-1x241-f", "hockey-2x145-f"]
+
+
+# --- CT1 (Task 2 part): the planner constants (CE4-CE7) ----------------------------------------
+
+END_FRAME_RULE = (" end_frame is one sentence of 8 to 30 words, in the present tense, of the "
+                  "frame the beat ends on: who or what is in frame, where each one is (left, "
+                  "centre or right; foreground or background), which way they face and how tight "
+                  "the shot is. It never names a camera move, the lighting, a colour or a style, "
+                  "has no spoken words and no double quotes, and names only characters in the "
+                  "beat's cast. Beat k's end frame is exactly where beat k+1 begins; write beat "
+                  "k+1's action so it starts from that composition. The last beat's end frame "
+                  "closes the story.")
+PLAN_REFERENCE_INTRO = ("FORMAT REFERENCE ONLY — never reuse its people, places, objects or "
+                        "words. This is the complete plan of a three-beat movie made as one "
+                        "continuous take, a different story from this one.%s It shows the format "
+                        "of every plan: each beat's end_frame says exactly where the beat ends, "
+                        "the next beat's action starts from that end frame, and the last end "
+                        "frame closes the story.\n")
+PLAN_REFERENCE_LINES_CLAUSE = (' Its narrative quoted two spoken lines: 1 "Forty years of '
+                               'mornings." and 2 "Not one more."')
+PLAN_REFERENCE_KEY_WORDS = frozenset(("fishmonger", "fishmongers", "herring", "herrings",
+                                      "crates", "zinc", "shutter", "cloth"))
+P22_MISSING = ("beat %d: P22 end frame: end_frame is missing or empty; write one sentence of 8 "
+               "to 30 words of the frame this beat ends on: who or what is in frame, where (left, "
+               "centre or right; foreground or background), which way they face and how tight "
+               "the shot is")
+P22_LENGTH = "beat %d: P22 end frame: end_frame is %d words; write one sentence of 8 to 30 words"
+P24_MESSAGE = ("plan: P24 reference copy: %s copies the plan reference (%s); write only this "
+               "movie's own people, places, objects and words")
+END_FRAMES_DROPPED = ("Warning: end frames dropped after %d attempts; this story has no seam "
+                      "report")
+
+
+def test_ct1b_the_planner_constants():
+    assert se.END_FRAME_RULE == END_FRAME_RULE
+    assert se.PLAN_REFERENCE_INTRO == PLAN_REFERENCE_INTRO
+    assert se.PLAN_REFERENCE_LINES_CLAUSE == PLAN_REFERENCE_LINES_CLAUSE
+    assert se.PLAN_REFERENCE_KEY_WORDS == PLAN_REFERENCE_KEY_WORDS
+    assert se.END_FRAME_WORDS == (8, 30)
+    assert se.P22_MISSING == P22_MISSING
+    assert se.P22_LENGTH == P22_LENGTH
+    assert se.P24_MESSAGE == P24_MESSAGE
+    assert se.END_FRAMES_DROPPED == END_FRAMES_DROPPED
+    for text in (END_FRAME_RULE, PLAN_REFERENCE_INTRO, PLAN_REFERENCE_LINES_CLAUSE, P22_MISSING,
+                 P22_LENGTH, P24_MESSAGE, END_FRAMES_DROPPED, se.plan_reference(True),
+                 se.plan_reference(False)):
+        assert "slowly" not in text.lower(), text
+
+
+# --- CT2: the plan reference (CE5) ---------------------------------------------------------------
+
+def _sha(text):
+    return (hashlib.sha256(text.encode("utf-8")).hexdigest(), len(text), len(text.split()))
+
+
+def test_ct2_the_plan_reference_is_pinned():
+    assert _sha(se._plan_reference_json(se.PLAN_REFERENCE_PLAN)) == (
+        "e3329d43c6049b5d7e727531d37cd14b0a19fda8d3055f79c9298e5280123a53", 2103, 322)
+    assert _sha(se.plan_reference(True)) == (
+        "f01c845181417fa7a3d77f112786e52efb05c029716c141e3999c6f2c1a87fb3", 2562, 403)
+    assert _sha(se.plan_reference(False)) == (
+        "571591dffb3a354b21569a171420b6e762268787854d9b1c22dbd496482c1eff", 2429, 380)
+    assert len(se.PLAN_REFERENCE_SIX_GRAMS) == 68
+    assert json.loads(se.plan_reference(True).split("\n", 1)[1]) == se.PLAN_REFERENCE_PLAN
+    no_lines = copy.deepcopy(se.PLAN_REFERENCE_PLAN)
+    for beat in no_lines["beats"]:
+        del beat["lines"]
+    assert json.loads(se.plan_reference(False).split("\n", 1)[1]) == no_lines
+    assert se.plan_reference(True).startswith(PLAN_REFERENCE_INTRO % PLAN_REFERENCE_LINES_CLAUSE)
+    assert se.plan_reference(False).startswith(PLAN_REFERENCE_INTRO % "")
+    for text in (se.plan_reference(True), se.plan_reference(False)):
+        assert "@@" not in text and text.endswith("}\n\n")
+
+
+def test_ct2_the_reference_plan_passes_the_plan_checks(ws):
+    for narration in ("speech", True):
+        ctx = ref_ctx(ws, narration=narration)
+        plan = _normalized(ctx, copy.deepcopy(se.PLAN_REFERENCE_PLAN))
+        hard, advisory = se.plan_checks(ctx, plan)
+        assert hard == [], narration
+        assert [m for m in advisory if re.search(r": P(?:8|22|23|24) ", m)] == [], narration
+        assert se.plan_end_frame_problems(ctx, plan) == []
+        assert se.line_assignment_problems(plan) == []
+        assert [b["end_frame"] for b in plan["beats"]] == [
+            b["end_frame"] for b in se.PLAN_REFERENCE_PLAN["beats"]]
+    ctx = ref_ctx(ws, narrative="A courier delivers a letter.")
+    plan = _normalized(ctx, copy.deepcopy(se.PLAN_REFERENCE_PLAN))
+    problems = se.plan_copy_problems(ctx, plan)
+    assert problems
+    assert all(m.startswith("plan: P24 reference copy: ") for m in problems)
+    assert problems[0].startswith("plan: P24 reference copy: the logline copies the plan reference (")
+
+
+# --- CT3: the plan prompt (CE4) -------------------------------------------------------------------
+
+LINES_NARRATIVE = ('At dusk Kyra climbs the stone steps of a mountain temple, and the ronin walks '
+                   'one step behind her. Near the top Kyra turns and says, "We reach the gate '
+                   'before dark." They pass under the gate together, and Kyra says, "Stay close '
+                   'to me."')
+CAMERA_LIST = ("camera is exactly one of: slow push-in, slow pull-back, slow tracking left, slow "
+               "tracking right, handheld, slow pan left, slow pan right, slow tilt up, slow tilt "
+               "down, slow crane up, slow crane down, slow orbit, static.")
+LINES_RULE_END = "never add a beat only to separate lines that fit together."
+
+
+def _plan_prompt(ws, **kw):
+    """The plan prompt of make_ctx(**kw), with no catalog and no pins."""
+    return se.build_plan_prompt(seu.make_ctx(se, ws, **kw), [], [])
+
+
+def test_ct3_the_chained_plan_prompt(ws):
+    lined = _plan_prompt(ws, narrative=LINES_NARRATIVE, narration="speech")
+    assert ("with the keys index, arc, action, shot, camera, location, cast, speaker, lines and "
+            "end_frame.") in lined
+    assert LINES_RULE_END + se.END_FRAME_RULE + "\n" in lined
+    assert CAMERA_LIST in lined
+    assert lined.endswith(se.plan_reference(True) + se.NO_TOOL_SENTENCE)
+    plain = _plan_prompt(ws)
+    assert "with the keys index, arc, action, shot, camera, location, cast, speaker and end_frame." in plain
+    assert se.END_FRAME_RULE + "\nloras: " in plain
+    assert plain.endswith(se.MODE_RULES["chained"] + se.plan_reference(False) + se.NO_TOOL_SENTENCE)
+    silent = _plan_prompt(ws, narration=False)
+    assert se.END_FRAME_RULE in silent
+    assert "FORMAT REFERENCE ONLY" not in silent
+    assert silent.endswith(se.MODE_RULES["chained"] + se.NO_TOOL_SENTENCE)
+    for prompt, lines in ((lined, True), (plain, False), (silent, None)):
+        assert "@@" not in prompt
+        rest = prompt.replace(se.plan_reference(lines), "") if lines is not None else prompt
+        assert "{" not in rest and "}" not in rest
+
+
+def test_ct3_shots_and_no_stills_plan_prompts(ws):
+    for mode in ("shots", "no_stills"):
+        for kw in ({}, {"narrative": LINES_NARRATIVE, "narration": "speech"}, {"narration": False}):
+            prompt = _plan_prompt(ws, mode=mode, **kw)
+            assert "end_frame" not in prompt, (mode, kw)
+            assert "FORMAT REFERENCE ONLY" not in prompt, (mode, kw)
+            assert CAMERA_LIST in prompt, (mode, kw)
+            assert "@@" not in prompt and "{" not in prompt and "}" not in prompt, (mode, kw)
+
+
+# --- CT4: normalize_plan keeps the end frame (CE3) ------------------------------------------------
+
+def test_ct4_normalize_plan_keeps_a_chained_end_frame(ws):
+    ctx = seu.make_ctx(se, ws)
+    keys = list(_normalized(ctx, seu.plan_json("chained", 3)))
+    raw = seu.plan_json("chained", 3)
+    raw["beats"][0]["end_frame"] = "  The courier  stands at frame centre,\n facing left.  "
+    plan = _normalized(ctx, raw)
+    assert plan["beats"][0]["end_frame"] == "The courier stands at frame centre, facing left."
+    assert list(plan) == keys
+    assert "end_frame" not in plan["beats"][1]
+    for value in ("", "   ", None, 7, ["The courier stands."], {"text": "x"}):
+        raw = seu.plan_json("chained", 3)
+        raw["beats"][0]["end_frame"] = value
+        assert "end_frame" not in _normalized(ctx, raw)["beats"][0], value
+    for mode in ("shots", "no_stills"):
+        other = seu.make_ctx(se, ws, mode=mode, story_id="n-" + mode.replace("_", "-"))
+        plan = _normalized(other, ef_plan(3, mode))
+        assert not any("end_frame" in b for b in plan["beats"]), mode
+        assert list(plan) == list(_normalized(other, seu.plan_json(mode, 3))), mode
+
+
+# --- CT5: P22 (CE6) ---------------------------------------------------------------------------------
+
+def _words_frame(n):
+    return " ".join(["The courier stands"] + ["still"] * (n - 3)) + "."
+
+
+def test_ct5_p22_end_frame_presence_and_length(ws):
+    ctx = seu.make_ctx(se, ws)
+    assert se.plan_end_frame_problems(ctx, _normalized(ctx, ef_plan(3))) == []
+    raw = ef_plan(3)
+    del raw["beats"][1]["end_frame"]
+    assert se.plan_end_frame_problems(ctx, _normalized(ctx, raw)) == [P22_MISSING % 2]
+    for k, words, expected in ((1, 7, [P22_LENGTH % (1, 7)]), (3, 31, [P22_LENGTH % (3, 31)]),
+                               (2, 8, []), (2, 30, [])):
+        raw = ef_plan(3)
+        raw["beats"][k - 1]["end_frame"] = _words_frame(words)
+        assert se.plan_end_frame_problems(ctx, _normalized(ctx, raw)) == expected, words
+    shots = seu.make_ctx(se, ws, mode="shots", story_id="p22-shots")
+    assert se.plan_end_frame_problems(shots, _normalized(shots, seu.plan_json("shots", 3))) == []
+    assert se.plan_end_frame_problems(ctx, _normalized(ctx, seu.plan_json("chained", 2))) == [
+        P22_MISSING % 1, P22_MISSING % 2]
+
+
+# --- CT6: P23 (CE6) ---------------------------------------------------------------------------------
+
+P23 = "beat 1: P23 end frame content: "
+
+
+def _p23(ws, text, cast=("c1",)):
+    ctx = seu.make_ctx(se, ws, panels=1)
+    raw = seu.plan_json("chained", 1)
+    raw["beats"][0]["cast"] = list(cast)
+    raw["beats"][0]["end_frame"] = text
+    plan = _normalized(ctx, raw)
+    found = se.end_frame_advisories(ctx, lib, plan)
+    assert [m for m in se.plan_checks(ctx, plan)[1] if " P23 " in m] == found
+    return found
+
+
+def test_ct6_p23_end_frame_content_rows(ws):
+    assert _p23(ws, "The courier stands beside the old monk at frame centre, facing the camera.") == [
+        P23 + "names 'the old monk', who is not in beat 1's cast"]
+    assert _p23(ws, "The camera pushes in on the courier at frame centre facing left.") == [
+        P23 + "says 'camera pushes'; an end frame describes the frame, never a camera move"]
+    assert _p23(ws, "The courier pans the quay from the right edge, facing left.") == [
+        P23 + "says 'pans'; an end frame describes the frame, never a camera move"]
+    assert _p23(ws, "The courier stands at frame centre, lit by a lamp, facing left.") == [
+        P23 + "says 'lit'; an end frame never describes appearance, clothing, setting, lighting, "
+        "colour or style"]
+    assert _p23(ws, "The courier says goodbye at frame centre, facing left.") == [
+        P23 + "says 'says'; an end frame has no spoken words"]
+    assert _p23(ws, 'The courier stands under the "closed" sign at frame centre, facing left.') == [
+        P23 + "contains a double quote; double quotes are kept for spoken lines"]
+    assert _p23(ws, "The courier stands still at frame centre, facing left, holding the sealed "
+                    "letter, seen from the waist up.") == []
+    assert _p23(ws, "The old monk follows the courier along the quay, both facing left at frame "
+                    "centre.", cast=("c1", "c2")) == []
+    ctx = ref_ctx(ws)
+    assert se.end_frame_advisories(ctx, lib, _normalized(ctx, copy.deepcopy(se.PLAN_REFERENCE_PLAN))) == []
+    shots = seu.make_ctx(se, ws, mode="shots", story_id="p23-shots")
+    assert se.end_frame_advisories(shots, lib, _normalized(shots, seu.plan_json("shots", 1))) == []
+
+
+# --- CT7: P24 (CE6) ---------------------------------------------------------------------------------
+
+HERRING_ACTION = "The courier drags a tall stack of empty herring crates past the boats."
+ZINC_FRAME = "The courier leans on the zinc counter, facing the camera, seen from the waist up."
+FISHER = "a weathered man with a grey beard and short white hair wearing an oilskin coat that smells of herring"
+
+
+def _p24_plan(ctx, action=None, frame=None):
+    raw = ef_plan(3)
+    if action is not None:
+        raw["beats"][0]["action"] = action
+    if frame is not None:
+        raw["beats"][1]["end_frame"] = frame
+    return _normalized(ctx, raw)
+
+
+def test_ct7_p24_reference_copy_rows(ws, story_env):
+    ctx = seu.make_ctx(se, ws)
+    assert se.plan_copy_problems(ctx, _p24_plan(ctx)) == []
+    assert se.plan_copy_problems(ctx, _p24_plan(ctx, action=HERRING_ACTION)) == [
+        P24_MESSAGE % ("beat 1's action", "'herring', 'a tall stack of empty herring', 'tall stack "
+                       "of empty herring crates'")]
+    assert se.plan_copy_problems(ctx, _p24_plan(ctx, frame=ZINC_FRAME)) == [
+        P24_MESSAGE % ("beat 2's end frame", "'zinc'")]
+    assert se.plan_copy_problems(ctx, _p24_plan(ctx, frame=ZINC_FRAME), end_frames=False) == []
+    zinc = seu.make_ctx(se, ws, narrative="A courier leans on a zinc counter in the rain.",
+                        story_id="p24-zinc")
+    assert se.plan_copy_problems(zinc, _p24_plan(zinc, frame=ZINC_FRAME)) == []
+    basket = "The courier carries a herring basket past the boats."
+    assert se.plan_copy_problems(ctx, _p24_plan(ctx, action=basket)) == [
+        P24_MESSAGE % ("beat 1's action", "'herring'")]
+    seu.make_character(story_env["lib"], "fisher", "fishermn", "the old fisherman", "man", FISHER)
+    pinned = seu.make_ctx(se, ws, members=lib.resolve_cast([(None, "fisher")]), story_id="p24-pin")
+    assert se.plan_copy_problems(pinned, _p24_plan(pinned, action=basket)) == []
+    assert se.plan_copy_problems(ctx, _p24_plan(
+        ctx, action="The courier turns back into the hall and walks to the gate.")) == []
+    for other in (seu.make_ctx(se, ws, mode="shots", story_id="p24-shots"),
+                  seu.make_ctx(se, ws, narration=False, story_id="p24-silent")):
+        assert se.plan_copy_problems(other, _p24_plan(other, action=HERRING_ACTION)) == []
+
+
+# --- CT8: the plan retry, end to end (CE7, CK1) -----------------------------------------------------
+
+def _panel_replies(mode, n):
+    return dict((str(k), [seu.answer(seu.panel_json(mode, k))]) for k in range(1, n + 1))
+
+
+def _e2e(ws, tmp_path, monkeypatch, plans, n=3, panel=None, **ctx_kw):
+    """(rc, agent log, saved plan.json or None, ctx) of se.run with the scripted plan replies
+    plans and panel replies panel (default: one seu.panel_json reply per panel)."""
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(p) for p in plans],
+                           panel=_panel_replies("chained", n) if panel is None else panel)
+    ctx = seu.make_ctx(se, ws, panels=ctx_kw.pop("panels", n), **ctx_kw)
+    rc, _advisories = se.run(ctx)
+    path = os.path.join(ctx.story_dir, "plan.json")
+    return rc, seu.agent_log(log), (_read_json(path) if os.path.exists(path) else None), ctx
+
+
+def _assert_p22_clean(plan):
+    """CK1: a saved plan either has every beat's end frame, each passing P22, or none."""
+    frames = [b.get("end_frame") for b in plan["beats"]]
+    if any(frames):
+        assert all(se.END_FRAME_WORDS[0] <= len(f.split()) <= se.END_FRAME_WORDS[1]
+                   for f in frames), frames
+
+
+def test_ct8_a_plan_without_end_frames_is_asked_again(ws, tmp_path, monkeypatch, capsys):
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [seu.plan_json("chained", 3), ef_plan(3)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert [c["stage"] for c in log][:3] == ["plan", "plan", "panel"]
+    assert ("YOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- " + P22_MISSING % 1 + "\n") in log[1]["argv"][-1]
+    assert [b["end_frame"] for b in plan["beats"]] == [END_FRAME % k for k in (1, 2, 3)]
+    assert "end frames dropped" not in out
+    _assert_p22_clean(plan)
+
+
+def test_ct8_two_plans_without_end_frames_drop_them(ws, tmp_path, monkeypatch, capsys):
+    rc, log, plan, ctx = _e2e(ws, tmp_path, monkeypatch, [seu.plan_json("chained", 3)] * 2)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert [c["stage"] for c in log][:3] == ["plan", "plan", "panel"]
+    assert END_FRAMES_DROPPED % 2 + "\n" in out
+    assert not any("end_frame" in b for b in plan["beats"])
+    checks = _read_json(os.path.join(ctx.story_dir, "story_checks.json"))
+    assert not [m for m in checks["advisory"] if " P22 " in m["message"]]
+    _assert_p22_clean(plan)
+
+
+def test_ct8_a_copied_action_after_the_last_call_is_fatal(ws, tmp_path, monkeypatch, capsys):
+    raw = ef_plan(3)
+    raw["beats"][0]["action"] = HERRING_ACTION
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [raw, raw])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert [c["stage"] for c in log] == ["plan", "plan"]
+    assert "  - plan: P24 reference copy: beat 1's action copies the plan reference (" in err
+    assert plan is None
+
+
+def test_ct8_a_copied_end_frame_after_the_last_call_is_dropped(ws, tmp_path, monkeypatch, capsys):
+    raw = ef_plan(3)
+    raw["beats"][1]["end_frame"] = ZINC_FRAME
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [raw, raw])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert END_FRAMES_DROPPED % 2 + "\n" in out
+    assert not any("end_frame" in b for b in plan["beats"])
+    _assert_p22_clean(plan)
+
+
+def test_ct8_a_plan_with_end_frames_makes_one_call(ws, tmp_path, monkeypatch, capsys):
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [ef_plan(3)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert [c["stage"] for c in log].count("plan") == 1
+    assert "end frames dropped" not in out
+    assert [b["end_frame"] for b in plan["beats"]] == [END_FRAME % k for k in (1, 2, 3)]
+    _assert_p22_clean(plan)
+
+
+# --- CT16: the soft panel count (CE7; [SPC]) -------------------------------------------------------
+
+def test_ct16_an_added_beat_needs_its_own_end_frame(ws, tmp_path, monkeypatch, capsys):
+    four = ef_plan(4)
+    del four["beats"][3]["end_frame"]
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [four, ef_plan(4)], n=4, panels=3)
+    assert rc == 0
+    assert [c["stage"] for c in log][:2] == ["plan", "plan"]
+    assert "YOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- " + P22_MISSING % 4 + "\n" in log[1]["argv"][-1]
+    assert len(plan["beats"]) == 4 and all(b.get("end_frame") for b in plan["beats"])
+    rc, log, plan, _ctx = _e2e(ws, tmp_path, monkeypatch, [ef_plan(4)], n=4, panels=3,
+                               story_id="s2")
+    assert rc == 0
+    assert [c["stage"] for c in log].count("plan") == 1
+    assert len(plan["beats"]) == 4
+    _assert_p22_clean(plan)
