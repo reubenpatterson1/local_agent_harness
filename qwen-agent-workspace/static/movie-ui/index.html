@@ -32,6 +32,7 @@
 <nav>
   <button id="tab-compose" type="button" class="tab active">Compose</button>
   <button id="tab-stories" type="button" class="tab">Stories</button>
+  <button id="tab-batches" type="button" class="tab">Batches</button>
   <button id="tab-characters" type="button" class="tab">Characters</button>
   <button id="tab-locations" type="button" class="tab">Locations</button>
   <button id="tab-actions" type="button" class="tab">Actions</button>
@@ -140,7 +141,8 @@
 </section>
 
 <section id="panel-stories" class="panel" hidden>
-  <table id="s-list" class="list"><thead><tr><th>Story</th><th>story.md</th><th>Checks</th><th>Stills</th><th>Clips</th><th>Movie</th><th>Modified</th></tr></thead><tbody></tbody></table>
+  <div class="row"><button id="s-new-batch" type="button" hidden>New batch (0)</button></div>
+  <table id="s-list" class="list"><thead><tr><th>Pick</th><th>Story</th><th>story.md</th><th>Checks</th><th>Stills</th><th>Clips</th><th>Movie</th><th>Modified</th></tr></thead><tbody></tbody></table>
   <div id="s-detail" hidden>
     <h2 id="s-title"></h2>
     <textarea id="s-editor" rows="20" spellcheck="false"></textarea>
@@ -162,6 +164,36 @@
     <pre id="s-picks"></pre>
     <h3>Gallery</h3>
     <div id="s-gallery" class="gallery"></div>
+  </div>
+</section>
+
+<section id="panel-batches" class="panel" hidden>
+  <div id="b-list-box">
+    <table id="b-list" class="list"><thead><tr><th>Batch</th><th>Created</th><th>Done</th><th>Status</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div id="b-editor" hidden>
+    <h2>New batch</h2>
+    <p id="b-editor-stories" class="muted"></p>
+    <div class="row"><button id="b-add-variant" type="button">Add variant</button> <span id="b-variant-note" class="muted"></span></div>
+    <div id="b-variants"></div>
+    <table id="b-preview" class="list"><thead></thead><tbody></tbody></table>
+    <p id="b-totals"></p>
+    <div class="row">
+      <button id="b-submit" type="button" disabled>Submit batch</button>
+      <button id="b-discard" type="button">Discard</button>
+      <span id="b-editor-status" class="muted"></span>
+    </div>
+  </div>
+  <div id="b-page" hidden>
+    <h2 id="b-page-title"></h2>
+    <div class="row">
+      <button id="b-back" type="button">All batches</button>
+      <button id="b-cancel" type="button">Cancel batch</button>
+      <button id="b-resume" type="button" hidden>Submit remaining</button>
+      <button id="b-delete" type="button">Delete batch</button>
+      <span id="b-page-status" class="muted"></span>
+    </div>
+    <table id="b-grid" class="list"><thead></thead><tbody></tbody></table>
   </div>
 </section>
 
@@ -340,6 +372,17 @@
     <p id="confirm-text"></p>
     <button id="confirm-yes" type="button">Yes</button>
     <button id="confirm-no" type="button">No</button>
+  </div>
+</div>
+
+<div id="b-prompt-dialog" class="dialog" hidden>
+  <div class="dialog-box">
+    <h3 id="b-prompt-title"></h3>
+    <textarea id="b-prompt-text" rows="12" cols="80"></textarea>
+    <p id="b-prompt-count" class="muted"></p>
+    <button id="b-prompt-save" type="button">Use this prompt</button>
+    <button id="b-prompt-original" type="button">Use the original</button>
+    <button id="b-prompt-close" type="button">Cancel</button>
   </div>
 </div>
 </body>

@@ -470,3 +470,51 @@ def test_bt31_mismatch(name, change):
     fork_rec, batch_rec = _pair()
     change(fork_rec, batch_rec)
     assert batch.fork_fallback(fork_rec, batch_rec, "ronin-rescue-b1-v1", WSR) == ("mismatch", None, BID, None)
+
+
+# --- BT13: the static page (spec 5) ---------------------------------------------------------
+
+PAGE_IDS = ("s-new-batch", "tab-batches", "panel-batches", "b-list-box", "b-list", "b-editor", "b-page",
+            "b-editor-stories", "b-add-variant", "b-variant-note", "b-variants", "b-preview", "b-totals",
+            "b-submit", "b-discard", "b-editor-status", "b-prompt-dialog", "b-prompt-title", "b-prompt-text",
+            "b-prompt-count", "b-prompt-save", "b-prompt-original", "b-prompt-close", "b-page-title", "b-back",
+            "b-cancel", "b-resume", "b-delete", "b-page-status", "b-grid")
+
+
+def test_bt13_the_static_page():
+    static = os.path.join(WS, "static", "movie-ui")
+    texts = {}
+    for name in ("index.html", "app.js", "app.css"):
+        with open(os.path.join(static, name), encoding="utf-8") as f:
+            texts[name] = f.read()
+    html, js, css = texts["index.html"], texts["app.js"], texts["app.css"]
+    for element in PAGE_IDS:
+        assert html.count('id="%s"' % element) == 1, element
+    assert html.index('id="tab-stories"') < html.index('id="tab-batches"') < html.index('id="tab-characters"')
+    assert "<thead><tr><th>Pick</th><th>Story</th><th>story.md</th>" in html
+    assert ('const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", '
+            '"jobs", "traces"];') in js
+    for text in ("New batch (", "Play row", "Submit remaining", "Use the original", "Add setting…",
+                 "settings from batch b"):
+        assert text in html + js, text
+    for text in ("const BATCH_POLL_MS = 2000;", '["jobs", "log", "host", "batch"]', 'if (name === "batches") { loadBatches(); }',
+                 "S.timers.batch = setInterval(pollBatch, BATCH_POLL_MS);", "function loraRow(target, item, container)",
+                 "function collectLoras(target, container)",
+                 "loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), loadModels()"):
+        assert text in js, text
+    for name, text in texts.items():
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
+                        r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    assert re.findall(r"<script[^>]*>", html) == ['<script src="/static/app.js" defer>']
+    for rule in (".chip {", "#b-grid video { max-width: 320px; }"):
+        assert css.count(rule) == 1, rule
+    for level in ("render", "stills", "replan"):
+        assert css.count(".level-%s {" % level) == 2, level
+        dark = css.index("@media (prefers-color-scheme: dark)")
+        assert css.index(".level-%s {" % level) < dark < css.rindex(".level-%s {" % level)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stderr
