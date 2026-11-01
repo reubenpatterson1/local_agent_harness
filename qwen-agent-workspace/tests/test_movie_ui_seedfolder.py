@@ -790,6 +790,83 @@ def test_sf_review_focus_4_a_too_small_image_refused_by_the_real_dry_run(env):
     assert _nothing_created(state)
 
 
+# --- SDT25 (SD26-SD35, SD50): the static page, Compose and the shared folder code ------------------
+
+NEW_IDS = ("c-story-id-label", "c-res-folder", "c-folder-choose", "c-folder-file", "c-folder-status",
+           "c-folder-list", "c-folder-confirm", "c-folder-shared", "c-folder-summary", "c-folder-table",
+           "c-folder-queue", "c-folder-cancel")
+JS_TEXTS = ('"/api/jobs/seed-folder"', 'new Intl.Collator("en", {numeric: true})',
+            "function sampleStoryId(name, prefix)", '"Story ID prefix (optional)"',
+            '"not available for a seed folder"', '"upload failed: "', '"seed folder "', '" · "', '"Queue "',
+            "const FOLDER_BOXES = {", "function part(box, name)")
+SHARED_FUNCTIONS = ("onFolderPick", "openFolderConfirm", "queueFolder", "closeFolderConfirm",
+                    "renderFolderTable", "renderFolderList")
+
+
+def _static_texts():
+    static = os.path.join(WS, "static", "movie-ui")
+    texts = {}
+    for name in ("index.html", "app.js", "app.css"):
+        with open(os.path.join(static, name), encoding="utf-8") as f:
+            texts[name] = f.read()
+    return static, texts
+
+
+def test_sdt25_the_static_page():
+    static, texts = _static_texts()
+    html, js = texts["index.html"], texts["app.js"]
+    for element in NEW_IDS:
+        assert html.count('id="%s"' % element) == 1, element
+    for element in ("c-story-id-label", "c-res-folder"):
+        assert '"#%s' % element in js, element
+    assert 'ids: "c-folder"' in js and 'ids: "ch-folder"' in js
+    assert "webkitdirectory" in html
+    assert "<th>File</th><th>Story ID</th><th>Result</th><th>Job</th>" in html
+    for text in JS_TEXTS:
+        assert text in js, text
+    for name in SHARED_FUNCTIONS:
+        assert js.count("function %s(box" % name) == 1, name
+        assert js.count("function %s(" % name) == 1, name
+    for name, text in texts.items():
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(",
+                        r"\bprompt\(", r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")],
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, proc.stderr
+
+
+# --- Review Focus 5: the page's sample story ID matches the server's rules ------------------------------
+
+SAMPLE_CASES = [("beach.png", ""), ("Beach Day!.webp", "temple"), ("__01.png", ""), ("日本.png", ""),
+                ("Beach Day.final.png", ""), ("Café.png", ""), ("a..b.png", ""), ("a -- b.png", ""),
+                (".png", ""), ("a" * 100 + ".png", P40), ("a" * 77 + "-bc.png", ""), ("ﬁx.png", "Temple"),
+                ("a\tb.png", ""), ("", ""), ("...", ""), ("-_-.png", "x"), ("x.tar.gz", ""),
+                ("Straße ☕.jpg", ""), ("\U0001F600 smile.png", ""), ("Café ☕ día.png", "temple")]
+
+
+def test_sf_review_focus_5_the_page_sample_id_matches_the_server(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    start = js.index("  function sampleStoryId(name, prefix) {")
+    end = js.index("\n  }\n", start) + len("\n  }\n")
+    script = js[start:end] + (
+        "process.stdout.write(JSON.stringify(%s.map(function (c) { return sampleStoryId(c[0], c[1]); })));\n"
+        % json.dumps(SAMPLE_CASES))
+    path = os.path.join(str(tmp_path), "sample.js")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    proc = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    want = [seedfolder.story_id_for(seedfolder.seed_stem(name), prefix, set()) for name, prefix in SAMPLE_CASES]
+    assert json.loads(proc.stdout) == want
+
+
 # --- The Characters HTTP tests: helpers (spec 6 rules) ---------------------------------------------
 
 def _cbody(ws, seeds, preview, **overrides):

@@ -8,11 +8,29 @@
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
   const BATCH_POLL_MS = 2000;   // batch forks spec 1.1: the jobs poll interval
   const LEVEL_LABELS = {render: "Render", stills: "New stills", replan: "Re-plan"};
+  const SEEDS_MAX = 100;   // seed-folder spec 1.1: the most seeds in one run
+  const SEED_TYPES = ["image/png", "image/jpeg", "image/webp"];
+  const SEED_COLLATOR = new Intl.Collator("en", {numeric: true});
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
     characters: [], locations: [], location: null, locationPick: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
+  // Seed-folder spec SD27: one state box per folder mode (Compose and Characters); part(box, name)
+  // is the box's element <ids>-<name>.
+  const FOLDER_BOXES = {
+    compose: {ids: "c-folder", endpoint: "/api/jobs/seed-folder", idKey: "story_id", shared: true,
+              mode: function () { return $("#c-res-folder").checked; },
+              select: function () { $("#c-res-folder").checked = true; },
+              refresh: function () { updateComposeButtons(); preview(); },
+              folder: null, seq: 0, body: null, rows: null, busy: false},
+    characters: {ids: "ch-folder", endpoint: "/api/characters/seed-folder", idKey: "character", shared: false,
+                 mode: function () { return $("#ch-folder-mode").checked; },
+                 select: function () { $("#ch-folder-mode").checked = true; },
+                 refresh: function () { updateCharacterButtons(); },
+                 folder: null, seq: 0, body: null, rows: null, busy: false}
+  };
+  function part(box, name) { return $("#" + box.ids + "-" + name); }
 
   // --- helpers -------------------------------------------------------------------------
 
@@ -370,6 +388,7 @@
   function composeFields(action) {
     const byLength = $("#c-size-length").checked;
     const bySeed = $("#c-res-seed").checked;
+    const byFolder = $("#c-res-folder").checked;
     const supported = (S.options && S.options.supported) || {};
     const goal = textOrNull("#c-goal");
     return {
@@ -379,7 +398,8 @@
       panels: byLength ? null : numberOrNull("#c-panels"),
       length: byLength ? numberOrNull("#c-length") : null,
       fps: numberOrNull("#c-fps"), frames: numberOrNull("#c-frames"),
-      width: bySeed ? null : numberOrNull("#c-width"), height: bySeed ? null : numberOrNull("#c-height"),
+      width: bySeed || byFolder ? null : numberOrNull("#c-width"),
+      height: bySeed || byFolder ? null : numberOrNull("#c-height"),
       seed_upload: bySeed ? S.seedUpload : null,
       mode: $("#c-mode").value,
       model: $("#c-model").value === "__download__" ? null : textOrNull("#c-model"),
@@ -413,6 +433,14 @@
     updateFrameHints();
     const fields = composeFields(S.composeAction);
     $("#c-command-for").textContent = "(" + S.composeAction + ")";
+    if (folderMode()) {
+      const first = uploadedSeeds(FOLDER_BOXES.compose)[0];
+      fields.seed_upload = first ? first.upload_id : null;
+      fields.story_id = sampleStoryId(first ? first.name : "seed", fields.story_id);
+      $("#c-command-for").textContent = first
+        ? "(" + S.composeAction + ", first seed " + first.name + ", sample story ID)"
+        : "(" + S.composeAction + ", no seed uploaded yet)";
+    }
     const order = ordered(fields.video_loras).concat(ordered(fields.stills_loras));
     $("#c-lora-order").textContent = order.map(function (i) { return i.id || i.path; }).join(", ") || "none";
     S.previewSeq = (S.previewSeq || 0) + 1;
@@ -473,6 +501,22 @@
     gate($("#c-write-story"), $("#c-write-story-reason"), []);
     gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
     show($("#c-check-seams-box"), mode === "chained");
+    // Seed-folder spec SD29: the folder mode of the Compose buttons.
+    const box = FOLDER_BOXES.compose;
+    const folder = folderMode();
+    $("#c-story-id-label").textContent = folder ? "Story ID prefix (optional)" : "Story ID";
+    $("#c-validate").disabled = folder;
+    renderFolderList(box);
+    if (!folder) { closeFolderConfirm(box); return; }
+    $("#c-smoke").disabled = true;
+    $("#c-smoke-reason").textContent = "not available for a seed folder";
+    const block = folderBlock(box);
+    if (!block) { return; }
+    [["#c-run-all", "#c-run-all-reason"], ["#c-write-story", "#c-write-story-reason"]].forEach(function (pair) {
+      $(pair[0]).disabled = true;
+      const reason = $(pair[1]);
+      reason.textContent = reason.textContent ? reason.textContent + "; " + block : block;
+    });
   }
 
   async function uploadFile(file) {
@@ -493,7 +537,216 @@
     } catch (err) {
       $("#c-seed-status").textContent = String(err.message);
     }
+    updateComposeButtons();
     preview();
+  }
+
+  // --- seed folder (docs/superpowers/specs/2026-11-01-seed-folder-compose-design.md, Section 4) ---
+  // One copy of each function serves both FOLDER_BOXES (SD27-SD33, SD50).
+
+  function folderMode() { return FOLDER_BOXES.compose.mode(); }
+
+  function sampleStoryId(name, prefix) {
+    const dot = name.lastIndexOf(".");
+    let stem = (dot > 0 ? name.slice(0, dot) : name).normalize("NFKD").replace(/[^\x00-\x7F]/g, "");
+    stem = stem.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/\.{2,}/g, ".").replace(/-{2,}/g, "-");
+    stem = stem.replace(/^[^A-Za-z0-9]+/, "").replace(/[-._]+$/, "") || "seed";
+    const head = prefix ? prefix + "-" : "";
+    return head + stem.slice(0, Math.max(1, 80 - head.length)).replace(/[-._]+$/, "");
+  }
+
+  function onFolderPick(box) {
+    box.seq += 1;
+    const input = part(box, "file");
+    const picked = Array.from(input.files);
+    input.value = "";
+    const files = picked.filter(function (f) {
+      return (f.webkitRelativePath.match(/\//g) || []).length === 1 && SEED_TYPES.indexOf(f.type) >= 0 &&
+        !f.name.startsWith(".");
+    }).sort(function (a, b) { return SEED_COLLATOR.compare(a.name, b.name); });
+    if (files.length === 0) {
+      part(box, "status").textContent = "no PNG, JPEG or WebP images directly in this folder";
+      box.folder = null;
+    } else if (files.length > SEEDS_MAX) {
+      part(box, "status").textContent = "found " + files.length + " images; at most " + SEEDS_MAX +
+        " per run — pick a smaller folder";
+      box.folder = null;
+    } else {
+      box.folder = {files: files.map(function (f) {
+        return {name: f.name, file: f, state: "waiting", upload_id: null, reason: null};
+      }), uploading: true};
+      box.select();
+      closeFolderConfirm(box);
+      uploadFolder(box, box.seq);
+    }
+    renderFolderList(box);
+    box.refresh();
+  }
+
+  async function uploadFolder(box, seq) {
+    const folder = box.folder;
+    const n = folder.files.length;
+    for (let i = 0; i < n; i += 1) {
+      if (seq !== box.seq) { return; }
+      const item = folder.files[i];
+      part(box, "status").textContent = "uploading " + (i + 1) + " of " + n + "…";
+      item.state = "uploading";
+      renderFolderList(box);
+      try {
+        const uploadId = await uploadFile(item.file);
+        if (seq !== box.seq) { return; }
+        item.state = "uploaded";
+        item.upload_id = uploadId;
+      } catch (err) {
+        if (seq !== box.seq) { return; }
+        item.state = "failed";
+        item.reason = String(err.message).replace(/^upload failed: /, "");
+      }
+      renderFolderList(box);
+      box.refresh();
+    }
+    folder.uploading = false;
+    const uploaded = uploadedSeeds(box).length;
+    const failed = folder.files.filter(function (f) { return f.state === "failed"; }).length;
+    part(box, "status").textContent = "uploaded " + uploaded + " of " + n + " images" +
+      (failed > 0 ? " (" + failed + " failed)" : "");
+    renderFolderList(box);
+    box.refresh();
+  }
+
+  function renderFolderList(box) {
+    const list = clear(part(box, "list"));
+    const visible = box.mode() && Boolean(box.folder);
+    show(list, visible);
+    if (!visible) { return; }
+    box.folder.files.forEach(function (f) {
+      const text = f.state === "uploading" ? "uploading…" : f.state === "failed" ? "upload failed: " + f.reason : f.state;
+      list.appendChild(el("li", {text: f.name + " — " + text}));
+    });
+  }
+
+  function uploadedSeeds(box) {
+    return box.folder ? box.folder.files.filter(function (f) { return f.state === "uploaded"; }) : [];
+  }
+
+  function folderBlock(box) {
+    if (!box.folder) { return "pick a seed folder"; }
+    if (box.folder.uploading) { return "uploading seeds…"; }
+    if (!uploadedSeeds(box).length) { return "no seed uploaded"; }
+    return null;
+  }
+
+  function folderResult(box, row, seed) {
+    row.id = seed[box.idKey];
+    row.status = seed.status;
+    row.result = seed.status === "ok" ? "OK" : seed.reason;
+  }
+
+  function folderError(res) {
+    return (res.data && res.data.error) || ("http " + res.status);
+  }
+
+  function renderFolderTable(box) {
+    const body = clear(part(box, "table").querySelector("tbody"));
+    (box.rows || []).forEach(function (row) {
+      body.appendChild(el("tr", {}, [el("td", {text: row.name}), el("td", {text: row.id || "—"}),
+        el("td", {text: row.result}), el("td", {text: row.job || ""})]));
+    });
+  }
+
+  async function openFolderConfirm(box, base) {
+    const seeds = uploadedSeeds(box).map(function (f) { return {name: f.name, upload_id: f.upload_id}; });
+    let sent = 0;
+    const rows = (box.folder ? box.folder.files : []).map(function (f) {
+      if (f.state === "uploaded") {
+        sent += 1;
+        return {name: f.name, id: null, status: null, result: "checking…", job: null, sent: sent - 1};
+      }
+      return {name: f.name, id: null, status: null, result: "upload failed: " + f.reason, job: null, sent: -1};
+    });
+    const body = Object.assign(base, {seeds: seeds, preview: true});
+    box.body = body;
+    box.rows = rows;
+    show(part(box, "confirm"), true);
+    if (box.shared) { clear(part(box, "shared")); }
+    part(box, "summary").textContent = "checking " + seeds.length + " seeds…";
+    part(box, "queue").disabled = true;
+    renderFolderTable(box);
+    const res = await api("POST", box.endpoint, body);
+    if (box.body !== body) { return; }
+    if (res.status !== 200) {
+      part(box, "summary").textContent = folderError(res);
+      rows.forEach(function (row) { if (row.result === "checking…") { row.result = "—"; } });
+      renderFolderTable(box);
+      return;
+    }
+    rows.forEach(function (row) { if (row.sent >= 0) { folderResult(box, row, res.data.seeds[row.sent]); } });
+    if (box.shared) {
+      const shared = clear(part(box, "shared"));
+      res.data.shared_checks.forEach(function (c) {
+        shared.appendChild(el("li", {cls: "check-" + c.status, text: c.status + " " + c.id + " " + c.name + ": " + c.detail}));
+      });
+      if (!res.data.shared_checks.length) {
+        shared.appendChild(el("li", {text: "shared checks not run: no seed passed its field checks"}));
+      }
+    }
+    const k = rows.filter(function (row) { return row.status === "ok"; }).length;
+    const sharedFailed = box.shared && res.data.shared_checks.some(function (c) { return c.status === "fail"; });
+    part(box, "summary").textContent = sharedFailed
+      ? "shared checks failed: nothing can be queued" : k + " of " + rows.length + " seeds can be queued";
+    part(box, "queue").textContent = "Queue " + k + (k === 1 ? " job" : " jobs");
+    part(box, "queue").disabled = k === 0;
+    renderFolderTable(box);
+  }
+
+  async function queueFolder(box) {
+    const body = box.body;
+    if (!body || box.busy) { return; }
+    const sent = box.rows.filter(function (row) { return row.sent >= 0 && row.status === "ok"; });
+    const request = Object.assign({}, body, {seeds: sent.map(function (row) { return body.seeds[row.sent]; }),
+                                             preview: false});
+    box.busy = true;
+    part(box, "queue").disabled = true;
+    part(box, "cancel").disabled = true;
+    part(box, "summary").textContent = "checking and queueing " + sent.length + " seeds…";
+    try {
+      const res = await api("POST", box.endpoint, request);
+      if (res.status === 201 || res.status === 409) {
+        sent.forEach(function (row, i) {
+          const seed = res.data.seeds[i];
+          folderResult(box, row, seed);
+          row.job = seed.job ? seed.job.id : "";
+        });
+        box.body = null;
+        renderFolderTable(box);
+        if (res.status === 201) {
+          const q = res.data.queued;
+          part(box, "summary").textContent = "queued " + q + (q === 1 ? " job" : " jobs");
+          const first = res.data.seeds.filter(function (seed) { return seed.job; })[0];
+          selectJob(first.job.id);
+          await pollJobs();
+          showTab("jobs");
+        } else {
+          part(box, "summary").textContent = "nothing was queued";
+        }
+      } else {
+        part(box, "summary").textContent = folderError(res);
+        part(box, "queue").disabled = false;
+      }
+    } finally {
+      box.busy = false;
+      part(box, "cancel").disabled = false;
+    }
+  }
+
+  function closeFolderConfirm(box) {
+    if (box.busy) { return; }
+    show(part(box, "confirm"), false);
+    if (box.shared) { clear(part(box, "shared")); }
+    part(box, "summary").textContent = "";
+    clear(part(box, "table").querySelector("tbody"));
+    box.body = null;
+    box.rows = null;
   }
 
   function fillCompose(fields) {
@@ -558,6 +811,11 @@
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);
+    const composeBox = FOLDER_BOXES.compose;
+    part(composeBox, "choose").addEventListener("click", function () { part(composeBox, "file").click(); });
+    part(composeBox, "file").addEventListener("change", function () { onFolderPick(composeBox); });
+    part(composeBox, "queue").addEventListener("click", function () { queueFolder(composeBox); });
+    part(composeBox, "cancel").addEventListener("click", function () { closeFolderConfirm(composeBox); });
     $("#c-res-preset").addEventListener("change", applyResPreset);
     syncResPreset();
     $("#c-model").addEventListener("change", function () {
@@ -578,9 +836,21 @@
       navigator.clipboard.writeText($("#c-command").textContent);
     });
     $("#c-validate").addEventListener("click", validate);
-    $("#c-write-story").addEventListener("click", function () { S.composeAction = "story"; submit(composeFields("story")); });
+    $("#c-write-story").addEventListener("click", function () {
+      S.composeAction = "story";
+      if (folderMode()) {
+        openFolderConfirm(FOLDER_BOXES.compose, Object.assign(composeFields("story"), {check_seams: false}));
+        return;
+      }
+      submit(composeFields("story"));
+    });
     $("#c-run-all").addEventListener("click", function () {
       S.composeAction = "movie";
+      if (folderMode()) {
+        openFolderConfirm(FOLDER_BOXES.compose, Object.assign(composeFields("movie"),
+          {check_seams: $("#c-mode").value === "chained" && $("#c-check-seams").checked}));
+        return;
+      }
       submit(Object.assign(composeFields("movie"),
                            {check_seams: $("#c-mode").value === "chained" && $("#c-check-seams").checked}));
     });
@@ -1936,6 +2206,11 @@
     return job.story_id || job.character || (job.kind === "smoke" ? "smoke render" : "-");
   }
 
+  function seedTag(job) {
+    const sf = job.seed_folder;
+    return sf ? el("span", {cls: "badge", text: "seed folder " + sf.run + " · " + sf.name}) : null;
+  }
+
   function duration(job) {
     const a = utcSeconds(job.started);
     const b = utcSeconds(job.ended);
@@ -2059,6 +2334,8 @@
     if (jobs.running) {
       running.textContent = jobs.running.id + " " + jobs.running.kind + " " + jobLabel(jobs.running) + " - " +
         jobs.running.state + " - " + jobs.running.command;
+      const runningTag = seedTag(jobs.running);
+      if (runningTag) { running.appendChild(document.createTextNode(" ")); running.appendChild(runningTag); }
       renderProgress(jobs.running);
       show($("#j-cancel"), true);
       $("#j-cancel").dataset.jobId = jobs.running.id;
@@ -2070,8 +2347,9 @@
     }
     const queue = clear($("#j-queue tbody"));
     jobs.queued.forEach(function (job) {
+      const tag = seedTag(job);
       queue.appendChild(el("tr", {data: {jobId: job.id}}, [el("td", {text: String(job.queue_position)}),
-        el("td", {text: job.id}), el("td", {text: job.kind}), el("td", {text: jobLabel(job)}),
+        el("td", {text: job.id}), el("td", {text: job.kind}), el("td", {}, tag ? [jobLabel(job), " ", tag] : [jobLabel(job)]),
         el("td", {}, [button("Up", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "up"}); }),
                       button("Down", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "down"}); }),
                       button("Cancel", async function () {
@@ -2080,6 +2358,7 @@
     });
     const past = clear($("#j-history tbody"));
     jobs.history.forEach(function (job) {
+      const tag = seedTag(job);
       const actions = el("td");
       actions.appendChild(button("Log", function () { selectJob(job.id); }));
       if (job.story_id) { actions.appendChild(button("Story", function () { openStory(job.story_id); })); }
@@ -2087,7 +2366,7 @@
       const row = el("tr", {data: {jobId: job.id}}, [el("td", {text: job.id}), el("td", {text: job.kind}),
         el("td", {text: job.state + (job.error ? " (" + job.error + ")" : ""), cls: "state-" + job.state}),
         el("td", {text: duration(job)}), el("td", {text: job.exit_code === null ? "-" : String(job.exit_code)}),
-        el("td", {text: jobLabel(job)}), actions]);
+        el("td", {}, tag ? [jobLabel(job), " ", tag] : [jobLabel(job)]), actions]);
       past.appendChild(row);
       if (job.state === "lost") { addOrphanButton(job.id, actions); }
     });
