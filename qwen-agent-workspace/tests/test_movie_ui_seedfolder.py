@@ -788,3 +788,262 @@ def test_sf_review_focus_4_a_too_small_image_refused_by_the_real_dry_run(env):
     status, _h, data = _post(s, _body(ws, seeds, False))
     assert status == 409, data
     assert _nothing_created(state)
+
+
+# --- The Characters HTTP tests: helpers (spec 6 rules) ---------------------------------------------
+
+def _cbody(ws, seeds, preview, **overrides):
+    """A Characters seed-folder request: no prefix, phrase "the stranger", seed 7."""
+    body = {"ws": ws, "name": "", "phrase": "the stranger", "seed": 7, "seeds": seeds, "preview": preview}
+    body.update(overrides)
+    return body
+
+
+def _cpost(s, body):
+    return mt.api(s, "POST", "/api/characters/seed-folder", body=body)
+
+
+def _character_job(state, ws, kind, name, job_state=None):
+    """A job naming a character, made as SDT28 says: queued, or with job_state written and the job
+    removed from the queue (as mt.make_job does)."""
+    job_id = lib.new_job_id(state)
+    lib.create_job(state, job_id, kind, ws, None, name, ["true"], {})
+    if job_state is not None:
+        lib.write_queue(state, [i for i in lib.read_queue(state) if i != job_id])
+        lib.write_status(lib.job_dir(state, job_id), {"state": job_state})
+    return job_id
+
+
+# --- SDT11 (SD11): the Compose route and its token-----------------------------------------------------
+
+def test_sdt11_the_route_and_its_token(env):
+    s = env["srv"]
+    routes = list(srv.ROUTES)
+    i = routes.index(("POST", r"/api/jobs", "h_job_create", "/api/jobs"))
+    assert routes[i + 1] == ("POST", r"/api/jobs/seed-folder", "h_seed_folder", "/api/jobs/seed-folder")
+    assert len(srv.ROUTES) == 57
+    assert srv.MovieUIHandler.h_seed_folder is srv._h_seed_folder
+    for token in (None, "wrong-token"):
+        assert mt.api(s, "POST", "/api/jobs/seed-folder", body={}, token=token)[::2] == (
+            401, {"error": "missing or invalid token"})
+    assert mt.api(s, "GET", "/api/jobs/seed-folder")[::2] == (405, {"error": "method not allowed"})
+
+
+# --- SDT28 (SD39): the character taken set --------------------------------------------------------
+
+def test_sdt28_the_character_taken_set(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    assert seedfolder.character_taken_names(["Kyra", ".triggers"], ["Zed", None]) == {"kyra", ".triggers", "zed"}
+    library = os.path.join(ws, "generated", "characters")
+    os.makedirs(os.path.join(library, "kyra"))
+    with open(os.path.join(library, "nova"), "w") as f:
+        f.write("x")
+    os.symlink(os.path.join(library, "missing"), os.path.join(library, "ghost"))
+    _character_job(state, ws, "character-create", "zed")
+    _character_job(state, ws, "character-train", "yon", "running")
+    _character_job(state, ws, "character-create", "old", "done")
+    _character_job(state, env["tmp"], "character-create", "far")
+    assert srv.character_taken(s.server, ws) == {"kyra", "nova", "ghost", "zed", "yon"}
+    other = os.path.join(env["tmp"], "lib")
+    os.makedirs(os.path.join(other, "lena"))
+    monkeypatch.setenv("CHARACTER_LIBRARY_DIR", other)
+    assert srv.character_taken(s.server, ws) == {"lena", "zed", "yon"}
+
+
+# --- SDT29 (SD41): the Characters route and its token -----------------------------------------------
+
+def test_sdt29_the_characters_route_and_its_token(env):
+    s, ws = env["srv"], env["ws"]
+    routes = list(srv.ROUTES)
+    i = routes.index(("POST", r"/api/characters", "h_character_create", "/api/characters"))
+    assert routes[i + 1] == ("POST", r"/api/characters/seed-folder", "h_character_seed_folder",
+                             "/api/characters/seed-folder")
+    assert len(srv.ROUTES) == 57
+    assert srv.MovieUIHandler.h_character_seed_folder is srv._h_character_seed_folder
+    for token in (None, "wrong-token"):
+        assert mt.api(s, "POST", "/api/characters/seed-folder", body={}, token=token)[::2] == (
+            401, {"error": "missing or invalid token"})
+    status, _h, data = mt.api(s, "GET", "/api/characters/seed-folder?ws=" + ws)
+    assert (status, data["error"]) == (502, "character printed unparsable output")
+
+
+# --- SDT30 (SD43): malformed Characters requests get 400 ------------------------------------------
+
+def test_sdt30_malformed_character_requests_get_400(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["a.png"])
+    good = _cbody(ws, seeds, True)
+    no_ws = dict(good)
+    del no_ws["ws"]
+    cases = [
+        (no_ws, "missing ws"),
+        (dict(good, phrase=""), "phrase is required"),
+        (dict(good, seed=-1), "seed must be an integer from 0 to 2147483647"),
+        (dict(good, name="Temple"), CPREFIX_MSG),
+        (dict(good, name="p" * 13), CPREFIX_MSG),
+        (dict(good, seeds=[]), SEEDS_MSG),
+        (dict(good, seeds=["a.png"]), "seed 1 must be an object"),
+        (dict(good, seeds=[{"name": "x/a.png", "upload_id": seeds[0]["upload_id"]}]),
+         "seed 1: name must be a string without '/'"),
+        (dict(good, preview="yes"), PREVIEW_MSG),
+        (dict(good, phrase="", seeds=[]), "phrase is required"),
+    ]
+    for body, message in cases:
+        assert _cpost(s, body)[::2] == (400, {"error": message}), message
+    assert _nothing_created(state)
+
+
+# --- SDT31 (SD44, SD46): a Characters preview creates nothing ----------------------------------------
+
+def test_sdt31_a_characters_preview_creates_nothing(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["Kyra.png", "Old Man #2.webp", "01_hero.png"])
+    status, _h, data = _cpost(s, _cbody(ws, seeds, True))
+    assert status == 200, data
+    assert set(data) == {"ok", "shared_checks", "queued", "refused", "run", "seeds"}
+    assert (data["ok"], data["queued"], data["run"], data["shared_checks"], data["refused"]) == (
+        True, 0, None, [], 0)
+    assert [r["character"] for r in data["seeds"]] == ["kyra", "old-man-2", "hero"]
+    for row in data["seeds"]:
+        assert set(row) == {"name", "upload_id", "character", "status", "reason", "checks", "job"}
+        assert [c["id"] for c in row["checks"]] == ["V1"]
+        assert (row["status"], row["job"]) == ("ok", None)
+    assert _nothing_created(state)
+    assert not os.path.exists(os.path.join(ws, "generated", "characters"))
+
+
+# --- SDT32 (SD42, SD44, SD45): queue character-create jobs in seed order -----------------------------
+
+def _queue_three_characters(env):
+    s, ws = env["srv"], env["ws"]
+    names = ["Kyra.png", "Old Man #2.webp", "01_hero.png"]
+    seeds = _seeds(s, names)
+    status, _h, data = _cpost(s, _cbody(ws, seeds, False, class_noun="woman", descriptor="x",
+                                        trigger="kyrax", force=True))
+    assert status == 201, data
+    return names, seeds, data
+
+
+def test_sdt32_queue_character_create_jobs_in_seed_order(env):
+    ws, state = env["ws"], env["state"]
+    _names, seeds, data = _queue_three_characters(env)
+    assert data["queued"] == 3
+    queue = lib.read_queue(state)
+    assert len(queue) == 3 and queue == [r["job"]["id"] for r in data["seeds"]]
+    for job_id, name, seed in zip(queue, ["kyra", "old-man-2", "hero"], seeds):
+        job = _job(state, job_id)
+        assert (job["kind"], job["story_id"], job["character"]) == ("character-create", None, name)
+        fields = job["fields"]
+        assert set(fields) == {"name", "phrase", "class_noun", "descriptor", "trigger", "seed", "seed_upload",
+                               "force", "ws", "seed_folder"}
+        assert (fields["class_noun"], fields["descriptor"], fields["trigger"], fields["force"]) == (
+            None, None, None, False)
+        argv = job["argv"]
+        assert argv == lib.character_argv("character-create", fields, ws, state)
+        assert argv[argv.index("--phrase") + 1] == "the stranger"
+        assert argv[argv.index("--seed-image") + 1] == _upload_path(state, seed)
+        assert argv[argv.index("--seed") + 1] == "7"
+        for flag in ("--class", "--descriptor", "--trigger", "--force"):
+            assert flag not in argv, flag
+
+
+# --- SDT33 (SD44, SD46): refused Characters rows ------------------------------------------------------
+
+def test_sdt33_refused_character_rows(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    unknown = "f" * 64 + ".png"
+    bad = [{"name": "a.png", "upload_id": unknown}, {"name": "b.png", "upload_id": ""},
+           {"name": "c.png", "upload_id": 7}]
+    want = [("refused", "seed image upload %s not found" % unknown), ("refused", "seed image upload missing"),
+            ("refused", "seed image upload missing")]
+    status, _h, data = _cpost(s, _cbody(ws, bad, False))
+    assert status == 409, data
+    assert (data["run"], data["queued"], data["refused"]) == (None, 0, 3)
+    assert [(r["status"], r["reason"]) for r in data["seeds"]] == want
+    assert _nothing_created(state)
+    good = _seeds(s, ["d.png"])
+    status, _h, data = _cpost(s, _cbody(ws, bad + good, False))
+    assert status == 201, data
+    assert (data["queued"], data["refused"]) == (1, 3)
+    assert [(r["status"], r["reason"]) for r in data["seeds"]] == want + [("ok", None)]
+    assert lib.read_queue(state) == [data["seeds"][3]["job"]["id"]]
+
+
+# --- SDT34 (SD39, SD44): final names avoid new characters and busy jobs --------------------------------
+
+def test_sdt34a_a_character_made_between_preview_and_queue(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["kyra.png"])
+    assert _cpost(s, _cbody(ws, seeds, True))[2]["seeds"][0]["character"] == "kyra"
+    os.makedirs(os.path.join(ws, "generated", "characters", "kyra"))
+    status, _h, data = _cpost(s, _cbody(ws, seeds, False))
+    assert status == 201, data
+    assert data["seeds"][0]["character"] == "kyra-2"
+    assert _job(state, data["seeds"][0]["job"]["id"])["character"] == "kyra-2"
+
+
+def test_sdt34b_a_queued_character_job_takes_its_name(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    _character_job(state, ws, "character-create", "nova")
+    status, _h, data = _cpost(s, _cbody(ws, _seeds(s, ["nova.png"]), False))
+    assert status == 201, data
+    assert data["seeds"][0]["character"] == "nova-2"
+
+
+def test_sdt34c_the_same_image_twice(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["kyra.png", "kyra.png"], same=True)
+    status, _h, data = _cpost(s, _cbody(ws, seeds, False))
+    assert status == 201, data
+    assert [r["character"] for r in data["seeds"]] == ["kyra", "kyra-2"]
+    assert len(lib.read_queue(state)) == 2
+
+
+# --- SDT35 (SD23, SD46): the tag on character jobs -----------------------------------------------------
+
+def test_sdt35_the_seed_folder_tag_on_character_jobs(env):
+    s, state = env["srv"], env["state"]
+    names, _seeds_sent, data = _queue_three_characters(env)
+    run = data["run"]
+    assert seedfolder.RUN_ID_RE.fullmatch(run)
+    for row, name in zip(data["seeds"], names):
+        assert _job(state, row["job"]["id"])["fields"]["seed_folder"] == {"run": run, "name": name}
+    queued = mt.api(s, "GET", "/api/jobs")[2]["queued"]
+    assert [(j["seed_folder"], j["character"]) for j in queued] == [
+        ({"run": run, "name": n}, c) for n, c in zip(names, ["kyra", "old-man-2", "hero"])]
+
+
+# --- SDT36 (SD43, SD45, SD46): POST /api/characters is unchanged ----------------------------------------
+
+def test_sdt36_post_api_characters_is_unchanged(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    body = {"ws": ws, "name": "kyra", "phrase": "", "seed": -1, "descriptor": "a tall man", "class_noun": "man"}
+    status, _h, data = mt.api(s, "POST", "/api/characters", body=body)
+    assert (status, data["error"], data["errors"]) == (
+        400, "invalid fields", ["phrase is required", "seed must be an integer from 0 to 2147483647"])
+    status, _h, data = mt.api(s, "POST", "/api/characters", body=dict(body, phrase="the stranger", seed=7))
+    assert status == 201, data
+    assert data["job"]["kind"] == "character-create"
+    status, _h, data = _cpost(s, _cbody(ws, _seeds(s, ["nova.png"]), False))
+    assert status == 201, data
+    fields = _job(state, data["seeds"][0]["job"]["id"])["fields"]
+    status, _h, data = mt.api(s, "POST", "/api/characters", body=dict(fields, force=True))
+    assert status == 201, data
+    forced = _job(state, data["job"]["id"])["fields"]
+    assert "seed_folder" not in forced and forced["force"] is True
+
+
+# --- Review Focus 1: phone and camera exports in Characters folder mode ---------------------------------
+
+def test_sf_review_focus_1_timestamp_and_non_latin_names_as_characters(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    names = ["20241101_123456.jpg", "20241101_123457.jpg", "日本.png", "Café ☕ día.png"]
+    status, _h, data = _cpost(s, _cbody(ws, _seeds(s, names), False))
+    assert status == 201, data
+    assert [r["character"] for r in data["seeds"]] == ["char", "char-2", "char-3", "cafe-dia"]
+    for row, name in zip(data["seeds"], names):
+        job = _job(state, row["job"]["id"])
+        assert job["argv"][job["argv"].index("create") + 1] == row["character"]
+        assert job["fields"]["seed_folder"]["name"] == name
+    queued = mt.api(s, "GET", "/api/jobs")[2]["queued"]
+    assert [j["seed_folder"]["name"] for j in queued] == names
