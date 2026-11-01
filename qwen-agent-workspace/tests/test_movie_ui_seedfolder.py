@@ -340,3 +340,451 @@ def test_sdt10_shared_checks_split(monkeypatch, tmp_path):
     assert lib.run_checks(mt.fields(ws, panels=0), ws, state) == (
         [lib.check("V1", "fields", "fail", "panels must be an integer from 1 to 200")]
         + [lib.check(i, n, "skip", "skipped: V1 failed") for i, n in lib.V_GROUP_NAMES])
+
+
+# --- The HTTP tests: fixture and helpers (spec 6 rules) ---------------------------------------------
+
+PASS_V2 = lib.check("V2", "render", "pass", "stub")
+
+
+@pytest.fixture
+def env(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOVIE_UI_VLM_LIFECYCLE", "0")
+    monkeypatch.delenv("CHARACTER_LIBRARY_DIR", raising=False)
+    state = mt.set_home(monkeypatch, tmp_path)
+    ws = mt.make_stub_workspace(tmp_path)
+    monkeypatch.setattr(lib, "shared_checks", lambda fields, ws_real, py=None: [PASS_V2])
+    running = mt.Running(state)
+    yield {"state": state, "ws": ws, "tmp": str(tmp_path), "srv": running}
+    running.close()
+    mt.kill_everything(state)
+
+
+def _upload(s, data=mt.PNG):
+    status, _h, payload = mt.api(s, "POST", "/api/uploads", raw=data,
+                                 headers={"Content-Type": "image/png"})
+    assert status == 201, payload
+    return payload["upload_id"]
+
+
+def _seeds(s, names, same=False):
+    """[{"name", "upload_id"}], one upload per name: mt.PNG + bytes([i]), or mt.PNG for every
+    name when same."""
+    return [{"name": name, "upload_id": _upload(s, mt.PNG if same else mt.PNG + bytes([i]))}
+            for i, name in enumerate(names)]
+
+
+def _body(ws, seeds, preview, **overrides):
+    """A seed-folder request: the stub workspace's valid Compose fields with no prefix."""
+    body = dict(mt.fields(ws, story_id=""), seeds=seeds, preview=preview)
+    body.update(overrides)
+    return body
+
+
+def _post(s, body):
+    return mt.api(s, "POST", "/api/jobs/seed-folder", body=body)
+
+
+def _job(state, job_id):
+    return lib.read_job(lib.job_dir(state, job_id))
+
+
+def _upload_path(state, seed):
+    return os.path.join(state, "uploads", seed["upload_id"])
+
+
+def _nothing_created(state):
+    return lib.list_job_ids(state) == [] and os.listdir(os.path.join(state, "jobs")) == [] and \
+        lib.read_queue(state) == []
+
+
+# --- SDT12 (SD13): malformed requests get 400 and run nothing ----------------------------------------
+
+def test_sdt12_malformed_requests_get_400(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["a.png"])
+    good = _body(ws, seeds, True)
+    no_ws = dict(good)
+    del no_ws["ws"]
+    no_preview = dict(good)
+    del no_preview["preview"]
+    cases = [
+        (no_ws, "missing ws"),
+        (dict(good, ws="relative/ws"), "ws must be an absolute path"),
+        (dict(good, ws=env["tmp"]), "not a harness workspace (no bin/ltx-movie): %s" % env["tmp"]),
+        (dict(good, action="regenerate"), "action must be movie or story"),
+        (dict(good, story_id="-x"), PREFIX_MSG),
+        (dict(good, seeds=[]), SEEDS_MSG),
+        (dict(good, seeds=["a.png"]), "seed 1 must be an object"),
+        (dict(good, seeds=[{"name": "x/a.png", "upload_id": seeds[0]["upload_id"]}]),
+         "seed 1: name must be a string without '/'"),
+        (dict(good, preview="yes"), PREVIEW_MSG),
+        (no_preview, PREVIEW_MSG),
+    ]
+    for body, message in cases:
+        assert _post(s, body)[::2] == (400, {"error": message}), message
+    assert _nothing_created(state)
+    assert [c for c in mt.stub_calls(ws) if c["sub"] == "--dry-run"] == []
+
+
+# --- SDT13 (SD14, SD19, SD21): a preview creates nothing ---------------------------------------------
+
+def test_sdt13_a_preview_creates_nothing(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    names = ["shot10.png", "shot2.png", "Beach Day!.webp"]
+    seeds = _seeds(s, names)
+    uploads = sorted(os.listdir(os.path.join(state, "uploads")))
+    status, _h, data = _post(s, _body(ws, seeds, True))
+    assert status == 200, data
+    assert set(data) == {"ok", "shared_checks", "queued", "refused", "run", "seeds"}
+    assert (data["ok"], data["queued"], data["run"], data["refused"]) == (True, 0, None, 0)
+    assert data["shared_checks"] == [PASS_V2]
+    assert [r["name"] for r in data["seeds"]] == names
+    assert [r["story_id"] for r in data["seeds"]] == ["shot10", "shot2", "Beach-Day"]
+    for row, seed in zip(data["seeds"], seeds):
+        assert set(row) == {"name", "upload_id", "story_id", "status", "reason", "checks", "job"}
+        assert (row["upload_id"], row["status"], row["reason"], row["job"]) == (
+            seed["upload_id"], "ok", None, None)
+        assert [(c["id"], c["status"]) for c in row["checks"]] == [("V1", "pass"), ("V6", "pass")]
+    assert _nothing_created(state)
+    assert os.listdir(os.path.join(ws, "generated", "stories")) == []
+    assert sorted(os.listdir(os.path.join(state, "uploads"))) == uploads
+
+
+# --- SDT14 (SD14, SD15, SD20, SD21): queue story jobs in seed order ------------------------------------
+
+def test_sdt14_queue_story_jobs_in_seed_order(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["Beach Day!.webp", "shot2.png", "shot10.png"])
+    status, _h, data = _post(s, _body(ws, seeds, False, action="story", story_id="temple"))
+    assert status == 201, data
+    assert (data["ok"], data["queued"], data["refused"]) == (True, 3, 0)
+    ids = ["temple-Beach-Day", "temple-shot2", "temple-shot10"]
+    assert [r["story_id"] for r in data["seeds"]] == ids
+    queue = lib.read_queue(state)
+    assert len(queue) == 3 and queue == [r["job"]["id"] for r in data["seeds"]]
+    for job_id, story_id, seed in zip(queue, ids, seeds):
+        job = _job(state, job_id)
+        assert (job["kind"], job["story_id"]) == ("story", story_id)
+        argv = job["argv"]
+        assert argv[argv.index("--story-id") + 1] == story_id
+        assert argv[argv.index("--seed-image") + 1] == _upload_path(state, seed)
+        assert "--story-only" in argv
+        assert job["fields"]["seed_upload"] == seed["upload_id"]
+        assert job["fields"]["width"] is None and job["fields"]["height"] is None
+    dry = [c for c in mt.stub_calls(ws) if c["tool"] == "ltx-movie" and c["sub"] == "--dry-run"]
+    assert len(dry) == 3
+    seen = dict((c["argv"][c["argv"].index("--story-id") + 1], c["argv"][c["argv"].index("--seed-image") + 1])
+                for c in dry)
+    assert seen == dict((story_id, _upload_path(state, seed)) for story_id, seed in zip(ids, seeds))
+
+
+# --- SDT15 (SD15, SD18, SD20): refused rows and the one queued seed -----------------------------------
+
+def test_sdt15_refused_rows_and_the_one_queued_seed(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["s1.png", "s2.png", "s3.png", "s4.png", "s5.png", "s6.png"])
+    unknown = "f" * 64 + ".png"
+    seeds[0]["upload_id"] = unknown
+    seeds[1]["upload_id"] = 7
+    seeds[5]["upload_id"] = ""
+    timeout = "bin/ltx-movie --dry-run timed out after %d s" % lib.DRY_RUN_TIMEOUT
+
+    def dry_run(fields, ws_real, st):
+        detail = {"s3": "plan\n" + DEGENERATE + "\n", "s4": timeout}.get(fields["story_id"])
+        return lib.check("V6", "dry run", "fail" if detail else "pass", detail or "")
+
+    monkeypatch.setattr(lib, "dry_run_check", dry_run)
+    status, _h, data = _post(s, _body(ws, seeds, False))
+    assert status == 201, data
+    assert (data["ok"], data["queued"], data["refused"]) == (True, 1, 5)
+    assert [(r["status"], r["reason"]) for r in data["seeds"]] == [
+        ("refused", "seed image upload %s not found" % unknown),
+        ("refused", "seed image upload missing"),
+        ("refused", "dry run failed: " + DEGENERATE),
+        ("refused", "dry run timed out after 60 s"),
+        ("ok", None),
+        ("refused", "seed image upload missing")]
+    assert (data["seeds"][1]["upload_id"], data["seeds"][5]["upload_id"]) == (7, "")
+    assert data["seeds"][0]["checks"][1] == lib.check("V6", "dry run", "skip", "skipped: V1 failed")
+    assert [r["job"] is None for r in data["seeds"]] == [True, True, True, True, False, True]
+    assert lib.read_queue(state) == [data["seeds"][4]["job"]["id"]]
+    assert len(lib.list_job_ids(state)) == 1
+
+
+# --- SDT16 (SD16, SD20, SD21): a failed shared check skips every seed ----------------------------------
+
+def test_sdt16_a_failed_shared_check_skips_every_seed(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    failing = [lib.check("V2", "render", "fail", "ffmpeg not found on PATH")]
+    monkeypatch.setattr(lib, "shared_checks", lambda fields, ws_real, py=None: list(failing))
+    calls = []
+
+    def dry_run(fields, ws_real, st):
+        calls.append(fields["story_id"])
+        return lib.check("V6", "dry run", "pass")
+
+    monkeypatch.setattr(lib, "dry_run_check", dry_run)
+    seeds = _seeds(s, ["a.png", "b.png"])
+    for preview, code in ((True, 200), (False, 409)):
+        status, _h, data = _post(s, _body(ws, seeds, preview))
+        assert status == code, data
+        assert "error" not in data
+        assert (data["ok"], data["queued"], data["run"], data["refused"]) == (False, 0, None, 2)
+        assert data["shared_checks"] == failing
+        assert [(r["status"], r["reason"]) for r in data["seeds"]] == [
+            ("skipped", "skipped: shared checks failed")] * 2
+        assert [r["checks"][1] for r in data["seeds"]] == [
+            lib.check("V6", "dry run", "skip", "skipped: shared checks failed")] * 2
+    assert calls == []
+    assert _nothing_created(state)
+
+
+# --- SDT17 (SD15, SD16, SD20): shots mode refuses every seed before the shared checks ------------------
+
+def test_sdt17_shots_mode_refuses_every_seed(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    calls = []
+
+    def shared(fields, ws_real, py=None):
+        calls.append(fields["story_id"])
+        return [PASS_V2]
+
+    monkeypatch.setattr(lib, "shared_checks", shared)
+    seeds = _seeds(s, ["a.png", "b.png"])
+    for preview, code in ((True, 200), (False, 409)):
+        status, _h, data = _post(s, _body(ws, seeds, preview, action="movie", mode="shots"))
+        assert status == code, data
+        assert (data["ok"], data["queued"], data["shared_checks"]) == (False, 0, [])
+        assert [(r["status"], r["reason"]) for r in data["seeds"]] == [
+            ("refused", "a seed image cannot be used with shots mode")] * 2
+    assert calls == []
+    assert _nothing_created(state)
+
+
+# --- SDT18 (SD20): seams jobs follow their movies ------------------------------------------------------
+
+def test_sdt18_seams_jobs_follow_their_movies(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["m1.png", "m2.png"])
+    status, _h, data = _post(s, _body(ws, seeds, False, action="movie", mode="chained", check_seams=True))
+    assert status == 201 and data["queued"] == 2, data
+    m1, m2 = [r["job"]["id"] for r in data["seeds"]]
+    queue = lib.read_queue(state)
+    assert len(queue) == 4 and (queue[0], queue[2]) == (m1, m2)
+    for movie, seams in ((m1, queue[1]), (m2, queue[3])):
+        assert _job(state, movie)["kind"] == "movie"
+        job = _job(state, seams)
+        assert job["kind"] == "seams"
+        assert job["fields"] == {"ws": ws, "story_id": _job(state, movie)["story_id"], "after": movie}
+    before = lib.read_queue(state)
+    status, _h, data = _post(s, _body(ws, seeds, False, action="movie", mode="chained", check_seams=False))
+    assert status == 201, data
+    assert lib.read_queue(state) == before + [r["job"]["id"] for r in data["seeds"]]
+    before = lib.read_queue(state)
+    status, _h, data = _post(s, _body(ws, seeds, False, action="story", check_seams=True))
+    assert status == 201, data
+    assert lib.read_queue(state) == before + [r["job"]["id"] for r in data["seeds"]]
+
+
+# --- SDT19 (SD20, SD23, SD24): the seed-folder tag -----------------------------------------------------
+
+def test_sdt19_the_seed_folder_tag(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    names = ["Beach Day!.webp", "shot2.png", "shot10.png"]
+    status, _h, data = _post(s, _body(ws, _seeds(s, names), False, story_id="temple"))
+    assert status == 201, data
+    run = data["run"]
+    assert seedfolder.RUN_ID_RE.fullmatch(run)
+    for row, name in zip(data["seeds"], names):
+        fields = _job(state, row["job"]["id"])["fields"]
+        assert fields["seed_folder"] == {"run": run, "name": name}
+        assert row["job"]["seed_folder"] == {"run": run, "name": name}
+        bare = dict(fields)
+        del bare["seed_folder"]
+        assert "seed_folder" not in lib.compose_fields(fields)
+        assert lib.compose_fields(fields) == lib.compose_fields(bare)
+    other = mt.make_job(env["state"], ["true"], ws, story_id="other")
+    queued = mt.api(s, "GET", "/api/jobs")[2]["queued"]
+    tags = dict((j["id"], j["seed_folder"]) for j in queued)
+    assert tags[other] is None
+    assert [tags[r["job"]["id"]] for r in data["seeds"]] == [{"run": run, "name": n} for n in names]
+    assert all(len(j) == 15 for j in queued)
+
+
+# --- SDT20 (SD9, SD14, SD20): final IDs avoid new stories and busy jobs ---------------------------------
+
+def test_sdt20a_a_story_made_between_preview_and_queue(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["beach.png"])
+    assert _post(s, _body(ws, seeds, True))[2]["seeds"][0]["story_id"] == "beach"
+    os.makedirs(os.path.join(ws, "generated", "stories", "beach"))
+    status, _h, data = _post(s, _body(ws, seeds, False))
+    assert status == 201, data
+    assert data["seeds"][0]["story_id"] == "beach-2"
+    assert _job(state, data["seeds"][0]["job"]["id"])["story_id"] == "beach-2"
+
+
+def test_sdt20b_a_story_made_during_the_dry_run(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seen = []
+
+    def dry_run(fields, ws_real, st):
+        seen.append(fields["story_id"])
+        os.makedirs(os.path.join(ws_real, "generated", "stories", "Beach"), exist_ok=True)
+        return lib.check("V6", "dry run", "pass")
+
+    monkeypatch.setattr(lib, "dry_run_check", dry_run)
+    status, _h, data = _post(s, _body(ws, _seeds(s, ["beach.png"]), False))
+    assert status == 201, data
+    assert seen == ["beach"]
+    assert data["seeds"][0]["story_id"] == "beach-2"
+    assert _job(state, data["seeds"][0]["job"]["id"])["story_id"] == "beach-2"
+
+
+def test_sdt20c_busy_jobs_take_their_story_ids(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    mt.make_job(state, ["true"], ws, story_id="BEACH")
+    mt.make_job(state, ["true"], ws, story_id="shore",
+                status={"state": "running", "dispatched": lib.utc_now()})
+    status, _h, data = _post(s, _body(ws, _seeds(s, ["beach.png", "shore.png"]), False))
+    assert status == 201, data
+    assert [r["story_id"] for r in data["seeds"]] == ["beach-2", "shore-2"]
+
+
+# --- SDT21 (SD17): four dry runs at a time, with no lock held ---------------------------------------
+
+def test_sdt21_four_dry_runs_at_a_time_with_no_lock_held(env, monkeypatch):
+    s, ws = env["srv"], env["ws"]
+    guard = threading.Lock()
+    counts = {"now": 0, "max": 0, "ran": 0}
+    locks = []
+
+    def probe():
+        got = []
+        for lock in (srv.STORE_LOCK, srv.BATCH_LOCK):
+            ok = lock.acquire(timeout=1)
+            if ok:
+                lock.release()
+            got.append(ok)
+        locks.append(got)
+
+    def dry_run(fields, ws_real, st):
+        with guard:
+            counts["now"] += 1
+            counts["max"] = max(counts["max"], counts["now"])
+        other = threading.Thread(target=probe)
+        other.start()
+        other.join()
+        time.sleep(0.3)
+        with guard:
+            counts["now"] -= 1
+            counts["ran"] += 1
+        return lib.check("V6", "dry run", "pass")
+
+    monkeypatch.setattr(lib, "dry_run_check", dry_run)
+    status, _h, data = _post(s, _body(ws, _seeds(s, ["s%d.png" % i for i in range(10)]), True))
+    assert status == 200, data
+    assert (counts["max"], counts["ran"]) == (4, 10)
+    assert locks == [[True, True]] * 10
+
+
+# --- SDT22 (SD8, SD20): the same image twice -----------------------------------------------------------
+
+def test_sdt22_the_same_image_twice(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["a.png", "a.png"], same=True)
+    assert seeds[0]["upload_id"] == seeds[1]["upload_id"]
+    status, _h, data = _post(s, _body(ws, seeds, False))
+    assert status == 201 and data["queued"] == 2, data
+    assert [r["story_id"] for r in data["seeds"]] == ["a", "a-2"]
+    argvs = [_job(state, r["job"]["id"])["argv"] for r in data["seeds"]]
+    assert [a[a.index("--seed-image") + 1] for a in argvs] == [_upload_path(state, seeds[0])] * 2
+
+
+# --- SDT23 (SD25): a failure mid-queue keeps the earlier jobs ------------------------------------------
+
+def test_sdt23_a_failure_mid_queue_keeps_the_earlier_jobs(env, monkeypatch):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["a.png", "b.png", "c.png"])
+    real = lib.create_job
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(args[1])
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lib, "create_job", flaky)
+    assert _post(s, _body(ws, seeds, False))[::2] == (500, {"error": "internal error"})
+    first = calls[0]
+    assert _job(state, first)["story_id"] == "a"
+    assert lib.read_queue(state) == [first] and lib.list_job_ids(state) == [first]
+    assert srv.STORE_LOCK.acquire(timeout=1)
+    srv.STORE_LOCK.release()
+
+
+# --- SDT24 (SD24): the compose routes ignore seed-folder keys ------------------------------------------
+
+def test_sdt24_the_compose_routes_ignore_seed_folder_keys(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    upload = _upload(s)
+    plain = mt.fields(ws, seed_upload=upload)
+    extra = dict(plain, seeds=[{"name": "a.png", "upload_id": upload}],
+                 seed_folder={"run": "sf-20261101-120000-ab12", "name": "a.png"})
+    status, _h, created = mt.api(s, "POST", "/api/jobs", body=extra)
+    assert status == 201, created
+    fields = _job(state, created["job"]["id"])["fields"]
+    assert "seeds" not in fields and "seed_folder" not in fields
+    assert created["job"]["seed_folder"] is None
+    assert mt.api(s, "POST", "/api/validate", body=extra)[::2] == mt.api(
+        s, "POST", "/api/validate", body=plain)[::2]
+
+
+# --- Review Focus 2-4 (the plan's Review Focus section) -------------------------------------------------
+
+def test_sf_review_focus_2_a_refused_seed_does_not_push_a_later_seed_to_a_suffix(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = [{"name": "beach.png", "upload_id": "f" * 64 + ".png"},
+             {"name": "beach.jpg", "upload_id": _upload(s)}]
+    preview = _post(s, _body(ws, seeds, True))[2]
+    assert [(r["story_id"], r["status"]) for r in preview["seeds"]] == [("beach", "refused"), ("beach-2", "ok")]
+    status, _h, data = _post(s, _body(ws, seeds, False))
+    assert status == 201, data
+    assert [(r["story_id"], r["status"]) for r in data["seeds"]] == [("beach", "refused"), ("beach", "ok")]
+    assert _job(state, data["seeds"][1]["job"]["id"])["story_id"] == "beach"
+
+
+def test_sf_review_focus_3_two_queue_requests_at_once(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    seeds = _seeds(s, ["a.png", "b.png"])
+    results = []
+
+    def post():
+        results.append(_post(s, _body(ws, seeds, False)))
+
+    threads = [threading.Thread(target=post) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(r[0] for r in results) == [201, 201]
+    assert sorted([row["story_id"] for row in r[2]["seeds"]] for r in results) == [["a", "b"], ["a-2", "b-2"]]
+    assert sorted(_job(state, i)["story_id"] for i in lib.list_job_ids(state)) == ["a", "a-2", "b", "b-2"]
+    for _status, _h, data in results:
+        assert set(row["job"]["seed_folder"]["run"] for row in data["seeds"]) == {data["run"]}
+
+
+def test_sf_review_focus_4_a_too_small_image_refused_by_the_real_dry_run(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    mt.stub_config(ws, {"ltx-movie --dry-run": {"exit": 2, "stdout": "", "stderr": DEGENERATE + "\n"}})
+    seeds = _seeds(s, ["thumb.png", "icon.png"])
+    status, _h, data = _post(s, _body(ws, seeds, True))
+    assert status == 200, data
+    assert (data["ok"], data["refused"]) == (False, 2)
+    assert [(r["status"], r["reason"]) for r in data["seeds"]] == [("refused", "dry run failed: " + DEGENERATE)] * 2
+    assert [r["checks"][1]["status"] for r in data["seeds"]] == ["fail", "fail"]
+    status, _h, data = _post(s, _body(ws, seeds, False))
+    assert status == 409, data
+    assert _nothing_created(state)
