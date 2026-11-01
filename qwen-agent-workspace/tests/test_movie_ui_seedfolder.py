@@ -319,3 +319,24 @@ def test_sdt27_random_names_always_give_valid_character_names():
             if prefix:
                 assert name.startswith(prefix + "-"), (prefix, name)
         outputs.extend(got)
+
+
+# --- SDT10 (SD2): lib.shared_checks is V2-V5 of run_checks ----------------------------------------
+
+def test_sdt10_shared_checks_split(monkeypatch, tmp_path):
+    state = mt.set_home(monkeypatch, tmp_path)
+    ws = mt.make_stub_workspace(tmp_path)
+    tagged = []
+    for name, check_id in (("host_checks", "V2"), ("model_checks", "V3"), ("lora_checks", "V4"),
+                           ("compat_checks", "V5")):
+        record = lib.check(check_id, name, "pass", "tagged " + name)
+        tagged.append(record)
+        monkeypatch.setattr(lib, name, (lambda r: lambda *args, **kwargs: [r])(record))
+    dry = lib.check("V6", "dry run", "pass", "tagged dry_run_check")
+    monkeypatch.setattr(lib, "dry_run_check", lambda fields, ws_real, st: dry)
+    fields = mt.fields(ws)
+    assert lib.run_checks(fields, ws, state) == [lib.check("V1", "fields", "pass", "")] + tagged + [dry]
+    assert lib.shared_checks(fields, ws) == tagged
+    assert lib.run_checks(mt.fields(ws, panels=0), ws, state) == (
+        [lib.check("V1", "fields", "fail", "panels must be an integer from 1 to 200")]
+        + [lib.check(i, n, "skip", "skipped: V1 failed") for i, n in lib.V_GROUP_NAMES])
