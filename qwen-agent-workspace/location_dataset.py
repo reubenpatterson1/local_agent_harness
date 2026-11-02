@@ -79,6 +79,67 @@ def gen_prompt(view, time, weather, description):
         view, description, TIME_PHRASES[time], WEATHER_PHRASES[weather], STYLE)
 
 
+# Yield spec LY2: a text location is indoors when its description has one of these words.
+INDOOR_WORDS = frozenset([
+    "atrium", "attic", "auditorium", "basement", "bathroom", "bedroom", "carpet", "carpeted",
+    "cellar", "ceiling", "ceilings", "chandelier", "chandeliers", "classroom", "concourse",
+    "corridor", "corridors", "crypt", "escalator", "escalators", "foyer", "hallway", "hallways",
+    "indoor", "indoors", "interior", "interiors", "lobby", "room", "rooms", "subway", "tunnel",
+    "tunnels", "underground", "wallpaper", "wallpapered"])
+
+
+def indoor_word(description):
+    """The first word of description that is in INDOOR_WORDS (yield spec LY3), or None: a
+    text location with one is drawn with INDOOR_VARIANTS."""
+    for word in location_lib.description_words(description):
+        if word in INDOOR_WORDS:
+            return word
+    return None
+
+
+# Yield spec LY4: the 24 indoor text-mode stills.
+INDOOR_VIEWS = ("Wide establishing shot from one end", "Wide shot from a high corner",
+                "Eye-level view looking along the length", "Low-angle view from near the floor",
+                "Medium shot of a single detail", "Close-up of a surface texture or sign")
+INDOOR_LIGHTS = ("overhead", "dim", "bright", "warm", "cool", "shadow")
+INDOOR_LIGHT_PHRASES = {"overhead": "under its own overhead lights", "dim": "in dim low light",
+                        "bright": "under bright even light", "warm": "in warm artificial light",
+                        "cool": "in cool white light",
+                        "shadow": "with deep shadows and pools of light"}
+INDOOR_VARIANTS = [
+    # (view, light), still n = position; view k (0-based) takes INDOOR_LIGHTS[(k + j) % 6], j 0-3
+    ("Wide establishing shot from one end", "overhead"),
+    ("Wide establishing shot from one end", "dim"),
+    ("Wide establishing shot from one end", "bright"),
+    ("Wide establishing shot from one end", "warm"),
+    ("Wide shot from a high corner", "dim"),
+    ("Wide shot from a high corner", "bright"),
+    ("Wide shot from a high corner", "warm"),
+    ("Wide shot from a high corner", "cool"),
+    ("Eye-level view looking along the length", "bright"),
+    ("Eye-level view looking along the length", "warm"),
+    ("Eye-level view looking along the length", "cool"),
+    ("Eye-level view looking along the length", "shadow"),
+    ("Low-angle view from near the floor", "warm"),
+    ("Low-angle view from near the floor", "cool"),
+    ("Low-angle view from near the floor", "shadow"),
+    ("Low-angle view from near the floor", "overhead"),
+    ("Medium shot of a single detail", "cool"),
+    ("Medium shot of a single detail", "shadow"),
+    ("Medium shot of a single detail", "overhead"),
+    ("Medium shot of a single detail", "dim"),
+    ("Close-up of a surface texture or sign", "shadow"),
+    ("Close-up of a surface texture or sign", "overhead"),
+    ("Close-up of a surface texture or sign", "dim"),
+    ("Close-up of a surface texture or sign", "bright"),
+]
+INDOOR_PROMPT = "%s of %s, %s, empty of people. %s."
+
+
+def indoor_prompt(view, light, description):
+    return INDOOR_PROMPT % (view, description, INDOOR_LIGHT_PHRASES[light], STYLE)
+
+
 # Spec 2.6: the photo-mode top-up edits; edit j (1-based) uses EDIT_VIEWS[j - 1] and
 # EDIT_CONDITIONS[j - 1].
 EDIT_PROMPT = ("Re-shoot this exact place as a %s, %s, %s: move the camera so the viewpoint "
@@ -363,11 +424,18 @@ def _with_story_server_stopped(min_gib, work):
 
 def _plan(data, loc_dir):
     """[{"n", "source", "photo", "prompt"}] for the 24 stills, and the image child to run:
-    ("generate", spec), ("edit", spec) or (None, None)."""
+    ("generate", spec), ("edit", spec) or (None, None). A text location whose description has
+    an indoor word is drawn with INDOOR_VARIANTS (yield spec LY5)."""
     if data["source"] == "text":
-        plan = [{"n": n, "source": "generated", "photo": None,
-                 "prompt": gen_prompt(view, time, weather, data["description"])}
-                for n, (view, time, weather) in enumerate(VARIANTS, start=1)]
+        word = indoor_word(data["description"])
+        if word is not None:
+            plan = [{"n": n, "source": "generated", "photo": None,
+                     "prompt": indoor_prompt(view, light, data["description"])}
+                    for n, (view, light) in enumerate(INDOOR_VARIANTS, start=1)]
+        else:
+            plan = [{"n": n, "source": "generated", "photo": None,
+                     "prompt": gen_prompt(view, time, weather, data["description"])}
+                    for n, (view, time, weather) in enumerate(VARIANTS, start=1)]
         jobs = [{"prompt": e["prompt"], "output_path": still_path(loc_dir, e["n"]),
                  "seed": data["seed"], "width": WIDTH, "height": HEIGHT} for e in plan]
         return plan, ("generate", {"jobs": jobs, "loras": None})
@@ -471,6 +539,10 @@ def _build_dataset(data, force):
         with Image.open(photo_copy_path(loc_dir, k)) as img:
             ImageOps.fit(img.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS,
                          centering=(0.5, 0.5)).save(still_path(loc_dir, k))
+    photo_mode = data["source"] == "photos"
+    word = None if photo_mode else indoor_word(data["description"])
+    if word is not None:
+        print('variants: indoor (the description has the word "%s")' % word)
     if child == "generate":
         print("=== generate: %d stills ===" % len(spec["jobs"]), flush=True)
         _with_story_server_stopped(character_dataset.GENERATE_MIN_AVAIL_GIB, lambda: (
@@ -482,7 +554,6 @@ def _build_dataset(data, force):
 
     print("=== check ===", flush=True)
     items = [_check_entry(data, loc_dir, entry, force) for entry in plan]
-    photo_mode = data["source"] == "photos"
     manifest = {"source": data["source"], "trigger": data["trigger"],
                 "description": data["description"], "seed": data["seed"],
                 "min_score": location_lib.MIN_SCORE,
@@ -492,6 +563,7 @@ def _build_dataset(data, force):
                                                           character_dataset.EDIT_LORA_FILE,
                                                           character_dataset.EDIT_STEPS)
                               if child == "edit" else "photos only"),
+                "variant_set": None if photo_mode else ("indoor" if word else "outdoor"),
                 "items": items}
     with open(os.path.join(loc_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)

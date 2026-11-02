@@ -19,6 +19,7 @@ import importlib.machinery
 import json
 import os
 import re
+import subprocess
 import sys
 import types
 
@@ -610,7 +611,7 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
     manifest = _manifest(env)
     assert {k: manifest[k] for k in manifest if k != "items"} == {
         "source": "text", "trigger": "harboplc", "description": lt.HARBOUR_DESC, "seed": 4,
-        "min_score": 7, "reference": None, "generator": "Z-Image"}
+        "min_score": 7, "reference": None, "generator": "Z-Image", "variant_set": "outdoor"}
     first, blocked = manifest["items"][0], manifest["items"][2]
     assert first == {"n": 1, "source": "generated", "photo": None,
                      "prompt": ld.gen_prompt(*(ld.VARIANTS[0] + (lt.HARBOUR_DESC,))),
@@ -629,6 +630,7 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
     assert (manifest["source"], manifest["reference"], manifest["generator"]) == (
         "photos", "source photo", "Qwen/Qwen-Image-Edit-2511 + "
         "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors, 8 steps")
+    assert manifest["variant_set"] is None
     photo, edit = manifest["items"][1], manifest["items"][2]
     assert (photo["source"], photo["photo"], photo["prompt"], photo["match_score"]) == (
         "photo", 2, None, None)
@@ -1165,6 +1167,9 @@ def test_ld27_edits_reshoot_from_new_viewpoints():
 
 # --- LY: dataset yield (docs/superpowers/specs/2026-11-02-location-yield-design.md) ---
 
+SUBWAY_DESC = ("a dimly lit underground new york subway platform with white tiled walls, green steel "
+               "columns, mosaic station name signs, a yellow edge strip and dark track beds")
+
 def test_lyd4_each_edit_is_scored_against_its_own_source_photo(env, monkeypatch, tmp_path):
     fakes = _Fakes(monkeypatch)
     assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 3),
@@ -1181,3 +1186,155 @@ def test_lyd4_each_edit_is_scored_against_its_own_source_photo(env, monkeypatch,
     assert checks[4][1][0] == "file:" + os.path.join(stills, "loc_02.png")
     assert checks[5][1][0] == "file:" + os.path.join(stills, "loc_03.png")
     assert _manifest(env, "old-mill")["reference"] == "source photo"
+
+
+def test_lyd1_the_indoor_rule(tmp_path):
+    assert ld.INDOOR_WORDS == frozenset([
+        "atrium", "attic", "auditorium", "basement", "bathroom", "bedroom", "carpet", "carpeted",
+        "cellar", "ceiling", "ceilings", "chandelier", "chandeliers", "classroom", "concourse",
+        "corridor", "corridors", "crypt", "escalator", "escalators", "foyer", "hallway",
+        "hallways", "indoor", "indoors", "interior", "interiors", "lobby", "room", "rooms",
+        "subway", "tunnel", "tunnels", "underground", "wallpaper", "wallpapered"])
+    assert len(ld.INDOOR_WORDS) == 36
+    assert ld.indoor_word(SUBWAY_DESC) == "underground"
+    cafe = ("a small café terrace in Montréal with wrought iron chairs, striped awnings, cracked "
+            "terracotta tiles and a faded blue sign above the door")    # test_location_tool.py:35
+    ui = ("a narrow cobbled harbour street lined with weathered stone warehouses, green wooden "
+          "shutters, rusted mooring rings and faded red fishmonger signs above granite quays")
+    for description in (lt.HARBOUR_DESC, lt.TEMPLE_DESC, lt.MILL_DESC, cafe, ui):
+        assert ld.indoor_word(description) is None, description
+    for word in sorted(ld.INDOOR_WORDS):
+        assert ld.indoor_word("a quiet " + word + " with old fittings") == word
+    for description in ("a grand ballroom with gilded mirrors", "a roomy yard with old sheds",
+                        "an undergrounds market square"):
+        assert ld.indoor_word(description) is None, description
+    assert ld.indoor_word("a Subway entrance on a corner") == "subway"
+    script = ("import py_compile, sys\n"
+              "py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)\n")
+    for python in ("/usr/bin/python3", sys.executable):
+        if not os.path.isfile(python):
+            continue                                     # an absent interpreter is skipped
+        for k, rel in enumerate(("location_dataset.py", os.path.join("bin", "location"))):
+            proc = subprocess.run([python, "-B", "-c", script, os.path.join(WS, rel),
+                                   str(tmp_path / ("%d.pyc" % k))],
+                                  capture_output=True, text=True, timeout=120)
+            assert proc.returncode == 0, (python, rel, proc.stderr)
+
+
+def test_lyd2_the_indoor_literals():
+    views = ["Wide establishing shot from one end", "Wide shot from a high corner",
+             "Eye-level view looking along the length", "Low-angle view from near the floor",
+             "Medium shot of a single detail", "Close-up of a surface texture or sign"]
+    assert ld.INDOOR_VIEWS == tuple(views)
+    assert ld.INDOOR_LIGHTS == ("overhead", "dim", "bright", "warm", "cool", "shadow")
+    assert ld.INDOOR_LIGHT_PHRASES == {
+        "overhead": "under its own overhead lights", "dim": "in dim low light",
+        "bright": "under bright even light", "warm": "in warm artificial light",
+        "cool": "in cool white light", "shadow": "with deep shadows and pools of light"}
+    assert ld.INDOOR_VARIANTS == [
+        ("Wide establishing shot from one end", "overhead"),
+        ("Wide establishing shot from one end", "dim"),
+        ("Wide establishing shot from one end", "bright"),
+        ("Wide establishing shot from one end", "warm"),
+        ("Wide shot from a high corner", "dim"),
+        ("Wide shot from a high corner", "bright"),
+        ("Wide shot from a high corner", "warm"),
+        ("Wide shot from a high corner", "cool"),
+        ("Eye-level view looking along the length", "bright"),
+        ("Eye-level view looking along the length", "warm"),
+        ("Eye-level view looking along the length", "cool"),
+        ("Eye-level view looking along the length", "shadow"),
+        ("Low-angle view from near the floor", "warm"),
+        ("Low-angle view from near the floor", "cool"),
+        ("Low-angle view from near the floor", "shadow"),
+        ("Low-angle view from near the floor", "overhead"),
+        ("Medium shot of a single detail", "cool"),
+        ("Medium shot of a single detail", "shadow"),
+        ("Medium shot of a single detail", "overhead"),
+        ("Medium shot of a single detail", "dim"),
+        ("Close-up of a surface texture or sign", "shadow"),
+        ("Close-up of a surface texture or sign", "overhead"),
+        ("Close-up of a surface texture or sign", "dim"),
+        ("Close-up of a surface texture or sign", "bright")]
+    for view in views:
+        lights = [light for v, light in ld.INDOOR_VARIANTS if v == view]
+        assert len(lights) == 4 and len(set(lights)) == 4, view
+    assert dict((light, sum(1 for _v, x in ld.INDOOR_VARIANTS if x == light))
+                for light in ld.INDOOR_LIGHTS) == dict((light, 4) for light in ld.INDOOR_LIGHTS)
+    assert ld.INDOOR_PROMPT == "%s of %s, %s, empty of people. %s."
+    d = SUBWAY_DESC
+    assert ld.indoor_prompt(*(ld.INDOOR_VARIANTS[0] + (d,))) == (
+        "Wide establishing shot from one end of %s, under its own overhead lights, empty of "
+        "people. photorealistic live-action film still, natural light." % d)
+    assert ld.indoor_prompt(*(ld.INDOOR_VARIANTS[10] + (d,))) == (
+        "Eye-level view looking along the length of %s, in cool white light, empty of people. "
+        "photorealistic live-action film still, natural light." % d)
+    assert ld.indoor_prompt(*(ld.INDOOR_VARIANTS[23] + (d,))) == (
+        "Close-up of a surface texture or sign of %s, under bright even light, empty of people. "
+        "photorealistic live-action film still, natural light." % d)
+
+
+def test_lyd3_an_indoor_text_create(env, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="nyc-subway", description=SUBWAY_DESC, seed=7)) == 0
+    stills = os.path.join(env["locations"], "nyc-subway", "stills")
+    ((spec, step),) = fakes.child_specs
+    assert step == "generate"
+    assert spec["jobs"] == [{"prompt": ld.indoor_prompt(view, light, SUBWAY_DESC),
+                             "output_path": os.path.join(stills, "loc_%02d.png" % n),
+                             "seed": 7, "width": 1024, "height": 640}
+                            for n, (view, light) in enumerate(ld.INDOOR_VARIANTS, start=1)]
+    out = capsys.readouterr().out
+    line = 'variants: indoor (the description has the word "underground")\n'
+    assert line in out
+    assert out.index(line) < out.index("=== generate: 24 stills ===")
+    assert _manifest(env, "nyc-subway")["variant_set"] == "indoor"
+    assert fakes.checks() == [(ld.CHECK_TEXT_PROMPT.replace("@@DESCRIPTION@@", SUBWAY_DESC),
+                               ["file:" + os.path.join(stills, "loc_%02d.png" % n)])
+                              for n in range(1, 25)]
+    _Fakes(monkeypatch)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 0
+    assert _manifest(env)["variant_set"] == "outdoor"
+    assert not [x for x in capsys.readouterr().out.splitlines() if x.startswith("variants:")]
+
+
+def test_ly_review_focus_1_a_photo_location_with_an_indoor_description(env, monkeypatch,
+                                                                         tmp_path, capsys):
+    def _never(description):
+        raise AssertionError("photo mode called indoor_word")
+
+    monkeypatch.setattr(ld, "indoor_word", _never)
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="nyc-subway", photos=_photos(tmp_path, 2),
+                                  description=SUBWAY_DESC)) == 0
+    stills = os.path.join(env["locations"], "nyc-subway", "stills")
+    ((spec, step),) = fakes.child_specs
+    assert step == "edit"
+    assert [job["prompt"] for job in spec["jobs"]] == [
+        ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[j - 1],) + ld.EDIT_CONDITIONS[j - 1]) for j in range(1, 23)]
+    assert "variants:" not in capsys.readouterr().out
+    assert _manifest(env, "nyc-subway")["variant_set"] is None
+    assert [urls[0] for _prompt, urls in fakes.checks()[2:]] == [
+        "file:" + os.path.join(stills, "loc_%02d.png" % (((n - 3) % 2) + 1)) for n in range(3, 25)]
+
+
+def test_ly_review_focus_2_regenerate_with_a_new_description_switches_the_variants(
+        env, monkeypatch, capsys):
+    _Fakes(monkeypatch)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 0
+    capsys.readouterr()
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(regenerate=True, description=SUBWAY_DESC)) == 0
+    assert ('variants: indoor (the description has the word "underground")\n'
+            in capsys.readouterr().out)
+    assert [job["prompt"] for job in fakes.child_specs[0][0]["jobs"]] == [
+        ld.indoor_prompt(view, light, SUBWAY_DESC) for view, light in ld.INDOOR_VARIANTS]
+    assert _manifest(env)["variant_set"] == "indoor"
+    assert _record(env)["description"] == SUBWAY_DESC
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(regenerate=True, description=lt.HARBOUR_DESC)) == 0
+    assert "variants:" not in capsys.readouterr().out
+    assert [job["prompt"] for job in fakes.child_specs[0][0]["jobs"]] == [
+        ld.gen_prompt(view, time, weather, lt.HARBOUR_DESC)
+        for view, time, weather in ld.VARIANTS]
+    assert _manifest(env)["variant_set"] == "outdoor"
