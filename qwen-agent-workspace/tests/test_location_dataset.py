@@ -1,7 +1,7 @@
 """Tests for the location library's dataset builder and trainer (docs/superpowers/specs/
 2026-10-29-location-lora-design.md, Sections 2.5-2.12 and 3.2-3.4, test table 6.5: LD1-LD24, with
 the plan's Review Focus pins): location_dataset.py, and the qwenedit child extension in
-character_dataset.py (LD18).
+character_dataset.py (LD18), and the yield spec LYD1-LYD13.
 
 Run from the workspace root: python3 -m pytest -q -p no:cacheprovider tests/test_location_dataset.py
 Stdlib plus pytest and PIL. No test reads the real HOME, renders, trains, runs Z-Image or the
@@ -543,11 +543,12 @@ def test_ld9_the_round_robin_top_up(env, monkeypatch, tmp_path, count):
                              "seed": 3, "width": 1024, "height": 640}
                             for j in range(1, 25 - count)]
     assert fakes.server_calls == ["stop", "restore-wait"]
-    ref = "file:" + os.path.join(stills, "loc_01.png")
     assert fakes.checks() == (
         [(ld.TAG_PROMPT, ["file:" + os.path.join(stills, "loc_%02d.png" % n)])
          for n in range(1, count + 1)]
-        + [(ld.CHECK_PHOTO_PROMPT, [ref, "file:" + os.path.join(stills, "loc_%02d.png" % n)])
+        + [(ld.CHECK_PHOTO_PROMPT,
+            ["file:" + os.path.join(stills, "loc_%02d.png" % (((n - count - 1) % count) + 1)),
+             "file:" + os.path.join(stills, "loc_%02d.png" % n)])
            for n in range(count + 1, 25)])
 
 
@@ -626,7 +627,7 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
                                   description=lt.MILL_DESC)) == 0
     manifest = _manifest(env, "old-mill")
     assert (manifest["source"], manifest["reference"], manifest["generator"]) == (
-        "photos", "loc_01", "Qwen/Qwen-Image-Edit-2511 + "
+        "photos", "source photo", "Qwen/Qwen-Image-Edit-2511 + "
         "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors, 8 steps")
     photo, edit = manifest["items"][1], manifest["items"][2]
     assert (photo["source"], photo["photo"], photo["prompt"], photo["match_score"]) == (
@@ -1160,3 +1161,23 @@ def test_ld27_edits_reshoot_from_new_viewpoints():
                              "under a clear sky: move the camera")
     assert "furniture, fixtures, decor" in prompt
     assert "same camera position" not in prompt and "identical" not in prompt
+
+
+# --- LY: dataset yield (docs/superpowers/specs/2026-11-02-location-yield-design.md) ---
+
+def test_lyd4_each_edit_is_scored_against_its_own_source_photo(env, monkeypatch, tmp_path):
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 3),
+                                  description=lt.MILL_DESC)) == 0
+    stills = os.path.join(env["locations"], "old-mill", "stills")
+    checks = fakes.checks()
+    assert len(checks) == 24
+    assert checks[3:] == [
+        (ld.CHECK_PHOTO_PROMPT,
+         ["file:" + os.path.join(stills, "loc_%02d.png" % (((n - 4) % 3) + 1)),
+          "file:" + os.path.join(stills, "loc_%02d.png" % n)])
+        for n in range(4, 25)]
+    # edit 5 is checked against photo 2 and edit 6 against photo 3, not against photo 1
+    assert checks[4][1][0] == "file:" + os.path.join(stills, "loc_02.png")
+    assert checks[5][1][0] == "file:" + os.path.join(stills, "loc_03.png")
+    assert _manifest(env, "old-mill")["reference"] == "source photo"

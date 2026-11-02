@@ -402,7 +402,8 @@ def _check_entry(data, loc_dir, entry, force):
         check, unparseable = check_still(
             CHECK_TEXT_PROMPT.replace("@@DESCRIPTION@@", data["description"]), [png], True)
     elif entry["source"] == "edit":
-        check, unparseable = check_still(CHECK_PHOTO_PROMPT, [still_path(loc_dir, 1), png], True)
+        check, unparseable = check_still(
+            CHECK_PHOTO_PROMPT, [still_path(loc_dir, entry["photo"]), png], True)
     else:
         check, unparseable = check_still(TAG_PROMPT, [png], False)
     if check is not None:
@@ -484,7 +485,8 @@ def _build_dataset(data, force):
     photo_mode = data["source"] == "photos"
     manifest = {"source": data["source"], "trigger": data["trigger"],
                 "description": data["description"], "seed": data["seed"],
-                "min_score": location_lib.MIN_SCORE, "reference": "loc_01" if photo_mode else None,
+                "min_score": location_lib.MIN_SCORE,
+                "reference": "source photo" if photo_mode else None,
                 "generator": ("Z-Image" if not photo_mode
                               else "%s + %s, %d steps" % (character_dataset.EDIT_MODEL,
                                                           character_dataset.EDIT_LORA_FILE,
