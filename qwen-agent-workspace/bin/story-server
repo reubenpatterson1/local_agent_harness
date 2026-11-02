@@ -65,7 +65,10 @@ VISION_MAX_MODEL_LEN="${STORY_SERVER_VISION_MAX_MODEL_LEN:-24576}"
 # from mlx_lm, which cannot process images at all -- confirmed 2026-09-27). No
 # --served-model-name equivalent exists, so MODEL_ID itself is overridden to this
 # value for this mode (see the CMD dispatch below) rather than aliased.
-MLX_VISION_MODEL_ID="${STORY_SERVER_MLX_VISION_MODEL_ID:-/Users/ailab1/mlx_models/qwen3-vl}"
+# Default (2026-11-02): Huihui-Qwen3.8-27B abliterated 8-bit MLX (ailexleon @ 0aa7243), a symlink
+# to its pinned download -- M38 prints the commands. vision mode stays on Qwen3-VL-32B: vllm-metal
+# drops the qwen3_5 vision tower and hermes is the wrong tool parser for Qwen3.8.
+MLX_VISION_MODEL_ID="${STORY_SERVER_MLX_VISION_MODEL_ID:-/Users/ailab1/mlx_models/qwen38-27b-abl-8bit}"
 MLX_VLM_PYTHON="${STORY_SERVER_MLX_VLM_PYTHON:-/Users/ailab1/mlx-serve/bin/python}"
 MLX_VISION_LOG="$WS/generated/mlx_vlm_serve.log"
 MLX_VISION_MAX_TOKENS="${STORY_SERVER_MLX_VISION_MAX_TOKENS:-16384}"
@@ -434,6 +437,16 @@ cmd_serve() {
             die2 "mlx-vision mode needs the mlx_vlm package importable by $MLX_VLM_PYTHON (pip install mlx-vlm)"   # M29
             exit 4
         fi
+        if ! "$MLX_VLM_PYTHON" -c 'import importlib.metadata as m, re, sys; n = tuple(int(x) for x in re.findall(r"\d+", m.version("mlx-vlm"))[:3]); sys.exit(0 if n >= (0, 7, 11) else 1)' >/dev/null 2>&1; then
+            die2 "REFUSING: mlx-vision mode needs mlx-vlm >= 0.7.11 in $MLX_VLM_PYTHON (older releases ignore chat_template_kwargs.enable_thinking); upgrade with: $MLX_VLM_PYTHON -m pip install -U 'mlx-vlm>=0.7.11'"   # M39
+            exit 4
+        fi
+        case "$MLX_VISION_MODEL_ID" in
+            /*) if [ ! -d "$MLX_VISION_MODEL_ID" ]; then
+                    die2 "mlx-vision mode needs the model directory $MLX_VISION_MODEL_ID; create it with: hf download ailexleon/Huihui-Qwen3.8-27B-abliterated-mlx-8Bit --revision 0aa7243af15e8156fe7346e2597bb393a972963e --local-dir /Users/ailab1/mlx_models/qwen38-27b-abl-8bit-0aa7243 && ln -sfn /Users/ailab1/mlx_models/qwen38-27b-abl-8bit-0aa7243 $MLX_VISION_MODEL_ID (about 27.5 GiB; or set STORY_SERVER_MLX_VISION_MODEL_ID to another model)"   # M38
+                    exit 4
+                fi ;;
+        esac
     else
         if [ ! -x "$MTPLX_BIN" ]; then
             die2 "text mode needs an executable $MTPLX_BIN; see README section \"MTPLX provisioning\""   # M12

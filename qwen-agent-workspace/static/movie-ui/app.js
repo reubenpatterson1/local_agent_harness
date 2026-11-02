@@ -2491,7 +2491,9 @@
       const parts = [];
       if (byN[item.n]) { parts.push(el("img", {src: fileUrl(byN[item.n]), alt: "still " + item.n})); }
       const people = item.people_visible === null ? "people -" : (item.people_visible ? "people" : "no people");
-      parts.push(el("figcaption", {text: [item.source, item.match_score === null ? "score -" : "score " + item.match_score,
+      parts.push(el("figcaption", {text: [
+        item.source + (typeof item.round === "number" && item.round > 1 ? " (round " + item.round + ")" : ""),
+        item.match_score === null ? "score -" : "score " + item.match_score,
         people, item.caption || "", item.kept ? "kept" : "dropped: " + (item.reason || "")].join("; ")}));
       stills.appendChild(el("figure", {}, parts));
     });
