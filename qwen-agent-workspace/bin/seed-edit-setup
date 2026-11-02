@@ -8,7 +8,8 @@ Lightning LoRA that bin/seed-edit's mflux q4 backend needs
 Run only by the controller on the user's go; never by a test. Steps: refuse when
 SEED_EDIT_MFLUX_PYTHON is set; read what is present (the venv ~/mflux-edit/.venv with mflux
 0.24.0, the q4 repo and the Lightning file in the Z-Image hub); with all three present, print the
-sizes and exit; else check 31 GiB of free space and a base Python of 3.11 or newer
+sizes and exit; else check 31 GiB of free space (less what an earlier partial run left) and a base
+Python of 3.11 or newer
 (SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python), create the venv, pip install
 mflux==0.24.0, download the q4 repo snapshot and the single Lightning file (both public; no token)
 into the Z-Image hub ($Z_IMAGE_HF_HOME/hub or ~/hf_home/hub, never $HF_HOME), then print the sizes
@@ -130,6 +131,17 @@ def snapshot_gib(snapshot):
     return total / 2 ** 30
 
 
+def present_gib(hub, venv):
+    """What an earlier, partial run left on disk: the q4 and Lightning repo directories in hub and
+    the venv (lstat sizes, so a snapshot symlink is not counted twice), in GiB."""
+    total = 0.0
+    for path in (os.path.join(hub, lib.repo_dir_name(Q4_REPO)),
+                 os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)), venv):
+        if os.path.isdir(path):
+            total += tree_gib(path)
+    return total
+
+
 def venv_ready(py, venv):
     best = mflux_version(venv)[1]
     return os.access(py, os.X_OK) and best is not None and best[1] == MFLUX_VERSION
@@ -179,9 +191,12 @@ def main(argv=None):
         return 0
     frees = [(free_gib(p), p) for p in (existing_ancestor(hub), existing_ancestor(os.path.dirname(venv)))]
     free, where = min(frees)
-    if free < SETUP_MIN_FREE_GIB:
-        return fail(2, "only %.1f GiB free on %s; seed-edit-setup needs at least %g GiB (q4 weights ~29 GB, "
-                       "Lightning LoRA ~0.85 GB, mflux venv)" % (free, where, SETUP_MIN_FREE_GIB))
+    present = present_gib(hub, venv)
+    need = max(SETUP_MIN_FREE_GIB - present, 0.0)
+    if free < need:
+        return fail(2, "only %.1f GiB free on %s; seed-edit-setup needs at least %.1f GiB more (%g GiB in all, "
+                       "%.1f GiB already present; q4 weights ~29 GB, Lightning LoRA ~0.85 GB, mflux venv)"
+                    % (free, where, need, SETUP_MIN_FREE_GIB, present))
     base = os.environ.get("SEED_EDIT_SETUP_PYTHON") or DEFAULT_BASE_PYTHON
     if not os.access(base, os.X_OK):
         return fail(2, "base python %s is not executable (set SEED_EDIT_SETUP_PYTHON)" % base)
@@ -200,7 +215,8 @@ def main(argv=None):
         if code != 0:
             return fail(1, "pip install mflux==0.24.0 exited %d" % code)
     if not (q4_ok and lora_ok):
-        env = dict(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0", HF_XET_CHUNK_CACHE_SIZE_BYTES="0")
+        env = dict(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0", HF_XET_CHUNK_CACHE_SIZE_BYTES="0",
+                   HF_HUB_ENABLE_HF_TRANSFER="0")
         code = subprocess.call([py, "-c", DOWNLOAD, hub, Q4_REPO, EDIT_LORA_REPO, EDIT_LORA_FILE], env=env)
         if code != 0:
             return fail(1, "the download exited %d" % code)

@@ -82,7 +82,7 @@ DEFAULT_MFLUX_PYTHON = "~/mflux-edit/.venv/bin/python"   # expanded at use
 SAFETY_SKILL = "seed_edit"
 BACKEND_LABELS = {"zimage": "Z-Image", "diffusers-bf16": "diffusers bf16", "mflux-q4": "mflux q4"}
 
-EXTS = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp"}
+EXTS = {"PNG": "png", "JPEG": "jpg", "MPO": "jpg", "WEBP": "webp"}
 BF16_LINE_RE = re.compile(r"^cand_(\d{2})\.part\.png (ok|blocked) ([0-9]+\.[0-9])s$")
 MFLUX_LINE_RE = re.compile(r"^seed-edit-child done (\d+) ([0-9]+\.[0-9])$")
 CHILD = None    # the running Qwen child's Popen (SG21), or None

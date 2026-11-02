@@ -1651,6 +1651,28 @@ def _cand_file(run_dir, entry):
     return path if entry.get("status") == "ok" and _isfile_in(run_dir, path) else None
 
 
+def _in_seed_work(real, ws_real):
+    """True when the realpath real lies in generated/seeds/runs/<run>/work/ of ws_real, where
+    bin/seed-edit keeps unscreened mflux candidates (seed generator SG20). Compared by inode, so a
+    differently-cased path on a case-insensitive volume is caught too."""
+    try:
+        runs_stat = os.stat(runs_root(ws_real))
+    except OSError:
+        return False
+    path = real
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        if os.path.basename(path).lower() == "work":
+            try:
+                if os.path.samestat(os.stat(os.path.dirname(parent)), runs_stat):
+                    return True
+            except OSError:
+                pass
+        path = parent
+
+
 def _run_job(server, record):
     """The record's job ID when it names an existing job directory, else None."""
     job_id = record.get("job")
@@ -2418,6 +2440,8 @@ def _h_files(self, groups, query, body):
     roots = (os.path.realpath(os.path.join(real_ws, "generated")),
              os.path.realpath(os.path.join(self.server.state, "uploads")))
     if not any(real.startswith(root + os.sep) for root in roots):
+        raise ApiError(403, "path not allowed")
+    if _in_seed_work(real, real_ws):
         raise ApiError(403, "path not allowed")
     if not os.path.isfile(real):
         raise ApiError(404, "not found")

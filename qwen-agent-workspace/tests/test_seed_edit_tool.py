@@ -859,3 +859,47 @@ def test_sgt16_the_setup_script_is_read_never_run():
         assert '%s = "%s"' % (name, getattr(tool, name)) in source, name
     for name in ("mflux_version", "find_lightning"):
         assert _code_of(source, name) == _code_of(tool_source, name), name
+
+
+def test_sg_final_setup_resume_counts_what_is_present(env):
+    """Final review F1: a resumed download is not refused for space it already used. bin/seed-edit-setup is
+    loaded as a module (its main is never called; its top level only imports and assigns)."""
+    path = os.path.join(WS, "bin", "seed-edit-setup")
+    loader = importlib.machinery.SourceFileLoader("seed_edit_setup", path)
+    spec = importlib.util.spec_from_loader("seed_edit_setup", loader)
+    setup = importlib.util.module_from_spec(spec)
+    loader.exec_module(setup)
+    hub, venv = os.path.join(env["tmp"], "hub"), os.path.join(env["tmp"], "venv")
+    assert setup.present_gib(hub, venv) == 0.0
+    blobs = os.path.join(hub, lib.repo_dir_name(setup.Q4_REPO), "blobs")
+    snap = os.path.join(hub, lib.repo_dir_name(setup.Q4_REPO), "snapshots", "abc")
+    os.makedirs(blobs)
+    os.makedirs(snap)
+    with open(os.path.join(blobs, "abc.incomplete"), "wb") as f:
+        f.truncate(3 * 2 ** 20)
+    os.symlink(os.path.join(blobs, "abc.incomplete"), os.path.join(snap, "model.safetensors"))
+    os.makedirs(os.path.join(venv, "bin"))
+    with open(os.path.join(venv, "bin", "python"), "wb") as f:
+        f.truncate(2 ** 20)
+    got = setup.present_gib(hub, venv)
+    assert 4 / 1024 <= got < 4 / 1024 + 0.001, got
+    with open(path, encoding="utf-8") as f:
+        source = f.read()
+    assert 'HF_HUB_ENABLE_HF_TRANSFER="0"' in source and "already present" in source
+
+
+def test_sg_final_a_phone_hdr_jpeg_is_a_jpeg(env):
+    """Final review F3: an iOS/Android HDR JPEG carries an MPF secondary image, which Pillow names MPO."""
+    zimage_cache(env)
+    mpo = os.path.join(env["tmp"], "hdr-phone.jpg")
+    Image.new("RGB", (300, 200), (0, 120, 200)).save(mpo, "MPO", save_all=True,
+                                                     append_images=[Image.new("RGB", (75, 50))])
+    with Image.open(mpo) as img:
+        assert img.format == "MPO"
+    code, run_dir = run_tool(env, "--candidates", "1", source=mpo, run=R1)
+    assert code == 0
+    record = record_of(run_dir)
+    assert (record["source"], record["source_size"], record["size"]) == (
+        "source.jpg", {"width": 300, "height": 200}, {"width": 288, "height": 192})
+    with open(mpo, "rb") as f, open(os.path.join(run_dir, "source.jpg"), "rb") as g:
+        assert f.read() == g.read()

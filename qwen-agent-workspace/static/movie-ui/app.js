@@ -1869,6 +1869,7 @@
       const res = await api("POST", "/api/seeds/runs", seedBody());
       if (res.status === 201 && res.data && res.data.run && res.data.run.run) {
         openSeedRun(res.data.run.run);
+        loadSeedRuns();
         pollJobs();
       } else if (res.status === 0 || res.status === 201 || res.status >= 500) {
         failure = "the request may have been queued — check Runs and Jobs before retrying";

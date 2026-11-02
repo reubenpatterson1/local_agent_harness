@@ -893,3 +893,26 @@ def test_sg_task6_review_page_guards():
                  '"the source image could not be loaded — pick it again"'):
         assert text in js, text
     assert js.count("S.timers.seeds = setInterval(") == 1
+    assert 'openSeedRun(res.data.run.run);\n        loadSeedRuns();\n        pollJobs();' in js
+
+
+def test_sg_final_files_refuses_a_runs_work_directory(env):
+    """Final review F2: /files never serves bin/seed-edit's unscreened work files, however the path is cased or
+    reached; a screened candidate is still served."""
+    s, ws = env["srv"], env["ws"]
+    run_dir = make_run(ws, RA, ["ok", "pending"])
+    work = os.path.join(run_dir, "work")
+    os.makedirs(work)
+    for name in ("cand_02.pending.png", "cand_02.part.png", "source.png"):
+        with open(os.path.join(work, name), "wb") as f:
+            f.write(mt.PNG)
+    status, _h, body = mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, os.path.join(run_dir, "cand_01.png")))
+    assert (status, body) == (200, mt.PNG + bytes([1]))
+    for name in ("cand_02.pending.png", "cand_02.part.png", "source.png"):
+        got = mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, os.path.join(work, name)))
+        assert (got[0], got[2]) == (403, {"error": "path not allowed"}), name
+    upper = os.path.join(run_dir, "WORK", "cand_02.pending.png")
+    assert mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, upper))[0] in (403, 404)
+    peek = os.path.join(ws, "generated", "peek.png")
+    os.symlink(os.path.join(work, "cand_02.pending.png"), peek)
+    assert mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, peek))[0] == 403
