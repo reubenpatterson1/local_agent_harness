@@ -213,6 +213,15 @@ CHECK_TEXT_PROMPT = (
     'shows this place, with its architecture, furniture, fixtures and decor, materials, '
     'signage, palette, era and ground or floor, where 10 is unmistakably this place and 1 is a '
     'different place. ' + _KEYS)
+# Yield spec LYA1: the photo check's first image is the edit's own source photo, which may show
+# people, so its four tags are judged on the candidate alone.
+_PHOTO_KEYS = ('"people_visible": true when any person or part of a person is visible anywhere '
+               'in the candidate (the second image), else false; people in the reference (the '
+               'first image) do not count. "shot", "time_of_day" and "weather" describe the '
+               'candidate. "shot": exactly one of extreme wide shot, wide shot, medium shot, '
+               'medium close-up, close-up, extreme close-up. "time_of_day": exactly one of dawn, '
+               'midday, golden hour, dusk, night. "weather": exactly one of clear, overcast, rain, '
+               'fog, snow.')
 CHECK_PHOTO_PROMPT = (
     'The first image shows the reference place. The second image is a candidate picture, which '
     'may show the same place from another viewpoint, at another time of day, in other weather or '
@@ -220,7 +229,7 @@ CHECK_PHOTO_PROMPT = (
     'from 1 to 10 for how clearly the candidate shows the same place as the reference, comparing '
     'its architecture, furniture, fixtures and decor, materials, signage, palette and ground or '
     'floor and ignoring the viewpoint, the time of day, weather and season, where 10 is '
-    'unmistakably the same place and 1 is a different place. ' + _KEYS)
+    'unmistakably the same place and 1 is a different place. ' + _PHOTO_KEYS)
 TAG_PROMPT = 'Reply with only a JSON object with four keys describing this image. ' + _KEYS
 CHECK_RETRY = ('Your previous reply was rejected: %s. Previous reply: %s\n'
                'Reply again with only the JSON object, using exactly the listed values for '
@@ -601,8 +610,9 @@ def build_dataset(data, force=False):
         print("Error: %s" % e, file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("\nError: aborted; the stills made so far are kept in %s; run bin/location create "
-              "%s --regenerate to start again"
+        print("\nError: aborted; the dataset in %s is incomplete (a still of the unfinished round "
+              "may be missing or unchecked); run bin/location create %s --regenerate to start "
+              "again"
               % (location_lib.location_dir(data["name"]), data["name"]), file=sys.stderr)
         return 1
 
@@ -643,6 +653,11 @@ def _build_dataset(data, force):
         if kept + len(redo) < location_lib.MIN_KEEP:
             print("top-up: not run; %d kept + %d dropped generated or edited stills cannot reach %d"
                   % (kept, len(redo), location_lib.MIN_KEEP))
+            break
+        # Yield spec LYA2: the preflight's busy check again, before this round renders.
+        busy = character_dataset.busy_process()
+        if busy is not None:
+            print("top-up: not run; a render or training process is running (pid %d: %s)" % busy)
             break
         print("=== top-up round %d of %d: regenerating %d dropped stills with new seeds (kept %d, "
               "need %d) ===" % (r, 1 + TOPUP_ROUNDS, len(redo), kept, location_lib.MIN_KEEP),

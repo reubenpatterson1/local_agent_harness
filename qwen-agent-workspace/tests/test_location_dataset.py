@@ -1,7 +1,7 @@
 """Tests for the location library's dataset builder and trainer (docs/superpowers/specs/
 2026-10-29-location-lora-design.md, Sections 2.5-2.12 and 3.2-3.4, test table 6.5: LD1-LD24, with
 the plan's Review Focus pins): location_dataset.py, and the qwenedit child extension in
-character_dataset.py (LD18), and the yield spec LYD1-LYD13.
+character_dataset.py (LD18), and the yield spec LYD1-LYD15.
 
 Run from the workspace root: python3 -m pytest -q -p no:cacheprovider tests/test_location_dataset.py
 Stdlib plus pytest and PIL. No test reads the real HOME, renders, trains, runs Z-Image or the
@@ -371,6 +371,13 @@ def test_ld2_the_section_2_literals():
         'shows this place, with its architecture, furniture, fixtures and decor, materials, '
         'signage, palette, era and ground or floor, '
         'where 10 is unmistakably this place and 1 is a different place. ' + keys)
+    photo_keys = ('"people_visible": true when any person or part of a person is visible '
+                  'anywhere in the candidate (the second image), else false; people in the '
+                  'reference (the first image) do not count. "shot", "time_of_day" and "weather" '
+                  'describe the candidate. "shot": exactly one of extreme wide shot, wide shot, '
+                  'medium shot, medium close-up, close-up, extreme close-up. "time_of_day": '
+                  'exactly one of dawn, midday, golden hour, dusk, night. "weather": exactly one '
+                  'of clear, overcast, rain, fog, snow.')
     assert ld.CHECK_PHOTO_PROMPT == (
         'The first image shows the reference place. The second image is a candidate picture, '
         'which may show the same place from another viewpoint, at another time of day, in other '
@@ -379,7 +386,7 @@ def test_ld2_the_section_2_literals():
         'place as the reference, comparing its architecture, furniture, fixtures and decor, '
         'materials, signage, palette and ground or floor and ignoring the viewpoint, the time '
         'of day, weather and season, where 10 is unmistakably the '
-        'same place and 1 is a different place. ' + keys)
+        'same place and 1 is a different place. ' + photo_keys)
     assert ld.TAG_PROMPT == 'Reply with only a JSON object with four keys describing this image. ' + keys
     assert ld.CHECK_RETRY == (
         'Your previous reply was rejected: %s. Previous reply: %s\n'
@@ -738,8 +745,9 @@ def test_ld17_an_interrupt_restores_detached(env, monkeypatch, capsys):
     assert fakes.server_calls == ["stop", "restore"]
     ldir = os.path.join(env["locations"], "harbour-street")
     assert _err_line(capsys) == (
-        "Error: aborted; the stills made so far are kept in %s; run bin/location create "
-        "harbour-street --regenerate to start again" % ldir)
+        "Error: aborted; the dataset in %s is incomplete (a still of the unfinished round may be "
+        "missing or unchecked); run bin/location create harbour-street --regenerate to start "
+        "again" % ldir)
     assert _record(env)["status"] == "dataset"
 
 
@@ -1576,8 +1584,9 @@ def test_lyd11_a_failure_or_interrupt_in_a_top_up_round(env, monkeypatch, capsys
     assert ld.create(_create_args(name="old-mill", description=lt.MILL_DESC)) == 1
     assert fakes.server_calls == ["stop", "restore-wait", "stop", "restore"]
     assert _err_line(capsys) == (
-        "Error: aborted; the stills made so far are kept in %s; run bin/location create "
-        "old-mill --regenerate to start again" % os.path.join(env["locations"], "old-mill"))
+        "Error: aborted; the dataset in %s is incomplete (a still of the unfinished round may be "
+        "missing or unchecked); run bin/location create old-mill --regenerate to start again"
+        % os.path.join(env["locations"], "old-mill"))
 
 
 def test_lyd12_top_up_seeds_follow_the_location_seed(env, monkeypatch):
@@ -1649,3 +1658,90 @@ def test_ly_review_focus_5_a_still_kept_in_a_top_up_round_is_trained(env, monkey
     assert ld._train_stills(_record(env)) == "ok"
     assert pairs == [(os.path.join(ldir, "stills", "loc_%02d.png" % n),
                       os.path.join(ldir, "captions", "loc_%02d.txt" % n)) for n in range(1, 13)]
+
+
+# --- LYD14, LYD15: the final-review amendments (yield spec Section 9a, LYA1-LYA2) ----------
+
+def test_lyd14_the_photo_check_judges_the_candidate_alone(env, monkeypatch, tmp_path):
+    assert ld._PHOTO_KEYS == (
+        '"people_visible": true when any person or part of a person is visible anywhere in the '
+        'candidate (the second image), else false; people in the reference (the first image) do '
+        'not count. "shot", "time_of_day" and "weather" describe the candidate. "shot": exactly '
+        'one of extreme wide shot, wide shot, medium shot, medium close-up, close-up, extreme '
+        'close-up. "time_of_day": exactly one of dawn, midday, golden hour, dusk, night. '
+        '"weather": exactly one of clear, overcast, rain, fog, snow.')
+    assert ld.CHECK_PHOTO_PROMPT.endswith(" " + ld._PHOTO_KEYS)
+    assert ld.CHECK_PHOTO_PROMPT.count("people_visible") == 1
+    assert "anywhere in the image" not in ld.CHECK_PHOTO_PROMPT
+    # The one-image prompts keep the shared keys byte for byte (LYK2).
+    assert "anywhere in the image" in ld._KEYS
+    assert ld.CHECK_TEXT_PROMPT.endswith(" " + ld._KEYS)
+    assert ld.TAG_PROMPT.endswith(" " + ld._KEYS)
+    # The reply format is unchanged, and people in a candidate still drop it.
+    fakes = _Fakes(monkeypatch, replies={5: dict(PASS, people_visible=True)})
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 3),
+                                  description=lt.MILL_DESC)) == 0
+    stills = os.path.join(env["locations"], "old-mill", "stills")
+    checks = fakes.checks()
+    assert [prompt for prompt, _urls in checks] == (
+        [ld.TAG_PROMPT] * 3 + [ld.CHECK_PHOTO_PROMPT] * 21)
+    assert checks[4][1] == ["file:" + _loc(stills, 2), "file:" + _loc(stills, 5)]
+    item = _manifest(env, "old-mill")["items"][4]
+    assert (item["kept"], item["reason"], item["people_visible"]) == (
+        False, "people visible", True)
+    assert _record(env, "old-mill")["dataset"]["kept"] == 23
+
+
+def _busy_after(monkeypatch, free_calls):
+    """Replace busy_process with a fake that finds nothing for its first free_calls calls (the
+    preflight is the first) and then a render; return the list that records the calls."""
+    calls = []
+
+    def _busy():
+        calls.append(len(calls) + 1)
+        return None if len(calls) <= free_calls else (4242, "python3 bin/ltx-movie render")
+
+    monkeypatch.setattr(character_dataset, "busy_process", _busy)
+    return calls
+
+
+def test_lyd15_a_busy_process_stops_the_top_up(env, monkeypatch, capsys):
+    line = ("top-up: not run; a render or training process is running (pid 4242: python3 "
+            "bin/ltx-movie render)\n")
+    # Busy before round 2: no top-up round runs, and round 1's record stands.
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    calls = _busy_after(monkeypatch, 1)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=5)) == 3
+    ldir = os.path.join(env["locations"], "harbour-street")
+    assert calls == [1, 2]
+    assert [step for _spec, step in fakes.child_specs] == ["generate"]
+    assert fakes.server_calls == ["stop", "restore-wait"]
+    out, err = capsys.readouterr()
+    assert "=== top-up round" not in out
+    assert _in_order(out, [line, "dataset: 11/24 stills kept (minimum 12) in %s\n" % ldir])
+    assert err.strip().splitlines()[-1] == (
+        "Error: only 11/24 stills kept (need 12): 13 score below 7; the dataset is kept in %s; "
+        "run bin/location create harbour-street --regenerate --new-seed, or --regenerate "
+        "--description TEXT with a clearer description" % ldir)
+    data = _record(env)
+    assert (data["status"], data["dataset"]["kept"]) == ("dataset", 11)
+    assert [r["round"] for r in _manifest(env)["rounds"]] == [1]
+    assert len(os.listdir(os.path.join(ldir, "stills"))) == 24
+    # Busy before round 3: round 2 runs, round 3 does not.
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    calls = _busy_after(monkeypatch, 2)
+    assert ld.create(_create_args(name="old-mill", description=lt.MILL_DESC, seed=5)) == 3
+    assert calls == [1, 2, 3]
+    assert [step for _spec, step in fakes.child_specs] == ["generate", "generate-round2"]
+    assert fakes.server_calls == ["stop", "restore-wait"] * 2
+    out = capsys.readouterr().out
+    assert _in_order(out, ["top-up round 2 of 3: kept 11 of 24 (need 12)\n", line,
+                           "dataset: 11/24 stills kept"])
+    assert "=== top-up round 3" not in out
+    assert [r["round"] for r in _manifest(env, "old-mill")["rounds"]] == [1, 2]
+    # Round 1 keeps 24: busy_process runs only at the preflight, as before.
+    _Fakes(monkeypatch)
+    calls = _busy_after(monkeypatch, 1)
+    assert ld.create(_create_args(name="dock-one", description=lt.TEMPLE_DESC)) == 0
+    assert calls == [1]
+    assert "top-up" not in capsys.readouterr().out
