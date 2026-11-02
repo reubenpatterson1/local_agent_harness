@@ -20,14 +20,19 @@ Z-Image hub ($Z_IMAGE_HF_HOME/hub or ~/hf_home/hub, never $HF_HOME).
 Steps: refuse unknown IDs, qwen2511-bf16 and a set SEED_EDIT_MFLUX_PYTHON; read what is present
 (the venv ~/mflux-edit/.venv with mflux 0.24.0; each item intact at its pinned revision); with
 everything present print the report and exit; else check the free space: the needed items' bytes,
-plus 3 GiB for the venv when it is not ready, plus 1 GiB headroom, less what an earlier partial run
-left in their repo directories (and in the venv), so a re-run resumes; check a base Python of 3.11
-or newer (SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python); create the venv; pip install
-mflux==0.24.0; print each needed item's licence (the Qwen Research License items are
-non-commercial); download the needed items (all public; no token); print the sizes and
-bin/seed-edit --probe's verdict for each selected model and LoRA.
+plus 3 GiB for the venv when it is not ready, plus 1 GiB headroom, less what is already present
+(each needed item's snapshot at its pinned revision, each file once, plus the partial blobs of an
+interrupted download; never another revision's snapshot) and the venv, so a re-run resumes; check
+a base Python of 3.11 or newer (SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python); create
+the venv; pip install mflux==0.24.0; print each needed item's licence (the Qwen Research License
+items are non-commercial); download the needed items (all public: the download child gets no
+Hugging Face token variable and HF_HUB_DISABLE_IMPLICIT_TOKEN=1); name each partial blob that still
+blocks a pinned snapshot after the download (an earlier download at another revision left it;
+delete it by hand); print the sizes and bin/seed-edit --probe's verdict for each selected model and
+LoRA.
 
-Exit codes: 0 done or nothing to do; 1 a step failed; 2 a precondition failed.
+Exit codes: 0 done or nothing to do; 1 a step failed, or an orphan partial blob still blocks a
+pinned snapshot; 2 a precondition failed.
 Standard library plus movie_ui_lib and movie_ui_seedgen. Python 3.9 and 3.13.
 """
 
@@ -188,6 +193,56 @@ def snapshot_gib(snapshot):
     return total / 2 ** 30
 
 
+def partial_blobs(repo_dir):
+    """The <repo dir>/blobs/*.incomplete files whose finished blob is absent (lib.intact_scan's partial
+    rule), sorted; [] when there is no blobs directory."""
+    blobs = os.path.join(repo_dir, "blobs")
+    try:
+        names = os.listdir(blobs)
+    except OSError:
+        return []
+    present = set(names)
+    return sorted(os.path.join(blobs, name) for name in names
+                  if name.endswith(".incomplete") and name.split(".", 1)[0] not in present)
+
+
+def present_gib(hub, needed):
+    """Seed models SQ44 step 4 (amended by §14a item A): what the needed items already have on disk, in
+    GiB: per distinct pinned snapshot <hub>/<repo dir>/snapshots/<revision>/ that exists, its files'
+    realpath sizes (each realpath once), plus per distinct repo directory its partial blobs' sizes.
+    Another revision's snapshot and blobs are not counted: the pinned download may not reuse them."""
+    total, snapshots, repo_dirs = 0.0, [], []
+    for item in needed:
+        repo_dir = os.path.join(hub, lib.repo_dir_name(item["repo"]))
+        snapshot = os.path.join(repo_dir, "snapshots", item["revision"])
+        if snapshot not in snapshots and os.path.isdir(snapshot):
+            snapshots.append(snapshot)
+            total += snapshot_gib(snapshot)
+        if repo_dir not in repo_dirs:
+            repo_dirs.append(repo_dir)
+            for path in partial_blobs(repo_dir):
+                try:
+                    total += os.lstat(path).st_size / 2 ** 30
+                except OSError:
+                    pass
+    return total
+
+
+def orphans_of(hub, needed):
+    """Seed models §14a item C: [(item, path)] of the partial blobs that still block a needed snapshot
+    item after its download exited 0 (weights_problem still reports "download incomplete"). An
+    earlier download at another revision left them; the pinned download never completes them, so
+    only deleting them clears the problem."""
+    out = []
+    for item in needed:
+        if item["kind"] != "snapshot":
+            continue
+        problem = weights_problem(dict(seedgen.qwen_model(item["name"]), builtin_lora=None), [hub])[0]
+        if problem is not None and "download incomplete" in problem:
+            out += [(item, path) for path in partial_blobs(os.path.join(hub, lib.repo_dir_name(item["repo"])))]
+    return out
+
+
 def venv_ready(py, venv):
     best = mflux_version(venv)[1]
     return os.access(py, os.X_OK) and best is not None and best[1] == MFLUX_VERSION
@@ -204,9 +259,10 @@ def unique(values):
 
 def selection(args):
     """SQ41: ((model IDs, LoRA IDs), None), or (None, the refusal text). No option at all selects
-    qwen21-q4 and uncensored."""
+    DEFAULT_QWEN_MODEL (qwen21-q4) and its default-on LoRAs (uncensored), from the registry."""
     if args.model is None and args.lora is None:
-        return ([seedgen.DEFAULT_QWEN_MODEL], ["uncensored"]), None
+        model_id = seedgen.DEFAULT_QWEN_MODEL
+        return ([model_id], [lora["id"] for lora in seedgen.default_loras(model_id)]), None
     models, loras = unique(args.model), unique(args.lora)
     for model_id in models:
         if model_id not in seedgen.QWEN_MODEL_IDS:
@@ -318,12 +374,7 @@ def main(argv=None):
         report(venv, hub, models, loras, items)
         return 0
     total = sum(item["bytes"] for item in needed) / 2 ** 30 + (0.0 if venv_ok else VENV_GIB) + HEADROOM_GIB
-    repo_dirs = []
-    for item in needed:
-        repo_dir = os.path.join(hub, lib.repo_dir_name(item["repo"]))
-        if repo_dir not in repo_dirs and os.path.isdir(repo_dir):
-            repo_dirs.append(repo_dir)
-    present = sum(tree_gib(repo_dir) for repo_dir in repo_dirs)
+    present = present_gib(hub, needed)
     if not venv_ok and os.path.isdir(venv):
         present += tree_gib(venv)
     need = max(total - present, 0.0)
@@ -355,13 +406,20 @@ def main(argv=None):
     if needed:
         for item in needed:
             say("license: %s: %s" % (item["name"], item["license"]))
-        env = dict(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0", HF_XET_CHUNK_CACHE_SIZE_BYTES="0",
-                   HF_HUB_ENABLE_HF_TRANSFER="0")
+        env = seedgen.hf_child_env(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0",
+                                   HF_XET_CHUNK_CACHE_SIZE_BYTES="0", HF_HUB_ENABLE_HF_TRANSFER="0")
         code = subprocess.call([py, "-c", DOWNLOAD, hub, json.dumps([download_item(item) for item in needed])],
                                env=env)
         if code != 0:
             return fail(1, "the download exited %d" % code)
+    orphans = orphans_of(hub, needed)
+    for item, path in orphans:
+        say("orphan partial blob %s blocks %s (it is not part of %s@%s); delete it"
+            % (path, item["name"], item["repo"], item["revision"][:12]))
     report(venv, hub, models, loras, items)
+    if orphans:
+        return fail(1, "%d orphan partial blob(s) left by an earlier download block the pinned snapshot; delete the "
+                       "file(s) listed above, then re-run bin/seed-edit-setup" % len(orphans))
     return 0
 
 

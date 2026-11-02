@@ -1228,6 +1228,52 @@ def test_sqt22_the_qwen_box_on_the_page():
                                        "Qwen-Image-Edit-2511 q4 (Lightning)", "qwen9", "Qwen-Image", "flux"]
 
 
+# --- Final fix wave (seed models spec 14a items D, E, F): junk records, an old capability, a failed probe ---------
+
+def test_sq_final_d_e_f_page_guards():
+    """Item D: seedModelText (the run title's and the Runs cell's only text source) skips loras items that are not
+    objects with a string id and reads a qwen_model without a string id as Qwen-Image. Item E: Qwen Generate is
+    disabled with a reason when the capability carries no registry. Item F: a LoRA row's note shows a failed
+    probe's reason, and the rows' key includes the note, so the rows are rebuilt when the probe fails."""
+    _static, texts = _static_texts()
+    js = texts["app.js"]
+    for text in ('    if (model === "qwen" && models && !S.seeds.qwen) {\n'
+                 '      qwenReason = "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui '
+                 'server)";\n    }\n    else if (model === "qwen" && models && S.seeds.qwen) {\n',
+                 '    const cap = capability("seed_edit");\n    const models = cap.models;\n    const state = S.seeds.qwen;\n',
+                 '      return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));\n',
+                 "return [l.id, loraOk(l.id), loraNote(l)];",
+                 'const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: loraNote(l)});',
+                 '$("#se-run-title").textContent = view.run + " · " + seedModelText(view) + ',
+                 '        el("td", {text: seedModelText(r)}), el("td", {text: r.state}), thumbs]);'):
+        assert text in js, text
+    assert js.count("seedModelText(") == 3
+    assert '(found ? found.reason : "probing")' not in js
+    node = shutil.which("node")
+    if not node:
+        return
+    start = js.index("  function seedRegistry() {")
+    helpers = js[start:js.index("  function seedMultiple() {", start)]
+    start = js.index("  function seedModelText(view) {")
+    helpers += js[start:js.index("\n  }\n", start) + len("\n  }\n")]
+    views = [{"model": "qwen", "qwen_model": {"id": "qwen21-q4"}, "loras": [None]},
+             {"model": "qwen", "qwen_model": {"id": "qwen21-q4"},
+              "loras": [None, "x", 3, [], {"scale": 1}, {"id": "uncensored", "scale": 0.5}]},
+             {"model": "qwen", "qwen_model": {}, "loras": []},
+             {"model": "qwen", "qwen_model": {"id": None}, "loras": None},
+             {"model": "qwen", "qwen_model": "qwen21-q4", "loras": "uncensored"},
+             {"model": "qwen", "qwen_model": {"id": 7}, "loras": {"id": "uncensored", "scale": 1}},
+             {"model": "qwen", "qwen_model": {"id": "qwen9"}, "loras": [{"id": "viggle-turbo", "scale": 2}]}]
+    script = ('const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image"};\n'
+              "function capability(name) { return {registry: %s}; }\n%s"
+              "process.stdout.write(JSON.stringify(%s.map(seedModelText)));\n"
+              % (json.dumps(seedgen.registry_view()), helpers, json.dumps(views)))
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["Qwen-Image-2.1 q4", "Qwen-Image-2.1 q4 + uncensored 0.5", "Qwen-Image",
+                                       "Qwen-Image", "Qwen-Image", "Qwen-Image", "qwen9 + viggle-turbo 2"]
+
+
 # --- Review Focus 5: the page's canvas size matches the tool's ----------------------------------------------
 
 CANVAS_CASES = [(1536, 1024), (1024, 1024), (800, 600), (4000, 3000), (3000, 4000), (720, 1280), (1023, 1023),
@@ -1307,7 +1353,7 @@ def test_sqt18_the_setup_script_carries_the_tool_lookups():
                  "HF_XET_CHUNK_CACHE_SIZE_BYTES", 'HF_HUB_ENABLE_HF_TRANSFER="0"', 'VENV = "~/mflux-edit/.venv"',
                  'DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"'):
         assert text in setup, text
-    for text in ("HF_TOKEN", "SETUP_MIN_FREE_GIB", "find_lightning", "Q4_REPO", "EDIT_LORA_REPO"):
+    for text in ("SETUP_MIN_FREE_GIB", "find_lightning", "Q4_REPO", "EDIT_LORA_REPO"):
         assert text not in setup, text
     assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", setup, re.M) == [
         "argparse", "glob", "json", "os", "re", "shutil", "subprocess", "sys", "movie_ui_lib", "movie_ui_seedgen"]

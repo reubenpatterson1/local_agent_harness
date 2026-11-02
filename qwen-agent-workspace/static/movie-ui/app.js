@@ -1808,7 +1808,8 @@
       $("#se-steps").textContent = "checking models…";
       return;
     }
-    const models = capability("seed_edit").models;
+    const cap = capability("seed_edit");
+    const models = cap.models;
     const state = S.seeds.qwen;
     function probe(id) { return models && models.qwen.models[id]; }
     function loraProbe(id) { return models && models.qwen.loras[id]; }
@@ -1833,7 +1834,12 @@
     const entry = seedQwenEntry(chosen);
     const loras = registry.loras.filter(function (l) { return l.family === entry.family; });
     function loraOk(id) { return loraProbe(id) ? loraProbe(id).ok === true : false; }
-    const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id)]; }));
+    function loraNote(l) {
+      if (loraOk(l.id)) { return l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : ""); }
+      const found = loraProbe(l.id);
+      return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));
+    }
+    const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id), loraNote(l)]; }));
     if (key !== S.seeds.qwenKey) {
       S.seeds.qwenKey = key;
       const box = clear($("#se-loras"));
@@ -1849,10 +1855,7 @@
           checkbox.disabled = !ok;
           const scale = el("input", {type: "number", id: "se-lora-scale-" + l.id, min: "0", max: "2", step: "0.05", value: saved.scale});
           scale.disabled = !ok;
-          const found = loraProbe(l.id);
-          const text = ok ? l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : "")
-            : "unavailable — " + (found ? found.reason : "probing");
-          const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: text});
+          const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: loraNote(l)});
           box.appendChild(el("div", {cls: "se-lora", data: {lora: l.id}}, [el("label", {}, [checkbox, " " + l.label]),
             el("label", {}, ["strength ", scale]), note]));
         });
@@ -1883,11 +1886,14 @@
   function seedModelText(view) {
     if (view.model !== "qwen") { return SEED_MODEL_LABELS[view.model] || String(view.model); }
     let text = SEED_MODEL_LABELS.qwen;
-    if (view.qwen_model) {
-      const entry = seedQwenEntry(view.qwen_model.id);
-      text = entry ? entry.label : String(view.qwen_model.id);
+    const qm = view.qwen_model;
+    if (qm && typeof qm === "object" && typeof qm.id === "string") {
+      const entry = seedQwenEntry(qm.id);
+      text = entry ? entry.label : qm.id;
     }
-    const loras = view.loras || [];
+    const loras = (Array.isArray(view.loras) ? view.loras : []).filter(function (l) {
+      return l !== null && typeof l === "object" && typeof l.id === "string";
+    });
     if (loras.length) { text += " + " + loras.map(function (l) { return l.id + " " + l.scale; }).join(", "); }
     return text;
   }
@@ -1959,7 +1965,10 @@
     }
     const entry = models && models[model];
     let qwenReason = "";
-    if (model === "qwen" && models && S.seeds.qwen) {
+    if (model === "qwen" && models && !S.seeds.qwen) {
+      qwenReason = "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui server)";
+    }
+    else if (model === "qwen" && models && S.seeds.qwen) {
       const chosen = seedQwenEntry(S.seeds.qwen.model);
       const found = models.qwen.models[S.seeds.qwen.model];
       if (!(found && found.ok === true)) {

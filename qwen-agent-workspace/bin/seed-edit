@@ -428,19 +428,22 @@ def qwen_hubs():
     return [lib.zimage_hub(), default_hub()]
 
 
-def mflux_env_problem():
-    """Seed models SQ16: None when the mflux venv holds mflux 0.24.0 or newer, else the first problem."""
+def mflux_env_problem(entry):
+    """Seed models SQ16 (amended by §14a item H): None when the mflux venv holds mflux 0.24.0 or newer,
+    else the first problem. The setup hint names entry's own --model, so one setup run installs the
+    venv and that model."""
+    setup = "(run bin/seed-edit-setup --model %s)" % entry["id"]
     py = mflux_python()
     if not os.access(py, os.X_OK):
-        return "no mflux venv at %s (run bin/seed-edit-setup)" % py
+        return "no mflux venv at %s %s" % (py, setup)
     venv = os.path.dirname(os.path.dirname(py))
     count, best = mflux_version(venv)
     if count == 0:
-        return "mflux is not installed in %s (run bin/seed-edit-setup)" % venv
+        return "mflux is not installed in %s %s" % (venv, setup)
     if best is None:
         return "cannot read the mflux version in %s" % venv
     if best[0] < MFLUX_MIN_VERSION:
-        return "mflux %s in %s is older than 0.24.0 (run bin/seed-edit-setup)" % (best[1], venv)
+        return "mflux %s in %s is older than 0.24.0 %s" % (best[1], venv, setup)
     return None
 
 
@@ -458,7 +461,7 @@ def qwen_model_problem(entry):
     for a ready mflux entry, else {}."""
     if entry["backend"] == "diffusers":
         return bf16_problem(), {}
-    problem = mflux_env_problem()
+    problem = mflux_env_problem(entry)
     if problem is not None:
         return problem, {}
     problem, model_path, builtin_lora = weights_problem(entry, qwen_hubs())
@@ -806,8 +809,8 @@ def run_mflux(ctx):
         finish(ctx, n, "ok", seconds)
 
     argv = [mflux_python(), os.path.join(WS, "seed_edit_mflux_child.py"), "--spec", spec_path]
-    return run_qwen_child(ctx, ctx["label"], argv, dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1"),
-                          handle)
+    return run_qwen_child(ctx, ctx["label"], argv,
+                          seedgen.hf_child_env(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1"), handle)
 
 
 # ---------------------------------------------------------------------------

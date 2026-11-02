@@ -91,6 +91,7 @@ DEFAULT_QWEN_MODEL = "qwen21-q4"
 LEGACY_QWEN_MODEL = "qwen2511-q4"
 SCALE_MAX = 2.0
 LORAS_MSG = "loras must be a list of {id, scale}"
+HF_TOKEN_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
 
 def _absent(body, key):
@@ -318,3 +319,15 @@ def availability_error(models, detail, clean):
         if not found["ok"]:
             return "LoRA %s is unavailable: %s" % (lora["label"], found["reason"])
     return None
+
+
+def hf_child_env(environ, **extra):
+    """Seed models §14a item B: the environment of bin/seed-edit's mflux child and bin/seed-edit-setup's
+    download child: a copy of environ with extra set, without the HF_TOKEN_VARS keys and with
+    HF_HUB_DISABLE_IMPLICIT_TOKEN "1", so no Hugging Face token reaches either child (every download is
+    public; the mflux child is offline). environ itself is not changed."""
+    env = dict(environ, **extra)
+    for key in HF_TOKEN_VARS:
+        env.pop(key, None)
+    env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    return env

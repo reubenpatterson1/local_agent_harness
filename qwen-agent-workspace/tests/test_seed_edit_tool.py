@@ -703,16 +703,19 @@ def test_sqt3_the_pinned_lookups(env):
     py = os.path.join(env["tmp"], "mflux-edit", ".venv", "bin", "python")
     venv = os.path.dirname(os.path.dirname(py))
     mp.setenv("SEED_EDIT_MFLUX_PYTHON", py)
-    assert tool.mflux_env_problem() == "no mflux venv at %s (run bin/seed-edit-setup)" % py
+    hint = "(run bin/seed-edit-setup --model qwen21-q8)"
+    assert tool.mflux_env_problem(q8) == "no mflux venv at %s %s" % (py, hint)
     mflux_venv(env, version=None)
-    assert tool.mflux_env_problem() == "mflux is not installed in %s (run bin/seed-edit-setup)" % venv
+    assert tool.mflux_env_problem(q8) == "mflux is not installed in %s %s" % (venv, hint)
     set_mflux_version(venv, "banana")
-    assert tool.mflux_env_problem() == "cannot read the mflux version in %s" % venv
+    assert tool.mflux_env_problem(q8) == "cannot read the mflux version in %s" % venv
     set_mflux_version(venv, "0.23.9")
-    assert tool.mflux_env_problem() == "mflux 0.23.9 in %s is older than 0.24.0 (run bin/seed-edit-setup)" % venv
+    assert tool.mflux_env_problem(q8) == "mflux 0.23.9 in %s is older than 0.24.0 %s" % (venv, hint)
+    assert tool.mflux_env_problem(q4) == ("mflux 0.23.9 in %s is older than 0.24.0 "
+                                          "(run bin/seed-edit-setup --model qwen21-q4)" % venv)
     for version in ("0.24.0", "0.25.1"):
         set_mflux_version(venv, version)
-        assert tool.mflux_env_problem() is None
+        assert tool.mflux_env_problem(q8) is None
     assert tool.qwen_model_problem(q8) == (None, {"model_path": q8_snapshot, "builtin_lora": None})
     mp.setattr(tool, "missing_modules", lambda names: ["torch"])
     assert tool.qwen_model_problem(q8) == ("torch not importable by %s" % sys.executable, {})
@@ -908,7 +911,7 @@ def test_sqt7_run_time_refusals(env, capsys):
     code, run_dir = run_tool(env, "--qwen-model", "qwen21-q4", model="qwen", run=R5)
     assert code == 2
     _refused(run_dir, "Qwen-Image-2.1 q4 is unavailable: mflux 0.23.0 in %s is older than 0.24.0 "
-                      "(run bin/seed-edit-setup)" % venv, capsys.readouterr())
+                      "(run bin/seed-edit-setup --model qwen21-q4)" % venv, capsys.readouterr())
     assert stub_calls(py) == [] and stub_calls(stub) == []
     set_mflux_version(venv, "0.24.0")
     stub_config(py, {"fail_after": 1})
@@ -1056,7 +1059,7 @@ def test_sgt13_the_probe(env, capsys):
     missing = os.path.join(env["tmp"], "none", "bin", "python")
     mp.setenv("SEED_EDIT_MFLUX_PYTHON", missing)
     assert tool.probe()["qwen"]["models"]["qwen2511-q4"] == {
-        "ok": False, "reason": "no mflux venv at %s (run bin/seed-edit-setup)" % missing}
+        "ok": False, "reason": "no mflux venv at %s (run bin/seed-edit-setup --model qwen2511-q4)" % missing}
     proc = subprocess.run([sys.executable, "-X", "importtime", TOOL_PATH, "--probe"], capture_output=True,
                           text=True, timeout=60, cwd=env["tmp"])
     assert proc.returncode == 0, proc.stderr
@@ -1448,7 +1451,8 @@ def load_setup():
 @pytest.fixture
 def setup_env(env):
     """bin/seed-edit-setup loaded in-process with spec 9.1's replacements: subprocess.call and .run record
-    their argv (and env) and return 0, free_gib returns rec["free"] (100 GiB), venv_ready returns
+    their argv (and env) and return 0 (the probe's stdout is rec["probe"], "" by default), free_gib
+    returns rec["free"] (100 GiB), venv_ready returns
     rec["ready"] (False), and SEED_EDIT_SETUP_PYTHON is an executable stub under tmp. Nothing is started,
     downloaded or installed."""
     setup = load_setup()
@@ -1458,7 +1462,7 @@ def setup_env(env):
         f.write("#!/bin/sh\nexit 0\n")
     os.chmod(base, 0o755)
     mp.setenv("SEED_EDIT_SETUP_PYTHON", base)
-    rec = {"call": [], "run": [], "free": 100.0, "ready": False}
+    rec = {"call": [], "run": [], "free": 100.0, "ready": False, "probe": ""}
 
     def call(argv, env=None):
         rec["call"].append({"argv": list(argv), "env": env})
@@ -1468,7 +1472,7 @@ def setup_env(env):
         rec["run"].append(list(argv))
         if argv[0] == base:
             return types.SimpleNamespace(returncode=0, stdout="3.13\n", stderr="")
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout=rec["probe"], stderr="")
 
     mp.setattr(setup.subprocess, "call", call)
     mp.setattr(setup.subprocess, "run", run)
@@ -1691,6 +1695,13 @@ def test_sq_review_focus_4_an_old_main_2511_snapshot(setup_env, capsys):
     mark_ready(e)
     total = (entry["bytes"] + entry["builtin_lora"]["bytes"]) / 2 ** 30 + 1.0
     rec["free"] = total - 2 / 1024
+    assert setup.main(["--model", "qwen2511-q4"]) == 2
+    where = min(setup.existing_ancestor(e["hub"]), setup.existing_ancestor(os.path.dirname(e["venv"])))
+    assert capsys.readouterr().err == (
+        "Error: only 28.8 GiB free on %s; seed-edit-setup needs at least 28.8 GiB more (28.8 GiB in all, 0.0 GiB "
+        "already present; qwen2511-q4 ~26.97 GiB, lightning ~0.79 GiB, 1 GiB headroom)\n" % where)
+    assert rec["call"] == []
+    rec["free"] = total
     assert setup.main(["--model", "qwen2511-q4"]) == 0
     assert downloads(rec) == [[{"kind": "snapshot", "repo": entry["repo"], "revision": entry["revision"],
                                 "allow_patterns": None}, LIGHTNING_ITEM]]
@@ -1698,6 +1709,179 @@ def test_sq_review_focus_4_an_old_main_2511_snapshot(setup_env, capsys):
     assert "seed-edit-setup: license: qwen2511-q4: Apache-2.0" in out
     assert "seed-edit-setup: license: lightning: Apache-2.0" in out
     assert os.path.isdir(os.path.join(old, "snapshots", REV))
+
+
+# --- Final fix wave (seed models spec 14a items A, B, C, G, I) -----------------------------------------------------
+
+def test_sq_final_a_the_floor_counts_only_the_pinned_revision(setup_env, capsys):
+    """Item A: present counts each needed item's pinned snapshot (each realpath once) and the partial blobs whose
+    finished blob is absent; another revision's snapshot and blobs and a stale .incomplete sidecar are not
+    counted."""
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    files = dict(QWEN21_FILES)
+    files["transformer/0.safetensors"] = b"\x01" * (3 * 2 ** 20)
+    del files["processor/tokenizer.json"]
+    snapshot = pinned_cache(os.path.join(e["tmp"], "zi"), Q4_ITEM["repo"], Q4_ITEM["revision"], files)
+    weights = os.path.join(snapshot, "transformer", "0.safetensors")
+    os.symlink(os.readlink(weights), os.path.join(snapshot, "transformer", "1.safetensors"))
+    repo_dir = os.path.dirname(os.path.dirname(snapshot))
+    blobs = os.path.join(repo_dir, "blobs")
+    for name, size in (("old0", 5 * 2 ** 20), ("beef", 8), ("beef.incomplete", 2 * 2 ** 20)):
+        with open(os.path.join(blobs, name), "wb") as f:
+            f.truncate(size)
+    old = os.path.join(repo_dir, "snapshots", REV, "transformer")
+    os.makedirs(old)
+    os.symlink(os.path.join("..", "..", "..", "blobs", "old0"), os.path.join(old, "old.safetensors"))
+    unc_blobs = os.path.join(e["hub"], lib.repo_dir_name(UNC_ITEM["repo"]), "blobs")
+    os.makedirs(unc_blobs)
+    with open(os.path.join(unc_blobs, "cafe.incomplete"), "wb") as f:
+        f.truncate(2 ** 20)
+    needed = setup.items_of(["qwen21-q4"], ["uncensored"])
+    assert [setup.item_ok(item, e["hub"]) for item in needed] == [False, False]
+    assert setup.partial_blobs(repo_dir) == []
+    assert setup.partial_blobs(os.path.dirname(unc_blobs)) == [os.path.join(unc_blobs, "cafe.incomplete")]
+    assert setup.partial_blobs(os.path.join(e["tmp"], "nowhere")) == []
+    assert setup.present_gib(e["hub"], needed) == pytest.approx((4 * 2 ** 20 + 6) / 2 ** 30, abs=1e-12)
+    total = (10638928735 + 33586704) / 2 ** 30 + 3.0 + 1.0
+    rec["free"] = total - 4.1 / 1024
+    assert setup.main([]) == 2
+    assert "seed-edit-setup needs at least" in capsys.readouterr().err
+    assert rec["call"] == []
+    rec["free"] = total - 3.9 / 1024
+    assert setup.main([]) == 0
+    assert downloads(rec) == [[Q4_ITEM, UNC_ITEM]]
+
+
+def test_sq_final_b_no_token_reaches_the_mflux_child(env):
+    """Item B: the mflux child's env has no HF_TOKEN or HUGGING_FACE_HUB_TOKEN even when this process has them
+    (dummy values), and has HF_HUB_DISABLE_IMPLICIT_TOKEN=1 beside SG20's HF_HUB_OFFLINE=1. No assert compares
+    the whole env dict: it holds this process's environment, which a failure message would print."""
+    tool, mp = env["tool"], env["mp"]
+    mp.setenv("HF_TOKEN", "dummy-not-a-token")
+    mp.setenv("HUGGING_FACE_HUB_TOKEN", "dummy-not-a-token")
+    mp.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    mflux_venv(env)
+    install_model(env, "qwen21-q4")
+    install_lora(env, "uncensored")
+    seen, real = [], tool.run_child
+
+    def spy(argv, child_env, on_line):
+        seen.append(dict(child_env))
+        return real(argv, child_env, on_line)
+
+    mp.setattr(tool, "run_child", spy)
+    code, run_dir = run_tool(env, "--qwen-model", "qwen21-q4", "--lora", "uncensored=1", "--candidates", "1",
+                             model="qwen")
+    assert code == 0 and statuses(run_dir) == ["ok"]
+    assert len(seen) == 1
+    child = seen[0]
+    assert sorted(k for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN") if k in child) == []
+    assert (child["HF_HUB_DISABLE_IMPLICIT_TOKEN"], child["HF_HUB_OFFLINE"], child["PYTHONUNBUFFERED"]) == (
+        "1", "1", "1")
+    assert child["HOME"] == os.environ["HOME"]
+    assert os.environ["HF_TOKEN"] == "dummy-not-a-token"
+
+
+def test_sq_final_b_no_token_reaches_the_download(setup_env):
+    """Item B (amends SQ45, SQT18): the download child's env has no HF_TOKEN or HUGGING_FACE_HUB_TOKEN even when
+    this process has them (dummy values), has HF_HUB_DISABLE_IMPLICIT_TOKEN=1 and keeps SQ44 step 8's four values;
+    seedgen.hf_child_env is the one rule both scripts use. No assert compares the whole env dict (a failure
+    message would print this process's environment)."""
+    e = setup_env
+    setup, rec, mp = e["setup"], e["rec"], e["mp"]
+    mp.setenv("HF_TOKEN", "dummy-not-a-token")
+    mp.setenv("HUGGING_FACE_HUB_TOKEN", "dummy-not-a-token")
+    mp.delenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", raising=False)
+    assert setup.main([]) == 0
+    calls = [c for c in rec["call"] if c["argv"][1] == "-c"]
+    assert len(calls) == 1
+    child = calls[0]["env"]
+    assert sorted(k for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN") if k in child) == []
+    assert {k: child[k] for k in ("HF_HUB_DISABLE_IMPLICIT_TOKEN", "HF_HOME", "HF_HUB_OFFLINE",
+                                  "HF_XET_CHUNK_CACHE_SIZE_BYTES", "HF_HUB_ENABLE_HF_TRANSFER")} == {
+        "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1", "HF_HOME": os.path.dirname(e["hub"]), "HF_HUB_OFFLINE": "0",
+        "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    assert child["HOME"] == os.environ["HOME"]
+    assert seedgen.HF_TOKEN_VARS == ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+    given = {"HF_TOKEN": "dummy", "HUGGING_FACE_HUB_TOKEN": "dummy", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "0", "A": "1"}
+    assert seedgen.hf_child_env(given, B="2") == {"A": "1", "B": "2", "HF_HUB_DISABLE_IMPLICIT_TOKEN": "1"}
+    assert given["HF_TOKEN"] == "dummy"
+
+
+def test_sq_final_c_an_orphan_partial_blob_is_named(setup_env, capsys):
+    """Item C: a partial blob the pinned download never completes (an older-main download left it) still blocks
+    the pinned snapshot after a download that exited 0: setup names each such file, says to delete it, prints the
+    report and exits 1; once it is deleted the snapshot is intact."""
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    mark_ready(e)
+    snapshot, _none = install_model(e, "qwen21-q4")
+    install_lora(e, "uncensored")
+    orphan = os.path.join(os.path.dirname(os.path.dirname(snapshot)), "blobs", "dead.incomplete")
+    with open(orphan, "wb") as f:
+        f.write(b"x")
+    assert setup.main([]) == 1
+    captured = capsys.readouterr()
+    assert downloads(rec) == [[Q4_ITEM]]
+    out = captured.out.splitlines()
+    line = ("seed-edit-setup: orphan partial blob %s blocks qwen21-q4 (it is not part of "
+            "mflux-community/qwen-image-2-1-mflux-q4@b6c0fc763506); delete it" % orphan)
+    assert out.count(line) == 1
+    assert out.index(line) < [x.startswith("seed-edit-setup: venv ") for x in out].index(True)
+    assert captured.err == ("Error: 1 orphan partial blob(s) left by an earlier download block the pinned snapshot; "
+                            "delete the file(s) listed above, then re-run bin/seed-edit-setup\n")
+    os.remove(orphan)
+    rec["call"] = []
+    assert setup.main([]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "seed-edit-setup: nothing to do"
+    assert rec["call"] == []
+
+
+def test_sq_final_g_the_setup_probe_lines(setup_env, capsys):
+    """Item G (SQ44 step 9): one probe line per selected model, then per selected LoRA, in selection order, from
+    the last line of bin/seed-edit --probe; an answer missing a selected ID, or not the probe's shape, prints the
+    unparsable line once."""
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    mark_ready(e)
+    models = dict((i, {"ok": True, "reason": None}) for i in seedgen.QWEN_MODEL_IDS)
+    models["qwen21-q8"] = {"ok": False, "reason": "q8 is not here"}
+    loras = {"uncensored": {"ok": True, "reason": None}, "viggle-turbo": {"ok": False, "reason": "viggle is not here"}}
+    answer = {"zimage": {"ok": True, "reason": None, "backend": "zimage"},
+              "qwen": {"ok": True, "reason": None, "models": models, "loras": loras}}
+    rec["probe"] = "a log line\n" + json.dumps(answer) + "\n"
+    argv = ["--model", "qwen21-q8", "--model", "qwen21-q4", "--lora", "viggle-turbo", "--lora", "uncensored"]
+    assert setup.main(argv) == 0
+    assert capsys.readouterr().out.splitlines()[-4:] == [
+        "seed-edit-setup: probe: qwen21-q8 unavailable: q8 is not here", "seed-edit-setup: probe: qwen21-q4 ok",
+        "seed-edit-setup: probe: viggle-turbo unavailable: viggle is not here", "seed-edit-setup: probe: uncensored ok"]
+    assert rec["run"][-1] == [sys.executable, os.path.join(WS, "bin", "seed-edit"), "--probe"]
+    del models["qwen21-q4"]
+    unparsable = "seed-edit-setup: probe: unavailable: bin/seed-edit --probe printed unparsable output"
+    for text in (json.dumps(answer), "", "{", "[]", json.dumps({"qwen": None})):
+        rec["probe"] = text
+        assert setup.main(argv) == 0, text
+        out = capsys.readouterr().out.splitlines()
+        assert out[-1] == unparsable and out.count(unparsable) == 1, text
+        assert not [x for x in out if x.startswith("seed-edit-setup: probe: qwen")], text
+
+
+def test_sq_final_i_the_default_selection_follows_the_registry(setup_env):
+    """Item I (SQ41): no option selects DEFAULT_QWEN_MODEL and the LoRAs seedgen.default_loras gives it."""
+    e = setup_env
+    setup = e["setup"]
+    none = types.SimpleNamespace(model=None, lora=None)
+    assert setup.selection(none) == ((["qwen21-q4"], ["uncensored"]), None)
+    asked = []
+
+    def default_loras(model_id):
+        asked.append(model_id)
+        return [{"id": "viggle-turbo", "scale": 1.0}]
+
+    e["mp"].setattr(setup.seedgen, "default_loras", default_loras)
+    assert setup.selection(none) == ((["qwen21-q4"], ["viggle-turbo"]), None)
+    assert asked == ["qwen21-q4"]
 
 
 def test_sg_final_a_phone_hdr_jpeg_is_a_jpeg(env):
