@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""seed-edit-setup -- create the mflux venv and download the Qwen-Image-Edit-2511 q4 weights and the
+Lightning LoRA that bin/seed-edit's mflux q4 backend needs
+(docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 7).
+
+  bin/seed-edit-setup
+
+Run only by the controller on the user's go; never by a test. Steps: refuse when
+SEED_EDIT_MFLUX_PYTHON is set; read what is present (the venv ~/mflux-edit/.venv with mflux
+0.24.0, the q4 repo and the Lightning file in the Z-Image hub); with all three present, print the
+sizes and exit; else check 31 GiB of free space and a base Python of 3.11 or newer
+(SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python), create the venv, pip install
+mflux==0.24.0, download the q4 repo snapshot and the single Lightning file (both public; no token)
+into the Z-Image hub ($Z_IMAGE_HF_HOME/hub or ~/hf_home/hub, never $HF_HOME), then print the sizes
+and bin/seed-edit --probe's Qwen-Image-Edit verdict. Re-running after success only prints;
+re-running after a partial download resumes it.
+
+Exit codes: 0 done or nothing to do; 1 a step failed; 2 a precondition failed.
+Standard library plus movie_ui_lib. Python 3.9 and 3.13.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import movie_ui_lib as lib  # noqa: E402
+
+VENV = "~/mflux-edit/.venv"
+MFLUX_SPEC = "mflux==0.24.0"
+MFLUX_VERSION = "0.24.0"
+SETUP_MIN_FREE_GIB = 31.0
+DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+Q4_REPO = "mflux-community/qwen-image-edit-2511-mflux-q4"
+EDIT_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+EDIT_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
+DOWNLOAD = ("import sys\n"
+            "from huggingface_hub import hf_hub_download, snapshot_download\n"
+            "hub, repo, lora_repo, lora_file = sys.argv[1:5]\n"
+            "print(snapshot_download(repo_id=repo, cache_dir=hub), flush=True)\n"
+            "print(hf_hub_download(repo_id=lora_repo, filename=lora_file, cache_dir=hub), flush=True)\n")
+
+
+def say(text):
+    print("seed-edit-setup: " + text, flush=True)
+
+
+def fail(code, text):
+    sys.stderr.write("Error: %s\n" % text)
+    return code
+
+
+def mflux_version(venv):
+    """bin/seed-edit's mflux_version, copied with identical behaviour: (number of
+    mflux-*.dist-info/METADATA files in venv, (parsed, text) of the highest version that parses or
+    None)."""
+    paths = sorted(glob.glob(os.path.join(venv, "lib", "python*", "site-packages", "mflux-*.dist-info",
+                                          "METADATA")))
+    best = None
+    for path in paths:
+        text = None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Version: "):
+                        text = line[len("Version: "):].strip()
+                        break
+        except OSError:
+            continue
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", text or "")
+        if match:
+            parsed = tuple(int(g) for g in match.groups())
+            if best is None or parsed > best[0]:
+                best = (parsed, text)
+    return len(paths), best
+
+
+def find_lightning(hubs):
+    """bin/seed-edit's find_lightning, copied with identical behaviour."""
+    for hub in hubs:
+        snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)))[0]
+        if snapshot is None:
+            continue
+        path = os.path.join(snapshot, EDIT_LORA_FILE)
+        real = os.path.realpath(path)
+        if os.path.isfile(real) and os.path.getsize(real) > 0:
+            return path
+    return None
+
+
+def existing_ancestor(path):
+    path = os.path.abspath(path)
+    while not os.path.exists(path) and os.path.dirname(path) != path:
+        path = os.path.dirname(path)
+    return path
+
+
+def free_gib(path):
+    return shutil.disk_usage(path).free / 2 ** 30
+
+
+def tree_gib(path):
+    """The sum of the lstat sizes under path (symlinks not followed), in GiB."""
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass
+    return total / 2 ** 30
+
+
+def snapshot_gib(snapshot):
+    """The sum of the realpath sizes of the snapshot's files, each realpath once, in GiB."""
+    seen, total = set(), 0
+    for dirpath, _dirnames, filenames in os.walk(snapshot):
+        for name in filenames:
+            real = os.path.realpath(os.path.join(dirpath, name))
+            if real not in seen and os.path.isfile(real):
+                seen.add(real)
+                total += os.path.getsize(real)
+    return total / 2 ** 30
+
+
+def venv_ready(py, venv):
+    best = mflux_version(venv)[1]
+    return os.access(py, os.X_OK) and best is not None and best[1] == MFLUX_VERSION
+
+
+def report(venv, hub):
+    """Step 9: the sizes, then bin/seed-edit --probe's Qwen-Image-Edit verdict (informational)."""
+    say("venv %s: %.2f GiB" % (venv, tree_gib(venv) if os.path.isdir(venv) else 0.0))
+    snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(Q4_REPO)))[0]
+    if snapshot is not None and os.path.isdir(snapshot):
+        say("q4 %s: %.2f GiB" % (snapshot, snapshot_gib(snapshot)))
+    else:
+        say("q4 %s is not in %s" % (Q4_REPO, hub))
+    lora = find_lightning([hub])
+    if lora is not None:
+        say("Lightning %s: %.2f GiB" % (lora, os.path.getsize(os.path.realpath(lora)) / 2 ** 30))
+    else:
+        say("Lightning %s is not in %s" % (EDIT_LORA_FILE, hub))
+    ancestor = existing_ancestor(hub)
+    say("free on %s: %.1f GiB" % (ancestor, free_gib(ancestor)))
+    proc = subprocess.run([sys.executable, os.path.join(WS, "bin", "seed-edit"), "--probe"],
+                          capture_output=True, text=True)
+    try:
+        qwen = json.loads(lib.last_line(proc.stdout))["qwen"]
+        verdict = ("ok (%s)" % qwen["backend"]) if qwen["ok"] else ("unavailable: %s" % qwen["reason"])
+    except (ValueError, KeyError, TypeError):
+        verdict = "unavailable: bin/seed-edit --probe printed unparsable output"
+    say("probe: Qwen-Image-Edit " + verdict)
+
+
+def main(argv=None):
+    """bin/seed-edit-setup (SG66-SG69). Returns the exit code."""
+    argparse.ArgumentParser(prog="seed-edit-setup", description="Create ~/mflux-edit/.venv (mflux 0.24.0) "
+                            "and download the q4 Qwen-Image-Edit-2511 weights and the Lightning LoRA "
+                            "into the Z-Image hub.").parse_args(argv)
+    if os.environ.get("SEED_EDIT_MFLUX_PYTHON"):
+        return fail(2, "SEED_EDIT_MFLUX_PYTHON is set; unset it to set up the default venv at ~/mflux-edit/.venv")
+    venv = os.path.expanduser(VENV)
+    py = os.path.join(venv, "bin", "python")
+    hub = lib.zimage_hub()
+    venv_ok = venv_ready(py, venv)
+    q4_ok = lib.model_check(Q4_REPO, hub)[0]
+    lora_ok = find_lightning([hub]) is not None
+    if venv_ok and q4_ok and lora_ok:
+        say("nothing to do")
+        report(venv, hub)
+        return 0
+    frees = [(free_gib(p), p) for p in (existing_ancestor(hub), existing_ancestor(os.path.dirname(venv)))]
+    free, where = min(frees)
+    if free < SETUP_MIN_FREE_GIB:
+        return fail(2, "only %.1f GiB free on %s; seed-edit-setup needs at least %g GiB (q4 weights ~29 GB, "
+                       "Lightning LoRA ~0.85 GB, mflux venv)" % (free, where, SETUP_MIN_FREE_GIB))
+    base = os.environ.get("SEED_EDIT_SETUP_PYTHON") or DEFAULT_BASE_PYTHON
+    if not os.access(base, os.X_OK):
+        return fail(2, "base python %s is not executable (set SEED_EDIT_SETUP_PYTHON)" % base)
+    proc = subprocess.run([base, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                          capture_output=True, text=True)
+    version = proc.stdout.strip()
+    match = re.fullmatch(r"(\d+)\.(\d+)", version)
+    if proc.returncode != 0 or not match or (int(match.group(1)), int(match.group(2))) < (3, 11):
+        return fail(2, "base python %s is Python %s; mflux 0.24.0 needs 3.11 or newer" % (base, version or "?"))
+    if not os.path.exists(py):
+        code = subprocess.call([base, "-m", "venv", venv])
+        if code != 0:
+            return fail(1, "python -m venv exited %d" % code)
+    if not venv_ready(py, venv):
+        code = subprocess.call([py, "-m", "pip", "install", MFLUX_SPEC])
+        if code != 0:
+            return fail(1, "pip install mflux==0.24.0 exited %d" % code)
+    if not (q4_ok and lora_ok):
+        env = dict(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0", HF_XET_CHUNK_CACHE_SIZE_BYTES="0")
+        code = subprocess.call([py, "-c", DOWNLOAD, hub, Q4_REPO, EDIT_LORA_REPO, EDIT_LORA_FILE], env=env)
+        if code != 0:
+            return fail(1, "the download exited %d" % code)
+    report(venv, hub)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

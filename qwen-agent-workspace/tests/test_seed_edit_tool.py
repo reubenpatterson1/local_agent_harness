@@ -801,3 +801,61 @@ def test_sg_review_focus_4_progress_bars_in_child_lines(env, capsys):
     code, run_dir = run_tool(env, "--candidates", "2", "--seed", "1", model="qwen", run=R2)
     assert code == 0 and statuses(run_dir) == ["ok", "ok"]
     assert record_of(run_dir)["backend"] == "diffusers-bf16"
+
+
+# --- SGT15 (SG24, SG25, SG27): the mflux child ---------------------------------------------------------
+
+def test_sgt15_the_mflux_child(monkeypatch, tmp_path, capsys):
+    import seed_edit_mflux_child as child
+    with open(os.path.join(WS, "seed_edit_mflux_child.py"), encoding="utf-8") as f:
+        source = f.read()
+    assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
+        "argparse", "importlib.metadata", "json", "os", "re", "sys", "threading", "time"]
+    for text, want in (("0.24.0", (0, 24, 0)), ("0.22.0", (0, 22, 0)), ("0.21.9", (0, 21, 9)), ("x", None),
+                       (None, None)):
+        assert child.parse_version(text) == want, text
+    assert child.parse_version("0.21.9") < child.MIN_VERSION <= child.parse_version("0.22.0")
+    monkeypatch.setattr(child, "exit_with_parent", lambda poll_s=2.0: None)
+    monkeypatch.setattr(child.importlib.metadata, "version", lambda name: "0.21.0")
+    missing = os.path.join(str(tmp_path), "missing-spec.json")
+    assert child.main(["--spec", missing]) == 2
+    assert capsys.readouterr().out == ("seed-edit-child: mflux 0.21.0 is missing or older than 0.22.0; refusing "
+                                       "(it would run Qwen-Image-Edit-2509)\n")
+
+    def not_installed(name):
+        raise child.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(child.importlib.metadata, "version", not_installed)
+    assert child.main(["--spec", missing]) == 2
+    assert capsys.readouterr().out.startswith("seed-edit-child: mflux None is missing or older than 0.22.0")
+    for text in ('guidance=spec["guidance"]', "bake_lora=False", 'negative_prompt=" "',
+                 "ModelConfig.qwen_image_edit_2511()", "quantize=None", "lora_scales=[1.0]"):
+        assert text in source, text
+
+
+# --- SGT16 (SG66-SG69): bin/seed-edit-setup is read, never run ------------------------------------------
+
+def _code_of(source, name):
+    """The text of function name in source, without its docstring."""
+    start = source.index("\ndef %s(" % name)
+    text = source[start:source.index("\n\n\n", start)]
+    doc = text.index('"""')
+    return text[:doc] + text[text.index('"""', doc + 3) + 3:]
+
+
+def test_sgt16_the_setup_script_is_read_never_run():
+    with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
+        source = f.read()
+    with open(TOOL_PATH, encoding="utf-8") as f:
+        tool_source = f.read()
+    assert source.startswith("#!/usr/bin/env python3\n")
+    for text in ('"mflux==0.24.0"', "SETUP_MIN_FREE_GIB = 31.0", "HF_XET_CHUNK_CACHE_SIZE_BYTES", "cache_dir=hub",
+                 'VENV = "~/mflux-edit/.venv"',
+                 'DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"'):
+        assert text in source, text
+    assert "HF_TOKEN" not in source
+    tool = load_tool()
+    for name in ("Q4_REPO", "EDIT_LORA_REPO", "EDIT_LORA_FILE"):
+        assert '%s = "%s"' % (name, getattr(tool, name)) in source, name
+    for name in ("mflux_version", "find_lightning"):
+        assert _code_of(source, name) == _code_of(tool_source, name), name
