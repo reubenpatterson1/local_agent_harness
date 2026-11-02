@@ -126,14 +126,18 @@ exec /usr/bin/python3 "$STUB_SERVER_PY" "$STORY_SERVER_PORT" "${STUB_MODEL_ID:-q
     --model-id "${STUB_MODEL_ID:-qwen38-6bit}"
 """
 
-# stub-bin/mlx-vlm-python -- stands in for $STORY_SERVER_MLX_VLM_PYTHON. Two forms:
+# stub-bin/mlx-vlm-python -- stands in for $STORY_SERVER_MLX_VLM_PYTHON. Three forms:
 # `-c "import mlx_vlm"` (the M29 preflight import check: exit 0/1 per
-# STUB_MLX_VLM_IMPORTABLE) and `-m mlx_vlm.server --model ... --port ...` (the real
+# STUB_MLX_VLM_IMPORTABLE), `-c` code containing importlib.metadata (the M39 version
+# check: exit 0/1 per STUB_MLX_VLM_VERSION_OK, default 1), and `-m mlx_vlm.server --model ... --port ...` (the real
 # serve invocation). No `exec` (SF-7, mirrors VLLM_STUB): the python server runs as a
 # foreground child, so `ps` sees THIS script's own `-m mlx_vlm.server ...` argv, which
 # is what is_server_pid/serve_cmd_pids match on.
 MLX_VLM_STUB = """#!/bin/bash
 if [ "${1:-}" = "-c" ]; then
+    case "${2:-}" in
+        *importlib.metadata*) if [ "${STUB_MLX_VLM_VERSION_OK:-1}" = "1" ]; then exit 0; else exit 1; fi ;;
+    esac
     if [ "${STUB_MLX_VLM_IMPORTABLE:-1}" = "1" ]; then exit 0; else exit 1; fi
 fi
 sleep "${STUB_LOAD_DELAY:-1}"
@@ -722,7 +726,7 @@ def test_s14_source_guards():
         "STORY_SERVER_WARM_TIMEOUT": "300",
         "STORY_SERVER_LOCK_TIMEOUT": "1260",
         "STORY_SERVER_VISION_GPU_MEM_UTIL": "0.70",
-        "STORY_SERVER_MLX_VISION_MODEL_ID": "/Users/ailab1/mlx_models/qwen3-vl",
+        "STORY_SERVER_MLX_VISION_MODEL_ID": "/Users/ailab1/mlx_models/qwen38-27b-abl-8bit",
         "STORY_SERVER_MLX_VLM_PYTHON": "/Users/ailab1/mlx-serve/bin/python",
         "STORY_SERVER_MLX_VISION_MAX_TOKENS": "16384",
     }
@@ -731,6 +735,7 @@ def test_s14_source_guards():
         pattern = r"\$\{%s:-%s\}" % (re.escape(name), re.escape(default))
         matches = re.findall(pattern, text)
         assert len(matches) == 1, "%s: expected exactly 1 occurrence, found %d" % (name, len(matches))
+    assert text.count("0aa7243af15e8156fe7346e2597bb393a972963e") == 1
 
     for line in lines:
         stripped = line.strip()
@@ -1053,6 +1058,57 @@ def test_s22_mlx_vision_cross_mode_refusal(tmp_path):
         if proc1.poll() is None:
             proc1.kill()
             proc1.wait(timeout=10)
+
+
+def test_s24_mlx_vision_version_and_model_dir_preflight(tmp_path):
+    port = _free_port()
+
+    # (a) M39: mlx-vlm too old.
+    env = _base_env(tmp_path, port)
+    mode_file = os.path.join(env["STORY_SERVER_STATE_DIR"], "story-server-mode")
+    env["STUB_MLX_VLM_VERSION_OK"] = "0"
+    rc, out, err = _run(["mlx-vision"], env, timeout=30)
+    assert rc == 4
+    assert "REFUSING: mlx-vision mode needs mlx-vlm >= 0.7.11 in %s" % env["STORY_SERVER_MLX_VLM_PYTHON"] in err
+    assert "pip install -U 'mlx-vlm>=0.7.11'" in err
+    assert "needs the model directory" not in err
+    assert not os.path.exists(mode_file)
+
+    # (b) M38: dangling symlink.
+    env = _base_env(tmp_path, port)
+    p = tmp_path / "dangling-mlx-model"
+    p.symlink_to(tmp_path / "does-not-exist")
+    env["STORY_SERVER_MLX_VISION_MODEL_ID"] = str(p)
+    rc, out, err = _run(["mlx-vision"], env, timeout=30)
+    assert rc == 4
+    assert ("story-server: mlx-vision mode needs the model directory %s; create it with: hf download ailexleon/Huihui-Qwen3.8-27B-abliterated-mlx-8Bit --revision 0aa7243af15e8156fe7346e2597bb393a972963e --local-dir /Users/ailab1/mlx_models/qwen38-27b-abl-8bit-0aa7243 && ln -sfn /Users/ailab1/mlx_models/qwen38-27b-abl-8bit-0aa7243 %s (about 27.5 GiB; or set STORY_SERVER_MLX_VISION_MODEL_ID to another model)\n" % (p, p)) in err
+    assert not os.path.exists(mode_file)
+
+    # (c) M38: symlink to a regular file.
+    env = _base_env(tmp_path, port)
+    target = tmp_path / "regular-file"
+    target.write_text("x")
+    p = tmp_path / "file-mlx-model"
+    p.symlink_to(target)
+    env["STORY_SERVER_MLX_VISION_MODEL_ID"] = str(p)
+    rc, out, err = _run(["mlx-vision"], env, timeout=30)
+    assert rc == 4
+    assert "mlx-vision mode needs the model directory" in err
+    assert not os.path.exists(mode_file)
+
+    # (d) a real directory passes both preflights.
+    env = _base_env(tmp_path, port)
+    d = tmp_path / "mlx-model-dir"
+    d.mkdir()
+    env["STORY_SERVER_MLX_VISION_MODEL_ID"] = str(d)
+    env["STUB_MODEL_ID"] = str(d)
+    env["STUB_LOAD_DELAY"] = "1"
+    try:
+        rc, out, err = _run(["mlx-vision"], env, timeout=60)
+        assert rc == 0
+        assert "ready after" in out
+    finally:
+        _run(["stop"], env, timeout=30)
 
 
 # ---------------------------------------------------------------------------
