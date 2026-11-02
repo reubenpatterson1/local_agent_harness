@@ -1222,6 +1222,34 @@ def test_sgt34_the_new_python_files_and_the_tool_imports():
         "threading", "time", "movie_ui_lib", "movie_ui_seedgen"]
 
 
+# --- SQT18 (seed models SQ42): bin/seed-edit-setup carries the tool's lookups byte for byte -------------------------
+
+def _code_of(source, name):
+    """The text of function name in source, without its docstring (as tests/test_seed_edit_tool.py's)."""
+    start = source.index("\ndef %s(" % name)
+    text = source[start:source.index("\n\n\n", start)]
+    doc = text.index('"""')
+    return text[:doc] + text[text.index('"""', doc + 3) + 3:]
+
+
+def test_sqt18_the_setup_script_carries_the_tool_lookups():
+    with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
+        setup = f.read()
+    with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
+        tool = f.read()
+    for name in ("mflux_version", "default_hub", "pinned_snapshot", "pinned_file", "weights_problem"):
+        assert _code_of(setup, name) == _code_of(tool, name), name
+    assert setup.startswith("#!/usr/bin/env python3\n")
+    for text in ('"mflux==0.24.0"', "VENV_GIB = 3.0", "HEADROOM_GIB = 1.0", "cache_dir=hub", 'revision=item["revision"]',
+                 "HF_XET_CHUNK_CACHE_SIZE_BYTES", 'HF_HUB_ENABLE_HF_TRANSFER="0"', 'VENV = "~/mflux-edit/.venv"',
+                 'DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"'):
+        assert text in setup, text
+    for text in ("HF_TOKEN", "SETUP_MIN_FREE_GIB", "find_lightning", "Q4_REPO", "EDIT_LORA_REPO"):
+        assert text not in setup, text
+    assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", setup, re.M) == [
+        "argparse", "glob", "json", "os", "re", "shutil", "subprocess", "sys", "movie_ui_lib", "movie_ui_seedgen"]
+
+
 def test_sg_task6_review_page_guards():
     """Task 6 review: one seed poll at a time and never on a hidden tab; stale-workspace answers ignored; the
     Seeds lists reload on a workspace switch; Keep and Use disabled while their request runs; Generate's unknown

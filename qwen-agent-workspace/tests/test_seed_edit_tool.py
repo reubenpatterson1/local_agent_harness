@@ -1434,60 +1434,270 @@ def test_sqt9_the_child_mirrors_the_registry():
         assert text in source, text
 
 
-# --- SGT16 (SG66-SG69): bin/seed-edit-setup is read, never run ------------------------------------------
+# --- bin/seed-edit-setup in-process (seed models spec 9.1) --------------------------------------------------
 
-def _code_of(source, name):
-    """The text of function name in source, without its docstring."""
-    start = source.index("\ndef %s(" % name)
-    text = source[start:source.index("\n\n\n", start)]
-    doc = text.index('"""')
-    return text[:doc] + text[text.index('"""', doc + 3) + 3:]
-
-
-def test_sgt16_the_setup_script_is_read_never_run():
-    with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
-        source = f.read()
-    with open(TOOL_PATH, encoding="utf-8") as f:
-        tool_source = f.read()
-    assert source.startswith("#!/usr/bin/env python3\n")
-    for text in ('"mflux==0.24.0"', "SETUP_MIN_FREE_GIB = 31.0", "HF_XET_CHUNK_CACHE_SIZE_BYTES", "cache_dir=hub",
-                 'VENV = "~/mflux-edit/.venv"',
-                 'DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"'):
-        assert text in source, text
-    assert "HF_TOKEN" not in source
-    tool = load_tool()
-    for name, value in (("Q4_REPO", seedgen.qwen_model("qwen2511-q4")["repo"]), ("EDIT_LORA_REPO", tool.EDIT_LORA_REPO),
-                        ("EDIT_LORA_FILE", tool.EDIT_LORA_FILE)):
-        assert '%s = "%s"' % (name, value) in source, name
-    for name in ("mflux_version", "find_lightning"):
-        assert _code_of(source, name) == _code_of(tool_source, name), name
-
-
-def test_sg_final_setup_resume_counts_what_is_present(env):
-    """Final review F1: a resumed download is not refused for space it already used. bin/seed-edit-setup is
-    loaded as a module (its main is never called; its top level only imports and assigns)."""
+def load_setup():
     path = os.path.join(WS, "bin", "seed-edit-setup")
     loader = importlib.machinery.SourceFileLoader("seed_edit_setup", path)
     spec = importlib.util.spec_from_loader("seed_edit_setup", loader)
-    setup = importlib.util.module_from_spec(spec)
-    loader.exec_module(setup)
-    hub, venv = os.path.join(env["tmp"], "hub"), os.path.join(env["tmp"], "venv")
-    assert setup.present_gib(hub, venv) == 0.0
-    blobs = os.path.join(hub, lib.repo_dir_name(setup.Q4_REPO), "blobs")
-    snap = os.path.join(hub, lib.repo_dir_name(setup.Q4_REPO), "snapshots", "abc")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def setup_env(env):
+    """bin/seed-edit-setup loaded in-process with spec 9.1's replacements: subprocess.call and .run record
+    their argv (and env) and return 0, free_gib returns rec["free"] (100 GiB), venv_ready returns
+    rec["ready"] (False), and SEED_EDIT_SETUP_PYTHON is an executable stub under tmp. Nothing is started,
+    downloaded or installed."""
+    setup = load_setup()
+    mp, tmp = env["mp"], env["tmp"]
+    base = os.path.join(tmp, "base-python")
+    with open(base, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(base, 0o755)
+    mp.setenv("SEED_EDIT_SETUP_PYTHON", base)
+    rec = {"call": [], "run": [], "free": 100.0, "ready": False}
+
+    def call(argv, env=None):
+        rec["call"].append({"argv": list(argv), "env": env})
+        return 0
+
+    def run(argv, **kwargs):
+        rec["run"].append(list(argv))
+        if argv[0] == base:
+            return types.SimpleNamespace(returncode=0, stdout="3.13\n", stderr="")
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    mp.setattr(setup.subprocess, "call", call)
+    mp.setattr(setup.subprocess, "run", run)
+    mp.setattr(setup, "free_gib", lambda path: rec["free"])
+    mp.setattr(setup, "venv_ready", lambda py, venv: rec["ready"])
+    venv = os.path.join(tmp, "home", "mflux-edit", ".venv")
+    return dict(env, setup=setup, rec=rec, base=base, venv=venv, py=os.path.join(venv, "bin", "python"),
+                hub=env["zhub"])
+
+
+def mark_ready(e):
+    """venv_ready answers True, and the venv python exists (as it does whenever the venv is ready)."""
+    e["rec"]["ready"] = True
+    os.makedirs(os.path.dirname(e["py"]), exist_ok=True)
+    with open(e["py"], "w", encoding="utf-8") as f:
+        f.write("")
+
+
+def downloads(rec):
+    """The item lists of the recorded DOWNLOAD calls."""
+    return [json.loads(c["argv"][4]) for c in rec["call"] if c["argv"][1] == "-c"]
+
+
+Q4_ITEM = {"kind": "snapshot", "repo": "mflux-community/qwen-image-2-1-mflux-q4",
+           "revision": "b6c0fc76350650482d13aea89b316c28cd487f7f", "allow_patterns": None}
+UNC_ITEM = {"kind": "file", "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized",
+            "revision": "7959e658915f52274897fb573ffeda49de8dc16b", "file": "qwen-image-2.1-uncensored-lora.safetensors"}
+VIG_ITEM = {"kind": "file", "repo": "Viggle/Qwen-Image-2.1-viggle-turbo",
+            "revision": "009a44a895ef85f7e643c80fdca9543795248867",
+            "file": "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors"}
+LIGHTNING_ITEM = {"kind": "file", "repo": "lightx2v/Qwen-Image-Edit-2511-Lightning",
+                  "revision": "107d238d68b8387e32843d0b4a2e24ceb0d3ad86",
+                  "file": "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"}
+RESEARCH_LINE = "seed-edit-setup: license: %s: Qwen Research License (non-commercial)"
+
+
+# --- SQT11 (seed models SQ41-SQ44): the items of a selection ---------------------------------------------------
+
+def test_sqt11_the_setup_items(setup_env, capsys):
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    assert setup.main([]) == 0
+    download = rec["call"][2]
+    assert [c["argv"] for c in rec["call"]] == [
+        [e["base"], "-m", "venv", e["venv"]], [e["py"], "-m", "pip", "install", "mflux==0.24.0"],
+        [e["py"], "-c", setup.DOWNLOAD, e["hub"], download["argv"][4]]]
+    assert downloads(rec) == [[Q4_ITEM, UNC_ITEM]]
+    assert {k: download["env"][k] for k in ("HF_HOME", "HF_HUB_OFFLINE", "HF_XET_CHUNK_CACHE_SIZE_BYTES",
+                                            "HF_HUB_ENABLE_HF_TRANSFER")} == {
+        "HF_HOME": os.path.dirname(e["hub"]), "HF_HUB_OFFLINE": "0", "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0",
+        "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    assert [e["base"], "-c", "import sys; print('%d.%d' % sys.version_info[:2])"] in rec["run"]
+    assert [sys.executable, os.path.join(WS, "bin", "seed-edit"), "--probe"] in rec["run"]
+    out = capsys.readouterr().out.splitlines()
+    assert RESEARCH_LINE % "qwen21-q4" in out and RESEARCH_LINE % "uncensored" in out
+    assert out[-1] == "seed-edit-setup: probe: unavailable: bin/seed-edit --probe printed unparsable output"
+    cases = [(["--model", "qwen21-bf16", "--lora", "viggle-turbo", "--lora", "uncensored"],
+              [{"kind": "snapshot", "repo": "Qwen/Qwen-Image-2.1", "revision": "d26bb61231c349cf6b7896fa83353113880e1ba3",
+                "allow_patterns": seedgen.QWEN21_PATTERNS}, VIG_ITEM, UNC_ITEM]),
+             (["--model", "qwen2511-q4"],
+              [{"kind": "snapshot", "repo": "mflux-community/qwen-image-edit-2511-mflux-q4",
+                "revision": "3c74aab7dd79e6a8148c329cbca78c00c049ec3b", "allow_patterns": None}, LIGHTNING_ITEM]),
+             (["--lora", "viggle-turbo"], [VIG_ITEM]),
+             (["--model", "qwen21-q4", "--model", "qwen21-q4", "--lora", "uncensored", "--lora", "uncensored"],
+              [Q4_ITEM, UNC_ITEM])]
+    mark_ready(e)
+    for argv, want in cases:
+        rec["call"] = []
+        assert setup.main(argv) == 0, argv
+        assert downloads(rec) == [want], argv
+        assert [c["argv"][1] for c in rec["call"]] == ["-c"], argv
+    lora_repos = set(lora["repo"] for lora in seedgen.QWEN_LORAS) | {"lightx2v/Qwen-Image-Edit-2511-Lightning"}
+    for model_id in ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4"):
+        for loras in ([], ["uncensored"], ["viggle-turbo"], ["uncensored", "viggle-turbo"]):
+            rec["call"] = []
+            argv = ["--model", model_id]
+            for lora_id in loras:
+                argv += ["--lora", lora_id]
+            assert setup.main(argv) == 0, argv
+            items = downloads(rec)[0]
+            assert [i["repo"] for i in items if i["kind"] == "snapshot"] == [seedgen.qwen_model(model_id)["repo"]]
+            assert not [i for i in items if i["kind"] == "snapshot" and i["repo"] in lora_repos], argv
+            assert [i["file"] for i in items if i["kind"] == "file" and i["repo"] != LIGHTNING_ITEM["repo"]] == [
+                seedgen.qwen_lora(lora_id)["file"] for lora_id in loras]
+
+
+# --- SQT12 (seed models SQ44 step 4): the per-selection free-space floor ---------------------------------------
+
+def test_sqt12_the_free_space_floor(setup_env, capsys):
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    def where():
+        return min(setup.existing_ancestor(e["hub"]), setup.existing_ancestor(os.path.dirname(e["venv"])))
+
+    rec["free"] = 5.0
+    assert setup.main([]) == 2
+    assert capsys.readouterr().err == (
+        "Error: only 5.0 GiB free on %s; seed-edit-setup needs at least 13.9 GiB more (13.9 GiB in all, 0.0 GiB "
+        "already present; qwen21-q4 ~9.91 GiB, uncensored ~0.03 GiB, mflux venv ~3 GiB, 1 GiB headroom)\n" % where())
+    assert rec["call"] == [] and rec["run"] == []
+    total = (10638928735 + 33586704) / 2 ** 30 + 3.0 + 1.0
+    rec["free"] = total - 2 / 1024
+    assert setup.main([]) == 2
+    capsys.readouterr()
+    blobs = os.path.join(e["hub"], lib.repo_dir_name("mflux-community/qwen-image-2-1-mflux-q4"), "blobs")
     os.makedirs(blobs)
-    os.makedirs(snap)
     with open(os.path.join(blobs, "abc.incomplete"), "wb") as f:
         f.truncate(3 * 2 ** 20)
-    os.symlink(os.path.join(blobs, "abc.incomplete"), os.path.join(snap, "model.safetensors"))
-    os.makedirs(os.path.join(venv, "bin"))
-    with open(os.path.join(venv, "bin", "python"), "wb") as f:
+    assert setup.main([]) == 0
+    assert downloads(rec) == [[Q4_ITEM, UNC_ITEM]]
+    capsys.readouterr()
+    rec["call"], rec["run"], rec["free"] = [], [], 5.0
+    mark_ready(e)
+    assert setup.main([]) == 2
+    assert capsys.readouterr().err == (
+        "Error: only 5.0 GiB free on %s; seed-edit-setup needs at least 10.9 GiB more (10.9 GiB in all, 0.0 GiB "
+        "already present; qwen21-q4 ~9.91 GiB, uncensored ~0.03 GiB, 1 GiB headroom)\n" % where())
+    os.remove(os.path.join(blobs, "abc.incomplete"))
+    pinned_cache(os.path.join(e["tmp"], "zi"), Q4_ITEM["repo"], Q4_ITEM["revision"], QWEN21_FILES)
+    install_lora(e, "uncensored")
+    assert setup.main([]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == "seed-edit-setup: nothing to do" and rec["call"] == []
+    assert out[2].startswith("seed-edit-setup: model qwen21-q4 %s: " % os.path.join(
+        e["hub"], lib.repo_dir_name(Q4_ITEM["repo"]), "snapshots", Q4_ITEM["revision"]))
+
+
+def test_sg_final_setup_resume_counts_what_is_present(setup_env, capsys):
+    """Final review F1, re-based on seed models SQ44 step 4: a resumed download is not refused for space it
+    already used: a 3 MiB partial blob in the q4 repo and a 1 MiB venv python count as present."""
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    blobs = os.path.join(e["hub"], lib.repo_dir_name("mflux-community/qwen-image-2-1-mflux-q4"), "blobs")
+    os.makedirs(blobs)
+    with open(os.path.join(blobs, "abc.incomplete"), "wb") as f:
+        f.truncate(3 * 2 ** 20)
+    os.makedirs(os.path.dirname(e["py"]))
+    with open(e["py"], "wb") as f:
         f.truncate(2 ** 20)
-    got = setup.present_gib(hub, venv)
-    assert 4 / 1024 <= got < 4 / 1024 + 0.001, got
-    with open(path, encoding="utf-8") as f:
+    total = (10638928735 + 33586704) / 2 ** 30 + 3.0 + 1.0
+    rec["free"] = total - 3.5 / 1024
+    assert setup.main([]) == 0
+    assert [c["argv"][1] for c in rec["call"]] == ["-m", "-c"]
+    capsys.readouterr()
+    rec["free"] = total - 4.5 / 1024
+    assert setup.main([]) == 2
+    assert re.fullmatch(r"Error: only [0-9.]+ GiB free on .+; seed-edit-setup needs at least 13\.9 GiB more \(13\.9 GiB "
+                        r"in all, 0\.0 GiB already present; qwen21-q4 ~9\.91 GiB, uncensored ~0\.03 GiB, mflux venv "
+                        r"~3 GiB, 1 GiB headroom\)\n", capsys.readouterr().err)
+    with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
         source = f.read()
     assert 'HF_HUB_ENABLE_HF_TRANSFER="0"' in source and "already present" in source
+
+
+# --- SQT13 (seed models SQ41): the refusals before anything else ------------------------------------------------
+
+def test_sqt13_the_setup_refusals(setup_env, capsys):
+    e = setup_env
+    setup, rec = e["setup"], e["rec"]
+    known = "qwen21-q4, qwen21-q8, qwen21-bf16, qwen2511-q4, qwen2511-bf16"
+    bf16 = ("qwen2511-bf16 is not installed by seed-edit-setup: it runs the diffusers weights of "
+            "Qwen/Qwen-Image-Edit-2511 and lightx2v/Qwen-Image-Edit-2511-Lightning from the default Hugging Face "
+            "cache (%s)" % e["hfhub"])
+    cases = [(["--model", "flux"], "unknown --model flux; known: %s" % known),
+             (["--model", "qwen2511-bf16"], bf16),
+             (["--model", "qwen2511-bf16", "--model", "flux"], "unknown --model flux; known: %s" % known),
+             (["--lora", "nope"], "unknown --lora nope; known: uncensored, viggle-turbo"),
+             (["--lora", "nope", "--model", "qwen2511-bf16"], bf16)]
+    for argv, text in cases:
+        assert setup.main(argv) == 2, argv
+        assert capsys.readouterr().err == "Error: %s\n" % text, argv
+    e["mp"].setenv("SEED_EDIT_MFLUX_PYTHON", "/x/python")
+    assert setup.main([]) == 2
+    assert capsys.readouterr().err == ("Error: SEED_EDIT_MFLUX_PYTHON is set; unset it to set up the default venv at "
+                                       "~/mflux-edit/.venv\n")
+    assert setup.main(["--model", "flux"]) == 2
+    assert capsys.readouterr().err.startswith("Error: unknown --model flux")
+    assert rec["call"] == [] and rec["run"] == []
+
+
+# --- SQT14 (seed models SQ44 step 8): the DOWNLOAD script ----------------------------------------------------------
+
+def test_sqt14_the_download_script(monkeypatch, tmp_path):
+    setup = load_setup()
+    calls = []
+    fake = types.ModuleType("huggingface_hub")
+
+    def snapshot_download(**kwargs):
+        calls.append(("snapshot_download", kwargs))
+        return "/snapshot"
+
+    def hf_hub_download(**kwargs):
+        calls.append(("hf_hub_download", kwargs))
+        return "/file"
+
+    fake.snapshot_download, fake.hf_hub_download = snapshot_download, hf_hub_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", fake)
+    hub = os.path.join(str(tmp_path), "hub")
+    items = [dict(Q4_ITEM, allow_patterns=["a/*.json"]), UNC_ITEM]
+    monkeypatch.setattr(sys, "argv", ["-c", hub, json.dumps(items)])
+    exec(compile(setup.DOWNLOAD, "DOWNLOAD", "exec"), {})
+    assert calls == [
+        ("snapshot_download", {"repo_id": Q4_ITEM["repo"], "revision": Q4_ITEM["revision"], "allow_patterns": ["a/*.json"],
+                               "cache_dir": hub}),
+        ("hf_hub_download", {"repo_id": UNC_ITEM["repo"], "filename": UNC_ITEM["file"], "revision": UNC_ITEM["revision"],
+                             "cache_dir": hub})]
+
+
+# --- Review Focus 4: a host holding a 2511 q4 snapshot from an older main ----------------------------------------
+
+def test_sq_review_focus_4_an_old_main_2511_snapshot(setup_env, capsys):
+    e = setup_env
+    setup, rec, tool = e["setup"], e["rec"], e["tool"]
+    entry = seedgen.qwen_model("qwen2511-q4")
+    old = mt.make_hf_cache(os.path.join(e["tmp"], "zi"), entry["repo"], {"transformer/0.safetensors": b"\x01" * (4 * 2 ** 20)})
+    mt.make_hf_cache(os.path.join(e["tmp"], "zi"), tool.EDIT_LORA_REPO, {tool.EDIT_LORA_FILE: b"\x01" * 8})
+    assert tool.weights_problem(entry, tool.qwen_hubs())[0] == (
+        "mflux-community/qwen-image-edit-2511-mflux-q4@3c74aab7dd79 is not in %s or %s "
+        "(run bin/seed-edit-setup --model qwen2511-q4)" % (e["zhub"], e["hfhub"]))
+    mark_ready(e)
+    total = (entry["bytes"] + entry["builtin_lora"]["bytes"]) / 2 ** 30 + 1.0
+    rec["free"] = total - 2 / 1024
+    assert setup.main(["--model", "qwen2511-q4"]) == 0
+    assert downloads(rec) == [[{"kind": "snapshot", "repo": entry["repo"], "revision": entry["revision"],
+                                "allow_patterns": None}, LIGHTNING_ITEM]]
+    out = capsys.readouterr().out.splitlines()
+    assert "seed-edit-setup: license: qwen2511-q4: Apache-2.0" in out
+    assert "seed-edit-setup: license: lightning: Apache-2.0" in out
+    assert os.path.isdir(os.path.join(old, "snapshots", REV))
 
 
 def test_sg_final_a_phone_hdr_jpeg_is_a_jpeg(env):
