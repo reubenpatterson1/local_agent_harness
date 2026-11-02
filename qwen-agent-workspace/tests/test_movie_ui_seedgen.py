@@ -1,7 +1,9 @@
 """Tests for the seed generator's movie-ui side (docs/superpowers/specs/2026-11-02-seed-generator-
 design.md, Section 9: SGT17-SGT34, with the plan's Review Focus pins 1, 2 and 5): the pure module
 movie_ui_seedgen, the movie_ui_lib hooks (job policy, argv, probe, progress), the six
-/api/seeds/ routes, the seed_edit capability, the job summary key and the static page.
+/api/seeds/ routes, the seed_edit capability, the job summary key and the static page. Also the
+seed models registry (docs/superpowers/specs/2026-11-02-seed-models-design.md, Section 9.2:
+SQT15-SQT22, with that plan's Review Focus pin 2).
 
 Run from the workspace root: python3 -m pytest -q -p no:cacheprovider tests/test_movie_ui_seedgen.py
 
@@ -102,12 +104,13 @@ def test_sgt17_validate_run_request_order_and_defaults():
     clean, error = seedgen.validate_run_request(_req(extra=1))
     assert error is None
     assert clean == {"prompt": "make it night", "model": "zimage", "strength": 0.45, "candidates": 2, "seed": 7,
-                     "source": {"kind": "upload", "upload_id": UP}}
+                     "qwen_model": None, "loras": [], "source": {"kind": "upload", "upload_id": UP}}
     bare = {"prompt": " a quiet street at dusk ", "model": "zimage", "source": {"run": RUN, "n": 3}}
     clean, error = seedgen.validate_run_request(bare)
     assert error is None
     assert clean == {"prompt": " a quiet street at dusk ", "model": "zimage", "strength": 0.45,
-                     "candidates": 4, "seed": None, "source": {"kind": "run", "run": RUN, "n": 3}}
+                     "candidates": 4, "seed": None, "qwen_model": None, "loras": [],
+                     "source": {"kind": "run", "run": RUN, "n": 3}}
     assert isinstance(seedgen.validate_run_request(_req(strength=1 / 2))[0]["strength"], float)
     assert seedgen.validate_run_request(_req(strength=None, candidates=None, seed=None))[0]["strength"] == 0.45
     clean, error = seedgen.validate_run_request(_req(model="qwen", strength=None,
@@ -157,6 +160,159 @@ def test_sgt17_the_module_imports():
         source = f.read()
     assert sorted(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M)) == [
         "movie_ui_lib", "re", "secrets", "time"]
+
+
+# --- SQT15 (seed models SQ30): the Qwen model and LoRA request rows ---------------------------------
+
+def _qreq(**overrides):
+    body = _req(model="qwen", strength=None)
+    body.update(overrides)
+    return body
+
+
+UNC1 = {"id": "uncensored", "scale": 1}
+SCALE_MSG = "LoRA uncensored scale must be a number above 0 and at most 2"
+QWEN_REQUEST_CASES = [
+    (_req(qwen_model="qwen21-q4"), "qwen_model is only for qwen"),
+    (_req(qwen_model=""), "qwen_model is only for qwen"),
+    (_req(qwen_model="x", loras="y"), "qwen_model is only for qwen"),
+    (_req(loras=[]), "loras is only for qwen"),
+    (_qreq(qwen_model="flux"), "unknown qwen_model flux"),
+    (_qreq(qwen_model=5), "unknown qwen_model 5"),
+    (_qreq(qwen_model="flux", loras="x"), "unknown qwen_model flux"),
+    (_qreq(loras="x"), "loras must be a list of {id, scale}"),
+    (_qreq(loras={"id": "uncensored", "scale": 1}), "loras must be a list of {id, scale}"),
+    (_qreq(loras=[{}]), "loras must be a list of {id, scale}"),
+    (_qreq(loras=[{"id": "uncensored"}]), "loras must be a list of {id, scale}"),
+    (_qreq(loras=[{"id": "uncensored", "scale": 1, "x": 1}]), "loras must be a list of {id, scale}"),
+    (_qreq(loras=["uncensored"]), "loras must be a list of {id, scale}"),
+    (_qreq(loras=[{"id": 5, "scale": 1}]), "unknown LoRA 5"),
+    (_qreq(loras=[{"id": "nope", "scale": 1}]), "unknown LoRA nope"),
+    (_qreq(loras=[UNC1, {"id": "uncensored", "scale": 0.5}]), "LoRA uncensored is listed twice"),
+    (_qreq(qwen_model="qwen2511-q4", loras=[UNC1]),
+     "LoRA uncensored is for Qwen-Image-2.1, not Qwen-Image-Edit-2511 q4 (Lightning)"),
+    (_qreq(qwen_model="qwen2511-bf16", loras=[{"id": "viggle-turbo", "scale": 1}]),
+     "LoRA viggle-turbo is for Qwen-Image-2.1, not Qwen-Image-Edit-2511 bf16 (Lightning, diffusers)"),
+    (_qreq(loras=[{"id": "uncensored", "scale": 0}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": -1}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": 2.01}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": True}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": "1"}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": None}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "uncensored", "scale": 5}, {}]), SCALE_MSG),
+    (_qreq(loras=[{"id": "nope", "scale": 1}, {}]), "unknown LoRA nope"),
+]
+
+
+@pytest.mark.parametrize("body,message", QWEN_REQUEST_CASES,
+                         ids=["case%d" % (i + 1) for i in range(len(QWEN_REQUEST_CASES))])
+def test_sqt15_the_qwen_request_rows(body, message):
+    assert seedgen.validate_run_request(body) == (None, message)
+
+
+def test_sqt15_qwen_defaults_order_and_placement():
+    clean, error = seedgen.validate_run_request(_qreq())
+    assert error is None
+    assert (clean["qwen_model"], clean["loras"]) == ("qwen21-q4", [{"id": "uncensored", "scale": 1.0}])
+    assert seedgen.validate_run_request(_qreq(qwen_model=None, loras=None))[0]["loras"] == [
+        {"id": "uncensored", "scale": 1.0}]
+    assert seedgen.validate_run_request(_qreq(qwen_model="qwen2511-q4"))[0]["loras"] == []
+    assert seedgen.validate_run_request(_qreq(qwen_model="qwen2511-bf16"))[0]["loras"] == []
+    assert seedgen.validate_run_request(_qreq(loras=[]))[0]["loras"] == []
+    clean = seedgen.validate_run_request(_qreq(qwen_model="qwen21-q8", loras=[
+        {"id": "viggle-turbo", "scale": 2}, {"id": "uncensored", "scale": 0.5}]))[0]
+    assert (clean["qwen_model"], clean["loras"]) == (
+        "qwen21-q8", [{"id": "uncensored", "scale": 0.5}, {"id": "viggle-turbo", "scale": 2.0}])
+    assert all(isinstance(item["scale"], float) for item in clean["loras"])
+    clean = seedgen.validate_run_request(_req(qwen_model=None, loras=None))[0]
+    assert (clean["qwen_model"], clean["loras"]) == (None, [])
+    assert seedgen.validate_run_request(_req(seed=-1, qwen_model="x")) == (
+        None, "seed must be an integer from 0 to 2147483647")
+    assert seedgen.validate_run_request(_req(qwen_model="x", source="x")) == (None, "qwen_model is only for qwen")
+    assert seedgen.validate_run_request(_qreq(strength=0.5, qwen_model="flux")) == (
+        None, "strength is only for zimage")
+    for body, message in REQUEST_CASES:
+        assert seedgen.validate_run_request(body) == (None, message)
+
+
+# --- SQT16 (seed models SQ7-SQ10): settings, legacy runs, the canvas multiple, the registry view -------
+
+REPOS = {"qwen21-q4": "mflux-community/qwen-image-2-1-mflux-q4", "qwen21-q8": "mflux-community/qwen-image-2-1-mflux-q8",
+         "qwen21-bf16": "Qwen/Qwen-Image-2.1", "qwen2511-q4": "mflux-community/qwen-image-edit-2511-mflux-q4",
+         "qwen2511-bf16": "Qwen/Qwen-Image-Edit-2511"}
+UNC = {"id": "uncensored", "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized",
+       "file": "qwen-image-2.1-uncensored-lora.safetensors"}
+VIG = {"id": "viggle-turbo", "repo": "Viggle/Qwen-Image-2.1-viggle-turbo",
+       "file": "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors"}
+
+
+def _settings(model_id, loras, steps, scheduler):
+    return {"qwen_model": {"id": model_id, "repo": REPOS[model_id]}, "loras": loras, "steps": steps,
+            "scheduler": scheduler}
+
+
+def test_sqt16_qwen_settings():
+    assert seedgen.qwen_settings(None, []) == {"qwen_model": None, "loras": [], "steps": None, "scheduler": None}
+    for model_id in ("qwen21-q4", "qwen21-q8", "qwen21-bf16"):
+        assert seedgen.qwen_settings(model_id, []) == _settings(model_id, [], 40, "linear")
+        assert seedgen.qwen_settings(model_id, [{"id": "uncensored", "scale": 1}]) == _settings(
+            model_id, [dict(UNC, scale=1.0)], 40, "linear")
+        assert seedgen.qwen_settings(model_id, [{"id": "viggle-turbo", "scale": 0.5}]) == _settings(
+            model_id, [dict(VIG, scale=0.5)], 6, "viggle_turbo")
+        assert seedgen.qwen_settings(model_id, [{"id": "viggle-turbo", "scale": 1.0}, {"id": "uncensored", "scale": 0.5}]) \
+            == _settings(model_id, [dict(UNC, scale=0.5), dict(VIG, scale=1.0)], 6, "viggle_turbo")
+    for model_id in ("qwen2511-q4", "qwen2511-bf16"):
+        assert seedgen.qwen_settings(model_id, []) == _settings(model_id, [], 8, None)
+    scale = seedgen.qwen_settings("qwen21-q4", [{"id": "uncensored", "scale": 1}])["loras"][0]["scale"]
+    assert isinstance(scale, float)
+
+
+def test_sqt16_record_settings_and_the_canvas_multiple():
+    new = dict(_settings("qwen21-q8", [dict(UNC, scale=0.5)], 40, "linear"), model="qwen", backend="mflux")
+    assert seedgen.record_settings(new) == _settings("qwen21-q8", [dict(UNC, scale=0.5)], 40, "linear")
+    odd = {"model": "qwen", "qwen_model": {"id": "qwen21-q4", "repo": REPOS["qwen21-q4"]}, "loras": "x"}
+    assert seedgen.record_settings(odd) == {"qwen_model": odd["qwen_model"], "loras": [], "steps": None,
+                                            "scheduler": None}
+    for backend in ("mflux-q4", None):
+        assert seedgen.record_settings({"model": "qwen", "backend": backend}) == _settings("qwen2511-q4", [], 8, None)
+    assert seedgen.record_settings({"model": "qwen", "backend": "diffusers-bf16"}) == _settings(
+        "qwen2511-bf16", [], 8, None)
+    zimage = {"qwen_model": None, "loras": [], "steps": None, "scheduler": None}
+    assert seedgen.record_settings({"model": "zimage", "backend": "zimage"}) == zimage
+    assert seedgen.record_settings({}) == zimage
+    assert [seedgen.canvas_multiple("qwen", m) for m in seedgen.QWEN_MODEL_IDS] == [32, 32, 32, 16, 16]
+    assert seedgen.canvas_multiple("zimage", None) == 16
+
+
+def test_sqt16_the_registry_view():
+    research = "Qwen Research License (non-commercial)"
+
+    def model(model_id, label, family, backend, steps, scheduler, multiple, memory, license, setup):
+        return {"id": model_id, "label": label, "family": family, "backend": backend, "steps": steps,
+                "scheduler": scheduler, "multiple": multiple, "memory_gib": memory, "license": license,
+                "setup": "bin/seed-edit-setup --model %s" % model_id if setup else None}
+
+    assert seedgen.registry_view() == {
+        "default_model": "qwen21-q4",
+        "families": {"qwen21": "Qwen-Image-2.1", "qwen2511": "Qwen-Image-Edit-2511"},
+        "models": [model("qwen21-q4", "Qwen-Image-2.1 q4", "qwen21", "mflux", 40, "linear", 32, 20.0, research, True),
+                   model("qwen21-q8", "Qwen-Image-2.1 q8", "qwen21", "mflux", 40, "linear", 32, 32.0, research, True),
+                   model("qwen21-bf16", "Qwen-Image-2.1 bf16", "qwen21", "mflux", 40, "linear", 32, 56.0, research,
+                         True),
+                   model("qwen2511-q4", "Qwen-Image-Edit-2511 q4 (Lightning)", "qwen2511", "mflux", 8, None, 16,
+                         32.0, "Apache-2.0", True),
+                   model("qwen2511-bf16", "Qwen-Image-Edit-2511 bf16 (Lightning, diffusers)", "qwen2511",
+                         "diffusers", 8, None, 16, 64.0, "Apache-2.0", False)],
+        "loras": [{"id": "uncensored", "label": "Uncensored (abenzerps)", "family": "qwen21", "default_on": True,
+                   "default_scale": 1.0, "steps": None, "scheduler": None, "license": research,
+                   "setup": "bin/seed-edit-setup --lora uncensored"},
+                  {"id": "viggle-turbo", "label": "Viggle turbo 6-step", "family": "qwen21", "default_on": False,
+                   "default_scale": 1.0, "steps": 6, "scheduler": "viggle_turbo", "license": research,
+                   "setup": "bin/seed-edit-setup --lora viggle-turbo"}]}
+    json.dumps(seedgen.registry_view())
+    view = seedgen.registry_view()
+    view["families"]["qwen21"] = "changed"
+    assert seedgen.QWEN_FAMILIES["qwen21"] == "Qwen-Image-2.1"
 
 
 # --- The probe stub and the environment (spec 9 rules) -----------------------------------------------

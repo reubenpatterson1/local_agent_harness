@@ -1,6 +1,7 @@
 """Tests for bin/seed-edit, seed_edit_mflux_child.py and bin/seed-edit-setup (docs/superpowers/specs/
 2026-11-02-seed-generator-design.md, Section 9: SGT1-SGT16, with the plan's Review Focus pins 3
-and 4).
+and 4), and the seed models registry in them (docs/superpowers/specs/2026-11-02-seed-models-
+design.md, Section 9.2: SQT1-SQT14, with that plan's Review Focus pins 1, 3, 4 and 5).
 
 Run from the workspace root: python3 -m pytest -q -p no:cacheprovider tests/test_seed_edit_tool.py
 
@@ -757,6 +758,81 @@ def test_sgt14_the_mirrored_constants():
     assert tool.BF16_MIN_AVAIL_GIB == character_dataset.EDIT_MIN_AVAIL_GIB
     assert tool.ZIMAGE_MIN_AVAIL_GIB == character_dataset.GENERATE_MIN_AVAIL_GIB
     assert tool.MIN_FREE_GIB == character_dataset.CREATE_MIN_FREE_GIB
+
+
+# --- SQT10 (seed models SQ3, SQ4, SQ6): the registry pins -------------------------------------------------
+
+RESEARCH = "Qwen Research License (non-commercial)"
+LIGHTNING_PIN = {"repo": "lightx2v/Qwen-Image-Edit-2511-Lightning", "revision": "107d238d68b8387e32843d0b4a2e24ceb0d3ad86",
+                 "file": "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors", "bytes": 849608296,
+                 "scale": 1.0}
+MFLUX_PATTERNS = ["model_index.json", "scheduler/*.json", "processor/**", "vae/*.json", "vae/*.safetensors",
+                  "transformer/*.json", "transformer/*.safetensors", "text_encoder/*.json", "text_encoder/*.safetensors"]
+C21 = "mflux.models.qwen21.variants.edit.qwen_image_21_edit.QwenImage21Edit"
+C2511 = "mflux.models.qwen.variants.edit.qwen_image_edit.QwenImageEdit"
+REGISTRY = [
+    {"id": "qwen21-q4", "label": "Qwen-Image-2.1 q4", "family": "qwen21", "backend": "mflux",
+     "repo": "mflux-community/qwen-image-2-1-mflux-q4", "revision": "b6c0fc76350650482d13aea89b316c28cd487f7f",
+     "allow_patterns": None, "bytes": 10638928735, "quant": "q4", "mflux_class": C21, "mflux_config": "qwen_image_21",
+     "steps": 40, "guidance": 1.0, "scheduler": "linear", "multiple": 32, "builtin_lora": None, "memory_gib": 20.0,
+     "license": RESEARCH, "setup": True},
+    {"id": "qwen21-q8", "label": "Qwen-Image-2.1 q8", "family": "qwen21", "backend": "mflux",
+     "repo": "mflux-community/qwen-image-2-1-mflux-q8", "revision": "f5c8cc79a6741026a6057546012fba3b0a4b5b25",
+     "allow_patterns": None, "bytes": 18460986297, "quant": "q8", "mflux_class": C21, "mflux_config": "qwen_image_21",
+     "steps": 40, "guidance": 1.0, "scheduler": "linear", "multiple": 32, "builtin_lora": None, "memory_gib": 32.0,
+     "license": RESEARCH, "setup": True},
+    {"id": "qwen21-bf16", "label": "Qwen-Image-2.1 bf16", "family": "qwen21", "backend": "mflux",
+     "repo": "Qwen/Qwen-Image-2.1", "revision": "d26bb61231c349cf6b7896fa83353113880e1ba3",
+     "allow_patterns": MFLUX_PATTERNS, "bytes": 33131601593, "quant": "bf16", "mflux_class": C21,
+     "mflux_config": "qwen_image_21", "steps": 40, "guidance": 1.0, "scheduler": "linear", "multiple": 32,
+     "builtin_lora": None, "memory_gib": 56.0, "license": RESEARCH, "setup": True},
+    {"id": "qwen2511-q4", "label": "Qwen-Image-Edit-2511 q4 (Lightning)", "family": "qwen2511", "backend": "mflux",
+     "repo": "mflux-community/qwen-image-edit-2511-mflux-q4", "revision": "3c74aab7dd79e6a8148c329cbca78c00c049ec3b",
+     "allow_patterns": None, "bytes": 28958989673, "quant": "q4", "mflux_class": C2511,
+     "mflux_config": "qwen_image_edit_2511", "steps": 8, "guidance": 1.0, "scheduler": None, "multiple": 16,
+     "builtin_lora": LIGHTNING_PIN, "memory_gib": 32.0, "license": "Apache-2.0", "setup": True},
+    {"id": "qwen2511-bf16", "label": "Qwen-Image-Edit-2511 bf16 (Lightning, diffusers)", "family": "qwen2511",
+     "backend": "diffusers", "repo": "Qwen/Qwen-Image-Edit-2511", "revision": None, "allow_patterns": None,
+     "bytes": None, "quant": "bf16", "mflux_class": None, "mflux_config": None, "steps": 8, "guidance": 1.0,
+     "scheduler": None, "multiple": 16, "builtin_lora": dict(LIGHTNING_PIN, revision=None), "memory_gib": 64.0,
+     "license": "Apache-2.0", "setup": False},
+]
+LORA_REGISTRY = [
+    {"id": "uncensored", "label": "Uncensored (abenzerps)", "family": "qwen21",
+     "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized", "revision": "7959e658915f52274897fb573ffeda49de8dc16b",
+     "file": "qwen-image-2.1-uncensored-lora.safetensors", "bytes": 33586704, "default_on": True,
+     "default_scale": 1.0, "steps": None, "scheduler": None, "license": RESEARCH},
+    {"id": "viggle-turbo", "label": "Viggle turbo 6-step", "family": "qwen21",
+     "repo": "Viggle/Qwen-Image-2.1-viggle-turbo", "revision": "009a44a895ef85f7e643c80fdca9543795248867",
+     "file": "Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors", "bytes": 679604800,
+     "default_on": False, "default_scale": 1.0, "steps": 6, "scheduler": "viggle_turbo", "license": RESEARCH},
+]
+
+
+def test_sqt10_the_registry_pins():
+    import character_dataset
+    tool = load_tool()
+    assert seedgen.QWEN_MODEL_IDS == ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4", "qwen2511-bf16")
+    assert seedgen.QWEN_LORA_IDS == ("uncensored", "viggle-turbo")
+    assert [dict(m) for m in seedgen.QWEN_MODELS] == REGISTRY
+    assert [dict(lora) for lora in seedgen.QWEN_LORAS] == LORA_REGISTRY
+    assert (seedgen.DEFAULT_QWEN_MODEL, seedgen.LEGACY_QWEN_MODEL, seedgen.SCALE_MAX) == ("qwen21-q4", "qwen2511-q4", 2.0)
+    assert seedgen.QWEN_FAMILIES == {"qwen21": "Qwen-Image-2.1", "qwen2511": "Qwen-Image-Edit-2511"}
+    assert seedgen.QWEN21_PATTERNS == MFLUX_PATTERNS
+    assert seedgen.QWEN21_REQUIRED == ("vae/config.json", "transformer/config.json", "text_encoder/config.json")
+    for entry in seedgen.QWEN_MODELS + seedgen.QWEN_LORAS:
+        assert entry["revision"] is None or re.fullmatch(r"[0-9a-f]{40}", entry["revision"]), entry["id"]
+    assert all("allow_patterns" not in lora for lora in seedgen.QWEN_LORAS)
+    for model_id in ("qwen2511-q4", "qwen2511-bf16"):
+        entry = seedgen.qwen_model(model_id)
+        assert entry["steps"] == tool.EDIT_STEPS
+        assert (entry["builtin_lora"]["repo"], entry["builtin_lora"]["file"]) == (tool.EDIT_LORA_REPO, tool.EDIT_LORA_FILE)
+    assert seedgen.qwen_model("qwen2511-bf16")["repo"] == tool.EDIT_MODEL
+    assert seedgen.qwen_model("qwen2511-bf16")["memory_gib"] == character_dataset.EDIT_MIN_AVAIL_GIB
+    assert [seedgen.default_loras(m) for m in seedgen.QWEN_MODEL_IDS] == [[{"id": "uncensored", "scale": 1.0}]] * 3 + [[]] * 2
+    assert (seedgen.qwen_model("nope"), seedgen.qwen_lora("nope")) == (None, None)
+    assert seedgen.registry_order([{"id": "viggle-turbo", "scale": 1}, {"id": "uncensored", "scale": 2}]) == [
+        {"id": "uncensored", "scale": 2}, {"id": "viggle-turbo", "scale": 1}]
 
 
 # --- Review Focus 3: prompts that look like shell or argparse input --------------------------------------
