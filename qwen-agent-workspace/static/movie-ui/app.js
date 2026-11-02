@@ -1783,9 +1783,22 @@
       $("#ch-train").disabled = true;
       $("#ch-train-reason").textContent = "fewer than 12 stills kept; regenerate the dataset";
     }
+    // Seed-folder spec SD48: the folder mode of the Characters form.
+    const box = FOLDER_BOXES.characters;
+    const folder = box.mode();
+    $("#ch-name-label").textContent = folder ? "Name prefix (optional)" : "Name";
+    ["#ch-class", "#ch-descriptor", "#ch-trigger", "#ch-seed-file"].forEach(function (id) { $(id).disabled = folder; });
+    renderFolderList(box);
+    if (!folder) { closeFolderConfirm(box); return; }
+    const block = folderBlock(box);
+    if (!block) { return; }
+    $("#ch-create").disabled = true;
+    const createStatus = $("#ch-create-status");
+    createStatus.textContent = createStatus.textContent ? createStatus.textContent + "; " + block : block;
   }
 
   async function createCharacter(force) {
+    if (!force && FOLDER_BOXES.characters.mode()) { openFolderConfirm(FOLDER_BOXES.characters, {ws: S.ws, name: $("#ch-name").value.trim(), phrase: $("#ch-phrase").value.trim(), seed: numberOrNull("#ch-seed")}); return; }
     let body;
     if (force) {
       body = Object.assign({}, S.character.last_create_fields, {force: true});
@@ -1816,6 +1829,12 @@
   function setupCharacters() {
     $("#ch-create").addEventListener("click", function () { createCharacter(false); });
     $("#ch-force").addEventListener("click", function () { createCharacter(true); });
+    $("#ch-folder-mode").addEventListener("change", updateCharacterButtons);
+    const charactersBox = FOLDER_BOXES.characters;
+    part(charactersBox, "choose").addEventListener("click", function () { part(charactersBox, "file").click(); });
+    part(charactersBox, "file").addEventListener("change", function () { onFolderPick(charactersBox); });
+    part(charactersBox, "queue").addEventListener("click", function () { queueFolder(charactersBox); });
+    part(charactersBox, "cancel").addEventListener("click", function () { closeFolderConfirm(charactersBox); });
     $("#ch-accept").addEventListener("click", function () { show($("#ch-train-form"), true); });
     $("#ch-regenerate").addEventListener("click", async function () {
       const name = S.character.character.name;

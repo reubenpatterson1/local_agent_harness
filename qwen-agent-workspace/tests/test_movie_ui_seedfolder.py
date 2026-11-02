@@ -867,6 +867,26 @@ def test_sf_review_focus_5_the_page_sample_id_matches_the_server(tmp_path):
     assert json.loads(proc.stdout) == want
 
 
+# --- SDT37 (SD47-SD50): the static page, Characters -----------------------------------------------------
+
+CHARACTER_IDS = ("ch-name-label", "ch-folder-mode", "ch-folder-choose", "ch-folder-file", "ch-folder-status",
+                 "ch-folder-list", "ch-folder-confirm", "ch-folder-summary", "ch-folder-table",
+                 "ch-folder-queue", "ch-folder-cancel")
+
+
+def test_sdt37_the_static_page_characters():
+    _static, texts = _static_texts()
+    html, js = texts["index.html"], texts["app.js"]
+    for element in CHARACTER_IDS:
+        assert html.count('id="%s"' % element) == 1, element
+    for element in ("ch-folder-mode", "ch-name-label"):
+        assert '"#%s' % element in js, element
+    assert "ch-folder-shared" not in html + js
+    assert "<th>File</th><th>Character</th><th>Result</th><th>Job</th>" in html
+    for text in ('"/api/characters/seed-folder"', '"Name prefix (optional)"', "Seed folder (one character per image)"):
+        assert text in html + js, text
+
+
 # --- The Characters HTTP tests: helpers (spec 6 rules) ---------------------------------------------
 
 def _cbody(ws, seeds, preview, **overrides):

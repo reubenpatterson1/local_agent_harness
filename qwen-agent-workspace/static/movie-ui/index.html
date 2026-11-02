@@ -223,15 +223,29 @@
   <table id="ch-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Video</th><th>Stills</th><th>Phrase</th></tr></thead><tbody></tbody></table>
   <h3>New character</h3>
   <div class="grid">
-    <label>Name <input id="ch-name" type="text" size="24"></label>
+    <label><span id="ch-name-label">Name</span> <input id="ch-name" type="text" size="24"></label>
     <label>Referring phrase <input id="ch-phrase" type="text" size="40"></label>
     <label>Class noun <input id="ch-class" type="text" size="12" placeholder="blank = auto"></label>
     <label class="wide">Descriptor <input id="ch-descriptor" type="text" size="60" placeholder="blank = describe from seed image"></label>
     <label>Trigger <input id="ch-trigger" type="text" size="16" placeholder="blank = auto"></label>
     <label>Seed <input id="ch-seed" type="number" min="0"></label>
     <label>Seed image <input id="ch-seed-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+    <label><input id="ch-folder-mode" type="checkbox"> Seed folder (one character per image)
+      <button id="ch-folder-choose" type="button">Choose folder…</button>
+      <input id="ch-folder-file" type="file" webkitdirectory hidden></label>
+    <span id="ch-folder-status" class="muted"></span>
+    <ul id="ch-folder-list" class="muted" hidden></ul>
   </div>
   <div class="row"><button id="ch-create" type="button">Create</button> <span id="ch-create-status" class="muted"></span></div>
+  <div id="ch-folder-confirm" hidden>
+    <h3>Seed folder</h3>
+    <p id="ch-folder-summary" class="muted"></p>
+    <table id="ch-folder-table" class="list"><thead><tr><th>File</th><th>Character</th><th>Result</th><th>Job</th></tr></thead><tbody></tbody></table>
+    <div class="row">
+      <button id="ch-folder-queue" type="button" disabled>Queue 0 jobs</button>
+      <button id="ch-folder-cancel" type="button">Cancel</button>
+    </div>
+  </div>
   <div id="ch-detail" hidden>
     <h2 id="ch-title"></h2>
     <div id="ch-gallery" class="gallery"></div>
