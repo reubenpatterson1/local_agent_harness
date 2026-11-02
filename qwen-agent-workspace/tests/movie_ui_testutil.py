@@ -462,7 +462,7 @@ def copy_ui(tmp):
     bin/movie-ui probes stubs instead of this checkout's real bin/story-server. Returns its root."""
     root = make_stub_workspace(os.path.join(str(tmp), "ui"))
     for rel in ("bin/movie-ui", "bin/movie-ui-job", "movie_ui_lib.py", "movie_ui_server.py", "fleet_lib.py",
-                "movie_ui_batch.py", "movie_ui_seedfolder.py"):
+                "movie_ui_batch.py", "movie_ui_seedfolder.py", "movie_ui_seedgen.py"):
         shutil.copy2(os.path.join(WS, rel), os.path.join(root, rel))
     static = os.path.join(WS, "static", "movie-ui")
     if os.path.isdir(static):

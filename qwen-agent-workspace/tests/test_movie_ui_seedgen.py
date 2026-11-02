@@ -859,6 +859,23 @@ def test_sg_review_focus_5_the_page_canvas_matches_the_tool(tmp_path):
         assert got == want, (w0, h0)
 
 
+# --- SGT34 (SG2, SG24): the new Python files are compiled and scanned; the tool's top-level imports ---------
+
+def test_sgt34_the_new_python_files_and_the_tool_imports():
+    with open(os.path.join(WS, "tests", "test_movie_ui_builder.py"), encoding="utf-8") as f:
+        builder = f.read()
+    start = builder.index("NEW_PY = (")
+    new_py = builder[start:builder.index(")", start)]
+    for rel in ("movie_ui_seedgen.py", "bin/seed-edit", "bin/seed-edit-setup", "seed_edit_mflux_child.py",
+                "tests/test_seed_edit_tool.py", "tests/test_movie_ui_seedgen.py"):
+        assert '"%s"' % rel in new_py, rel
+    with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
+        source = f.read()
+    assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
+        "argparse", "glob", "importlib.util", "json", "os", "re", "secrets", "shutil", "signal", "subprocess", "sys",
+        "threading", "time", "movie_ui_lib"]
+
+
 def test_sg_task6_review_page_guards():
     """Task 6 review: one seed poll at a time and never on a hidden tab; stale-workspace answers ignored; the
     Seeds lists reload on a workspace switch; Keep and Use disabled while their request runs; Generate's unknown

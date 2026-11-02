@@ -348,7 +348,7 @@ JS_SNIPPETS = (
     '"seams check queued as job "', 'show($("#c-check-seams-box"), mode === "chained");',
     '(Array.isArray(report.panels) ? report.panels : []).forEach(function (p) {\n'
     '      if (!p || typeof p !== "object") { return; }\n',
-    'const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", '
+    'const TABS = ["compose", "seeds", "stories", "batches", "characters", "locations", "actions", "loras", '
     '"jobs", "traces"];',
 )
 

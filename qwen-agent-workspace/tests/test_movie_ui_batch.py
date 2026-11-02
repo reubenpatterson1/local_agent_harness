@@ -492,7 +492,7 @@ def test_bt13_the_static_page():
         assert html.count('id="%s"' % element) == 1, element
     assert html.index('id="tab-stories"') < html.index('id="tab-batches"') < html.index('id="tab-characters"')
     assert "<thead><tr><th>Pick</th><th>Story</th><th>story.md</th>" in html
-    assert ('const TABS = ["compose", "stories", "batches", "characters", "locations", "actions", "loras", '
+    assert ('const TABS = ["compose", "seeds", "stories", "batches", "characters", "locations", "actions", "loras", '
             '"jobs", "traces"];') in js
     for text in ("New batch (", "Play row", "Submit remaining", "Use the original", "Add setting…",
                  "settings from batch b"):

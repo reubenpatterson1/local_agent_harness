@@ -214,7 +214,8 @@ NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui
           "tests/test_movie_ui_builder.py", "tests/test_movie_ui_checks.py", "tests/test_movie_ui_jobs.py",
           "tests/test_movie_ui_progress.py", "tests/test_movie_ui_http.py", "tests/test_movie_ui_traces.py",
           "movie_ui_batch.py", "tests/test_movie_ui_batch.py", "movie_ui_seedfolder.py",
-          "tests/test_movie_ui_seedfolder.py")
+          "tests/test_movie_ui_seedfolder.py", "movie_ui_seedgen.py", "bin/seed-edit", "bin/seed-edit-setup",
+          "seed_edit_mflux_child.py", "tests/test_seed_edit_tool.py", "tests/test_movie_ui_seedgen.py")
 CHANGED_PY = ("fleet_lib.py", "bin/qwen-agentd", "tests/test_fleet_lib.py", "tests/test_fleet_self_update.py")
 PIPELINE_FILES = ("bin/ltx-movie", "bin/ltx-mlx-render", "bin/ltx-story-images", "bin/ltx-story-manifest",
                   "bin/ltx-story-video", "bin/ltx-chain", "bin/ltx-generate", "bin/ltx-host-prep",
@@ -259,7 +260,7 @@ def test_mut25_source_scan_of_new_python_files():
         allowed = {"argparse", "calendar", "errno", "fcntl", "hashlib", "hmac", "http.client", "http.server",
                    "json", "os", "platform", "re", "secrets", "shlex", "shutil", "signal", "socket", "struct",
                    "subprocess", "sys", "threading", "time", "fleet_lib", "movie_ui_lib", "movie_ui_batch",
-                   "movie_ui_seedfolder"}
+                   "movie_ui_seedfolder", "movie_ui_seedgen"}
         assert imported <= allowed, (rel, imported - allowed)
         for loader in ("importlib", "SourceFileLoader", "runpy", "exec(", "__import__"):
             assert loader not in source, (rel, loader)
