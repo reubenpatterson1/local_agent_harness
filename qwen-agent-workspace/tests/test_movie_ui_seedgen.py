@@ -132,27 +132,74 @@ def test_sgt17_folders_run_ids_and_keep_names():
     assert seedgen.keep_name(RUN, 2, 3) == RUN + "-02-3.png"
 
 
+def qwen_probe(models=None, loras=None):
+    """A probe qwen entry in seed models SQ18's shape: every model and LoRA ok except the IDs that
+    models and loras map to their reasons; ok and reason follow SQ18's aggregate rule."""
+    models, loras = models or {}, loras or {}
+    per_model = dict((i, {"ok": i not in models, "reason": models.get(i)}) for i in seedgen.QWEN_MODEL_IDS)
+    per_lora = dict((i, {"ok": i not in loras, "reason": loras.get(i)}) for i in seedgen.QWEN_LORA_IDS)
+    ok = any(e["ok"] for e in per_model.values())
+    reason = None if ok else "; ".join("%s: %s" % (i, per_model[i]["reason"]) for i in seedgen.QWEN_MODEL_IDS)
+    return {"ok": ok, "reason": reason, "models": per_model, "loras": per_lora}
+
+
+ALL_MODELS_OFF = dict((i, "%s is missing" % i) for i in seedgen.QWEN_MODEL_IDS)
+ZCLEAN = {"model": "zimage", "qwen_model": None, "loras": []}
+
+
 def test_sgt17_capability_and_availability():
     ok_z = {"ok": True, "reason": None, "backend": "zimage"}
     no_z = {"ok": False, "reason": "torch not importable by /py", "backend": None}
-    ok_q = {"ok": True, "reason": None, "backend": "mflux-q4"}
-    no_q = {"ok": False, "reason": "diffusers bf16: x; mflux q4: y", "backend": None}
+    ok_q = qwen_probe()
+    no_q = qwen_probe(models=ALL_MODELS_OFF)
+    registry = seedgen.registry_view()
     both = {"zimage": ok_z, "qwen": ok_q}
-    assert seedgen.capability(both, None, "T") == {"ok": True, "reason": None, "checked": "T", "models": both}
+    assert seedgen.capability(both, None, "T") == {"ok": True, "reason": None, "checked": "T", "models": both,
+                                                   "registry": registry}
     partial = {"zimage": ok_z, "qwen": no_q}
-    assert seedgen.capability(partial, None, "T") == {"ok": True, "reason": None, "checked": "T", "models": partial}
+    assert seedgen.capability(partial, None, "T") == {"ok": True, "reason": None, "checked": "T", "models": partial,
+                                                      "registry": registry}
     none_ok = {"zimage": no_z, "qwen": no_q}
     assert seedgen.capability(none_ok, None, "T") == {
-        "ok": False, "reason": "Z-Image: torch not importable by /py; Qwen-Image-Edit: diffusers bf16: x; mflux q4: y",
-        "checked": "T", "models": none_ok}
+        "ok": False, "reason": "Z-Image: torch not importable by /py; Qwen-Image: " + no_q["reason"],
+        "checked": "T", "models": none_ok, "registry": registry}
     assert seedgen.capability(None, "bin/seed-edit --probe exited 1: boom", "T") == {
-        "ok": False, "reason": "bin/seed-edit --probe exited 1: boom", "checked": "T", "models": None}
-    assert seedgen.availability_error(both, None, "qwen") is None
-    assert seedgen.availability_error(partial, None, "zimage") is None
-    assert seedgen.availability_error(partial, None, "qwen") == (
-        "Qwen-Image-Edit is unavailable: diffusers bf16: x; mflux q4: y")
-    assert seedgen.availability_error(none_ok, None, "zimage") == "Z-Image is unavailable: torch not importable by /py"
-    assert seedgen.availability_error(None, "boom", "zimage") == "cannot check the seed models: boom"
+        "ok": False, "reason": "bin/seed-edit --probe exited 1: boom", "checked": "T", "models": None,
+        "registry": registry}
+    assert seedgen.MODELS == {"zimage": "Z-Image", "qwen": "Qwen-Image"}
+    assert seedgen.availability_error(partial, None, ZCLEAN) is None
+    assert seedgen.availability_error(none_ok, None, ZCLEAN) == "Z-Image is unavailable: torch not importable by /py"
+    assert seedgen.availability_error(None, "boom", ZCLEAN) == "cannot check the seed models: boom"
+
+
+# --- SQT16 (seed models SQ31): the 409 texts for a Qwen selection ------------------------------------
+
+def test_sqt16_availability_of_a_qwen_selection():
+    ok_z = {"ok": True, "reason": None, "backend": "zimage"}
+
+    def clean(model_id, *lora_ids):
+        return {"model": "qwen", "qwen_model": model_id, "loras": [{"id": i, "scale": 1.0} for i in lora_ids]}
+
+    every = {"zimage": ok_z, "qwen": qwen_probe()}
+    assert seedgen.availability_error(every, None, clean("qwen21-q4", "uncensored", "viggle-turbo")) is None
+    q8_off = {"zimage": ok_z, "qwen": qwen_probe(models={"qwen21-q8": "not installed (run x)"})}
+    assert seedgen.availability_error(q8_off, None, clean("qwen21-q8")) == (
+        "Qwen-Image-2.1 q8 is unavailable: not installed (run x)")
+    assert seedgen.availability_error(q8_off, None, clean("qwen21-q4", "uncensored")) is None
+    loras_off = {"zimage": ok_z, "qwen": qwen_probe(loras={"uncensored": "u missing", "viggle-turbo": "v missing"})}
+    assert seedgen.availability_error(loras_off, None, clean("qwen21-q4", "uncensored", "viggle-turbo")) == (
+        "LoRA Uncensored (abenzerps) is unavailable: u missing")
+    assert seedgen.availability_error(loras_off, None, clean("qwen21-q4", "viggle-turbo")) == (
+        "LoRA Viggle turbo 6-step is unavailable: v missing")
+    assert seedgen.availability_error(loras_off, None, clean("qwen21-q4")) is None
+    both_off = {"zimage": ok_z, "qwen": qwen_probe(models={"qwen21-bf16": "needs 56 GiB"}, loras={"uncensored": "u"})}
+    assert seedgen.availability_error(both_off, None, clean("qwen21-bf16", "uncensored")) == (
+        "Qwen-Image-2.1 bf16 is unavailable: needs 56 GiB")
+    aggregate_off = {"zimage": ok_z, "qwen": dict(qwen_probe(), ok=False, reason="x")}
+    assert seedgen.availability_error(aggregate_off, None, clean("qwen2511-q4")) is None
+    zimage_off = {"zimage": dict(ok_z, ok=False, reason="z"), "qwen": qwen_probe()}
+    assert seedgen.availability_error(zimage_off, None, clean("qwen2511-bf16")) is None
+    assert seedgen.availability_error(None, "boom", clean("qwen21-q4")) == "cannot check the seed models: boom"
 
 
 def test_sgt17_the_module_imports():
@@ -317,8 +364,8 @@ def test_sqt16_the_registry_view():
 
 # --- The probe stub and the environment (spec 9 rules) -----------------------------------------------
 
-OK_MODELS = {"zimage": {"ok": True, "reason": None, "backend": "zimage"},
-             "qwen": {"ok": True, "reason": None, "backend": "mflux-q4"}}
+OK_MODELS = {"zimage": {"ok": True, "reason": None, "backend": "zimage"}, "qwen": qwen_probe()}
+IDS, LIDS = seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS
 
 
 def stub_seed_edit(ws, models, exit=0, stderr="", sleep=0):
@@ -392,14 +439,14 @@ def test_sgt19_seed_edit_check(monkeypatch, tmp_path):
     clean_env(monkeypatch, tmp_path)
     ws = mt.make_stub_workspace(tmp_path)
     stub_seed_edit(ws, OK_MODELS)
-    assert lib.seed_edit_check(ws) == (OK_MODELS, None)
+    assert lib.seed_edit_check(ws, IDS, LIDS) == (OK_MODELS, None)
     extra = {"zimage": dict(OK_MODELS["zimage"], note=1), "qwen": OK_MODELS["qwen"], "other": 1}
     stub_seed_edit(ws, extra)
-    assert lib.seed_edit_check(ws) == (OK_MODELS, None)
+    assert lib.seed_edit_check(ws, IDS, LIDS) == (OK_MODELS, None)
     stub_seed_edit(ws, OK_MODELS, exit=3, stderr="first\nnope\n")
-    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe exited 3: nope")
+    assert lib.seed_edit_check(ws, IDS, LIDS) == (None, "bin/seed-edit --probe exited 3: nope")
     stub_seed_edit(ws, OK_MODELS, exit=3)
-    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe exited 3: -")
+    assert lib.seed_edit_check(ws, IDS, LIDS) == (None, "bin/seed-edit --probe exited 3: -")
     bad = [
         "not json",
         json.dumps({"zimage": dict(OK_MODELS["zimage"], ok="yes"), "qwen": OK_MODELS["qwen"]}),
@@ -407,21 +454,66 @@ def test_sgt19_seed_edit_check(monkeypatch, tmp_path):
         json.dumps([OK_MODELS]),
         json.dumps({"zimage": {"ok": True, "backend": "zimage"}, "qwen": OK_MODELS["qwen"]}),
         json.dumps({"zimage": dict(OK_MODELS["zimage"], reason=5), "qwen": OK_MODELS["qwen"]}),
-        json.dumps({"zimage": OK_MODELS["zimage"], "qwen": dict(OK_MODELS["qwen"], backend=["x"])}),
+        json.dumps({"zimage": OK_MODELS["zimage"], "qwen": dict(OK_MODELS["qwen"], reason=["x"])}),
     ]
     for printed in bad:
         stub_seed_edit(ws, printed)
-        assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe printed unparsable output"), printed
+        assert lib.seed_edit_check(ws, IDS, LIDS) == (None, "bin/seed-edit --probe printed unparsable output"), printed
     monkeypatch.setattr(lib, "LIGHT_TIMEOUT", 1)
     stub_seed_edit(ws, OK_MODELS, sleep=2)
-    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe timed out after 1 s")
+    assert lib.seed_edit_check(ws, IDS, LIDS) == (None, "bin/seed-edit --probe timed out after 1 s")
+
+
+# --- SQT17 (seed models SQ34, SQ35): the qwen argv and the probe's new shape ----------------------------
+
+def test_sqt17_qwen_argv_and_probe_shape(monkeypatch, tmp_path):
+    mt.set_home(monkeypatch, tmp_path)
+    clean_env(monkeypatch, tmp_path)
+    ws = mt.make_stub_workspace(tmp_path)
+    run_dir = os.path.join(ws, "generated", "seeds", "runs", RUN)
+    fields = {"ws": ws, "run": RUN, "source_file": "source.png", "prompt": "make it night", "model": "qwen",
+              "strength": None, "qwen_model": "qwen21-q4",
+              "loras": [{"id": "uncensored", "scale": 1.0}, {"id": "viggle-turbo", "scale": 0.5}],
+              "candidates": 4, "seed": 7, "source": {"kind": "upload", "upload_id": UP}}
+    assert lib.seed_edit_argv(fields, ws, py="/py") == [
+        "/py", os.path.join(ws, "bin", "seed-edit"), "--source", os.path.join(run_dir, "source.png"),
+        "--prompt", "make it night", "--model", "qwen", "--qwen-model", "qwen21-q4", "--lora", "uncensored=1.0",
+        "--lora", "viggle-turbo=0.5", "--candidates", "4", "--seed", "7", "--run-dir", run_dir]
+    plain = dict(fields, qwen_model="qwen2511-q4", loras=[])
+    assert lib.seed_edit_argv(plain, ws, py="/py")[6:11] == ["--model", "qwen", "--qwen-model", "qwen2511-q4",
+                                                             "--candidates"]
+    legacy = dict(fields)
+    del legacy["qwen_model"], legacy["loras"]
+    assert lib.seed_edit_argv(legacy, ws, py="/py") == [
+        "/py", os.path.join(ws, "bin", "seed-edit"), "--source", os.path.join(run_dir, "source.png"),
+        "--prompt", "make it night", "--model", "qwen", "--candidates", "4", "--seed", "7", "--run-dir", run_dir]
+    zimage = dict(fields, model="zimage", strength=0.3, qwen_model=None, loras=[])
+    assert "--qwen-model" not in lib.seed_edit_argv(zimage, ws) and "--lora" not in lib.seed_edit_argv(zimage, ws)
+    qwen = qwen_probe(models={"qwen21-q8": "q8 missing"}, loras={"viggle-turbo": "v missing"})
+    noisy = dict(qwen, backend="mflux", models=dict((i, dict(e, extra=1)) for i, e in qwen["models"].items()))
+    stub_seed_edit(ws, {"zimage": OK_MODELS["zimage"], "qwen": noisy})
+    assert lib.seed_edit_check(ws, IDS, LIDS) == ({"zimage": OK_MODELS["zimage"], "qwen": qwen}, None)
+    models = dict(qwen["models"])
+    del models["qwen21-q8"]
+    loras = dict(qwen["loras"], extra={"ok": True, "reason": None})
+    no_loras = dict(qwen)
+    del no_loras["loras"]
+    bad_ok = dict(qwen, models=dict(qwen["models"], **{"qwen21-q4": {"ok": "yes", "reason": None}}))
+    bad_reason = dict(qwen, loras=dict(qwen["loras"], uncensored={"ok": False, "reason": 5}))
+    no_reason = dict(qwen, models=dict(qwen["models"], **{"qwen21-q4": {"ok": True}}))
+    for printed in (dict(qwen, models=models), dict(qwen, loras=loras), bad_ok, no_loras, bad_reason, no_reason,
+                    dict(qwen, models=[]), dict(qwen, ok=None)):
+        stub_seed_edit(ws, {"zimage": OK_MODELS["zimage"], "qwen": printed})
+        assert lib.seed_edit_check(ws, IDS, LIDS) == (None, "bin/seed-edit --probe printed unparsable output"), printed
 
 
 # --- The HTTP tests: fixture and helpers (spec 9 rules) -----------------------------------------------
 
 TIME_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 VIEW_KEYS = {"run", "dir", "created", "state", "prompt", "model", "backend", "strength", "seed", "size",
-             "source_size", "source_origin", "error", "source", "candidates", "job"}
+             "source_size", "source_origin", "error", "source", "candidates", "job",
+             "qwen_model", "loras", "steps", "scheduler"}
+NO_QWEN = {"qwen_model": None, "loras": [], "steps": None, "scheduler": None}
 RA, RB = "se-20261101-100000-000a", "se-20261101-100000-000b"
 
 
@@ -565,10 +657,10 @@ def test_sgt21_bad_requests_get_400_and_create_nothing(env):
 def test_sgt22_conflicts_get_409_and_create_nothing(env):
     s, ws = env["srv"], env["ws"]
     up = _upload(s)
-    reason = "diffusers bf16: needs a host with at least 64 GiB of memory (this host has 48.0 GiB); mflux q4: x"
-    stub_seed_edit(ws, dict(OK_MODELS, qwen={"ok": False, "reason": reason, "backend": None}))
+    reason = "needs a host with at least 20 GiB of memory (this host has 16.0 GiB)"
+    stub_seed_edit(ws, dict(OK_MODELS, qwen=qwen_probe(models={"qwen21-q4": reason})))
     assert _create(s, _body(ws, {"upload_id": up}, model="qwen", strength=None))[::2] == (
-        409, {"error": "Qwen-Image-Edit is unavailable: " + reason})
+        409, {"error": "Qwen-Image-2.1 q4 is unavailable: " + reason})
     stub_seed_edit(ws, dict(OK_MODELS, zimage={"ok": False, "reason": "torch not importable by /py", "backend": None}))
     assert _create(s, _body(ws, {"upload_id": up}))[::2] == (
         409, {"error": "Z-Image is unavailable: torch not importable by /py"})
@@ -605,12 +697,12 @@ def test_sgt23_queue_a_run_from_an_upload(env):
         "model": "zimage", "backend": None, "strength": 0.45, "seed": 7, "size": None, "source_size": None,
         "source": "source.png", "source_origin": {"kind": "upload", "upload_id": up}, "job": job_id, "error": None,
         "candidates": [{"n": 1, "seed": 8, "status": "pending", "seconds": None},
-                       {"n": 2, "seed": 9, "status": "pending", "seconds": None}]}
+                       {"n": 2, "seed": 9, "status": "pending", "seconds": None}], **NO_QWEN}
     job = lib.read_job(lib.job_dir(state, job_id))
     assert (job["kind"], job["story_id"], job["character"], job["vlm"]) == ("seed-edit", None, None, "forbidden")
     assert job["fields"] == {"ws": ws, "run": run, "source_file": "source.png", "prompt": "make it night",
-                             "model": "zimage", "strength": 0.45, "candidates": 2, "seed": 7,
-                             "source": {"kind": "upload", "upload_id": up}}
+                             "model": "zimage", "strength": 0.45, "qwen_model": None, "loras": [], "candidates": 2,
+                             "seed": 7, "source": {"kind": "upload", "upload_id": up}}
     assert job["argv"] == lib.seed_edit_argv(job["fields"], ws)
     assert lib.read_queue(state) == [job_id]
     assert set(view) == VIEW_KEYS
@@ -698,12 +790,12 @@ def test_sgt26_the_runs_list(env):
     assert status == 200
     runs = data["runs"]
     assert [r["run"] for r in runs] == [r3, r2, r1]
-    assert all(set(r) == {"run", "created", "state", "prompt", "model", "backend", "count", "ok", "thumbs"}
-               for r in runs)
+    assert all(set(r) == {"run", "created", "state", "prompt", "model", "backend", "qwen_model", "loras", "count",
+                          "ok", "thumbs"} for r in runs)
     assert [(r["state"], r["prompt"], r["count"], r["ok"], r["thumbs"]) for r in runs[:2]] == [
         ("unknown", "third", 1, 0, []), ("queued", "second", 2, 0, [])]
     assert runs[2] == {"run": r1, "created": "2026-11-02T14:15:00Z", "state": "done", "prompt": "make it night",
-                       "model": "zimage", "backend": "zimage", "count": 3, "ok": 2,
+                       "model": "zimage", "backend": "zimage", "qwen_model": None, "loras": [], "count": 3, "ok": 2,
                        "thumbs": [os.path.join(d1, "cand_01.png")]}
     for i in range(201):
         make_run(ws, "se-20261103-%06d-0000" % i, [])
@@ -728,7 +820,7 @@ def test_sgt27_the_run_view(env):
                        {"n": 2, "seed": 9, "status": "blocked", "seconds": 1.0, "path": None},
                        {"n": 3, "seed": 10, "status": "ok", "seconds": 1.0, "path": None},
                        {"n": 4, "seed": 11, "status": "failed", "seconds": None, "path": None}],
-        "job": None}
+        "job": None, **NO_QWEN}
     job_id = seed_job(state, ws, RB)
     make_run(ws, RB, ["pending"], state="queued", job=job_id)
     view = mt.api(s, "GET", "/api/seeds/runs/%s?ws=%s" % (RB, ws))[2]
@@ -829,8 +921,9 @@ def test_sgt30_the_seed_folders(env):
 def test_sgt31_the_seed_edit_capability(env):
     s, ws, tmp = env["srv"], env["ws"], env["tmp"]
     server = s.server
+    registry = seedgen.registry_view()
     assert mt.api(s, "GET", "/api/host")[2]["capabilities"]["seed_edit"] == {
-        "ok": None, "reason": "probing", "checked": None, "models": None}
+        "ok": None, "reason": "probing", "checked": None, "models": None, "registry": registry}
     server.probe_ws = ws
     good_py = os.path.join(tmp, "good-python")
     with open(good_py, "w") as f:
@@ -841,18 +934,19 @@ def test_sgt31_the_seed_edit_capability(env):
     caps = mt.api(s, "GET", "/api/host?refresh=1")[2]["capabilities"]
     checked = caps["seed_edit"]["checked"]
     assert TIME_RE.fullmatch(checked)
-    assert caps["seed_edit"] == {"ok": True, "reason": None, "checked": checked, "models": OK_MODELS}
+    assert caps["seed_edit"] == {"ok": True, "reason": None, "checked": checked, "models": OK_MODELS,
+                                 "registry": registry}
     assert all(set(caps[key]) == {"ok", "reason", "checked"} for key in ("render", "stills", "story_server"))
     none_ok = {"zimage": {"ok": False, "reason": "z", "backend": None},
-               "qwen": {"ok": False, "reason": "q", "backend": None}}
+               "qwen": dict(qwen_probe(models=ALL_MODELS_OFF), reason="q")}
     stub_seed_edit(ws, none_ok)
     caps = mt.api(s, "GET", "/api/host?refresh=1")[2]["capabilities"]
-    assert dict(caps["seed_edit"], checked=None) == {"ok": False, "reason": "Z-Image: z; Qwen-Image-Edit: q",
-                                                     "checked": None, "models": none_ok}
+    assert dict(caps["seed_edit"], checked=None) == {"ok": False, "reason": "Z-Image: z; Qwen-Image: q",
+                                                     "checked": None, "models": none_ok, "registry": registry}
     stub_seed_edit(ws, OK_MODELS, exit=1, stderr="boom\n")
     caps = mt.api(s, "GET", "/api/host?refresh=1")[2]["capabilities"]
     assert dict(caps["seed_edit"], checked=None) == {"ok": False, "reason": "bin/seed-edit --probe exited 1: boom",
-                                                     "checked": None, "models": None}
+                                                     "checked": None, "models": None, "registry": registry}
 
 
 # --- SGT32 (SG46): the job summary key -------------------------------------------------------------------
@@ -864,6 +958,102 @@ def test_sgt32_the_job_summary_key(env):
     mt.make_job(state, ["true"], ws)
     queued = mt.api(s, "GET", "/api/jobs")[2]["queued"]
     assert [(j["kind"], j["seed_run"]) for j in queued] == [("seed-edit", data["run"]["run"]), ("movie", None)]
+
+
+# --- SQT19 (seed models SQ36, SQ39): a Qwen run over HTTP; every new 400 and 409 creates nothing ------------
+
+def test_sqt19_a_qwen_run_and_its_refusals(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    up = _upload(s)
+    body = _body(ws, {"upload_id": up}, model="qwen", strength=None, qwen_model="qwen21-q4",
+                 loras=[{"id": "uncensored", "scale": 0.5}])
+    for case, message in QWEN_REQUEST_CASES:
+        assert _create(s, dict(case, ws=ws, source={"upload_id": up}))[::2] == (400, {"error": message}), message
+    q8 = ("mflux-community/qwen-image-2-1-mflux-q8@f5c8cc79a674 is not in /z or /h "
+          "(run bin/seed-edit-setup --model qwen21-q8)")
+    stub_seed_edit(ws, dict(OK_MODELS, qwen=qwen_probe(models={"qwen21-q8": q8})))
+    assert _create(s, dict(body, qwen_model="qwen21-q8"))[::2] == (
+        409, {"error": "Qwen-Image-2.1 q8 is unavailable: " + q8})
+    vig = ("Qwen-Image-2.1-viggle-turbo-v0.3-6step-lora-r128.safetensors is not in /z or /h "
+           "(run bin/seed-edit-setup --lora viggle-turbo)")
+    stub_seed_edit(ws, dict(OK_MODELS, qwen=qwen_probe(loras={"viggle-turbo": vig})))
+    assert _create(s, dict(body, loras=[{"id": "viggle-turbo", "scale": 1}]))[::2] == (
+        409, {"error": "LoRA Viggle turbo 6-step is unavailable: " + vig})
+    assert _nothing_created(env)
+    status, _h, data = _create(s, body)
+    assert status == 201, data
+    record = _record(data["run"]["dir"])
+    assert {k: record[k] for k in NO_QWEN} == {
+        "qwen_model": {"id": "qwen21-q4", "repo": "mflux-community/qwen-image-2-1-mflux-q4"},
+        "loras": [{"id": "uncensored", "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized",
+                   "file": "qwen-image-2.1-uncensored-lora.safetensors", "scale": 0.5}],
+        "steps": 40, "scheduler": "linear"}
+    assert {k: data["run"][k] for k in NO_QWEN} == {k: record[k] for k in NO_QWEN}
+    job = lib.read_job(lib.job_dir(state, data["run"]["job"]["id"]))
+    assert (job["fields"]["qwen_model"], job["fields"]["loras"]) == ("qwen21-q4", [{"id": "uncensored", "scale": 0.5}])
+    argv = job["argv"]
+    assert argv == lib.seed_edit_argv(job["fields"], ws)
+    i = argv.index("--qwen-model")
+    assert argv[i:i + 4] == ["--qwen-model", "qwen21-q4", "--lora", "uncensored=0.5"]
+
+
+# --- SQT20 (seed models SQ37, SQ38): the run view and the runs list carry the selection ---------------------
+
+def test_sqt20_the_view_and_the_list_carry_the_selection(env):
+    s, ws = env["srv"], env["ws"]
+    legacy = make_run(ws, RA, ["ok"])
+    record = dict(_record(legacy), model="qwen", backend="mflux-q4", strength=None)
+    with open(os.path.join(legacy, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    view = mt.api(s, "GET", "/api/seeds/runs/%s?ws=%s" % (RA, ws))[2]
+    assert set(view) == VIEW_KEYS
+    assert {k: view[k] for k in NO_QWEN} == {
+        "qwen_model": {"id": "qwen2511-q4", "repo": "mflux-community/qwen-image-edit-2511-mflux-q4"}, "loras": [],
+        "steps": 8, "scheduler": None}
+    newer = make_run(ws, RB, ["ok"])
+    settings = seedgen.qwen_settings("qwen21-q4", [{"id": "viggle-turbo", "scale": 1.0}])
+    record = dict(_record(newer), model="qwen", backend="mflux", strength=None, **settings)
+    with open(os.path.join(newer, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    view = mt.api(s, "GET", "/api/seeds/runs/%s?ws=%s" % (RB, ws))[2]
+    assert {k: view[k] for k in NO_QWEN} == settings and settings["steps"] == 6
+    runs = mt.api(s, "GET", "/api/seeds/runs?ws=" + ws)[2]["runs"]
+    assert [(r["run"], r["qwen_model"], r["loras"]) for r in runs] == [
+        (RB, settings["qwen_model"], settings["loras"]),
+        (RA, {"id": "qwen2511-q4", "repo": "mflux-community/qwen-image-edit-2511-mflux-q4"}, [])]
+    assert all("steps" not in r for r in runs)
+
+
+# --- SQT21 (seed models SQ33): the capability carries the registry from the start ----------------------------
+
+def test_sqt21_the_capability_carries_the_registry(env):
+    s, ws = env["srv"], env["ws"]
+    server = s.server
+    assert server.capabilities["seed_edit"] == {"ok": None, "reason": "probing", "checked": None, "models": None,
+                                                "registry": seedgen.registry_view()}
+    server.probe_ws = ws
+    env["mp"].setenv("LTX2_MLX_BIN", os.path.join(env["tmp"], "missing-ltx"))
+    seed_edit = mt.api(s, "GET", "/api/host?refresh=1")[2]["capabilities"]["seed_edit"]
+    assert (seed_edit["models"], seed_edit["registry"]) == (OK_MODELS, seedgen.registry_view())
+
+
+# --- Review Focus 2: an old page tab (or a script) posts a Qwen run without qwen_model or loras ---------------
+
+def test_sq_review_focus_2_a_qwen_request_without_the_new_fields(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    up = _upload(s)
+    old_page = _body(ws, {"upload_id": up}, model="qwen", strength=None)
+    unc = "qwen-image-2.1-uncensored-lora.safetensors is not in /z or /h (run bin/seed-edit-setup --lora uncensored)"
+    stub_seed_edit(ws, dict(OK_MODELS, qwen=qwen_probe(loras={"uncensored": unc})))
+    assert _create(s, old_page)[::2] == (409, {"error": "LoRA Uncensored (abenzerps) is unavailable: " + unc})
+    assert _nothing_created(env)
+    stub_seed_edit(ws, OK_MODELS)
+    status, _h, data = _create(s, old_page)
+    assert status == 201, data
+    job = lib.read_job(lib.job_dir(state, data["run"]["job"]["id"]))
+    assert (job["fields"]["qwen_model"], job["fields"]["loras"]) == ("qwen21-q4", [{"id": "uncensored", "scale": 1.0}])
+    assert job["argv"][job["argv"].index("--qwen-model"):][:4] == ["--qwen-model", "qwen21-q4", "--lora", "uncensored=1.0"]
+    assert (data["run"]["steps"], data["run"]["scheduler"]) == (40, "linear")
 
 
 # --- Review Focus 1: phone JPEGs and WebP files keep their extension end to end ----------------------------

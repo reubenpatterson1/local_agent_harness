@@ -212,7 +212,8 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         self.cap_lock = threading.Lock()
         self.capabilities = dict((k, {"ok": None, "reason": "probing", "checked": None})
                                  for k in ("render", "stills", "story_server"))
-        self.capabilities["seed_edit"] = {"ok": None, "reason": "probing", "checked": None, "models": None}
+        self.capabilities["seed_edit"] = {"ok": None, "reason": "probing", "checked": None, "models": None,
+                                          "registry": seedgen.registry_view()}
         self.parser_lock = threading.Lock()
         self.parsers = {}
         self.job_cache = {}
@@ -224,7 +225,7 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         and store the results."""
         results = {"render": lib.render_check(), "stills": lib.stills_check(self.probe_ws, self.stills_py),
                    "story_server": lib.story_server_check(self.probe_ws)}
-        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws)
+        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
         checked = lib.utc_now()
         with self.cap_lock:
             for key, (ok, detail) in results.items():
@@ -1697,7 +1698,10 @@ def run_view(server, ws_real, run, run_dir, record, queue):
         source_path = None
     job_id = _run_job(server, record)
     view = {"run": run, "dir": run_dir, "created": record.get("created"), "state": run_state(server, record, queue)}
-    for key in ("prompt", "model", "backend", "strength", "seed", "size", "source_size", "source_origin", "error"):
+    for key in ("prompt", "model", "backend"):
+        view[key] = record.get(key)
+    view.update(seedgen.record_settings(record))
+    for key in ("strength", "seed", "size", "source_size", "source_origin", "error"):
         view[key] = record.get(key)
     view["source"] = source_path
     view["candidates"] = [{"n": c["n"], "seed": c.get("seed"), "status": c.get("status"),
@@ -1739,8 +1743,8 @@ def _h_seed_run_create(self, groups, query, body):
     if error is not None:
         raise ApiError(400, error)
     source, ext = _seed_source(server, real, clean["source"])
-    models, detail = lib.seed_edit_check(real)
-    error = seedgen.availability_error(models, detail, clean["model"])
+    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
+    error = seedgen.availability_error(models, detail, clean)
     if error is not None:
         raise ApiError(409, error)
     generated = os.path.join(real, "generated")
@@ -1766,13 +1770,15 @@ def _h_seed_run_create(self, groups, query, body):
         job_id = lib.new_job_id(server.state)
         record = {"schema": "seed-edit.run.v1", "run": run, "created": lib.utc_now(), "state": "queued",
                   "prompt": clean["prompt"], "model": clean["model"], "backend": None,
-                  "strength": clean["strength"], "seed": seed, "size": None, "source_size": None,
+                  "strength": clean["strength"], "seed": seed,
+                  **seedgen.qwen_settings(clean["qwen_model"], clean["loras"]), "size": None, "source_size": None,
                   "source": source_file, "source_origin": origin, "job": job_id, "error": None,
                   "candidates": [{"n": i, "seed": seed + i, "status": "pending", "seconds": None}
                                  for i in range(1, clean["candidates"] + 1)]}
         lib.write_json_atomic(os.path.join(run_dir, "run.json"), record)
         fields = {"ws": real, "run": run, "source_file": source_file, "prompt": clean["prompt"],
-                  "model": clean["model"], "strength": clean["strength"], "candidates": clean["candidates"],
+                  "model": clean["model"], "strength": clean["strength"], "qwen_model": clean["qwen_model"],
+                  "loras": clean["loras"], "candidates": clean["candidates"],
                   "seed": seed, "source": origin}
         lib.create_job(server.state, job_id, "seed-edit", real, None, None, lib.seed_edit_argv(fields, real), fields)
     return 201, {"run": run_view(server, real, run, run_dir, record, lib.read_queue(server.state))}
@@ -1795,9 +1801,10 @@ def _h_seed_runs(self, groups, query, body):
         except ApiError:
             continue
         cands = [(c, _cand_file(run_dir, c)) for c in _candidates(record)]
+        settings = seedgen.record_settings(record)
         runs.append({"run": name, "created": record.get("created"), "state": run_state(self.server, record, queue),
                      "prompt": record.get("prompt"), "model": record.get("model"), "backend": record.get("backend"),
-                     "count": len(cands), "ok": sum(1 for c, _path in cands if c.get("status") == "ok"),
+                     "qwen_model": settings["qwen_model"], "loras": settings["loras"], "count": len(cands), "ok": sum(1 for c, _path in cands if c.get("status") == "ok"),
                      "thumbs": [path for _c, path in cands if path is not None]})
     return 200, {"runs": runs}
 

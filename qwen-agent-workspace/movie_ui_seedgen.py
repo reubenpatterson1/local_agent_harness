@@ -23,7 +23,7 @@ STRENGTH_MIN, STRENGTH_MAX, STRENGTH_DEFAULT = 0.10, 0.90, 0.45
 SEED_MAX = 2147483647
 MIN_FREE_GIB = 2.0
 RUNS_MAX = 200
-MODELS = {"zimage": "Z-Image", "qwen": "Qwen-Image-Edit"}
+MODELS = {"zimage": "Z-Image", "qwen": "Qwen-Image"}
 RUN_ID_RE = re.compile(r"^se-[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$")
 FOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 STILL_RE = re.compile(r"^char_[0-9]{2}\.png$")          # movie_ui_server.STILL_FILE_RE
@@ -290,18 +290,31 @@ def registry_view():
 
 
 def capability(models, detail, checked):
-    """SG36: the seed_edit capability from lib.seed_edit_check's (models, detail)."""
+    """SG36, seed models SQ32: the seed_edit capability from lib.seed_edit_check's (models, detail),
+    with the registry view."""
     if models is None:
-        return {"ok": False, "reason": detail, "checked": checked, "models": None}
+        return {"ok": False, "reason": detail, "checked": checked, "models": None, "registry": registry_view()}
     ok = any(m["ok"] for m in models.values())
     reason = None if ok else "; ".join("%s: %s" % (MODELS[k], models[k]["reason"]) for k in ("zimage", "qwen"))
-    return {"ok": ok, "reason": reason, "checked": checked, "models": models}
+    return {"ok": ok, "reason": reason, "checked": checked, "models": models, "registry": registry_view()}
 
 
-def availability_error(models, detail, model):
-    """SG37: the 409 error for model, or None when it can run."""
+def availability_error(models, detail, clean):
+    """SG37, seed models SQ31: the 409 error for a cleaned request, or None when it can run. For qwen
+    the selected model's own probe entry decides, then each selected LoRA's in registry order."""
     if models is None:
         return "cannot check the seed models: %s" % detail
-    if not models[model]["ok"]:
-        return "%s is unavailable: %s" % (MODELS[model], models[model]["reason"])
+    if clean["model"] == "zimage":
+        if not models["zimage"]["ok"]:
+            return "%s is unavailable: %s" % (MODELS["zimage"], models["zimage"]["reason"])
+        return None
+    entry = qwen_model(clean["qwen_model"])
+    found = models["qwen"]["models"][entry["id"]]
+    if not found["ok"]:
+        return "%s is unavailable: %s" % (entry["label"], found["reason"])
+    for item in clean["loras"]:
+        lora = qwen_lora(item["id"])
+        found = models["qwen"]["loras"][lora["id"]]
+        if not found["ok"]:
+            return "LoRA %s is unavailable: %s" % (lora["label"], found["reason"])
     return None

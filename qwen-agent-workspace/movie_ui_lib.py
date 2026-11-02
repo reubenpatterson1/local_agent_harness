@@ -1197,11 +1197,17 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
 
 
 def seed_edit_argv(fields, ws_real, py=sys.executable):
-    """The bin/seed-edit argv of a seed-edit job (seed generator spec SG29)."""
+    """The bin/seed-edit argv of a seed-edit job (seed generator spec SG29; seed models SQ34: a qwen
+    job's --qwen-model and one --lora ID=SCALE per LoRA, in the fields' (registry) order). Fields
+    without qwen_model (a job queued before the registry) give SG29's argv."""
     run_dir = os.path.join(ws_real, "generated", "seeds", "runs", fields["run"])
     argv = [py, os.path.join(ws_real, "bin", "seed-edit"),
             "--source", os.path.join(run_dir, fields["source_file"]),
             "--prompt", fields["prompt"], "--model", fields["model"]]
+    if fields["model"] == "qwen" and fields.get("qwen_model") is not None:
+        argv += ["--qwen-model", fields["qwen_model"]]
+        for lora in fields["loras"]:
+            argv += ["--lora", "%s=%r" % (lora["id"], float(lora["scale"]))]
     if fields["model"] == "zimage":
         argv += ["--strength", repr(float(fields["strength"]))]
     return argv + ["--candidates", str(fields["candidates"]), "--seed", str(fields["seed"]),
@@ -1655,8 +1661,33 @@ def _probe_model(value):
     return {"ok": value["ok"], "reason": value["reason"], "backend": value["backend"]}
 
 
-def seed_edit_check(ws_real):
-    """(models, None) from <ws>/bin/seed-edit --probe, or (None, detail) (seed generator SG30)."""
+def _probe_qwen(value, model_ids, lora_ids):
+    """The qwen entry of bin/seed-edit --probe's output (seed models SQ35): {"ok", "reason", "models",
+    "loras"} with exactly those keys, models and loras keyed by exactly model_ids and lora_ids and each
+    entry {"ok", "reason"}; extra keys are dropped. None when the shape is wrong."""
+    def entry(item):
+        if not (isinstance(item, dict) and isinstance(item.get("ok"), bool) and "reason" in item
+                and (item["reason"] is None or isinstance(item["reason"], str))):
+            return None
+        return {"ok": item["ok"], "reason": item["reason"]}
+
+    top = entry(value)
+    if top is None:
+        return None
+    for key, ids in (("models", model_ids), ("loras", lora_ids)):
+        found = value.get(key)
+        if not (isinstance(found, dict) and set(found) == set(ids)):
+            return None
+        parsed = dict((i, entry(found[i])) for i in ids)
+        if None in parsed.values():
+            return None
+        top[key] = parsed
+    return top
+
+
+def seed_edit_check(ws_real, model_ids, lora_ids):
+    """(models, None) from <ws>/bin/seed-edit --probe, or (None, detail) (seed generator SG30; seed
+    models SQ35: the qwen entry carries one {"ok", "reason"} per registry model and LoRA)."""
     run = run_light(tool_argv(ws_real, "seed-edit", "--probe"), ws_real)
     if run["timed_out"]:
         return None, "bin/seed-edit --probe timed out after %d s" % LIGHT_TIMEOUT
@@ -1669,7 +1700,8 @@ def seed_edit_check(ws_real):
         data = None
     models = None
     if isinstance(data, dict):
-        models = dict((key, _probe_model(data.get(key))) for key in ("zimage", "qwen"))
+        models = {"zimage": _probe_model(data.get("zimage")),
+                  "qwen": _probe_qwen(data.get("qwen"), model_ids, lora_ids)}
         if None in models.values():
             models = None
     if models is None:
