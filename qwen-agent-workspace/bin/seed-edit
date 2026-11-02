@@ -593,14 +593,22 @@ def run_child(argv, env, on_line):
     """SG21: run a Qwen child in its own session with a CHILD_TIMEOUT_S timer that SIGKILLs its
     process group; echo each line to stdout and pass it to on_line without its newline. Text mode
     reads with universal newlines, so a progress bar's carriage return also ends a line and never
-    hides a candidate line. Returns the exit code (-9 after the timeout). The child is killed if
-    this function exits early (an exception in on_line, or an interrupt)."""
+    hides a candidate line. Returns (exit code, True when the timer killed the child); any other
+    SIGKILL (a memory-pressure kill) is an ordinary -9 exit. The child is killed if this function
+    exits early (an exception in on_line, or an interrupt)."""
     global CHILD
     proc = subprocess.Popen(argv, cwd=WS, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
                             bufsize=1, start_new_session=True)
     CHILD = proc
-    timer = threading.Timer(CHILD_TIMEOUT_S, _kill_group, args=(proc.pid,))
+    timed_out = threading.Event()
+
+    def on_timeout():
+        if proc.poll() is None:
+            timed_out.set()
+            _kill_group(proc.pid)
+
+    timer = threading.Timer(CHILD_TIMEOUT_S, on_timeout)
     timer.daemon = True
     timer.start()
     try:
@@ -608,7 +616,7 @@ def run_child(argv, env, on_line):
             sys.stdout.write(line)
             sys.stdout.flush()
             on_line(line.rstrip("\n"))
-        return proc.wait()
+        return proc.wait(), timed_out.is_set()
     finally:
         timer.cancel()
         if proc.poll() is None:
@@ -627,8 +635,8 @@ def run_qwen_child(ctx, label, argv, env, handle):
             last[0] = line.strip()
         handle(line)
 
-    code = run_child(argv, env, on_line)
-    if code == -9:
+    code, timed_out = run_child(argv, env, on_line)
+    if timed_out:
         return "%s child timed out after %d s" % (label, CHILD_TIMEOUT_S)
     if code != 0:
         return "%s child exited %d: %s" % (label, code, last[0] or "-")

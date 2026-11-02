@@ -179,6 +179,9 @@ for i, job in enumerate(spec["jobs"]):
     if config.get("fail_after") == i:
         print("boom", flush=True)
         sys.exit(1)
+    if config.get("kill_after") == i:
+        print("killed", flush=True)
+        os.kill(os.getpid(), 9)
     color = (255, 0, 0) if job["n"] in config.get("red", []) else (0, 0, 200)
     Image.new("RGB", (spec["width"], spec["height"]), color).save(job["output_path"])
     print(config.get("prefix", "") + "seed-edit-child done %d 1.0" % job["n"], flush=True)
@@ -653,6 +656,14 @@ def test_sgt10_the_mflux_child_fails_or_times_out(env, capsys):
     record = record_of(run_dir)
     assert statuses(run_dir) == ["failed"] * 3
     assert record["error"] == "mflux q4 child timed out after %d s" % tool.CHILD_TIMEOUT_S
+    assert tool.CHILD is None
+    env["mp"].setattr(tool, "CHILD_TIMEOUT_S", 3600)
+    stub_config(py, {"kill_after": 1})
+    code, run_dir = run_tool(env, "--candidates", "3", "--seed", "100", model="qwen", run=R3)
+    assert code == 1
+    record = record_of(run_dir)
+    assert statuses(run_dir) == ["ok", "failed", "failed"]
+    assert (record["state"], record["error"]) == ("failed", "mflux q4 child exited -9: killed")
     assert tool.CHILD is None
 
 
