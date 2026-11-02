@@ -105,3 +105,6 @@ table.list th, table.list td { border-bottom: 1px solid var(--line); padding: 4p
 .se-actions { display: flex; flex-direction: column; gap: 4px; }
 .se-mini { width: 64px; height: auto; margin-right: 4px; }
 .gallery figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+/* seed models spec SQ48: the Qwen model box and its LoRA rows */
+.se-loras { display: flex; flex-direction: column; gap: 4px; }
+.se-lora { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }

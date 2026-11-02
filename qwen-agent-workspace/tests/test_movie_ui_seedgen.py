@@ -1101,7 +1101,7 @@ def test_sg_review_focus_2_keep_clicked_four_times_at_once(env):
 PAGE_IDS = ("tab-seeds", "panel-seeds", "se-file", "se-source-status", "se-source-img", "se-source-size", "se-prompt",
             "se-prompt-count", "se-model", "se-model-note", "se-strength-box", "se-strength", "se-candidates",
             "se-seed", "se-generate", "se-generate-reason", "se-run-title", "se-run-status", "se-folder-options",
-            "se-grid", "se-runs", "se-folders")
+            "se-grid", "se-runs", "se-folders", "se-qwen-box", "se-qwen-model", "se-steps", "se-loras", "se-qwen-note")
 JS_TEXTS = ('"/api/seeds/runs"', '"/api/seeds/folders"', '"/keep"', '"/use"', '"New seed from this"',
             '"Use in Compose"', '"Edit again"', '"Copy path"', '"blocked by content safety"', '"unavailable — "',
             '"selected — press Cmd+C"', '"seed run "', "navigator.clipboard", "S.timers.seeds",
@@ -1122,7 +1122,8 @@ JS_TEXTS = ('"/api/seeds/runs"', '"/api/seeds/folders"', '"/keep"', '"/use"', '"
 SEED_FUNCTIONS = ("seedCanvas", "setSeedSource", "onSeedSourceFile", "updateSeedButtons", "seedBody", "generateSeeds",
                   "openSeedRun", "pollSeedRun", "renderSeedRun", "seedRow", "keepSeed", "useSeed", "editSeedAgain",
                   "loadSeeds", "loadSeedRuns", "loadSeedFolders", "copySeedPath", "seedFromStill", "stopSeedPoll",
-                  "resetSeeds", "setupSeeds")
+                  "resetSeeds", "setupSeeds", "seedRegistry", "seedQwenEntry", "seedLoraEntry", "seedMultiple",
+                  "renderSeedQwen", "readSeedQwen", "seedLoraBody", "seedModelText")
 CSS_RULES = (".se-grid { display: flex; flex-direction: column; gap: 12px; }",
              ".se-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }",
              ".se-img, .se-thumb { width: 320px; height: auto; border: 1px solid var(--line); }",
@@ -1166,6 +1167,67 @@ def test_sgt33_the_static_page():
         assert proc.returncode == 0, proc.stderr
 
 
+# --- SQT22 (seed models SQ48-SQ56): the Qwen model box on the static page -------------------------------------
+
+QWEN_BOX = ('      <div id="se-qwen-box" class="wide" hidden>\n'
+            '        <label>Qwen model <select id="se-qwen-model"></select></label>\n'
+            '        <span id="se-steps" class="muted"></span>\n'
+            '        <div id="se-loras" class="se-loras"></div>\n'
+            '        <p id="se-qwen-note" class="muted"></p>\n'
+            '      </div>\n')
+QWEN_JS_TEXTS = ('"Lightning 8-step LoRA built in (not selectable)"', '" steps (turbo)"', '"Unavailable here: "',
+                 '"se-lora-scale-"', '"se-lora-note-"', '" — unavailable"', '"checking models…"', '" (Lightning)"',
+                 "qwen_model: model === \"qwen\" ? S.seeds.qwen.model : null",
+                 "loras: model === \"qwen\" ? seedLoraBody() : null",
+                 '  const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image"};',
+                 '  const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", '
+                 '"mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};',
+                 'S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false, qwen: null, '
+                 'qwenKey: ""};',
+                 "  function seedCanvas(w, h, multiple) {",
+                 "seedCanvas(natural.width, natural.height, seedMultiple())",
+                 '" strength must be above 0 and at most 2"',
+                 '    else if (qwenReason) { reason = qwenReason; }\n',
+                 '        el("td", {text: seedModelText(r)}), el("td", {text: r.state}), thumbs]);')
+
+
+def test_sqt22_the_qwen_box_on_the_page():
+    static, texts = _static_texts()
+    html, js, css = texts["index.html"], texts["app.js"], texts["app.css"]
+    assert '<span id="se-model-note" class="muted"></span>\n' + QWEN_BOX in html
+    assert '<option value="qwen">Qwen-Image (edit)</option>' in html and "Qwen-Image-Edit<" not in html
+    for rule in (".se-loras { display: flex; flex-direction: column; gap: 4px; }",
+                 ".se-lora { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }"):
+        assert rule in css, rule
+    for text in QWEN_JS_TEXTS:
+        assert text in js, text
+    for gone in ("Qwen-Image-Edit backend", "seedCanvas(img.naturalWidth", "SEED_BACKEND_LABELS[models.qwen.backend]"):
+        assert gone not in js, gone
+    node = shutil.which("node")
+    if not node:
+        return
+    start = js.index("  function seedRegistry() {")
+    helpers = js[start:js.index("  function seedMultiple() {", start)]
+    start = js.index("  function seedModelText(view) {")
+    helpers += js[start:js.index("\n  }\n", start) + len("\n  }\n")]
+    views = [{"model": "zimage"},
+             {"model": "qwen", "qwen_model": {"id": "qwen21-q4"}, "loras": [{"id": "uncensored", "scale": 1.0}]},
+             {"model": "qwen", "qwen_model": {"id": "qwen21-q8"},
+              "loras": [{"id": "uncensored", "scale": 0.5}, {"id": "viggle-turbo", "scale": 1}]},
+             {"model": "qwen", "qwen_model": {"id": "qwen2511-q4"}, "loras": []},
+             {"model": "qwen", "qwen_model": {"id": "qwen9"}, "loras": []},
+             {"model": "qwen", "qwen_model": None}, {"model": "flux"}]
+    script = ('const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image"};\n'
+              "function capability(name) { return {registry: %s}; }\n%s"
+              "process.stdout.write(JSON.stringify(%s.map(seedModelText)));\n"
+              % (json.dumps(seedgen.registry_view()), helpers, json.dumps(views)))
+    proc = subprocess.run([node, "-e", script], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["Z-Image", "Qwen-Image-2.1 q4 + uncensored 1",
+                                       "Qwen-Image-2.1 q8 + uncensored 0.5, viggle-turbo 1",
+                                       "Qwen-Image-Edit-2511 q4 (Lightning)", "qwen9", "Qwen-Image", "flux"]
+
+
 # --- Review Focus 5: the page's canvas size matches the tool's ----------------------------------------------
 
 CANVAS_CASES = [(1536, 1024), (1024, 1024), (800, 600), (4000, 3000), (3000, 4000), (720, 1280), (1023, 1023),
@@ -1186,23 +1248,24 @@ def test_sg_review_focus_5_the_page_canvas_matches_the_tool(tmp_path):
     loader.exec_module(tool)
     with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
         js = f.read()
-    start = js.index("  function seedCanvas(w, h) {")
+    start = js.index("  function seedCanvas(w, h, multiple) {")
     end = js.index("\n  }\n", start) + len("\n  }\n")
+    cases = [[w, h, m] for (w, h) in CANVAS_CASES for m in (16, 32)]
     script = js[start:end] + "const SEED_LONG_EDGE = 1024;\nprocess.stdout.write(JSON.stringify(%s.map(function (c) { " \
-        "return seedCanvas(c[0], c[1]); })));\n" % json.dumps(CANVAS_CASES)
+        "return seedCanvas(c[0], c[1], c[2]); })));\n" % json.dumps(cases)
     path = os.path.join(str(tmp_path), "canvas.js")
     with open(path, "w", encoding="utf-8") as f:
         f.write(script)
     proc = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
-    for (w0, h0), got in zip(CANVAS_CASES, json.loads(proc.stdout)):
+    for (w0, h0, m), got in zip(cases, json.loads(proc.stdout)):
         try:
-            want = dict(zip(("width", "height"), tool.canvas(w0, h0)))
+            want = dict(zip(("width", "height"), tool.canvas(w0, h0, m)))
         except tool.Refusal as e:
             found = re.search(r"gives a ([0-9]+)x([0-9]+) canvas", str(e))
             want = {"width": int(found.group(1)), "height": int(found.group(2))}
-            assert min(got["width"], got["height"]) < 64, (w0, h0, got)
-        assert got == want, (w0, h0)
+            assert min(got["width"], got["height"]) < 64, (w0, h0, m, got)
+        assert got == want, (w0, h0, m)
 
 
 # --- SGT34 (SG2, SG24): the new Python files are compiled and scanned; the tool's top-level imports ---------

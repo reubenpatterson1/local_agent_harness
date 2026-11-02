@@ -172,9 +172,15 @@
     <span id="se-prompt-count" class="muted">0 / 2000 characters</span>
     <label>Model <select id="se-model">
         <option value="zimage">Z-Image (img2img)</option>
-        <option value="qwen">Qwen-Image-Edit</option>
+        <option value="qwen">Qwen-Image (edit)</option>
       </select></label>
     <span id="se-model-note" class="muted"></span>
+      <div id="se-qwen-box" class="wide" hidden>
+        <label>Qwen model <select id="se-qwen-model"></select></label>
+        <span id="se-steps" class="muted"></span>
+        <div id="se-loras" class="se-loras"></div>
+        <p id="se-qwen-note" class="muted"></p>
+      </div>
     <label id="se-strength-box">Strength <input id="se-strength" type="number" min="0.10" max="0.90" step="0.05" value="0.45">
       <span class="muted">lower keeps more of the source</span></label>
     <label>Candidates <select id="se-candidates"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>

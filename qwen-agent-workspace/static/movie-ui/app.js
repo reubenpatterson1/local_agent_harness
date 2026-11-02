@@ -17,8 +17,8 @@
   const SEED_PROMPT_MAX = 2000;
   const SEED_POLL_MS = 2000;
   const SEED_ACTIVE = ["queued", "starting", "running"];
-  const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image-Edit"};
-  const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};
+  const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image"};
+  const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", "mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
     characters: [], locations: [], location: null, locationPick: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
@@ -40,7 +40,7 @@
   };
   function part(box, name) { return $("#" + box.ids + "-" + name); }
   // Seed generator spec SG56: the Seeds tab's state.
-  S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false};
+  S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false, qwen: null, qwenKey: ""};
 
   // --- helpers -------------------------------------------------------------------------
 
@@ -1758,7 +1758,7 @@
 
   // --- seeds (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 6) ---------
 
-  function seedCanvas(w, h) {
+  function seedCanvas(w, h, multiple) {
     const longest = Math.max(w, h);
     let a = w;
     let b = h;
@@ -1766,7 +1766,130 @@
       a = Math.floor(w * SEED_LONG_EDGE / longest);
       b = Math.floor(h * SEED_LONG_EDGE / longest);
     }
-    return {width: Math.floor(a / 16) * 16, height: Math.floor(b / 16) * 16};
+    return {width: Math.floor(a / multiple) * multiple, height: Math.floor(b / multiple) * multiple};
+  }
+
+  // Seed models spec SQ50-SQ55: the Qwen model registry (from the seed_edit capability) on the page.
+  function seedRegistry() { return capability("seed_edit").registry || null; }
+
+  function seedQwenEntry(id) {
+    const registry = seedRegistry();
+    return (registry && registry.models.filter(function (m) { return m.id === id; })[0]) || null;
+  }
+
+  function seedLoraEntry(id) {
+    const registry = seedRegistry();
+    return (registry && registry.loras.filter(function (l) { return l.id === id; })[0]) || null;
+  }
+
+  function seedMultiple() {
+    const entry = seedQwenEntry(S.seeds.qwen ? S.seeds.qwen.model : null);
+    return $("#se-model").value === "qwen" && entry ? entry.multiple : 16;
+  }
+
+  function readSeedQwen() {
+    const state = S.seeds.qwen;
+    if (!state) { return; }
+    const select = $("#se-qwen-model");
+    if (select.value) { state.model = select.value; }
+    Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
+      const id = row.dataset.lora;
+      const box = $("#se-lora-" + id);
+      if (!box.disabled) { state.loras[id].checked = box.checked; }
+      state.loras[id].scale = $("#se-lora-scale-" + id).value;
+    });
+  }
+
+  function renderSeedQwen() {
+    const registry = seedRegistry();
+    const select = $("#se-qwen-model");
+    if (!registry) {
+      clear(select);
+      $("#se-steps").textContent = "checking models…";
+      return;
+    }
+    const models = capability("seed_edit").models;
+    const state = S.seeds.qwen;
+    function probe(id) { return models && models.qwen.models[id]; }
+    function loraProbe(id) { return models && models.qwen.loras[id]; }
+    function enabled(id) { return !(probe(id) && probe(id).ok === false); }
+    if (select.options.length !== registry.models.length) {
+      clear(select);
+      registry.models.forEach(function (m) { select.appendChild(el("option", {value: m.id})); });
+    }
+    registry.models.forEach(function (m, i) {
+      const option = select.options[i];
+      option.textContent = m.label + (enabled(m.id) ? "" : " — unavailable");
+      option.disabled = !enabled(m.id);
+    });
+    let chosen = state.model;
+    if (!enabled(chosen)) {
+      const first = registry.models.filter(function (m) { return enabled(m.id); })[0];
+      if (enabled(registry.default_model)) { chosen = registry.default_model; }
+      else if (first) { chosen = first.id; }
+    }
+    state.model = chosen;
+    select.value = chosen;
+    const entry = seedQwenEntry(chosen);
+    const loras = registry.loras.filter(function (l) { return l.family === entry.family; });
+    function loraOk(id) { return loraProbe(id) ? loraProbe(id).ok === true : false; }
+    const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id)]; }));
+    if (key !== S.seeds.qwenKey) {
+      S.seeds.qwenKey = key;
+      const box = clear($("#se-loras"));
+      if (entry.family === "qwen2511") {
+        box.appendChild(el("span", {cls: "muted", text: "Lightning 8-step LoRA built in (not selectable)"}));
+      }
+      else {
+        loras.forEach(function (l) {
+          const ok = loraOk(l.id);
+          const saved = state.loras[l.id];
+          const checkbox = el("input", {type: "checkbox", id: "se-lora-" + l.id});
+          checkbox.checked = saved.checked && ok;
+          checkbox.disabled = !ok;
+          const scale = el("input", {type: "number", id: "se-lora-scale-" + l.id, min: "0", max: "2", step: "0.05", value: saved.scale});
+          scale.disabled = !ok;
+          const found = loraProbe(l.id);
+          const text = ok ? l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : "")
+            : "unavailable — " + (found ? found.reason : "probing");
+          const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: text});
+          box.appendChild(el("div", {cls: "se-lora", data: {lora: l.id}}, [el("label", {}, [checkbox, " " + l.label]),
+            el("label", {}, ["strength ", scale]), note]));
+        });
+      }
+    }
+    const turbo = loras.filter(function (l) {
+      const box = $("#se-lora-" + l.id);
+      return l.steps && box && !box.disabled && box.checked;
+    })[0];
+    $("#se-steps").textContent = turbo ? turbo.steps + " steps (turbo)"
+      : entry.steps + " steps" + (entry.family === "qwen2511" ? " (Lightning)" : "");
+    const parts = registry.models.filter(function (m) { return !enabled(m.id); }).map(function (m) {
+      return m.label + " — " + probe(m.id).reason;
+    });
+    $("#se-qwen-note").textContent = parts.length ? "Unavailable here: " + parts.join("; ") : "";
+  }
+
+  function seedLoraBody() {
+    const out = [];
+    Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
+      const id = row.dataset.lora;
+      const box = $("#se-lora-" + id);
+      if (!box.disabled && box.checked) { out.push({id: id, scale: Number($("#se-lora-scale-" + id).value)}); }
+    });
+    return out;
+  }
+
+  function seedModelText(view) {
+    if (view.model !== "qwen") { return SEED_MODEL_LABELS[view.model] || String(view.model); }
+    let text = SEED_MODEL_LABELS.qwen;
+    if (view.qwen_model) {
+      const entry = seedQwenEntry(view.qwen_model.id);
+      text = entry ? entry.label : String(view.qwen_model.id);
+    }
+    const loras = view.loras || [];
+    if (loras.length) { text += " + " + loras.map(function (l) { return l.id + " " + l.scale; }).join(", "); }
+    return text;
   }
 
   function setSeedSource(source, statusText) {
@@ -1795,6 +1918,14 @@
   function updateSeedButtons() {
     const cap = capability("seed_edit");
     const models = cap.models || null;
+    const registry = seedRegistry();
+    if (!S.seeds.qwen && registry) {
+      const loras = {};
+      registry.loras.forEach(function (l) { loras[l.id] = {checked: l.default_on, scale: String(l.default_scale)}; });
+      S.seeds.qwen = {model: registry.default_model, loras: loras};
+    }
+    readSeedQwen();
+    renderSeedQwen();
     const select = $("#se-model");
     Array.prototype.forEach.call(select.options, function (o) {
       o.disabled = Boolean(models && models[o.value] && models[o.value].ok === false);
@@ -1814,16 +1945,37 @@
       const parts = [];
       const off = "unavailable — ";
       if (!models.zimage.ok) { parts.push("Z-Image: " + off + models.zimage.reason); }
-      if (models.qwen.ok) { parts.push("Qwen-Image-Edit backend: " + SEED_BACKEND_LABELS[models.qwen.backend]); }
-      else { parts.push("Qwen-Image-Edit: " + off + models.qwen.reason); }
+      if (!models.qwen.ok) { parts.push("Qwen-Image: " + off + models.qwen.reason); }
       note = parts.join("; ");
     }
     $("#se-model-note").textContent = note;
     show($("#se-strength-box"), model === "zimage");
+    show($("#se-qwen-box"), model === "qwen");
     $("#se-prompt-count").textContent = $("#se-prompt").value.length + " / " + SEED_PROMPT_MAX + " characters";
     const natural = S.seeds.natural;
-    const canvas = natural ? seedCanvas(natural.width, natural.height) : null;
+    const canvas = natural ? seedCanvas(natural.width, natural.height, seedMultiple()) : null;
+    if (natural) {
+      $("#se-source-size").textContent = natural.width + " × " + natural.height + " → " + canvas.width + " × " + canvas.height;
+    }
     const entry = models && models[model];
+    let qwenReason = "";
+    if (model === "qwen" && models && S.seeds.qwen) {
+      const chosen = seedQwenEntry(S.seeds.qwen.model);
+      const found = models.qwen.models[S.seeds.qwen.model];
+      if (!(found && found.ok === true)) {
+        qwenReason = (chosen ? chosen.label : S.seeds.qwen.model) + " unavailable: " + ((found && found.reason) || "probing");
+      }
+      else {
+        Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
+          const id = row.dataset.lora;
+          const box = $("#se-lora-" + id);
+          const s = Number($("#se-lora-scale-" + id).value);
+          if (!qwenReason && !box.disabled && box.checked && !(Number.isFinite(s) && s > 0 && s <= 2)) {
+            qwenReason = "LoRA " + seedLoraEntry(id).label + " strength must be above 0 and at most 2";
+          }
+        });
+      }
+    }
     const strength = Number($("#se-strength").value);
     const seedText = $("#se-seed").value.trim();
     const seed = Number(seedText);
@@ -1838,6 +1990,7 @@
     else if (!(entry && entry.ok === true)) {
       reason = SEED_MODEL_LABELS[model] + " unavailable: " + ((entry && entry.reason) || cap.reason || "probing");
     }
+    else if (qwenReason) { reason = qwenReason; }
     else if (model === "zimage" && !(Number.isFinite(strength) && strength >= 0.10 && strength <= 0.90)) {
       reason = "strength must be from 0.10 to 0.90";
     }
@@ -1858,7 +2011,8 @@
     const seedText = $("#se-seed").value.trim();
     return {ws: S.ws, source: source, prompt: $("#se-prompt").value, model: model,
             strength: model === "zimage" ? Number($("#se-strength").value) : null,
-            candidates: Number($("#se-candidates").value), seed: seedText === "" ? null : Number(seedText)};
+            candidates: Number($("#se-candidates").value), seed: seedText === "" ? null : Number(seedText),
+            qwen_model: model === "qwen" ? S.seeds.qwen.model : null, loras: model === "qwen" ? seedLoraBody() : null};
   }
 
   async function generateSeeds() {
@@ -1920,8 +2074,8 @@
   function renderSeedRun(view) {
     if (!view || view.run !== S.seeds.run) { return; }
     S.seeds.view = view;
-    $("#se-run-title").textContent = view.run + " · " + (SEED_MODEL_LABELS[view.model] || view.model) +
-      (view.backend ? " (" + SEED_BACKEND_LABELS[view.backend] + ")" : "");
+    $("#se-run-title").textContent = view.run + " · " + seedModelText(view) + (view.steps ? " · " + view.steps + " steps" : "") +
+      (view.backend ? " (" + (SEED_BACKEND_LABELS[view.backend] || view.backend) + ")" : "");
     const job = view.job;
     const progress = job && job.progress && job.progress.candidates;
     const counts = {ok: 0, blocked: 0, failed: 0};
@@ -2035,7 +2189,7 @@
       const thumbs = el("td");
       r.thumbs.forEach(function (p) { thumbs.appendChild(el("img", {cls: "se-mini", src: fileUrl(p), alt: ""})); });
       const row = el("tr", {cls: "clickable"}, [el("td", {text: r.run}), el("td", {text: text}),
-        el("td", {text: SEED_MODEL_LABELS[r.model] || String(r.model)}), el("td", {text: r.state}), thumbs]);
+        el("td", {text: seedModelText(r)}), el("td", {text: r.state}), thumbs]);
       row.addEventListener("click", function () { openSeedRun(r.run); });
       body.appendChild(row);
     });
@@ -2109,8 +2263,6 @@
       const img = $("#se-source-img");
       if (!S.seeds.source) { return; }
       S.seeds.natural = {width: img.naturalWidth, height: img.naturalHeight};
-      const canvas = seedCanvas(img.naturalWidth, img.naturalHeight);
-      $("#se-source-size").textContent = img.naturalWidth + " × " + img.naturalHeight + " → " + canvas.width + " × " + canvas.height;
       updateSeedButtons();
     });
     $("#se-source-img").addEventListener("error", function () {
