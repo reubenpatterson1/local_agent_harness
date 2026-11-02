@@ -16,7 +16,7 @@ import pytest
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 QA_PATH = os.path.join(WS, "bin", "qwen-agent")
-VLM = "/Users/ailab1/mlx_models/qwen3-vl"
+VLM = "/Users/ailab1/mlx_models/qwen38-27b-abl-8bit"
 
 
 def _load(path=QA_PATH, name="qwen_agent_model_default_under_test"):
