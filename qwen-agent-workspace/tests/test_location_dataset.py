@@ -1338,3 +1338,25 @@ def test_ly_review_focus_2_regenerate_with_a_new_description_switches_the_varian
         ld.gen_prompt(view, time, weather, lt.HARBOUR_DESC)
         for view, time, weather in ld.VARIANTS]
     assert _manifest(env)["variant_set"] == "outdoor"
+
+
+def test_lyd13_round_labels_and_the_banner(tmp_path, monkeypatch):
+    item = {"n": 12, "source": "generated", "match_score": 8, "kept": True, "reason": None,
+            "round": 2}
+    assert ld.cell_label(item) == "12 G r2 s8 kept"
+    for value in (1, None, True):
+        assert ld.cell_label(dict(item, round=value)) == "12 G s8 kept", value
+    assert ld.cell_label(dict((k, item[k]) for k in item if k != "round")) == "12 G s8 kept"
+    stills = tmp_path / "stills"
+    stills.mkdir()
+    items = [{"n": n, "source": "generated", "match_score": 9 if n <= 13 else 3, "kept": n <= 13,
+              "reason": None if n <= 13 else "score 3", "round": 1} for n in range(1, 25)]
+    texts = []
+    real_text = ld.ImageDraw.ImageDraw.text
+    monkeypatch.setattr(ld.ImageDraw.ImageDraw, "text",
+                        lambda self, xy, text, **kw: texts.append((xy, text)) or real_text(
+                            self, xy, text, **kw))
+    ld.write_contact_sheet(items, str(stills), str(tmp_path / "three.jpg"), rounds=3)
+    ld.write_contact_sheet(items, str(stills), str(tmp_path / "one.jpg"), rounds=1)
+    assert [text for xy, text in texts if xy == (4, 6)] == [
+        "kept 13 of 24 (need 12) after 3 rounds", "kept 13 of 24 (need 12)"]

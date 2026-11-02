@@ -362,16 +362,19 @@ def caption(trigger, check):
 # The contact sheet (spec 2.11)
 # ---------------------------------------------------------------------------
 
-def write_contact_sheet(items, stills_dir, out_path):
+def write_contact_sheet(items, stills_dir, out_path, rounds=1):
     """5 columns of 256x160 thumbnails, each with a 20-px label row, under a 24-px banner; a
-    dropped cell is outlined in red, a missing still is a black cell."""
+    dropped cell is outlined in red, a missing still is a black cell. After more than one round
+    the banner names the round count (yield spec LY14)."""
     cols, tw, th, lh, banner = 5, 256, 160, 20, 24
     rows = (len(items) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * tw, banner + rows * (th + lh)), (0, 0, 0))
     draw = ImageDraw.Draw(sheet)
     kept = sum(1 for item in items if item["kept"])
-    draw.text((4, 6), "kept %d of %d (need %d)" % (kept, len(items), location_lib.MIN_KEEP),
-              fill=(255, 255, 255))
+    heading = "kept %d of %d (need %d)" % (kept, len(items), location_lib.MIN_KEEP)
+    if rounds > 1:
+        heading += " after %d rounds" % rounds
+    draw.text((4, 6), heading, fill=(255, 255, 255))
     for k, item in enumerate(items):
         x, y = (k % cols) * tw, banner + (k // cols) * (th + lh)
         path = os.path.join(stills_dir, "loc_%02d.png" % item["n"])
@@ -387,7 +390,10 @@ def write_contact_sheet(items, stills_dir, out_path):
 def cell_label(item):
     score = "s%d" % item["match_score"] if item["match_score"] is not None else "s-"
     verdict = "kept" if item["kept"] else (item["reason"] or "")[:28]
-    return "%02d %s %s %s" % (item["n"], item["source"][0].upper(), score, verdict)
+    round_n = item.get("round")         # absent in a manifest written before the yield spec
+    round_text = (" r%d" % round_n if isinstance(round_n, int) and not isinstance(round_n, bool)
+                  and round_n > 1 else "")
+    return "%02d %s%s %s %s" % (item["n"], item["source"][0].upper(), round_text, score, verdict)
 
 
 # ---------------------------------------------------------------------------

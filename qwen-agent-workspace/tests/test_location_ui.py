@@ -423,3 +423,13 @@ def test_lu15_locations_refuse_story_legacy():
     assert "locations need the story engine; turn off story legacy" in lib._rule_locations(
         dict(base, story_legacy=True))
     assert lib._rule_locations(dict(base, story_legacy=False)) == []
+
+
+# --- LYU1: a top-up still names its round (docs/superpowers/specs/2026-11-02-location-yield-design.md, LY16)
+
+def test_lyu1_a_top_up_still_names_its_round():
+    with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        app = f.read()
+    assert app.count('item.source + (typeof item.round === "number" && item.round > 1 ? " (round " '
+                     '+ item.round + ")" : "")') == 1
+    assert app.count('item.match_score === null ? "score -" : "score " + item.match_score') == 1
