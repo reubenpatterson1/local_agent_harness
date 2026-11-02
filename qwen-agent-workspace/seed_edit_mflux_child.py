@@ -1,18 +1,21 @@
-"""seed_edit_mflux_child.py -- bin/seed-edit's mflux q4 child: load Qwen-Image-Edit-2511 once from a
-local q4 directory with the Lightning LoRA as a local file, then edit the source into every job of
-a spec file (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 3).
+"""seed_edit_mflux_child.py -- bin/seed-edit's mflux child: load one Qwen registry model of family
+qwen21 (Qwen-Image-2.1, QwenImage21Edit) or qwen2511 (Qwen-Image-Edit-2511, QwenImageEdit) once from
+a local pinned snapshot with its LoRAs as local files, then edit the source into every job of a
+spec file (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 3, amended by
+docs/superpowers/specs/2026-11-02-seed-models-design.md, Section 4).
 
   ~/mflux-edit/.venv/bin/python seed_edit_mflux_child.py --spec SPEC
 
-Runs under the mflux venv's Python (mflux pinned to 0.24.0). It never screens: bin/seed-edit
-screens each pending image before giving it its final name. After saving each job's image it
-prints "seed-edit-child done <n> <seconds>". guidance is the spec's (always 1.0) and the LoRA is
-never baked into the quantized weights.
+The spec carries family, model_path, lora_paths and lora_scales (equal-length lists, possibly
+empty), prompt, source, width, height, steps, guidance (always 1.0), scheduler (qwen21 only) and
+jobs. Runs under the mflux venv's Python (mflux pinned to 0.24.0). It never screens: bin/seed-edit
+screens each pending image before giving it its final name. After saving each job's image as RGB
+it prints "seed-edit-child done <n> <seconds>". LoRAs are never baked into the quantized weights.
 
-Exit codes: 0 every job saved; 2 mflux missing or older than 0.22.0 (refused before the spec is
-read; an older mflux would run Qwen-Image-Edit-2509); 3 the parent died; anything else is a crash.
-Top-level imports are standard library only; mlx and mflux are imported inside main after the
-version gate.
+Exit codes: 0 every job saved; 2 mflux missing or older than 0.24.0 (refused before the spec is
+read) or an unknown family (refused before mlx or mflux is imported); 3 the parent died; anything
+else is a crash. Top-level imports are standard library only; mlx and mflux are imported inside
+main after both gates.
 """
 
 import argparse
@@ -24,7 +27,11 @@ import sys
 import threading
 import time
 
-MIN_VERSION = (0, 22, 0)
+MIN_VERSION = (0, 24, 0)
+FAMILIES = {
+    "qwen21": ("mflux.models.qwen21.variants.edit.qwen_image_21_edit", "QwenImage21Edit", "qwen_image_21"),
+    "qwen2511": ("mflux.models.qwen.variants.edit.qwen_image_edit", "QwenImageEdit", "qwen_image_edit_2511"),
+}
 
 
 def parse_version(text):
@@ -55,27 +62,39 @@ def main(argv=None):
         version = None
     parsed = parse_version(version)
     if parsed is None or parsed < MIN_VERSION:
-        print("seed-edit-child: mflux %s is missing or older than 0.22.0; refusing (it would run "
-              "Qwen-Image-Edit-2509)" % version, flush=True)
+        print("seed-edit-child: mflux %s is missing or older than 0.24.0; refusing (run bin/seed-edit-setup)"
+              % version, flush=True)
         return 2
     with open(args.spec, encoding="utf-8") as f:
         spec = json.load(f)
+    family = spec.get("family")
+    if family not in FAMILIES:
+        print("seed-edit-child: unknown model family %r; refusing" % (family,), flush=True)
+        return 2
     import mlx.core as mx
     from mflux.models.common.config.model_config import ModelConfig
-    from mflux.models.qwen.variants.edit.qwen_image_edit import QwenImageEdit
-    config = ModelConfig.qwen_image_edit_2511()
-    print("seed-edit-child: mflux %s, model %s, transformer overrides %s"
-          % (version, config.model_name, config.transformer_overrides), flush=True)
-    model = QwenImageEdit(model_path=spec["model_path"], quantize=None, model_config=config,
-                          lora_paths=[spec["lora_path"]], lora_scales=[1.0], bake_lora=False)
+    module_name, class_name, config_name = FAMILIES[family]
+    model_class = getattr(importlib.import_module(module_name), class_name)
+    config = getattr(ModelConfig, config_name)()
+    loras = [[os.path.basename(p), s] for p, s in zip(spec["lora_paths"], spec["lora_scales"])]
+    print("seed-edit-child: mflux %s, family %s, model %s, transformer overrides %s, scheduler %s, LoRAs %s"
+          % (version, family, config.model_name, getattr(config, "transformer_overrides", None),
+             spec["scheduler"], json.dumps(loras)), flush=True)
+    model = model_class(model_path=spec["model_path"], quantize=None, model_config=config,
+                        lora_paths=spec["lora_paths"] or None, lora_scales=spec["lora_scales"] or None,
+                        bake_lora=False)
     peak = getattr(mx, "get_peak_memory", None) or mx.metal.get_peak_memory
     for job in spec["jobs"]:
         started = time.monotonic()
-        result = model.generate_image(seed=job["seed"], prompt=spec["prompt"],
-                                      image_paths=[spec["source"]],
-                                      num_inference_steps=spec["steps"], guidance=spec["guidance"],
-                                      negative_prompt=" ", width=spec["width"], height=spec["height"])
-        result.image.save(job["output_path"])
+        kwargs = {"seed": job["seed"], "prompt": spec["prompt"], "image_paths": [spec["source"]],
+                  "num_inference_steps": spec["steps"], "guidance": spec["guidance"],
+                  "width": spec["width"], "height": spec["height"]}
+        if family == "qwen21":
+            kwargs["scheduler"] = spec["scheduler"]
+        else:
+            kwargs["negative_prompt"] = " "
+        result = model.generate_image(**kwargs)
+        result.image.convert("RGB").save(job["output_path"])
         seconds = time.monotonic() - started
         print("seed-edit-child: mlx peak memory %.2f GiB" % (peak() / 2 ** 30), flush=True)
         print("seed-edit-child done %d %.1f" % (job["n"], seconds), flush=True)

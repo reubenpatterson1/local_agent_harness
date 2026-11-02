@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
-"""seed-edit-setup -- create the mflux venv and download the Qwen-Image-Edit-2511 q4 weights and the
-Lightning LoRA that bin/seed-edit's mflux q4 backend needs
-(docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 7).
+"""seed-edit-setup -- create the mflux venv and download the pinned weights of the selected Qwen
+registry models and LoRAs that bin/seed-edit's mflux backend needs
+(docs/superpowers/specs/2026-11-02-seed-models-design.md, Section 6; replaces seed generator SG66-SG69).
 
-  bin/seed-edit-setup
+  bin/seed-edit-setup [--model ID ...] [--lora ID ...]
 
-Run only by the controller on the user's go; never by a test. Steps: refuse when
-SEED_EDIT_MFLUX_PYTHON is set; read what is present (the venv ~/mflux-edit/.venv with mflux
-0.24.0, the q4 repo and the Lightning file in the Z-Image hub); with all three present, print the
-sizes and exit; else check 31 GiB of free space (less what an earlier partial run left) and a base
-Python of 3.11 or newer
-(SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python), create the venv, pip install
-mflux==0.24.0, download the q4 repo snapshot and the single Lightning file (both public; no token)
-into the Z-Image hub ($Z_IMAGE_HF_HOME/hub or ~/hf_home/hub, never $HF_HOME), then print the sizes
-and bin/seed-edit --probe's Qwen-Image-Edit verdict. Re-running after success only prints;
-re-running after a partial download resumes it.
+Run by the user (or the controller on the user's go); tests call main only with every process,
+download and disk check replaced. With no option the selection is --model qwen21-q4 --lora
+uncensored; otherwise it is exactly the options given (repeats dropped; --lora alone installs the
+venv and those LoRAs only). --model takes qwen21-q4, qwen21-q8, qwen21-bf16 or qwen2511-q4;
+qwen2511-bf16 is refused (it runs the diffusers weights of the default Hugging Face cache).
 
-Exit codes: 0 done or nothing to do; 1 a step failed; 2 a precondition failed.
-Standard library plus movie_ui_lib. Python 3.9 and 3.13.
+Items: each model is one snapshot of its repo at the registry's pinned revision (qwen21-bf16 only
+the nine mflux file patterns of Qwen/Qwen-Image-2.1); qwen2511-q4 also gets its Lightning LoRA as
+one file; each LoRA is one file of its repo at its pinned revision. A LoRA repo is never
+snapshotted (the abenzerps and Viggle repos are about 98 GiB each). Everything goes into the
+Z-Image hub ($Z_IMAGE_HF_HOME/hub or ~/hf_home/hub, never $HF_HOME).
+
+Steps: refuse unknown IDs, qwen2511-bf16 and a set SEED_EDIT_MFLUX_PYTHON; read what is present
+(the venv ~/mflux-edit/.venv with mflux 0.24.0; each item intact at its pinned revision); with
+everything present print the report and exit; else check the free space: the needed items' bytes,
+plus 3 GiB for the venv when it is not ready, plus 1 GiB headroom, less what is already present
+(each needed item's snapshot at its pinned revision, each file once, plus the partial blobs of an
+interrupted download; never another revision's snapshot) and the venv, so a re-run resumes; check
+a base Python of 3.11 or newer (SEED_EDIT_SETUP_PYTHON, default the 3.13 framework Python); create
+the venv; pip install mflux==0.24.0; print each needed item's licence (the Qwen Research License
+items are non-commercial); download the needed items (all public: the download child gets no
+Hugging Face token variable and HF_HUB_DISABLE_IMPLICIT_TOKEN=1); name each partial blob that still
+blocks a pinned snapshot after the download (an earlier download at another revision left it;
+delete it by hand); print the sizes and bin/seed-edit --probe's verdict for each selected model and
+LoRA.
+
+Exit codes: 0 done or nothing to do; 1 a step failed, or an orphan partial blob still blocks a
+pinned snapshot; 2 a precondition failed.
+Standard library plus movie_ui_lib and movie_ui_seedgen. Python 3.9 and 3.13.
 """
 
 import argparse
@@ -33,20 +49,25 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 
 import movie_ui_lib as lib  # noqa: E402
+import movie_ui_seedgen as seedgen  # noqa: E402
 
 VENV = "~/mflux-edit/.venv"
 MFLUX_SPEC = "mflux==0.24.0"
 MFLUX_VERSION = "0.24.0"
-SETUP_MIN_FREE_GIB = 31.0
 DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
-Q4_REPO = "mflux-community/qwen-image-edit-2511-mflux-q4"
-EDIT_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
-EDIT_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
-DOWNLOAD = ("import sys\n"
+VENV_GIB = 3.0
+HEADROOM_GIB = 1.0
+DOWNLOAD = ("import json\n"
+            "import sys\n"
             "from huggingface_hub import hf_hub_download, snapshot_download\n"
-            "hub, repo, lora_repo, lora_file = sys.argv[1:5]\n"
-            "print(snapshot_download(repo_id=repo, cache_dir=hub), flush=True)\n"
-            "print(hf_hub_download(repo_id=lora_repo, filename=lora_file, cache_dir=hub), flush=True)\n")
+            "hub, items = sys.argv[1], json.loads(sys.argv[2])\n"
+            "for item in items:\n"
+            '    if item["kind"] == "snapshot":\n'
+            '        print(snapshot_download(repo_id=item["repo"], revision=item["revision"],\n'
+            '                                allow_patterns=item["allow_patterns"], cache_dir=hub), flush=True)\n'
+            "    else:\n"
+            '        print(hf_hub_download(repo_id=item["repo"], filename=item["file"], revision=item["revision"],\n'
+            "                              cache_dir=hub), flush=True)\n")
 
 
 def say(text):
@@ -59,9 +80,8 @@ def fail(code, text):
 
 
 def mflux_version(venv):
-    """bin/seed-edit's mflux_version, copied with identical behaviour: (number of
-    mflux-*.dist-info/METADATA files in venv, (parsed, text) of the highest version that parses or
-    None)."""
+    """(number of mflux-*.dist-info/METADATA files in venv, (parsed, text) of the highest version that
+    parses or None). Reads the files only; nothing is imported."""
     paths = sorted(glob.glob(os.path.join(venv, "lib", "python*", "site-packages", "mflux-*.dist-info",
                                           "METADATA")))
     best = None
@@ -83,17 +103,59 @@ def mflux_version(venv):
     return len(paths), best
 
 
-def find_lightning(hubs):
-    """bin/seed-edit's find_lightning, copied with identical behaviour."""
+def default_hub():
+    """$HF_HUB_CACHE, else <$HF_HOME or ~/.cache/huggingface>/hub (huggingface_hub's own rule)."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return os.environ["HF_HUB_CACHE"]
+    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
+
+
+def pinned_snapshot(repo, revision, hubs):
+    """(snapshot, repo_dir) of the first hub holding <repo dir>/snapshots/<revision> as a directory,
+    else (None, None)."""
     for hub in hubs:
-        snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)))[0]
-        if snapshot is None:
-            continue
-        path = os.path.join(snapshot, EDIT_LORA_FILE)
+        repo_dir = os.path.join(hub, lib.repo_dir_name(repo))
+        snapshot = os.path.join(repo_dir, "snapshots", revision)
+        if os.path.isdir(snapshot):
+            return snapshot, repo_dir
+    return None, None
+
+
+def pinned_file(repo, revision, name, hubs):
+    """<hub>/<repo dir>/snapshots/<revision>/<name> in the first hub where its realpath is a non-empty
+    regular file (the snapshot path is returned, not the realpath), else None."""
+    for hub in hubs:
+        path = os.path.join(hub, lib.repo_dir_name(repo), "snapshots", revision, name)
         real = os.path.realpath(path)
         if os.path.isfile(real) and os.path.getsize(real) > 0:
             return path
     return None
+
+
+def weights_problem(entry, hubs):
+    """(problem, model dir, built-in LoRA path) of an mflux registry model in hubs. problem is None
+    when the pinned snapshot is intact (for qwen21 also with its component configs and processor/)
+    and the built-in LoRA, if any, is present."""
+    where = " or ".join(hubs)
+    setup = "(run bin/seed-edit-setup --model %s)" % entry["id"]
+    snapshot, repo_dir = pinned_snapshot(entry["repo"], entry["revision"], hubs)
+    if snapshot is None:
+        return "%s@%s is not in %s %s" % (entry["repo"], entry["revision"][:12], where, setup), None, None
+    problems = list(lib.intact_scan(snapshot, repo_dir)[0])
+    if entry["family"] == "qwen21":
+        problems += ["missing %s" % rel for rel in seedgen.QWEN21_REQUIRED
+                     if not os.path.isfile(os.path.join(snapshot, rel))]
+        if not os.path.isdir(os.path.join(snapshot, "processor")):
+            problems.append("missing processor/")
+    if problems:
+        return "%s: %s %s" % (entry["repo"], "; ".join(problems), setup), None, None
+    lora = entry["builtin_lora"]
+    lora_path = None
+    if lora is not None:
+        lora_path = pinned_file(lora["repo"], lora["revision"], lora["file"], hubs)
+        if lora_path is None:
+            return "Lightning LoRA %s is not in %s %s" % (lora["file"], where, setup), None, None
+    return None, snapshot, lora_path
 
 
 def existing_ancestor(path):
@@ -131,15 +193,54 @@ def snapshot_gib(snapshot):
     return total / 2 ** 30
 
 
-def present_gib(hub, venv):
-    """What an earlier, partial run left on disk: the q4 and Lightning repo directories in hub and
-    the venv (lstat sizes, so a snapshot symlink is not counted twice), in GiB."""
-    total = 0.0
-    for path in (os.path.join(hub, lib.repo_dir_name(Q4_REPO)),
-                 os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)), venv):
-        if os.path.isdir(path):
-            total += tree_gib(path)
+def partial_blobs(repo_dir):
+    """The <repo dir>/blobs/*.incomplete files whose finished blob is absent (lib.intact_scan's partial
+    rule), sorted; [] when there is no blobs directory."""
+    blobs = os.path.join(repo_dir, "blobs")
+    try:
+        names = os.listdir(blobs)
+    except OSError:
+        return []
+    present = set(names)
+    return sorted(os.path.join(blobs, name) for name in names
+                  if name.endswith(".incomplete") and name.split(".", 1)[0] not in present)
+
+
+def present_gib(hub, needed):
+    """Seed models SQ44 step 4 (amended by §14a item A): what the needed items already have on disk, in
+    GiB: per distinct pinned snapshot <hub>/<repo dir>/snapshots/<revision>/ that exists, its files'
+    realpath sizes (each realpath once), plus per distinct repo directory its partial blobs' sizes.
+    Another revision's snapshot and blobs are not counted: the pinned download may not reuse them."""
+    total, snapshots, repo_dirs = 0.0, [], []
+    for item in needed:
+        repo_dir = os.path.join(hub, lib.repo_dir_name(item["repo"]))
+        snapshot = os.path.join(repo_dir, "snapshots", item["revision"])
+        if snapshot not in snapshots and os.path.isdir(snapshot):
+            snapshots.append(snapshot)
+            total += snapshot_gib(snapshot)
+        if repo_dir not in repo_dirs:
+            repo_dirs.append(repo_dir)
+            for path in partial_blobs(repo_dir):
+                try:
+                    total += os.lstat(path).st_size / 2 ** 30
+                except OSError:
+                    pass
     return total
+
+
+def orphans_of(hub, needed):
+    """Seed models §14a item C: [(item, path)] of the partial blobs that still block a needed snapshot
+    item after its download exited 0 (weights_problem still reports "download incomplete"). An
+    earlier download at another revision left them; the pinned download never completes them, so
+    only deleting them clears the problem."""
+    out = []
+    for item in needed:
+        if item["kind"] != "snapshot":
+            continue
+        problem = weights_problem(dict(seedgen.qwen_model(item["name"]), builtin_lora=None), [hub])[0]
+        if problem is not None and "download incomplete" in problem:
+            out += [(item, path) for path in partial_blobs(os.path.join(hub, lib.repo_dir_name(item["repo"])))]
+    return out
 
 
 def venv_ready(py, venv):
@@ -147,56 +248,144 @@ def venv_ready(py, venv):
     return os.access(py, os.X_OK) and best is not None and best[1] == MFLUX_VERSION
 
 
-def report(venv, hub):
-    """Step 9: the sizes, then bin/seed-edit --probe's Qwen-Image-Edit verdict (informational)."""
+def unique(values):
+    """values (None for none) without repeats, first order kept."""
+    out = []
+    for value in values or []:
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def selection(args):
+    """SQ41: ((model IDs, LoRA IDs), None), or (None, the refusal text). No option at all selects
+    DEFAULT_QWEN_MODEL (qwen21-q4) and its default-on LoRAs (uncensored), from the registry."""
+    if args.model is None and args.lora is None:
+        model_id = seedgen.DEFAULT_QWEN_MODEL
+        return ([model_id], [lora["id"] for lora in seedgen.default_loras(model_id)]), None
+    models, loras = unique(args.model), unique(args.lora)
+    for model_id in models:
+        if model_id not in seedgen.QWEN_MODEL_IDS:
+            return None, "unknown --model %s; known: %s" % (model_id, ", ".join(seedgen.QWEN_MODEL_IDS))
+    for model_id in models:
+        entry = seedgen.qwen_model(model_id)
+        if not entry["setup"]:
+            return None, ("%s is not installed by seed-edit-setup: it runs the diffusers weights of %s and %s from "
+                          "the default Hugging Face cache (%s)" % (model_id, entry["repo"], entry["builtin_lora"]["repo"],
+                                                                    default_hub()))
+    for lora_id in loras:
+        if lora_id not in seedgen.QWEN_LORA_IDS:
+            return None, "unknown --lora %s; known: %s" % (lora_id, ", ".join(seedgen.QWEN_LORA_IDS))
+    return (models, loras), None
+
+
+def items_of(models, loras):
+    """SQ43: the selection's items in order: per model a snapshot item (and qwen2511-q4's Lightning
+    file item), then per LoRA a file item. Each carries its licence for the step 8 lines."""
+    items = []
+    for model_id in models:
+        entry = seedgen.qwen_model(model_id)
+        items.append({"kind": "snapshot", "name": model_id, "repo": entry["repo"], "revision": entry["revision"],
+                      "allow_patterns": entry["allow_patterns"], "bytes": entry["bytes"], "license": entry["license"]})
+        lightning = entry["builtin_lora"]
+        if lightning is not None:
+            items.append({"kind": "file", "name": "lightning", "repo": lightning["repo"],
+                          "revision": lightning["revision"], "file": lightning["file"], "bytes": lightning["bytes"],
+                          "license": "Apache-2.0"})
+    for lora_id in loras:
+        lora = seedgen.qwen_lora(lora_id)
+        items.append({"kind": "file", "name": lora_id, "repo": lora["repo"], "revision": lora["revision"],
+                      "file": lora["file"], "bytes": lora["bytes"], "license": lora["license"]})
+    return items
+
+
+def item_ok(item, hub):
+    """SQ43: a snapshot item is ok when its pinned snapshot is intact (weights_problem without the
+    built-in LoRA, which is its own item); a file item when its pinned file is present."""
+    if item["kind"] == "snapshot":
+        entry = seedgen.qwen_model(item["name"])
+        return weights_problem(dict(entry, builtin_lora=None), [hub])[0] is None
+    return pinned_file(item["repo"], item["revision"], item["file"], [hub]) is not None
+
+
+def download_item(item):
+    """The DOWNLOAD script's view of an item."""
+    if item["kind"] == "snapshot":
+        return {"kind": "snapshot", "repo": item["repo"], "revision": item["revision"],
+                "allow_patterns": item["allow_patterns"]}
+    return {"kind": "file", "repo": item["repo"], "revision": item["revision"], "file": item["file"]}
+
+
+def report(venv, hub, models, loras, items):
+    """SQ44 step 9: the sizes, then bin/seed-edit --probe's verdict per selected model and LoRA
+    (informational)."""
     say("venv %s: %.2f GiB" % (venv, tree_gib(venv) if os.path.isdir(venv) else 0.0))
-    snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(Q4_REPO)))[0]
-    if snapshot is not None and os.path.isdir(snapshot):
-        say("q4 %s: %.2f GiB" % (snapshot, snapshot_gib(snapshot)))
-    else:
-        say("q4 %s is not in %s" % (Q4_REPO, hub))
-    lora = find_lightning([hub])
-    if lora is not None:
-        say("Lightning %s: %.2f GiB" % (lora, os.path.getsize(os.path.realpath(lora)) / 2 ** 30))
-    else:
-        say("Lightning %s is not in %s" % (EDIT_LORA_FILE, hub))
+    for model_id in models:
+        problem, snapshot, _lora = weights_problem(dict(seedgen.qwen_model(model_id), builtin_lora=None), [hub])
+        if problem is None:
+            say("model %s %s: %.2f GiB" % (model_id, snapshot, snapshot_gib(snapshot)))
+        else:
+            say("model %s: %s" % (model_id, problem))
+    for item in items:
+        if item["kind"] != "file":
+            continue
+        path = pinned_file(item["repo"], item["revision"], item["file"], [hub])
+        if path is not None:
+            say("LoRA %s %s: %.2f GiB" % (item["name"], path, os.path.getsize(os.path.realpath(path)) / 2 ** 30))
+        else:
+            say("LoRA %s (%s) is not in %s" % (item["name"], item["file"], hub))
     ancestor = existing_ancestor(hub)
     say("free on %s: %.1f GiB" % (ancestor, free_gib(ancestor)))
     proc = subprocess.run([sys.executable, os.path.join(WS, "bin", "seed-edit"), "--probe"],
                           capture_output=True, text=True)
     try:
         qwen = json.loads(lib.last_line(proc.stdout))["qwen"]
-        verdict = ("ok (%s)" % qwen["backend"]) if qwen["ok"] else ("unavailable: %s" % qwen["reason"])
+        verdicts = [(i, qwen["models"][i]) for i in models] + [(i, qwen["loras"][i]) for i in loras]
+        lines = [("probe: %s ok" % i) if v["ok"] else ("probe: %s unavailable: %s" % (i, v["reason"]))
+                 for i, v in verdicts]
     except (ValueError, KeyError, TypeError):
-        verdict = "unavailable: bin/seed-edit --probe printed unparsable output"
-    say("probe: Qwen-Image-Edit " + verdict)
+        lines = ["probe: unavailable: bin/seed-edit --probe printed unparsable output"]
+    for line in lines:
+        say(line)
 
 
 def main(argv=None):
-    """bin/seed-edit-setup (SG66-SG69). Returns the exit code."""
-    argparse.ArgumentParser(prog="seed-edit-setup", description="Create ~/mflux-edit/.venv (mflux 0.24.0) "
-                            "and download the q4 Qwen-Image-Edit-2511 weights and the Lightning LoRA "
-                            "into the Z-Image hub.").parse_args(argv)
+    """bin/seed-edit-setup (seed models SQ41-SQ47). Returns the exit code."""
+    parser = argparse.ArgumentParser(prog="seed-edit-setup", description="Create ~/mflux-edit/.venv (mflux "
+                                     "0.24.0) and download the pinned weights of the selected Qwen models and "
+                                     "LoRAs into the Z-Image hub (default: --model qwen21-q4 --lora uncensored).")
+    parser.add_argument("--model", type=str, action="append")
+    parser.add_argument("--lora", type=str, action="append")
+    args = parser.parse_args(argv)
+    chosen, error = selection(args)
+    if error is not None:
+        return fail(2, error)
     if os.environ.get("SEED_EDIT_MFLUX_PYTHON"):
         return fail(2, "SEED_EDIT_MFLUX_PYTHON is set; unset it to set up the default venv at ~/mflux-edit/.venv")
+    models, loras = chosen
     venv = os.path.expanduser(VENV)
     py = os.path.join(venv, "bin", "python")
     hub = lib.zimage_hub()
+    items = items_of(models, loras)
     venv_ok = venv_ready(py, venv)
-    q4_ok = lib.model_check(Q4_REPO, hub)[0]
-    lora_ok = find_lightning([hub]) is not None
-    if venv_ok and q4_ok and lora_ok:
+    needed = [item for item in items if not item_ok(item, hub)]
+    if venv_ok and not needed:
         say("nothing to do")
-        report(venv, hub)
+        report(venv, hub, models, loras, items)
         return 0
-    frees = [(free_gib(p), p) for p in (existing_ancestor(hub), existing_ancestor(os.path.dirname(venv)))]
-    free, where = min(frees)
-    present = present_gib(hub, venv)
-    need = max(SETUP_MIN_FREE_GIB - present, 0.0)
+    total = sum(item["bytes"] for item in needed) / 2 ** 30 + (0.0 if venv_ok else VENV_GIB) + HEADROOM_GIB
+    present = present_gib(hub, needed)
+    if not venv_ok and os.path.isdir(venv):
+        present += tree_gib(venv)
+    need = max(total - present, 0.0)
+    free, where = min((free_gib(p), p) for p in (existing_ancestor(hub), existing_ancestor(os.path.dirname(venv))))
     if free < need:
-        return fail(2, "only %.1f GiB free on %s; seed-edit-setup needs at least %.1f GiB more (%g GiB in all, "
-                       "%.1f GiB already present; q4 weights ~29 GB, Lightning LoRA ~0.85 GB, mflux venv)"
-                    % (free, where, need, SETUP_MIN_FREE_GIB, present))
+        parts = ["%s ~%.2f GiB" % (item["name"], item["bytes"] / 2 ** 30) for item in needed]
+        if not venv_ok:
+            parts.append("mflux venv ~%g GiB" % VENV_GIB)
+        parts.append("%g GiB headroom" % HEADROOM_GIB)
+        return fail(2, "only %.1f GiB free on %s; seed-edit-setup needs at least %.1f GiB more (%.1f GiB in all, "
+                       "%.1f GiB already present; %s)" % (free, where, need, total, present, ", ".join(parts)))
     base = os.environ.get("SEED_EDIT_SETUP_PYTHON") or DEFAULT_BASE_PYTHON
     if not os.access(base, os.X_OK):
         return fail(2, "base python %s is not executable (set SEED_EDIT_SETUP_PYTHON)" % base)
@@ -214,13 +403,23 @@ def main(argv=None):
         code = subprocess.call([py, "-m", "pip", "install", MFLUX_SPEC])
         if code != 0:
             return fail(1, "pip install mflux==0.24.0 exited %d" % code)
-    if not (q4_ok and lora_ok):
-        env = dict(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0", HF_XET_CHUNK_CACHE_SIZE_BYTES="0",
-                   HF_HUB_ENABLE_HF_TRANSFER="0")
-        code = subprocess.call([py, "-c", DOWNLOAD, hub, Q4_REPO, EDIT_LORA_REPO, EDIT_LORA_FILE], env=env)
+    if needed:
+        for item in needed:
+            say("license: %s: %s" % (item["name"], item["license"]))
+        env = seedgen.hf_child_env(os.environ, HF_HOME=os.path.dirname(hub), HF_HUB_OFFLINE="0",
+                                   HF_XET_CHUNK_CACHE_SIZE_BYTES="0", HF_HUB_ENABLE_HF_TRANSFER="0")
+        code = subprocess.call([py, "-c", DOWNLOAD, hub, json.dumps([download_item(item) for item in needed])],
+                               env=env)
         if code != 0:
             return fail(1, "the download exited %d" % code)
-    report(venv, hub)
+    orphans = orphans_of(hub, needed)
+    for item, path in orphans:
+        say("orphan partial blob %s blocks %s (it is not part of %s@%s); delete it"
+            % (path, item["name"], item["repo"], item["revision"][:12]))
+    report(venv, hub, models, loras, items)
+    if orphans:
+        return fail(1, "%d orphan partial blob(s) left by an earlier download block the pinned snapshot; delete the "
+                       "file(s) listed above, then re-run bin/seed-edit-setup" % len(orphans))
     return 0
 
 
