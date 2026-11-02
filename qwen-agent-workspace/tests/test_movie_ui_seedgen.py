@@ -157,3 +157,105 @@ def test_sgt17_the_module_imports():
         source = f.read()
     assert sorted(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M)) == [
         "movie_ui_lib", "re", "secrets", "time"]
+
+
+# --- The probe stub and the environment (spec 9 rules) -----------------------------------------------
+
+OK_MODELS = {"zimage": {"ok": True, "reason": None, "backend": "zimage"},
+             "qwen": {"ok": True, "reason": None, "backend": "mflux-q4"}}
+
+
+def stub_seed_edit(ws, models, exit=0, stderr="", sleep=0):
+    """<ws>/bin/seed-edit as a stub: it sleeps `sleep` s, prints json.dumps(models) (models itself
+    when it is a str) for --probe, writes stderr and exits with `exit`. Returns its path."""
+    out = models if isinstance(models, str) else json.dumps(models)
+    path = os.path.join(ws, "bin", "seed-edit")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("#!%s\nimport sys\nimport time\ntime.sleep(%r)\nif sys.argv[1:] == ['--probe']:\n"
+                "    sys.stdout.write(%r + '\\n')\nsys.stderr.write(%r)\nsys.exit(%d)\n"
+                % (sys.executable, sleep, out, stderr, exit))
+    os.chmod(path, 0o755)
+    return path
+
+
+def clean_env(monkeypatch, tmp_path):
+    """Spec 9: no HF_HUB_CACHE and no SEED_EDIT_* variable; HF_HOME and Z_IMAGE_HF_HOME under tmp_path."""
+    for key in list(os.environ):
+        if key.startswith("SEED_EDIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", os.path.join(str(tmp_path), "hf"))
+    monkeypatch.setenv("Z_IMAGE_HF_HOME", os.path.join(str(tmp_path), "zi"))
+
+
+# --- SGT18 (SG28, SG29, SG31, SG32): job policy, argv and progress ------------------------------------
+
+def test_sgt18_policy_argv_and_progress(monkeypatch, tmp_path):
+    state = mt.set_home(monkeypatch, tmp_path)
+    clean_env(monkeypatch, tmp_path)
+    ws = mt.make_stub_workspace(tmp_path)
+    assert lib.job_vlm("seed-edit", {}, ws, None) == "forbidden"
+    run_dir = os.path.join(ws, "generated", "seeds", "runs", RUN)
+    fields = {"ws": ws, "run": RUN, "source_file": "source.png", "prompt": "make it night", "model": "zimage",
+              "strength": 0.3, "candidates": 3, "seed": 7, "source": {"kind": "upload", "upload_id": UP}}
+    assert lib.seed_edit_argv(fields, ws) == [
+        sys.executable, os.path.join(ws, "bin", "seed-edit"), "--source", os.path.join(run_dir, "source.png"),
+        "--prompt", "make it night", "--model", "zimage", "--strength", "0.3", "--candidates", "3",
+        "--seed", "7", "--run-dir", run_dir]
+    qwen = dict(fields, model="qwen", strength=None, source_file="source.jpg")
+    assert lib.seed_edit_argv(qwen, ws, py="/py") == [
+        "/py", os.path.join(ws, "bin", "seed-edit"), "--source", os.path.join(run_dir, "source.jpg"),
+        "--prompt", "make it night", "--model", "qwen", "--candidates", "3", "--seed", "7", "--run-dir", run_dir]
+    job = {"id": "20261102-141500-a1b2", "workspace": ws, "story_id": None}
+    parser = lib.ProgressParser("seed-edit", dict(fields, candidates=4))
+    assert parser.snapshot(job, None, state) == {
+        "kind": "seed-edit", "elapsed_s": None, "last_line": "", "face_problem": False,
+        "candidates": {"total": 4, "done": 0, "ok": 0, "blocked": 0, "failed": 0, "current": 1}}
+    lines = b"seed-edit: backend zimage (Z-Image img2img)\ncandidate 1/4 ok 1.0s\ncandidate 2/4 blocked 2.0s\n"
+    parser.feed(lines)
+    snap = parser.snapshot(job, None, state)
+    assert snap["candidates"] == {"total": 4, "done": 2, "ok": 1, "blocked": 1, "failed": 0, "current": 3}
+    assert snap["last_line"] == "candidate 2/4 blocked 2.0s"
+    parser.feed(b"panel 3 ok: x\ncandidate 3/4 failed\ncandidate 4/4 failed\n")
+    assert parser.snapshot(job, None, state)["candidates"] == {
+        "total": 4, "done": 4, "ok": 1, "blocked": 1, "failed": 2, "current": None}
+    assert parser.panels == {}
+    bare = lib.ProgressParser("seed-edit", {"candidates": "4"})
+    assert bare.snapshot(job, None, state)["candidates"] == {
+        "total": None, "done": 0, "ok": 0, "blocked": 0, "failed": 0, "current": None}
+    other = lib.ProgressParser("character-create", {"name": "kyra"})
+    other.feed(lines)
+    assert set(other.snapshot(job, None, state)) == {"kind", "elapsed_s", "last_line", "face_problem"}
+    assert other.candidates == {}
+
+
+# --- SGT19 (SG30): lib.seed_edit_check ---------------------------------------------------------------
+
+def test_sgt19_seed_edit_check(monkeypatch, tmp_path):
+    mt.set_home(monkeypatch, tmp_path)
+    clean_env(monkeypatch, tmp_path)
+    ws = mt.make_stub_workspace(tmp_path)
+    stub_seed_edit(ws, OK_MODELS)
+    assert lib.seed_edit_check(ws) == (OK_MODELS, None)
+    extra = {"zimage": dict(OK_MODELS["zimage"], note=1), "qwen": OK_MODELS["qwen"], "other": 1}
+    stub_seed_edit(ws, extra)
+    assert lib.seed_edit_check(ws) == (OK_MODELS, None)
+    stub_seed_edit(ws, OK_MODELS, exit=3, stderr="first\nnope\n")
+    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe exited 3: nope")
+    stub_seed_edit(ws, OK_MODELS, exit=3)
+    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe exited 3: -")
+    bad = [
+        "not json",
+        json.dumps({"zimage": dict(OK_MODELS["zimage"], ok="yes"), "qwen": OK_MODELS["qwen"]}),
+        json.dumps({"zimage": OK_MODELS["zimage"]}),
+        json.dumps([OK_MODELS]),
+        json.dumps({"zimage": {"ok": True, "backend": "zimage"}, "qwen": OK_MODELS["qwen"]}),
+        json.dumps({"zimage": dict(OK_MODELS["zimage"], reason=5), "qwen": OK_MODELS["qwen"]}),
+        json.dumps({"zimage": OK_MODELS["zimage"], "qwen": dict(OK_MODELS["qwen"], backend=["x"])}),
+    ]
+    for printed in bad:
+        stub_seed_edit(ws, printed)
+        assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe printed unparsable output"), printed
+    monkeypatch.setattr(lib, "LIGHT_TIMEOUT", 1)
+    stub_seed_edit(ws, OK_MODELS, sleep=2)
+    assert lib.seed_edit_check(ws) == (None, "bin/seed-edit --probe timed out after 1 s")
