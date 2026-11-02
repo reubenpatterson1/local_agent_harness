@@ -748,3 +748,112 @@ def test_sg_review_focus_2_keep_clicked_four_times_at_once(env):
     assert names == sorted([RA + "-01.png"] + [RA + "-01-%d.png" % k for k in (2, 3, 4)])
     for r in results:
         assert _read(r[2]["path"]) == _read(os.path.join(run_dir, "cand_01.png"))
+
+
+# --- SGT33 (SG54-SG65): the static page ----------------------------------------------------------------
+
+PAGE_IDS = ("tab-seeds", "panel-seeds", "se-file", "se-source-status", "se-source-img", "se-source-size", "se-prompt",
+            "se-prompt-count", "se-model", "se-model-note", "se-strength-box", "se-strength", "se-candidates",
+            "se-seed", "se-generate", "se-generate-reason", "se-run-title", "se-run-status", "se-folder-options",
+            "se-grid", "se-runs", "se-folders")
+JS_TEXTS = ('"/api/seeds/runs"', '"/api/seeds/folders"', '"/keep"', '"/use"', '"New seed from this"',
+            '"Use in Compose"', '"Edit again"', '"Copy path"', '"blocked by content safety"', '"unavailable — "',
+            '"selected — press Cmd+C"', '"seed run "', "navigator.clipboard", "S.timers.seeds",
+            'const TABS = ["compose", "seeds", "stories", "batches", "characters", "locations", "actions", "loras", '
+            '"jobs", "traces"];',
+            '["jobs", "log", "host", "batch"]',
+            "await Promise.all([loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), "
+            "loadModels()]);",
+            "    resetSeeds();\n    await loadOptions();\n", "    setupCompose();\n    setupSeeds();\n",
+            "    updateLocationButtons();\n    updateSeedButtons();\n  }\n",
+            '    if (name !== "seeds") { stopSeedPoll(); }\n    if (name === "seeds") { loadSeeds(); }\n',
+            "    });\n    if (S.timers.seeds) { clearInterval(S.timers.seeds); S.timers.seeds = null; }\n"
+            "    if (S.timers.traces) {",
+            'return job.story_id || job.character || (job.seed_run ? "seed run " + job.seed_run : "") || '
+            '(job.kind === "smoke" ? "smoke render" : "-");',
+            'gallery.appendChild(el("figure", {cls: "se-still"}, [el("img", {src: fileUrl(p), alt: p}), '
+            'button("New seed from this", function () { seedFromStill(name, p); })]));')
+SEED_FUNCTIONS = ("seedCanvas", "setSeedSource", "onSeedSourceFile", "updateSeedButtons", "seedBody", "generateSeeds",
+                  "openSeedRun", "pollSeedRun", "renderSeedRun", "seedRow", "keepSeed", "useSeed", "editSeedAgain",
+                  "loadSeeds", "loadSeedRuns", "loadSeedFolders", "copySeedPath", "seedFromStill", "stopSeedPoll",
+                  "resetSeeds", "setupSeeds")
+CSS_RULES = (".se-grid { display: flex; flex-direction: column; gap: 12px; }",
+             ".se-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }",
+             ".se-img, .se-thumb { width: 320px; height: auto; border: 1px solid var(--line); }",
+             ".se-actions { display: flex; flex-direction: column; gap: 4px; }",
+             ".se-mini { width: 64px; height: auto; margin-right: 4px; }",
+             ".gallery figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }")
+
+
+def _static_texts():
+    static = os.path.join(WS, "static", "movie-ui")
+    texts = {}
+    for name in ("index.html", "app.js", "app.css"):
+        with open(os.path.join(static, name), encoding="utf-8") as f:
+            texts[name] = f.read()
+    return static, texts
+
+
+def test_sgt33_the_static_page():
+    static, texts = _static_texts()
+    html, js, css = texts["index.html"], texts["app.js"], texts["app.css"]
+    for element in PAGE_IDS:
+        assert html.count('id="%s"' % element) == 1, element
+    assert html.index('id="tab-compose"') < html.index('id="tab-seeds"') < html.index('id="tab-stories"')
+    assert html.index('id="panel-compose"') < html.index('id="panel-seeds"') < html.index('id="panel-stories"')
+    assert '<img id="se-source-img" class="se-thumb" alt="source image" hidden>' in html
+    assert '<option value="4" selected>4</option>' in html and 'placeholder="blank = random"' in html
+    for text in JS_TEXTS:
+        assert text in js, text
+    for name in SEED_FUNCTIONS:
+        assert js.count("function %s(" % name) == 1, name
+    for rule in CSS_RULES:
+        assert rule in css, rule
+    for name, text in texts.items():
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
+                        r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stderr
+
+
+# --- Review Focus 5: the page's canvas size matches the tool's ----------------------------------------------
+
+CANVAS_CASES = [(1536, 1024), (1024, 1024), (800, 600), (4000, 3000), (3000, 4000), (720, 1280), (1023, 1023),
+                (100, 70), (100, 60), (64, 64), (63, 100), (1025, 1), (2000, 1999), (1, 5000), (4032, 3024),
+                (3024, 4032), (1080, 1920), (1920, 1080), (5000, 5000), (17, 17), (1040, 1040), (1041, 300),
+                (8192, 64), (64, 8192), (1366, 768), (2048, 1365)]
+
+
+def test_sg_review_focus_5_the_page_canvas_matches_the_tool(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is not installed")
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("seed_edit_tool", os.path.join(WS, "bin", "seed-edit"))
+    spec = importlib.util.spec_from_loader("seed_edit_tool", loader)
+    tool = importlib.util.module_from_spec(spec)
+    loader.exec_module(tool)
+    with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    start = js.index("  function seedCanvas(w, h) {")
+    end = js.index("\n  }\n", start) + len("\n  }\n")
+    script = js[start:end] + "const SEED_LONG_EDGE = 1024;\nprocess.stdout.write(JSON.stringify(%s.map(function (c) { " \
+        "return seedCanvas(c[0], c[1]); })));\n" % json.dumps(CANVAS_CASES)
+    path = os.path.join(str(tmp_path), "canvas.js")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    proc = subprocess.run([node, path], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    for (w0, h0), got in zip(CANVAS_CASES, json.loads(proc.stdout)):
+        try:
+            want = dict(zip(("width", "height"), tool.canvas(w0, h0)))
+        except tool.Refusal as e:
+            found = re.search(r"gives a ([0-9]+)x([0-9]+) canvas", str(e))
+            want = {"width": int(found.group(1)), "height": int(found.group(2))}
+            assert min(got["width"], got["height"]) < 64, (w0, h0, got)
+        assert got == want, (w0, h0)
