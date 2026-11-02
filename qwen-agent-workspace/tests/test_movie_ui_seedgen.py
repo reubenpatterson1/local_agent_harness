@@ -857,3 +857,22 @@ def test_sg_review_focus_5_the_page_canvas_matches_the_tool(tmp_path):
             want = {"width": int(found.group(1)), "height": int(found.group(2))}
             assert min(got["width"], got["height"]) < 64, (w0, h0, got)
         assert got == want, (w0, h0)
+
+
+def test_sg_task6_review_page_guards():
+    """Task 6 review: one seed poll at a time and never on a hidden tab; stale-workspace answers ignored; the
+    Seeds lists reload on a workspace switch; Keep and Use disabled while their request runs; Generate's unknown
+    outcome warns instead of offering a blind retry; a source that fails to load is dropped with a reason."""
+    _static, texts = _static_texts()
+    js = texts["app.js"]
+    for text in ('    stopSeedPoll();\n    if (SEED_ACTIVE.indexOf(res.data.state) >= 0 && !$("#panel-seeds").hidden) {\n',
+                 '    if (ws !== S.ws) { return; }\n    const body = clear($("#se-runs tbody"));\n',
+                 '    if (ws !== S.ws) { return; }\n    const options = clear($("#se-folder-options"));\n',
+                 'loadModels()]);\n    if (!$("#panel-seeds").hidden) { loadSeeds(); }\n',
+                 'try { await keepSeed(run, cand.n, input, status); } finally { target.disabled = false; }',
+                 'try { await useSeed(run, cand.n, status); } finally { target.disabled = false; }',
+                 '"the request may have been queued — check Runs and Jobs before retrying"',
+                 '$("#se-source-img").addEventListener("error", function () {',
+                 '"the source image could not be loaded — pick it again"'):
+        assert text in js, text
+    assert js.count("S.timers.seeds = setInterval(") == 1

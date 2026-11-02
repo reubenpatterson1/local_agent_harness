@@ -297,6 +297,7 @@
     resetSeeds();
     await loadOptions();
     await Promise.all([loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), loadModels()]);
+    if (!$("#panel-seeds").hidden) { loadSeeds(); }
     preview();
   }
 
@@ -1866,8 +1867,12 @@
     let failure = null;
     try {
       const res = await api("POST", "/api/seeds/runs", seedBody());
-      if (res.status === 201) {
+      if (res.status === 201 && res.data && res.data.run && res.data.run.run) {
         openSeedRun(res.data.run.run);
+        pollJobs();
+      } else if (res.status === 0 || res.status === 201 || res.status >= 500) {
+        failure = "the request may have been queued — check Runs and Jobs before retrying";
+        loadSeedRuns();
         pollJobs();
       } else {
         failure = (res.data && res.data.error) || ("http " + res.status);
@@ -1893,7 +1898,10 @@
       return;
     }
     renderSeedRun(res.data);
-    if (SEED_ACTIVE.indexOf(res.data.state) >= 0) { S.timers.seeds = setInterval(pollSeedRun, SEED_POLL_MS); }
+    stopSeedPoll();
+    if (SEED_ACTIVE.indexOf(res.data.state) >= 0 && !$("#panel-seeds").hidden) {
+      S.timers.seeds = setInterval(pollSeedRun, SEED_POLL_MS);
+    }
   }
 
   async function pollSeedRun() {
@@ -1961,8 +1969,16 @@
       const input = el("input", {cls: "se-keep-folder", type: "text", list: "se-folder-options", placeholder: "folder name", size: "20"});
       const status = el("span", {cls: "se-cand-status muted"});
       row.parts.push(el("div", {cls: "se-actions"}, [input,
-        button("Keep", function () { keepSeed(run, cand.n, input, status); }),
-        button("Use in Compose", function () { useSeed(run, cand.n, status); }),
+        button("Keep", async function (ev) {
+          const target = ev.currentTarget;
+          target.disabled = true;
+          try { await keepSeed(run, cand.n, input, status); } finally { target.disabled = false; }
+        }),
+        button("Use in Compose", async function (ev) {
+          const target = ev.currentTarget;
+          target.disabled = true;
+          try { await useSeed(run, cand.n, status); } finally { target.disabled = false; }
+        }),
         button("Edit again", function () { editSeedAgain(cand); }),
         status]));
     }
@@ -2008,7 +2024,9 @@
 
   async function loadSeedRuns() {
     if (!S.ws) { return; }
+    const ws = S.ws;
     const res = await api("GET", "/api/seeds/runs" + wsQuery());
+    if (ws !== S.ws) { return; }
     const body = clear($("#se-runs tbody"));
     if (res.status !== 200) { return; }
     res.data.runs.forEach(function (r) {
@@ -2024,7 +2042,9 @@
 
   async function loadSeedFolders() {
     if (!S.ws) { return; }
+    const ws = S.ws;
     const res = await api("GET", "/api/seeds/folders" + wsQuery());
+    if (ws !== S.ws) { return; }
     const options = clear($("#se-folder-options"));
     const body = clear($("#se-folders tbody"));
     if (res.status !== 200) { return; }
@@ -2090,6 +2110,14 @@
       S.seeds.natural = {width: img.naturalWidth, height: img.naturalHeight};
       const canvas = seedCanvas(img.naturalWidth, img.naturalHeight);
       $("#se-source-size").textContent = img.naturalWidth + " × " + img.naturalHeight + " → " + canvas.width + " × " + canvas.height;
+      updateSeedButtons();
+    });
+    $("#se-source-img").addEventListener("error", function () {
+      if (!S.seeds.source) { return; }
+      S.seeds.source = null;
+      S.seeds.natural = null;
+      show($("#se-source-img"), false);
+      $("#se-source-status").textContent = "the source image could not be loaded — pick it again";
       updateSeedButtons();
     });
     ["input", "change"].forEach(function (type) { $("#panel-seeds").addEventListener(type, updateSeedButtons); });
