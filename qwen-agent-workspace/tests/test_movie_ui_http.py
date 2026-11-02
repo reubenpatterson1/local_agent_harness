@@ -41,7 +41,7 @@ def test_mu13_query_parsing():
 
 def test_mut18_every_api_route_needs_the_token(env):
     s = env["srv"]
-    assert len(srv.ROUTES) == 55
+    assert len(srv.ROUTES) == 57
     for method, regex, name, sample in srv.ROUTES:
         assert re.fullmatch(regex, sample), sample
         body = {} if method in ("POST", "PUT") else None
@@ -341,7 +341,7 @@ def test_mut2_preview_argv_is_the_job_argv(env):
     assert [j["queue_position"] for j in jobs["queued"]] == [1, 2, 3]
     assert set(jobs["queued"][0]) == {"id", "kind", "state", "workspace", "story_id", "character", "created",
                                       "started", "ended", "exit_code", "error", "queue_position", "command",
-                                      "progress"}
+                                      "progress", "seed_folder"}
 
 
 def test_mut13_mut14_job_actions_over_http(env):
