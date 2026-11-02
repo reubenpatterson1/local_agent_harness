@@ -1286,22 +1286,151 @@ def test_sgt15_the_mflux_child(monkeypatch, tmp_path, capsys):
     for text, want in (("0.24.0", (0, 24, 0)), ("0.22.0", (0, 22, 0)), ("0.21.9", (0, 21, 9)), ("x", None),
                        (None, None)):
         assert child.parse_version(text) == want, text
-    assert child.parse_version("0.21.9") < child.MIN_VERSION <= child.parse_version("0.22.0")
+    assert child.parse_version("0.23.9") < child.MIN_VERSION <= child.parse_version("0.24.0")
     monkeypatch.setattr(child, "exit_with_parent", lambda poll_s=2.0: None)
-    monkeypatch.setattr(child.importlib.metadata, "version", lambda name: "0.21.0")
+    monkeypatch.setattr(child.importlib.metadata, "version", lambda name: "0.23.0")
     missing = os.path.join(str(tmp_path), "missing-spec.json")
     assert child.main(["--spec", missing]) == 2
-    assert capsys.readouterr().out == ("seed-edit-child: mflux 0.21.0 is missing or older than 0.22.0; refusing "
-                                       "(it would run Qwen-Image-Edit-2509)\n")
+    assert capsys.readouterr().out == ("seed-edit-child: mflux 0.23.0 is missing or older than 0.24.0; refusing "
+                                       "(run bin/seed-edit-setup)\n")
 
     def not_installed(name):
         raise child.importlib.metadata.PackageNotFoundError(name)
 
     monkeypatch.setattr(child.importlib.metadata, "version", not_installed)
     assert child.main(["--spec", missing]) == 2
-    assert capsys.readouterr().out.startswith("seed-edit-child: mflux None is missing or older than 0.22.0")
-    for text in ('guidance=spec["guidance"]', "bake_lora=False", 'negative_prompt=" "',
-                 "ModelConfig.qwen_image_edit_2511()", "quantize=None", "lora_scales=[1.0]"):
+    assert capsys.readouterr().out.startswith("seed-edit-child: mflux None is missing or older than 0.24.0")
+    for text in ("bake_lora=False", "quantize=None", '.convert("RGB").save('):
+        assert text in source, text
+
+
+# --- SQT8 (seed models SQ28, SQ29): the child in-process with fake mlx and mflux modules --------------------
+
+def child_fakes(monkeypatch):
+    """sys.modules fakes of mlx, mlx.core, ModelConfig's module and the two FAMILIES classes; returns the
+    record {"init": [(class name, kwargs)], "generate": [(class name, kwargs)]}."""
+    record = {"init": [], "generate": []}
+    core = types.ModuleType("mlx.core")
+    core.get_peak_memory = lambda: 2 ** 30
+    mlx = types.ModuleType("mlx")
+    mlx.core = core
+    config_module = types.ModuleType("mflux.models.common.config.model_config")
+
+    class ModelConfig(object):
+        def __init__(self, name):
+            self.model_name = name
+
+        @staticmethod
+        def qwen_image_21():
+            return ModelConfig("Qwen/Qwen-Image-2.1")
+
+        @staticmethod
+        def qwen_image_edit_2511():
+            return ModelConfig("Qwen/Qwen-Image-Edit-2511")
+
+    config_module.ModelConfig = ModelConfig
+
+    def fake_class(name):
+        class Fake(object):
+            def __init__(self, **kwargs):
+                record["init"].append((name, kwargs))
+
+            def generate_image(self, **kwargs):
+                record["generate"].append((name, kwargs))
+                return types.SimpleNamespace(image=Image.new("RGBA", (kwargs["width"], kwargs["height"]),
+                                                             (0, 0, 200, 128)))
+        return Fake
+
+    modules = {"mlx": mlx, "mlx.core": core, "mflux.models.common.config.model_config": config_module}
+    for family, (module_name, class_name, _config) in (
+            ("qwen21", ("mflux.models.qwen21.variants.edit.qwen_image_21_edit", "QwenImage21Edit", None)),
+            ("qwen2511", ("mflux.models.qwen.variants.edit.qwen_image_edit", "QwenImageEdit", None))):
+        module = types.ModuleType(module_name)
+        setattr(module, class_name, fake_class(class_name))
+        modules[module_name] = module
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return record
+
+
+def child_spec(tmp_path, family, lora_paths, lora_scales, scheduler):
+    tmp = str(tmp_path)
+    spec = {"family": family, "model_path": os.path.join(tmp, "model"), "lora_paths": lora_paths,
+            "lora_scales": lora_scales, "prompt": PROMPT, "source": os.path.join(tmp, "source.png"), "width": 64,
+            "height": 96, "steps": 40, "guidance": 1.0, "scheduler": scheduler,
+            "jobs": [{"n": 1, "seed": 11, "output_path": os.path.join(tmp, "cand_01.pending.png")}]}
+    path = os.path.join(tmp, "spec-%s-%d.json" % (family, len(lora_paths)))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(spec, f)
+    return path, spec
+
+
+def test_sqt8_the_child_per_family(monkeypatch, tmp_path, capsys):
+    import seed_edit_mflux_child as child
+    monkeypatch.setattr(child, "exit_with_parent", lambda poll_s=2.0: None)
+    monkeypatch.setattr(child.importlib.metadata, "version", lambda name: "0.24.0")
+    record = child_fakes(monkeypatch)
+    lora = os.path.join(str(tmp_path), "uncensored.safetensors")
+    path, spec = child_spec(tmp_path, "qwen21", [lora], [1.0], "linear")
+    assert child.main(["--spec", path]) == 0
+    (name, init), = record["init"]
+    assert name == "QwenImage21Edit"
+    assert set(init) == {"model_path", "quantize", "model_config", "lora_paths", "lora_scales", "bake_lora"}
+    assert (init["model_path"], init["quantize"], init["model_config"].model_name, init["lora_paths"],
+            init["lora_scales"], init["bake_lora"]) == (spec["model_path"], None, "Qwen/Qwen-Image-2.1", [lora], [1.0],
+                                                        False)
+    (name, kwargs), = record["generate"]
+    assert kwargs == {"seed": 11, "prompt": PROMPT, "image_paths": [spec["source"]], "num_inference_steps": 40,
+                      "guidance": 1.0, "width": 64, "height": 96, "scheduler": "linear"}
+    with Image.open(spec["jobs"][0]["output_path"]) as img:
+        assert (img.mode, img.size) == ("RGB", (64, 96))
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == ('seed-edit-child: mflux 0.24.0, family qwen21, model Qwen/Qwen-Image-2.1, transformer overrides '
+                      'None, scheduler linear, LoRAs [["uncensored.safetensors", 1.0]]')
+    assert re.fullmatch(r"seed-edit-child done 1 [0-9]+\.[0-9]", out[-1])
+    record["init"], record["generate"] = [], []
+    path, spec = child_spec(tmp_path, "qwen21", [], [], "viggle_turbo")
+    assert child.main(["--spec", path]) == 0
+    assert (record["init"][0][1]["lora_paths"], record["init"][0][1]["lora_scales"]) == (None, None)
+    assert record["generate"][0][1]["scheduler"] == "viggle_turbo"
+    record["init"], record["generate"] = [], []
+    lightning = os.path.join(str(tmp_path), "lightning.safetensors")
+    path, spec = child_spec(tmp_path, "qwen2511", [lightning], [1.0], None)
+    assert child.main(["--spec", path]) == 0
+    (name, init), = record["init"]
+    assert (name, init["model_config"].model_name, init["lora_paths"]) == (
+        "QwenImageEdit", "Qwen/Qwen-Image-Edit-2511", [lightning])
+    kwargs = record["generate"][0][1]
+    assert kwargs["negative_prompt"] == " " and "scheduler" not in kwargs
+    capsys.readouterr()
+    record["init"], record["generate"] = [], []
+    path, spec = child_spec(tmp_path, "x", [], [], None)
+    assert child.main(["--spec", path]) == 2
+    assert capsys.readouterr().out == "seed-edit-child: unknown model family 'x'; refusing\n"
+    assert record == {"init": [], "generate": []}
+    monkeypatch.setattr(child.importlib.metadata, "version", lambda name: "0.23.0")
+    assert child.main(["--spec", os.path.join(str(tmp_path), "missing.json")]) == 2
+    assert capsys.readouterr().out == ("seed-edit-child: mflux 0.23.0 is missing or older than 0.24.0; refusing "
+                                       "(run bin/seed-edit-setup)\n")
+
+
+# --- SQT9 (seed models SQ2, SQ28): the child's FAMILIES table mirrors the registry ----------------------------
+
+def test_sqt9_the_child_mirrors_the_registry():
+    import seed_edit_mflux_child as child
+    tool = load_tool()
+    for entry in seedgen.QWEN_MODELS:
+        if entry["backend"] != "mflux":
+            continue
+        module_name, class_name = entry["mflux_class"].rsplit(".", 1)
+        assert child.FAMILIES[entry["family"]] == (module_name, class_name, entry["mflux_config"]), entry["id"]
+    assert set(child.FAMILIES) == set(seedgen.QWEN_FAMILIES)
+    assert child.MIN_VERSION == tool.MFLUX_MIN_VERSION == (0, 24, 0)
+    with open(os.path.join(WS, "seed_edit_mflux_child.py"), encoding="utf-8") as f:
+        source = f.read()
+    assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
+        "argparse", "importlib.metadata", "json", "os", "re", "sys", "threading", "time"]
+    for text in ("bake_lora=False", "quantize=None", '.convert("RGB").save('):
         assert text in source, text
 
 
