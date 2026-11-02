@@ -722,3 +722,11 @@ The browser check (§6.2) is part of the testing, run before the merge (§8 step
 ## 11. Open questions
 
 None. Every point the notes left open is decided in Section 10.
+
+## 11. Amendments after the final review (2026-11-02)
+
+1. **SD33 (Queue failure):** Queue is re-enabled only after a 400, which is refused before any job is created. After any other non-201/409 status (a dropped connection, a timeout, a 500), the page sets `box.body = null`, leaves Queue disabled, shows `<error> — the request may have queued jobs; check the Jobs tab before queueing again`, and refreshes the job list. A retry could otherwise queue a duplicate set of jobs.
+2. **SD31 (confirm while busy):** `openFolderConfirm` returns at once while that box's Queue request is running.
+3. **SD35 / Q1:** `onSeedFile` calls `updateComposeButtons()` before `preview()`, so a single-seed pick in Compose folder mode restores the normal controls.
+4. **Workspace switch:** `selectWorkspace` closes both confirm tables, so a frozen request can never queue into the previous workspace.
+5. **queueFolder:** the Jobs selection after a 201 is skipped when no job summary came back.

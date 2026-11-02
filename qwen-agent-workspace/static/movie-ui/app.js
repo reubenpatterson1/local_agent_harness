@@ -280,6 +280,8 @@
 
   async function selectWorkspace(path) {
     S.ws = path;
+    closeFolderConfirm(FOLDER_BOXES.compose);
+    closeFolderConfirm(FOLDER_BOXES.characters);
     await loadOptions();
     await Promise.all([loadCatalog(), loadCharacters(), loadLocations(), loadActions(), loadStories(), loadModels()]);
     preview();
@@ -655,6 +657,7 @@
   }
 
   async function openFolderConfirm(box, base) {
+    if (box.busy) { return; }
     const seeds = uploadedSeeds(box).map(function (f) { return {name: f.name, upload_id: f.upload_id}; });
     let sent = 0;
     const rows = (box.folder ? box.folder.files : []).map(function (f) {
@@ -723,15 +726,20 @@
           const q = res.data.queued;
           part(box, "summary").textContent = "queued " + q + (q === 1 ? " job" : " jobs");
           const first = res.data.seeds.filter(function (seed) { return seed.job; })[0];
-          selectJob(first.job.id);
+          if (first) { selectJob(first.job.id); }
           await pollJobs();
           showTab("jobs");
         } else {
           part(box, "summary").textContent = "nothing was queued";
         }
-      } else {
+      } else if (res.status === 400) {
         part(box, "summary").textContent = folderError(res);
         part(box, "queue").disabled = false;
+      } else {
+        box.body = null;
+        part(box, "summary").textContent = folderError(res) +
+          " — the request may have queued jobs; check the Jobs tab before queueing again";
+        await pollJobs();
       }
     } finally {
       box.busy = false;

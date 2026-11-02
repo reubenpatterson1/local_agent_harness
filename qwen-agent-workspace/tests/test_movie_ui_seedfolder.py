@@ -1144,3 +1144,21 @@ def test_sf_review_focus_1_timestamp_and_non_latin_names_as_characters(env):
         assert job["fields"]["seed_folder"]["name"] == name
     queued = mt.api(s, "GET", "/api/jobs")[2]["queued"]
     assert [j["seed_folder"]["name"] for j in queued] == names
+
+
+def test_sf_final_review_queue_and_confirm_guards():
+    """Final-review fixes: openFolderConfirm ignores clicks while a Queue request runs (I2); after a
+    non-400 Queue failure the page never re-enables Queue (I1); a workspace switch closes both
+    confirm tables (M1)."""
+    with open(os.path.join(WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    start = js.index("async function openFolderConfirm(box, base) {")
+    assert js[start:].split("\n")[1].strip() == "if (box.busy) { return; }"
+    queue = js[js.index("async function queueFolder(box) {"):js.index("function closeFolderConfirm(box) {")]
+    assert '} else if (res.status === 400) {' in queue
+    assert "the request may have queued jobs; check the Jobs tab before queueing again" in queue
+    assert queue.count('part(box, "queue").disabled = false;') == 1
+    assert "if (first) { selectJob(first.job.id); }" in queue
+    ws_fn = js[js.index("async function selectWorkspace(path) {"):js.index("async function loadOptions() {")]
+    assert "closeFolderConfirm(FOLDER_BOXES.compose);" in ws_fn
+    assert "closeFolderConfirm(FOLDER_BOXES.characters);" in ws_fn
