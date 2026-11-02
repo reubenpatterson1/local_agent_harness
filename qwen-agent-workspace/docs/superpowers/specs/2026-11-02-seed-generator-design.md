@@ -740,6 +740,17 @@ Without the go, each is recorded as "not run (awaiting the user's go)".
 8. **Content safety in `~/mflux-edit`** — mflux 0.24.0 declares torch and transformers, so `content_safety` would import there, but the parent screens anyway (decision 9).
 9. **Page bans** — `\bprompt\(` and the pinned `["jobs", "log", "host", "batch"]` and `Promise.all` lines constrain naming and placement (SG56, SG64).
 
+## 14a. Amendments during implementation
+
+Made by the controller from the task and final reviews; each is pinned by a test.
+
+1. **§9.2 (PR2).** The test-only commit also changes `test_sdt19_the_seed_folder_tag` (`tests/test_movie_ui_seedfolder.py:612`): `len(j) == 15` becomes `== 16`, because SG46 adds the 16th summary key.
+2. **SG21.** `run_child` returns the exit code and whether the `CHILD_TIMEOUT_S` timer killed the child. Only a timer kill gives the SG17 timeout text; any other SIGKILL (for example a macOS memory-pressure kill) is an ordinary `<label> child exited -9: <last line>`.
+3. **SG60/SG62/SG63 (page guards).** Only one seed poll runs at a time and never on a hidden tab; a Runs or Seed folders answer for a workspace that is no longer selected is ignored; a workspace switch while the Seeds tab is open reloads both lists; Keep and Use in Compose are disabled while their request runs; Generate's unknown outcome (status 0, 5xx, or a 201 without a run) shows `the request may have been queued — check Runs and Jobs before retrying` and refreshes Runs and Jobs; a source image that fails to load is dropped with `the source image could not be loaded — pick it again`; a 201 also calls `loadSeedRuns()` so the new run is listed at once.
+4. **SG9.** A Pillow format of `MPO` (a JPEG with an MPF secondary image, as iOS and Android HDR photos are) counts as JPEG: `source.jpg`, frame 0.
+5. **SG20 / `/files`.** The guarantee is that no unscreened candidate is reachable: `/files` answers 403 `path not allowed` for any path inside `generated/seeds/runs/<run>/work/` (compared by inode, so case and symlinks do not get round it).
+6. **SG67 step 4 / SG68.** The free-space check needs `31 GiB − what an earlier run left` (the lstat sizes of the q4 and Lightning repo directories in the hub and of the venv), so re-running after a partial download resumes it as SG68 says. The download also sets `HF_HUB_ENABLE_HF_TRANSFER="0"`.
+
 ## 15. Open questions
 
 None. Every point the notes left open is decided in Section 13.
