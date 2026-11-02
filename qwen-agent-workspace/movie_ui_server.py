@@ -31,11 +31,14 @@ import fleet_lib
 import movie_ui_batch as batch
 import movie_ui_lib as lib
 import movie_ui_seedfolder as seedfolder
+import movie_ui_seedgen as seedgen
 
 UI_WS = os.path.dirname(os.path.realpath(__file__))
 STORE_LOCK = threading.Lock()   # MU18: guards queue.json, server-side status writes, dispatch
 BATCH_LOCK = threading.Lock()   # batch forks BF2: batch.json read-modify-writes, submit planning;
                                 # never held together with STORE_LOCK
+SEEDS_LOCK = threading.Lock()   # seed generator SG41: Keep's name choice and write; never held
+                                # together with STORE_LOCK
 MAX_BODY = 26214400             # 25 MiB (MU10)
 UPLOAD_MAX = 20971520           # 20 MiB (MU53)
 LOG_CHUNK = 262144              # MU58
@@ -58,11 +61,13 @@ FILE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", 
               ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8"}
 
 _ID = r"([0-9]{8}-[0-9]{6}-[0-9a-f]{4})"
+_RUN = r"(se-[0-9]{8}-[0-9]{6}-[0-9a-f]{4})"   # seed generator SG40
 _STORY = r"([A-Za-z0-9][A-Za-z0-9._-]{0,79})"
 _NAME = r"([a-z][a-z0-9-]{1,23})"
 _ACTION = r"([a-z][a-z0-9-]{1,31})"
 _TRACE = r"([0-9a-f]{32})"
 _SAMPLE_ID = "20261019-142233-a1b2"
+_SAMPLE_RUN = "se-20261102-141500-a1b2"
 _SAMPLE_TRACE = "0123456789abcdef0123456789abcdef"
 
 # MU11: (method, regex, handler name, sample path), matched with re.fullmatch in this order.
@@ -96,6 +101,12 @@ ROUTES = [
     ("GET", r"/api/actions/" + _ACTION, "h_action", "/api/actions/roundhouse-kick"),
     ("POST", r"/api/actions/" + _ACTION + r"/train", "h_action_train", "/api/actions/roundhouse-kick/train"),
     ("POST", r"/api/uploads", "h_upload", "/api/uploads"),
+    ("POST", r"/api/seeds/runs", "h_seed_run_create", "/api/seeds/runs"),
+    ("GET", r"/api/seeds/runs", "h_seed_runs", "/api/seeds/runs"),
+    ("GET", r"/api/seeds/runs/" + _RUN, "h_seed_run", "/api/seeds/runs/" + _SAMPLE_RUN),
+    ("POST", r"/api/seeds/runs/" + _RUN + r"/keep", "h_seed_keep", "/api/seeds/runs/" + _SAMPLE_RUN + "/keep"),
+    ("POST", r"/api/seeds/runs/" + _RUN + r"/use", "h_seed_use", "/api/seeds/runs/" + _SAMPLE_RUN + "/use"),
+    ("GET", r"/api/seeds/folders", "h_seed_folders", "/api/seeds/folders"),
     ("POST", r"/api/preview", "h_preview", "/api/preview"),
     ("POST", r"/api/validate", "h_validate", "/api/validate"),
     ("GET", r"/api/jobs", "h_jobs", "/api/jobs"),
@@ -201,6 +212,7 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         self.cap_lock = threading.Lock()
         self.capabilities = dict((k, {"ok": None, "reason": "probing", "checked": None})
                                  for k in ("render", "stills", "story_server"))
+        self.capabilities["seed_edit"] = {"ok": None, "reason": "probing", "checked": None, "models": None}
         self.parser_lock = threading.Lock()
         self.parsers = {}
         self.job_cache = {}
@@ -208,14 +220,17 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         self.batch_thread = None   # the batch-submitter thread while it runs (BF24, BF25)
 
     def refresh_capabilities(self):
-        """Re-run MU60's three probes against probe_ws and store the results."""
+        """Re-run MU60's three probes and the seed_edit probe (seed generator SG38) against probe_ws
+        and store the results."""
         results = {"render": lib.render_check(), "stills": lib.stills_check(self.probe_ws, self.stills_py),
                    "story_server": lib.story_server_check(self.probe_ws)}
+        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws)
         checked = lib.utc_now()
         with self.cap_lock:
             for key, (ok, detail) in results.items():
                 reason = detail if (key == "story_server" or not ok) else None
                 self.capabilities[key] = {"ok": ok, "reason": reason, "checked": checked}
+            self.capabilities["seed_edit"] = seedgen.capability(seed_models, seed_detail, checked)
 
     def capability_snapshot(self):
         with self.cap_lock:
@@ -736,7 +751,8 @@ def job_summary(server, job_id, queue):
             "error": status.get("error"), "queue_position": queue.index(job_id) + 1 if state == "queued" else None,
             "command": shlex.join(job["argv"]),
             "progress": server.progress(job_id, job, status) if state in lib.ACTIVE_STATES else None,
-            "seed_folder": seedfolder.seed_tag(job.get("fields"))}
+            "seed_folder": seedfolder.seed_tag(job.get("fields")),
+            "seed_run": (job.get("fields") or {}).get("run") if job["kind"] == "seed-edit" else None}
 
 
 def _fields_body(body):
@@ -1115,17 +1131,23 @@ def tool_result(tool, run):
     return run
 
 
+def store_upload(state, data, ext):
+    """<state>/uploads/<sha256 hex>.<ext>, written once; returns {"upload_id", "path", "bytes"} (MU53,
+    seed generator SG53)."""
+    upload_id = "%s.%s" % (hashlib.sha256(data).hexdigest(), ext)
+    path = os.path.join(state, "uploads", upload_id)
+    if not os.path.isfile(path):
+        lib.write_bytes_atomic(path, data)
+    return {"upload_id": upload_id, "path": path, "bytes": len(data)}
+
+
 def _h_upload(self, groups, query, body):
     media = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
     ext, magic = UPLOAD_TYPES[media]
     ok = (body[:4] == b"RIFF" and body[8:12] == b"WEBP") if magic is None else body.startswith(magic)
     if not ok:
         raise ApiError(400, "file content is not %s" % media)
-    upload_id = "%s.%s" % (hashlib.sha256(body).hexdigest(), ext)
-    path = os.path.join(self.server.state, "uploads", upload_id)
-    if not os.path.isfile(path):
-        lib.write_bytes_atomic(path, body)
-    return 201, {"upload_id": upload_id, "path": path, "bytes": len(body)}
+    return 201, store_upload(self.server.state, body, ext)
 
 
 def _h_loras(self, groups, query, body):
@@ -1583,6 +1605,308 @@ MovieUIHandler.h_character_create = _h_character_create
 MovieUIHandler.h_character_seed_folder = _h_character_seed_folder
 MovieUIHandler.h_character_regenerate = _h_character_regenerate
 MovieUIHandler.h_character_train = _h_character_train
+
+
+# ---------------------------------------------------------------------------
+# The seed generator (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 5)
+# ---------------------------------------------------------------------------
+
+def seeds_root(ws_real):
+    return os.path.join(ws_real, "generated", "seeds")
+
+
+def runs_root(ws_real):
+    return os.path.join(seeds_root(ws_real), "runs")
+
+
+def seed_free_gib(path):
+    return shutil.disk_usage(path).free / 2 ** 30
+
+
+def _seed_run(ws_real, run):
+    """SG42: (run_dir, record) of a run whose directory lies inside runs_root and whose run.json is
+    a JSON object, else ApiError(404)."""
+    root = runs_root(ws_real)
+    run_dir = os.path.join(root, run)
+    record = None
+    if _inside(run_dir, root) and os.path.isdir(run_dir):
+        record = _json_in(run_dir, os.path.join(run_dir, "run.json"))
+    if not isinstance(record, dict):
+        raise ApiError(404, "unknown seed run %s" % run)
+    return run_dir, record
+
+
+def _candidates(record):
+    """SG42: the candidate entries of a record with an int n from 1 to 4, in order."""
+    cands = record.get("candidates")
+    if not isinstance(cands, list):
+        return []
+    return [c for c in cands if isinstance(c, dict) and lib._is_int(c.get("n"))
+            and 1 <= c["n"] <= seedgen.CANDIDATES_MAX]
+
+
+def _cand_file(run_dir, entry):
+    """SG42: <run_dir>/cand_NN.png of an ok entry when that file exists inside run_dir, else None."""
+    path = os.path.join(run_dir, "cand_%02d.png" % entry["n"])
+    return path if entry.get("status") == "ok" and _isfile_in(run_dir, path) else None
+
+
+def _in_seed_work(real, ws_real):
+    """True when the realpath real lies in generated/seeds/runs/<run>/work/ of ws_real, where
+    bin/seed-edit keeps unscreened mflux candidates (seed generator SG20). Compared by inode, so a
+    differently-cased path on a case-insensitive volume is caught too."""
+    try:
+        runs_stat = os.stat(runs_root(ws_real))
+    except OSError:
+        return False
+    path = real
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            return False
+        if os.path.basename(path).lower() == "work":
+            try:
+                if os.path.samestat(os.stat(os.path.dirname(parent)), runs_stat):
+                    return True
+            except OSError:
+                pass
+        path = parent
+
+
+def _run_job(server, record):
+    """The record's job ID when it names an existing job directory, else None."""
+    job_id = record.get("job")
+    if isinstance(job_id, str) and lib.JOB_ID_RE.fullmatch(job_id) and os.path.isdir(lib.job_dir(server.state, job_id)):
+        return job_id
+    return None
+
+
+def run_state(server, record, queue):
+    """SG43: the tool's final state, else the job's state, else "unknown"."""
+    if record.get("state") in ("done", "failed", "cancelled"):
+        return record["state"]
+    job_id = _run_job(server, record)
+    return lib.job_state(server.state, job_id, queue) if job_id is not None else "unknown"
+
+
+def run_view(server, ws_real, run, run_dir, record, queue):
+    """SG43: the run as the page shows it."""
+    source = record.get("source")
+    source_path = os.path.join(run_dir, source) if source in seedgen.SOURCE_NAMES else None
+    if source_path is not None and not _isfile_in(run_dir, source_path):
+        source_path = None
+    job_id = _run_job(server, record)
+    view = {"run": run, "dir": run_dir, "created": record.get("created"), "state": run_state(server, record, queue)}
+    for key in ("prompt", "model", "backend", "strength", "seed", "size", "source_size", "source_origin", "error"):
+        view[key] = record.get(key)
+    view["source"] = source_path
+    view["candidates"] = [{"n": c["n"], "seed": c.get("seed"), "status": c.get("status"),
+                           "seconds": c.get("seconds"), "path": _cand_file(run_dir, c)} for c in _candidates(record)]
+    view["job"] = job_summary(server, job_id, queue) if job_id is not None else None
+    return view
+
+
+def _seed_source(server, real, source):
+    """SG44 step 2: (source file, extension) of a validated source, else ApiError(400)."""
+    if source["kind"] == "upload":
+        path = os.path.join(server.state, "uploads", source["upload_id"])
+        if not os.path.isfile(path):
+            raise ApiError(400, "source upload %s not found" % source["upload_id"])
+        return path, source["upload_id"].rsplit(".", 1)[1]
+    if source["kind"] == "run":
+        try:
+            run_dir, record = _seed_run(real, source["run"])
+        except ApiError:
+            raise ApiError(400, "unknown source run %s" % source["run"])
+        entries = [c for c in _candidates(record) if c["n"] == source["n"]]
+        path = _cand_file(run_dir, entries[0]) if entries else None
+        if path is None:
+            raise ApiError(400, "source run %s has no ok candidate %s" % (source["run"], source["n"]))
+        return path, "png"
+    library = os.environ.get("CHARACTER_LIBRARY_DIR") or os.path.join(real, "generated", "characters")
+    path = os.path.join(library, source["character"], "dataset", "stills", source["still"])
+    if not _isfile_in(library, path):
+        raise ApiError(400, "unknown character still %s/%s" % (source["character"], source["still"]))
+    return path, "png"
+
+
+def _h_seed_run_create(self, groups, query, body):
+    """SG44: validate, check the source, the models and the disk, then create the run directory and
+    queue its seed-edit job."""
+    server = self.server
+    real = self.ws(body.get("ws"))
+    clean, error = seedgen.validate_run_request(body)
+    if error is not None:
+        raise ApiError(400, error)
+    source, ext = _seed_source(server, real, clean["source"])
+    models, detail = lib.seed_edit_check(real)
+    error = seedgen.availability_error(models, detail, clean["model"])
+    if error is not None:
+        raise ApiError(409, error)
+    generated = os.path.join(real, "generated")
+    where = generated if os.path.isdir(generated) else real
+    free = seed_free_gib(where)
+    if free < seedgen.MIN_FREE_GIB:
+        raise ApiError(409, "less than 2 GiB free on the disk holding %s (%.1f GiB free)" % (where, free))
+    seed = clean["seed"] if clean["seed"] is not None else secrets.randbelow(seedgen.SEED_MAX + 1)
+    root = runs_root(real)
+    os.makedirs(root, exist_ok=True)
+    while True:
+        run = seedgen.new_run_id()
+        try:
+            os.mkdir(os.path.join(root, run))
+            break
+        except FileExistsError:
+            continue
+    run_dir = os.path.join(root, run)
+    source_file = "source." + ext
+    shutil.copyfile(source, os.path.join(run_dir, source_file))
+    origin = clean["source"]
+    with STORE_LOCK:
+        job_id = lib.new_job_id(server.state)
+        record = {"schema": "seed-edit.run.v1", "run": run, "created": lib.utc_now(), "state": "queued",
+                  "prompt": clean["prompt"], "model": clean["model"], "backend": None,
+                  "strength": clean["strength"], "seed": seed, "size": None, "source_size": None,
+                  "source": source_file, "source_origin": origin, "job": job_id, "error": None,
+                  "candidates": [{"n": i, "seed": seed + i, "status": "pending", "seconds": None}
+                                 for i in range(1, clean["candidates"] + 1)]}
+        lib.write_json_atomic(os.path.join(run_dir, "run.json"), record)
+        fields = {"ws": real, "run": run, "source_file": source_file, "prompt": clean["prompt"],
+                  "model": clean["model"], "strength": clean["strength"], "candidates": clean["candidates"],
+                  "seed": seed, "source": origin}
+        lib.create_job(server.state, job_id, "seed-edit", real, None, None, lib.seed_edit_argv(fields, real), fields)
+    return 201, {"run": run_view(server, real, run, run_dir, record, lib.read_queue(server.state))}
+
+
+def _h_seed_runs(self, groups, query, body):
+    """SG47: the newest RUNS_MAX readable runs."""
+    real = self.ws(query.get("ws"))
+    try:
+        names = sorted((n for n in os.listdir(runs_root(real)) if seedgen.RUN_ID_RE.fullmatch(n)), reverse=True)
+    except OSError:
+        names = []
+    queue = lib.read_queue(self.server.state)
+    runs = []
+    for name in names:
+        if len(runs) >= seedgen.RUNS_MAX:
+            break
+        try:
+            run_dir, record = _seed_run(real, name)
+        except ApiError:
+            continue
+        cands = [(c, _cand_file(run_dir, c)) for c in _candidates(record)]
+        runs.append({"run": name, "created": record.get("created"), "state": run_state(self.server, record, queue),
+                     "prompt": record.get("prompt"), "model": record.get("model"), "backend": record.get("backend"),
+                     "count": len(cands), "ok": sum(1 for c, _path in cands if c.get("status") == "ok"),
+                     "thumbs": [path for _c, path in cands if path is not None]})
+    return 200, {"runs": runs}
+
+
+def _h_seed_run(self, groups, query, body):
+    """SG48: one run's view."""
+    real = self.ws(query.get("ws"))
+    run_dir, record = _seed_run(real, groups[0])
+    return 200, run_view(self.server, real, groups[0], run_dir, record, lib.read_queue(self.server.state))
+
+
+def _candidate_number(entries, n):
+    """SG50, SG52: ApiError(400) unless n is a candidate number of entries."""
+    if not (lib._is_int(n) and 1 <= n <= len(entries)):
+        raise ApiError(400, "n must be a candidate number from 1 to %d" % len(entries))
+
+
+def _ok_candidate(run_dir, entries, run, n, verb):
+    """SG50, SG52: the image file of candidate n when it is ok, else ApiError(409)."""
+    entry = None
+    for c in entries:
+        if c["n"] == n:
+            entry = c
+            break
+    status = entry.get("status") if entry is not None else "missing"
+    if status != "ok":
+        raise ApiError(409, "candidate %s of %s is %s; only an ok candidate can be %s" % (n, run, status, verb))
+    path = _cand_file(run_dir, entry)
+    if path is None:
+        raise ApiError(409, "candidate %s of %s has no image file" % (n, run))
+    return path
+
+
+def _h_seed_keep(self, groups, query, body):
+    """SG50, SG51: copy an ok candidate into a seed folder under the first free name."""
+    real, run = self.ws(body.get("ws")), groups[0]
+    run_dir, record = _seed_run(real, run)
+    entries = _candidates(record)
+    n, folder = body.get("n"), body.get("folder")
+    _candidate_number(entries, n)
+    if not seedgen.valid_folder(folder):
+        raise ApiError(400, seedgen.FOLDER_MSG)
+    with open(_ok_candidate(run_dir, entries, run, n, "kept"), "rb") as f:
+        data = f.read()
+    root = seeds_root(real)
+    folder_dir = os.path.join(root, folder)
+    with SEEDS_LOCK:
+        os.makedirs(folder_dir, exist_ok=True)
+        if not _inside(folder_dir, root):
+            raise ApiError(409, "folder %s resolves outside %s" % (folder, root))
+        k = 1
+        while True:
+            dest = os.path.join(folder_dir, seedgen.keep_name(run, n, k))
+            try:
+                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                break
+            except FileExistsError:
+                k += 1
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except BaseException:
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+            raise
+    return 201, {"folder": folder, "file": os.path.basename(dest), "path": dest}
+
+
+def _h_seed_use(self, groups, query, body):
+    """SG52: register an ok candidate as an upload, exactly as POST /api/uploads would."""
+    real, run = self.ws(body.get("ws")), groups[0]
+    run_dir, record = _seed_run(real, run)
+    entries = _candidates(record)
+    _candidate_number(entries, body.get("n"))
+    with open(_ok_candidate(run_dir, entries, run, body["n"], "used"), "rb") as f:
+        data = f.read()
+    return 201, store_upload(self.server.state, data, "png")
+
+
+def _h_seed_folders(self, groups, query, body):
+    """SG49: the seed folders with their image counts."""
+    real = self.ws(query.get("ws"))
+    root = seeds_root(real)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        names = []
+    folders = []
+    for name in sorted(names, key=lambda n: n.lower()):
+        path = os.path.join(root, name)
+        if not (seedgen.valid_folder(name) and os.path.isdir(path) and _inside(path, root)):
+            continue
+        try:
+            count = sum(1 for n in os.listdir(path) if os.path.splitext(n)[1].lower() in seedgen.IMAGE_EXTS
+                        and os.path.isfile(os.path.join(path, n)))
+        except OSError:
+            count = 0
+        folders.append({"folder": name, "count": count, "path": path})
+    return 200, {"root": root, "folders": folders}
+
+
+MovieUIHandler.h_seed_run_create = _h_seed_run_create
+MovieUIHandler.h_seed_runs = _h_seed_runs
+MovieUIHandler.h_seed_run = _h_seed_run
+MovieUIHandler.h_seed_keep = _h_seed_keep
+MovieUIHandler.h_seed_use = _h_seed_use
+MovieUIHandler.h_seed_folders = _h_seed_folders
 
 
 # ---------------------------------------------------------------------------
@@ -2116,6 +2440,8 @@ def _h_files(self, groups, query, body):
     roots = (os.path.realpath(os.path.join(real_ws, "generated")),
              os.path.realpath(os.path.join(self.server.state, "uploads")))
     if not any(real.startswith(root + os.sep) for root in roots):
+        raise ApiError(403, "path not allowed")
+    if _in_seed_work(real, real_ws):
         raise ApiError(403, "path not allowed")
     if not os.path.isfile(real):
         raise ApiError(404, "not found")

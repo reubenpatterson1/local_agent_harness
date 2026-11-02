@@ -31,6 +31,7 @@
 
 <nav>
   <button id="tab-compose" type="button" class="tab active">Compose</button>
+  <button id="tab-seeds" type="button" class="tab">Seeds</button>
   <button id="tab-stories" type="button" class="tab">Stories</button>
   <button id="tab-batches" type="button" class="tab">Batches</button>
   <button id="tab-characters" type="button" class="tab">Characters</button>
@@ -154,6 +155,41 @@
       <button id="c-folder-cancel" type="button">Cancel</button>
     </div>
   </div>
+</section>
+
+<section id="panel-seeds" class="panel" hidden>
+  <h3>Source</h3>
+  <div class="row">
+    <label>Upload <input id="se-file" type="file" accept="image/png,image/jpeg,image/webp"></label>
+    <span id="se-source-status" class="muted"></span>
+  </div>
+  <div class="row">
+    <img id="se-source-img" class="se-thumb" alt="source image" hidden>
+    <span id="se-source-size" class="muted"></span>
+  </div>
+  <div class="grid">
+    <label class="wide">Prompt <textarea id="se-prompt" rows="3" maxlength="2000"></textarea></label>
+    <span id="se-prompt-count" class="muted">0 / 2000 characters</span>
+    <label>Model <select id="se-model">
+        <option value="zimage">Z-Image (img2img)</option>
+        <option value="qwen">Qwen-Image-Edit</option>
+      </select></label>
+    <span id="se-model-note" class="muted"></span>
+    <label id="se-strength-box">Strength <input id="se-strength" type="number" min="0.10" max="0.90" step="0.05" value="0.45">
+      <span class="muted">lower keeps more of the source</span></label>
+    <label>Candidates <select id="se-candidates"><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4" selected>4</option></select></label>
+    <label>Seed <input id="se-seed" type="number" min="0" max="2147483647" step="1" placeholder="blank = random"></label>
+  </div>
+  <div class="row"><button id="se-generate" type="button">Generate</button> <span id="se-generate-reason" class="muted"></span></div>
+  <h3 id="se-run-title"></h3>
+  <p id="se-run-status" class="muted"></p>
+  <datalist id="se-folder-options"></datalist>
+  <div id="se-grid" class="se-grid"></div>
+  <h3>Runs</h3>
+  <table id="se-runs" class="list"><thead><tr><th>Run</th><th>Prompt</th><th>Model</th><th>State</th><th>Candidates</th></tr></thead><tbody></tbody></table>
+  <h3>Seed folders</h3>
+  <p class="muted">Kept seeds land in these folders; pick one in Compose → Seed folder.</p>
+  <table id="se-folders" class="list"><thead><tr><th>Folder</th><th>Images</th><th>Path</th><th></th></tr></thead><tbody></tbody></table>
 </section>
 
 <section id="panel-stories" class="panel" hidden>

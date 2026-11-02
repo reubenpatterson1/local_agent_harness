@@ -431,7 +431,7 @@ def job_vlm(kind, fields, workspace, story_id):
             return "required"
         return ("forbidden" if os.path.isfile(os.path.join(story_dir(workspace, story_id), "story.md"))
                 else "required")
-    if kind in ("smoke", "character-train", "action-train", "location-train"):
+    if kind in ("smoke", "character-train", "action-train", "location-train", "seed-edit"):
         return "forbidden"
     return "any"
 
@@ -1196,6 +1196,18 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
     return argv + ["--no-review"]
 
 
+def seed_edit_argv(fields, ws_real, py=sys.executable):
+    """The bin/seed-edit argv of a seed-edit job (seed generator spec SG29)."""
+    run_dir = os.path.join(ws_real, "generated", "seeds", "runs", fields["run"])
+    argv = [py, os.path.join(ws_real, "bin", "seed-edit"),
+            "--source", os.path.join(run_dir, fields["source_file"]),
+            "--prompt", fields["prompt"], "--model", fields["model"]]
+    if fields["model"] == "zimage":
+        argv += ["--strength", repr(float(fields["strength"]))]
+    return argv + ["--candidates", str(fields["candidates"]), "--seed", str(fields["seed"]),
+                   "--run-dir", run_dir]
+
+
 def run_light(argv, cwd, env=None, timeout=None):
     """One light subprocess (MU59): {"argv", "exit_code", "stdout", "stderr", "timed_out"}."""
     limit = LIGHT_TIMEOUT if timeout is None else timeout
@@ -1631,6 +1643,38 @@ def story_server_record(ws_real):
                      "the job checks the story server and restarts it if needed when it reaches "
                      "the front of the queue")
     return _from_pair("V2", "story server", _story_server_pair(kind, value))
+
+
+def _probe_model(value):
+    """One model entry of bin/seed-edit --probe's output with exactly its three keys, or None."""
+    if not (isinstance(value, dict) and isinstance(value.get("ok"), bool) and "reason" in value
+            and "backend" in value):
+        return None
+    if not all(value[k] is None or isinstance(value[k], str) for k in ("reason", "backend")):
+        return None
+    return {"ok": value["ok"], "reason": value["reason"], "backend": value["backend"]}
+
+
+def seed_edit_check(ws_real):
+    """(models, None) from <ws>/bin/seed-edit --probe, or (None, detail) (seed generator SG30)."""
+    run = run_light(tool_argv(ws_real, "seed-edit", "--probe"), ws_real)
+    if run["timed_out"]:
+        return None, "bin/seed-edit --probe timed out after %d s" % LIGHT_TIMEOUT
+    code = run["exit_code"]
+    if code != 0:
+        return None, "bin/seed-edit --probe exited %s: %s" % (code or "none", last_line(run["stderr"]) or "-")
+    try:
+        data = json.loads(last_line(run["stdout"]))
+    except (ValueError, RecursionError):
+        data = None
+    models = None
+    if isinstance(data, dict):
+        models = dict((key, _probe_model(data.get(key))) for key in ("zimage", "qwen"))
+        if None in models.values():
+            models = None
+    if models is None:
+        return None, "bin/seed-edit --probe printed unparsable output"
+    return models, None
 
 
 def judge_key_check():
@@ -2152,6 +2196,7 @@ FACE_RE = re.compile(
     r"face makes a weak identity reference\. Use a closer crop of the character, or pass --force to "
     r"proceed anyway\.)$")
 STILL_NAME_RE = re.compile(r"^panel_\d{2}\.png$")
+SEED_CAND_RE = re.compile(r"^candidate (\d+)/(\d+) (ok|blocked|failed)(?: [0-9]+\.[0-9]s)?$")   # seed generator SG31
 
 
 def collapse(line):
@@ -2192,6 +2237,8 @@ class ProgressParser(object):
         self.wrap_up = False
         self.face_problem = False
         self.last_line = ""
+        self.candidates = {}            # seed generator SG31: {"<i>": "ok" | "blocked" | "failed"}
+        self.candidates_total = None
 
     def feed(self, data):
         self.offset += len(data)
@@ -2221,6 +2268,12 @@ class ProgressParser(object):
     def _line(self, line):
         if line.strip():
             self.last_line = line[:LINE_CLIP]
+        if self.kind == "seed-edit":
+            match = SEED_CAND_RE.match(line)
+            if match:
+                self.candidates_total = int(match.group(2))
+                self.candidates[match.group(1)] = match.group(3)
+            return
         match = PHASE_RE.match(line)
         if match:
             self.phase, self.phase_title = match.group(1), match.group(2)
@@ -2271,6 +2324,17 @@ class ProgressParser(object):
             clip = os.path.join(state, "smoke", job["id"], "clips", "panel_01.mp4")
             return {"kind": "smoke", "elapsed_s": elapsed, "last_line": self.current_last_line(),
                     "smoke": {"clip": clip, "clip_ok": os.path.isfile(clip) and os.path.getsize(clip) > 0}}
+        if self.kind == "seed-edit":
+            total = self.candidates_total
+            if total is None:
+                total = self.fields.get("candidates") if _is_int(self.fields.get("candidates")) else None
+            done = len(self.candidates)
+            states = list(self.candidates.values())
+            return {"kind": "seed-edit", "elapsed_s": elapsed, "last_line": self.current_last_line(),
+                    "face_problem": False,
+                    "candidates": {"total": total, "done": done, "ok": states.count("ok"),
+                                   "blocked": states.count("blocked"), "failed": states.count("failed"),
+                                   "current": done + 1 if total is not None and done < total else None}}
         if self.kind not in ("story", "movie"):
             return {"kind": self.kind, "elapsed_s": elapsed, "last_line": self.current_last_line(),
                     "face_problem": self.face_problem}

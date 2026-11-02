@@ -1,0 +1,787 @@
+#!/usr/bin/env python3
+"""seed-edit -- edit one source image into 1 to 4 seed candidates with Z-Image img2img or
+Qwen-Image-Edit-2511 (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Section 2).
+
+  bin/seed-edit --source PATH --prompt TEXT --model zimage|qwen [--strength S] [--candidates N]
+                [--seed N] --run-dir DIR
+  bin/seed-edit --probe
+
+The movie-ui runs it as a queued GPU job of kind seed-edit; it also runs by hand. Candidate i
+(1-based) uses seed + i and lands in <run dir>/cand_NN.png. --strength (0.10 to 0.90, default
+0.45) is for zimage only; --candidates defaults to 4; a missing --seed is drawn at random.
+Qwen-Image-Edit runs through diffusers bf16 (the unchanged character_dataset.py qwenedit child)
+when at least 64 GiB is available and the bf16 weights are cached, else through mflux q4
+(seed_edit_mflux_child.py under the mflux venv, every image screened here), else it refuses
+before loading. --probe prints one JSON line {"qwen": {...}, "zimage": {...}}, each value
+{"backend", "ok", "reason"}, and loads nothing.
+
+Exit codes: 0 every candidate ended ok or blocked; 1 the backend failed (finished candidates are
+kept, the rest are failed); 2 refused before any model loaded; 130 interrupted (SIGINT, SIGTERM
+or SIGHUP).
+
+run.json (schema seed-edit.run.v1) write order: (1) the run directory and work/ are created;
+(2) the source is read, copied and sized, and a refusal writes state failed with every candidate
+failed; (3) state running, backend null, every candidate pending; (4) the preflight and the
+backend choice, a refusal written as in (2); (5) the backend; (6) per candidate: the final
+cand_NN.png (ok only), then run.json, then the candidate line; (7) state done or failed; (8) an
+interrupt kills the child, marks the pending candidates failed and writes state cancelled.
+created, source_origin and job are kept from an existing run.json; the tool owns every other key.
+
+Environment: SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python),
+SEED_EDIT_QWEN_Q4_DIR (a local q4 model directory whose name contains qwen-image-edit-2511),
+SEED_EDIT_LIGHTNING_FILE (a local Lightning LoRA file), SEED_EDIT_QWENEDIT_SCRIPT (default
+<ws>/character_dataset.py), HF_HUB_CACHE and HF_HOME (the default hub), Z_IMAGE_HF_HOME (the
+Z-Image hub, through movie_ui_lib.zimage_hub) and HOME.
+
+Python 3.9 and 3.13. The top level imports only the standard library and movie_ui_lib; PIL,
+psutil, torch, z_image_skill, content_safety and character_dataset are imported inside the
+functions that use them.
+"""
+
+import argparse
+import glob
+import importlib.util
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import movie_ui_lib as lib  # noqa: E402
+
+LONG_EDGE = 1024
+MULTIPLE = 16
+MIN_SIDE = 64
+PROMPT_MAX = 2000
+SEED_MAX = 2147483647
+STRENGTH_DEFAULT = 0.45
+MIN_FREE_GIB = 2.0               # character_dataset.CREATE_MIN_FREE_GIB
+ZIMAGE_MIN_AVAIL_GIB = 20.0      # character_dataset.GENERATE_MIN_AVAIL_GIB
+BF16_MIN_AVAIL_GIB = 64.0        # character_dataset.EDIT_MIN_AVAIL_GIB
+MFLUX_MIN_AVAIL_GIB = 32.0
+AVAIL_WAIT_S = 600               # character_dataset.AVAIL_WAIT_S
+CHILD_TIMEOUT_S = 3600
+EDIT_MODEL = "Qwen/Qwen-Image-Edit-2511"                                  # character_dataset.EDIT_MODEL
+EDIT_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"                # character_dataset.EDIT_LORA_REPO
+EDIT_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
+EDIT_STEPS = 8
+EDIT_TRUE_CFG = 1.0
+Q4_REPO = "mflux-community/qwen-image-edit-2511-mflux-q4"
+Q4_NAME_PART = "qwen-image-edit-2511"
+MFLUX_MIN_VERSION = (0, 22, 0)
+MFLUX_GUIDANCE = 1.0
+DEFAULT_MFLUX_PYTHON = "~/mflux-edit/.venv/bin/python"   # expanded at use
+SAFETY_SKILL = "seed_edit"
+BACKEND_LABELS = {"zimage": "Z-Image", "diffusers-bf16": "diffusers bf16", "mflux-q4": "mflux q4"}
+
+EXTS = {"PNG": "png", "JPEG": "jpg", "MPO": "jpg", "WEBP": "webp"}
+BF16_LINE_RE = re.compile(r"^cand_(\d{2})\.part\.png (ok|blocked) ([0-9]+\.[0-9])s$")
+MFLUX_LINE_RE = re.compile(r"^seed-edit-child done (\d+) ([0-9]+\.[0-9])$")
+CHILD = None    # the running Qwen child's Popen (SG21), or None
+
+
+class Refusal(Exception):
+    """A refusal before any model loads (exit 2); the message is the error text."""
+
+
+def say(text):
+    """Every stdout line of the tool goes through here (SG7)."""
+    print(text, flush=True)
+
+
+def error(text):
+    sys.stderr.write("Error: %s\n" % text)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------------------
+# The command line (SG4)
+# ---------------------------------------------------------------------------
+
+def parse(argv):
+    parser = argparse.ArgumentParser(prog="seed-edit", description="Edit one source image into 1 to 4 "
+                                     "seed candidates (Z-Image img2img or Qwen-Image-Edit-2511).")
+    for name in ("--source", "--prompt", "--model", "--strength", "--candidates", "--seed", "--run-dir"):
+        parser.add_argument(name, type=str)
+    parser.add_argument("--probe", action="store_true")
+    return parser.parse_args(argv)
+
+
+def check_args(args):
+    """SG4: the cleaned options (None for --probe), or Refusal with the first failing rule's text."""
+    given = (args.source, args.prompt, args.model, args.strength, args.candidates, args.seed, args.run_dir)
+    if args.probe:
+        if any(value is not None for value in given):
+            raise Refusal("--probe takes no other options")
+        return None
+    if None in (args.source, args.prompt, args.model, args.run_dir):
+        raise Refusal("--source, --prompt, --model and --run-dir are required")
+    if args.model not in ("zimage", "qwen"):
+        raise Refusal("--model must be zimage or qwen")
+    if not args.prompt.strip():
+        raise Refusal("--prompt must not be empty")
+    if len(args.prompt) > PROMPT_MAX:
+        raise Refusal("--prompt is longer than 2000 characters")
+    if args.candidates is None:
+        candidates = 4
+    elif re.fullmatch(r"[0-9]+", args.candidates) and 1 <= int(args.candidates) <= 4:
+        candidates = int(args.candidates)
+    else:
+        raise Refusal("--candidates must be an integer from 1 to 4")
+    if args.model == "qwen":
+        if args.strength is not None:
+            raise Refusal("--strength is only for --model zimage")
+        strength = None
+    elif args.strength is None:
+        strength = STRENGTH_DEFAULT
+    else:
+        try:
+            strength = float(args.strength)
+        except ValueError:
+            strength = None
+        if strength is None or not 0.10 <= strength <= 0.90:
+            raise Refusal("--strength must be a number from 0.10 to 0.90")
+    if args.seed is None:
+        seed = secrets.randbelow(SEED_MAX + 1)
+    elif re.fullmatch(r"[0-9]+", args.seed) and int(args.seed) <= SEED_MAX:
+        seed = int(args.seed)
+    else:
+        raise Refusal("--seed must be an integer from 0 to 2147483647")
+    return {"source": args.source, "prompt": args.prompt, "model": args.model, "strength": strength,
+            "candidates": candidates, "seed": seed, "run_dir": os.path.abspath(args.run_dir)}
+
+
+# ---------------------------------------------------------------------------
+# The source and its size (SG8-SG10)
+# ---------------------------------------------------------------------------
+
+def canvas(w0, h0):
+    """SG8: the (W, H) edit canvas of a w0 x h0 source, or Refusal when a side is under MIN_SIDE."""
+    longest = max(w0, h0)
+    if longest <= LONG_EDGE:
+        w, h = w0, h0
+    else:
+        w, h = w0 * LONG_EDGE // longest, h0 * LONG_EDGE // longest
+    width, height = w // MULTIPLE * MULTIPLE, h // MULTIPLE * MULTIPLE
+    if width < MIN_SIDE or height < MIN_SIDE:
+        raise Refusal("--source is too small: %dx%d gives a %dx%d canvas; each side must be at least 64 px"
+                      % (w0, h0, width, height))
+    return width, height
+
+
+def read_source(path):
+    """SG8, SG9: (PIL format, the EXIF-transposed RGB image) of path, or Refusal."""
+    from PIL import Image, ImageOps
+    try:
+        with Image.open(path) as img:
+            fmt = img.format
+            if fmt not in EXTS:
+                raise Refusal("--source must be a PNG, JPEG or WebP image (got %s): %s" % (fmt, path))
+            image = ImageOps.exif_transpose(img).convert("RGB")
+    except Refusal:
+        raise
+    except Exception as e:
+        raise Refusal("cannot read --source %s: %s: %s" % (path, type(e).__name__, e))
+    return fmt, image
+
+
+def prepare_source(ctx):
+    """SG8-SG10: read the source, copy its bytes to <run>/source.<ext>, size it and save the
+    transposed RGB image as work/source.png."""
+    rec, path = ctx["record"], ctx["opts"]["source"]
+    fmt, image = read_source(path)
+    dest = os.path.join(ctx["dir"], "source." + EXTS[fmt])
+    if not (os.path.exists(dest) and os.path.samefile(path, dest)):
+        shutil.copyfile(path, dest)
+    rec["source"] = os.path.basename(dest)
+    w0, h0 = image.size
+    width, height = canvas(w0, h0)
+    rec["size"] = {"width": width, "height": height}
+    rec["source_size"] = {"width": w0, "height": h0}
+    image.save(os.path.join(ctx["work"], "source.png"))
+    ctx["width"], ctx["height"] = width, height
+    say("seed-edit: source %dx%d -> %dx%d" % (w0, h0, width, height))
+
+
+# ---------------------------------------------------------------------------
+# Host checks, the backend checks and the probe (SG13-SG15)
+# ---------------------------------------------------------------------------
+
+def disk_free_gib(path):
+    return shutil.disk_usage(path).free / 2 ** 30
+
+
+def avail_gib():
+    import psutil
+    return psutil.virtual_memory().available / 2 ** 30
+
+
+def total_gib():
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2 ** 30
+    except (ValueError, OSError):
+        return None
+
+
+def cpu_generator(seed):
+    import torch
+    return torch.Generator("cpu").manual_seed(seed)
+
+
+def missing_modules(names):
+    """The names importlib cannot find (find_spec None, ImportError or ValueError); imports nothing."""
+    missing = []
+    for name in names:
+        try:
+            found = importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(name)
+    return missing
+
+
+def modules_problem(names):
+    missing = missing_modules(names)
+    return "%s not importable by %s" % (", ".join(missing), sys.executable) if missing else None
+
+
+def default_hub():
+    """$HF_HUB_CACHE, else <$HF_HOME or ~/.cache/huggingface>/hub (huggingface_hub's own rule)."""
+    if os.environ.get("HF_HUB_CACHE"):
+        return os.environ["HF_HUB_CACHE"]
+    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
+
+
+def mflux_python():
+    return os.environ.get("SEED_EDIT_MFLUX_PYTHON") or os.path.expanduser(DEFAULT_MFLUX_PYTHON)
+
+
+def zimage_problem():
+    """None when Z-Image img2img can run in this python, else the first problem."""
+    problem = modules_problem(["PIL", "psutil", "torch", "diffusers", "transformers"])
+    if problem:
+        return problem
+    for repo in (lib.STILLS_BASE_MODEL, lib.ZIMAGE_TEXT_ENCODER):
+        ok, detail = lib.model_check(repo, lib.zimage_hub_for(repo))
+        if not ok:
+            return detail
+    return None
+
+
+def find_lightning(hubs):
+    """The snapshot path of the Lightning LoRA file in the first hub holding it (a non-empty regular
+    file through its realpath), or None."""
+    for hub in hubs:
+        snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)))[0]
+        if snapshot is None:
+            continue
+        path = os.path.join(snapshot, EDIT_LORA_FILE)
+        real = os.path.realpath(path)
+        if os.path.isfile(real) and os.path.getsize(real) > 0:
+            return path
+    return None
+
+
+def bf16_problem():
+    """None when the diffusers bf16 child's weights and modules are present, else the first problem."""
+    problem = modules_problem(["PIL", "psutil", "torch", "diffusers", "transformers", "huggingface_hub"])
+    if problem:
+        return problem
+    hub = default_hub()
+    ok, detail = lib.model_check(EDIT_MODEL, hub)
+    if not ok:
+        return detail
+    if find_lightning([hub]) is None:
+        return "Lightning LoRA %s is not in %s" % (EDIT_LORA_FILE, hub)
+    return None
+
+
+def mflux_version(venv):
+    """(number of mflux-*.dist-info/METADATA files in venv, (parsed, text) of the highest version that
+    parses or None). Reads the files only; nothing is imported."""
+    paths = sorted(glob.glob(os.path.join(venv, "lib", "python*", "site-packages", "mflux-*.dist-info",
+                                          "METADATA")))
+    best = None
+    for path in paths:
+        text = None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("Version: "):
+                        text = line[len("Version: "):].strip()
+                        break
+        except OSError:
+            continue
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", text or "")
+        if match:
+            parsed = tuple(int(g) for g in match.groups())
+            if best is None or parsed > best[0]:
+                best = (parsed, text)
+    return len(paths), best
+
+
+def mflux_problem():
+    """(problem, q4_dir, lora_file): problem is None when the mflux q4 backend is ready, and the two
+    paths are None when it is not."""
+    py = mflux_python()
+    if not os.access(py, os.X_OK):
+        return "no mflux venv at %s (run bin/seed-edit-setup)" % py, None, None
+    venv = os.path.dirname(os.path.dirname(py))
+    count, best = mflux_version(venv)
+    if count == 0:
+        return "mflux is not installed in %s (run bin/seed-edit-setup)" % venv, None, None
+    if best is None:
+        return "cannot read the mflux version in %s" % venv, None, None
+    if best[0] < MFLUX_MIN_VERSION:
+        return "mflux %s in %s is older than 0.22.0 (run bin/seed-edit-setup)" % (best[1], venv), None, None
+    zhub, dhub = lib.zimage_hub(), default_hub()
+    q4_dir = os.environ.get("SEED_EDIT_QWEN_Q4_DIR")
+    if q4_dir:
+        if not os.path.isabs(q4_dir):
+            return "SEED_EDIT_QWEN_Q4_DIR %s: not an absolute path" % q4_dir, None, None
+        if Q4_NAME_PART not in os.path.basename(os.path.normpath(q4_dir)).lower():
+            return ("SEED_EDIT_QWEN_Q4_DIR %s: the directory name must contain qwen-image-edit-2511" % q4_dir,
+                    None, None)
+        ok, detail = lib.model_check(q4_dir, None)
+        if not ok:
+            return "SEED_EDIT_QWEN_Q4_DIR %s: %s" % (q4_dir, detail), None, None
+    else:
+        hub = None
+        for candidate in (zhub, dhub):
+            if os.path.isdir(os.path.join(candidate, lib.repo_dir_name(Q4_REPO))):
+                hub = candidate
+                break
+        if hub is None:
+            return "%s is not in %s or %s (run bin/seed-edit-setup)" % (Q4_REPO, zhub, dhub), None, None
+        ok, detail = lib.model_check(Q4_REPO, hub)
+        if not ok:
+            return "%s: %s" % (Q4_REPO, detail), None, None
+        q4_dir = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(Q4_REPO)))[0]
+    lora_file = os.environ.get("SEED_EDIT_LIGHTNING_FILE")
+    if lora_file:
+        real = os.path.realpath(lora_file)
+        if not (os.path.isabs(lora_file) and os.path.isfile(real) and os.path.getsize(real) > 0):
+            return "SEED_EDIT_LIGHTNING_FILE %s is not a non-empty file" % lora_file, None, None
+    else:
+        lora_file = find_lightning([zhub, dhub])
+        if lora_file is None:
+            return ("Lightning LoRA %s is not in %s or %s (run bin/seed-edit-setup)" % (EDIT_LORA_FILE, zhub, dhub),
+                    None, None)
+    problem = modules_problem(["PIL", "psutil", "torch", "transformers"])
+    if problem:
+        return problem, None, None
+    return None, q4_dir, lora_file
+
+
+def choose_qwen(paths=None):
+    """SG14's run-time choice: ("diffusers-bf16" or "mflux-q4", why), or Refusal. When paths is a dict,
+    a mflux-q4 choice also stores its "q4_dir" and "lora_file" there."""
+    b = bf16_problem()
+    if b is None:
+        a = avail_gib()
+        if a >= BF16_MIN_AVAIL_GIB:
+            return "diffusers-bf16", "%.1f GiB available" % a
+        b = "only %.1f GiB available (needs 64)" % a
+    m, q4_dir, lora_file = mflux_problem()
+    if m is None:
+        if paths is not None:
+            paths["q4_dir"], paths["lora_file"] = q4_dir, lora_file
+        return "mflux-q4", "diffusers bf16: %s" % b
+    raise Refusal("Qwen-Image-Edit is unavailable: diffusers bf16: %s; mflux q4: %s" % (b, m))
+
+
+def probe():
+    """SG15: {"zimage": {...}, "qwen": {...}}, each {"ok", "reason", "backend"}; bf16 is judged by the
+    host's total memory. Loads no model and starts no process."""
+    p = zimage_problem()
+    t = total_gib()
+    if t is None:
+        b = "cannot read this host's memory size"
+    elif t < BF16_MIN_AVAIL_GIB:
+        b = "needs a host with at least 64 GiB of memory (this host has %.1f GiB)" % t
+    else:
+        b = bf16_problem()
+    m = mflux_problem()[0]
+    ok = b is None or m is None
+    backend = "diffusers-bf16" if b is None else ("mflux-q4" if m is None else None)
+    return {"zimage": {"ok": p is None, "reason": p, "backend": "zimage" if p is None else None},
+            "qwen": {"ok": ok, "reason": None if ok else "diffusers bf16: %s; mflux q4: %s" % (b, m),
+                     "backend": backend}}
+
+
+def wait_for_memory(floor, label):
+    """SG13 step 4: wait up to AVAIL_WAIT_S for floor GiB available, else Refusal."""
+    now = avail_gib()
+    if now >= floor:
+        return
+    say("seed-edit: waiting up to %d s for %g GiB available (now %.1f GiB)" % (AVAIL_WAIT_S, floor, now))
+    deadline = time.monotonic() + AVAIL_WAIT_S
+    while True:
+        now = avail_gib()
+        if now >= floor:
+            return
+        if time.monotonic() >= deadline:
+            raise Refusal("only %.1f GiB available after waiting %d s; %s needs %g GiB; free memory and retry"
+                          % (now, AVAIL_WAIT_S, label, floor))
+        time.sleep(5)
+
+
+def preflight(ctx):
+    """SG13: disk, busy GPU, the backend (SG14), the memory floor; (backend, why) or Refusal."""
+    run_dir = ctx["dir"]
+    free = disk_free_gib(run_dir)
+    if free < MIN_FREE_GIB:
+        raise Refusal("less than 2 GiB free on the disk holding %s (%.1f GiB free)" % (run_dir, free))
+    import character_dataset
+    busy = character_dataset.busy_process()
+    if busy:
+        raise Refusal("another GPU process is running (pid %s: %s); try again when it ends" % (busy[0], busy[1]))
+    if ctx["opts"]["model"] == "zimage":
+        problem = zimage_problem()
+        if problem is not None:
+            raise Refusal("Z-Image is unavailable: %s" % problem)
+        backend, why = "zimage", "Z-Image img2img"
+    else:
+        paths = {}
+        backend, why = choose_qwen(paths)
+        ctx.update(paths)
+    floor = {"zimage": ZIMAGE_MIN_AVAIL_GIB, "mflux-q4": MFLUX_MIN_AVAIL_GIB}.get(backend)
+    if floor is not None:
+        wait_for_memory(floor, BACKEND_LABELS[backend])
+    return backend, why
+
+
+# ---------------------------------------------------------------------------
+# run.json and the candidates (SG11, SG12, SG16)
+# ---------------------------------------------------------------------------
+
+def new_record(run_dir, opts):
+    old = lib.read_json(os.path.join(run_dir, "run.json"))
+    if isinstance(old, dict):
+        created, origin, job = old.get("created"), old.get("source_origin"), old.get("job")
+    else:
+        created, origin, job = lib.utc_now(), None, None
+    return {"schema": "seed-edit.run.v1", "run": os.path.basename(run_dir), "created": created,
+            "state": "running", "prompt": opts["prompt"], "model": opts["model"], "backend": None,
+            "strength": opts["strength"], "seed": opts["seed"], "size": None, "source_size": None,
+            "source": None, "source_origin": origin, "job": job, "error": None,
+            "candidates": [{"n": i, "seed": opts["seed"] + i, "status": "pending", "seconds": None}
+                           for i in range(1, opts["candidates"] + 1)]}
+
+
+def write_run(ctx):
+    lib.write_json_atomic(os.path.join(ctx["dir"], "run.json"), ctx["record"])
+
+
+def final_path(ctx, n):
+    return os.path.join(ctx["dir"], "cand_%02d.png" % n)
+
+
+def part_path(ctx, n):
+    return os.path.join(ctx["work"], "cand_%02d.part.png" % n)
+
+
+def pending_path(ctx, n):
+    return os.path.join(ctx["work"], "cand_%02d.pending.png" % n)
+
+
+def pending_candidate(ctx, n):
+    """Candidate n's entry while it is pending, else None."""
+    cands = ctx["record"]["candidates"]
+    if 1 <= n <= len(cands) and cands[n - 1]["status"] == "pending":
+        return cands[n - 1]
+    return None
+
+
+def first_pending(ctx):
+    """The first pending candidate's n, else the candidate count."""
+    cands = ctx["record"]["candidates"]
+    for cand in cands:
+        if cand["status"] == "pending":
+            return cand["n"]
+    return len(cands)
+
+
+def finish(ctx, n, status, seconds=None):
+    """SG12 step 6, SG16: record candidate n's status in run.json, then print its line. An ok
+    candidate's cand_NN.png is already in place."""
+    cands = ctx["record"]["candidates"]
+    cand = cands[n - 1]
+    cand["status"] = status
+    cand["seconds"] = None if seconds is None or status == "failed" else round(seconds, 1)
+    write_run(ctx)
+    if status == "failed":
+        say("candidate %d/%d failed" % (n, len(cands)))
+    else:
+        say("candidate %d/%d %s %.1fs" % (n, len(cands), status, cand["seconds"]))
+
+
+def fail_rest(ctx):
+    """SG16: every candidate not yet finished gets its own failed line, in order."""
+    for cand in ctx["record"]["candidates"]:
+        if cand["status"] == "pending":
+            finish(ctx, cand["n"], "failed")
+
+
+def refuse(ctx, text):
+    """SG12 steps 2 and 4: state failed, error, every candidate failed; exit 2."""
+    rec = ctx["record"]
+    for cand in rec["candidates"]:
+        cand["status"], cand["seconds"] = "failed", None
+    rec["state"], rec["error"] = "failed", text
+    write_run(ctx)
+    error(text)
+    return 2
+
+
+def cleanup(work):
+    """SG12 step 7: delete leftover work/*.part.png and work/*.pending.png."""
+    for pattern in ("*.part.png", "*.pending.png"):
+        for path in glob.glob(os.path.join(work, pattern)):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# The backends (SG17-SG22)
+# ---------------------------------------------------------------------------
+
+def run_zimage(ctx):
+    """SG18: Z-Image img2img in this process (the z_image_skill singleton loads once); returns None.
+    A content-safety block is that candidate only; any other exception propagates to run()."""
+    import z_image_skill
+    import content_safety
+    from PIL import Image
+    opts = ctx["opts"]
+    with Image.open(os.path.join(ctx["work"], "source.png")) as img:
+        src = img.convert("RGB").resize((ctx["width"], ctx["height"]), Image.LANCZOS)
+    for cand in ctx["record"]["candidates"]:
+        n = cand["n"]
+        started = time.monotonic()
+        try:
+            image = z_image_skill.generate_variation(src, opts["prompt"], output_path=None,
+                                                     strength=opts["strength"], generator=cpu_generator(cand["seed"]))
+        except content_safety.ContentSafetyError:
+            finish(ctx, n, "blocked", time.monotonic() - started)
+            continue
+        seconds = time.monotonic() - started
+        image.save(part_path(ctx, n))
+        os.replace(part_path(ctx, n), final_path(ctx, n))
+        finish(ctx, n, "ok", seconds)
+    return None
+
+
+def _kill_group(pid):
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def run_child(argv, env, on_line):
+    """SG21: run a Qwen child in its own session with a CHILD_TIMEOUT_S timer that SIGKILLs its
+    process group; echo each line to stdout and pass it to on_line without its newline. Text mode
+    reads with universal newlines, so a progress bar's carriage return also ends a line and never
+    hides a candidate line. Returns (exit code, True when the timer killed the child); any other
+    SIGKILL (a memory-pressure kill) is an ordinary -9 exit. The child is killed if this function
+    exits early (an exception in on_line, or an interrupt)."""
+    global CHILD
+    proc = subprocess.Popen(argv, cwd=WS, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                            bufsize=1, start_new_session=True)
+    CHILD = proc
+    timed_out = threading.Event()
+
+    def on_timeout():
+        if proc.poll() is None:
+            timed_out.set()
+            _kill_group(proc.pid)
+
+    timer = threading.Timer(CHILD_TIMEOUT_S, on_timeout)
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            on_line(line.rstrip("\n"))
+        return proc.wait(), timed_out.is_set()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            _kill_group(proc.pid)
+            proc.wait()
+        proc.stdout.close()
+        CHILD = None
+
+
+def run_qwen_child(ctx, label, argv, env, handle):
+    """SG17, SG19-SG21: run a Qwen child, handing each line to handle; None, or the SG17 text."""
+    last = [""]
+
+    def on_line(line):
+        if line.strip():
+            last[0] = line.strip()
+        handle(line)
+
+    code, timed_out = run_child(argv, env, on_line)
+    if timed_out:
+        return "%s child timed out after %d s" % (label, CHILD_TIMEOUT_S)
+    if code != 0:
+        return "%s child exited %d: %s" % (label, code, last[0] or "-")
+    if any(cand["status"] == "pending" for cand in ctx["record"]["candidates"]):
+        return "%s child exited 0 without finishing candidate %d" % (label, first_pending(ctx))
+    return None
+
+
+def run_bf16(ctx):
+    """SG19: the unchanged character_dataset.py qwenedit child (it screens with skill seed_edit and
+    never saves a blocked image); returns None or the SG17 text."""
+    work, opts, rec = ctx["work"], ctx["opts"], ctx["record"]
+    spec_path = os.path.join(work, "qwenedit_spec.json")
+    lib.write_json_atomic(spec_path, {
+        "image": os.path.join(work, "source.png"), "model": EDIT_MODEL, "lora_repo": EDIT_LORA_REPO,
+        "lora_file": EDIT_LORA_FILE, "steps": EDIT_STEPS, "true_cfg": EDIT_TRUE_CFG, "skill": SAFETY_SKILL,
+        "jobs": [{"prompt": opts["prompt"], "output_path": part_path(ctx, c["n"]), "seed": c["seed"],
+                  "width": ctx["width"], "height": ctx["height"]} for c in rec["candidates"]],
+        "report_path": os.path.join(work, "qwenedit_report.json")})
+    script = os.environ.get("SEED_EDIT_QWENEDIT_SCRIPT") or os.path.join(WS, "character_dataset.py")
+
+    def handle(line):
+        match = BF16_LINE_RE.match(line)
+        if not match or pending_candidate(ctx, int(match.group(1))) is None:
+            return
+        n = int(match.group(1))
+        if match.group(2) == "ok":
+            os.replace(part_path(ctx, n), final_path(ctx, n))
+        finish(ctx, n, match.group(2), float(match.group(3)))
+
+    return run_qwen_child(ctx, "diffusers bf16", [sys.executable, script, "qwenedit", "--spec", spec_path],
+                          dict(os.environ, PYTHONUNBUFFERED="1"), handle)
+
+
+def run_mflux(ctx):
+    """SG20: seed_edit_mflux_child.py under the mflux venv; this process screens every pending image
+    before it gets its final name. Returns None or the SG17 text."""
+    import content_safety
+    from PIL import Image
+    work, opts, rec = ctx["work"], ctx["opts"], ctx["record"]
+    spec_path = os.path.join(work, "mflux_spec.json")
+    lib.write_json_atomic(spec_path, {
+        "model_path": ctx["q4_dir"], "lora_path": ctx["lora_file"], "prompt": opts["prompt"],
+        "source": os.path.join(work, "source.png"), "width": ctx["width"], "height": ctx["height"],
+        "steps": EDIT_STEPS, "guidance": MFLUX_GUIDANCE,
+        "jobs": [{"n": c["n"], "seed": c["seed"], "output_path": pending_path(ctx, c["n"])}
+                 for c in rec["candidates"]]})
+
+    def handle(line):
+        match = MFLUX_LINE_RE.match(line)
+        if not match or pending_candidate(ctx, int(match.group(1))) is None:
+            return
+        n, seconds = int(match.group(1)), float(match.group(2))
+        with Image.open(pending_path(ctx, n)) as img:
+            rgb = img.convert("RGB")
+        try:
+            content_safety.assert_image_safe(rgb, skill=SAFETY_SKILL, prompt=opts["prompt"])
+        except content_safety.ContentSafetyError:
+            os.remove(pending_path(ctx, n))
+            finish(ctx, n, "blocked", seconds)
+            return
+        os.replace(pending_path(ctx, n), final_path(ctx, n))
+        finish(ctx, n, "ok", seconds)
+
+    argv = [mflux_python(), os.path.join(WS, "seed_edit_mflux_child.py"), "--spec", spec_path]
+    return run_qwen_child(ctx, "mflux q4", argv, dict(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1"),
+                          handle)
+
+
+# ---------------------------------------------------------------------------
+# main (SG5-SG7, SG12)
+# ---------------------------------------------------------------------------
+
+def run(ctx):
+    """SG12 steps 2-7 for one run; returns the exit code."""
+    rec = ctx["record"]
+    try:
+        prepare_source(ctx)
+    except Refusal as e:
+        return refuse(ctx, str(e))
+    rec["state"] = "running"
+    write_run(ctx)
+    try:
+        backend, why = preflight(ctx)
+    except Refusal as e:
+        return refuse(ctx, str(e))
+    rec["backend"] = backend
+    write_run(ctx)
+    say("seed-edit: backend %s (%s)" % (backend, why))
+    runner = {"zimage": run_zimage, "diffusers-bf16": run_bf16, "mflux-q4": run_mflux}[backend]
+    try:
+        failure = runner(ctx)
+    except Exception as e:
+        failure = "%s failed on candidate %d: %s: %s" % (BACKEND_LABELS[backend], first_pending(ctx),
+                                                         type(e).__name__, e)
+    fail_rest(ctx)
+    statuses = [cand["status"] for cand in rec["candidates"]]
+    rec["state"] = "failed" if "failed" in statuses else "done"
+    rec["error"] = failure
+    write_run(ctx)
+    say("seed-edit: done: %d ok, %d blocked, %d failed" % (statuses.count("ok"), statuses.count("blocked"),
+                                                          statuses.count("failed")))
+    return 0 if failure is None and "failed" not in statuses else 1
+
+
+def main(argv=None):
+    """bin/seed-edit (SG4-SG23). Returns the exit code; installs no signal handler."""
+    args = parse(argv)
+    try:
+        opts = check_args(args)
+    except Refusal as e:
+        error(str(e))
+        return 2
+    if opts is None:
+        say(json.dumps(probe(), sort_keys=True))
+        return 0
+    run_dir = opts["run_dir"]
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "work"), exist_ok=True)
+    ctx = {"dir": run_dir, "work": os.path.join(run_dir, "work"), "opts": opts,
+           "record": new_record(run_dir, opts)}
+    say("seed-edit: run %s" % run_dir)
+    try:
+        return run(ctx)
+    except KeyboardInterrupt:
+        child = CHILD
+        if child is not None:
+            _kill_group(child.pid)
+        for cand in ctx["record"]["candidates"]:
+            if cand["status"] == "pending":
+                cand["status"] = "failed"
+        ctx["record"]["state"], ctx["record"]["error"] = "cancelled", "interrupted"
+        write_run(ctx)
+        sys.stderr.write("seed-edit: interrupted\n")
+        return 130
+    finally:
+        cleanup(ctx["work"])
+
+
+def _interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
+if __name__ == "__main__":
+    # A movie-ui Cancel (SIGTERM), a closed terminal (SIGHUP) and Ctrl-C take the same path (SG6).
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
+    sys.exit(main())

@@ -98,3 +98,10 @@ table.list th, table.list td { border-bottom: 1px solid var(--line); padding: 4p
 #b-grid video { max-width: 320px; }
 /* chained end frames spec CE15: a panel whose seam was missed */
 .seam-missed td { background: var(--warn-bg); }
+/* seed generator spec SG65: the Seeds tab and the Characters stills */
+.se-grid { display: flex; flex-direction: column; gap: 12px; }
+.se-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+.se-img, .se-thumb { width: 320px; height: auto; border: 1px solid var(--line); }
+.se-actions { display: flex; flex-direction: column; gap: 4px; }
+.se-mini { width: 64px; height: auto; margin-right: 4px; }
+.gallery figure { margin: 0; display: flex; flex-direction: column; gap: 4px; }

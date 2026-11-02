@@ -609,7 +609,7 @@ def test_sdt19_the_seed_folder_tag(env):
     tags = dict((j["id"], j["seed_folder"]) for j in queued)
     assert tags[other] is None
     assert [tags[r["job"]["id"]] for r in data["seeds"]] == [{"run": run, "name": n} for n in names]
-    assert all(len(j) == 15 for j in queued)
+    assert all(len(j) == 16 for j in queued)
 
 
 # --- SDT20 (SD9, SD14, SD20): final IDs avoid new stories and busy jobs ---------------------------------
@@ -918,7 +918,7 @@ def test_sdt11_the_route_and_its_token(env):
     routes = list(srv.ROUTES)
     i = routes.index(("POST", r"/api/jobs", "h_job_create", "/api/jobs"))
     assert routes[i + 1] == ("POST", r"/api/jobs/seed-folder", "h_seed_folder", "/api/jobs/seed-folder")
-    assert len(srv.ROUTES) == 57
+    assert len(srv.ROUTES) == 63
     assert srv.MovieUIHandler.h_seed_folder is srv._h_seed_folder
     for token in (None, "wrong-token"):
         assert mt.api(s, "POST", "/api/jobs/seed-folder", body={}, token=token)[::2] == (
@@ -955,7 +955,7 @@ def test_sdt29_the_characters_route_and_its_token(env):
     i = routes.index(("POST", r"/api/characters", "h_character_create", "/api/characters"))
     assert routes[i + 1] == ("POST", r"/api/characters/seed-folder", "h_character_seed_folder",
                              "/api/characters/seed-folder")
-    assert len(srv.ROUTES) == 57
+    assert len(srv.ROUTES) == 63
     assert srv.MovieUIHandler.h_character_seed_folder is srv._h_character_seed_folder
     for token in (None, "wrong-token"):
         assert mt.api(s, "POST", "/api/characters/seed-folder", body={}, token=token)[::2] == (
