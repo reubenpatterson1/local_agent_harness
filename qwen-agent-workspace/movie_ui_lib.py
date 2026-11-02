@@ -2112,6 +2112,13 @@ V_GROUP_NAMES = (("V2", "host can run it"), ("V3", "models present and intact"),
                  ("V5", "compatible"), ("V6", "dry run"))
 
 
+def shared_checks(fields, ws_real, py=sys.executable):
+    """V2-V5 of run_checks for fields that passed V1 (seed-folder spec SD2, SD16)."""
+    cache = {}
+    return (host_checks(fields, ws_real, py) + model_checks(fields, ws_real)
+            + lora_checks(fields, ws_real, cache) + compat_checks(fields, ws_real, cache))
+
+
 def run_checks(fields, ws_real, state, py=sys.executable):
     """MU43: V1; on a V1 failure one skip per V2-V6; otherwise V2-V6 in order, no short circuit."""
     errors = validate_fields(fields, ws_real, state)
@@ -2120,10 +2127,7 @@ def run_checks(fields, ws_real, state, py=sys.executable):
         return [v1] + [check(i, n, "skip", "skipped: V1 failed") for i, n in V_GROUP_NAMES]
     if fields["action"] == "smoke":
         return [v1] + smoke_checks(fields, ws_real)
-    cache = {}
-    return ([v1] + host_checks(fields, ws_real, py) + model_checks(fields, ws_real)
-            + lora_checks(fields, ws_real, cache) + compat_checks(fields, ws_real, cache)
-            + [dry_run_check(fields, ws_real, state)])
+    return [v1] + shared_checks(fields, ws_real, py) + [dry_run_check(fields, ws_real, state)]
 
 
 # ---------------------------------------------------------------------------

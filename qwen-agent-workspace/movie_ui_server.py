@@ -30,6 +30,7 @@ import time
 import fleet_lib
 import movie_ui_batch as batch
 import movie_ui_lib as lib
+import movie_ui_seedfolder as seedfolder
 
 UI_WS = os.path.dirname(os.path.realpath(__file__))
 STORE_LOCK = threading.Lock()   # MU18: guards queue.json, server-side status writes, dispatch
@@ -77,6 +78,7 @@ ROUTES = [
     ("POST", r"/api/models/download", "h_model_download", "/api/models/download"),
     ("GET", r"/api/characters", "h_characters", "/api/characters"),
     ("POST", r"/api/characters", "h_character_create", "/api/characters"),
+    ("POST", r"/api/characters/seed-folder", "h_character_seed_folder", "/api/characters/seed-folder"),
     ("GET", r"/api/characters/" + _NAME, "h_character", "/api/characters/kyra"),
     ("POST", r"/api/characters/" + _NAME + r"/train", "h_character_train", "/api/characters/kyra/train"),
     ("POST", r"/api/characters/" + _NAME + r"/regenerate", "h_character_regenerate",
@@ -98,6 +100,7 @@ ROUTES = [
     ("POST", r"/api/validate", "h_validate", "/api/validate"),
     ("GET", r"/api/jobs", "h_jobs", "/api/jobs"),
     ("POST", r"/api/jobs", "h_job_create", "/api/jobs"),
+    ("POST", r"/api/jobs/seed-folder", "h_seed_folder", "/api/jobs/seed-folder"),
     ("GET", r"/api/jobs/" + _ID, "h_job", "/api/jobs/" + _SAMPLE_ID),
     ("DELETE", r"/api/jobs/" + _ID, "h_job_delete", "/api/jobs/" + _SAMPLE_ID),
     ("GET", r"/api/jobs/" + _ID + r"/log", "h_job_log", "/api/jobs/" + _SAMPLE_ID + "/log"),
@@ -732,7 +735,8 @@ def job_summary(server, job_id, queue):
             "started": status.get("started"), "ended": status.get("ended"), "exit_code": status.get("exit_code"),
             "error": status.get("error"), "queue_position": queue.index(job_id) + 1 if state == "queued" else None,
             "command": shlex.join(job["argv"]),
-            "progress": server.progress(job_id, job, status) if state in lib.ACTIVE_STATES else None}
+            "progress": server.progress(job_id, job, status) if state in lib.ACTIVE_STATES else None,
+            "seed_folder": seedfolder.seed_tag(job.get("fields"))}
 
 
 def _fields_body(body):
@@ -776,23 +780,30 @@ def _create_seams_job(state, real, story_id, after=None):
     return job_id
 
 
+def _compose_job_locked(server, fields, seams=False):
+    """Create the queued job of a validated compose submission; returns its ID. With seams, a
+    chained movie's seams job is queued right behind it under the same STORE_LOCK hold, with the
+    movie as its "after" (chained end frames spec CE14, D12). The caller holds STORE_LOCK."""
+    state, real = server.state, fields["ws"]
+    job_id = lib.new_job_id(state)
+    if fields["action"] == "smoke":
+        lib.write_smoke_manifest(state, job_id)
+        argv = lib.build_smoke_argv(fields, real, state, job_id)
+        return lib.create_job(state, job_id, "smoke", real, None, None, argv, fields)["id"]
+    argv = lib.build_argv(fields, real, state)
+    job_id = lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"],
+                            None, argv, fields)["id"]
+    if seams and fields["action"] == "movie" and fields["mode"] == "chained":
+        _create_seams_job(state, real, fields["story_id"], after=job_id)
+    return job_id
+
+
 def create_compose_job(server, fields, seams=False):
     """Create the queued job of a validated compose submission; returns its ID. With seams, a
     chained movie's seams job is queued right behind it under the same STORE_LOCK hold, with the
     movie as its "after" (chained end frames spec CE14, D12)."""
-    state, real = server.state, fields["ws"]
     with STORE_LOCK:
-        job_id = lib.new_job_id(state)
-        if fields["action"] == "smoke":
-            lib.write_smoke_manifest(state, job_id)
-            argv = lib.build_smoke_argv(fields, real, state, job_id)
-            return lib.create_job(state, job_id, "smoke", real, None, None, argv, fields)["id"]
-        argv = lib.build_argv(fields, real, state)
-        job_id = lib.create_job(state, job_id, COMPOSE_KINDS[fields["action"]], real, fields["story_id"],
-                                None, argv, fields)["id"]
-        if seams and fields["action"] == "movie" and fields["mode"] == "chained":
-            _create_seams_job(state, real, fields["story_id"], after=job_id)
-        return job_id
+        return _compose_job_locked(server, fields, seams)
 
 
 def _h_job_create(self, groups, query, body):
@@ -803,6 +814,127 @@ def _h_job_create(self, groups, query, body):
     job_id = create_compose_job(self.server, fields,
                                 seams=isinstance(body, dict) and body.get("check_seams") is True)
     return 201, {"job": job_summary(self.server, job_id, lib.read_queue(self.server.state)), "checks": checks}
+
+
+# ---------------------------------------------------------------------------
+# Seed-folder Compose (docs/superpowers/specs/2026-11-01-seed-folder-compose-design.md, Section 3)
+# ---------------------------------------------------------------------------
+
+def seed_taken(server, ws_real):
+    """SD9: the lower-case names a seed's story ID must avoid."""
+    try:
+        names = os.listdir(os.path.join(ws_real, "generated", "stories"))
+    except OSError:
+        names = []
+    return seedfolder.taken_names(names, job_index(server, ws_real)[1])
+
+
+def _dry_runs(server, rows):
+    """SD17: V6 (lib.dry_run_check) for each of rows, at most seedfolder.DRY_RUN_WORKERS at a
+    time on plain threads that take the next index from a shared counter; sets row["v6"]. A dry
+    run that raises gives a V6 fail record. Neither STORE_LOCK nor BATCH_LOCK is held."""
+    state = server.state
+    guard = threading.Lock()
+    nxt = [0]
+
+    def work():
+        while True:
+            with guard:
+                i = nxt[0]
+                nxt[0] += 1
+            if i >= len(rows):
+                return
+            row = rows[i]
+            try:
+                row["v6"] = lib.dry_run_check(row["fields"], row["fields"]["ws"], state)
+            except Exception as e:
+                row["v6"] = lib.check("V6", "dry run", "fail",
+                                      "dry run error: %s: %s" % (type(e).__name__, e))
+
+    workers = [threading.Thread(target=work, name="movie-ui-dry-run", daemon=True)
+               for _ in range(min(seedfolder.DRY_RUN_WORKERS, len(rows)))]
+    for t in workers:
+        t.start()
+    for t in workers:
+        t.join()
+
+
+def seed_rows(server, fields, clean):
+    """SD14-SD18: steps 1-4 for every seed of a validated request, with no lock held. Returns
+    (rows, shared). rows has one dict per request seed, in request order: {"name", "upload_id",
+    "story_id" (provisional), "fields" (the seed's job fields), "v1", "v6", "status", "reason"};
+    shared is the V2-V5 records of SD16 ([] when no seed passed V1)."""
+    ws, state = fields["ws"], server.state
+    seeds = clean["seeds"]
+    ids = seedfolder.assign_story_ids([s["name"] for s in seeds], clean["prefix"],
+                                      seed_taken(server, ws))                          # step 1
+    rows = []
+    for seed, story_id in zip(seeds, ids):                                             # step 2
+        f = dict(fields, story_id=story_id, seed_upload=seed["upload_id"])
+        if not (isinstance(seed["upload_id"], str) and seed["upload_id"]):
+            errors = ["seed image upload missing"]
+        else:
+            errors = lib.validate_fields(f, ws, state)
+        rows.append({"name": seed["name"], "upload_id": seed["upload_id"], "story_id": story_id,
+                     "fields": f, "v1": lib.check("V1", "fields", "fail" if errors else "pass",
+                                                  "\n".join(errors)),
+                     "v6": None, "status": None, "reason": None})
+    passed = [row for row in rows if row["v1"]["status"] == "pass"]
+    shared = lib.shared_checks(passed[0]["fields"], ws) if passed else []               # step 3
+    if passed and lib.checks_pass(shared):
+        _dry_runs(server, passed)                                                       # step 4
+    for row in rows:
+        if row["v6"] is None:
+            detail = "skipped: V1 failed" if row["v1"]["status"] == "fail" else "skipped: shared checks failed"
+            row["v6"] = lib.check("V6", "dry run", "skip", detail)
+        row["status"], row["reason"] = seedfolder.row_reason(row["v1"], row["v6"])
+    return rows, shared
+
+
+def _seed_response(server, rows, shared, run=None, job_ids=None):
+    """SD21: the answer body. job_ids maps the index of each queued row to its job ID; queue.json
+    is read once, after STORE_LOCK was released (SD20 step 4)."""
+    job_ids = job_ids or {}
+    queue = lib.read_queue(server.state) if job_ids else []
+    seeds = []
+    for i, row in enumerate(rows):
+        seeds.append({"name": row["name"], "upload_id": row["upload_id"], "story_id": row["story_id"],
+                      "status": row["status"], "reason": row["reason"], "checks": [row["v1"], row["v6"]],
+                      "job": job_summary(server, job_ids[i], queue) if i in job_ids else None})
+    return {"ok": any(row["status"] == "ok" for row in rows), "shared_checks": shared,
+            "queued": len(job_ids), "refused": sum(1 for row in rows if row["status"] != "ok"),
+            "run": run, "seeds": seeds}
+
+
+def _h_seed_folder(self, groups, query, body):
+    """POST /api/jobs/seed-folder (SD11-SD21): check every seed, then answer a preview (200) or
+    queue one story or movie job per ok seed, in seed order (201; 409 when no seed is ok)."""
+    server = self.server
+    fields = _fields_body(body)
+    clean, error = seedfolder.validate_request(body)
+    if error is not None:
+        raise ApiError(400, error)
+    fields["seed_upload"] = fields["width"] = fields["height"] = None
+    rows, shared = seed_rows(server, fields, clean)
+    if clean["preview"]:
+        return 200, _seed_response(server, rows, shared)
+    ok = [i for i, row in enumerate(rows) if row["status"] == "ok"]
+    if not ok:
+        return 409, _seed_response(server, rows, shared)
+    run = seedfolder.new_run_id()
+    created = []
+    with STORE_LOCK:
+        final = seedfolder.assign_story_ids([rows[i]["name"] for i in ok], clean["prefix"],
+                                            seed_taken(server, fields["ws"]))
+        for i, story_id in zip(ok, final):
+            f = dict(rows[i]["fields"], story_id=story_id,
+                     seed_folder={"run": run, "name": rows[i]["name"]})
+            created.append((i, story_id, _compose_job_locked(server, f, seams=clean["check_seams"])))
+    job_ids = {}
+    for i, story_id, job_id in created:
+        rows[i]["story_id"] = story_id
+        job_ids[i] = job_id
+    return 201, _seed_response(server, rows, shared, run, job_ids)
 
 
 def _h_jobs(self, groups, query, body):
@@ -955,6 +1087,7 @@ def _h_job_kill_orphan(self, groups, query, body):
 MovieUIHandler.h_preview = _h_preview
 MovieUIHandler.h_validate = _h_validate
 MovieUIHandler.h_job_create = _h_job_create
+MovieUIHandler.h_seed_folder = _h_seed_folder
 MovieUIHandler.h_jobs = _h_jobs
 MovieUIHandler.h_job = _h_job
 MovieUIHandler.h_job_log = _h_job_log
@@ -1239,6 +1372,27 @@ def _h_character(self, groups, query, body):
 PHRASE_MAX = 200
 
 
+def _phrase_errors(phrase):
+    """MU65's phrase rule, moved out of character_create_errors unchanged (seed-folder SD43):
+    [] or the one failing message."""
+    if not (isinstance(phrase, str) and 1 <= len(phrase.strip()) and len(phrase) <= PHRASE_MAX
+            and "\n" not in phrase and "\r" not in phrase):
+        return ["phrase is required"]
+    if not lib._argv_safe(phrase):
+        return ["phrase contains invalid characters"]
+    if phrase.strip().startswith("-"):
+        return ["phrase must not start with '-'"]
+    return []
+
+
+def _seed_number_errors(seed_n):
+    """MU65's seed-number rule, moved out of character_create_errors unchanged (seed-folder
+    SD43): [] or the one failing message."""
+    if seed_n is not None and not (isinstance(seed_n, int) and not isinstance(seed_n, bool) and 0 <= seed_n <= 2147483647):
+        return ["seed must be an integer from 0 to 2147483647"]
+    return []
+
+
 def character_create_errors(body, state):
     """MU65's field rules for POST /api/characters; [] when they pass."""
     errors = []
@@ -1250,13 +1404,7 @@ def character_create_errors(body, state):
     trigger, seed_n, force = body.get("trigger"), body.get("seed"), body.get("force", False)
     if not (isinstance(name, str) and lib.CHARACTER_NAME_RE.fullmatch(name)):
         errors.append("character name must match [a-z][a-z0-9-]{1,23}")
-    if not (isinstance(phrase, str) and 1 <= len(phrase.strip()) and len(phrase) <= PHRASE_MAX
-            and "\n" not in phrase and "\r" not in phrase):
-        errors.append("phrase is required")
-    elif not lib._argv_safe(phrase):
-        errors.append("phrase contains invalid characters")
-    elif phrase.strip().startswith("-"):
-        errors.append("phrase must not start with '-'")
+    errors += _phrase_errors(phrase)
     if (seed is None) == (descriptor is None or descriptor == ""):
         errors.append("give exactly one of a seed image or a descriptor")
     if descriptor not in (None, "") and not class_noun:
@@ -1271,8 +1419,7 @@ def character_create_errors(body, state):
         errors.append("class noun must match [a-z]{3,12}")
     if trigger not in (None, "") and not (isinstance(trigger, str) and re.fullmatch(r"[a-z][a-z0-9]{3,15}", trigger)):
         errors.append("trigger must match [a-z][a-z0-9]{3,15}")
-    if seed_n is not None and not (isinstance(seed_n, int) and not isinstance(seed_n, bool) and 0 <= seed_n <= 2147483647):
-        errors.append("seed must be an integer from 0 to 2147483647")
+    errors += _seed_number_errors(seed_n)
     if seed is not None and not (isinstance(seed, str) and lib.UPLOAD_ID_RE.fullmatch(seed)
                                  and os.path.isfile(os.path.join(state, "uploads", seed))):
         errors.append("seed image upload %s not found" % (_fs_text(seed) if isinstance(seed, str) else seed,))
@@ -1281,11 +1428,18 @@ def character_create_errors(body, state):
     return errors
 
 
+def _character_job_locked(server, kind, real, fields):
+    """Create the queued job of a character action and return its ID (seed-folder SD45). The
+    caller holds STORE_LOCK."""
+    job_id = lib.new_job_id(server.state)
+    argv = lib.character_argv(kind, fields, real, server.state)
+    lib.create_job(server.state, job_id, kind, real, None, fields["name"], argv, fields)
+    return job_id
+
+
 def create_character_job(server, kind, real, fields):
     with STORE_LOCK:
-        job_id = lib.new_job_id(server.state)
-        argv = lib.character_argv(kind, fields, real, server.state)
-        lib.create_job(server.state, job_id, kind, real, None, fields["name"], argv, fields)
+        job_id = _character_job_locked(server, kind, real, fields)
     return 201, {"job": job_summary(server, job_id, lib.read_queue(server.state))}
 
 
@@ -1302,6 +1456,93 @@ def _h_character_create(self, groups, query, body):
     fields["force"] = body.get("force", False)
     fields["ws"] = real
     return create_character_job(self.server, "character-create", real, fields)
+
+
+# ---------------------------------------------------------------------------
+# Seed-folder Characters (docs/superpowers/specs/2026-11-01-seed-folder-compose-design.md, 3.5)
+# ---------------------------------------------------------------------------
+
+def character_taken(server, ws_real):
+    """SD39: the names a seed's character must avoid."""
+    library = os.environ.get("CHARACTER_LIBRARY_DIR") or os.path.join(ws_real, "generated", "characters")
+    try:
+        names = os.listdir(library)
+    except OSError:
+        names = []
+    state, queue = server.state, lib.read_queue(server.state)
+    busy = [job["character"] for job in (server.job(i) for i in lib.list_job_ids(state))
+            if job is not None and job.get("workspace") == ws_real and isinstance(job.get("character"), str)
+            and lib.job_state(state, job["id"], queue) in ("queued", "starting", "running")]
+    return seedfolder.character_taken_names(names, busy)
+
+
+def _character_rows(server, real, body, clean):
+    """SD44 steps 1-2 for every seed of a validated request, with no lock held. One row per seed,
+    in request order: {"name", "upload_id", "character" (provisional), "v1", "status", "reason"}."""
+    seeds = clean["seeds"]
+    names = seedfolder.assign_character_names([s["name"] for s in seeds], clean["prefix"],
+                                              character_taken(server, real))           # step 1
+    rows = []
+    for seed, name in zip(seeds, names):                                               # step 2
+        upload_id = seed["upload_id"]
+        if not (isinstance(upload_id, str) and upload_id):
+            errors = ["seed image upload missing"]
+        else:
+            errors = character_create_errors(
+                {"name": name, "phrase": body.get("phrase"), "seed": body.get("seed"), "seed_upload": upload_id,
+                 "class_noun": None, "descriptor": None, "trigger": None, "force": False}, server.state)
+        rows.append({"name": seed["name"], "upload_id": upload_id, "character": name,
+                     "v1": lib.check("V1", "fields", "fail" if errors else "pass", "\n".join(errors)),
+                     "status": "refused" if errors else "ok", "reason": "; ".join(errors) if errors else None})
+    return rows
+
+
+def _character_response(server, rows, run=None, job_ids=None):
+    """SD46: SD21's shape with "character" for "story_id", checks [V1] and shared_checks []."""
+    job_ids = job_ids or {}
+    queue = lib.read_queue(server.state) if job_ids else []
+    seeds = []
+    for i, row in enumerate(rows):
+        seeds.append({"name": row["name"], "upload_id": row["upload_id"], "character": row["character"],
+                      "status": row["status"], "reason": row["reason"], "checks": [row["v1"]],
+                      "job": job_summary(server, job_ids[i], queue) if i in job_ids else None})
+    return {"ok": any(row["status"] == "ok" for row in rows), "shared_checks": [],
+            "queued": len(job_ids), "refused": sum(1 for row in rows if row["status"] != "ok"),
+            "run": run, "seeds": seeds}
+
+
+def _h_character_seed_folder(self, groups, query, body):
+    """POST /api/characters/seed-folder (SD41-SD46): check every seed, then answer a preview (200)
+    or queue one character-create job per ok seed, in seed order (201; 409 when no seed is ok)."""
+    server = self.server
+    real = self.ws(body.get("ws"))
+    for errors in (_phrase_errors(body.get("phrase")), _seed_number_errors(body.get("seed"))):
+        if errors:
+            raise ApiError(400, errors[0])
+    clean, error = seedfolder.validate_character_request(body)
+    if error is not None:
+        raise ApiError(400, error)
+    rows = _character_rows(server, real, body, clean)
+    if clean["preview"]:
+        return 200, _character_response(server, rows)
+    ok = [i for i, row in enumerate(rows) if row["status"] == "ok"]
+    if not ok:
+        return 409, _character_response(server, rows)
+    run = seedfolder.new_run_id()
+    created = []
+    with STORE_LOCK:
+        final = seedfolder.assign_character_names([rows[i]["name"] for i in ok], clean["prefix"],
+                                                  character_taken(server, real))
+        for i, name in zip(ok, final):
+            fields = {"name": name, "phrase": body.get("phrase"), "class_noun": None, "descriptor": None,
+                      "trigger": None, "seed": body.get("seed"), "seed_upload": rows[i]["upload_id"],
+                      "force": False, "ws": real, "seed_folder": {"run": run, "name": rows[i]["name"]}}
+            created.append((i, name, _character_job_locked(server, "character-create", real, fields)))
+    job_ids = {}
+    for i, name, job_id in created:
+        rows[i]["character"] = name
+        job_ids[i] = job_id
+    return 201, _character_response(server, rows, run, job_ids)
 
 
 def _h_character_regenerate(self, groups, query, body):
@@ -1339,6 +1580,7 @@ MovieUIHandler.h_model_download = _h_model_download
 MovieUIHandler.h_characters = _h_characters
 MovieUIHandler.h_character = _h_character
 MovieUIHandler.h_character_create = _h_character_create
+MovieUIHandler.h_character_seed_folder = _h_character_seed_folder
 MovieUIHandler.h_character_regenerate = _h_character_regenerate
 MovieUIHandler.h_character_train = _h_character_train
 
