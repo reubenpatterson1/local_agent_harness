@@ -1219,7 +1219,7 @@ def test_sgt34_the_new_python_files_and_the_tool_imports():
         source = f.read()
     assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
         "argparse", "glob", "importlib.util", "json", "os", "re", "secrets", "shutil", "signal", "subprocess", "sys",
-        "threading", "time", "movie_ui_lib"]
+        "threading", "time", "movie_ui_lib", "movie_ui_seedgen"]
 
 
 def test_sg_task6_review_page_guards():
