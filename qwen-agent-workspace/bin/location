@@ -20,7 +20,8 @@ new description. list and show read the library only. A trained location is pinn
 with bin/ltx-movie --location NAME.
 
 Exit codes: 0 success, 1 runtime failure, 2 argument or precondition failure, 3 create kept fewer
-than 12 stills.
+than 12 stills. When fewer than 12 are kept, create regenerates the dropped generated or edited
+stills (never your photos) with new seeds, for up to 2 more rounds.
 
 list/show import location_lib only (stdlib); create, train and edit import location_dataset, which needs
 PIL and psutil: without them bin/location re-executes itself under $CHARACTER_PYTHON (default

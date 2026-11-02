@@ -159,13 +159,21 @@ class _Fakes(object):
     exception raised, or a list of those, one per attempt; default PASS), the story server, every
     gate, and image children that write 1024x640 solid PNGs for their jobs (except the 1-based
     job numbers in skip, which are blocked) or raise child_error. image_data_url is replaced by
-    "file:<path>", so a check call names its still."""
+    "file:<path>", so a check call names its still.
+
+    Yield spec 7.2: skip_n blocks still numbers (from a job's output_path) in every child call;
+    rounds, a list of replies dicts, answers a check from rounds[min(max(child calls so far, 1),
+    len(rounds)) - 1], so the last dict repeats; child_error_at raises child_error only on that
+    1-based child call; existed gets, per child call, whether each job's output existed before
+    the call."""
 
     def __init__(self, monkeypatch, replies=None, describe=(), skip=(), child_error=None,
-                 missing=(), vlm_up=True):
+                 missing=(), vlm_up=True, skip_n=(), rounds=None, child_error_at=None):
         self.replies, self.describe = dict(replies or {}), list(describe)
         self.vlm_calls, self.server_calls, self.child_specs = [], [], []
         self.skip, self.child_error, self.missing = set(skip), child_error, list(missing)
+        self.skip_n, self.rounds, self.child_error_at = set(skip_n), rounds, child_error_at
+        self.existed = []
         self.attempt = 0
         fakes = self
 
@@ -175,7 +183,9 @@ class _Fakes(object):
                 return fakes.describe.pop(0)
             fakes.attempt = fakes.attempt + 1 if _kind(parts) == "retry" else 0
             url = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"][-1]
-            reply = fakes.replies.get(int(re.search(r"loc_(\d+)\.png$", url).group(1)), PASS)
+            replies = fakes.replies if fakes.rounds is None else fakes.rounds[
+                min(max(len(fakes.child_specs), 1), len(fakes.rounds)) - 1]
+            reply = replies.get(int(re.search(r"loc_(\d+)\.png$", url).group(1)), PASS)
             if isinstance(reply, list):
                 reply = reply[min(fakes.attempt, len(reply) - 1)]
             if isinstance(reply, Exception):
@@ -184,11 +194,14 @@ class _Fakes(object):
 
         def _child(spec, loc_dir, step):
             fakes.child_specs.append((json.loads(json.dumps(spec)), step))
-            if fakes.child_error is not None:
+            fakes.existed.append([os.path.exists(job["output_path"]) for job in spec["jobs"]])
+            if fakes.child_error is not None and (
+                    fakes.child_error_at is None or fakes.child_error_at == len(fakes.child_specs)):
                 raise fakes.child_error
             jobs = []
             for i, job in enumerate(spec["jobs"], 1):
-                if i in fakes.skip:
+                n = int(re.search(r"loc_(\d+)\.png$", job["output_path"]).group(1))
+                if i in fakes.skip or n in fakes.skip_n:
                     jobs.append({"output_path": job["output_path"], "status": "blocked",
                                  "seconds": 0.0})
                     continue
@@ -609,20 +622,22 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
     _Fakes(monkeypatch, skip=[3])
     assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=4)) == 0
     manifest = _manifest(env)
-    assert {k: manifest[k] for k in manifest if k != "items"} == {
+    assert {k: manifest[k] for k in manifest if k not in ("items", "rounds")} == {
         "source": "text", "trigger": "harboplc", "description": lt.HARBOUR_DESC, "seed": 4,
         "min_score": 7, "reference": None, "generator": "Z-Image", "variant_set": "outdoor"}
+    assert [r["round"] for r in manifest["rounds"]] == [1]
+    assert manifest["rounds"][0]["kept"] == 23
     first, blocked = manifest["items"][0], manifest["items"][2]
     assert first == {"n": 1, "source": "generated", "photo": None,
                      "prompt": ld.gen_prompt(*(ld.VARIANTS[0] + (lt.HARBOUR_DESC,))),
                      "match_score": 9, "people_visible": False, "shot": "wide shot",
                      "time_of_day": "dusk", "weather": "fog", "kept": True, "reason": None,
-                     "caption": ld.caption("harboplc", PASS)}
+                     "caption": ld.caption("harboplc", PASS), "seed": 4, "round": 1}
     assert blocked == {"n": 3, "source": "generated", "photo": None,
                        "prompt": ld.gen_prompt(*(ld.VARIANTS[2] + (lt.HARBOUR_DESC,))),
                        "match_score": None, "people_visible": None, "shot": "", "time_of_day": "",
                        "weather": "", "kept": False, "reason": "blocked by the content screen",
-                       "caption": None}
+                       "caption": None, "seed": 4, "round": 1}
     _Fakes(monkeypatch)
     assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 2),
                                   description=lt.MILL_DESC)) == 0
@@ -636,8 +651,11 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
         "photo", 2, None, None)
     assert (edit["source"], edit["photo"], edit["prompt"], edit["match_score"]) == (
         "edit", 1, ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[0],) + ld.EDIT_CONDITIONS[0]), 9)
+    assert (photo["seed"], photo["round"]) == (None, None)
+    assert (edit["seed"], edit["round"]) == (0, 1)
     assert list(edit) == ["n", "source", "photo", "prompt", "match_score", "people_visible",
-                          "shot", "time_of_day", "weather", "kept", "reason", "caption"]
+                          "shot", "time_of_day", "weather", "kept", "reason", "caption", "seed",
+                          "round"]
 
 
 def test_ld14_the_contact_sheet(tmp_path, monkeypatch):
@@ -675,7 +693,7 @@ def test_ld15_too_few_stills_exit_3(env, monkeypatch, tmp_path, capsys):
     replies = dict((n, dict(PASS, people_visible=True)) for n in range(12, 17))
     replies.update((n, dict(PASS, match_score=3)) for n in range(17, 21))
     replies.update((n, ["x", "x", "x"]) for n in (23, 24))
-    _Fakes(monkeypatch, replies=replies, skip=[21, 22])
+    _Fakes(monkeypatch, replies=replies, skip_n=[21, 22])
     assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 3
     ldir = os.path.join(env["locations"], "harbour-street")
     assert _err_line(capsys) == (
@@ -1360,3 +1378,274 @@ def test_lyd13_round_labels_and_the_banner(tmp_path, monkeypatch):
     ld.write_contact_sheet(items, str(stills), str(tmp_path / "one.jpg"), rounds=1)
     assert [text for xy, text in texts if xy == (4, 6)] == [
         "kept 13 of 24 (need 12) after 3 rounds", "kept 13 of 24 (need 12)"]
+
+
+def _low(ns):
+    """Check replies that score every still n in ns 3, so each is dropped as "score 3"."""
+    return dict((n, dict(PASS, match_score=3)) for n in ns)
+
+
+def _made(n, seed, score):
+    """One entry of a manifest round's "made" list, for a still the fakes scored score."""
+    return {"n": n, "seed": seed, "match_score": score, "kept": score >= 7,
+            "reason": None if score >= 7 else "score %d" % score}
+
+
+def _in_order(out, lines):
+    """True when every line occurs in out, each after the end of the one before it."""
+    at = 0
+    for line in lines:
+        found = out.find(line, at)
+        if found < 0:
+            return False
+        at = found + len(line)
+    return True
+
+
+def _loc(stills, n):
+    return os.path.join(stills, "loc_%02d.png" % n)
+
+
+def test_lyd5_the_top_up_seed():
+    assert ld.TOPUP_ROUNDS == 2
+    for args, value in (((0, 2, 12), 526042623), ((0, 3, 12), 543898680),
+                        ((0, 2, 13), 972079275), ((1, 2, 12), 1141495259),
+                        ((7, 2, 21), 1210575679), ((2147483647, 3, 24), 520239272)):
+        assert ld.topup_seed(*args) == value, args
+    values = [ld.topup_seed(0, r, n) for r in (2, 3) for n in range(1, 25)]
+    assert len(set(values)) == 48
+    assert all(0 <= v <= 2147483647 for v in values)
+
+
+def test_lyd6_a_top_up_round_reaches_12(env, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25)), _low(range(13, 25))])
+    inner, seen = character_dataset.run_zimage_child, []
+
+    def _child(spec, loc_dir, step):
+        if step == "generate-round2":
+            seen.append((len(fakes.checks()), list(fakes.server_calls)))
+        return inner(spec, loc_dir, step)
+
+    monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=5)) == 0
+    ldir = os.path.join(env["locations"], "harbour-street")
+    stills = os.path.join(ldir, "stills")
+    data = _record(env)
+    assert (data["status"], data["dataset"]["kept"]) == ("untrained", 12)
+    assert [step for _spec, step in fakes.child_specs] == ["generate", "generate-round2"]
+    prompts = [ld.gen_prompt(*(v + (lt.HARBOUR_DESC,))) for v in ld.VARIANTS]
+    assert fakes.child_specs[1][0]["jobs"] == [
+        {"prompt": prompts[n - 1], "output_path": _loc(stills, n),
+         "seed": ld.topup_seed(5, 2, n), "width": 1024, "height": 640} for n in range(12, 25)]
+    assert fakes.existed[1] == [False] * 13
+    assert fakes.server_calls == ["stop", "restore-wait", "stop", "restore-wait"]
+    assert seen == [(24, ["stop", "restore-wait", "stop"])]
+    assert [urls for _prompt, urls in fakes.checks()] == (
+        [["file:" + _loc(stills, n)] for n in range(1, 25)]
+        + [["file:" + _loc(stills, n)] for n in range(12, 25)])
+    assert _in_order(capsys.readouterr().out, [
+        "=== top-up round 2 of 3: regenerating 13 dropped stills with new seeds (kept 11, need "
+        "12) ===\n", "=== generate: 13 stills ===\n", "=== check ===\n",
+        "top-up round 2 of 3: kept 12 of 24 (need 12)\n",
+        "dataset: 12/24 stills kept (minimum 12) in %s\n" % ldir,
+        "next: review the contact sheet, then run bin/location train harbour-street\n"])
+    manifest = _manifest(env)
+    assert manifest["rounds"] == [
+        {"round": 1, "made": [_made(n, 5, 9 if n < 12 else 3) for n in range(1, 25)], "kept": 11},
+        {"round": 2, "made": [_made(n, ld.topup_seed(5, 2, n), 9 if n == 12 else 3)
+                              for n in range(12, 25)], "kept": 12}]
+    items = manifest["items"]
+    assert (items[11]["seed"], items[11]["round"], items[11]["kept"]) == (
+        ld.topup_seed(5, 2, 12), 2, True)
+    assert (items[12]["seed"], items[12]["round"], items[12]["kept"]) == (
+        ld.topup_seed(5, 2, 13), 2, False)
+    assert (items[0]["seed"], items[0]["round"]) == (5, 1)
+    assert sorted(os.listdir(os.path.join(ldir, "captions"))) == [
+        "loc_%02d.txt" % n for n in range(1, 13)]
+
+
+def test_lyd7_the_top_up_is_exhausted(env, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    texts = []
+    real_text = ld.ImageDraw.ImageDraw.text
+    monkeypatch.setattr(ld.ImageDraw.ImageDraw, "text",
+                        lambda self, xy, text, **kw: texts.append((xy, text)) or real_text(
+                            self, xy, text, **kw))
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=5)) == 3
+    ldir = os.path.join(env["locations"], "harbour-street")
+    stills = os.path.join(ldir, "stills")
+    assert [step for _spec, step in fakes.child_specs] == [
+        "generate", "generate-round2", "generate-round3"]
+    assert [(job["output_path"], job["seed"]) for job in fakes.child_specs[2][0]["jobs"]] == [
+        (_loc(stills, n), ld.topup_seed(5, 3, n)) for n in range(12, 25)]
+    assert fakes.server_calls == ["stop", "restore-wait"] * 3
+    assert [r["kept"] for r in _manifest(env)["rounds"]] == [11, 11, 11]
+    assert _err_line(capsys) == (
+        "Error: only 11/24 stills kept (need 12): 13 score below 7; the dataset is kept in %s; "
+        "run bin/location create harbour-street --regenerate --new-seed, or --regenerate "
+        "--description TEXT with a clearer description" % ldir)
+    assert [text for xy, text in texts if xy == (4, 6)][-1] == (
+        "kept 11 of 24 (need 12) after 3 rounds")
+
+
+def test_lyd8_a_photo_top_up_regenerates_edits_only(env, monkeypatch, tmp_path, capsys):
+    paths = _photos(tmp_path, 3)
+    people = dict(PASS, people_visible=True)
+    first = dict((n, dict(PASS, match_score=5)) for n in range(4, 16))
+    first[1] = people
+    fakes = _Fakes(monkeypatch, rounds=[first, {1: people}])
+    assert ld.create(_create_args(name="old-mill", photos=paths, description=lt.MILL_DESC,
+                                  seed=2)) == 0
+    stills = os.path.join(env["locations"], "old-mill", "stills")
+    manifest = _manifest(env, "old-mill")
+    assert [r["kept"] for r in manifest["rounds"]] == [11, 23]
+    assert _record(env, "old-mill")["dataset"]["kept"] == 23
+    assert len(fakes.child_specs) == 2
+    spec, step = fakes.child_specs[1]
+    assert (step, spec["skill"], spec["image"]) == ("edit-round2", "location_edit",
+                                                    _loc(stills, 1))
+    assert spec["jobs"] == [
+        {"image": _loc(stills, ((n - 4) % 3) + 1),
+         "prompt": ld.EDIT_PROMPT % ((ld.EDIT_VIEWS[n - 4],) + ld.EDIT_CONDITIONS[n - 4]),
+         "output_path": _loc(stills, n), "seed": ld.topup_seed(2, 2, n), "width": 1024,
+         "height": 640} for n in range(4, 16)]
+    assert fakes.checks()[24:] == [
+        (ld.CHECK_PHOTO_PROMPT, ["file:" + _loc(stills, ((n - 4) % 3) + 1),
+                                 "file:" + _loc(stills, n)]) for n in range(4, 16)]
+    photo = manifest["items"][0]
+    assert (photo["kept"], photo["round"], photo["seed"]) == (False, None, None)
+    capsys.readouterr()
+    fakes = _Fakes(monkeypatch, rounds=[first, {1: people}])
+    assert ld.create(_create_args(name="dock-one", photos=paths, description=lt.MILL_DESC,
+                                  seed=2, force=True)) == 0
+    assert len(fakes.child_specs) == 1
+    assert "top-up" not in capsys.readouterr().out
+    assert _record(env, "dock-one")["dataset"]["kept"] == 12
+
+
+def test_lyd9_when_no_top_up_round_runs(env, monkeypatch, tmp_path, capsys):
+    people = dict(PASS, people_visible=True)
+    fakes = _Fakes(monkeypatch, replies=dict((n, people) for n in range(1, 14)))
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 24),
+                                  description=lt.MILL_DESC)) == 3
+    assert (fakes.child_specs, fakes.server_calls) == ([], [])
+    assert _record(env, "old-mill")["dataset"]["kept"] == 11
+    assert ("top-up: not run; no generated or edited stills were dropped\n"
+            in capsys.readouterr().out)
+    replies = dict((n, people) for n in range(1, 15))
+    replies.update(_low([21, 22]))
+    fakes = _Fakes(monkeypatch, replies=replies)
+    assert ld.create(_create_args(name="dock-one", photos=_photos(tmp_path, 20, start=24),
+                                  description=lt.MILL_DESC)) == 3
+    assert len(fakes.child_specs) == 1
+    assert _record(env, "dock-one")["dataset"]["kept"] == 8
+    assert ("top-up: not run; 8 kept + 2 dropped generated or edited stills cannot reach 12\n"
+            in capsys.readouterr().out)
+    _Fakes(monkeypatch, replies=_low(range(21, 25)))
+    assert ld.create(_create_args(description="The " + lt.HARBOUR_DESC[2:] + ".", seed=7)) == 0
+    out = capsys.readouterr().out
+    assert "top-up" not in out and "variants:" not in out
+    assert len(_manifest(env)["rounds"]) == 1
+
+
+def test_lyd10_a_still_blocked_again_in_a_top_up_round(env, monkeypatch):
+    fakes = _Fakes(monkeypatch, skip_n=[12], rounds=[_low(range(13, 25)), {}])
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 0
+    ldir = os.path.join(env["locations"], "harbour-street")
+    manifest = _manifest(env)
+    assert [r["kept"] for r in manifest["rounds"]] == [11, 23]
+    item = manifest["items"][11]
+    assert (item["kept"], item["reason"], item["round"], item["seed"]) == (
+        False, "blocked by the content screen", 2, ld.topup_seed(0, 2, 12))
+    assert not os.path.exists(os.path.join(ldir, "stills", "loc_12.png"))
+    assert fakes.existed[1] == [False] * 13
+
+
+def test_lyd11_a_failure_or_interrupt_in_a_top_up_round(env, monkeypatch, capsys):
+    error = character_dataset.DatasetError("Z-Image child process exited -9; log: /x/logs/g.log")
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))], child_error=error,
+                   child_error_at=2)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 1
+    assert fakes.server_calls == ["stop", "restore-wait", "stop", "restore-wait"]
+    assert _err_line(capsys) == "Error: Z-Image child process exited -9; log: /x/logs/g.log"
+    data = _record(env)
+    assert (data["status"], data["dataset"]["kept"]) == ("dataset", 11)
+    assert len(_manifest(env)["rounds"]) == 1
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))], child_error=KeyboardInterrupt(),
+                   child_error_at=2)
+    assert ld.create(_create_args(name="old-mill", description=lt.MILL_DESC)) == 1
+    assert fakes.server_calls == ["stop", "restore-wait", "stop", "restore"]
+    assert _err_line(capsys) == (
+        "Error: aborted; the stills made so far are kept in %s; run bin/location create "
+        "old-mill --regenerate to start again" % os.path.join(env["locations"], "old-mill"))
+
+
+def test_lyd12_top_up_seeds_follow_the_location_seed(env, monkeypatch):
+    def _seeds(fakes, k):
+        return [job["seed"] for job in fakes.child_specs[k][0]["jobs"]]
+
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=5)) == 3
+    first = _seeds(fakes, 1)
+    assert first == [ld.topup_seed(5, 2, n) for n in range(12, 25)]
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    assert ld.create(_create_args(regenerate=True, new_seed=True)) == 3
+    assert _record(env)["seed"] == 6
+    assert _seeds(fakes, 0) == [6] * 24
+    assert _seeds(fakes, 1) == [ld.topup_seed(6, 2, n) for n in range(12, 25)]
+    assert _seeds(fakes, 2) == [ld.topup_seed(6, 3, n) for n in range(12, 25)]
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25))])
+    assert ld.create(_create_args(name="dock-one", description=lt.HARBOUR_DESC, seed=5)) == 3
+    assert _seeds(fakes, 1) == first
+
+
+def test_ly_review_focus_3_the_vision_model_fails_in_a_top_up_round(env, monkeypatch, capsys):
+    down = RuntimeError("VLM request failed: connection refused")
+    fakes = _Fakes(monkeypatch, rounds=[_low(range(12, 25)), dict((n, down) for n in range(12, 25))])
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 1
+    assert _err_line(capsys) == "Error: VLM request failed: connection refused"
+    assert fakes.server_calls == ["stop", "restore-wait"] * 2
+    data = _record(env)
+    assert (data["status"], data["dataset"]["kept"]) == ("dataset", 11)
+    manifest = _manifest(env)
+    assert len(manifest["rounds"]) == 1
+    assert [item["round"] for item in manifest["items"]] == [1] * 24
+    ldir = os.path.join(env["locations"], "harbour-street")
+    assert sorted(os.listdir(os.path.join(ldir, "captions"))) == [
+        "loc_%02d.txt" % n for n in range(1, 12)]
+    assert sorted(os.listdir(os.path.join(ldir, "videos"))) == [
+        "loc_%02d.mp4" % n for n in range(1, 12)]
+
+
+def test_ly_review_focus_4_regenerate_after_a_failed_top_up_round(env, monkeypatch):
+    error = character_dataset.DatasetError("Z-Image child process exited -9; log: /x/logs/g.log")
+    _Fakes(monkeypatch, rounds=[_low(range(12, 25))], child_error=error, child_error_at=2)
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 1
+    stills = os.path.join(env["locations"], "harbour-street", "stills")
+    assert sorted(os.listdir(stills)) == ["loc_%02d.png" % n for n in range(1, 12)]
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(regenerate=True)) == 0
+    assert [step for _spec, step in fakes.child_specs] == ["generate"]
+    assert len(fakes.child_specs[0][0]["jobs"]) == 24
+    manifest = _manifest(env)
+    assert [r["round"] for r in manifest["rounds"]] == [1]
+    assert [(i["round"], i["seed"], i["kept"]) for i in manifest["items"]] == [(1, 0, True)] * 24
+    data = _record(env)
+    assert (data["status"], data["dataset"]["kept"]) == ("untrained", 24)
+    assert sorted(os.listdir(stills)) == ["loc_%02d.png" % n for n in range(1, 25)]
+
+
+def test_ly_review_focus_5_a_still_kept_in_a_top_up_round_is_trained(env, monkeypatch):
+    _Fakes(monkeypatch, rounds=[_low(range(12, 25)), _low(range(13, 25))])
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC, seed=5)) == 0
+    ldir = os.path.join(env["locations"], "harbour-street")
+    assert sorted(os.listdir(os.path.join(ldir, "videos"))) == [
+        "loc_%02d.mp4" % n for n in range(1, 13)]
+    with open(os.path.join(ldir, "captions", "loc_12.txt"), encoding="utf-8") as f:
+        assert f.read() == _manifest(env)["items"][11]["caption"]
+    pairs = []
+    monkeypatch.setattr(character_dataset, "train_stills_lora",
+                        lambda loc_dir, p, prompt, seed, kept_ok, skipped: pairs.extend(p) or "ok")
+    assert ld._train_stills(_record(env)) == "ok"
+    assert pairs == [(os.path.join(ldir, "stills", "loc_%02d.png" % n),
+                      os.path.join(ldir, "captions", "loc_%02d.txt" % n)) for n in range(1, 13)]

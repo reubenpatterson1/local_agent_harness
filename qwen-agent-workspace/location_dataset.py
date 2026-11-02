@@ -5,8 +5,10 @@
 A location's dataset is 24 people-free 1024x640 stills: 24 Z-Image text2img stills of the
 description (text mode), or the user's photos plus Qwen-Image-Edit-2511 edits of them that
 re-shoot the place from a new viewpoint at a new time of day, weather or season (photo mode).
-The vision model checks every still; the kept ones get a trigger-led caption and a 1-frame mp4. Training reuses
-character_dataset.train_video_lora and train_stills_lora.
+The vision model checks every still; the kept ones get a trigger-led caption and a 1-frame mp4.
+When fewer than 12 are kept, the dropped generated or edited stills are regenerated with new seeds
+for up to 2 more rounds (docs/superpowers/specs/2026-11-02-location-yield-design.md). Training
+reuses character_dataset.train_video_lora and train_stills_lora.
 
 Top-level imports are stdlib, PIL, psutil, character_dataset and location_lib. All
 image work runs in character_dataset's own child processes (run_zimage_child, run_edit_child),
@@ -37,6 +39,7 @@ SEED_MAX = 2147483647
 MIN_CROP_W, MIN_CROP_H = 512, 320
 WARN_CROP_W, WARN_CROP_H = 768, 480
 DESCRIBE_PHOTOS = 5
+TOPUP_ROUNDS = 2                        # yield spec LY6: rounds 2 and 3 regenerate dropped stills
 
 # Spec 2.5: the 24 text-mode stills.
 TIMES = ("dawn", "midday", "golden hour", "dusk", "night")
@@ -428,46 +431,76 @@ def _with_story_server_stopped(min_gib, work):
                 raise DatasetError("timed out waiting for the vision server to come back")
 
 
+def topup_seed(seed, round_n, n):
+    """The seed of still n in top-up round round_n (yield spec LY7): deterministic from the
+    location seed, the round and the still, in 0..SEED_MAX."""
+    digest = hashlib.sha256(("location-topup:%d:%d:%d" % (seed, round_n, n)).encode("ascii"))
+    return int(digest.hexdigest()[:8], 16) & SEED_MAX
+
+
 def _plan(data, loc_dir):
-    """[{"n", "source", "photo", "prompt"}] for the 24 stills, and the image child to run:
-    ("generate", spec), ("edit", spec) or (None, None). A text location whose description has
-    an indoor word is drawn with INDOOR_VARIANTS (yield spec LY5)."""
+    """[{"n", "source", "photo", "prompt", "seed", "round"}] for the 24 stills (yield spec LY8):
+    a generated or edit entry starts at round 1 with the location seed, a photo entry has seed
+    and round None. A text location whose description has an indoor word is drawn with
+    INDOOR_VARIANTS (yield spec LY5)."""
+    seed = data["seed"]
     if data["source"] == "text":
         word = indoor_word(data["description"])
         if word is not None:
-            plan = [{"n": n, "source": "generated", "photo": None,
-                     "prompt": indoor_prompt(view, light, data["description"])}
+            return [{"n": n, "source": "generated", "photo": None,
+                     "prompt": indoor_prompt(view, light, data["description"]), "seed": seed,
+                     "round": 1}
                     for n, (view, light) in enumerate(INDOOR_VARIANTS, start=1)]
-        else:
-            plan = [{"n": n, "source": "generated", "photo": None,
-                     "prompt": gen_prompt(view, time, weather, data["description"])}
-                    for n, (view, time, weather) in enumerate(VARIANTS, start=1)]
-        jobs = [{"prompt": e["prompt"], "output_path": still_path(loc_dir, e["n"]),
-                 "seed": data["seed"], "width": WIDTH, "height": HEIGHT} for e in plan]
-        return plan, ("generate", {"jobs": jobs, "loras": None})
+        return [{"n": n, "source": "generated", "photo": None,
+                 "prompt": gen_prompt(view, time, weather, data["description"]), "seed": seed,
+                 "round": 1}
+                for n, (view, time, weather) in enumerate(VARIANTS, start=1)]
     p = len(data["photos"])
-    plan = [{"n": k, "source": "photo", "photo": k, "prompt": None} for k in range(1, p + 1)]
+    plan = [{"n": k, "source": "photo", "photo": k, "prompt": None, "seed": None, "round": None}
+            for k in range(1, p + 1)]
     for j in range(1, location_lib.TOTAL_STILLS - p + 1):
         plan.append({"n": p + j, "source": "edit", "photo": ((j - 1) % p) + 1,
-                     "prompt": EDIT_PROMPT % ((EDIT_VIEWS[j - 1],) + EDIT_CONDITIONS[j - 1])})
-    edits = [e for e in plan if e["source"] == "edit"]
-    if not edits:
-        return plan, (None, None)
+                     "prompt": EDIT_PROMPT % ((EDIT_VIEWS[j - 1],) + EDIT_CONDITIONS[j - 1]),
+                     "seed": seed, "round": 1})
+    return plan
+
+
+def _child_spec(data, loc_dir, entries):
+    """("generate", spec), ("edit", spec) or (None, None) for the image jobs of entries."""
+    if not entries:
+        return None, None
+    if data["source"] == "text":
+        jobs = [{"prompt": e["prompt"], "output_path": still_path(loc_dir, e["n"]),
+                 "seed": e["seed"], "width": WIDTH, "height": HEIGHT} for e in entries]
+        return "generate", {"jobs": jobs, "loras": None}
     jobs = [{"image": still_path(loc_dir, e["photo"]), "prompt": e["prompt"],
-             "output_path": still_path(loc_dir, e["n"]), "seed": data["seed"], "width": WIDTH,
-             "height": HEIGHT} for e in edits]
-    spec = {"image": jobs[0]["image"], "skill": "location_edit",
-            "model": character_dataset.EDIT_MODEL, "lora_repo": character_dataset.EDIT_LORA_REPO,
-            "lora_file": character_dataset.EDIT_LORA_FILE, "steps": character_dataset.EDIT_STEPS,
-            "true_cfg": character_dataset.EDIT_TRUE_CFG, "jobs": jobs}
-    return plan, ("edit", spec)
+             "output_path": still_path(loc_dir, e["n"]), "seed": e["seed"], "width": WIDTH,
+             "height": HEIGHT} for e in entries]
+    return "edit", {"image": jobs[0]["image"], "skill": "location_edit",
+                    "model": character_dataset.EDIT_MODEL,
+                    "lora_repo": character_dataset.EDIT_LORA_REPO,
+                    "lora_file": character_dataset.EDIT_LORA_FILE,
+                    "steps": character_dataset.EDIT_STEPS,
+                    "true_cfg": character_dataset.EDIT_TRUE_CFG, "jobs": jobs}
+
+
+def _render(child, spec, loc_dir, step):
+    """Run one round's image child with the story server stopped (yield spec LY8, LY11)."""
+    print("=== %s: %d stills ===" % (child, len(spec["jobs"])), flush=True)
+    if child == "generate":
+        _with_story_server_stopped(character_dataset.GENERATE_MIN_AVAIL_GIB, lambda: (
+            character_dataset.run_zimage_child(spec, loc_dir, step)))
+    else:
+        _with_story_server_stopped(character_dataset.EDIT_MIN_AVAIL_GIB, lambda: (
+            character_dataset.run_edit_child(spec, loc_dir, step)))
 
 
 def _check_entry(data, loc_dir, entry, force):
     """The manifest item of one still (spec 2.9, 2.10)."""
     item = {"n": entry["n"], "source": entry["source"], "photo": entry["photo"],
             "prompt": entry["prompt"], "match_score": None, "people_visible": None, "shot": "",
-            "time_of_day": "", "weather": "", "kept": False, "reason": None, "caption": None}
+            "time_of_day": "", "weather": "", "kept": False, "reason": None, "caption": None,
+            "seed": entry["seed"], "round": entry["round"]}
     png = still_path(loc_dir, entry["n"])
     if not os.path.isfile(png):
         item["reason"] = BLOCKED
@@ -521,6 +554,43 @@ def reason_counts(items):
     return ", ".join(counts)
 
 
+def _round_summary(round_n, items, entries):
+    """The manifest's record of one round (yield spec LY9): each still it made, with its seed,
+    score and verdict, in n order, and the kept count over all 24 stills after it."""
+    made = []
+    for e in entries:
+        item = items[e["n"] - 1]
+        made.append({"n": item["n"], "seed": item["seed"], "match_score": item["match_score"],
+                     "kept": item["kept"], "reason": item["reason"]})
+    return {"round": round_n, "made": made, "kept": sum(1 for item in items if item["kept"])}
+
+
+def _record(data, loc_dir, items, rounds, child, variant_set):
+    """Write manifest.json, contact_sheet.jpg and location.json for items after a round
+    (yield spec LY12); return (kept, contact sheet path)."""
+    photo_mode = data["source"] == "photos"
+    manifest = {"source": data["source"], "trigger": data["trigger"],
+                "description": data["description"], "seed": data["seed"],
+                "min_score": location_lib.MIN_SCORE,
+                "reference": "source photo" if photo_mode else None,
+                "generator": ("Z-Image" if not photo_mode
+                              else "%s + %s, %d steps" % (character_dataset.EDIT_MODEL,
+                                                          character_dataset.EDIT_LORA_FILE,
+                                                          character_dataset.EDIT_STEPS)
+                              if child == "edit" else "photos only"),
+                "variant_set": variant_set, "rounds": rounds, "items": items}
+    with open(os.path.join(loc_dir, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    sheet = os.path.join(loc_dir, "contact_sheet.jpg")
+    write_contact_sheet(items, os.path.join(loc_dir, "stills"), sheet, rounds=len(rounds))
+    kept = sum(1 for item in items if item["kept"])
+    data["dataset"] = {"kept": kept, "total": location_lib.TOTAL_STILLS,
+                       "min_score": location_lib.MIN_SCORE, "contact_sheet": sheet}
+    data["status"] = "untrained" if kept >= location_lib.MIN_KEEP else "dataset"
+    location_lib.write_location(data)
+    return kept, sheet
+
+
 def build_dataset(data, force=False):
     """Make, check, caption and wrap the 24 stills of location.json data; write manifest.json,
     contact_sheet.jpg and the updated location.json. Returns 0, 1 (a DatasetError or
@@ -540,47 +610,58 @@ def build_dataset(data, force=False):
 def _build_dataset(data, force):
     name = data["name"]
     loc_dir = location_lib.location_dir(name)
-    plan, (child, spec) = _plan(data, loc_dir)
+    plan = _plan(data, loc_dir)
     for k in range(1, len(data["photos"]) + 1):
         with Image.open(photo_copy_path(loc_dir, k)) as img:
             ImageOps.fit(img.convert("RGB"), (WIDTH, HEIGHT), Image.LANCZOS,
                          centering=(0.5, 0.5)).save(still_path(loc_dir, k))
     photo_mode = data["source"] == "photos"
     word = None if photo_mode else indoor_word(data["description"])
+    variant_set = None if photo_mode else ("indoor" if word else "outdoor")
     if word is not None:
         print('variants: indoor (the description has the word "%s")' % word)
-    if child == "generate":
-        print("=== generate: %d stills ===" % len(spec["jobs"]), flush=True)
-        _with_story_server_stopped(character_dataset.GENERATE_MIN_AVAIL_GIB, lambda: (
-            character_dataset.run_zimage_child(spec, loc_dir, "generate")))
-    elif child == "edit":
-        print("=== edit: %d stills ===" % len(spec["jobs"]), flush=True)
-        _with_story_server_stopped(character_dataset.EDIT_MIN_AVAIL_GIB, lambda: (
-            character_dataset.run_edit_child(spec, loc_dir, "edit")))
+    # Round 1 (yield spec LY9 step 3): every generated or edit still, with the location seed.
+    made = [e for e in plan if e["source"] != "photo"]
+    child, spec = _child_spec(data, loc_dir, made)
+    if child is not None:
+        _render(child, spec, loc_dir, child)
+    generator_child = child
 
     print("=== check ===", flush=True)
     items = [_check_entry(data, loc_dir, entry, force) for entry in plan]
-    manifest = {"source": data["source"], "trigger": data["trigger"],
-                "description": data["description"], "seed": data["seed"],
-                "min_score": location_lib.MIN_SCORE,
-                "reference": "source photo" if photo_mode else None,
-                "generator": ("Z-Image" if not photo_mode
-                              else "%s + %s, %d steps" % (character_dataset.EDIT_MODEL,
-                                                          character_dataset.EDIT_LORA_FILE,
-                                                          character_dataset.EDIT_STEPS)
-                              if child == "edit" else "photos only"),
-                "variant_set": None if photo_mode else ("indoor" if word else "outdoor"),
-                "items": items}
-    with open(os.path.join(loc_dir, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-    sheet = os.path.join(loc_dir, "contact_sheet.jpg")
-    write_contact_sheet(items, os.path.join(loc_dir, "stills"), sheet)
-
-    kept = sum(1 for item in items if item["kept"])
-    data["dataset"] = {"kept": kept, "total": location_lib.TOTAL_STILLS,
-                       "min_score": location_lib.MIN_SCORE, "contact_sheet": sheet}
-    data["status"] = "untrained" if kept >= location_lib.MIN_KEEP else "dataset"
-    location_lib.write_location(data)
+    rounds = [_round_summary(1, items, made)]
+    kept, sheet = _record(data, loc_dir, items, rounds, generator_child, variant_set)
+    # Top-up rounds (yield spec LY9 step 6): regenerate every dropped generated or edit still.
+    for r in range(2, 2 + TOPUP_ROUNDS):
+        if kept >= location_lib.MIN_KEEP:
+            break
+        redo = [plan[k] for k, item in enumerate(items)
+                if not item["kept"] and item["source"] != "photo"]
+        if not redo:
+            print("top-up: not run; no generated or edited stills were dropped")
+            break
+        if kept + len(redo) < location_lib.MIN_KEEP:
+            print("top-up: not run; %d kept + %d dropped generated or edited stills cannot reach %d"
+                  % (kept, len(redo), location_lib.MIN_KEEP))
+            break
+        print("=== top-up round %d of %d: regenerating %d dropped stills with new seeds (kept %d, "
+              "need %d) ===" % (r, 1 + TOPUP_ROUNDS, len(redo), kept, location_lib.MIN_KEEP),
+              flush=True)
+        for e in redo:
+            e["seed"] = topup_seed(data["seed"], r, e["n"])
+            e["round"] = r
+            # A blocked job writes no file, so the old dropped image must not be re-scored.
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(still_path(loc_dir, e["n"]))
+        child, spec = _child_spec(data, loc_dir, redo)
+        _render(child, spec, loc_dir, "%s-round%d" % (child, r))
+        print("=== check ===", flush=True)
+        for e in redo:
+            items[e["n"] - 1] = _check_entry(data, loc_dir, e, force)
+        rounds.append(_round_summary(r, items, redo))
+        kept, sheet = _record(data, loc_dir, items, rounds, generator_child, variant_set)
+        print("top-up round %d of %d: kept %d of %d (need %d)"
+              % (r, 1 + TOPUP_ROUNDS, kept, location_lib.TOTAL_STILLS, location_lib.MIN_KEEP))
 
     print("%-4s %-6s %-5s %s" % ("n", "score", "kept", "caption"))
     for item in items:
