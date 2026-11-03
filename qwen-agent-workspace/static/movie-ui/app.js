@@ -1850,7 +1850,7 @@
       const models = capability("seed_edit").models;
       return models && models.qwen.models[id];
     }
-    function enabled(id) { return id === "as-is" || !(probe(id) && probe(id).ok === false); }
+    function enabled(id) { return id === "as-is" || (Boolean(seedQwenEntry(id)) && !(probe(id) && probe(id).ok === false)); }
     function fresh(wanted) {
       const registry = seedRegistry();
       const loras = {};

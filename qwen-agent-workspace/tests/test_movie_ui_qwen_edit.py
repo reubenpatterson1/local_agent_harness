@@ -467,6 +467,7 @@ def test_qet38_the_picker_on_the_page():
     assert js.index("  function seedModelText(view) {") < js.index("  function qwenPicker(prefix, asIs) {")
     for line in MOUNTS:
         assert js.count(line) == 1, line
+    assert 'function enabled(id) { return id === "as-is" || (Boolean(seedQwenEntry(id)) && !(probe(id) && probe(id).ok === false)); }' in js
     assert js.index('S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false};') < js.index(
         MOUNTS[0])
     for gone in ("function renderSeedQwen(", "function readSeedQwen(", "function seedLoraBody(", "S.seeds.qwen",
