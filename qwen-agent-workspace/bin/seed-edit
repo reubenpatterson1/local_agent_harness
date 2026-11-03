@@ -32,29 +32,28 @@ cand_NN.png (ok only), then run.json, then the candidate line; (7) state done or
 interrupt kills the child, marks the pending candidates failed and writes state cancelled.
 created, source_origin and job are kept from an existing run.json; the tool owns every other key.
 
-Environment: SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python),
+Environment (read by qwen_edit.py): SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python),
 SEED_EDIT_QWENEDIT_SCRIPT (default <ws>/character_dataset.py), HF_HUB_CACHE and HF_HOME (the
 default hub), Z_IMAGE_HF_HOME (the Z-Image hub, through movie_ui_lib.zimage_hub) and HOME. The
 mflux weights and LoRAs are looked up only at their pinned revisions, in the Z-Image hub and then
-the default hub.
+the default hub. The Qwen checks and the child run live in qwen_edit.py
+(docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md); the child timeout is
+max(3600, 600 x candidates) s.
 
-Python 3.9 and 3.13. The top level imports only the standard library, movie_ui_lib and
-movie_ui_seedgen; PIL, psutil, torch, z_image_skill, content_safety and character_dataset are
-imported inside the functions that use them.
+Python 3.9 and 3.13. The top level imports only the standard library, movie_ui_lib,
+movie_ui_seedgen and qwen_edit; PIL, psutil, torch, z_image_skill, content_safety and
+character_dataset are imported inside the functions that use them.
 """
 
 import argparse
 import glob
-import importlib.util
 import json
 import os
 import re
 import secrets
 import shutil
 import signal
-import subprocess
 import sys
-import threading
 import time
 
 WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -62,6 +61,7 @@ sys.path.insert(0, WS)
 
 import movie_ui_lib as lib  # noqa: E402
 import movie_ui_seedgen as seedgen  # noqa: E402
+import qwen_edit as qe  # noqa: E402
 
 LONG_EDGE = 1024
 MULTIPLE = 16
@@ -71,23 +71,10 @@ SEED_MAX = 2147483647
 STRENGTH_DEFAULT = 0.45
 MIN_FREE_GIB = 2.0               # character_dataset.CREATE_MIN_FREE_GIB
 ZIMAGE_MIN_AVAIL_GIB = 20.0      # character_dataset.GENERATE_MIN_AVAIL_GIB
-AVAIL_WAIT_S = 600               # character_dataset.AVAIL_WAIT_S
-CHILD_TIMEOUT_S = 3600
-EDIT_MODEL = "Qwen/Qwen-Image-Edit-2511"                                  # character_dataset.EDIT_MODEL
-EDIT_LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"                # character_dataset.EDIT_LORA_REPO
-EDIT_LORA_FILE = "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors"
-EDIT_STEPS = 8
-EDIT_TRUE_CFG = 1.0
-MFLUX_MIN_VERSION = (0, 24, 0)
-MFLUX_GUIDANCE = 1.0
-DEFAULT_MFLUX_PYTHON = "~/mflux-edit/.venv/bin/python"   # expanded at use
 SAFETY_SKILL = "seed_edit"
 BACKEND_LABELS = {"zimage": "Z-Image", "mflux": "mflux", "diffusers": "diffusers"}
 
 EXTS = {"PNG": "png", "JPEG": "jpg", "MPO": "jpg", "WEBP": "webp"}
-BF16_LINE_RE = re.compile(r"^cand_(\d{2})\.part\.png (ok|blocked) ([0-9]+\.[0-9])s$")
-MFLUX_LINE_RE = re.compile(r"^seed-edit-child done (\d+) ([0-9]+\.[0-9])$")
-CHILD = None    # the running Qwen child's Popen (SG21), or None
 
 
 class Refusal(Exception):
@@ -117,33 +104,6 @@ def parse(argv):
     parser.add_argument("--lora", type=str, action="append")
     parser.add_argument("--probe", action="store_true")
     return parser.parse_args(argv)
-
-
-def check_loras(values, entry):
-    """Seed models SQ12 rows 12-16 for each --lora value in the order given: the cleaned
-    [{"id", "scale"}] in registry order, or Refusal."""
-    loras = []
-    for value in values:
-        match = re.match(r"^([a-z0-9-]+)=(.*)$", value)
-        if not match:
-            raise Refusal("--lora must be ID=SCALE (got %s)" % value)
-        lora_id, text = match.group(1), match.group(2)
-        if lora_id not in seedgen.QWEN_LORA_IDS:
-            raise Refusal("--lora: unknown LoRA %s; known: %s" % (lora_id, ", ".join(seedgen.QWEN_LORA_IDS)))
-        if any(item["id"] == lora_id for item in loras):
-            raise Refusal("--lora %s is given twice" % lora_id)
-        lora = seedgen.qwen_lora(lora_id)
-        if lora["family"] != entry["family"]:
-            raise Refusal("--lora %s is for %s, not %s" % (lora_id, seedgen.QWEN_FAMILIES[lora["family"]],
-                                                           entry["label"]))
-        try:
-            scale = float(text)
-        except ValueError:
-            scale = None
-        if scale is None or not 0 < scale <= seedgen.SCALE_MAX:
-            raise Refusal("--lora %s scale must be a number above 0 and at most 2" % lora_id)
-        loras.append({"id": lora_id, "scale": scale})
-    return seedgen.registry_order(loras)
 
 
 def check_args(args):
@@ -192,7 +152,10 @@ def check_args(args):
         qwen_model = seedgen.LEGACY_QWEN_MODEL if args.qwen_model is None else args.qwen_model
         if qwen_model not in seedgen.QWEN_MODEL_IDS:
             raise Refusal("--qwen-model must be one of %s" % ", ".join(seedgen.QWEN_MODEL_IDS))
-        loras = check_loras(args.lora or [], seedgen.qwen_model(qwen_model))
+        try:
+            loras = qe.check_lora_args(args.lora or [], seedgen.qwen_model(qwen_model))
+        except qe.SelectionError as e:
+            raise Refusal(str(e))
     if args.seed is None:
         seed = secrets.randbelow(SEED_MAX + 1)
     elif re.fullmatch(r"[0-9]+", args.seed) and int(args.seed) <= SEED_MAX:
@@ -258,23 +221,11 @@ def prepare_source(ctx):
 
 
 # ---------------------------------------------------------------------------
-# Host checks, the backend checks and the probe (SG13-SG15)
+# Host checks, the backend checks and the probe (SG13-SG15; the Qwen checks live in qwen_edit.py)
 # ---------------------------------------------------------------------------
 
 def disk_free_gib(path):
     return shutil.disk_usage(path).free / 2 ** 30
-
-
-def avail_gib():
-    import psutil
-    return psutil.virtual_memory().available / 2 ** 30
-
-
-def total_gib():
-    try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2 ** 30
-    except (ValueError, OSError):
-        return None
 
 
 def cpu_generator(seed):
@@ -282,38 +233,9 @@ def cpu_generator(seed):
     return torch.Generator("cpu").manual_seed(seed)
 
 
-def missing_modules(names):
-    """The names importlib cannot find (find_spec None, ImportError or ValueError); imports nothing."""
-    missing = []
-    for name in names:
-        try:
-            found = importlib.util.find_spec(name) is not None
-        except (ImportError, ValueError):
-            found = False
-        if not found:
-            missing.append(name)
-    return missing
-
-
-def modules_problem(names):
-    missing = missing_modules(names)
-    return "%s not importable by %s" % (", ".join(missing), sys.executable) if missing else None
-
-
-def default_hub():
-    """$HF_HUB_CACHE, else <$HF_HOME or ~/.cache/huggingface>/hub (huggingface_hub's own rule)."""
-    if os.environ.get("HF_HUB_CACHE"):
-        return os.environ["HF_HUB_CACHE"]
-    return os.path.join(os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
-
-
-def mflux_python():
-    return os.environ.get("SEED_EDIT_MFLUX_PYTHON") or os.path.expanduser(DEFAULT_MFLUX_PYTHON)
-
-
 def zimage_problem():
     """None when Z-Image img2img can run in this python, else the first problem."""
-    problem = modules_problem(["PIL", "psutil", "torch", "diffusers", "transformers"])
+    problem = qe.modules_problem(["PIL", "psutil", "torch", "diffusers", "transformers"])
     if problem:
         return problem
     for repo in (lib.STILLS_BASE_MODEL, lib.ZIMAGE_TEXT_ENCODER):
@@ -323,179 +245,19 @@ def zimage_problem():
     return None
 
 
-def find_lightning(hubs):
-    """The snapshot path of the Lightning LoRA file in the first hub holding it (a non-empty regular
-    file through its realpath), or None."""
-    for hub in hubs:
-        snapshot = lib.choose_snapshot(os.path.join(hub, lib.repo_dir_name(EDIT_LORA_REPO)))[0]
-        if snapshot is None:
-            continue
-        path = os.path.join(snapshot, EDIT_LORA_FILE)
-        real = os.path.realpath(path)
-        if os.path.isfile(real) and os.path.getsize(real) > 0:
-            return path
-    return None
-
-
-def bf16_problem():
-    """None when the diffusers bf16 child's weights and modules are present, else the first problem."""
-    problem = modules_problem(["PIL", "psutil", "torch", "diffusers", "transformers", "huggingface_hub"])
-    if problem:
-        return problem
-    hub = default_hub()
-    ok, detail = lib.model_check(EDIT_MODEL, hub)
-    if not ok:
-        return detail
-    if find_lightning([hub]) is None:
-        return "Lightning LoRA %s is not in %s" % (EDIT_LORA_FILE, hub)
-    return None
-
-
-def mflux_version(venv):
-    """(number of mflux-*.dist-info/METADATA files in venv, (parsed, text) of the highest version that
-    parses or None). Reads the files only; nothing is imported."""
-    paths = sorted(glob.glob(os.path.join(venv, "lib", "python*", "site-packages", "mflux-*.dist-info",
-                                          "METADATA")))
-    best = None
-    for path in paths:
-        text = None
-        try:
-            with open(path, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if line.startswith("Version: "):
-                        text = line[len("Version: "):].strip()
-                        break
-        except OSError:
-            continue
-        match = re.match(r"^(\d+)\.(\d+)\.(\d+)", text or "")
-        if match:
-            parsed = tuple(int(g) for g in match.groups())
-            if best is None or parsed > best[0]:
-                best = (parsed, text)
-    return len(paths), best
-
-
-def pinned_snapshot(repo, revision, hubs):
-    """(snapshot, repo_dir) of the first hub holding <repo dir>/snapshots/<revision> as a directory,
-    else (None, None)."""
-    for hub in hubs:
-        repo_dir = os.path.join(hub, lib.repo_dir_name(repo))
-        snapshot = os.path.join(repo_dir, "snapshots", revision)
-        if os.path.isdir(snapshot):
-            return snapshot, repo_dir
-    return None, None
-
-
-def pinned_file(repo, revision, name, hubs):
-    """<hub>/<repo dir>/snapshots/<revision>/<name> in the first hub where its realpath is a non-empty
-    regular file (the snapshot path is returned, not the realpath), else None."""
-    for hub in hubs:
-        path = os.path.join(hub, lib.repo_dir_name(repo), "snapshots", revision, name)
-        real = os.path.realpath(path)
-        if os.path.isfile(real) and os.path.getsize(real) > 0:
-            return path
-    return None
-
-
-def weights_problem(entry, hubs):
-    """(problem, model dir, built-in LoRA path) of an mflux registry model in hubs. problem is None
-    when the pinned snapshot is intact (for qwen21 also with its component configs and processor/)
-    and the built-in LoRA, if any, is present."""
-    where = " or ".join(hubs)
-    setup = "(run bin/seed-edit-setup --model %s)" % entry["id"]
-    snapshot, repo_dir = pinned_snapshot(entry["repo"], entry["revision"], hubs)
-    if snapshot is None:
-        return "%s@%s is not in %s %s" % (entry["repo"], entry["revision"][:12], where, setup), None, None
-    problems = list(lib.intact_scan(snapshot, repo_dir)[0])
-    if entry["family"] == "qwen21":
-        problems += ["missing %s" % rel for rel in seedgen.QWEN21_REQUIRED
-                     if not os.path.isfile(os.path.join(snapshot, rel))]
-        if not os.path.isdir(os.path.join(snapshot, "processor")):
-            problems.append("missing processor/")
-    if problems:
-        return "%s: %s %s" % (entry["repo"], "; ".join(problems), setup), None, None
-    lora = entry["builtin_lora"]
-    lora_path = None
-    if lora is not None:
-        lora_path = pinned_file(lora["repo"], lora["revision"], lora["file"], hubs)
-        if lora_path is None:
-            return "Lightning LoRA %s is not in %s %s" % (lora["file"], where, setup), None, None
-    return None, snapshot, lora_path
-
-
-def qwen_hubs():
-    """Seed models SQ16: the hubs searched for the mflux weights and LoRAs, in order."""
-    return [lib.zimage_hub(), default_hub()]
-
-
-def mflux_env_problem(entry):
-    """Seed models SQ16 (amended by §14a item H): None when the mflux venv holds mflux 0.24.0 or newer,
-    else the first problem. The setup hint names entry's own --model, so one setup run installs the
-    venv and that model."""
-    setup = "(run bin/seed-edit-setup --model %s)" % entry["id"]
-    py = mflux_python()
-    if not os.access(py, os.X_OK):
-        return "no mflux venv at %s %s" % (py, setup)
-    venv = os.path.dirname(os.path.dirname(py))
-    count, best = mflux_version(venv)
-    if count == 0:
-        return "mflux is not installed in %s %s" % (venv, setup)
-    if best is None:
-        return "cannot read the mflux version in %s" % venv
-    if best[0] < MFLUX_MIN_VERSION:
-        return "mflux %s in %s is older than 0.24.0 %s" % (best[1], venv, setup)
-    return None
-
-
-def lora_problem(lora, hubs):
-    """Seed models SQ16: (None, snapshot path) of a registry LoRA's pinned file, else (problem, None)."""
-    path = pinned_file(lora["repo"], lora["revision"], lora["file"], hubs)
-    if path is None:
-        return ("%s is not in %s (run bin/seed-edit-setup --lora %s)" % (lora["file"], " or ".join(hubs), lora["id"]),
-                None)
-    return None, path
-
-
-def qwen_model_problem(entry):
-    """Seed models SQ16: (problem, paths) of a registry model; paths is {"model_path", "builtin_lora"}
-    for a ready mflux entry, else {}."""
-    if entry["backend"] == "diffusers":
-        return bf16_problem(), {}
-    problem = mflux_env_problem(entry)
-    if problem is not None:
-        return problem, {}
-    problem, model_path, builtin_lora = weights_problem(entry, qwen_hubs())
-    if problem is not None:
-        return problem, {}
-    problem = modules_problem(["PIL", "psutil", "torch", "transformers"])
-    if problem is not None:
-        return problem, {}
-    return None, {"model_path": model_path, "builtin_lora": builtin_lora}
-
-
-def memory_problem(entry):
-    """Seed models SQ16: None when this host's total memory reaches the entry's floor, else why not."""
-    t = total_gib()
-    if t is None:
-        return "cannot read this host's memory size"
-    if t < entry["memory_gib"]:
-        return "needs a host with at least %g GiB of memory (this host has %.1f GiB)" % (entry["memory_gib"], t)
-    return None
-
-
 def probe():
     """SG15, seed models SQ18: {"zimage": {"ok", "reason", "backend"}, "qwen": {"ok", "reason",
     "models", "loras"}}; each registry model is judged by the host's total memory first, then by
     what is installed. Loads no model and starts no process."""
     p = zimage_problem()
-    hubs = qwen_hubs()
+    hubs = qe.qwen_hubs()
     models = {}
     for entry in seedgen.QWEN_MODELS:
-        reason = memory_problem(entry) or qwen_model_problem(entry)[0]
+        reason = qe.memory_problem(entry) or qe.qwen_model_problem(entry)[0]
         models[entry["id"]] = {"ok": reason is None, "reason": reason}
     loras = {}
     for lora in seedgen.QWEN_LORAS:
-        reason = lora_problem(lora, hubs)[0]
+        reason = qe.lora_problem(lora, hubs)[0]
         loras[lora["id"]] = {"ok": reason is None, "reason": reason}
     ok = any(m["ok"] for m in models.values())
     reason = None if ok else "; ".join("%s: %s" % (i, models[i]["reason"]) for i in seedgen.QWEN_MODEL_IDS)
@@ -503,27 +265,10 @@ def probe():
             "qwen": {"ok": ok, "reason": reason, "models": models, "loras": loras}}
 
 
-def wait_for_memory(floor, label):
-    """SG13 step 4: wait up to AVAIL_WAIT_S for floor GiB available, else Refusal."""
-    now = avail_gib()
-    if now >= floor:
-        return
-    say("seed-edit: waiting up to %d s for %g GiB available (now %.1f GiB)" % (AVAIL_WAIT_S, floor, now))
-    deadline = time.monotonic() + AVAIL_WAIT_S
-    while True:
-        now = avail_gib()
-        if now >= floor:
-            return
-        if time.monotonic() >= deadline:
-            raise Refusal("only %.1f GiB available after waiting %d s; %s needs %g GiB; free memory and retry"
-                          % (now, AVAIL_WAIT_S, label, floor))
-        time.sleep(5)
-
-
 def preflight(ctx):
-    """SG13 and seed models SQ21: disk, busy GPU, the selected model and LoRAs, the memory floor;
-    (backend, why) or Refusal. Sets ctx["label"], and for qwen ctx["entry"], ctx["paths"] and
-    ctx["lora_paths"] (registry order)."""
+    """SG13, seed models SQ21 and qwen edit models QE21: disk, busy GPU, the selected model and LoRAs
+    (qwen_edit.install_problem), the memory floor; (backend, why) or Refusal. Sets ctx["label"], and
+    for qwen ctx["entry"]."""
     run_dir = ctx["dir"]
     free = disk_free_gib(run_dir)
     if free < MIN_FREE_GIB:
@@ -538,22 +283,20 @@ def preflight(ctx):
         if problem is not None:
             raise Refusal("Z-Image is unavailable: %s" % problem)
         ctx["label"] = BACKEND_LABELS["zimage"]
-        wait_for_memory(ZIMAGE_MIN_AVAIL_GIB, ctx["label"])
+        try:
+            qe.wait_for_memory(ZIMAGE_MIN_AVAIL_GIB, ctx["label"])
+        except qe.Unavailable as e:
+            raise Refusal(str(e))
         return "zimage", "Z-Image img2img"
     entry = seedgen.qwen_model(opts["qwen_model"])
     ctx["entry"], ctx["label"] = entry, entry["label"]
-    problem, paths = qwen_model_problem(entry)
+    problem, _paths = qe.install_problem(entry["id"], opts["loras"])
     if problem is not None:
-        raise Refusal("%s is unavailable: %s" % (entry["label"], problem))
-    lora_paths = []
-    for item in opts["loras"]:
-        lora = seedgen.qwen_lora(item["id"])
-        problem, path = lora_problem(lora, qwen_hubs())
-        if problem is not None:
-            raise Refusal("LoRA %s is unavailable: %s" % (lora["label"], problem))
-        lora_paths.append(path)
-    wait_for_memory(entry["memory_gib"], entry["label"])
-    ctx["paths"], ctx["lora_paths"] = paths, lora_paths
+        raise Refusal(problem)
+    try:
+        qe.wait_for_memory(entry["memory_gib"], entry["label"])
+    except qe.Unavailable as e:
+        raise Refusal(str(e))
     settings = seedgen.qwen_settings(entry["id"], opts["loras"])
     listed = ", ".join("%s@%g" % (item["id"], item["scale"]) for item in settings["loras"]) or "none"
     return entry["backend"], "%s; LoRAs %s; %d steps; scheduler %s" % (
@@ -593,14 +336,6 @@ def part_path(ctx, n):
 
 def pending_path(ctx, n):
     return os.path.join(ctx["work"], "cand_%02d.pending.png" % n)
-
-
-def pending_candidate(ctx, n):
-    """Candidate n's entry while it is pending, else None."""
-    cands = ctx["record"]["candidates"]
-    if 1 <= n <= len(cands) and cands[n - 1]["status"] == "pending":
-        return cands[n - 1]
-    return None
 
 
 def first_pending(ctx):
@@ -655,7 +390,7 @@ def cleanup(work):
 
 
 # ---------------------------------------------------------------------------
-# The backends (SG17-SG22)
+# The backends (SG17-SG22; the Qwen child run lives in qwen_edit.run_jobs)
 # ---------------------------------------------------------------------------
 
 def run_zimage(ctx):
@@ -683,134 +418,18 @@ def run_zimage(ctx):
     return None
 
 
-def _kill_group(pid):
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except OSError:
-        pass
-
-
-def run_child(argv, env, on_line):
-    """SG21: run a Qwen child in its own session with a CHILD_TIMEOUT_S timer that SIGKILLs its
-    process group; echo each line to stdout and pass it to on_line without its newline. Text mode
-    reads with universal newlines, so a progress bar's carriage return also ends a line and never
-    hides a candidate line. Returns (exit code, True when the timer killed the child); any other
-    SIGKILL (a memory-pressure kill) is an ordinary -9 exit. The child is killed if this function
-    exits early (an exception in on_line, or an interrupt)."""
-    global CHILD
-    proc = subprocess.Popen(argv, cwd=WS, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                            bufsize=1, start_new_session=True)
-    CHILD = proc
-    timed_out = threading.Event()
-
-    def on_timeout():
-        if proc.poll() is None:
-            timed_out.set()
-            _kill_group(proc.pid)
-
-    timer = threading.Timer(CHILD_TIMEOUT_S, on_timeout)
-    timer.daemon = True
-    timer.start()
-    try:
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            on_line(line.rstrip("\n"))
-        return proc.wait(), timed_out.is_set()
-    finally:
-        timer.cancel()
-        if proc.poll() is None:
-            _kill_group(proc.pid)
-            proc.wait()
-        proc.stdout.close()
-        CHILD = None
-
-
-def run_qwen_child(ctx, label, argv, env, handle):
-    """SG17, SG19-SG21: run a Qwen child, handing each line to handle; None, or the SG17 text."""
-    last = [""]
-
-    def on_line(line):
-        if line.strip():
-            last[0] = line.strip()
-        handle(line)
-
-    code, timed_out = run_child(argv, env, on_line)
-    if timed_out:
-        return "%s child timed out after %d s" % (label, CHILD_TIMEOUT_S)
-    if code != 0:
-        return "%s child exited %d: %s" % (label, code, last[0] or "-")
-    if any(cand["status"] == "pending" for cand in ctx["record"]["candidates"]):
-        return "%s child exited 0 without finishing candidate %d" % (label, first_pending(ctx))
-    return None
-
-
-def run_bf16(ctx):
-    """SG19: the unchanged character_dataset.py qwenedit child (it screens with skill seed_edit and
-    never saves a blocked image); returns None or the SG17 text."""
-    work, opts, rec = ctx["work"], ctx["opts"], ctx["record"]
-    spec_path = os.path.join(work, "qwenedit_spec.json")
-    lib.write_json_atomic(spec_path, {
-        "image": os.path.join(work, "source.png"), "model": EDIT_MODEL, "lora_repo": EDIT_LORA_REPO,
-        "lora_file": EDIT_LORA_FILE, "steps": EDIT_STEPS, "true_cfg": EDIT_TRUE_CFG, "skill": SAFETY_SKILL,
-        "jobs": [{"prompt": opts["prompt"], "output_path": part_path(ctx, c["n"]), "seed": c["seed"],
-                  "width": ctx["width"], "height": ctx["height"]} for c in rec["candidates"]],
-        "report_path": os.path.join(work, "qwenedit_report.json")})
-    script = os.environ.get("SEED_EDIT_QWENEDIT_SCRIPT") or os.path.join(WS, "character_dataset.py")
-
-    def handle(line):
-        match = BF16_LINE_RE.match(line)
-        if not match or pending_candidate(ctx, int(match.group(1))) is None:
-            return
-        n = int(match.group(1))
-        if match.group(2) == "ok":
-            os.replace(part_path(ctx, n), final_path(ctx, n))
-        finish(ctx, n, match.group(2), float(match.group(3)))
-
-    return run_qwen_child(ctx, ctx["label"], [sys.executable, script, "qwenedit", "--spec", spec_path],
-                          dict(os.environ, PYTHONUNBUFFERED="1"), handle)
-
-
-def run_mflux(ctx):
-    """SG20, seed models SQ23: seed_edit_mflux_child.py under the mflux venv with the registry
-    family, the pinned local paths (the built-in Lightning LoRA, then the selected LoRAs in registry
-    order) and the run's steps and scheduler; this process screens every pending image before it
-    gets its final name. Returns None or the SG17 text."""
-    import content_safety
-    from PIL import Image
-    work, opts, rec, entry = ctx["work"], ctx["opts"], ctx["record"], ctx["entry"]
-    builtin = entry["builtin_lora"]
-    lora_paths = ([ctx["paths"]["builtin_lora"]] if builtin is not None else []) + ctx["lora_paths"]
-    lora_scales = ([builtin["scale"]] if builtin is not None else []) + [item["scale"] for item in opts["loras"]]
-    spec_path = os.path.join(work, "mflux_spec.json")
-    lib.write_json_atomic(spec_path, {
-        "family": entry["family"], "model_path": ctx["paths"]["model_path"], "lora_paths": lora_paths,
-        "lora_scales": lora_scales, "prompt": opts["prompt"], "source": os.path.join(work, "source.png"),
-        "width": ctx["width"], "height": ctx["height"], "steps": rec["steps"], "guidance": MFLUX_GUIDANCE,
-        "scheduler": rec["scheduler"],
-        "jobs": [{"n": c["n"], "seed": c["seed"], "output_path": pending_path(ctx, c["n"])}
-                 for c in rec["candidates"]]})
-
-    def handle(line):
-        match = MFLUX_LINE_RE.match(line)
-        if not match or pending_candidate(ctx, int(match.group(1))) is None:
-            return
-        n, seconds = int(match.group(1)), float(match.group(2))
-        with Image.open(pending_path(ctx, n)) as img:
-            rgb = img.convert("RGB")
-        try:
-            content_safety.assert_image_safe(rgb, skill=SAFETY_SKILL, prompt=opts["prompt"])
-        except content_safety.ContentSafetyError:
-            os.remove(pending_path(ctx, n))
-            finish(ctx, n, "blocked", seconds)
-            return
-        os.replace(pending_path(ctx, n), final_path(ctx, n))
-        finish(ctx, n, "ok", seconds)
-
-    argv = [mflux_python(), os.path.join(WS, "seed_edit_mflux_child.py"), "--spec", spec_path]
-    return run_qwen_child(ctx, ctx["label"], argv,
-                          seedgen.hf_child_env(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1"), handle)
+def run_qwen(ctx):
+    """SG19, SG20, seed models SQ23, qwen edit models QE22: every candidate through qwen_edit.run_jobs;
+    returns None or the SG17 text. The bf16 child stages cand_NN.part.png, mflux cand_NN.pending.png."""
+    opts, rec, entry = ctx["opts"], ctx["record"], ctx["entry"]
+    stage = pending_path if entry["backend"] == "mflux" else part_path
+    jobs = [{"n": c["n"], "seed": c["seed"], "prompt": opts["prompt"],
+             "source": os.path.join(ctx["work"], "source.png"), "stage_path": stage(ctx, c["n"]),
+             "output_path": final_path(ctx, c["n"])} for c in rec["candidates"]]
+    _results, failure = qe.run_jobs(entry["id"], opts["loras"], jobs, ctx["width"], ctx["height"], SAFETY_SKILL,
+                                    ctx["work"], on_result=lambda r: finish(ctx, r["n"], r["status"], r["seconds"]),
+                                    noun="candidate")
+    return failure
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +452,7 @@ def run(ctx):
     rec["backend"] = backend
     write_run(ctx)
     say("seed-edit: backend %s (%s)" % (backend, why))
-    runner = {"zimage": run_zimage, "diffusers": run_bf16, "mflux": run_mflux}[backend]
+    runner = {"zimage": run_zimage, "diffusers": run_qwen, "mflux": run_qwen}[backend]
     try:
         failure = runner(ctx)
     except Exception as e:
@@ -868,9 +487,7 @@ def main(argv=None):
     try:
         return run(ctx)
     except KeyboardInterrupt:
-        child = CHILD
-        if child is not None:
-            _kill_group(child.pid)
+        qe.kill_running_child()
         for cand in ctx["record"]["candidates"]:
             if cand["status"] == "pending":
                 cand["status"] = "failed"

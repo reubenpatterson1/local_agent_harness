@@ -1327,8 +1327,8 @@ def test_sgt34_the_new_python_files_and_the_tool_imports():
     with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
         source = f.read()
     assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
-        "argparse", "glob", "importlib.util", "json", "os", "re", "secrets", "shutil", "signal", "subprocess", "sys",
-        "threading", "time", "movie_ui_lib", "movie_ui_seedgen"]
+        "argparse", "glob", "json", "os", "re", "secrets", "shutil", "signal", "sys", "time", "movie_ui_lib",
+        "movie_ui_seedgen", "qwen_edit"]
 
 
 # --- SQT18 (seed models SQ42): bin/seed-edit-setup carries the tool's lookups byte for byte -------------------------
@@ -1344,7 +1344,7 @@ def _code_of(source, name):
 def test_sqt18_the_setup_script_carries_the_tool_lookups():
     with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
         setup = f.read()
-    with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
+    with open(os.path.join(WS, "qwen_edit.py"), encoding="utf-8") as f:
         tool = f.read()
     for name in ("mflux_version", "default_hub", "pinned_snapshot", "pinned_file", "weights_problem"):
         assert _code_of(setup, name) == _code_of(tool, name), name
