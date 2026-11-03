@@ -759,7 +759,25 @@ def job_summary(server, job_id, queue):
 def _fields_body(body):
     fields = lib.compose_fields(body)
     fields["ws"] = resolve_ws(body.get("ws"))
+    if fields["seed_edit_model"] not in (None, "as-is"):
+        # Qwen edit models QE57: a named registry selection is checked and stored cleaned (400 otherwise).
+        model_id, loras, error = seedgen.qwen_selection(fields["seed_edit_model"], fields["seed_edit_loras"],
+                                                        "seed_edit_model", "seed_edit_loras")
+        if error is not None:
+            raise ApiError(400, error)
+        fields["seed_edit_model"], fields["seed_edit_loras"] = model_id, loras
     return fields
+
+
+def _edit_given(body):
+    """Qwen edit models QE56: True when a Locations or Characters request names a Qwen edit selection."""
+    return body.get("qwen_model") is not None or body.get("loras") is not None
+
+
+def edit_availability(real, model_id, loras):
+    """The 409 text of a Qwen edit selection (seed models SQ31 rules through bin/seed-edit --probe), or None."""
+    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
+    return seedgen.availability_error(models, detail, {"model": "qwen", "qwen_model": model_id, "loras": loras})
 
 
 def _preview(server, fields):
@@ -828,6 +846,11 @@ def _h_job_create(self, groups, query, body):
     checks = lib.run_checks(fields, fields["ws"], self.server.state)
     if not lib.checks_pass(checks):
         raise ApiError(409, "validation failed", checks=checks)
+    if (fields["action"] == "movie" and fields["seed_upload"]
+            and fields["seed_edit_model"] not in (None, "as-is")):
+        text = edit_availability(fields["ws"], fields["seed_edit_model"], fields["seed_edit_loras"])
+        if text is not None:
+            raise ApiError(409, text)
     job_id = create_compose_job(self.server, fields,
                                 seams=isinstance(body, dict) and body.get("check_seams") is True)
     return 201, {"job": job_summary(self.server, job_id, lib.read_queue(self.server.state)), "checks": checks}
@@ -931,6 +954,11 @@ def _h_seed_folder(self, groups, query, body):
     clean, error = seedfolder.validate_request(body)
     if error is not None:
         raise ApiError(400, error)
+    if (not clean["preview"] and fields["action"] == "movie"
+            and fields["seed_edit_model"] not in (None, "as-is")):
+        text = edit_availability(fields["ws"], fields["seed_edit_model"], fields["seed_edit_loras"])
+        if text is not None:
+            raise ApiError(409, text)
     fields["seed_upload"] = fields["width"] = fields["height"] = None
     rows, shared = seed_rows(server, fields, clean)
     if clean["preview"]:
@@ -1448,6 +1476,13 @@ def character_create_errors(body, state):
         errors.append("seed image upload %s not found" % (_fs_text(seed) if isinstance(seed, str) else seed,))
     if not isinstance(force, bool):
         errors.append("force must be true or false")
+    if _edit_given(body):
+        if seed is None:
+            errors.append("qwen_model and loras apply only to seed-image characters")
+        else:
+            error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))[2]
+            if error is not None:
+                errors.append(error)
     return errors
 
 
@@ -1478,6 +1513,12 @@ def _h_character_create(self, groups, query, body):
             fields[key] = None
     fields["force"] = body.get("force", False)
     fields["ws"] = real
+    if _edit_given(body) and fields["seed_upload"]:
+        model_id, loras, _error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))
+        text = edit_availability(real, model_id, loras)
+        if text is not None:
+            raise ApiError(409, text)
+        fields["qwen_model"], fields["loras"] = model_id, loras
     return create_character_job(self.server, "character-create", real, fields)
 
 
@@ -1545,6 +1586,16 @@ def _h_character_seed_folder(self, groups, query, body):
     clean, error = seedfolder.validate_character_request(body)
     if error is not None:
         raise ApiError(400, error)
+    edit = None
+    if _edit_given(body):
+        model_id, loras, error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))
+        if error is not None:
+            raise ApiError(400, error)
+        if not clean["preview"]:
+            text = edit_availability(real, model_id, loras)
+            if text is not None:
+                raise ApiError(409, text)
+        edit = (model_id, loras)
     rows = _character_rows(server, real, body, clean)
     if clean["preview"]:
         return 200, _character_response(server, rows)
@@ -1560,6 +1611,8 @@ def _h_character_seed_folder(self, groups, query, body):
             fields = {"name": name, "phrase": body.get("phrase"), "class_noun": None, "descriptor": None,
                       "trigger": None, "seed": body.get("seed"), "seed_upload": rows[i]["upload_id"],
                       "force": False, "ws": real, "seed_folder": {"run": run, "name": rows[i]["name"]}}
+            if edit is not None:
+                fields["qwen_model"], fields["loras"] = edit
             created.append((i, name, _character_job_locked(server, "character-create", real, fields)))
     job_ids = {}
     for i, name, job_id in created:
@@ -1571,10 +1624,30 @@ def _h_character_seed_folder(self, groups, query, body):
 def _h_character_regenerate(self, groups, query, body):
     real = self.ws(body.get("ws"))
     seed = body.get("seed")
+    errors = []
     if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and 0 <= seed <= 2147483647):
-        raise ApiError(400, "invalid fields", errors=["seed must be an integer from 0 to 2147483647"])
-    return create_character_job(self.server, "character-regenerate", real,
-                                {"ws": real, "name": groups[0], "seed": seed})
+        errors.append("seed must be an integer from 0 to 2147483647")
+    given = _edit_given(body)
+    if given:
+        library = os.environ.get("CHARACTER_LIBRARY_DIR") or os.path.join(real, "generated", "characters")
+        record = lib.read_json(os.path.join(library, groups[0], "character.json"))
+        source = record.get("source") if isinstance(record, dict) else None
+        if isinstance(source, dict) and source.get("type") == "descriptor":
+            errors.append("qwen_model and loras apply only to seed-image characters")
+        else:
+            error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))[2]
+            if error is not None:
+                errors.append(error)
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    fields = {"ws": real, "name": groups[0], "seed": seed}
+    if given:
+        model_id, loras, _error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))
+        text = edit_availability(real, model_id, loras)
+        if text is not None:
+            raise ApiError(409, text)
+        fields["qwen_model"], fields["loras"] = model_id, loras
+    return create_character_job(self.server, "character-regenerate", real, fields)
 
 
 def _h_character_train(self, groups, query, body):
@@ -1995,6 +2068,13 @@ def location_create_errors(body, state):
     errors += _seed_errors(body.get("seed"))
     if not isinstance(body.get("force", False), bool):
         errors.append("force must be true or false")
+    if _edit_given(body):
+        if not photos:
+            errors.append("qwen_model and loras apply only to photo locations")
+        else:
+            error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))[2]
+            if error is not None:
+                errors.append(error)
     return errors
 
 
@@ -2058,6 +2138,13 @@ def _h_location_create(self, groups, query, body):
     fields = {"ws": real, "name": body["name"], "photo_uploads": list(body.get("photo_uploads") or []),
               "description": body.get("description") or None, "trigger": body.get("trigger") or None,
               "seed": body.get("seed"), "force": body.get("force", False)}
+    if _edit_given(body) and fields["photo_uploads"]:
+        model_id, loras, _error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))
+        if len(fields["photo_uploads"]) < LOCATION_MAX_PHOTOS:       # 24 photos: no edit runs
+            text = edit_availability(real, model_id, loras)
+            if text is not None:
+                raise ApiError(409, text)
+        fields["qwen_model"], fields["loras"] = model_id, loras
     return create_location_job(self.server, "location-create", real, fields)
 
 
@@ -2092,11 +2179,30 @@ def _h_location_regenerate(self, groups, query, body):
     for key, value in (("new_seed", new_seed), ("force", force)):
         if not isinstance(value, bool):
             errors.append("%s must be true or false" % key)
+    given = _edit_given(body)
+    record = None
+    if given:
+        library = os.environ.get("LOCATION_LIBRARY_DIR") or os.path.join(real, "generated", "locations")
+        record = lib.read_json(os.path.join(library, groups[0], "location.json"))
+        if isinstance(record, dict) and record.get("source") == "text":
+            errors.append("qwen_model and loras apply only to photo locations")
+        else:
+            error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))[2]
+            if error is not None:
+                errors.append(error)
     if errors:
         raise ApiError(400, "invalid fields", errors=errors)
-    return create_location_job(self.server, "location-regenerate", real,
-                               {"ws": real, "name": groups[0], "seed": seed, "new_seed": new_seed,
-                                "description": description or None, "force": force})
+    fields = {"ws": real, "name": groups[0], "seed": seed, "new_seed": new_seed,
+              "description": description or None, "force": force}
+    if given:
+        model_id, loras, _error = seedgen.qwen_selection(body.get("qwen_model"), body.get("loras"))
+        photos = record.get("photos") if isinstance(record, dict) else None
+        if not (isinstance(photos, list) and len(photos) >= LOCATION_MAX_PHOTOS):   # plan ruling R11
+            text = edit_availability(real, model_id, loras)
+            if text is not None:
+                raise ApiError(409, text)
+        fields["qwen_model"], fields["loras"] = model_id, loras
+    return create_location_job(self.server, "location-regenerate", real, fields)
 
 
 def _h_location_train(self, groups, query, body):

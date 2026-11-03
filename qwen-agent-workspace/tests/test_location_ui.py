@@ -264,7 +264,7 @@ def test_lu9_job_vlm_policy(tmp_path):
 
 def test_lu10_compose_fields_flags_and_rule_12c(env):
     state = env["state"]
-    assert len(lib.FIELD_FLAGS) == 30
+    assert len(lib.FIELD_FLAGS) == 31
     keys = [k for k, _flags in lib.FIELD_FLAGS]
     assert keys[keys.index("characters") + 1:keys.index("characters") + 3] == [
         "locations", "location_strength"]

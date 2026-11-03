@@ -7,8 +7,10 @@ docs/superpowers/specs/2026-11-02-seed-models-design.md, Section 4).
   ~/mflux-edit/.venv/bin/python seed_edit_mflux_child.py --spec SPEC
 
 The spec carries family, model_path, lora_paths and lora_scales (equal-length lists, possibly
-empty), prompt, source, width, height, steps, guidance (always 1.0), scheduler (qwen21 only) and
-jobs. Runs under the mflux venv's Python (mflux pinned to 0.24.0). It never screens: bin/seed-edit
+empty), width, height, steps, guidance (always 1.0), scheduler (qwen21 only) and jobs, each {n,
+seed, prompt, source, output_path}; a spec-level prompt and source (the shape before
+docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md) are used for jobs that carry none.
+Runs under the mflux venv's Python (mflux pinned to 0.24.0). It never screens: bin/seed-edit
 screens each pending image before giving it its final name. After saving each job's image as RGB
 it prints "seed-edit-child done <n> <seconds>". LoRAs are never baked into the quantized weights.
 
@@ -86,7 +88,9 @@ def main(argv=None):
     peak = getattr(mx, "get_peak_memory", None) or mx.metal.get_peak_memory
     for job in spec["jobs"]:
         started = time.monotonic()
-        kwargs = {"seed": job["seed"], "prompt": spec["prompt"], "image_paths": [spec["source"]],
+        prompt = job["prompt"] if "prompt" in job else spec["prompt"]
+        source = job["source"] if "source" in job else spec["source"]
+        kwargs = {"seed": job["seed"], "prompt": prompt, "image_paths": [source],
                   "num_inference_steps": spec["steps"], "guidance": spec["guidance"],
                   "width": spec["width"], "height": spec["height"]}
         if family == "qwen21":

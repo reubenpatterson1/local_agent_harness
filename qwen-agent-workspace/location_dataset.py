@@ -3,14 +3,15 @@
 (docs/superpowers/specs/2026-10-29-location-lora-design.md, Sections 2 and 3).
 
 A location's dataset is 24 people-free 1024x640 stills: 24 Z-Image text2img stills of the
-description (text mode), or the user's photos plus Qwen-Image-Edit-2511 edits of them that
+description (text mode), or the user's photos plus Qwen edits (the registry model of
+location.json's edit key; docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md) of them that
 re-shoot the place from a new viewpoint at a new time of day, weather or season (photo mode).
 The vision model checks every still; the kept ones get a trigger-led caption and a 1-frame mp4.
 When fewer than 12 are kept, the dropped generated or edited stills are regenerated with new seeds
 for up to 2 more rounds (docs/superpowers/specs/2026-11-02-location-yield-design.md). Training
 reuses character_dataset.train_video_lora and train_stills_lora.
 
-Top-level imports are stdlib, PIL, psutil, character_dataset and location_lib. All
+Top-level imports are stdlib, PIL, psutil, character_dataset, location_lib and qwen_edit. All
 image work runs in character_dataset's own child processes (run_zimage_child, run_edit_child),
 so character_dataset.busy_process's markers cover location work. Every gate, VLM call and child
 is called through the character_dataset module, so a test fake there applies here too.
@@ -31,6 +32,7 @@ sys.path.insert(0, WS)
 
 import character_dataset  # noqa: E402
 import location_lib  # noqa: E402
+import qwen_edit  # noqa: E402
 
 DatasetError = character_dataset.DatasetError
 STYLE = character_dataset.STYLE        # "photorealistic live-action film still, natural light"
@@ -245,6 +247,7 @@ REASON_GROUPS = (("people visible", "people visible"), ("score ", "score below 7
                  ("blocked by the content screen", "blocked by the content screen"),
                  ("unparseable", "unparseable"))
 BLOCKED = "blocked by the content screen"
+PHOTO_ONLY = "--qwen-model and --lora apply only to photo locations"
 FORCE_HINT = " (pass --force to keep it)"
 # Spec 3.3, 3.4: the trigger-only test prompt of both LoRAs.
 TEST_PROMPT = "%s, wide establishing shot at dusk, empty of people."
@@ -485,12 +488,14 @@ def _child_spec(data, loc_dir, entries):
     jobs = [{"image": still_path(loc_dir, e["photo"]), "prompt": e["prompt"],
              "output_path": still_path(loc_dir, e["n"]), "seed": e["seed"], "width": WIDTH,
              "height": HEIGHT} for e in entries]
+    edit_model, edit_loras = qwen_edit.selection_of(data["edit"])
     return "edit", {"image": jobs[0]["image"], "skill": "location_edit",
                     "model": character_dataset.EDIT_MODEL,
                     "lora_repo": character_dataset.EDIT_LORA_REPO,
                     "lora_file": character_dataset.EDIT_LORA_FILE,
                     "steps": character_dataset.EDIT_STEPS,
-                    "true_cfg": character_dataset.EDIT_TRUE_CFG, "jobs": jobs}
+                    "true_cfg": character_dataset.EDIT_TRUE_CFG, "jobs": jobs,
+                    "edit": {"qwen_model": edit_model, "loras": edit_loras}}
 
 
 def _render(child, spec, loc_dir, step):
@@ -500,7 +505,7 @@ def _render(child, spec, loc_dir, step):
         _with_story_server_stopped(character_dataset.GENERATE_MIN_AVAIL_GIB, lambda: (
             character_dataset.run_zimage_child(spec, loc_dir, step)))
     else:
-        _with_story_server_stopped(character_dataset.EDIT_MIN_AVAIL_GIB, lambda: (
+        _with_story_server_stopped(qwen_edit.memory_floor(spec["edit"]["qwen_model"]), lambda: (
             character_dataset.run_edit_child(spec, loc_dir, step)))
 
 
@@ -583,11 +588,13 @@ def _record(data, loc_dir, items, rounds, child, variant_set):
                 "min_score": location_lib.MIN_SCORE,
                 "reference": "source photo" if photo_mode else None,
                 "generator": ("Z-Image" if not photo_mode
-                              else "%s + %s, %d steps" % (character_dataset.EDIT_MODEL,
-                                                          character_dataset.EDIT_LORA_FILE,
-                                                          character_dataset.EDIT_STEPS)
-                              if child == "edit" else "photos only"),
-                "variant_set": variant_set, "rounds": rounds, "items": items}
+                              else qwen_edit.generator_text(*qwen_edit.selection_of(data["edit"]))
+                              if child == "edit" else "photos only")}
+    if child == "edit":
+        manifest["edit"] = data["edit"]
+    manifest["variant_set"] = variant_set
+    manifest["rounds"] = rounds
+    manifest["items"] = items
     with open(os.path.join(loc_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     sheet = os.path.join(loc_dir, "contact_sheet.jpg")
@@ -740,7 +747,11 @@ def _load_photos(paths):
     return loaded, None
 
 
-def _edit_models_problem():
+def _edit_models_problem(model_id, loras):
+    """The photo editor preflight (qwen edit models QE26): qwen2511-bf16 keeps today's check of the
+    diffusers weights; every other registry model is checked through character_dataset."""
+    if model_id != qwen_edit.LEGACY_EDIT_MODEL:
+        return character_dataset.edit_selection_problem(model_id, loras)
     missing = character_dataset.edit_models_missing()
     if not missing:
         return None
@@ -807,6 +818,15 @@ def create(args):
             return _error(problem)
     if not photos and description is None:
         return _error("create needs --description or at least one --photo")
+    qwen_model, lora = getattr(args, "qwen_model", None), getattr(args, "lora", None)
+    if not photos and (qwen_model is not None or lora is not None):
+        return _error(PHOTO_ONLY)
+    edit_model = edit_loras = None
+    if photos:
+        try:
+            edit_model, edit_loras = qwen_edit.cli_selection(qwen_model, lora)
+        except qwen_edit.SelectionError as e:
+            return _error(str(e))
     seed = args.seed if args.seed is not None else 0
     if not 0 <= seed <= SEED_MAX:
         return _error("--seed must be between 0 and 2147483647")
@@ -820,7 +840,7 @@ def create(args):
             return _error("trigger %s is already used by %s; triggers are never reused"
                           % (args.trigger, owner))
     if photos and len(photos) < location_lib.TOTAL_STILLS:
-        problem = _edit_models_problem()
+        problem = _edit_models_problem(edit_model, edit_loras)
         if problem:
             return _error(problem)
 
@@ -857,7 +877,11 @@ def create(args):
                 "seed": seed, "status": "dataset", "created_at": location_lib.utc_now(),
                 "trained_at": None, "dataset": None, "loras": {"video": None, "stills": None},
                 "stills_skip_reason": None, "strength": None}
+        if photos:
+            data["edit"] = qwen_edit.settings(edit_model, edit_loras)
         location_lib.write_location(data)
+        if photos and len(photos) < location_lib.TOTAL_STILLS:
+            print("edit model: %s" % qwen_edit.generator_text(edit_model, edit_loras))
         return build_dataset(data, args.force)
 
 
@@ -872,6 +896,15 @@ def _regenerate(args):
     if args.photos or args.trigger is not None:
         return _error("--regenerate takes no --photo or --trigger: a location keeps the photos and "
                       "the trigger it was created with")
+    qwen_model, lora = getattr(args, "qwen_model", None), getattr(args, "lora", None)
+    if data["source"] != "photos" and (qwen_model is not None or lora is not None):
+        return _error(PHOTO_ONLY)
+    edit_model = edit_loras = None
+    if data["source"] == "photos":
+        try:
+            edit_model, edit_loras = qwen_edit.cli_selection(qwen_model, lora)
+        except qwen_edit.SelectionError as e:
+            return _error(str(e))
     if args.seed is not None and args.new_seed:
         return _error("give --seed or --new-seed, not both")
     if args.seed is not None and not 0 <= args.seed <= SEED_MAX:
@@ -888,7 +921,7 @@ def _regenerate(args):
         return _error("location %s is trained; regenerating its dataset deletes its LoRAs. Pass "
                       "--force to regenerate it anyway" % name)
     if data["source"] == "photos" and len(data["photos"]) < location_lib.TOTAL_STILLS:
-        problem = _edit_models_problem()
+        problem = _edit_models_problem(edit_model, edit_loras)
         if problem:
             return _error(problem)
     if data["source"] == "photos":
@@ -917,10 +950,14 @@ def _regenerate(args):
             data["trained_at"] = None
             data["stills_skip_reason"] = None
         data["seed"], data["description"] = new_seed, description
+        if data["source"] == "photos":
+            data["edit"] = qwen_edit.settings(edit_model, edit_loras)
         data["status"], data["dataset"] = "dataset", None
         location_lib.write_location(data)
         print("seed: %d -> %d" % (old_seed, new_seed) if new_seed != old_seed
               else "seed: %d (unchanged)" % old_seed)
+        if data["source"] == "photos" and len(data["photos"]) < location_lib.TOTAL_STILLS:
+            print("edit model: %s" % qwen_edit.generator_text(edit_model, edit_loras))
         for sub in ("stills", "captions", "videos"):
             shutil.rmtree(os.path.join(loc_dir, sub), ignore_errors=True)
             os.makedirs(os.path.join(loc_dir, sub))

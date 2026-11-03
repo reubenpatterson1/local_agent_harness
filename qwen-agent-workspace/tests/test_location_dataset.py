@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(WS, "tests"))
 
 import character_dataset  # noqa: E402
 import location_testutil as lt  # noqa: E402
+import qwen_edit  # noqa: E402
 import story_engine_testutil as seu  # noqa: E402
 
 ld = importlib.machinery.SourceFileLoader(
@@ -218,6 +219,7 @@ class _Fakes(object):
         monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
         monkeypatch.setattr(character_dataset, "run_edit_child", _child)
         monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: list(fakes.missing))
+        monkeypatch.setattr(character_dataset, "edit_selection_problem", lambda model_id, loras: None)
         monkeypatch.setattr(character_dataset, "restore_story_server",
                             lambda wait=False: fakes.server_calls.append(
                                 "restore-wait" if wait else "restore") or 0)
@@ -575,7 +577,8 @@ def test_ld9_the_round_robin_top_up(env, monkeypatch, tmp_path, count):
 
 def test_ld10_the_edit_model_gate(env, monkeypatch, tmp_path, capsys):
     fakes = _Fakes(monkeypatch, missing=["Qwen/Qwen-Image-Edit-2511"])
-    assert ld.create(_create_args(photos=_photos(tmp_path, 2), description=lt.HARBOUR_DESC)) == 2
+    assert ld.create(_create_args(photos=_photos(tmp_path, 2), description=lt.HARBOUR_DESC,
+                                  qwen_model="qwen2511-bf16")) == 2
     assert _err_line(capsys) == (
         "Error: the photo editor is not downloaded: Qwen/Qwen-Image-Edit-2511; download it with: "
         "hf download Qwen/Qwen-Image-Edit-2511")
@@ -650,8 +653,7 @@ def test_ld13_the_manifest(env, monkeypatch, tmp_path):
                                   description=lt.MILL_DESC)) == 0
     manifest = _manifest(env, "old-mill")
     assert (manifest["source"], manifest["reference"], manifest["generator"]) == (
-        "photos", "source photo", "Qwen/Qwen-Image-Edit-2511 + "
-        "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors, 8 steps")
+        "photos", "source photo", qwen_edit.generator_text("qwen21-q4", [{"id": "uncensored", "scale": 1.0}]))
     assert manifest["variant_set"] is None
     photo, edit = manifest["items"][1], manifest["items"][2]
     assert (photo["source"], photo["photo"], photo["prompt"], photo["match_score"]) == (
@@ -1745,3 +1747,210 @@ def test_lyd15_a_busy_process_stops_the_top_up(env, monkeypatch, capsys):
     assert ld.create(_create_args(name="dock-one", description=lt.TEMPLE_DESC)) == 0
     assert calls == [1]
     assert "top-up" not in capsys.readouterr().out
+
+
+# --- QET18 (qwen edit models QE33): run_edit_child routes by the spec's edit key -----------------------------
+
+def test_qet18_run_edit_child_routes_by_the_edit_key(tmp_path, monkeypatch):
+    char_dir = str(tmp_path / "loc")
+    a, b = str(tmp_path / "a.png"), str(tmp_path / "b.png")
+    out = [str(tmp_path / ("loc_%02d.png" % n)) for n in (3, 4)]
+    base = {"image": a, "skill": "location_edit", "model": character_dataset.EDIT_MODEL,
+            "lora_repo": character_dataset.EDIT_LORA_REPO, "lora_file": character_dataset.EDIT_LORA_FILE,
+            "steps": character_dataset.EDIT_STEPS, "true_cfg": character_dataset.EDIT_TRUE_CFG,
+            "jobs": [{"image": a, "prompt": "north view", "output_path": out[0], "seed": 4, "width": 1024,
+                      "height": 640},
+                     {"image": b, "prompt": "south view", "output_path": out[1], "seed": 4, "width": 1024,
+                      "height": 640}]}
+    runs, calls = [], []
+
+    def _run_logged(cmd, log_path, cwd, env, timeout_s):
+        spec_path = cmd[cmd.index("--spec") + 1]
+        with open(spec_path, encoding="utf-8") as f:
+            text = f.read()
+        runs.append({"cmd": cmd, "text": text, "log": log_path, "timeout": timeout_s, "spec_path": spec_path})
+        with open(json.loads(text)["report_path"], "w", encoding="utf-8") as f:
+            json.dump({"jobs": [{"output_path": p, "status": "ok", "seconds": 1.0} for p in out]}, f)
+        return 0
+
+    def _run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None,
+                  noun="job"):
+        calls.append({"model_id": model_id, "loras": loras, "jobs": jobs, "size": (width, height), "skill": skill,
+                      "work_dir": work_dir, "log_path": log_path})
+        return [{"n": j["n"], "output_path": j["output_path"], "status": "ok", "seconds": 2.5} for j in jobs], None
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run_logged)
+    monkeypatch.setattr(qwen_edit, "run_jobs", _run_jobs)
+    for edit in (None, {"qwen_model": "qwen2511-bf16", "loras": []}):
+        spec = dict(base) if edit is None else dict(base, edit=edit)
+        report = character_dataset.run_edit_child(spec, char_dir, "edit")
+        run = runs[-1]
+        stem = run["log"][:-len(".log")]
+        assert run["cmd"] == [sys.executable, os.path.join(WS, "character_dataset.py"), "qwenedit", "--spec",
+                              stem + ".spec.json"]
+        assert run["text"] == json.dumps(dict(base, report_path=stem + ".report.json"), indent=2)
+        assert run["timeout"] == character_dataset.EDIT_CHILD_TIMEOUT_S
+        assert report == {"jobs": [{"output_path": p, "status": "ok", "seconds": 1.0} for p in out]}
+    assert calls == []
+    unc = [{"id": "uncensored", "scale": 1.0}]
+    report = character_dataset.run_edit_child(dict(base, edit={"qwen_model": "qwen21-q4", "loras": unc}), char_dir,
+                                              "edit-round2")
+    (call,) = calls
+    log = call["log_path"]
+    assert log.startswith(os.path.join(char_dir, "logs") + os.sep) and log.endswith("-edit-round2.log")
+    assert (call["model_id"], call["loras"], call["size"], call["skill"], call["work_dir"]) == (
+        "qwen21-q4", unc, (1024, 640), "location_edit", log[:-len(".log")])
+    assert call["jobs"] == [
+        {"n": 1, "seed": 4, "prompt": "north view", "source": a, "stage_path": str(tmp_path / "loc_03.pending.png"),
+         "output_path": out[0]},
+        {"n": 2, "seed": 4, "prompt": "south view", "source": b, "stage_path": str(tmp_path / "loc_04.pending.png"),
+         "output_path": out[1]}]
+    assert report == {"jobs": [{"output_path": p, "status": "ok", "seconds": 2.5} for p in out]}
+    character = {"image": a, "model": character_dataset.EDIT_MODEL, "lora_repo": character_dataset.EDIT_LORA_REPO,
+                 "lora_file": character_dataset.EDIT_LORA_FILE, "steps": 8, "true_cfg": 1.0,
+                 "edit": {"qwen_model": "qwen21-q4", "loras": unc},
+                 "jobs": [{"prompt": "a pose", "output_path": out[0], "seed": 0, "width": 1024, "height": 640}]}
+    character_dataset.run_edit_child(character, char_dir, "edit")
+    assert (calls[-1]["skill"], calls[-1]["jobs"][0]["source"]) == ("character_edit", a)
+
+    def _failing(*args, **kwargs):
+        return [], "Qwen-Image-2.1 q4 child exited 1: boom"
+
+    monkeypatch.setattr(qwen_edit, "run_jobs", _failing)
+    with pytest.raises(character_dataset.DatasetError) as info:
+        character_dataset.run_edit_child(character, char_dir, "edit")
+    assert str(info.value) == "Qwen-Image-2.1 q4 child exited 1: boom; log: %s" % info.value.log_path
+    assert info.value.log_path.endswith("-edit.log")
+
+    def _unavailable(*args, **kwargs):
+        raise qwen_edit.Unavailable("LoRA Uncensored (abenzerps) is unavailable: gone")
+
+    monkeypatch.setattr(qwen_edit, "run_jobs", _unavailable)
+    with pytest.raises(character_dataset.DatasetError) as info:
+        character_dataset.run_edit_child(character, char_dir, "edit")
+    assert str(info.value) == "LoRA Uncensored (abenzerps) is unavailable: gone"
+
+
+# --- QET13-QET17 (qwen edit models QE25-QE30): the Qwen selection of photo edits ---------------------------
+
+UNC = [{"id": "uncensored", "scale": 1.0}]
+
+
+def _floors(monkeypatch):
+    """Replace wait_for_avail with a recorder of the floors it is asked for; returns the list."""
+    floors = []
+    monkeypatch.setattr(character_dataset, "wait_for_avail", lambda gib, timeout_s: floors.append(gib) or True)
+    return floors
+
+
+def test_qet13_a_photo_create_records_the_selection(env, monkeypatch, tmp_path, capsys):
+    fakes = _Fakes(monkeypatch)
+    floors = _floors(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 2), description=lt.MILL_DESC)) == 0
+    ((spec, step),) = fakes.child_specs
+    stills = os.path.join(env["locations"], "old-mill", "stills")
+    assert (step, spec["skill"], spec["edit"]) == ("edit", "location_edit", {"qwen_model": "qwen21-q4", "loras": UNC})
+    assert [job["image"] for job in spec["jobs"][:2]] == [_loc(stills, 1), _loc(stills, 2)]
+    assert _record(env, "old-mill")["edit"] == qwen_edit.settings("qwen21-q4", UNC)
+    manifest = _manifest(env, "old-mill")
+    text = qwen_edit.generator_text("qwen21-q4", UNC)
+    assert (manifest["generator"], manifest["edit"]) == (text, qwen_edit.settings("qwen21-q4", UNC))
+    assert list(manifest) == ["source", "trigger", "description", "seed", "min_score", "reference", "generator",
+                              "edit", "variant_set", "rounds", "items"]
+    assert floors == [20.0]
+    assert "edit model: %s" % text in capsys.readouterr().out.splitlines()
+    fakes = _Fakes(monkeypatch)
+    floors = _floors(monkeypatch)
+    assert ld.create(_create_args(name="dock-one", photos=_photos(tmp_path, 2), description=lt.MILL_DESC,
+                                  qwen_model="qwen2511-bf16")) == 0
+    spec = fakes.child_specs[0][0]
+    assert spec["edit"] == {"qwen_model": "qwen2511-bf16", "loras": []}
+    assert (spec["model"], spec["lora_file"], spec["steps"]) == (
+        character_dataset.EDIT_MODEL, character_dataset.EDIT_LORA_FILE, 8)
+    assert _manifest(env, "dock-one")["generator"] == (
+        "Qwen/Qwen-Image-Edit-2511 + Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors, 8 steps")
+    assert floors == [64.0]
+
+
+def test_qet14_the_options_need_a_photo_location(env, monkeypatch, tmp_path, capsys):
+    fakes = _Fakes(monkeypatch)
+    photo_only = "Error: --qwen-model and --lora apply only to photo locations"
+    for extra in ({"qwen_model": "qwen21-q4"}, {"lora": ["uncensored=1"]}):
+        assert ld.create(_create_args(description=lt.HARBOUR_DESC, **extra)) == 2, extra
+        assert _err_line(capsys) == photo_only
+    assert not os.path.exists(os.path.join(env["locations"], "harbour-street"))
+    assert ld.create(_create_args(description=lt.HARBOUR_DESC)) == 0
+    path = os.path.join(env["locations"], "harbour-street", "location.json")
+    with open(path, encoding="utf-8") as f:
+        before = f.read()
+    assert "edit" not in json.loads(before)
+    assert ld.create(_create_args(regenerate=True, qwen_model="qwen21-q4")) == 2
+    assert _err_line(capsys) == photo_only
+    with open(path, encoding="utf-8") as f:
+        assert f.read() == before
+    paths = _photos(tmp_path, 2)
+    assert ld.create(_create_args(name="old-mill", photos=paths, description=lt.MILL_DESC,
+                                  lora=["uncensored=1"])) == 2
+    assert _err_line(capsys) == "Error: --lora needs --qwen-model"
+    assert ld.create(_create_args(name="old-mill", photos=paths, description=lt.MILL_DESC, qwen_model="flux")) == 2
+    assert _err_line(capsys) == ("Error: --qwen-model must be one of qwen21-q4, qwen21-q8, qwen21-bf16, "
+                                 "qwen2511-q4, qwen2511-bf16")
+    assert not os.path.exists(os.path.join(env["locations"], "old-mill"))
+    assert len(fakes.child_specs) == 1
+
+
+def test_qet16_regenerate_records_the_selection_under_the_lock(env, monkeypatch, tmp_path, capsys):
+    _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 2), description=lt.MILL_DESC)) == 0
+    path = os.path.join(env["locations"], "old-mill", "location.json")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    del data["edit"]                                    # a photo location made before this feature
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    _Fakes(monkeypatch)
+    writes = []
+    real_write = ll.write_location
+    monkeypatch.setattr(ll, "write_location", lambda d: writes.append((d["seed"], d.get("edit"))) or real_write(d))
+    assert ld.create(_create_args(name="old-mill", regenerate=True, new_seed=True, qwen_model="qwen21-q8")) == 0
+    assert writes[0] == (1, qwen_edit.settings("qwen21-q8", []))
+    assert _record(env, "old-mill")["edit"] == qwen_edit.settings("qwen21-q8", [])
+    assert "edit model: %s" % qwen_edit.generator_text("qwen21-q8", []) in capsys.readouterr().out.splitlines()
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", regenerate=True)) == 0
+    assert _record(env, "old-mill")["edit"] == qwen_edit.settings("qwen21-q4", UNC)
+    assert fakes.child_specs[0][0]["edit"] == {"qwen_model": "qwen21-q4", "loras": UNC}
+    fakes = _Fakes(monkeypatch)
+    assert ld.create(_create_args(name="old-mill", regenerate=True, qwen_model="qwen2511-bf16")) == 0
+    spec = fakes.child_specs[0][0]
+    assert spec["edit"] == {"qwen_model": "qwen2511-bf16", "loras": []}
+    assert {k: spec[k] for k in ("skill", "model", "lora_repo", "lora_file", "steps", "true_cfg")} == {
+        "skill": "location_edit", "model": character_dataset.EDIT_MODEL,
+        "lora_repo": character_dataset.EDIT_LORA_REPO, "lora_file": character_dataset.EDIT_LORA_FILE,
+        "steps": 8, "true_cfg": 1.0}
+
+
+def test_qet17_top_up_rounds_reuse_the_selection(env, monkeypatch, tmp_path):
+    first = dict((n, dict(PASS, match_score=5)) for n in range(4, 17))
+    fakes = _Fakes(monkeypatch, rounds=[first, first, {}])
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 3), description=lt.MILL_DESC,
+                                  qwen_model="qwen21-q8", lora=["uncensored=0.5"])) == 0
+    assert [step for _spec, step in fakes.child_specs] == ["edit", "edit-round2", "edit-round3"]
+    assert [spec["edit"] for spec, _step in fakes.child_specs] == [
+        {"qwen_model": "qwen21-q8", "loras": [{"id": "uncensored", "scale": 0.5}]}] * 3
+    assert [r["kept"] for r in _manifest(env, "old-mill")["rounds"]] == [11, 11, 24]
+
+
+# --- Review Focus 3: a 24-photo location runs no edit and needs no editor -----------------------------------
+
+def test_qe_review_focus_3_a_24_photo_location_needs_no_editor(env, monkeypatch, tmp_path, capsys):
+    fakes = _Fakes(monkeypatch, missing=["Qwen/Qwen-Image-Edit-2511"])
+    monkeypatch.setattr(character_dataset, "edit_selection_problem",
+                        lambda model_id, loras: "Qwen-Image-2.1 q4 is unavailable: not installed here")
+    assert ld.create(_create_args(name="old-mill", photos=_photos(tmp_path, 24, size=(768, 480)),
+                                  description=lt.MILL_DESC)) == 0
+    assert fakes.child_specs == []
+    manifest = _manifest(env, "old-mill")
+    assert manifest["generator"] == "photos only" and "edit" not in manifest
+    assert _record(env, "old-mill")["edit"] == qwen_edit.settings("qwen21-q4", UNC)
+    assert [line for line in capsys.readouterr().out.splitlines() if line.startswith("edit model:")] == []

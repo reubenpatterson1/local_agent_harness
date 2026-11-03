@@ -22,6 +22,7 @@ sys.path.insert(0, WS)
 
 import character_dataset  # noqa: E402
 import character_lib  # noqa: E402
+import qwen_edit  # noqa: E402
 
 TOOL_PATH = os.path.join(WS, "bin", "character")
 tool = importlib.machinery.SourceFileLoader("character_tool", TOOL_PATH).load_module()
@@ -128,6 +129,7 @@ class _Fakes(object):
         monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
         monkeypatch.setattr(character_dataset, "run_edit_child", _child)
         monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: [])
+        monkeypatch.setattr(character_dataset, "edit_selection_problem", lambda model_id, loras: None)
         monkeypatch.setattr(character_dataset, "restore_story_server",
                             lambda wait=False: fakes.server_calls.append(
                                 "restore-wait" if wait else "restore") or 0)
@@ -532,7 +534,7 @@ def test_k19_seed_create_edits_the_seed(tmp_path, lib_dir, monkeypatch, capsys):
     assert fakes.vlm_calls == ["face", "describe"] + ["check"] * 25
     with open(os.path.join(cdir, "dataset", "manifest.json")) as f:
         manifest = json.load(f)
-    assert manifest["generator"].startswith("Qwen/Qwen-Image-Edit-2511 + ")
+    assert manifest["generator"] == qwen_edit.generator_text("qwen21-q4", [{"id": "uncensored", "scale": 1.0}])
     assert [item["n"] for item in manifest["items"]] == list(range(25))
     assert "=== edit: 24 stills ===" in capsys.readouterr().out
 
@@ -593,7 +595,7 @@ def test_k23_missing_editor_is_refused(tmp_path, lib_dir, monkeypatch, capsys):
     fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE)
     monkeypatch.setattr(character_dataset, "edit_models_missing",
                         lambda: ["Qwen/Qwen-Image-Edit-2511"])
-    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 2
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review", "--qwen-model", "qwen2511-bf16")) == 2
     assert capsys.readouterr().err == (
         "Error: the seed-image editor is not downloaded: Qwen/Qwen-Image-Edit-2511; download it "
         "with: hf download Qwen/Qwen-Image-Edit-2511\n")
@@ -844,3 +846,101 @@ def test_seed_guidance_names_new_seed(tmp_path, lib_dir, monkeypatch, capsys):
     assert capsys.readouterr().err == (
         "Error: only 6/25 stills kept (need 12); the dataset is kept in %s; run "
         "bin/character create kyra --regenerate --new-seed\n" % os.path.join(lib_dir, "kyra", "dataset"))
+
+
+# --- QET20-QET22 (qwen edit models QE32, QE36, QE37, QE39): the Qwen selection of seed-image datasets -----
+
+UNC = [{"id": "uncensored", "scale": 1.0}]
+
+
+def _floors(monkeypatch):
+    """Replace wait_for_avail with a recorder of the floors it is asked for; returns the list."""
+    floors = []
+    monkeypatch.setattr(character_dataset, "wait_for_avail", lambda gib, timeout_s: floors.append(gib) or True)
+    return floors
+
+
+def test_qet20_a_seed_create_records_the_selection(tmp_path, lib_dir, monkeypatch, capsys):
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=[9] * 25)
+    floors = _floors(monkeypatch)
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review")) == 0
+    spec = fakes.child_specs[0][0]
+    assert spec["edit"] == {"qwen_model": "qwen21-q4", "loras": UNC}
+    data = character_lib.load_character("kyra")
+    assert data["edit"] == qwen_edit.settings("qwen21-q4", UNC)
+    with open(os.path.join(lib_dir, "kyra", "dataset", "manifest.json")) as f:
+        manifest = json.load(f)
+    text = qwen_edit.generator_text("qwen21-q4", UNC)
+    assert manifest["generator"] == text and manifest["edit"] == data["edit"]
+    keys = list(manifest)
+    assert keys[keys.index("generator") + 1:] == ["edit", "items"]
+    assert floors == [20.0]
+    assert "edit model: %s" % text in capsys.readouterr().out.splitlines()
+    fakes = _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=[9] * 25)
+    floors = _floors(monkeypatch)
+    legacy = []
+    monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: legacy.append("checked") or [])
+    monkeypatch.setattr(character_dataset, "edit_selection_problem",
+                        lambda model_id, loras: pytest.fail("the registry check ran for qwen2511-bf16"))
+    assert tool.main(["create", "kyra-two", "--phrase", "the woman in grey", "--seed-image", _seed_image(tmp_path),
+                      "--no-review", "--qwen-model", "qwen2511-bf16"]) == 0
+    spec = fakes.child_specs[0][0]
+    assert spec["edit"] == {"qwen_model": "qwen2511-bf16", "loras": []}
+    assert (spec["model"], spec["lora_file"], spec["steps"]) == (
+        "Qwen/Qwen-Image-Edit-2511", "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors", 8)
+    with open(os.path.join(lib_dir, "kyra-two", "dataset", "manifest.json")) as f:
+        assert json.load(f)["generator"] == (
+            "Qwen/Qwen-Image-Edit-2511 + Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors, 8 steps")
+    assert (floors, legacy) == ([64.0], ["checked"])
+
+
+def test_qet21_the_options_need_a_seed_image(tmp_path, lib_dir, monkeypatch, capsys):
+    _Fakes(monkeypatch, scores=[9] * 24)
+    seed_only = "Error: --qwen-model and --lora apply only to seed-image characters\n"
+    for extra in (("--qwen-model", "qwen21-q4"), ("--lora", "uncensored=1")):
+        assert tool.main(_ronin_create(*extra)) == 2, extra
+        assert capsys.readouterr().err == seed_only
+    assert not os.path.exists(os.path.join(lib_dir, "ronin"))
+    path = _ronin_dataset(lib_dir, monkeypatch, seed=9)
+    capsys.readouterr()
+    before = open(path).read()
+    _Fakes(monkeypatch)
+    assert tool.main(["create", "ronin", "--regenerate", "--qwen-model", "qwen21-q4"]) == 2
+    assert capsys.readouterr().err == seed_only and open(path).read() == before
+    _Fakes(monkeypatch)
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review", "--lora", "uncensored=1")) == 2
+    assert capsys.readouterr().err == "Error: --lora needs --qwen-model\n"
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review", "--qwen-model", "flux")) == 2
+    assert capsys.readouterr().err == ("Error: --qwen-model must be one of qwen21-q4, qwen21-q8, qwen21-bf16, "
+                                       "qwen2511-q4, qwen2511-bf16\n")
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review", "--qwen-model", "qwen2511-q4",
+                                       "--lora", "uncensored=1")) == 2
+    assert capsys.readouterr().err == ("Error: --lora uncensored is for Qwen-Image-2.1, not Qwen-Image-Edit-2511 "
+                                       "q4 (Lightning)\n")
+    assert not os.path.exists(os.path.join(lib_dir, "kyra"))
+
+
+def test_qet22_regenerate_keeps_the_record_outside_the_dataset(tmp_path, lib_dir, monkeypatch, capsys):
+    _Fakes(monkeypatch, face=[350, 100, 650, 500], describe=KYRA_DESCRIBE, scores=[9] * 25)
+    assert tool.main(_kyra_seed_create(tmp_path, "--no-review", "--qwen-model", "qwen21-q4")) == 0
+    cdir = os.path.join(lib_dir, "kyra")
+    description = os.path.join(cdir, "dataset", "description.json")
+    with open(description, "rb") as f:
+        saved = f.read()
+    capsys.readouterr()
+    fakes = _Fakes(monkeypatch, scores=[9] * 25)
+    assert tool.main(["create", "kyra", "--regenerate", "--new-seed", "--no-review", "--qwen-model", "qwen21-q8",
+                      "--lora", "uncensored=0.5"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    half = [{"id": "uncensored", "scale": 0.5}]
+    assert "seed: 0 -> 1" in out and "edit model: %s" % qwen_edit.generator_text("qwen21-q8", half) in out
+    assert fakes.child_specs[0][0]["edit"] == {"qwen_model": "qwen21-q8", "loras": half}
+    assert character_lib.load_character("kyra")["edit"] == qwen_edit.settings("qwen21-q8", half)
+    assert os.path.isfile(os.path.join(cdir, "character.json"))
+    with open(description, "rb") as f:
+        assert f.read() == saved
+    assert len(os.listdir(os.path.join(cdir, "dataset", "stills"))) == 25
+    _Fakes(monkeypatch, scores=[9] * 25)
+    assert tool.main(["create", "kyra", "--regenerate", "--no-review"]) == 0
+    assert "seed: 1 (unchanged)" in capsys.readouterr().out.splitlines()
+    assert character_lib.load_character("kyra")["edit"] == qwen_edit.settings("qwen21-q4", UNC)

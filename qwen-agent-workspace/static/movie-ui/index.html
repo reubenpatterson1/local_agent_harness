@@ -87,6 +87,15 @@
         <input id="c-folder-file" type="file" webkitdirectory hidden></label>
       <span id="c-folder-status" class="muted"></span>
       <ul id="c-folder-list" class="muted" hidden></ul>
+      <div data-field="seed_edit" class="wide">
+        <div id="c-sq-qwen-box" hidden>
+          <label>Panel 1 from the seed <select id="c-sq-qwen-model"></select></label>
+          <span id="c-sq-steps" class="muted"></span>
+          <div id="c-sq-loras" class="se-loras"></div>
+          <p id="c-sq-qwen-note" class="muted"></p>
+          <span id="c-sq-reason" class="muted"></span>
+        </div>
+      </div>
     </fieldset>
     <label>Mode <select id="c-mode">
       <option value="chained">chained</option>
@@ -277,6 +286,13 @@
       <input id="ch-folder-file" type="file" webkitdirectory hidden></label>
     <span id="ch-folder-status" class="muted"></span>
     <ul id="ch-folder-list" class="muted" hidden></ul>
+    <div id="ch-cq-qwen-box" class="wide" hidden>
+      <label>Qwen edit model (seed-image edits) <select id="ch-cq-qwen-model"></select></label>
+      <span id="ch-cq-steps" class="muted"></span>
+      <div id="ch-cq-loras" class="se-loras"></div>
+      <p id="ch-cq-qwen-note" class="muted"></p>
+      <span id="ch-cq-reason" class="muted"></span>
+    </div>
   </div>
   <div class="row"><button id="ch-create" type="button">Create</button> <span id="ch-create-status" class="muted"></span></div>
   <div id="ch-folder-confirm" hidden>
@@ -298,6 +314,13 @@
       <button id="ch-force" type="button" hidden>Create anyway (--force)</button>
       <span id="ch-status" class="muted"></span>
     </div>
+    <div id="ch-rq-qwen-box" class="wide" hidden>
+      <label>Qwen edit model for Regenerate <select id="ch-rq-qwen-model"></select></label>
+      <span id="ch-rq-steps" class="muted"></span>
+      <div id="ch-rq-loras" class="se-loras"></div>
+      <p id="ch-rq-qwen-note" class="muted"></p>
+      <span id="ch-rq-reason" class="muted"></span>
+    </div>
     <div id="ch-train-form" hidden>
       <label><input id="ch-train-video" type="checkbox" checked> Video LoRA</label>
       <label><input id="ch-train-stills" type="checkbox" checked> Stills LoRA</label>
@@ -316,6 +339,13 @@
     <label>Trigger <input id="lo-trigger" type="text" size="16" placeholder="blank = auto"></label>
     <label>Seed <input id="lo-seed" type="number" min="0"></label>
     <label class="wide">Photos <input id="lo-photos" type="file" multiple accept="image/png,image/jpeg,image/webp"></label>
+    <div id="lo-cq-qwen-box" class="wide" hidden>
+      <label>Qwen edit model (photo edits) <select id="lo-cq-qwen-model"></select></label>
+      <span id="lo-cq-steps" class="muted"></span>
+      <div id="lo-cq-loras" class="se-loras"></div>
+      <p id="lo-cq-qwen-note" class="muted"></p>
+      <span id="lo-cq-reason" class="muted"></span>
+    </div>
   </div>
   <p id="lo-angles-note" class="muted">Every extra still re-shoots one of your photos from a new viewpoint at a new time of day, weather or season. Edits can only guess at what your photos do not show, so for a varied dataset, upload 3-5 photos taken from different spots. Without photos, the 24 stills are drawn from the description.</p>
   <div class="row"><button id="lo-create" type="button" disabled>Create</button> <span id="lo-create-status" class="muted"></span></div>
@@ -332,6 +362,13 @@
       <label title="keeps photos that show people; allows regenerating a trained location, which deletes its LoRAs"><input id="lo-force" type="checkbox"> Force</label>
       <button id="lo-accept" type="button">Accept dataset</button>
       <span id="lo-status" class="muted"></span>
+    </div>
+    <div id="lo-rq-qwen-box" class="wide" hidden>
+      <label>Qwen edit model for Regenerate <select id="lo-rq-qwen-model"></select></label>
+      <span id="lo-rq-steps" class="muted"></span>
+      <div id="lo-rq-loras" class="se-loras"></div>
+      <p id="lo-rq-qwen-note" class="muted"></p>
+      <span id="lo-rq-reason" class="muted"></span>
     </div>
     <div id="lo-train-form" hidden>
       <label><input id="lo-train-video" type="checkbox" checked> Video LoRA</label>

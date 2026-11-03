@@ -19,7 +19,7 @@ Rules (spec Section 9):
   and character_dataset through sys.modules fakes. Each stub records its argv, an env subset and
   its spec, and behaves per a config file its test writes. The fake assert_image_safe raises
   ContentSafetyError when the image's top-left pixel is pure red.
-- tool.avail_gib, tool.total_gib, tool.missing_modules, tool.cpu_generator and tool.disk_free_gib
+- qe.avail_gib, qe.total_gib, qe.missing_modules, tool.cpu_generator and tool.disk_free_gib
   are monkeypatched (cpu_generator returns the seed itself). Sources are real PNG, JPEG and GIF
   files drawn with PIL under tmp_path.
 - No test uses the real HOME, loads a real model, runs bin/seed-edit-setup, or contacts a server.
@@ -123,13 +123,14 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("HF_HOME", os.path.join(tmp, "hf"))
     monkeypatch.setenv("Z_IMAGE_HF_HOME", os.path.join(tmp, "zi"))
     tool = load_tool()
+    qe = tool.qe
     gens = []
-    monkeypatch.setattr(tool, "avail_gib", lambda: 40.0)
-    monkeypatch.setattr(tool, "total_gib", lambda: 48.0)
-    monkeypatch.setattr(tool, "missing_modules", lambda names: [])
+    monkeypatch.setattr(qe, "avail_gib", lambda: 40.0)
+    monkeypatch.setattr(qe, "total_gib", lambda: 48.0)
+    monkeypatch.setattr(qe, "missing_modules", lambda names: [])
     monkeypatch.setattr(tool, "disk_free_gib", lambda path: 100.0)
     monkeypatch.setattr(tool, "cpu_generator", lambda seed: gens.append(seed) or seed)
-    return {"tmp": tmp, "tool": tool, "gens": gens, "calls": make_fakes(monkeypatch), "mp": monkeypatch,
+    return {"tmp": tmp, "tool": tool, "qe": qe, "gens": gens, "calls": make_fakes(monkeypatch), "mp": monkeypatch,
             "zhub": os.path.join(tmp, "zi", "hub"), "hfhub": os.path.join(tmp, "hf", "hub")}
 
 
@@ -139,9 +140,9 @@ def zimage_cache(env):
 
 
 def bf16_cache(env):
-    root, tool = os.path.join(env["tmp"], "hf"), env["tool"]
-    mt.make_hf_cache(root, tool.EDIT_MODEL, {"transformer/x.safetensors": b"\x01" * 8})
-    mt.make_hf_cache(root, tool.EDIT_LORA_REPO, {tool.EDIT_LORA_FILE: b"\x01" * 8})
+    root, qe = os.path.join(env["tmp"], "hf"), env["qe"]
+    mt.make_hf_cache(root, qe.EDIT_MODEL, {"transformer/x.safetensors": b"\x01" * 8})
+    mt.make_hf_cache(root, qe.EDIT_LORA_REPO, {qe.EDIT_LORA_FILE: b"\x01" * 8})
 
 
 def pinned_cache(root, repo, revision, files):
@@ -216,7 +217,8 @@ for i, job in enumerate(spec["jobs"]):
         os.kill(os.getpid(), 9)
     color = (255, 0, 0) if job["n"] in config.get("red", []) else (0, 0, 200)
     Image.new("RGB", (spec["width"], spec["height"]), color).save(job["output_path"])
-    print(config.get("prefix", "") + "seed-edit-child done %d 1.0" % job["n"], flush=True)
+    if job["n"] not in config.get("silent", []):
+        print(config.get("prefix", "") + "seed-edit-child done %d 1.0" % job["n"], flush=True)
 '''
 
 QWENEDIT_STUB = r'''"""Stub of character_dataset.py qwenedit (tests only): records argv, env and spec, then obeys
@@ -549,13 +551,13 @@ def test_sgt7_preflight_refusals(env, capsys):
     _refused(run_dir, "another GPU process is running (pid 4242: bin/ltx-movie --story-id x); try again when "
                       "it ends", capsys.readouterr())
     calls["busy"] = None
-    mp.setattr(tool, "missing_modules", lambda names: ["torch"])
+    mp.setattr(env["qe"], "missing_modules", lambda names: ["torch"])
     code, run_dir = run_tool(env, run=R3)
     assert code == 2
     _refused(run_dir, "Z-Image is unavailable: torch not importable by %s" % sys.executable, capsys.readouterr())
-    mp.setattr(tool, "missing_modules", lambda names: [])
-    mp.setattr(tool, "avail_gib", lambda: 10.0)
-    mp.setattr(tool, "AVAIL_WAIT_S", 0)
+    mp.setattr(env["qe"], "missing_modules", lambda names: [])
+    mp.setattr(env["qe"], "avail_gib", lambda: 10.0)
+    mp.setattr(env["qe"], "AVAIL_WAIT_S", 0)
     code, run_dir = run_tool(env, run=R4)
     assert code == 2
     captured = capsys.readouterr()
@@ -657,77 +659,80 @@ def test_sqt2_the_cleaned_qwen_options(env):
 # --- SQT3 (seed models SQ15-SQ17): the pinned registry lookups --------------------------------------------
 
 def test_sqt3_the_pinned_lookups(env):
-    tool, mp, zhub, hfhub = env["tool"], env["mp"], env["zhub"], env["hfhub"]
+    qe, mp, zhub, hfhub = env["qe"], env["mp"], env["zhub"], env["hfhub"]
     hubs, where = [zhub, hfhub], "%s or %s" % (zhub, hfhub)
     q8 = seedgen.qwen_model("qwen21-q8")
     absent = ("mflux-community/qwen-image-2-1-mflux-q8@f5c8cc79a674 is not in %s "
               "(run bin/seed-edit-setup --model qwen21-q8)" % where)
-    assert tool.weights_problem(q8, hubs) == (absent, None, None)
+    assert qe.weights_problem(q8, hubs) == (absent, None, None)
     mt.make_hf_cache(os.path.join(env["tmp"], "hf"), q8["repo"], QWEN21_FILES)
-    assert tool.weights_problem(q8, hubs) == (absent, None, None)
+    assert qe.weights_problem(q8, hubs) == (absent, None, None)
     q8_snapshot, _none = install_model(env, "qwen21-q8")
-    assert tool.weights_problem(q8, hubs) == (None, q8_snapshot, None)
+    assert qe.weights_problem(q8, hubs) == (None, q8_snapshot, None)
     q4 = seedgen.qwen_model("qwen21-q4")
     snapshot, _none = install_model(env, "qwen21-q4")
     with open(os.path.join(os.path.dirname(os.path.dirname(snapshot)), "blobs", "partial0.incomplete"), "wb") as f:
         f.write(b"x")
-    assert tool.weights_problem(q4, hubs) == (
+    assert qe.weights_problem(q4, hubs) == (
         "mflux-community/qwen-image-2-1-mflux-q4: download incomplete: 1 partial blob(s) "
         "(run bin/seed-edit-setup --model qwen21-q4)", None, None)
     bf16 = seedgen.qwen_model("qwen21-bf16")
     files = dict(QWEN21_FILES)
     del files["vae/config.json"], files["processor/tokenizer.json"]
     install_model(env, "qwen21-bf16", files=files)
-    assert tool.weights_problem(bf16, hubs) == (
+    assert qe.weights_problem(bf16, hubs) == (
         "Qwen/Qwen-Image-2.1: missing vae/config.json; missing processor/ (run bin/seed-edit-setup --model qwen21-bf16)",
         None, None)
     e2511 = seedgen.qwen_model("qwen2511-q4")
     only = pinned_cache(os.path.join(env["tmp"], "hf"), e2511["repo"], e2511["revision"],
                         {"transformer/0.safetensors": b"\x01" * 8})
-    mt.make_hf_cache(os.path.join(env["tmp"], "zi"), tool.EDIT_LORA_REPO, {tool.EDIT_LORA_FILE: b"\x01" * 8})
-    assert tool.weights_problem(e2511, hubs) == (
+    mt.make_hf_cache(os.path.join(env["tmp"], "zi"), qe.EDIT_LORA_REPO, {qe.EDIT_LORA_FILE: b"\x01" * 8})
+    assert qe.weights_problem(e2511, hubs) == (
         "Lightning LoRA Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors is not in %s "
         "(run bin/seed-edit-setup --model qwen2511-q4)" % where, None, None)
-    lightning = os.path.join(pinned_cache(os.path.join(env["tmp"], "hf"), tool.EDIT_LORA_REPO,
-                                          e2511["builtin_lora"]["revision"], {tool.EDIT_LORA_FILE: b"\x01" * 8}),
-                             tool.EDIT_LORA_FILE)
-    assert tool.weights_problem(e2511, hubs) == (None, only, lightning)
+    lightning = os.path.join(pinned_cache(os.path.join(env["tmp"], "hf"), qe.EDIT_LORA_REPO,
+                                          e2511["builtin_lora"]["revision"], {qe.EDIT_LORA_FILE: b"\x01" * 8}),
+                             qe.EDIT_LORA_FILE)
+    assert qe.weights_problem(e2511, hubs) == (None, only, lightning)
     unc = seedgen.qwen_lora("uncensored")
     missing = ("qwen-image-2.1-uncensored-lora.safetensors is not in %s (run bin/seed-edit-setup --lora uncensored)"
                % where)
-    assert tool.lora_problem(unc, hubs) == (missing, None)
+    assert qe.lora_problem(unc, hubs) == (missing, None)
     pinned_cache(os.path.join(env["tmp"], "zi"), unc["repo"], unc["revision"], {unc["file"]: b""})
-    assert tool.lora_problem(unc, hubs) == (missing, None)
+    assert qe.lora_problem(unc, hubs) == (missing, None)
     found = install_lora(env, "uncensored", root="hf")
-    assert tool.lora_problem(unc, hubs) == (None, found)
+    assert qe.lora_problem(unc, hubs) == (None, found)
     py = os.path.join(env["tmp"], "mflux-edit", ".venv", "bin", "python")
     venv = os.path.dirname(os.path.dirname(py))
     mp.setenv("SEED_EDIT_MFLUX_PYTHON", py)
     hint = "(run bin/seed-edit-setup --model qwen21-q8)"
-    assert tool.mflux_env_problem(q8) == "no mflux venv at %s %s" % (py, hint)
+    assert qe.mflux_env_problem(q8) == "no mflux venv at %s %s" % (py, hint)
     mflux_venv(env, version=None)
-    assert tool.mflux_env_problem(q8) == "mflux is not installed in %s %s" % (venv, hint)
+    assert qe.mflux_env_problem(q8) == "mflux is not installed in %s %s" % (venv, hint)
     set_mflux_version(venv, "banana")
-    assert tool.mflux_env_problem(q8) == "cannot read the mflux version in %s" % venv
+    assert qe.mflux_env_problem(q8) == "cannot read the mflux version in %s" % venv
     set_mflux_version(venv, "0.23.9")
-    assert tool.mflux_env_problem(q8) == "mflux 0.23.9 in %s is older than 0.24.0 %s" % (venv, hint)
-    assert tool.mflux_env_problem(q4) == ("mflux 0.23.9 in %s is older than 0.24.0 "
-                                          "(run bin/seed-edit-setup --model qwen21-q4)" % venv)
+    assert qe.mflux_env_problem(q8) == "mflux 0.23.9 in %s is older than 0.24.0 %s" % (venv, hint)
+    assert qe.mflux_env_problem(q4) == ("mflux 0.23.9 in %s is older than 0.24.0 "
+                                        "(run bin/seed-edit-setup --model qwen21-q4)" % venv)
     for version in ("0.24.0", "0.25.1"):
         set_mflux_version(venv, version)
-        assert tool.mflux_env_problem(q8) is None
-    assert tool.qwen_model_problem(q8) == (None, {"model_path": q8_snapshot, "builtin_lora": None})
-    mp.setattr(tool, "missing_modules", lambda names: ["torch"])
-    assert tool.qwen_model_problem(q8) == ("torch not importable by %s" % sys.executable, {})
-    assert tool.qwen_hubs() == [zhub, hfhub]
-    assert tool.MFLUX_MIN_VERSION == (0, 24, 0)
+        assert qe.mflux_env_problem(q8) is None
+    assert qe.qwen_model_problem(q8) == (None, {"model_path": q8_snapshot, "builtin_lora": None})
+    mp.setattr(qe, "missing_modules", lambda names: ["torch"])
+    assert qe.qwen_model_problem(q8) == ("torch not importable by %s" % sys.executable, {})
+    assert qe.qwen_hubs() == [zhub, hfhub]
+    assert qe.MFLUX_MIN_VERSION == (0, 24, 0)
     with open(TOOL_PATH, encoding="utf-8") as f:
         source = f.read()
     for gone in ("SEED_EDIT_QWEN_Q4_DIR", "SEED_EDIT_LIGHTNING_FILE", "def choose_qwen(", "def mflux_problem(",
                  "BF16_MIN_AVAIL_GIB", "MFLUX_MIN_AVAIL_GIB", "Q4_REPO", "Q4_NAME_PART"):
         assert gone not in source, gone
-    assert set(re.findall(r"os\.environ(?:\.get\(|\[)\"([A-Z0-9_]+)\"", source)) == {
-        "SEED_EDIT_MFLUX_PYTHON", "SEED_EDIT_QWENEDIT_SCRIPT", "HF_HUB_CACHE", "HF_HOME"}
+    environ_re = r"os\.environ(?:\.get\(|\[)\"([A-Z0-9_]+)\""
+    assert re.findall(environ_re, source) == []
+    with open(os.path.join(WS, "qwen_edit.py"), encoding="utf-8") as f:
+        assert set(re.findall(environ_re, f.read())) == {
+            "SEED_EDIT_MFLUX_PYTHON", "SEED_EDIT_QWENEDIT_SCRIPT", "HF_HUB_CACHE", "HF_HOME"}
 
 
 # --- SQT4 (seed models SQ18): the probe's new shape ---------------------------------------------------------
@@ -766,11 +771,11 @@ def test_sqt4_the_probe(env, capsys):
     assert tool.main(["--probe"]) == 0
     assert capsys.readouterr().out == json.dumps(tool.probe(), sort_keys=True) + "\n"
     install_model(env, "qwen21-bf16")
-    mp.setattr(tool, "total_gib", lambda: 128.0)
+    mp.setattr(env["qe"], "total_gib", lambda: 128.0)
     got = tool.probe()["qwen"]
     assert got["models"]["qwen21-bf16"] == {"ok": True, "reason": None}
     assert "backend" not in got and set(got) == {"ok", "reason", "models", "loras"}
-    mp.setattr(tool, "total_gib", lambda: None)
+    mp.setattr(env["qe"], "total_gib", lambda: None)
     assert set(e["reason"] for e in tool.probe()["qwen"]["models"].values()) == {"cannot read this host's memory size"}
 
 
@@ -792,8 +797,7 @@ SQT5_CASES = [
 @pytest.mark.parametrize("model_id,loras,paths,scales,steps,scheduler,why", SQT5_CASES,
                          ids=["case%d" % (i + 1) for i in range(len(SQT5_CASES))])
 def test_sqt5_the_mflux_selection(env, capsys, model_id, loras, paths, scales, steps, scheduler, why):
-    tool = env["tool"]
-    env["mp"].setattr(tool, "avail_gib", lambda: 128.0)
+    env["mp"].setattr(env["qe"], "avail_gib", lambda: 128.0)
     py, _venv = mflux_venv(env)
     snapshot, lightning = install_model(env, model_id)
     found = {"lightning": lightning}
@@ -813,10 +817,10 @@ def test_sqt5_the_mflux_selection(env, capsys, model_id, loras, paths, scales, s
     entry = seedgen.qwen_model(model_id)
     assert calls[0]["spec"] == {
         "family": entry["family"], "model_path": snapshot, "lora_paths": [found[p] for p in paths],
-        "lora_scales": scales, "prompt": PROMPT, "source": os.path.join(work, "source.png"), "width": 1024,
-        "height": 672, "steps": steps, "guidance": 1.0, "scheduler": scheduler,
-        "jobs": [{"n": n, "seed": 100 + n, "output_path": os.path.join(work, "cand_%02d.pending.png" % n)}
-                 for n in (1, 2)]}
+        "lora_scales": scales, "width": 1024, "height": 672, "steps": steps, "guidance": 1.0,
+        "scheduler": scheduler,
+        "jobs": [{"n": n, "seed": 100 + n, "prompt": PROMPT, "source": os.path.join(work, "source.png"),
+                  "output_path": os.path.join(work, "cand_%02d.pending.png" % n)} for n in (1, 2)]}
     assert all(p.startswith(env["zhub"]) and os.path.realpath(p) != p for p in calls[0]["spec"]["lora_paths"])
     record = record_of(run_dir)
     chosen = [{"id": v.split("=")[0], "scale": float(v.split("=")[1])} for v in loras]
@@ -830,8 +834,8 @@ def test_sqt5_the_mflux_selection(env, capsys, model_id, loras, paths, scales, s
 # --- SQT6 (seed models SQ24): content safety screens every candidate of every registry model --------------
 
 def test_sqt6_content_safety_on_every_candidate_of_every_model(env, capsys):
-    tool, calls = env["tool"], env["calls"]
-    env["mp"].setattr(tool, "avail_gib", lambda: 70.0)
+    calls = env["calls"]
+    env["mp"].setattr(env["qe"], "avail_gib", lambda: 70.0)
     py, _venv = mflux_venv(env)
     for model_id in ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4"):
         install_model(env, model_id)
@@ -878,7 +882,7 @@ def test_sqt6_content_safety_on_every_candidate_of_every_model(env, capsys):
 # --- SQT7 (seed models SQ13, SQ21): run-time refusals and the child failure text ----------------------------
 
 def test_sqt7_run_time_refusals(env, capsys):
-    tool, mp, zhub, hfhub = env["tool"], env["mp"], env["zhub"], env["hfhub"]
+    qe, mp, zhub, hfhub = env["qe"], env["mp"], env["zhub"], env["hfhub"]
     where = "%s or %s" % (zhub, hfhub)
     py, venv = mflux_venv(env)
     install_model(env, "qwen21-q4")
@@ -894,15 +898,15 @@ def test_sqt7_run_time_refusals(env, capsys):
         code, run_dir = run_tool(env, *extra, model="qwen", run=(R1, R2)[i])
         assert code == 2
         _refused(run_dir, text, capsys.readouterr())
-    mp.setattr(tool, "avail_gib", lambda: 10.0)
-    mp.setattr(tool, "AVAIL_WAIT_S", 0)
+    mp.setattr(qe, "avail_gib", lambda: 10.0)
+    mp.setattr(qe, "AVAIL_WAIT_S", 0)
     code, run_dir = run_tool(env, "--qwen-model", "qwen21-q4", model="qwen", run=R3)
     assert code == 2
     _refused(run_dir, "only 10.0 GiB available after waiting 0 s; Qwen-Image-2.1 q4 needs 20 GiB; free memory and retry",
              capsys.readouterr())
     bf16_cache(env)
     stub = qwenedit_stub(env, {})
-    mp.setattr(tool, "avail_gib", lambda: 40.0)
+    mp.setattr(qe, "avail_gib", lambda: 40.0)
     code, run_dir = run_tool(env, "--qwen-model", "qwen2511-bf16", model="qwen", run=R4)
     assert code == 2
     _refused(run_dir, "only 40.0 GiB available after waiting 0 s; Qwen-Image-Edit-2511 bf16 (Lightning, diffusers) "
@@ -938,11 +942,10 @@ def test_sgt9_the_mflux_child_screened_in_the_parent(env, capsys):
                                 os.path.join(work, "mflux_spec.json")]
     assert calls[0]["env"] == {"HF_HUB_OFFLINE": "1", "PYTHONUNBUFFERED": "1"}
     assert calls[0]["spec"] == {
-        "family": "qwen2511", "model_path": q4, "lora_paths": [lora], "lora_scales": [1.0], "prompt": PROMPT,
-        "source": os.path.join(work, "source.png"), "width": 1024, "height": 672, "steps": 8, "guidance": 1.0,
-        "scheduler": None,
-        "jobs": [{"n": n, "seed": 100 + n, "output_path": os.path.join(work, "cand_%02d.pending.png" % n)}
-                 for n in (1, 2, 3)]}
+        "family": "qwen2511", "model_path": q4, "lora_paths": [lora], "lora_scales": [1.0], "width": 1024,
+        "height": 672, "steps": 8, "guidance": 1.0, "scheduler": None,
+        "jobs": [{"n": n, "seed": 100 + n, "prompt": PROMPT, "source": os.path.join(work, "source.png"),
+                  "output_path": os.path.join(work, "cand_%02d.pending.png" % n)} for n in (1, 2, 3)]}
     assert [os.path.isfile(cand(run_dir, n)) for n in (1, 2, 3)] == [True, False, True]
     assert not os.path.exists(os.path.join(work, "cand_02.pending.png"))
     record = record_of(run_dir)
@@ -959,7 +962,7 @@ def test_sgt9_the_mflux_child_screened_in_the_parent(env, capsys):
 # --- SGT10 (SG17, SG20): the mflux child fails or times out --------------------------------------------
 
 def test_sgt10_the_mflux_child_fails_or_times_out(env, capsys):
-    tool = env["tool"]
+    qe = env["qe"]
     py, _venv = mflux_venv(env)
     mflux_weights(env)
     stub_config(py, {"fail_after": 1})
@@ -973,31 +976,31 @@ def test_sgt10_the_mflux_child_fails_or_times_out(env, capsys):
     out = capsys.readouterr().out.splitlines()
     assert "boom" in out and out[-3:] == ["candidate 2/3 failed", "candidate 3/3 failed",
                                          "seed-edit: done: 1 ok, 0 blocked, 2 failed"]
-    env["mp"].setattr(tool, "CHILD_TIMEOUT_S", 1)
+    env["mp"].setattr(qe, "CHILD_TIMEOUT_S", 1)
+    env["mp"].setattr(qe, "JOB_TIMEOUT_S", 0)
     stub_config(py, {"sleep": 30})
     started = time.monotonic()
     code, run_dir = run_tool(env, *q4, model="qwen", run=R2)
     assert code == 1 and time.monotonic() - started < 20
     record = record_of(run_dir)
     assert statuses(run_dir) == ["failed"] * 3
-    assert record["error"] == "Qwen-Image-Edit-2511 q4 (Lightning) child timed out after %d s" % tool.CHILD_TIMEOUT_S
-    assert tool.CHILD is None
-    env["mp"].setattr(tool, "CHILD_TIMEOUT_S", 3600)
+    assert record["error"] == "Qwen-Image-Edit-2511 q4 (Lightning) child timed out after %d s" % qe.CHILD_TIMEOUT_S
+    assert qe.CHILD is None
+    env["mp"].setattr(qe, "CHILD_TIMEOUT_S", 3600)
     stub_config(py, {"kill_after": 1})
     code, run_dir = run_tool(env, *q4, model="qwen", run=R3)
     assert code == 1
     record = record_of(run_dir)
     assert statuses(run_dir) == ["ok", "failed", "failed"]
     assert (record["state"], record["error"]) == ("failed", "Qwen-Image-Edit-2511 q4 (Lightning) child exited -9: killed")
-    assert tool.CHILD is None
+    assert qe.CHILD is None
 
 
 # --- SGT11 (SG19, SG22): the diffusers bf16 child ------------------------------------------------------
 
 def test_sgt11_the_bf16_child(env, capsys):
-    tool = env["tool"]
     bf16_cache(env)
-    env["mp"].setattr(tool, "avail_gib", lambda: 70.0)
+    env["mp"].setattr(env["qe"], "avail_gib", lambda: 70.0)
     stub = qwenedit_stub(env, {"blocked": [2]})
     code, run_dir = run_tool(env, "--qwen-model", "qwen2511-bf16", "--candidates", "2", "--seed", "100", model="qwen")
     assert code == 0
@@ -1054,7 +1057,7 @@ def test_sgt13_the_probe(env, capsys):
     assert tool.main(["--probe"]) == 0
     assert capsys.readouterr().out == json.dumps(tool.probe(), sort_keys=True) + "\n"
     bf16_cache(env)
-    mp.setattr(tool, "total_gib", lambda: 128.0)
+    mp.setattr(env["qe"], "total_gib", lambda: 128.0)
     assert tool.probe()["qwen"]["models"]["qwen2511-bf16"] == {"ok": True, "reason": None}
     missing = os.path.join(env["tmp"], "none", "bin", "python")
     mp.setenv("SEED_EDIT_MFLUX_PYTHON", missing)
@@ -1077,7 +1080,7 @@ def test_sgt14_the_mirrored_constants():
     import character_dataset
     tool = load_tool()
     for name in ("EDIT_MODEL", "EDIT_LORA_REPO", "EDIT_LORA_FILE", "EDIT_STEPS", "EDIT_TRUE_CFG", "AVAIL_WAIT_S"):
-        assert getattr(tool, name) == getattr(character_dataset, name), name
+        assert getattr(tool.qe, name) == getattr(character_dataset, name), name
     assert seedgen.qwen_model("qwen2511-bf16")["memory_gib"] == character_dataset.EDIT_MIN_AVAIL_GIB
     assert tool.ZIMAGE_MIN_AVAIL_GIB == character_dataset.GENERATE_MIN_AVAIL_GIB
     assert tool.MIN_FREE_GIB == character_dataset.CREATE_MIN_FREE_GIB
@@ -1148,9 +1151,10 @@ def test_sqt10_the_registry_pins():
     assert all("allow_patterns" not in lora for lora in seedgen.QWEN_LORAS)
     for model_id in ("qwen2511-q4", "qwen2511-bf16"):
         entry = seedgen.qwen_model(model_id)
-        assert entry["steps"] == tool.EDIT_STEPS
-        assert (entry["builtin_lora"]["repo"], entry["builtin_lora"]["file"]) == (tool.EDIT_LORA_REPO, tool.EDIT_LORA_FILE)
-    assert seedgen.qwen_model("qwen2511-bf16")["repo"] == tool.EDIT_MODEL
+        assert entry["steps"] == tool.qe.EDIT_STEPS
+        assert (entry["builtin_lora"]["repo"], entry["builtin_lora"]["file"]) == (tool.qe.EDIT_LORA_REPO,
+                                                                                   tool.qe.EDIT_LORA_FILE)
+    assert seedgen.qwen_model("qwen2511-bf16")["repo"] == tool.qe.EDIT_MODEL
     assert seedgen.qwen_model("qwen2511-bf16")["memory_gib"] == character_dataset.EDIT_MIN_AVAIL_GIB
     assert [seedgen.default_loras(m) for m in seedgen.QWEN_MODEL_IDS] == [[{"id": "uncensored", "scale": 1.0}]] * 3 + [[]] * 2
     assert (seedgen.qwen_model("nope"), seedgen.qwen_lora("nope")) == (None, None)
@@ -1186,7 +1190,7 @@ def test_sg_review_focus_3_prompts_survive_the_argv_round_trip(env):
 # --- Review Focus 4: progress bars in the children's lines ---------------------------------------------
 
 def test_sg_review_focus_4_progress_bars_in_child_lines(env, capsys):
-    tool = env["tool"]
+    qe = env["qe"]
     py, _venv = mflux_venv(env)
     mflux_weights(env)
     bar = "  0%|          | 0/8 [00:00<?, ?it/s]\r100%|##########| 8/8 [00:01<00:00]\r"
@@ -1195,7 +1199,7 @@ def test_sg_review_focus_4_progress_bars_in_child_lines(env, capsys):
     assert code == 0 and statuses(run_dir) == ["ok", "ok"]
     assert "100%|##########| 8/8 [00:01<00:00]\nseed-edit-child done 1 1.0\n" in capsys.readouterr().out
     bf16_cache(env)
-    env["mp"].setattr(tool, "avail_gib", lambda: 70.0)
+    env["mp"].setattr(qe, "avail_gib", lambda: 70.0)
     qwenedit_stub(env, {"prefix": "Loading pipeline components...: 100%|##########| 5/5\r"})
     code, run_dir = run_tool(env, "--qwen-model", "qwen2511-bf16", "--candidates", "2", "--seed", "1", model="qwen",
                              run=R2)
@@ -1428,7 +1432,7 @@ def test_sqt9_the_child_mirrors_the_registry():
         module_name, class_name = entry["mflux_class"].rsplit(".", 1)
         assert child.FAMILIES[entry["family"]] == (module_name, class_name, entry["mflux_config"]), entry["id"]
     assert set(child.FAMILIES) == set(seedgen.QWEN_FAMILIES)
-    assert child.MIN_VERSION == tool.MFLUX_MIN_VERSION == (0, 24, 0)
+    assert child.MIN_VERSION == tool.qe.MFLUX_MIN_VERSION == (0, 24, 0)
     with open(os.path.join(WS, "seed_edit_mflux_child.py"), encoding="utf-8") as f:
         source = f.read()
     assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
@@ -1685,11 +1689,11 @@ def test_sqt14_the_download_script(monkeypatch, tmp_path):
 
 def test_sq_review_focus_4_an_old_main_2511_snapshot(setup_env, capsys):
     e = setup_env
-    setup, rec, tool = e["setup"], e["rec"], e["tool"]
+    setup, rec, qe = e["setup"], e["rec"], e["qe"]
     entry = seedgen.qwen_model("qwen2511-q4")
     old = mt.make_hf_cache(os.path.join(e["tmp"], "zi"), entry["repo"], {"transformer/0.safetensors": b"\x01" * (4 * 2 ** 20)})
-    mt.make_hf_cache(os.path.join(e["tmp"], "zi"), tool.EDIT_LORA_REPO, {tool.EDIT_LORA_FILE: b"\x01" * 8})
-    assert tool.weights_problem(entry, tool.qwen_hubs())[0] == (
+    mt.make_hf_cache(os.path.join(e["tmp"], "zi"), qe.EDIT_LORA_REPO, {qe.EDIT_LORA_FILE: b"\x01" * 8})
+    assert qe.weights_problem(entry, qe.qwen_hubs())[0] == (
         "mflux-community/qwen-image-edit-2511-mflux-q4@3c74aab7dd79 is not in %s or %s "
         "(run bin/seed-edit-setup --model qwen2511-q4)" % (e["zhub"], e["hfhub"]))
     mark_ready(e)
@@ -1764,13 +1768,13 @@ def test_sq_final_b_no_token_reaches_the_mflux_child(env):
     mflux_venv(env)
     install_model(env, "qwen21-q4")
     install_lora(env, "uncensored")
-    seen, real = [], tool.run_child
+    seen, real = [], env["qe"].run_child
 
-    def spy(argv, child_env, on_line):
+    def spy(argv, child_env, on_line, timeout_s, log_path=None):
         seen.append(dict(child_env))
-        return real(argv, child_env, on_line)
+        return real(argv, child_env, on_line, timeout_s, log_path)
 
-    mp.setattr(tool, "run_child", spy)
+    mp.setattr(env["qe"], "run_child", spy)
     code, run_dir = run_tool(env, "--qwen-model", "qwen21-q4", "--lora", "uncensored=1", "--candidates", "1",
                              model="qwen")
     assert code == 0 and statuses(run_dir) == ["ok"]
@@ -1899,3 +1903,98 @@ def test_sg_final_a_phone_hdr_jpeg_is_a_jpeg(env):
         "source.jpg", {"width": 300, "height": 200}, {"width": 288, "height": 192})
     with open(mpo, "rb") as f, open(os.path.join(run_dir, "source.jpg"), "rb") as g:
         assert f.read() == g.read()
+
+
+# --- QET12 (qwen edit models QE19-QE23, QEK3): the tool on top of qwen_edit.py behaves as before -------------
+
+QET12_CASES = SQT5_CASES + [("qwen2511-bf16", [], [], [], 8, None,
+                             "Qwen-Image-Edit-2511 bf16 (Lightning, diffusers); LoRAs none; 8 steps; scheduler default")]
+
+
+@pytest.mark.parametrize("model_id,loras,paths,scales,steps,scheduler,why", QET12_CASES,
+                         ids=["case%d" % (i + 1) for i in range(len(QET12_CASES))])
+def test_qet12_the_tool_on_qwen_edit_behaves_as_before(env, capsys, model_id, loras, paths, scales, steps,
+                                                        scheduler, why):
+    env["mp"].setattr(env["qe"], "avail_gib", lambda: 128.0)
+    entry = seedgen.qwen_model(model_id)
+    if entry["backend"] == "mflux":
+        py, _venv = mflux_venv(env)
+        snapshot, lightning = install_model(env, model_id)
+        found = {"lightning": lightning}
+        for lora_id in ("uncensored", "viggle-turbo"):
+            found[lora_id] = install_lora(env, lora_id)
+    else:
+        bf16_cache(env)
+        stub = qwenedit_stub(env, {})
+    extra = ["--qwen-model", model_id, "--candidates", "2", "--seed", "100"]
+    for value in loras:
+        extra += ["--lora", value]
+    code, run_dir = run_tool(env, *extra, model="qwen")
+    assert code == 0
+    work = os.path.join(run_dir, "work")
+    record = record_of(run_dir)
+    chosen = [{"id": v.split("=")[0], "scale": float(v.split("=")[1])} for v in loras]
+    expected = {"schema": "seed-edit.run.v1", "run": RUN, "created": None, "state": "done", "prompt": PROMPT,
+                "model": "qwen", "backend": entry["backend"], "strength": None, "seed": 100,
+                "size": {"width": 1024, "height": 672}, "source_size": {"width": 1536, "height": 1024},
+                "source": "source.png", "source_origin": None, "job": None, "error": None,
+                "candidates": [{"n": n, "seed": 100 + n, "status": "ok", "seconds": None} for n in (1, 2)]}
+    expected.update(seedgen.qwen_settings(model_id, chosen))
+    assert dict(record, created=None, candidates=[dict(c, seconds=None) for c in record["candidates"]]) == expected
+    for n in (1, 2):
+        with Image.open(cand(run_dir, n)) as img:
+            assert img.size == (1024, 672)
+    assert glob.glob(os.path.join(work, "*.part.png")) + glob.glob(os.path.join(work, "*.pending.png")) == []
+    out = [line for line in capsys.readouterr().out.splitlines() if line.startswith(("seed-edit: ", "candidate "))]
+    assert plain(out) == ["seed-edit: run %s" % run_dir, "seed-edit: source 1536x1024 -> 1024x672",
+                          "seed-edit: backend %s (%s)" % (entry["backend"], why), "candidate 1/2 ok Ss",
+                          "candidate 2/2 ok Ss", "seed-edit: done: 2 ok, 0 blocked, 0 failed"]
+    if entry["backend"] == "mflux":
+        (call,) = stub_calls(py)
+        assert call["spec"] == {
+            "family": entry["family"], "model_path": snapshot, "lora_paths": [found[p] for p in paths],
+            "lora_scales": scales, "width": 1024, "height": 672, "steps": steps, "guidance": 1.0,
+            "scheduler": scheduler,
+            "jobs": [{"n": n, "seed": 100 + n, "prompt": PROMPT, "source": os.path.join(work, "source.png"),
+                      "output_path": os.path.join(work, "cand_%02d.pending.png" % n)} for n in (1, 2)]}
+    else:
+        (call,) = stub_calls(stub)
+        assert call["spec"] == {
+            "image": os.path.join(work, "source.png"), "model": "Qwen/Qwen-Image-Edit-2511",
+            "lora_repo": "lightx2v/Qwen-Image-Edit-2511-Lightning",
+            "lora_file": "Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors", "steps": 8, "true_cfg": 1.0,
+            "skill": "seed_edit",
+            "jobs": [{"prompt": PROMPT, "output_path": os.path.join(work, "cand_%02d.part.png" % n), "seed": 100 + n,
+                      "width": 1024, "height": 672} for n in (1, 2)],
+            "report_path": os.path.join(work, "qwenedit_report.json")}
+    with open(TOOL_PATH, encoding="utf-8") as f:
+        source = f.read()
+    for gone in ("def run_child(", "def weights_problem(", "CHILD_TIMEOUT_S", "import subprocess", "import threading"):
+        assert gone not in source, gone
+
+
+# --- Review Focus 2: a Cancel during a Qwen run kills the Qwen child -----------------------------------------
+
+def test_qe_review_focus_2_an_interrupt_kills_the_qwen_child(env, capsys):
+    tool, qe, mp = env["tool"], env["qe"], env["mp"]
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        mp.setattr(qe, "CHILD", proc)
+        qe.kill_running_child()
+        assert proc.wait(timeout=10) == -9
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    killed = []
+    mp.setattr(qe, "kill_running_child", lambda: killed.append(True))
+
+    def interrupted(ctx):
+        raise KeyboardInterrupt
+
+    mp.setattr(tool, "run", interrupted)
+    code, run_dir = run_tool(env, "--qwen-model", "qwen21-q4", model="qwen", run=R1)
+    assert (code, killed) == (130, [True])
+    record = record_of(run_dir)
+    assert (record["state"], record["error"]) == ("cancelled", "interrupted")
+    assert capsys.readouterr().err == "seed-edit: interrupted\n"

@@ -2,8 +2,9 @@
 """location -- build, train and inspect the location LoRA library (generated/locations/).
 
   bin/location create NAME [--description TEXT] [--photo PATH ...] [--trigger WORD] [--seed N]
-                           [--force]
+                           [--force] [--qwen-model ID] [--lora ID=SCALE ...]
   bin/location create NAME --regenerate [--seed N | --new-seed] [--description TEXT] [--force]
+                           [--qwen-model ID] [--lora ID=SCALE ...]
   bin/location train NAME [--video] [--stills] [--force]
   bin/location edit NAME --description TEXT
   bin/location list
@@ -14,7 +15,9 @@ Without --photo the 24 stills are drawn from --description by Z-Image. With --ph
 the stills are the photos plus Qwen-Image-Edit-2511 edits of them that re-shoot the place from a
 new viewpoint at a new time of day, weather or season; edits can only guess at what the photos
 do not show, so 3-5 photos taken from different spots are recommended; without --description the vision model drafts one from the first
-5 photos. train trains the video LoRA (ltx-2-mlx) and, when mflux is installed and its adapter
+5 photos. Photo edits (and their top-up rounds) use the Qwen edit model of --qwen-model (default
+qwen21-q4 with the uncensored LoRA); text stills stay Z-Image. train trains the video LoRA
+(ltx-2-mlx) and, when mflux is installed and its adapter
 passes the compat gate, the stills LoRA; neither flag means both. edit saves a photo location's
 new description. list and show read the library only. A trained location is pinned in a movie
 with bin/ltx-movie --location NAME.
@@ -69,6 +72,12 @@ def build_parser():
                    help="rebuild an existing location's dataset")
     p.add_argument("--new-seed", dest="new_seed", action="store_true",
                    help="with --regenerate: use the stored seed + 1")
+    p.add_argument("--qwen-model", dest="qwen_model", default=None, metavar="ID",
+                   help="photo locations: the Qwen edit model of the edits (qwen21-q4, qwen21-q8, qwen21-bf16, "
+                        "qwen2511-q4, qwen2511-bf16; default qwen21-q4 with its default LoRAs)")
+    p.add_argument("--lora", dest="lora", action="append", default=None, metavar="ID=SCALE",
+                   help="with --qwen-model: a registry LoRA of its family, 0 < SCALE <= 2 (repeatable); none listed "
+                        "means no LoRA")
     t = sub.add_parser("train", help="train the video LoRA and/or the stills LoRA")
     t.add_argument("name", metavar="NAME")
     t.add_argument("--video", action="store_true")

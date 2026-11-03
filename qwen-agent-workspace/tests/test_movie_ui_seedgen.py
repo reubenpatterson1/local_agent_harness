@@ -1123,7 +1123,7 @@ SEED_FUNCTIONS = ("seedCanvas", "setSeedSource", "onSeedSourceFile", "updateSeed
                   "openSeedRun", "pollSeedRun", "renderSeedRun", "seedRow", "keepSeed", "useSeed", "editSeedAgain",
                   "loadSeeds", "loadSeedRuns", "loadSeedFolders", "copySeedPath", "seedFromStill", "stopSeedPoll",
                   "resetSeeds", "setupSeeds", "seedRegistry", "seedQwenEntry", "seedLoraEntry", "seedMultiple",
-                  "renderSeedQwen", "readSeedQwen", "seedLoraBody", "seedModelText")
+                  "seedModelText")
 CSS_RULES = (".se-grid { display: flex; flex-direction: column; gap: 12px; }",
              ".se-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }",
              ".se-img, .se-thumb { width: 320px; height: auto; border: 1px solid var(--line); }",
@@ -1176,14 +1176,14 @@ QWEN_BOX = ('      <div id="se-qwen-box" class="wide" hidden>\n'
             '        <p id="se-qwen-note" class="muted"></p>\n'
             '      </div>\n')
 QWEN_JS_TEXTS = ('"Lightning 8-step LoRA built in (not selectable)"', '" steps (turbo)"', '"Unavailable here: "',
-                 '"se-lora-scale-"', '"se-lora-note-"', '" — unavailable"', '"checking models…"', '" (Lightning)"',
-                 "qwen_model: model === \"qwen\" ? S.seeds.qwen.model : null",
-                 "loras: model === \"qwen\" ? seedLoraBody() : null",
+                 'prefix + "-lora-scale-"', 'prefix + "-lora-note-"', '" — unavailable"', '"checking models…"',
+                 '" (Lightning)"',
+                 "qwen_model: model === \"qwen\" ? SEED_PICKER.selection().model : null",
+                 "loras: model === \"qwen\" ? SEED_PICKER.selection().loras : null",
                  '  const SEED_MODEL_LABELS = {zimage: "Z-Image", qwen: "Qwen-Image"};',
                  '  const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", '
                  '"mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};',
-                 'S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false, qwen: null, '
-                 'qwenKey: ""};',
+                 'S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false};',
                  "  function seedCanvas(w, h, multiple) {",
                  "seedCanvas(natural.width, natural.height, seedMultiple())",
                  '" strength must be above 0 and at most 2"',
@@ -1237,13 +1237,14 @@ def test_sq_final_d_e_f_page_guards():
     probe's reason, and the rows' key includes the note, so the rows are rebuilt when the probe fails."""
     _static, texts = _static_texts()
     js = texts["app.js"]
-    for text in ('    if (model === "qwen" && models && !S.seeds.qwen) {\n'
-                 '      qwenReason = "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui '
-                 'server)";\n    }\n    else if (model === "qwen" && models && S.seeds.qwen) {\n',
-                 '    const cap = capability("seed_edit");\n    const models = cap.models;\n    const state = S.seeds.qwen;\n',
+    for text in ('      if (!p.state) {\n'
+                 '        return models ? "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui '
+                 'server)"\n',
+                 'let qwenReason = ""; if (model === "qwen" && models) { qwenReason = SEED_PICKER.reason(); }',
+                 '      const cap = capability("seed_edit");\n      const models = cap.models;\n      const state = p.state;\n',
                  '      return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));\n',
                  "return [l.id, loraOk(l.id), loraNote(l)];",
-                 'const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: loraNote(l)});',
+                 'const note = el("span", {cls: "muted", id: prefix + "-lora-note-" + l.id, text: loraNote(l)});',
                  '$("#se-run-title").textContent = view.run + " · " + seedModelText(view) + ',
                  '        el("td", {text: seedModelText(r)}), el("td", {text: r.state}), thumbs]);'):
         assert text in js, text
@@ -1327,8 +1328,8 @@ def test_sgt34_the_new_python_files_and_the_tool_imports():
     with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
         source = f.read()
     assert re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M) == [
-        "argparse", "glob", "importlib.util", "json", "os", "re", "secrets", "shutil", "signal", "subprocess", "sys",
-        "threading", "time", "movie_ui_lib", "movie_ui_seedgen"]
+        "argparse", "glob", "json", "os", "re", "secrets", "shutil", "signal", "sys", "time", "movie_ui_lib",
+        "movie_ui_seedgen", "qwen_edit"]
 
 
 # --- SQT18 (seed models SQ42): bin/seed-edit-setup carries the tool's lookups byte for byte -------------------------
@@ -1344,7 +1345,7 @@ def _code_of(source, name):
 def test_sqt18_the_setup_script_carries_the_tool_lookups():
     with open(os.path.join(WS, "bin", "seed-edit-setup"), encoding="utf-8") as f:
         setup = f.read()
-    with open(os.path.join(WS, "bin", "seed-edit"), encoding="utf-8") as f:
+    with open(os.path.join(WS, "qwen_edit.py"), encoding="utf-8") as f:
         tool = f.read()
     for name in ("mflux_version", "default_hub", "pinned_snapshot", "pinned_file", "weights_problem"):
         assert _code_of(setup, name) == _code_of(tool, name), name

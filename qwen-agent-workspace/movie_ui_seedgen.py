@@ -121,27 +121,23 @@ def _source(value):
     return None, SOURCE_MSG
 
 
-def _qwen_fields(body, model):
-    """Seed models SQ30 rows 9a-9i: (qwen_model, loras, None) cleaned, or (None, None, error)."""
-    model_id, loras = body.get("qwen_model"), body.get("loras")
-    if model == "zimage":
-        if model_id is not None:
-            return None, None, "qwen_model is only for qwen"
-        if loras is not None:
-            return None, None, "loras is only for qwen"
-        return None, [], None
+def qwen_selection(model_id, loras, model_key="qwen_model", loras_key="loras"):
+    """Seed models SQ30 rows 9b-9i as a shared rule (qwen edit models QE51): (model_id, loras, None)
+    cleaned, or (None, None, error). A null model is DEFAULT_QWEN_MODEL, null loras that model's
+    default_loras, [] no LoRA; model_key and loras_key name the request fields in the texts."""
+    lists = "%s must be a list of {id, scale}" % loras_key
     if model_id is not None and not (isinstance(model_id, str) and model_id in QWEN_MODEL_IDS):
-        return None, None, "unknown qwen_model %s" % (model_id,)
+        return None, None, "unknown %s %s" % (model_key, model_id)
     if model_id is None:
         model_id = DEFAULT_QWEN_MODEL
     if loras is None:
         return model_id, default_loras(model_id), None
     if not isinstance(loras, list):
-        return None, None, LORAS_MSG
+        return None, None, lists
     entry, seen, clean = qwen_model(model_id), set(), []
     for item in loras:
         if not (isinstance(item, dict) and set(item) == {"id", "scale"}):
-            return None, None, LORAS_MSG
+            return None, None, lists
         lora_id, scale = item["id"], item["scale"]
         if not (isinstance(lora_id, str) and lora_id in QWEN_LORA_IDS):
             return None, None, "unknown LoRA %s" % (lora_id,)
@@ -155,6 +151,18 @@ def _qwen_fields(body, model):
             return None, None, "LoRA %s scale must be a number above 0 and at most 2" % lora_id
         clean.append({"id": lora_id, "scale": float(scale)})
     return model_id, registry_order(clean), None
+
+
+def _qwen_fields(body, model):
+    """Seed models SQ30 rows 9a-9i: (qwen_model, loras, None) cleaned, or (None, None, error)."""
+    model_id, loras = body.get("qwen_model"), body.get("loras")
+    if model == "zimage":
+        if model_id is not None:
+            return None, None, "qwen_model is only for qwen"
+        if loras is not None:
+            return None, None, "loras is only for qwen"
+        return None, [], None
+    return qwen_selection(model_id, loras)
 
 
 def validate_run_request(body):

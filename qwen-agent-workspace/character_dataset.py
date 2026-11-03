@@ -9,8 +9,9 @@ ltx2_mlx_video_skill (as SKILL). torch, z_image_skill, diffusers and content_saf
 imported ONLY inside child_zimage() and child_qwenedit(), which run in a child process
 (python3 character_dataset.py zimage|qwenedit --spec SPEC): z_image_skill allows one LoRA
 set per process, and `create` must release the image model's memory before it restarts
-the vision server. Seed-image datasets are edits of the seed (qwenedit, spec
-docs/superpowers/specs/2026-10-21-character-seed-edit-design.md); descriptor datasets are
+the vision server. Seed-image datasets are edits of the seed with the Qwen registry model of
+character.json's edit key (qwen_edit.run_jobs; the qwenedit child for qwen2511-bf16;
+docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md); descriptor datasets are
 Z-Image text2img (zimage).
 
 The prompts, VARIANTS and the VLM helpers below are copied verbatim from the spike tool
@@ -47,6 +48,7 @@ sys.path.insert(0, WS)
 
 import character_lib  # noqa: E402
 import ltx2_mlx_video_skill as SKILL  # noqa: E402
+import qwen_edit  # noqa: E402
 
 STORY_SERVER = os.path.join(WS, "bin", "story-server")
 # story-server mode used to (re)start the vision model after the generate phase frees
@@ -534,8 +536,8 @@ def wait_for_avail(min_gib, timeout_s):
 
 def busy_process():
     """(pid, first 120 characters of its command line) for the first render, training,
-    Z-Image or Qwen-Image-Edit process found, else None. Fail-closed by design (spec 4.12,
-    G17)."""
+    Z-Image or Qwen-Image-Edit, Seeds or Qwen edit (seed_edit_mflux_child.py) process found, else
+    None. Fail-closed by design (spec 4.12, G17)."""
     skip = {os.getpid(), os.getppid()}
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
@@ -546,12 +548,15 @@ def busy_process():
         if pid in skip:
             continue
         joined = " ".join(cmdline)
+        seed_tool = (any(a == "bin/seed-edit" or a.endswith("/bin/seed-edit") for a in cmdline)
+                     and "--probe" not in cmdline)
         if (("ltx-2-mlx" in joined
              and any(t in cmdline for t in ("generate", "train", "preprocess")))
+                or seed_tool
                 or any(marker in joined for marker in (
                     "mflux-train", "bin/ltx-movie", "bin/ltx-mlx-render",
                     "bin/ltx-story-images", "character_dataset.py zimage",
-                    "character_dataset.py qwenedit"))):
+                    "character_dataset.py qwenedit", "seed_edit_mflux_child.py"))):
             return pid, joined[:120]
     return None
 
@@ -844,6 +849,13 @@ def edit_models_missing():
     return missing
 
 
+def edit_selection_problem(model_id, loras):
+    """None when a registry edit selection other than qwen2511-bf16 is installed and fits this host's
+    memory, else the reason (qwen edit models spec QE34). qwen2511-bf16 stays checked by
+    edit_models_missing. Called through this module so a test fake applies to bin/location too."""
+    return qwen_edit.selection_problem(model_id, loras)
+
+
 # Two-source dataset mode (opt-in via the CHARACTER_TWO_SOURCE env var; survives
 # --regenerate, which rebuilds from character.json). Instead of 24 independent
 # text2img VARIANTS -- where identity drifts shot to shot -- it generates a few
@@ -919,10 +931,12 @@ def build_dataset(data, face_height, review=False):
 def _generate_edits(data, plan, char_dir, stills_dir, review):
     """Edit the seed into every plan entry in a qwenedit child; with review, edit the
     EDIT_PREVIEW entries first, write dataset/preview_sheet.jpg and wait for Enter."""
+    edit_model, edit_loras = qwen_edit.selection_of(data["edit"])
+
     def spec_for(entries):
         return {"image": os.path.join(char_dir, "seed.png"), "model": EDIT_MODEL,
                 "lora_repo": EDIT_LORA_REPO, "lora_file": EDIT_LORA_FILE, "steps": EDIT_STEPS,
-                "true_cfg": EDIT_TRUE_CFG,
+                "true_cfg": EDIT_TRUE_CFG, "edit": {"qwen_model": edit_model, "loras": edit_loras},
                 "jobs": [{"prompt": e["prompt"],
                           "output_path": os.path.join(stills_dir, "char_%02d.png" % e["n"]),
                           "seed": data["seed"], "width": WIDTH, "height": HEIGHT}
@@ -983,7 +997,7 @@ def _build_dataset(data, face_height, review=False):
     if rc != 0:
         print("warning: story-server stop returned %d" % rc, file=sys.stderr)
     try:
-        min_gib = EDIT_MIN_AVAIL_GIB if seed_mode else GENERATE_MIN_AVAIL_GIB
+        min_gib = qwen_edit.memory_floor(data["edit"]["qwen_model"]["id"]) if seed_mode else GENERATE_MIN_AVAIL_GIB
         if not wait_for_avail(min_gib, AVAIL_WAIT_S):
             raise DatasetError("timed out waiting for %d GiB available memory after stopping the "
                                "story server" % min_gib)
@@ -1052,9 +1066,11 @@ def _build_dataset(data, face_height, review=False):
                 "class_noun": data["class_noun"], "descriptor": data["descriptor"],
                 "seed": data["seed"], "min_score": character_lib.MIN_SCORE,
                 "reference": "char_%02d" % ref_n, "face_height": face_height,
-                "generator": ("%s + %s, %d steps" % (EDIT_MODEL, EDIT_LORA_FILE, EDIT_STEPS)
-                              if seed_mode else "Z-Image"),
-                "items": items}
+                "generator": (qwen_edit.generator_text(*qwen_edit.selection_of(data["edit"]))
+                              if seed_mode else "Z-Image")}
+    if seed_mode:
+        manifest["edit"] = data["edit"]
+    manifest["items"] = items
     with open(os.path.join(dataset_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     sheet = os.path.join(dataset_dir, "contact_sheet.jpg")
@@ -1113,6 +1129,7 @@ def _face_problem(fh):
 
 
 SEED_MAX = 2147483647
+SEED_ONLY = "--qwen-model and --lora apply only to seed-image characters"
 
 
 def create(args):
@@ -1126,6 +1143,7 @@ def create(args):
     char_dir = character_lib.character_dir(name)
     json_path = character_lib.character_json_path(name)
     data = None
+    qwen_args = (getattr(args, "qwen_model", None), getattr(args, "lora", None))
     if args.regenerate:
         if (any(v is not None for v in (args.phrase, args.seed_image, args.descriptor,
                                         args.class_noun, args.trigger))
@@ -1145,6 +1163,8 @@ def create(args):
             return _error("character %s is trained; regenerating its dataset would orphan its "
                           "LoRAs. Create a new character instead" % name)
         seed_mode = data["source"]["type"] == "seed_image"
+        if not seed_mode and qwen_args != (None, None):
+            return _error(SEED_ONLY)
         old_seed = data["seed"]
         if args.new_seed:
             new_seed = 0 if old_seed >= SEED_MAX else old_seed + 1
@@ -1208,17 +1228,28 @@ def create(args):
                 return _error("trigger %s must not be a word of the phrase or the class noun"
                               % args.trigger)
         seed_mode = seed_path is not None
+        if not seed_mode and qwen_args != (None, None):
+            return _error(SEED_ONLY)
 
+    if seed_mode:
+        try:
+            edit_model, edit_loras = qwen_edit.cli_selection(*qwen_args)
+        except qwen_edit.SelectionError as e:
+            return _error(str(e))
     review = seed_mode and not getattr(args, "no_review", False)
     if review and not sys.stdin.isatty():
         return _error("the seed-image preview review needs an interactive terminal; run this "
                       "interactively, or pass --no-review for unattended operation")
-    if seed_mode:
+    if seed_mode and edit_model == qwen_edit.LEGACY_EDIT_MODEL:
         missing = edit_models_missing()
         if missing:
             return _error("the seed-image editor is not downloaded: %s; download it with: %s"
                           % (", ".join(missing),
                              "; ".join("hf download %s" % m for m in missing)))
+    elif seed_mode:
+        problem = edit_selection_problem(edit_model, edit_loras)
+        if problem:
+            return _error(problem)
 
     with contextlib.ExitStack() as stack:
         try:
@@ -1240,15 +1271,21 @@ def create(args):
         if data is not None:
             # Persisted only now: the lock is held and every preflight passed, so a refused
             # run never burns a seed and a concurrent job's character.json is never rewritten.
-            if new_seed != old_seed:
-                data["seed"] = new_seed
+            changed = new_seed != old_seed
+            if seed_mode:
+                new_edit = qwen_edit.settings(edit_model, edit_loras)
+                changed = changed or data.get("edit") != new_edit
+                data["edit"] = new_edit
+            data["seed"] = new_seed
+            if changed:
                 try:
                     character_lib.write_character(data)
                 except character_lib.CharacterError as e:
                     return _error(e)
-                print("seed: %d -> %d" % (old_seed, new_seed))
-            else:
-                print("seed: %d (unchanged)" % old_seed)
+            print("seed: %d -> %d" % (old_seed, new_seed) if new_seed != old_seed
+                  else "seed: %d (unchanged)" % old_seed)
+            if seed_mode:
+                print("edit model: %s" % qwen_edit.generator_text(edit_model, edit_loras))
             return _regenerate(data, review)
 
         fh = raw = cls_vlm = box = None
@@ -1298,7 +1335,11 @@ def create(args):
                 "strength": None, "status": "dataset", "created_at": character_lib.utc_now(),
                 "dataset": None, "loras": {"video": None, "stills": None},
                 "stills_skip_reason": None}
+        if seed_path is not None:
+            data["edit"] = qwen_edit.settings(edit_model, edit_loras)
         character_lib.write_character(data)
+        if seed_path is not None:
+            print("edit model: %s" % qwen_edit.generator_text(edit_model, edit_loras))
         return build_dataset(data, fh, review)
 
 
@@ -1804,8 +1845,12 @@ def run_zimage_child(spec, char_dir, step):
 
 
 def run_edit_child(spec, char_dir, step):
-    """Run the seed edits in spec through Qwen-Image-Edit in a child process and return its
-    report: {"jobs": [{"output_path", "status", "seconds"}]}."""
+    """Run the seed edits in spec (the qwenedit child for qwen2511-bf16, else qwen_edit.run_jobs) and
+    return its report: {"jobs": [{"output_path", "status", "seconds"}]}."""
+    edit = spec.get("edit")
+    if edit is not None and edit["qwen_model"] != qwen_edit.LEGACY_EDIT_MODEL:
+        return _run_registry_edit(spec, edit, char_dir, step)
+    spec = dict((k, v) for k, v in spec.items() if k != "edit")
     log = step_log_path(char_dir, step)
     stem = log[:-len(".log")]
     spec_path = stem + ".spec.json"
@@ -1820,6 +1865,30 @@ def run_edit_child(spec, char_dir, step):
         raise error
     with open(report_path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def _run_registry_edit(spec, edit, char_dir, step):
+    """run_edit_child for a registry model other than qwen2511-bf16 (qwen edit models spec QE33): the jobs
+    through qwen_edit.run_jobs, logged to logs/<stamp>-<step>.log, staged as <stem>.pending.png beside each
+    output, screened with spec["skill"] (default character_edit). Returns run_edit_child's report shape."""
+    log = step_log_path(char_dir, step)
+    jobs = [{"n": i, "seed": job["seed"], "prompt": job["prompt"], "source": job.get("image", spec["image"]),
+             "stage_path": os.path.splitext(job["output_path"])[0] + ".pending.png",
+             "output_path": job["output_path"]} for i, job in enumerate(spec["jobs"], 1)]
+    print("Running: %s edit of %d stills; log: %s" % (qwen_edit.label(edit["qwen_model"]), len(jobs), log))
+    sys.stdout.flush()
+    try:
+        results, failure = qwen_edit.run_jobs(edit["qwen_model"], edit["loras"], jobs, spec["jobs"][0]["width"],
+                                              spec["jobs"][0]["height"], spec.get("skill", "character_edit"),
+                                              log[:-len(".log")], log_path=log)
+    except qwen_edit.Unavailable as e:
+        raise DatasetError(str(e))
+    if failure is not None:
+        error = DatasetError("%s; log: %s" % (failure, log))
+        error.log_path = log
+        raise error
+    return {"jobs": [{"output_path": r["output_path"], "status": r["status"], "seconds": r["seconds"]}
+                     for r in results]}
 
 
 def exit_with_parent(poll_s=2.0):

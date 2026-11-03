@@ -432,3 +432,59 @@ def test_ll15_an_unreadable_record_is_a_location_error(env):
         assert "harbour-street" not in names
     finally:
         os.chmod(path, 0o644)
+
+
+# --- QET15 (qwen edit models QE31, QE38): the optional edit key of location.json ----------------------------
+
+EDIT = {"qwen_model": {"id": "qwen21-q4", "repo": "mflux-community/qwen-image-2-1-mflux-q4"},
+        "loras": [{"id": "uncensored", "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized",
+                   "file": "qwen-image-2.1-uncensored-lora.safetensors", "scale": 1.0}],
+        "steps": 40, "scheduler": "linear"}
+
+
+def _bad_edits():
+    """(bad edit value, its _edit_problem text): one bad shape per QE31 rule."""
+    no_steps = dict((k, v) for k, v in EDIT.items() if k != "steps")
+    model = {"id": "qwen21-q4"}
+    keys = "must be an object with exactly the keys loras, qwen_model, scheduler, steps, got %r"
+    loras_text = ("loras must be a list of objects with exactly the keys file, id, repo (non-empty strings) and "
+                  "scale (a number in (0, 2]), got %r")
+    out = [("x", keys % ("x",)), (no_steps, keys % (no_steps,)),
+           (dict(EDIT, qwen_model=model), "qwen_model must be an object with exactly the keys id and repo, both "
+            "non-empty strings, got %r" % (model,))]
+    for loras in ([{"id": "uncensored"}], [dict(EDIT["loras"][0], scale=0)], [dict(EDIT["loras"][0], scale=2.5)]):
+        out.append((dict(EDIT, loras=loras), loras_text % (loras,)))
+    out += [(dict(EDIT, steps=0), "steps must be an int >= 1, got 0"),
+            (dict(EDIT, scheduler=""), "scheduler must be null or a non-empty string, got ''")]
+    return out
+
+
+def _code_of(source, name):
+    """The text of function name in source, without its docstring (tests/test_movie_ui_seedgen.py's)."""
+    start = source.index("\ndef %s(" % name)
+    text = source[start:source.index("\n\n\n", start)]
+    doc = text.index('"""')
+    return text[:doc] + text[text.index('"""', doc + 3) + 3:]
+
+
+def test_qet15_the_optional_edit_key(env):
+    lib = env["locations"]
+    data = lt.mill(lib, status="untrained", source="photos")
+    ll.validate_location(data, name="old-mill")
+    data["edit"] = json.loads(json.dumps(EDIT))
+    ll.write_location(data)
+    assert ll.load_location("old-mill")["edit"] == EDIT
+    ll.validate_location(dict(data, edit=dict(EDIT, scheduler=None, loras=[])), name="old-mill")
+    for bad, text in _bad_edits():
+        assert _raises(ll.validate_location, dict(data, edit=bad)) == "edit: " + text, bad
+    text_location = lt.harbour(lib)
+    assert _raises(ll.validate_location, dict(text_location, edit=EDIT)) == (
+        "edit: only a photo location records an edit model")
+    ll.validate_location(text_location, name="harbour-street")
+    sources = []
+    for rel in ("location_lib.py", "character_lib.py"):
+        with open(os.path.join(WS, rel), encoding="utf-8") as f:
+            sources.append(f.read())
+    assert _code_of(sources[0], "_edit_problem") == _code_of(sources[1], "_edit_problem")
+    for name in ("_OPTIONAL_KEYS", "_EDIT_KEYS", "_EDIT_MODEL_KEYS", "_EDIT_LORA_KEYS"):
+        assert getattr(ll, name) == getattr(cl, name), name

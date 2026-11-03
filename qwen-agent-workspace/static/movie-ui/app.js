@@ -21,7 +21,7 @@
   const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", "mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
+    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, seedOrigin: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
   // Seed-folder spec SD27: one state box per folder mode (Compose and Characters); part(box, name)
@@ -40,7 +40,14 @@
   };
   function part(box, name) { return $("#" + box.ids + "-" + name); }
   // Seed generator spec SG56: the Seeds tab's state.
-  S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false, qwen: null, qwenKey: ""};
+  S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false};
+  // Qwen edit models spec QE62: the picker's mounts.
+  const SEED_PICKER = qwenPicker("se", false);
+  const LOCATION_PICKER = qwenPicker("lo-cq", false);
+  const LOCATION_REGEN_PICKER = qwenPicker("lo-rq", false);
+  const CHARACTER_PICKER = qwenPicker("ch-cq", false);
+  const CHARACTER_REGEN_PICKER = qwenPicker("ch-rq", false);
+  const COMPOSE_PICKER = qwenPicker("c-sq", true);
 
   // --- helpers -------------------------------------------------------------------------
 
@@ -403,12 +410,27 @@
     return first.concat(rest);
   }
 
+  function composeSeedEditActive() {
+    const supported = (S.options && S.options.supported) || {};
+    return supported.seed_edit !== false && $("#c-mode").value === "chained"
+      && (($("#c-res-seed").checked && Boolean(S.seedUpload)) || $("#c-res-folder").checked);
+  }
+
+  // Qwen edit models spec QE67: a Seeds-tab "Use" seed defaults to as-is, an upload or a seed folder to the
+  // registry default (qwen21-q4 + its default LoRAs). The origin is kept in S.seedOrigin.
+  function composeSeedDefault(origin) {
+    S.seedOrigin = origin;
+    if (origin === "seeds") { COMPOSE_PICKER.select("as-is", []); }
+    else { COMPOSE_PICKER.select(null, null); }
+  }
+
   function composeFields(action) {
     const byLength = $("#c-size-length").checked;
     const bySeed = $("#c-res-seed").checked;
     const byFolder = $("#c-res-folder").checked;
     const supported = (S.options && S.options.supported) || {};
     const goal = textOrNull("#c-goal");
+    const seedEdit = composeSeedEditActive() ? COMPOSE_PICKER.selection() : null;
     return {
       ws: S.ws, action: action || "story",
       story_id: $("#c-story-id").value.trim(), narrative: $("#c-narrative").value,
@@ -419,6 +441,7 @@
       width: bySeed || byFolder ? null : numberOrNull("#c-width"),
       height: bySeed || byFolder ? null : numberOrNull("#c-height"),
       seed_upload: bySeed ? S.seedUpload : null,
+      seed_edit_model: seedEdit ? seedEdit.model : null, seed_edit_loras: seedEdit && seedEdit.model !== "as-is" ? seedEdit.loras : null,
       mode: $("#c-mode").value,
       model: $("#c-model").value === "__download__" ? null : textOrNull("#c-model"),
       gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
@@ -519,6 +542,16 @@
     gate($("#c-write-story"), $("#c-write-story-reason"), []);
     gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
     show($("#c-check-seams-box"), mode === "chained");
+    COMPOSE_PICKER.update();
+    const seedEditOn = composeSeedEditActive();
+    show($("#c-sq-qwen-box"), seedEditOn);
+    const seedEditReason = seedEditOn ? COMPOSE_PICKER.reason() : "";
+    $("#c-sq-reason").textContent = seedEditReason;
+    if (seedEditReason) {
+      $("#c-run-all").disabled = true;
+      const runReason = $("#c-run-all-reason");
+      runReason.textContent = runReason.textContent ? runReason.textContent + "; " + seedEditReason : seedEditReason;
+    }
     // Seed-folder spec SD29: the folder mode of the Compose buttons.
     const box = FOLDER_BOXES.compose;
     const folder = folderMode();
@@ -552,6 +585,7 @@
       S.seedUpload = await uploadFile(file);
       $("#c-seed-status").textContent = "uploaded " + S.seedUpload.slice(0, 12);
       $("#c-res-seed").checked = true;
+      composeSeedDefault("upload");
     } catch (err) {
       $("#c-seed-status").textContent = String(err.message);
     }
@@ -594,6 +628,7 @@
         return {name: f.name, file: f, state: "waiting", upload_id: null, reason: null};
       }), uploading: true};
       box.select();
+      if (box === FOLDER_BOXES.compose) { composeSeedDefault("folder"); }
       closeFolderConfirm(box);
       uploadFolder(box, box.seq);
     }
@@ -791,6 +826,8 @@
     S.seedUpload = f.seed_upload || null;
     $("#c-res-seed").checked = Boolean(S.seedUpload);
     $("#c-res-size").checked = !S.seedUpload;
+    S.seedOrigin = "job";
+    COMPOSE_PICKER.select(f.seed_edit_model || "as-is", f.seed_edit_loras || []);
     $("#c-mode").value = f.mode || "chained";
     fillModelSelect(f.model || "");
     $("#c-gemma").value = f.gemma || "";
@@ -835,6 +872,7 @@
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);
+    COMPOSE_PICKER.listen(function () { updateComposeButtons(); preview(); });
     const composeBox = FOLDER_BOXES.compose;
     part(composeBox, "choose").addEventListener("click", function () { part(composeBox, "file").click(); });
     part(composeBox, "file").addEventListener("change", function () { onFolderPick(composeBox); });
@@ -1783,104 +1821,7 @@
   }
 
   function seedMultiple() {
-    const entry = seedQwenEntry(S.seeds.qwen ? S.seeds.qwen.model : null);
-    return $("#se-model").value === "qwen" && entry ? entry.multiple : 16;
-  }
-
-  function readSeedQwen() {
-    const state = S.seeds.qwen;
-    if (!state) { return; }
-    const select = $("#se-qwen-model");
-    if (select.value) { state.model = select.value; }
-    Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
-      const id = row.dataset.lora;
-      const box = $("#se-lora-" + id);
-      if (!box.disabled) { state.loras[id].checked = box.checked; }
-      state.loras[id].scale = $("#se-lora-scale-" + id).value;
-    });
-  }
-
-  function renderSeedQwen() {
-    const registry = seedRegistry();
-    const select = $("#se-qwen-model");
-    if (!registry) {
-      clear(select);
-      $("#se-steps").textContent = "checking models…";
-      return;
-    }
-    const cap = capability("seed_edit");
-    const models = cap.models;
-    const state = S.seeds.qwen;
-    function probe(id) { return models && models.qwen.models[id]; }
-    function loraProbe(id) { return models && models.qwen.loras[id]; }
-    function enabled(id) { return !(probe(id) && probe(id).ok === false); }
-    if (select.options.length !== registry.models.length) {
-      clear(select);
-      registry.models.forEach(function (m) { select.appendChild(el("option", {value: m.id})); });
-    }
-    registry.models.forEach(function (m, i) {
-      const option = select.options[i];
-      option.textContent = m.label + (enabled(m.id) ? "" : " — unavailable");
-      option.disabled = !enabled(m.id);
-    });
-    let chosen = state.model;
-    if (!enabled(chosen)) {
-      const first = registry.models.filter(function (m) { return enabled(m.id); })[0];
-      if (enabled(registry.default_model)) { chosen = registry.default_model; }
-      else if (first) { chosen = first.id; }
-    }
-    state.model = chosen;
-    select.value = chosen;
-    const entry = seedQwenEntry(chosen);
-    const loras = registry.loras.filter(function (l) { return l.family === entry.family; });
-    function loraOk(id) { return loraProbe(id) ? loraProbe(id).ok === true : false; }
-    function loraNote(l) {
-      if (loraOk(l.id)) { return l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : ""); }
-      const found = loraProbe(l.id);
-      return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));
-    }
-    const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id), loraNote(l)]; }));
-    if (key !== S.seeds.qwenKey) {
-      S.seeds.qwenKey = key;
-      const box = clear($("#se-loras"));
-      if (entry.family === "qwen2511") {
-        box.appendChild(el("span", {cls: "muted", text: "Lightning 8-step LoRA built in (not selectable)"}));
-      }
-      else {
-        loras.forEach(function (l) {
-          const ok = loraOk(l.id);
-          const saved = state.loras[l.id];
-          const checkbox = el("input", {type: "checkbox", id: "se-lora-" + l.id});
-          checkbox.checked = saved.checked && ok;
-          checkbox.disabled = !ok;
-          const scale = el("input", {type: "number", id: "se-lora-scale-" + l.id, min: "0", max: "2", step: "0.05", value: saved.scale});
-          scale.disabled = !ok;
-          const note = el("span", {cls: "muted", id: "se-lora-note-" + l.id, text: loraNote(l)});
-          box.appendChild(el("div", {cls: "se-lora", data: {lora: l.id}}, [el("label", {}, [checkbox, " " + l.label]),
-            el("label", {}, ["strength ", scale]), note]));
-        });
-      }
-    }
-    const turbo = loras.filter(function (l) {
-      const box = $("#se-lora-" + l.id);
-      return l.steps && box && !box.disabled && box.checked;
-    })[0];
-    $("#se-steps").textContent = turbo ? turbo.steps + " steps (turbo)"
-      : entry.steps + " steps" + (entry.family === "qwen2511" ? " (Lightning)" : "");
-    const parts = registry.models.filter(function (m) { return !enabled(m.id); }).map(function (m) {
-      return m.label + " — " + probe(m.id).reason;
-    });
-    $("#se-qwen-note").textContent = parts.length ? "Unavailable here: " + parts.join("; ") : "";
-  }
-
-  function seedLoraBody() {
-    const out = [];
-    Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
-      const id = row.dataset.lora;
-      const box = $("#se-lora-" + id);
-      if (!box.disabled && box.checked) { out.push({id: id, scale: Number($("#se-lora-scale-" + id).value)}); }
-    });
-    return out;
+    return $("#se-model").value === "qwen" ? SEED_PICKER.multiple() : 16;
   }
 
   function seedModelText(view) {
@@ -1896,6 +1837,176 @@
     });
     if (loras.length) { text += " + " + loras.map(function (l) { return l.id + " " + l.scale; }).join(", "); }
     return text;
+  }
+
+  // Qwen edit models spec QE61: one Qwen edit model + LoRA picker. prefix names its elements:
+  // <prefix>-qwen-box, -qwen-model, -steps, -loras, -qwen-note, -lora-<id>, -lora-scale-<id>, -lora-note-<id>.
+  // asIs puts "Seed as-is (no edit)" first (Compose). Nothing touches the DOM before update().
+  function qwenPicker(prefix, asIs) {
+    const p = {state: null, key: "", wanted: null};
+    function node(suffix) { return $("#" + prefix + suffix); }
+    function rows() { return document.querySelectorAll("#" + prefix + "-loras .se-lora"); }
+    function probe(id) {
+      const models = capability("seed_edit").models;
+      return models && models.qwen.models[id];
+    }
+    function enabled(id) { return id === "as-is" || (Boolean(seedQwenEntry(id)) && !(probe(id) && probe(id).ok === false)); }
+    function fresh(wanted) {
+      const registry = seedRegistry();
+      const loras = {};
+      registry.loras.forEach(function (l) {
+        const listed = wanted && wanted.loras ? wanted.loras.filter(function (w) { return w.id === l.id; })[0] : null;
+        loras[l.id] = {checked: wanted && wanted.loras ? Boolean(listed) : l.default_on,
+                       scale: String(listed ? listed.scale : l.default_scale)};
+      });
+      return {model: wanted && wanted.model ? wanted.model : registry.default_model, loras: loras};
+    }
+    p.select = function (model, loras) {
+      p.wanted = {model: model, loras: loras};
+      p.state = null;
+      p.key = "";
+    };
+    p.update = function () {
+      if (!p.state && seedRegistry()) {
+        p.state = fresh(p.wanted);
+        p.wanted = null;
+      } else {
+        p.read();
+      }
+      p.render();
+    };
+    p.read = function () {
+      if (!p.state) { return; }
+      const select = node("-qwen-model");
+      if (select.value) { p.state.model = select.value; }
+      Array.prototype.forEach.call(rows(), function (row) {
+        const id = row.dataset.lora;
+        const box = node("-lora-" + id);
+        if (!box.disabled) { p.state.loras[id].checked = box.checked; }
+        p.state.loras[id].scale = node("-lora-scale-" + id).value;
+      });
+    };
+    p.render = function () {
+      const registry = seedRegistry();
+      const select = node("-qwen-model");
+      if (!registry) {
+        clear(select);
+        node("-steps").textContent = "checking models…";
+        return;
+      }
+      const cap = capability("seed_edit");
+      const models = cap.models;
+      const state = p.state;
+      function loraProbe(id) { return models && models.qwen.loras[id]; }
+      const ids = (asIs ? ["as-is"] : []).concat(registry.models.map(function (m) { return m.id; }));
+      if (select.options.length !== ids.length) {
+        clear(select);
+        ids.forEach(function (id) { select.appendChild(el("option", {value: id})); });
+      }
+      ids.forEach(function (id, i) {
+        const option = select.options[i];
+        option.textContent = id === "as-is" ? "Seed as-is (no edit)"
+          : seedQwenEntry(id).label + (enabled(id) ? "" : " — unavailable");
+        option.disabled = !enabled(id);
+      });
+      let chosen = state.model;
+      if (!enabled(chosen)) {
+        const first = registry.models.filter(function (m) { return enabled(m.id); })[0];
+        if (enabled(registry.default_model)) { chosen = registry.default_model; }
+        else if (first) { chosen = first.id; }
+      }
+      state.model = chosen;
+      select.value = chosen;
+      const parts = registry.models.filter(function (m) { return !enabled(m.id); }).map(function (m) {
+        return m.label + " — " + probe(m.id).reason;
+      });
+      node("-qwen-note").textContent = parts.length ? "Unavailable here: " + parts.join("; ") : "";
+      if (chosen === "as-is") {
+        if (p.key !== "as-is") { p.key = "as-is"; clear(node("-loras")); }
+        node("-steps").textContent = "";
+        return;
+      }
+      const entry = seedQwenEntry(chosen);
+      const loras = registry.loras.filter(function (l) { return l.family === entry.family; });
+      function loraOk(id) { return loraProbe(id) ? loraProbe(id).ok === true : false; }
+      function loraNote(l) {
+        if (loraOk(l.id)) { return l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : ""); }
+        const found = loraProbe(l.id);
+        return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));
+      }
+      const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id), loraNote(l)]; }));
+      if (key !== p.key) {
+        p.key = key;
+        const box = clear(node("-loras"));
+        if (entry.family === "qwen2511") {
+          box.appendChild(el("span", {cls: "muted", text: "Lightning 8-step LoRA built in (not selectable)"}));
+        }
+        else {
+          loras.forEach(function (l) {
+            const ok = loraOk(l.id);
+            const saved = state.loras[l.id];
+            const checkbox = el("input", {type: "checkbox", id: prefix + "-lora-" + l.id});
+            checkbox.checked = saved.checked && ok;
+            checkbox.disabled = !ok;
+            const scale = el("input", {type: "number", id: prefix + "-lora-scale-" + l.id, min: "0", max: "2", step: "0.05", value: saved.scale});
+            scale.disabled = !ok;
+            const note = el("span", {cls: "muted", id: prefix + "-lora-note-" + l.id, text: loraNote(l)});
+            box.appendChild(el("div", {cls: "se-lora", data: {lora: l.id}}, [el("label", {}, [checkbox, " " + l.label]),
+              el("label", {}, ["strength ", scale]), note]));
+          });
+        }
+      }
+      const turbo = loras.filter(function (l) {
+        const box = node("-lora-" + l.id);
+        return l.steps && box && !box.disabled && box.checked;
+      })[0];
+      node("-steps").textContent = turbo ? turbo.steps + " steps (turbo)"
+        : entry.steps + " steps" + (entry.family === "qwen2511" ? " (Lightning)" : "");
+    };
+    p.selection = function () {
+      if (!p.state) { return null; }
+      if (p.state.model === "as-is") { return {model: "as-is", loras: []}; }
+      const out = [];
+      Array.prototype.forEach.call(rows(), function (row) {
+        const id = row.dataset.lora;
+        const box = node("-lora-" + id);
+        if (!box.disabled && box.checked) { out.push({id: id, scale: Number(node("-lora-scale-" + id).value)}); }
+      });
+      return {model: p.state.model, loras: out};
+    };
+    p.reason = function () {
+      const cap = capability("seed_edit");
+      const models = cap.models;
+      if (!p.state) {
+        return models ? "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui server)"
+          : "checking models…";
+      }
+      if (p.state.model === "as-is") { return ""; }
+      if (!models) { return cap.ok === false ? "cannot check the Qwen edit models: " + cap.reason : "checking models…"; }
+      const chosen = seedQwenEntry(p.state.model);
+      const found = models.qwen.models[p.state.model];
+      if (!(found && found.ok === true)) {
+        return (chosen ? chosen.label : p.state.model) + " unavailable: " + ((found && found.reason) || "probing");
+      }
+      let text = "";
+      Array.prototype.forEach.call(rows(), function (row) {
+        const id = row.dataset.lora;
+        const box = node("-lora-" + id);
+        const s = Number(node("-lora-scale-" + id).value);
+        if (!text && !box.disabled && box.checked && !(Number.isFinite(s) && s > 0 && s <= 2)) {
+          text = "LoRA " + seedLoraEntry(id).label + " strength must be above 0 and at most 2";
+        }
+      });
+      return text;
+    };
+    p.multiple = function () {
+      const entry = p.state ? seedQwenEntry(p.state.model) : null;
+      return entry ? entry.multiple : 16;
+    };
+    p.listen = function (onChange) {
+      ["input", "change"].forEach(function (type) { node("-qwen-box").addEventListener(type, onChange); });
+    };
+    return p;
   }
 
   function setSeedSource(source, statusText) {
@@ -1924,14 +2035,7 @@
   function updateSeedButtons() {
     const cap = capability("seed_edit");
     const models = cap.models || null;
-    const registry = seedRegistry();
-    if (!S.seeds.qwen && registry) {
-      const loras = {};
-      registry.loras.forEach(function (l) { loras[l.id] = {checked: l.default_on, scale: String(l.default_scale)}; });
-      S.seeds.qwen = {model: registry.default_model, loras: loras};
-    }
-    readSeedQwen();
-    renderSeedQwen();
+    SEED_PICKER.update();
     const select = $("#se-model");
     Array.prototype.forEach.call(select.options, function (o) {
       o.disabled = Boolean(models && models[o.value] && models[o.value].ok === false);
@@ -1964,27 +2068,7 @@
       $("#se-source-size").textContent = natural.width + " × " + natural.height + " → " + canvas.width + " × " + canvas.height;
     }
     const entry = models && models[model];
-    let qwenReason = "";
-    if (model === "qwen" && models && !S.seeds.qwen) {
-      qwenReason = "Qwen-Image unavailable: the server sent no Qwen model list (restart the movie-ui server)";
-    }
-    else if (model === "qwen" && models && S.seeds.qwen) {
-      const chosen = seedQwenEntry(S.seeds.qwen.model);
-      const found = models.qwen.models[S.seeds.qwen.model];
-      if (!(found && found.ok === true)) {
-        qwenReason = (chosen ? chosen.label : S.seeds.qwen.model) + " unavailable: " + ((found && found.reason) || "probing");
-      }
-      else {
-        Array.prototype.forEach.call(document.querySelectorAll("#se-loras .se-lora"), function (row) {
-          const id = row.dataset.lora;
-          const box = $("#se-lora-" + id);
-          const s = Number($("#se-lora-scale-" + id).value);
-          if (!qwenReason && !box.disabled && box.checked && !(Number.isFinite(s) && s > 0 && s <= 2)) {
-            qwenReason = "LoRA " + seedLoraEntry(id).label + " strength must be above 0 and at most 2";
-          }
-        });
-      }
-    }
+    let qwenReason = ""; if (model === "qwen" && models) { qwenReason = SEED_PICKER.reason(); }
     const strength = Number($("#se-strength").value);
     const seedText = $("#se-seed").value.trim();
     const seed = Number(seedText);
@@ -2021,7 +2105,7 @@
     return {ws: S.ws, source: source, prompt: $("#se-prompt").value, model: model,
             strength: model === "zimage" ? Number($("#se-strength").value) : null,
             candidates: Number($("#se-candidates").value), seed: seedText === "" ? null : Number(seedText),
-            qwen_model: model === "qwen" ? S.seeds.qwen.model : null, loras: model === "qwen" ? seedLoraBody() : null};
+            qwen_model: model === "qwen" ? SEED_PICKER.selection().model : null, loras: model === "qwen" ? SEED_PICKER.selection().loras : null};
   }
 
   async function generateSeeds() {
@@ -2167,6 +2251,7 @@
     }
     const uploadId = res.data.upload_id;
     S.seedUpload = uploadId;
+    composeSeedDefault("seeds");
     $("#c-res-seed").checked = true;
     $("#c-seed-status").textContent = "seed from " + run + " candidate " + n + " (" + uploadId.slice(0, 12) + ")";
     showTab("compose");
@@ -2325,6 +2410,10 @@
     show($("#ch-force"), res.data.face_problem === true && Boolean(res.data.last_create_fields));
     show($("#ch-train-form"), false);
     $("#ch-status").textContent = res.data.face_problem ? "the last create refused the seed face" : "";
+    if (res.data.character.source.type === "seed_image") {
+      const e = res.data.character.edit;
+      CHARACTER_REGEN_PICKER.select(e ? e.qwen_model.id : "qwen2511-bf16", e ? e.loras.map(function (l) { return {id: l.id, scale: l.scale}; }) : []);
+    }
     updateCharacterButtons();
   }
 
@@ -2336,6 +2425,18 @@
       $("#ch-train").disabled = true;
       $("#ch-train-reason").textContent = "fewer than 12 stills kept; regenerate the dataset";
     }
+    const seedOn = FOLDER_BOXES.characters.mode() || $("#ch-seed-file").files.length > 0;
+    CHARACTER_PICKER.update();
+    show($("#ch-cq-qwen-box"), seedOn);
+    const createReason = seedOn ? CHARACTER_PICKER.reason() : "";
+    $("#ch-cq-reason").textContent = createReason;
+    if (createReason) { $("#ch-create").disabled = true; }
+    const seedCharacter = Boolean(S.character && S.character.character.source.type === "seed_image");
+    CHARACTER_REGEN_PICKER.update();
+    show($("#ch-rq-qwen-box"), seedCharacter);
+    const regenReason = seedCharacter ? CHARACTER_REGEN_PICKER.reason() : "";
+    $("#ch-rq-reason").textContent = regenReason;
+    $("#ch-regenerate").disabled = Boolean(regenReason);
     // Seed-folder spec SD48: the folder mode of the Characters form.
     const box = FOLDER_BOXES.characters;
     const folder = box.mode();
@@ -2351,7 +2452,7 @@
   }
 
   async function createCharacter(force) {
-    if (!force && FOLDER_BOXES.characters.mode()) { openFolderConfirm(FOLDER_BOXES.characters, {ws: S.ws, name: $("#ch-name").value.trim(), phrase: $("#ch-phrase").value.trim(), seed: numberOrNull("#ch-seed")}); return; }
+    if (!force && FOLDER_BOXES.characters.mode()) { openFolderConfirm(FOLDER_BOXES.characters, {ws: S.ws, name: $("#ch-name").value.trim(), phrase: $("#ch-phrase").value.trim(), seed: numberOrNull("#ch-seed"), qwen_model: CHARACTER_PICKER.selection().model, loras: CHARACTER_PICKER.selection().loras}); return; }
     let body;
     if (force) {
       body = Object.assign({}, S.character.last_create_fields, {force: true});
@@ -2366,7 +2467,8 @@
       }
       body = {ws: S.ws, name: $("#ch-name").value.trim(), phrase: $("#ch-phrase").value.trim(),
               class_noun: textOrNull("#ch-class"), descriptor: file ? null : textOrNull("#ch-descriptor"),
-              trigger: textOrNull("#ch-trigger"), seed: numberOrNull("#ch-seed"), seed_upload: seed, force: false};
+              trigger: textOrNull("#ch-trigger"), seed: numberOrNull("#ch-seed"), seed_upload: seed, force: false,
+              qwen_model: file ? CHARACTER_PICKER.selection().model : null, loras: file ? CHARACTER_PICKER.selection().loras : null};
     }
     body.ws = S.ws;
     const res = await api("POST", "/api/characters", body);
@@ -2383,6 +2485,9 @@
     $("#ch-create").addEventListener("click", function () { createCharacter(false); });
     $("#ch-force").addEventListener("click", function () { createCharacter(true); });
     $("#ch-folder-mode").addEventListener("change", updateCharacterButtons);
+    CHARACTER_PICKER.listen(updateCharacterButtons);
+    CHARACTER_REGEN_PICKER.listen(updateCharacterButtons);
+    $("#ch-seed-file").addEventListener("change", updateCharacterButtons);
     const charactersBox = FOLDER_BOXES.characters;
     part(charactersBox, "choose").addEventListener("click", function () { part(charactersBox, "file").click(); });
     part(charactersBox, "file").addEventListener("change", function () { onFolderPick(charactersBox); });
@@ -2397,8 +2502,13 @@
       const confirmText = withSeed ? "Regenerate the dataset of " + name + " with seed " + seedText + "?"
                                   : "Regenerate the dataset of " + name + "?";
       if (!(await askConfirm(confirmText))) { return; }
-      const res = await api("POST", "/api/characters/" + enc(name) + "/regenerate",
-                            withSeed ? {ws: S.ws, seed: seedValue} : {ws: S.ws});
+      const body = withSeed ? {ws: S.ws, seed: seedValue} : {ws: S.ws};
+      if (S.character.character.source.type === "seed_image") {
+        const pick = CHARACTER_REGEN_PICKER.selection();
+        body.qwen_model = pick.model;
+        body.loras = pick.loras;
+      }
+      const res = await api("POST", "/api/characters/" + enc(name) + "/regenerate", body);
       $("#ch-status").textContent = res.status === 201 ? "queued job " + res.data.job.id : (res.data && res.data.error);
     });
     $("#ch-train").addEventListener("click", async function () {
@@ -2508,6 +2618,10 @@
       });
     }
     $("#lo-status").textContent = "";
+    if (loc.source === "photos") {
+      const e = loc.edit;
+      LOCATION_REGEN_PICKER.select(e ? e.qwen_model.id : "qwen2511-bf16", e ? e.loras.map(function (l) { return {id: l.id, scale: l.scale}; }) : []);
+    }
     updateLocationButtons();
   }
 
@@ -2523,6 +2637,18 @@
       $("#lo-train").disabled = true;
       $("#lo-train-reason").textContent = "fewer than 12 stills kept; regenerate the dataset";
     }
+    const photosOn = photos > 0;
+    LOCATION_PICKER.update();
+    show($("#lo-cq-qwen-box"), photosOn);
+    const createReason = photosOn ? LOCATION_PICKER.reason() : "";
+    $("#lo-cq-reason").textContent = createReason;
+    if (createReason) { $("#lo-create").disabled = true; }
+    const photoLocation = Boolean(S.location && S.location.location.source === "photos");
+    LOCATION_REGEN_PICKER.update();
+    show($("#lo-rq-qwen-box"), photoLocation);
+    const regenReason = photoLocation ? LOCATION_REGEN_PICKER.reason() : "";
+    $("#lo-rq-reason").textContent = regenReason;
+    $("#lo-regen").disabled = Boolean(regenReason);
   }
 
   async function createLocation() {
@@ -2540,7 +2666,8 @@
     }
     const res = await api("POST", "/api/locations", {ws: S.ws, name: $("#lo-name").value.trim(),
       description: oneLine("#lo-description") || null, photo_uploads: uploads, trigger: textOrNull("#lo-trigger"),
-      seed: numberOrNull("#lo-seed"), force: false});
+      seed: numberOrNull("#lo-seed"), force: false,
+      qwen_model: uploads.length ? LOCATION_PICKER.selection().model : null, loras: uploads.length ? LOCATION_PICKER.selection().loras : null});
     status.textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
     if (res.status === 201) { pollJobs(); }
   }
@@ -2549,6 +2676,8 @@
     $("#lo-name").addEventListener("input", updateLocationButtons);
     $("#lo-description").addEventListener("input", updateLocationButtons);
     $("#lo-photos").addEventListener("change", updateLocationButtons);
+    LOCATION_PICKER.listen(updateLocationButtons);
+    LOCATION_REGEN_PICKER.listen(updateLocationButtons);
     $("#lo-create").addEventListener("click", createLocation);
     $("#c-locations").addEventListener("change", onLocationPick);
     $("#lo-accept").addEventListener("click", function () { show($("#lo-train-form"), true); });
@@ -2568,8 +2697,13 @@
     $("#lo-regen").addEventListener("click", async function () {
       const name = S.location.location.name;
       if (!(await askConfirm("Regenerate the dataset of " + name + " with a new seed?" + loraLossNote(S.location.location)))) { return; }
-      const res = await api("POST", "/api/locations/" + enc(name) + "/regenerate",
-                            {ws: S.ws, new_seed: true, force: $("#lo-force").checked});
+      const body = {ws: S.ws, new_seed: true, force: $("#lo-force").checked};
+      if (S.location.location.source === "photos") {
+        const pick = LOCATION_REGEN_PICKER.selection();
+        body.qwen_model = pick.model;
+        body.loras = pick.loras;
+      }
+      const res = await api("POST", "/api/locations/" + enc(name) + "/regenerate", body);
       $("#lo-status").textContent = res.status === 201 ? "queued job " + res.data.job.id : errorText(res);
       if (res.status === 201) { pollJobs(); }
     });
