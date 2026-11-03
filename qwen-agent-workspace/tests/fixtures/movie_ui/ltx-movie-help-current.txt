@@ -1,4 +1,5 @@
 usage: ltx-movie [-h] --story-id STORY_ID [--seed-image SEED_IMAGE]
+                 [--seed-edit-model ID|as-is] [--seed-edit-lora ID=SCALE]
                  [--panels PANELS] [--length LENGTH] [--fps FPS]
                  [--frames FRAMES] [--image-seed IMAGE_SEED]
                  [--video-width VIDEO_WIDTH] [--video-height VIDEO_HEIGHT]
@@ -42,6 +43,18 @@ options:
                         video size, same as z_image, so ltx-2-mlx's own
                         downscale keeps more real detail. Incompatible with
                         --no-stills and with --video-width/--video-height.
+  --seed-edit-model ID|as-is
+                        with --seed-image: edit the seed into panel 1 with a
+                        Qwen registry edit model (qwen21-q4, qwen21-q8,
+                        qwen21-bf16, qwen2511-q4, qwen2511-bf16), prompted by
+                        panel 1's Image: text after Phase 1 and screened with
+                        content safety; as-is, like leaving the flag out, uses
+                        the seed unchanged. See docs/superpowers/specs/2026-11-
+                        03-qwen-edit-models-design.md.
+  --seed-edit-lora ID=SCALE
+                        with --seed-edit-model ID: a registry LoRA of that
+                        model's family, 0 < SCALE <= 2 (repeatable); none
+                        listed means no LoRA
   --panels PANELS       number of chained clips; panel 1 also gets the movie's
                         one still image; mutually exclusive with --length
   --length LENGTH       total movie length in seconds; mutually exclusive with

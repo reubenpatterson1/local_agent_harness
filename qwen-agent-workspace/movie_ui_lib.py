@@ -943,7 +943,7 @@ DEFAULT_FIELDS = {
     "ws": None, "action": "story",
     "story_id": "", "narrative": "", "goal": None,
     "panels": 15, "length": None, "fps": 24, "frames": 145,
-    "width": None, "height": None, "seed_upload": None,
+    "width": None, "height": None, "seed_upload": None, "seed_edit_model": None, "seed_edit_loras": None,
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
@@ -970,7 +970,7 @@ FIELD_FLAGS = (
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
-    ("no_review", ("--no-review",)),
+    ("no_review", ("--no-review",)), ("seed_edit", ("--seed-edit-model", "--seed-edit-lora")),
 )
 
 
@@ -1013,6 +1013,14 @@ def action_arg(item):
     return "%s:%s" % (item["name"], repr(float(item["strength"])))
 
 
+def qwen_edit_flags(model_flag, lora_flag, model_id, loras):
+    """[model_flag, model_id] then lora_flag ID=SCALE per LoRA, SCALE as repr(float) (qwen edit models QE52)."""
+    argv = [model_flag, model_id]
+    for lora in loras or []:
+        argv += [lora_flag, "%s=%r" % (lora["id"], float(lora["scale"]))]
+    return argv
+
+
 def build_argv(fields, ws_real, state, py=sys.executable):
     """The bin/ltx-movie argv for actions story, regenerate, movie and redo (MU40). Pure; the
     fields have passed V1."""
@@ -1026,6 +1034,9 @@ def build_argv(fields, ws_real, state, py=sys.executable):
     argv += ["--fps", str(fields["fps"]), "--frames", str(fields["frames"])]
     if fields["seed_upload"]:
         argv += ["--seed-image", os.path.join(state, "uploads", fields["seed_upload"])]
+        if fields.get("seed_edit_model") is not None:
+            argv += qwen_edit_flags("--seed-edit-model", "--seed-edit-lora", fields["seed_edit_model"],
+                                    fields.get("seed_edit_loras"))
     elif fields["width"] is not None and fields["height"] is not None:
         argv += ["--video-width", str(fields["width"]), "--video-height", str(fields["height"])]
     for key, flag in (("model", "--model"), ("gemma", "--gemma"), ("story_model", "--story-model")):
@@ -1117,6 +1128,26 @@ def _rule_locations(fields):
     return errors
 
 
+SEED_EDIT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def _rule_seed_edit(fields):
+    """V1 rule 12d (qwen edit models QE54): the shape of the Compose seed edit fields."""
+    model, loras, seed = fields.get("seed_edit_model"), fields.get("seed_edit_loras"), fields.get("seed_upload")
+    errors = []
+    if not (model is None or (isinstance(model, str) and SEED_EDIT_ID_RE.fullmatch(model))):
+        errors.append("seed edit model must be as-is or a Qwen model ID")
+    if not (loras is None or (isinstance(loras, list) and len(loras) <= 4 and all(
+            isinstance(i, dict) and set(i) == {"id", "scale"} and isinstance(i["id"], str)
+            and SEED_EDIT_ID_RE.fullmatch(i["id"]) and _is_number(i["scale"]) for i in loras))):
+        errors.append("seed edit LoRAs must be a list of at most 4 {id, scale} items")
+    if model is not None and seed is None:
+        errors.append("a seed edit model needs a seed image")
+    if loras is not None and model in (None, "as-is"):
+        errors.append("seed edit LoRAs need a seed edit model other than as-is")
+    return errors
+
+
 def location_argv(kind, fields, ws_real, state, py=sys.executable):
     """The bin/location argv of a location-create, -regenerate or -train job (location library
     spec L4.1)."""
@@ -1135,6 +1166,8 @@ def location_argv(kind, fields, ws_real, state, py=sys.executable):
             argv.append("--new-seed")
         if fields.get("description"):
             argv += ["--description", fields["description"]]
+        if fields.get("qwen_model") is not None:
+            argv += qwen_edit_flags("--qwen-model", "--lora", fields["qwen_model"], fields.get("loras"))
         return argv + (["--force"] if fields.get("force") else [])
     if fields.get("description"):
         argv += ["--description", fields["description"]]
@@ -1144,6 +1177,8 @@ def location_argv(kind, fields, ws_real, state, py=sys.executable):
         argv += ["--trigger", fields["trigger"]]
     if fields.get("seed") is not None:
         argv += ["--seed", str(fields["seed"])]
+    if fields.get("qwen_model") is not None:
+        argv += qwen_edit_flags("--qwen-model", "--lora", fields["qwen_model"], fields.get("loras"))
     return argv + (["--force"] if fields.get("force") else [])
 
 
@@ -1172,6 +1207,8 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
         argv += ["create", fields["name"], "--regenerate", "--no-review"]
         if fields.get("seed") is not None:
             argv += ["--seed", str(fields["seed"])]
+        if fields.get("qwen_model") is not None:
+            argv += qwen_edit_flags("--qwen-model", "--lora", fields["qwen_model"], fields.get("loras"))
         return argv
     if kind == "character-train":
         # Route through character-train-vlm, which stops the VLM (freeing its memory for
@@ -1191,6 +1228,8 @@ def character_argv(kind, fields, ws_real, state, py=sys.executable):
         argv += ["--trigger", fields["trigger"]]
     if fields.get("seed") is not None:
         argv += ["--seed", str(fields["seed"])]
+    if fields.get("qwen_model") is not None:
+        argv += qwen_edit_flags("--qwen-model", "--lora", fields["qwen_model"], fields.get("loras"))
     if fields.get("force"):
         argv.append("--force")
     return argv + ["--no-review"]
@@ -1532,6 +1571,7 @@ def validate_fields(fields, ws_real, state):
         errors.append("characters must be distinct character names")
     errors += _rule_actions(fields)                                          # 12b
     errors += _rule_locations(fields)                                        # 12c
+    errors += _rule_seed_edit(fields)                                        # 12d
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
@@ -2212,7 +2252,7 @@ def run_checks(fields, ws_real, state, py=sys.executable):
 
 LINE_CLIP = 300
 FEED_MAX = 1048576
-PHASE_RE = re.compile(r"^=== Phase (\d+b?): (.+?)(?: \(rewrite (\d+) of (\d+)\))? ===$")
+PHASE_RE = re.compile(r"^=== Phase (\d+[bc]?): (.+?)(?: \(rewrite (\d+) of (\d+)\))? ===$")
 REDO_RE = re.compile(r"^=== Redo: panels (.+) ===$")
 TOTAL_RE = re.compile(r"^panels: (\d+)$")
 PANEL_HDR_RE = re.compile(r"^=== panel (\d+)/(\d+) \(")
@@ -2252,7 +2292,9 @@ def job_phases(kind, fields):
     seed = ["0"] if fields.get("seed_upload") else []
     if kind == "story":
         return seed + ["1"]
-    return (seed + ["1", "1b"] + (["redo"] if fields.get("action") == "redo" else [])
+    edit = (["1c"] if kind == "movie" and fields.get("seed_upload")
+            and fields.get("seed_edit_model") not in (None, "as-is") else [])
+    return (seed + ["1", "1b"] + edit + (["redo"] if fields.get("action") == "redo" else [])
             + ([] if fields.get("mode") == "no_stills" else ["2"]) + ["3", "4"])
 
 
