@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(WS, "tests"))
 
 import character_dataset  # noqa: E402
 import location_testutil as lt  # noqa: E402
+import qwen_edit  # noqa: E402
 import story_engine_testutil as seu  # noqa: E402
 
 ld = importlib.machinery.SourceFileLoader(
@@ -1745,3 +1746,85 @@ def test_lyd15_a_busy_process_stops_the_top_up(env, monkeypatch, capsys):
     assert ld.create(_create_args(name="dock-one", description=lt.TEMPLE_DESC)) == 0
     assert calls == [1]
     assert "top-up" not in capsys.readouterr().out
+
+
+# --- QET18 (qwen edit models QE33): run_edit_child routes by the spec's edit key -----------------------------
+
+def test_qet18_run_edit_child_routes_by_the_edit_key(tmp_path, monkeypatch):
+    char_dir = str(tmp_path / "loc")
+    a, b = str(tmp_path / "a.png"), str(tmp_path / "b.png")
+    out = [str(tmp_path / ("loc_%02d.png" % n)) for n in (3, 4)]
+    base = {"image": a, "skill": "location_edit", "model": character_dataset.EDIT_MODEL,
+            "lora_repo": character_dataset.EDIT_LORA_REPO, "lora_file": character_dataset.EDIT_LORA_FILE,
+            "steps": character_dataset.EDIT_STEPS, "true_cfg": character_dataset.EDIT_TRUE_CFG,
+            "jobs": [{"image": a, "prompt": "north view", "output_path": out[0], "seed": 4, "width": 1024,
+                      "height": 640},
+                     {"image": b, "prompt": "south view", "output_path": out[1], "seed": 4, "width": 1024,
+                      "height": 640}]}
+    runs, calls = [], []
+
+    def _run_logged(cmd, log_path, cwd, env, timeout_s):
+        spec_path = cmd[cmd.index("--spec") + 1]
+        with open(spec_path, encoding="utf-8") as f:
+            text = f.read()
+        runs.append({"cmd": cmd, "text": text, "log": log_path, "timeout": timeout_s, "spec_path": spec_path})
+        with open(json.loads(text)["report_path"], "w", encoding="utf-8") as f:
+            json.dump({"jobs": [{"output_path": p, "status": "ok", "seconds": 1.0} for p in out]}, f)
+        return 0
+
+    def _run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None,
+                  noun="job"):
+        calls.append({"model_id": model_id, "loras": loras, "jobs": jobs, "size": (width, height), "skill": skill,
+                      "work_dir": work_dir, "log_path": log_path})
+        return [{"n": j["n"], "output_path": j["output_path"], "status": "ok", "seconds": 2.5} for j in jobs], None
+
+    monkeypatch.setattr(character_dataset, "run_logged", _run_logged)
+    monkeypatch.setattr(qwen_edit, "run_jobs", _run_jobs)
+    for edit in (None, {"qwen_model": "qwen2511-bf16", "loras": []}):
+        spec = dict(base) if edit is None else dict(base, edit=edit)
+        report = character_dataset.run_edit_child(spec, char_dir, "edit")
+        run = runs[-1]
+        stem = run["log"][:-len(".log")]
+        assert run["cmd"] == [sys.executable, os.path.join(WS, "character_dataset.py"), "qwenedit", "--spec",
+                              stem + ".spec.json"]
+        assert run["text"] == json.dumps(dict(base, report_path=stem + ".report.json"), indent=2)
+        assert run["timeout"] == character_dataset.EDIT_CHILD_TIMEOUT_S
+        assert report == {"jobs": [{"output_path": p, "status": "ok", "seconds": 1.0} for p in out]}
+    assert calls == []
+    unc = [{"id": "uncensored", "scale": 1.0}]
+    report = character_dataset.run_edit_child(dict(base, edit={"qwen_model": "qwen21-q4", "loras": unc}), char_dir,
+                                              "edit-round2")
+    (call,) = calls
+    log = call["log_path"]
+    assert log.startswith(os.path.join(char_dir, "logs") + os.sep) and log.endswith("-edit-round2.log")
+    assert (call["model_id"], call["loras"], call["size"], call["skill"], call["work_dir"]) == (
+        "qwen21-q4", unc, (1024, 640), "location_edit", log[:-len(".log")])
+    assert call["jobs"] == [
+        {"n": 1, "seed": 4, "prompt": "north view", "source": a, "stage_path": str(tmp_path / "loc_03.pending.png"),
+         "output_path": out[0]},
+        {"n": 2, "seed": 4, "prompt": "south view", "source": b, "stage_path": str(tmp_path / "loc_04.pending.png"),
+         "output_path": out[1]}]
+    assert report == {"jobs": [{"output_path": p, "status": "ok", "seconds": 2.5} for p in out]}
+    character = {"image": a, "model": character_dataset.EDIT_MODEL, "lora_repo": character_dataset.EDIT_LORA_REPO,
+                 "lora_file": character_dataset.EDIT_LORA_FILE, "steps": 8, "true_cfg": 1.0,
+                 "edit": {"qwen_model": "qwen21-q4", "loras": unc},
+                 "jobs": [{"prompt": "a pose", "output_path": out[0], "seed": 0, "width": 1024, "height": 640}]}
+    character_dataset.run_edit_child(character, char_dir, "edit")
+    assert (calls[-1]["skill"], calls[-1]["jobs"][0]["source"]) == ("character_edit", a)
+
+    def _failing(*args, **kwargs):
+        return [], "Qwen-Image-2.1 q4 child exited 1: boom"
+
+    monkeypatch.setattr(qwen_edit, "run_jobs", _failing)
+    with pytest.raises(character_dataset.DatasetError) as info:
+        character_dataset.run_edit_child(character, char_dir, "edit")
+    assert str(info.value) == "Qwen-Image-2.1 q4 child exited 1: boom; log: %s" % info.value.log_path
+    assert info.value.log_path.endswith("-edit.log")
+
+    def _unavailable(*args, **kwargs):
+        raise qwen_edit.Unavailable("LoRA Uncensored (abenzerps) is unavailable: gone")
+
+    monkeypatch.setattr(qwen_edit, "run_jobs", _unavailable)
+    with pytest.raises(character_dataset.DatasetError) as info:
+        character_dataset.run_edit_child(character, char_dir, "edit")
+    assert str(info.value) == "LoRA Uncensored (abenzerps) is unavailable: gone"

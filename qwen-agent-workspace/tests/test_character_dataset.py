@@ -1321,3 +1321,42 @@ def test_d48_check_retry_alias_and_empty_caption(monkeypatch, tmp_path):
                                                     "setting": "a park"}) == (
         "trg man, close-up, smiling, in a park, photorealistic live-action film still, natural "
         "light.")
+
+
+# --- QET24, QET25 (qwen edit models QE35, QE37) ------------------------------------------------------------------
+
+def test_qet24_the_stills_test_renders_stay_on_z_image(lib_dir, monkeypatch):
+    import qwen_edit
+    data = _untrained(lib_dir)
+    data["edit"] = qwen_edit.settings("qwen21-q4", [{"id": "uncensored", "scale": 1.0}])
+    character_lib.write_character(data)
+    record = _fake_stills_tools(monkeypatch)
+    monkeypatch.setattr(qwen_edit, "run_jobs", lambda *args, **kwargs: pytest.fail("qwen_edit.run_jobs was called"))
+    assert character_dataset.train_stills(data) == "ok"
+    assert [step for _spec, step in record["children"]] == ["test-stills-lora", "test-stills-control"]
+    assert _load()["edit"] == data["edit"]
+
+
+def test_qet25_busy_process_sees_the_qwen_child(monkeypatch):
+    py = sys.executable
+    cases = [([py, "/w/seed_edit_mflux_child.py", "--spec", "s"], True),
+             ([py, "/w/bin/seed-edit", "--source", "/x/src.png", "--prompt", "p"], True),
+             ([py, "bin/seed-edit", "--source", "/x/src.png"], True),
+             ([py, "/w/bin/seed-edit", "--probe"], False),
+             ([py, "/w/bin/seed-edit-setup"], False),
+             ([py, "/w/bin/seed-edit-setup", "--model", "qwen21-q4"], False),
+             (["/x/ltx-2-mlx", "generate", "--model", "m"], True),
+             (["python3", "bin/ltx-mlx-render", "m.json", "o.mp4"], True),
+             (["/x/mflux-train", "--config", "c"], True),
+             (["python3", "/w/bin/ltx-movie", "n", "--story-id", "s"], True),
+             (["python3", "/w/bin/ltx-story-images", "--story-md", "s"], True),
+             (["python3", "character_dataset.py", "zimage", "--spec", "s"], True),
+             (["python3", "/w/character_dataset.py", "qwenedit", "--spec", "s"], True),
+             (["vim", "notes-ltx-2-mlx.txt"], False)]
+    for cmdline, busy in cases:
+        monkeypatch.setattr(character_dataset.psutil, "process_iter",
+                            lambda attrs, c=cmdline: iter([_FakeProc(4242, c)]))
+        found = character_dataset.busy_process()
+        assert (found is not None) == busy, cmdline
+        if busy:
+            assert found == (4242, " ".join(cmdline)[:120]), cmdline

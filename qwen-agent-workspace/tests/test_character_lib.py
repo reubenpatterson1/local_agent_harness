@@ -566,3 +566,44 @@ def test_spoken_narration_helpers():
     assert lib.insert_speech("He runs. The camera tracks alongside the movement.", said) == (
         'He runs. He says: "Go." The camera tracks alongside the movement.')
     assert lib.insert_speech("He runs. He jumps.", said) == 'He runs. He jumps. He says: "Go."'
+
+
+# --- QET23 (qwen edit models QE38): the optional edit key of character.json ----------------------------------
+
+EDIT = {"qwen_model": {"id": "qwen21-q4", "repo": "mflux-community/qwen-image-2-1-mflux-q4"},
+        "loras": [{"id": "uncensored", "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized",
+                   "file": "qwen-image-2.1-uncensored-lora.safetensors", "scale": 1.0}],
+        "steps": 40, "scheduler": "linear"}
+
+
+def _bad_edits():
+    """(bad edit value, its _edit_problem text): one bad shape per QE31 rule."""
+    no_steps = dict((k, v) for k, v in EDIT.items() if k != "steps")
+    model = {"id": "qwen21-q4"}
+    keys = "must be an object with exactly the keys loras, qwen_model, scheduler, steps, got %r"
+    loras_text = ("loras must be a list of objects with exactly the keys file, id, repo (non-empty strings) and "
+                  "scale (a number in (0, 2]), got %r")
+    out = [("x", keys % ("x",)), (no_steps, keys % (no_steps,)),
+           (dict(EDIT, qwen_model=model), "qwen_model must be an object with exactly the keys id and repo, both "
+            "non-empty strings, got %r" % (model,))]
+    for loras in ([{"id": "uncensored"}], [dict(EDIT["loras"][0], scale=0)], [dict(EDIT["loras"][0], scale=2.5)]):
+        out.append((dict(EDIT, loras=loras), loras_text % (loras,)))
+    out += [(dict(EDIT, steps=0), "steps must be an int >= 1, got 0"),
+            (dict(EDIT, scheduler=""), "scheduler must be null or a non-empty string, got ''")]
+    return out
+
+
+def test_qet23_the_optional_edit_key(lib_dir):
+    data = make_character(lib_dir, status="untrained")
+    character_lib.validate_character(data, name="kyra")
+    data["edit"] = copy.deepcopy(EDIT)
+    character_lib.write_character(data)
+    assert character_lib.load_character("kyra")["edit"] == EDIT
+    character_lib.validate_character(dict(data, edit=dict(EDIT, scheduler=None, loras=[])), name="kyra")
+    for bad, text in _bad_edits():
+        assert _raises(character_lib.validate_character, dict(data, edit=bad)) == "edit: " + text, bad
+    descriptor = dict(data, source={"type": "descriptor"})
+    assert _raises(character_lib.validate_character, descriptor) == (
+        "edit: only a seed-image character records an edit model")
+    del descriptor["edit"]
+    character_lib.validate_character(descriptor, name="kyra")

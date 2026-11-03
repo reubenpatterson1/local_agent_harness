@@ -3,17 +3,19 @@
 (generated/characters/).
 
   bin/character create NAME --phrase PHRASE --seed-image PATH [--descriptor TEXT --class NOUN]
-                        [--trigger WORD] [--seed N] [--force] [--no-review]
+                        [--trigger WORD] [--seed N] [--force] [--no-review] [--qwen-model ID] [--lora ID=SCALE ...]
   bin/character create NAME --phrase PHRASE --descriptor TEXT --class NOUN
                         [--trigger WORD] [--seed N]
-  bin/character create NAME --regenerate [--seed N | --new-seed] [--no-review]
+  bin/character create NAME --regenerate [--seed N | --new-seed] [--no-review] [--qwen-model ID] [--lora ID=SCALE ...]
   bin/character train NAME [--video] [--stills] [--force]
   bin/character list
   bin/character show NAME
 
 create builds the training dataset and stops for review (dataset/contact_sheet.jpg). A
---seed-image create poses the seed itself with Qwen-Image-Edit-2511 (Lightning 8-step), editing 6
-preview stills first and stopping at dataset/preview_sheet.jpg before the other 18; --no-review
+--seed-image create poses the seed itself with a Qwen edit model (--qwen-model; default
+Qwen-Image-2.1 q4 with the uncensored LoRA; qwen2511-bf16 is the earlier Qwen-Image-Edit-2511
+Lightning route), editing 6 preview stills first and stopping at dataset/preview_sheet.jpg
+before the other 18; --no-review
 skips that stop (an unattended create needs it). The vision model still writes the story
 descriptor from the seed unless --descriptor is given. See
 docs/superpowers/specs/2026-10-21-character-seed-edit-design.md. train
@@ -69,6 +71,12 @@ def build_parser():
                    help="rebuild an existing, untrained character's dataset from its character.json")
     p.add_argument("--no-review", dest="no_review", action="store_true",
                    help="do not stop after the 6 preview stills of a seed-image dataset")
+    p.add_argument("--qwen-model", dest="qwen_model", default=None, metavar="ID",
+                   help="seed-image characters: the Qwen edit model of the dataset edits (qwen21-q4, qwen21-q8, "
+                        "qwen21-bf16, qwen2511-q4, qwen2511-bf16; default qwen21-q4 with its default LoRAs)")
+    p.add_argument("--lora", dest="lora", action="append", default=None, metavar="ID=SCALE",
+                   help="with --qwen-model: a registry LoRA of its family, 0 < SCALE <= 2 (repeatable); none listed "
+                        "means no LoRA")
     t = sub.add_parser("train", help="train the video LoRA and/or the stills LoRA")
     t.add_argument("name", metavar="NAME")
     t.add_argument("--video", action="store_true")
