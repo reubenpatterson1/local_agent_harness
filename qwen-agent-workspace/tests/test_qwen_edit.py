@@ -399,4 +399,5 @@ def test_qet11_imports_and_the_new_files(tmp_path):
         builder = f.read()
     start = builder.index("NEW_PY = (")
     new_py = re.findall(r'"([^"]+)"', builder[start:builder.index(")", start)])
-    assert new_py[new_py.index("tests/test_movie_ui_seedgen.py") + 1:] == ["qwen_edit.py", "tests/test_qwen_edit.py"]
+    assert new_py[new_py.index("tests/test_movie_ui_seedgen.py") + 1:] == [
+        "qwen_edit.py", "tests/test_qwen_edit.py", "tests/test_ltx_movie_seed_edit.py"]
