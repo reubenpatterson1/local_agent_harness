@@ -9,7 +9,7 @@ exec_module as ltx_movie_qe. Every test patches _story_dir to <tmp>/stories/<id>
 _qwen_edit to a fake module (the qe_fake fixture): the real qwen_edit's MODEL_IDS, cli_selection,
 SelectionError, Unavailable, settings, label, multiple, memory_floor and generator_text, and recorders for
 selection_problem, wait_for_memory and run_jobs. Nothing loads a model, renders, contacts a server or
-touches port 8177 or 8178; the only processes are none (Phase 2's subprocess.run is a recorder). Stdlib,
+touches port 8177 or 8178; no real process is started (Phase 2's subprocess.run is a recorder). Stdlib,
 PIL and pytest.
 """
 
@@ -356,6 +356,27 @@ def test_qet30_a_rerun_reuses_an_identical_edit(qe_fake, tmp_path, capsys):
     half = [{"id": "uncensored", "scale": 0.5}]
     assert runs_after(_edit_args(tmp_path, image_seed=4, model="qwen21-q8", loras=half)) == 1
     assert runs_after(_edit_args(tmp_path, image_seed=4, model="qwen21-q8", loras=half)) == 0
+
+
+def test_qet30b_an_interrupted_edit_leaves_no_ok_record(qe_fake, tmp_path):
+    story_dir = _write_story(tmp_path)
+    files = _files(story_dir)
+    assert movie.phase_seed_edit(_edit_args(tmp_path)) == 0
+    real, seen = qe_fake.run_jobs, []
+
+    def interrupted(model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None, noun="job"):
+        seen.append(os.path.exists(files["record"]))
+        Image.new("RGB", (width, height), (0, 0, 200)).save(jobs[0]["output_path"])
+        raise KeyboardInterrupt
+
+    qe_fake.run_jobs = interrupted
+    with pytest.raises(KeyboardInterrupt):
+        movie.phase_seed_edit(_edit_args(tmp_path, image_seed=4))
+    assert seen == [False] and not os.path.exists(files["record"])
+    qe_fake.run_jobs = real
+    before = len(qe_fake.calls["run_jobs"])
+    assert movie.phase_seed_edit(_edit_args(tmp_path)) == 0
+    assert len(qe_fake.calls["run_jobs"]) == before + 1
 
 
 # --- QET31 (QE50, QEK4): the dry run -----------------------------------------------------------------------------

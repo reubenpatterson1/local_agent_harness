@@ -2293,7 +2293,7 @@ def phase_seed_edit(args):
         args.seed_edited_path = files["edited"]
         return 0
     _image_fit().load_oriented_rgb(args.seed_image).save(files["original"], format="PNG")
-    for path in (files["edited"], files["stage"]):
+    for path in (files["record"], files["edited"], files["stage"]):
         if os.path.exists(path):
             os.remove(path)
     print("seed edit: %s; %dx%d; seed %d; prompt: panel 1's Image: text (%d characters)"

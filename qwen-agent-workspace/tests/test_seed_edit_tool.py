@@ -19,7 +19,7 @@ Rules (spec Section 9):
   and character_dataset through sys.modules fakes. Each stub records its argv, an env subset and
   its spec, and behaves per a config file its test writes. The fake assert_image_safe raises
   ContentSafetyError when the image's top-left pixel is pure red.
-- tool.avail_gib, tool.total_gib, tool.missing_modules, tool.cpu_generator and tool.disk_free_gib
+- qe.avail_gib, qe.total_gib, qe.missing_modules, tool.cpu_generator and tool.disk_free_gib
   are monkeypatched (cpu_generator returns the seed itself). Sources are real PNG, JPEG and GIF
   files drawn with PIL under tmp_path.
 - No test uses the real HOME, loads a real model, runs bin/seed-edit-setup, or contacts a server.

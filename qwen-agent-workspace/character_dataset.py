@@ -1845,8 +1845,8 @@ def run_zimage_child(spec, char_dir, step):
 
 
 def run_edit_child(spec, char_dir, step):
-    """Run the seed edits in spec through Qwen-Image-Edit in a child process and return its
-    report: {"jobs": [{"output_path", "status", "seconds"}]}."""
+    """Run the seed edits in spec (the qwenedit child for qwen2511-bf16, else qwen_edit.run_jobs) and
+    return its report: {"jobs": [{"output_path", "status", "seconds"}]}."""
     edit = spec.get("edit")
     if edit is not None and edit["qwen_model"] != qwen_edit.LEGACY_EDIT_MODEL:
         return _run_registry_edit(spec, edit, char_dir, step)
