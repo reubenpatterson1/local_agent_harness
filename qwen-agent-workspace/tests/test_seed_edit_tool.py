@@ -1200,7 +1200,7 @@ def test_sg_review_focus_4_progress_bars_in_child_lines(env, capsys):
     assert "100%|##########| 8/8 [00:01<00:00]\nseed-edit-child done 1 1.0\n" in capsys.readouterr().out
     bf16_cache(env)
     env["mp"].setattr(qe, "avail_gib", lambda: 70.0)
-    qwenedit_stub(env, {"prefix":"Loading pipeline components...: 100%|##########| 5/5\r"})
+    qwenedit_stub(env, {"prefix": "Loading pipeline components...: 100%|##########| 5/5\r"})
     code, run_dir = run_tool(env, "--qwen-model", "qwen2511-bf16", "--candidates", "2", "--seed", "1", model="qwen",
                              run=R2)
     assert code == 0 and statuses(run_dir) == ["ok", "ok"]
