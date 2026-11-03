@@ -1,7 +1,8 @@
 """location_lib -- the location library's schema, validation, triggers, resolution and plan reader.
 
-Stdlib only. This module is the single owner of the location.json schema (schema_version 1), of
-the location name, description and trigger rules, of resolving pinned locations (--location NAME)
+Stdlib only. This module is the single owner of the location.json schema (schema_version 1, with
+the optional edit key of docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md), of the
+location name, description and trigger rules, of resolving pinned locations (--location NAME)
 into LocationPin records, and of reading a story's plan.json for the panels set at a pinned
 location. bin/location list/show import it at top level; bin/ltx-movie, bin/ltx-story-manifest
 and bin/ltx-story-images load it by path, and only when --location is given. It loads
@@ -58,6 +59,10 @@ _TOP_LEVEL_KEYS = frozenset([
 _DATASET_KEYS = frozenset(["kept", "total", "min_score", "contact_sheet"])
 _LORA_KEYS = frozenset(["path", "sha256", "base_model", "rank", "alpha", "steps"])
 _PHOTO_KEYS = frozenset(["path", "sha256"])
+_OPTIONAL_KEYS = frozenset(["edit"])
+_EDIT_KEYS = frozenset(["qwen_model", "loras", "steps", "scheduler"])
+_EDIT_MODEL_KEYS = frozenset(["id", "repo"])
+_EDIT_LORA_KEYS = frozenset(["id", "repo", "file", "scale"])
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _FORBIDDEN_CHARS = (".", "!", "?", '"', "\n", "\r")
 
@@ -185,6 +190,29 @@ def _validate_lora_entry(field, entry):
         raise LocationError("%s: steps must be an int >= 1, got %r" % (field, entry["steps"]))
 
 
+def _edit_problem(edit):
+    """The problem of a recorded Qwen edit settings block (qwen edit models spec QE31), or None. Shape
+    only: the registry is not consulted."""
+    if not isinstance(edit, dict) or set(edit) != _EDIT_KEYS:
+        return "must be an object with exactly the keys loras, qwen_model, scheduler, steps, got %r" % (edit,)
+    model = edit["qwen_model"]
+    if not (isinstance(model, dict) and set(model) == _EDIT_MODEL_KEYS
+            and all(isinstance(model[k], str) and model[k] for k in ("id", "repo"))):
+        return "qwen_model must be an object with exactly the keys id and repo, both non-empty strings, got %r" % (model,)
+    loras = edit["loras"]
+    if not (isinstance(loras, list) and all(
+            isinstance(l, dict) and set(l) == _EDIT_LORA_KEYS
+            and all(isinstance(l[k], str) and l[k] for k in ("id", "repo", "file"))
+            and _is_number(l["scale"]) and 0 < l["scale"] <= 2 for l in loras)):
+        return ("loras must be a list of objects with exactly the keys file, id, repo (non-empty strings) and "
+                "scale (a number in (0, 2]), got %r" % (loras,))
+    if not _is_int(edit["steps"]) or edit["steps"] < 1:
+        return "steps must be an int >= 1, got %r" % (edit["steps"],)
+    if edit["scheduler"] is not None and not (isinstance(edit["scheduler"], str) and edit["scheduler"]):
+        return "scheduler must be null or a non-empty string, got %r" % (edit["scheduler"],)
+    return None
+
+
 def validate_location(data, name=None):
     """Strict schema_version 1 validation (spec 3.7). Raises LocationError("<field>: <reason>").
     File existence is not checked here."""
@@ -193,7 +221,7 @@ def validate_location(data, name=None):
     missing = sorted(_TOP_LEVEL_KEYS - set(data))
     if missing:
         raise LocationError("top level: missing keys %s" % ", ".join(missing))
-    extra = sorted(set(data) - _TOP_LEVEL_KEYS)
+    extra = sorted(set(data) - _TOP_LEVEL_KEYS - _OPTIONAL_KEYS)
     if extra:
         raise LocationError("top level: unexpected keys %s" % ", ".join(extra))
     if not _is_int(data["schema_version"]) or data["schema_version"] != SCHEMA_VERSION:
@@ -281,6 +309,12 @@ def validate_location(data, name=None):
                                                         or dataset["kept"] < MIN_KEEP):
         raise LocationError("status: %r requires a dataset with at least %d kept stills"
                             % (data["status"], MIN_KEEP))
+    if "edit" in data:
+        if data["source"] != "photos":
+            raise LocationError("edit: only a photo location records an edit model")
+        problem = _edit_problem(data["edit"])
+        if problem is not None:
+            raise LocationError("edit: " + problem)
 
 
 def load_location(name):

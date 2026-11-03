@@ -59,6 +59,7 @@ def _fakes(monkeypatch, vlm_up=True):
     monkeypatch.setattr(character_dataset, "run_zimage_child", _child)
     monkeypatch.setattr(character_dataset, "run_edit_child", _child)
     monkeypatch.setattr(character_dataset, "edit_models_missing", lambda: [])
+    monkeypatch.setattr(character_dataset, "edit_selection_problem", lambda model_id, loras: None)
     monkeypatch.setattr(character_dataset, "restore_story_server",
                         lambda wait=False: calls.append("restore") or 0)
     monkeypatch.setattr(character_dataset, "story_server", lambda cmd: calls.append(cmd) or 0)
@@ -494,3 +495,18 @@ def test_lt10_train_with_neither_flag_trains_both(env, monkeypatch, tmp_path, ca
     assert tool.main(["train", "harbour-street"]) == 1
     assert calls == ["video", "video", "stills"]
     assert ll.load_location("harbour-street")["status"] == "trained"
+
+
+# --- QET19 (qwen edit models QE24): bin/location create's two options -------------------------------------
+
+def test_qet19_the_create_options(env):
+    create = _subprocess(["create", "--help"])
+    assert create.returncode == 0
+    text = " ".join(create.stdout.split())
+    for flag in ("[--qwen-model ID]", "[--lora ID=SCALE]"):
+        assert flag in text, flag
+    args = tool.build_parser().parse_args(["create", "old-mill", "--photo", "p.png", "--qwen-model", "qwen21-q4",
+                                           "--lora", "uncensored=1", "--lora", "viggle-turbo=0.5"])
+    assert (args.qwen_model, args.lora) == ("qwen21-q4", ["uncensored=1", "viggle-turbo=0.5"])
+    args = tool.build_parser().parse_args(["create", "old-mill"])
+    assert (args.qwen_model, args.lora) == (None, None)
