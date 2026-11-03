@@ -421,3 +421,78 @@ def test_qe_review_focus_5_the_selection_round_trip(tmp_path, monkeypatch):
             model_arg, lora_args = _flags(argv, model_flag, lora_flag)
             got = qwen_edit.cli_selection(model_arg, lora_args, model_flag, lora_flag)
             assert qwen_edit.settings(*got) == want, (model_id, loras, model_flag)
+
+
+# --- QET38, QET39 (QE61-QE63, QE67, QE68): the picker on the static page ------------------------------------
+
+PREFIXES = ("lo-cq", "lo-rq", "ch-cq", "ch-rq", "c-sq")
+SUFFIXES = ("qwen-box", "qwen-model", "steps", "loras", "qwen-note", "reason")
+QWEN_BOX = ('      <div id="se-qwen-box" class="wide" hidden>\n'
+            '        <label>Qwen model <select id="se-qwen-model"></select></label>\n'
+            '        <span id="se-steps" class="muted"></span>\n'
+            '        <div id="se-loras" class="se-loras"></div>\n'
+            '        <p id="se-qwen-note" class="muted"></p>\n'
+            '      </div>\n')   # SQT22's Seeds box, unchanged
+MOUNTS = ('const SEED_PICKER = qwenPicker("se", false);', 'const LOCATION_PICKER = qwenPicker("lo-cq", false);',
+          'const LOCATION_REGEN_PICKER = qwenPicker("lo-rq", false);',
+          'const CHARACTER_PICKER = qwenPicker("ch-cq", false);',
+          'const CHARACTER_REGEN_PICKER = qwenPicker("ch-rq", false);', 'const COMPOSE_PICKER = qwenPicker("c-sq", true);')
+
+
+def _page():
+    static = os.path.join(WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    return static, html, js
+
+
+def _function(js, head):
+    """The text of the app.js function starting with head, through its closing line."""
+    start = js.index(head)
+    return js[start:js.index("\n  }\n", start) + len("\n  }\n")]
+
+
+def test_qet38_the_picker_on_the_page():
+    static, html, js = _page()
+    for prefix in PREFIXES:
+        for suffix in SUFFIXES:
+            assert html.count('id="%s-%s"' % (prefix, suffix)) == 1, (prefix, suffix)
+    wrapper = html.index('<div data-field="seed_edit" class="wide">')
+    assert html.index('id="c-folder-list"') < wrapper < html.index('id="c-sq-qwen-box"') < html.index(
+        "</fieldset>", wrapper)
+    assert '<span id="se-model-note" class="muted"></span>\n' + QWEN_BOX in html
+    assert js.count("function qwenPicker(prefix, asIs) {") == 1 and '"Seed as-is (no edit)"' in js
+    assert js.index("  function seedModelText(view) {") < js.index("  function qwenPicker(prefix, asIs) {")
+    for line in MOUNTS:
+        assert js.count(line) == 1, line
+    assert js.index('S.seeds = {source: null, natural: null, run: null, view: null, rows: {}, busy: false};') < js.index(
+        MOUNTS[0])
+    for gone in ("function renderSeedQwen(", "function readSeedQwen(", "function seedLoraBody(", "S.seeds.qwen",
+                 "qwenKey"):
+        assert gone not in js, gone
+    for name, text in (("index.html", html), ("app.js", js)):
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
+                        r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_qet39_the_compose_defaults_and_fields():
+    _static, _html, js = _page()
+    assert 'composeSeedDefault("seeds");' in _function(js, "  async function useSeed(run, n, status) {")
+    assert 'composeSeedDefault("upload");' in _function(js, "  async function onSeedFile() {")
+    assert 'composeSeedDefault("folder")' in _function(js, "  function onFolderPick(box) {")
+    assert ('COMPOSE_PICKER.select(f.seed_edit_model || "as-is", f.seed_edit_loras || []);'
+            in _function(js, "  function fillCompose(fields) {"))
+    body = _function(js, "  function composeFields(action) {")
+    assert "const seedEdit = composeSeedEditActive() ? COMPOSE_PICKER.selection() : null;" in body
+    assert ('seed_edit_model: seedEdit ? seedEdit.model : null, seed_edit_loras: seedEdit && seedEdit.model !== '
+            '"as-is" ? seedEdit.loras : null,') in body
+    assert js.count("function composeSeedDefault(origin) {") == 1
+    assert js.count("function composeSeedEditActive() {") == 1
