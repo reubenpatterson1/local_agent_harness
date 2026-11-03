@@ -216,7 +216,8 @@ for i, job in enumerate(spec["jobs"]):
         os.kill(os.getpid(), 9)
     color = (255, 0, 0) if job["n"] in config.get("red", []) else (0, 0, 200)
     Image.new("RGB", (spec["width"], spec["height"]), color).save(job["output_path"])
-    print(config.get("prefix", "") + "seed-edit-child done %d 1.0" % job["n"], flush=True)
+    if job["n"] not in config.get("silent", []):
+        print(config.get("prefix", "") + "seed-edit-child done %d 1.0" % job["n"], flush=True)
 '''
 
 QWENEDIT_STUB = r'''"""Stub of character_dataset.py qwenedit (tests only): records argv, env and spec, then obeys
