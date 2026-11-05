@@ -217,6 +217,120 @@ def _blocked_text(story_dir, panels):
             % (panels, os.path.join(story_dir, "story.md")))
 
 
+# --- SET1 (SE2): the option rules of --shots with --seed-image -----------------------------------------------
+
+def _parse(*extra):
+    return movie.build_parser().parse_args(["a narrative", "--story-id", "s1"] + list(extra))
+
+
+MODEL_RULE = ("Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen edit of the "
+              "seed, so the seed cannot be used as-is\n")
+ENGINE_RULE = ("Error: --shots with --seed-image needs the default story engine; it cannot be combined with %s\n")
+STILLS_RULE = ("Error: --stills-lora cannot be combined with --shots and --seed-image: every panel's still is a Qwen "
+               "edit of the seed, and Z-Image stills LoRAs do not apply to it\n")
+
+
+def test_set1_the_shots_seed_option_rules(clean_env, capsys):
+    tmp = clean_env["tmp"]
+    seed = st.png(os.path.join(tmp, "seed.png"), (64, 64))
+    override = os.path.join(tmp, "prompt.txt")
+    with open(override, "w", encoding="utf-8") as f:
+        f.write("x")
+    shots = ["--shots", "--seed-image", seed]
+    cases = [((), MODEL_RULE), (("--seed-edit-model", "as-is"), MODEL_RULE),
+             (("--seed-edit-model", "qwen21-q4", "--story-legacy"), ENGINE_RULE % "--story-legacy"),
+             (("--seed-edit-model", "qwen21-q4", "--story-prompt-override", override),
+              ENGINE_RULE % "--story-prompt-override"),
+             (("--seed-edit-model", "qwen21-q4", "--stills-lora", os.path.join(tmp, "x.safetensors")), STILLS_RULE)]
+    for extra, text in cases:
+        args = _parse(*(shots + list(extra)))
+        assert movie._resolve_shots(args) == 2, extra
+        assert capsys.readouterr().err == text, extra
+    args = _parse(*(shots + ["--seed-edit-model", "qwen21-q4"]))
+    assert movie._resolve_shots(args) == 0 and args.redo_panels == []
+    _write_story(tmp)
+    args = _parse(*(shots + ["--seed-edit-model", "qwen21-q4", "--redo", "2"]))
+    assert movie._resolve_shots(args) == 0 and args.redo_panels == [2]
+    assert capsys.readouterr().err == ""
+
+
+# --- SET2 (SE6): the shots story prompt has no seed preface ------------------------------------------------
+
+def test_set2_the_shots_story_prompt_has_no_seed_preface():
+    seeded = movie.build_story_prompt("N", "sid", 3, False, True, seconds="6", shots=True)
+    assert seeded == movie.build_story_prompt("N", "sid", 3, seconds="6", shots=True)
+    assert movie.SEED_IMAGE_PREFACE not in seeded and movie.SEED_IMAGE_POSTFACE not in seeded
+    chained = movie.build_story_prompt("N", "sid", 3, False, True, seconds="6")
+    assert chained.startswith(movie.SEED_IMAGE_PREFACE) and chained.endswith(movie.SEED_IMAGE_POSTFACE)
+
+
+# --- SET3 (SE7, SEK3): a shots seed run has the ordinary shots phase tuple, with no Phase 1c ------------------
+
+class _SeqArgs(object):
+    """_phase_sequence's inputs for a shots seed run with a seed edit; keyword arguments override."""
+
+    def __init__(self, **kwargs):
+        self.no_stills, self.story_server_stop_after_story, self.seed_image = False, False, "x.png"
+        self.story_only, self.shots, self.redo_panels = False, True, []
+        self.seed_edit = {"qwen_model": "qwen21-q4", "loras": UNC}
+        self.min_avail_gib, self.avail_timeout = 25.0, 1800
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+def _names(args):
+    return tuple(p.__name__ for p in movie._phase_sequence(args))
+
+
+def test_set3_shots_seed_runs_have_no_phase_1c():
+    assert _names(_SeqArgs(story_server_stop_after_story=True)) == (
+        "phase0_seed", "phase1_story", "phase_release_story_server", "phase2_stills", "phase3_manifest",
+        "phase4_render")
+    assert _names(_SeqArgs(story_server_stop_after_story=True, redo_panels=[2])) == (
+        "phase0_seed", "phase1_story", "phase_release_story_server", "phase_redo_shots", "phase2_stills",
+        "phase3_manifest", "phase4_render")
+    assert _names(_SeqArgs(story_only=True)) == ("phase0_seed", "phase1_story")
+    assert _names(_SeqArgs(story_server_stop_after_story=True, shots=False)) == (
+        "phase0_seed", "phase1_story", "phase_release_story_server", "phase_seed_edit", "phase2_stills",
+        "phase3_manifest", "phase4_render")
+
+
+# --- SE4, SE5 (plan ruling R8): the three help texts and the docstring sentence ------------------------------
+
+HELP = {
+    "--seed-image": (
+        "image that becomes the movie's literal first frame: Phase 0 derives the video width/height from its aspect "
+        "ratio (1:3 to 3:1) and attaches a scaled copy to the Phase 1 story prompt; Phase 2 fits the ORIGINAL "
+        "(scaled, never cropped) into panel_01.png at twice the video size, same as z_image, so ltx-2-mlx's own "
+        "downscale keeps more real detail. With --shots, Phase 2 instead edits the ORIGINAL into every panel's "
+        "still (see --seed-edit-model). Incompatible with --no-stills and with --video-width/--video-height."),
+    "--seed-edit-model": (
+        "with --seed-image: edit the seed into panel 1 with a Qwen registry edit model (qwen21-q4, qwen21-q8, "
+        "qwen21-bf16, qwen2511-q4, qwen2511-bf16), prompted by panel 1's Image: text after Phase 1 and screened "
+        "with content safety; as-is, like leaving the flag out, uses the seed unchanged. With --shots it is "
+        "required and as-is is refused: every panel's still is an edit of the seed, each prompted by its own "
+        "Image: text. See docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md and "
+        "2026-11-05-compose-shots-seed-edit-design.md."),
+    "--shots": (
+        "shots mode: every panel is its own shot with its own Image: still and is rendered from that still (no "
+        "chaining; cuts between panels). Phase 1 uses the shots story template and enforces the shot rules (one "
+        "action per Motion:, at most two cast characters per shot), Phase 2 renders a still for every panel, and "
+        "every cast character LoRA defaults to 0.8. With --seed-image, every panel's still is instead a Qwen edit "
+        "of the seed (--seed-edit-model ID, required). See docs/superpowers/specs/2026-10-06-shots-mode-design.md.")}
+DOC_SENTENCE = (
+    "so that only they re-render. With --seed-image (docs/superpowers/specs/2026-11-05-compose-shots-seed-edit-"
+    "design.md), Phase 2 instead edits the seed into every panel's still with the Qwen model of --seed-edit-model "
+    "(required), in one child, each panel prompted by its own Image: text, screened, recorded in seed_edits.json "
+    "and reused on a rerun when nothing changed. Story engine")
+
+
+def test_se4_se5_the_help_texts_and_the_docstring():
+    actions = dict((a.option_strings[0], a) for a in movie.build_parser()._actions if a.option_strings)
+    for flag, text in HELP.items():
+        assert actions[flag].help == text, flag
+    assert DOC_SENTENCE in " ".join(movie.__doc__.split())
+
+
 # --- SET4 (SE8, SEK3): Phase 2 dispatches a shots seed run, and only it -------------------------------------
 
 def test_set4_phase_2_dispatches_shots_seed_runs(clean_env, monkeypatch, capsys):
@@ -441,6 +555,75 @@ def test_set12_a_panel_without_an_image_line(clean_env, capsys):
     assert movie._phase2_shots_seed(_phase_args(tmp)) == 1
     assert capsys.readouterr().err == "Error: %s has no panels to edit the seed into\n" % story_md
     assert not os.path.exists(os.path.join(story_dir, "seed_edits.json"))
+
+
+# --- SET13 (SE19, SE20): the shots seed dry run ------------------------------------------------------------
+
+def _dry(capsys, *extra):
+    argv = ["a narrative", "--story-id", "s1", "--dry-run", "--no-review", "--no-auto-lora"] + list(extra)
+    rc = movie.main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    return captured.out
+
+
+def _seed1920(tmp):
+    """A 1920x1080 PNG seed (QET31's): the dry run derives the video geometry 576x320 from it."""
+    path = os.path.join(tmp, "seed1920.png")
+    if not os.path.isfile(path):
+        Image.new("RGB", (1920, 1080), (40, 50, 60)).save(path)
+    return path
+
+
+SHOTS_DRY = ("Would edit the seed into every panel's still with %s at 576x320, seed 0, in one Qwen child: each panel "
+             "is prompted by the shots seed-edit instruction and its own Image: text (and the Style: text) from "
+             "story.md, screened with content safety (skill ltx_movie_shots_seed_edit), fitted (never cropped) into "
+             "%s at 1152x640 and recorded in %s. Z-Image and stills LoRAs are not used. A blocked or failed panel "
+             "stops the run after the batch; a rerun reuses every recorded edit.")
+
+
+def test_set13_the_shots_seed_dry_run(clean_env, capsys):
+    tmp, fake = clean_env["tmp"], clean_env["fake"]
+    seed = _seed1920(tmp)
+    story_dir = os.path.join(tmp, "stories", "s1")
+    shots = ("--shots", "--seed-image", seed, "--seed-edit-model", "qwen21-q4")
+    out = _dry(capsys, *shots)
+    lines = out.splitlines()
+    zero = [line for line in lines if line.startswith("Would validate ")]
+    assert len(zero) == 1 and zero[0].endswith(
+        "(long edge 1024px) to %s. Phase 2 edits the ORIGINAL into every panel's still with the Qwen edit model; "
+        "nothing is cropped." % os.path.join(story_dir, "seed_downscaled.png"))
+    assert "--- Phase 1c: seed edit ---" not in lines and "ltx-story-images" not in out
+    i = lines.index("--- Phase 2: stills ---")
+    assert lines[i:i + 5] == [
+        "--- Phase 2: stills ---",
+        SHOTS_DRY % (qwen_edit.generator_text("qwen21-q4", []), os.path.join(story_dir, "images", "panel_NN.png"),
+                     os.path.join(story_dir, "seed_edits.json")),
+        "Panels: decided at Phase 2, from story.md after Phase 1", "", "--- Phase 3: manifest + dry-run ---"]
+    assert fake.calls == {"selection_problem": [], "wait_for_memory": [], "run_jobs": []}
+    _write_story(tmp)
+    assert movie._phase2_shots_seed(_phase_args(tmp, seed_image=seed, video_width=576, video_height=320,
+                                                image_seed=0, seed_edit={"qwen_model": "qwen21-q4", "loras": []})) == 0
+    _write_story(tmp, text=_story_md([IMAGES[0], IMAGES[1] + " Gulls circle overhead.", IMAGES[2]]))
+    capsys.readouterr()
+    assert "Panels to edit: 2; reused: 1,3" in _dry(capsys, *shots).splitlines()
+    assert len(fake.calls["run_jobs"]) == 1 and fake.calls["selection_problem"] == []
+    assert not os.path.exists(os.path.join(story_dir, "redo"))
+
+
+# --- SET14 (SEK3): the chained and the plain shots dry runs are unchanged ------------------------------------
+
+def test_set14_chained_and_plain_shots_dry_runs_are_unchanged(clean_env, capsys):
+    seed = _seed1920(clean_env["tmp"])
+    fits = "Phase 2 fits the ORIGINAL into panel_01.png at twice the video size; nothing is cropped."
+    plain = _dry(capsys, "--seed-image", seed)
+    assert fits in plain and "--- Phase 1c: seed edit ---" not in plain.splitlines()
+    edited = _dry(capsys, "--seed-image", seed, "--seed-edit-model", "qwen21-q4")
+    assert fits in edited and "--- Phase 1c: seed edit ---" in edited.splitlines()
+    shots = _dry(capsys, "--shots")
+    assert ("Stills groups: computed from story.md after Phase 1 -- one run per distinct set of cast stills LoRAs, "
+            "each with --only <PANELS> (that group's panels):") in shots.splitlines()
+    assert "Would edit the seed into every panel's still" not in shots
 
 
 # --- SET15 (SE15, SEK4, SEK5): the real runner, one mflux child, every output screened ---------------------

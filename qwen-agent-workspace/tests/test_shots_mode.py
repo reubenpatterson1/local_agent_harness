@@ -934,8 +934,8 @@ def test_s33_resolve_shots_errors(tmp_path, movie_ws, capsys):
         (base + ["--shots", "--no-stills"],
          "Error: --shots needs Phase 2's per-panel stills; it cannot be combined with --no-stills"),
         (base + ["--shots", "--seed-image", str(seed)],
-         "Error: --shots is not supported with --seed-image: the seed image can be only panel 1's "
-         "still, and the seed-image story preface describes the chained flow"),
+         "Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen edit of "
+         "the seed, so the seed cannot be used as-is"),
         (base + ["--shots", "--redo", "x"], malformed % "x"),
         (base + ["--shots", "--redo", "3.0"], malformed % "3.0"),
         (base + ["--shots", "--redo", ""], malformed % ""),

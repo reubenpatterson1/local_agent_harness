@@ -95,7 +95,11 @@ stills-LoRA group (z_image_skill holds one LoRA set per process); Phase 3 builds
 manifest in which every panel is conditioned on its own still; Phase 4 renders independent
 clips (--on-panel-failure skip). Every cast character LoRA defaults to 0.8, alone or
 paired. --redo N[,M] moves those panels' stills and clips, and movie.mp4, into
-<story>/redo/<stamp>-<pid>/ so that only they re-render.
+<story>/redo/<stamp>-<pid>/ so that only they re-render. With --seed-image
+(docs/superpowers/specs/2026-11-05-compose-shots-seed-edit-design.md), Phase 2 instead edits
+the seed into every panel's still with the Qwen model of --seed-edit-model (required), in one
+child, each panel prompted by its own Image: text, screened, recorded in seed_edits.json and
+reused on a rerun when nothing changed.
 
 Story engine (docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md): by default
 Phase 1 asks the story model for a JSON plan and then one panel at a time, assembles story.md
@@ -255,7 +259,8 @@ def build_story_prompt(narrative, story_id, panels, no_stills=False, seed_image=
         if rendered.count(anchor) != 1:
             raise ValueError("the story template no longer has exactly one %r anchor" % anchor)
         rendered = rendered.replace(anchor, "\n\n" + cast_block + anchor, 1)
-    if seed_image and not no_stills:
+    if seed_image and not no_stills and not shots:
+        # Shots seed edits SE6: the seed preface describes the chained flow; shots stories keep the shots template.
         # The postface goes AFTER the rendered template on purpose. The template's
         # VERBATIM-repetition rule and its 70-90 word Image: budget are concrete and
         # imperative; a preface-only override of them sits ~1000 words upstream and lost
@@ -321,14 +326,18 @@ def build_parser():
                               "3:1) and attaches a scaled copy to the Phase 1 story prompt; "
                               "Phase 2 fits the ORIGINAL (scaled, never cropped) into "
                               "panel_01.png at twice the video size, same as z_image, so "
-                              "ltx-2-mlx's own downscale keeps more real detail. Incompatible "
-                              "with --no-stills and with --video-width/--video-height.")
+                              "ltx-2-mlx's own downscale keeps more real detail. With --shots, "
+                              "Phase 2 instead edits the ORIGINAL into every panel's still (see "
+                              "--seed-edit-model). Incompatible with --no-stills and with "
+                              "--video-width/--video-height.")
     parser.add_argument("--seed-edit-model", dest="seed_edit_model", default=None, metavar="ID|as-is",
                          help="with --seed-image: edit the seed into panel 1 with a Qwen registry edit model "
                               "(qwen21-q4, qwen21-q8, qwen21-bf16, qwen2511-q4, qwen2511-bf16), prompted by panel 1's "
                               "Image: text after Phase 1 and screened with content safety; as-is, like leaving the "
-                              "flag out, uses the seed unchanged. See docs/superpowers/specs/"
-                              "2026-11-03-qwen-edit-models-design.md.")
+                              "flag out, uses the seed unchanged. With --shots it is required and as-is is refused: "
+                              "every panel's still is an edit of the seed, each prompted by its own Image: text. See "
+                              "docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md and "
+                              "2026-11-05-compose-shots-seed-edit-design.md.")
     parser.add_argument("--seed-edit-lora", dest="seed_edit_loras", action="append", default=None,
                          metavar="ID=SCALE",
                          help="with --seed-edit-model ID: a registry LoRA of that model's family, 0 < SCALE <= 2 "
@@ -416,7 +425,9 @@ def build_parser():
                               "panels). Phase 1 uses the shots story template and enforces the "
                               "shot rules (one action per Motion:, at most two cast characters "
                               "per shot), Phase 2 renders a still for every panel, and every "
-                              "cast character LoRA defaults to 0.8. See docs/superpowers/specs/"
+                              "cast character LoRA defaults to 0.8. With --seed-image, every "
+                              "panel's still is instead a Qwen edit of the seed (--seed-edit-model "
+                              "ID, required). See docs/superpowers/specs/"
                               "2026-10-06-shots-mode-design.md.")
     parser.add_argument("--redo", dest="redo", default=None, metavar="N[,M...]",
                          help="with --shots and an existing story.md: move panels N,M...'s "
@@ -1260,10 +1271,20 @@ def _resolve_shots(args):
               "--no-stills", file=sys.stderr)
         return 2
     if getattr(args, "seed_image", None):
-        print("Error: --shots is not supported with --seed-image: the seed image can be only "
-              "panel 1's still, and the seed-image story preface describes the chained flow",
-              file=sys.stderr)
-        return 2
+        # Shots seed edits SE2: every panel's still is a Qwen edit of the seed.
+        if args.story_legacy or args.story_prompt_override is not None:
+            print("Error: --shots with --seed-image needs the default story engine; it cannot be combined "
+                  "with %s" % ("--story-legacy" if args.story_legacy else "--story-prompt-override"),
+                  file=sys.stderr)
+            return 2
+        if args.seed_edit_model in (None, "as-is"):
+            print("Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen "
+                  "edit of the seed, so the seed cannot be used as-is", file=sys.stderr)
+            return 2
+        if getattr(args, "stills_lora_path_specs", None):
+            print("Error: --stills-lora cannot be combined with --shots and --seed-image: every panel's still "
+                  "is a Qwen edit of the seed, and Z-Image stills LoRAs do not apply to it", file=sys.stderr)
+            return 2
     if args.redo is None:
         return 0
     if args.force_story:
@@ -2872,6 +2893,33 @@ def _print_shots_stills_plan(args, cmd):
         print("Command: %s" % shlex.join(group_cmd))
 
 
+def _print_shots_seed_plan(args):
+    """Phase 2's dry-run lines in shots mode with a seed image (shots seed edits spec SE19). Reads; never writes."""
+    qe = _qwen_edit()
+    paths = _story_paths(args.story_id)
+    model_id, loras = args.seed_edit["qwen_model"], args.seed_edit["loras"]
+    known = isinstance(args.video_width, int)
+    size = "%dx%d" % _seed_edit_size(args, qe.multiple(model_id)) if known else "<W>x<H>"
+    still = "%dx%d" % _still_size(args) if known else "<2W>x<2H>"
+    print("Would edit the seed into every panel's still with %s at %s, seed %d, in one Qwen child: each panel is "
+          "prompted by the shots seed-edit instruction and its own Image: text (and the Style: text) from story.md, "
+          "screened with content safety (skill %s), fitted (never cropped) into %s at %s and recorded in %s. "
+          "Z-Image and stills LoRAs are not used. A blocked or failed panel stops the run after the batch; a rerun "
+          "reuses every recorded edit."
+          % (qe.generator_text(model_id, loras), size, args.image_seed, SHOTS_SEED_EDIT_SKILL,
+             os.path.join(paths["images_dir"], "panel_NN.png"), still,
+             _shots_seed_paths(paths["story_dir"])["record"]))
+    if args.force_story or not known or not os.path.exists(paths["story_md"]):
+        print("Panels: decided at Phase 2, from story.md after Phase 1")
+        return
+    error, plan = _shots_seed_plan(args, qe)
+    if error is not None:
+        print("Panels: Phase 2 would stop: %s" % error)
+        return
+    print("Panels to edit: %s; reused: %s"
+          % (_panel_list(plan["todo"]) or "none", _panel_list(plan["reuse"]) or "none"))
+
+
 def _print_dry_run_plan(args):
     paths = _story_paths(args.story_id)
     geometry_line = None
@@ -2927,10 +2975,11 @@ def _print_dry_run_plan(args):
         print("--- Phase 0: seed image ---")
         print("Would validate %s (readable image, every edge >= %dpx, aspect 1:3 to 3:1), "
               "derive the video geometry from it, and write a scaled story-model copy "
-              "(long edge %dpx) to %s. Phase 2 fits the ORIGINAL into panel_01.png at "
-              "twice the video size; nothing is cropped."
-              % (args.seed_image, SEED_MIN_EDGE, SEED_DOWNSCALE_MAX_EDGE,
-                 paths["seed_downscaled"]))
+              "(long edge %dpx) to %s. %s"
+              % (args.seed_image, SEED_MIN_EDGE, SEED_DOWNSCALE_MAX_EDGE, paths["seed_downscaled"],
+                 "Phase 2 edits the ORIGINAL into every panel's still with the Qwen edit model; nothing is cropped."
+                 if getattr(args, "shots", False) else
+                 "Phase 2 fits the ORIGINAL into panel_01.png at twice the video size; nothing is cropped."))
         print(geometry_line)
 
     print("--- Phase 1: story ---")
@@ -2954,7 +3003,7 @@ def _print_dry_run_plan(args):
         print("Then only those panels' stills and clips re-render; every other panel is reused.")
         print()
 
-    if getattr(args, "seed_edit", None):
+    if getattr(args, "seed_edit", None) and not getattr(args, "shots", False):
         qe = _qwen_edit()
         model_id, loras = args.seed_edit["qwen_model"], args.seed_edit["loras"]
         files = _seed_edit_paths(paths["story_dir"])
@@ -2968,7 +3017,11 @@ def _print_dry_run_plan(args):
                  files["original"], files["edited"], files["record"]))
         print()
 
-    if args.no_stills:
+    if getattr(args, "shots", False) and getattr(args, "seed_image", None):
+        print("--- Phase 2: stills ---")
+        _print_shots_seed_plan(args)
+        print()
+    elif args.no_stills:
         print("--- Phase 2: stills --- SKIPPED (--no-stills: no anchor stills are generated)")
         print()
     else:
@@ -3063,7 +3116,7 @@ def _phase_sequence(args):
     if getattr(args, "redo_panels", None):
         cut = phases.index(phase2_stills)
         phases = phases[:cut] + (phase_redo_shots,) + phases[cut:]
-    if getattr(args, "seed_edit", None) and phase2_stills in phases:
+    if (getattr(args, "seed_edit", None) and phase2_stills in phases and not getattr(args, "shots", False)):
         cut = phases.index(phase2_stills)
         phases = phases[:cut] + (phase_seed_edit,) + phases[cut:]
     if getattr(args, "seed_image", None):
