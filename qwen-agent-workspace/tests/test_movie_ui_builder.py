@@ -217,7 +217,7 @@ NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui
           "tests/test_movie_ui_seedfolder.py", "movie_ui_seedgen.py", "bin/seed-edit", "bin/seed-edit-setup",
           "seed_edit_mflux_child.py", "tests/test_seed_edit_tool.py", "tests/test_movie_ui_seedgen.py",
           "qwen_edit.py", "tests/test_qwen_edit.py", "tests/test_ltx_movie_seed_edit.py",
-          "tests/test_movie_ui_qwen_edit.py")
+          "tests/test_movie_ui_qwen_edit.py", "tests/test_ltx_movie_shots_seed.py")
 CHANGED_PY = ("fleet_lib.py", "bin/qwen-agentd", "tests/test_fleet_lib.py", "tests/test_fleet_self_update.py")
 PIPELINE_FILES = ("bin/ltx-movie", "bin/ltx-mlx-render", "bin/ltx-story-images", "bin/ltx-story-manifest",
                   "bin/ltx-story-video", "bin/ltx-chain", "bin/ltx-generate", "bin/ltx-host-prep",
