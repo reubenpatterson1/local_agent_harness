@@ -49,7 +49,7 @@ FIELD_LEVELS = {
 # Spec 2.6 (BF16): the allowlist of the files a fork copies, by level.
 COPY_FILES = {
     "render": ("story.md", "plan.json", "story_checks.json", "story_prompt.txt", "catalog_loras.json",
-               "manifest.json"),
+               "manifest.json", "seed_edits.json"),
     "stills": ("story.md", "plan.json", "story_checks.json", "story_prompt.txt"),
     "replan": (),
 }

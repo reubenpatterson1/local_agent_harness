@@ -557,7 +557,8 @@ def test_sdt17_shots_mode_refuses_every_seed(env, monkeypatch):
         assert status == code, data
         assert (data["ok"], data["queued"], data["shared_checks"]) == (False, 0, [])
         assert [(r["status"], r["reason"]) for r in data["seeds"]] == [
-            ("refused", "a seed image cannot be used with shots mode")] * 2
+            ("refused", "a seed image in shots mode needs a Qwen edit model: every panel's still is an edit of "
+                        "the seed, so the seed cannot be used as-is")] * 2
     assert calls == []
     assert _nothing_created(state)
 
