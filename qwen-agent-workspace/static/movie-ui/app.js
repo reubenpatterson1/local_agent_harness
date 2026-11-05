@@ -412,7 +412,8 @@
 
   function composeSeedEditActive() {
     const supported = (S.options && S.options.supported) || {};
-    return supported.seed_edit !== false && $("#c-mode").value === "chained"
+    const mode = $("#c-mode").value;
+    return supported.seed_edit !== false && (mode === "chained" || mode === "shots")
       && (($("#c-res-seed").checked && Boolean(S.seedUpload)) || $("#c-res-folder").checked);
   }
 
@@ -544,6 +545,19 @@
     show($("#c-check-seams-box"), mode === "chained");
     COMPOSE_PICKER.update();
     const seedEditOn = composeSeedEditActive();
+    // Shots seed edits spec SE31: in shots mode every panel is an edit of the seed, so "Seed as-is" is not offered.
+    const shotsSeed = seedEditOn && mode === "shots";
+    if (shotsSeed && COMPOSE_PICKER.state && COMPOSE_PICKER.state.model === "as-is") {
+      COMPOSE_PICKER.select(null, null);
+      COMPOSE_PICKER.update();
+    }
+    const asIsOption = $("#c-sq-qwen-model").options[0];
+    if (asIsOption && asIsOption.value === "as-is") {
+      asIsOption.disabled = shotsSeed;
+      asIsOption.textContent = shotsSeed ? "Seed as-is (no edit) — chained mode only" : "Seed as-is (no edit)";
+    }
+    $("#c-sq-label").textContent = mode === "shots" ? "Every panel from the seed" : "Panel 1 from the seed";
+    show($("#c-sq-shots-note"), shotsSeed);
     show($("#c-sq-qwen-box"), seedEditOn);
     const seedEditReason = seedEditOn ? COMPOSE_PICKER.reason() : "";
     $("#c-sq-reason").textContent = seedEditReason;

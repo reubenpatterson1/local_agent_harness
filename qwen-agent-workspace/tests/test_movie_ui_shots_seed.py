@@ -15,7 +15,9 @@ multi-job fake. No test uses the real HOME, renders, dispatches a job or contact
 """
 
 import os
+import re
 import shutil
+import subprocess
 
 import pytest
 
@@ -23,7 +25,7 @@ import movie_ui_testutil as mt
 import movie_ui_batch as batch
 import movie_ui_lib as lib
 import test_ltx_movie_shots_seed as sse
-from test_movie_ui_qwen_edit import _clean_env, _compose, _job, _probe, _upload, env  # noqa: F401
+from test_movie_ui_qwen_edit import _clean_env, _compose, _function, _job, _probe, _upload, env  # noqa: F401
 
 WS = mt.WS
 UP = "a" * 64 + ".png"
@@ -178,3 +180,57 @@ def test_sse_review_focus_5_a_render_fork_reuses_every_still(monkeypatch, tmp_pa
         "seed edits: every panel's still is a recorded edit of the same seed image, prompt, seed and settings; "
         "nothing to edit")
     assert not os.path.exists(os.path.join(fork, "seed-original.png"))
+
+
+# --- SET20 (SE29-SE32): the static page ------------------------------------------------------------------------
+
+LABEL = '<label><span id="c-sq-label">Panel 1 from the seed</span> <select id="c-sq-qwen-model"></select></label>'
+SHOTS_NOTE = ("<p id=\"c-sq-shots-note\" class=\"muted\" hidden>Every panel's still is a Qwen edit of the seed, "
+              "prompted by that panel's own Image: text. Z-Image is not used: stills LoRAs, and the stills LoRAs of "
+              "characters and locations, do not apply (characters and locations still shape the story and the "
+              "video).</p>")
+ACTIVE = ('    return supported.seed_edit !== false && (mode === "chained" || mode === "shots")\n'
+          '      && (($("#c-res-seed").checked && Boolean(S.seedUpload)) || $("#c-res-folder").checked);\n')
+SE31 = ('    const shotsSeed = seedEditOn && mode === "shots";\n'
+        '    if (shotsSeed && COMPOSE_PICKER.state && COMPOSE_PICKER.state.model === "as-is") {\n'
+        '      COMPOSE_PICKER.select(null, null);\n'
+        '      COMPOSE_PICKER.update();\n'
+        '    }\n'
+        '    const asIsOption = $("#c-sq-qwen-model").options[0];\n'
+        '    if (asIsOption && asIsOption.value === "as-is") {\n'
+        '      asIsOption.disabled = shotsSeed;\n'
+        '      asIsOption.textContent = shotsSeed ? "Seed as-is (no edit) — chained mode only" '
+        ': "Seed as-is (no edit)";\n'
+        '    }\n'
+        '    $("#c-sq-label").textContent = mode === "shots" ? "Every panel from the seed" : "Panel 1 from the seed";\n'
+        '    show($("#c-sq-shots-note"), shotsSeed);\n')
+
+
+def test_set20_the_page(v1_env):
+    static = os.path.join(WS, "static", "movie-ui")
+    with open(os.path.join(static, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    with open(os.path.join(static, "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    assert html.count("          " + LABEL + "\n") == 1
+    assert html.count('          <p id="c-sq-qwen-note" class="muted"></p>\n          ' + SHOTS_NOTE + "\n") == 1
+    for ident in ('id="c-sq-label"', 'id="c-sq-shots-note"'):
+        assert html.count(ident) == 1, ident
+    box = html.index('<div id="c-sq-qwen-box" hidden>')
+    assert box < html.index(LABEL) < html.index(SHOTS_NOTE) < html.index('id="c-sq-reason"') < html.index(
+        "</fieldset>", box)
+    active = _function(js, "  function composeSeedEditActive() {")
+    assert '    const mode = $("#c-mode").value;\n' + ACTIVE in active
+    buttons = _function(js, "  function updateComposeButtons() {")
+    assert ('    COMPOSE_PICKER.update();\n    const seedEditOn = composeSeedEditActive();\n'
+            '    // Shots seed edits spec SE31: in shots mode every panel is an edit of the seed, so "Seed as-is" is '
+            'not offered.\n' + SE31 + '    show($("#c-sq-qwen-box"), seedEditOn);\n') in buttons
+    for name, text in (("index.html", html), ("app.js", js)):
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
+                        r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stderr
