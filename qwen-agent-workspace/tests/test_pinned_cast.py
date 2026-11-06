@@ -161,7 +161,7 @@ UNCHANGED = {
         "tone, hair, clothing and accessories as actually visible -- invent no person who is not "
         "visible, and make beat 1 start from the exact scene it shows.\n\n"),
     "SPEAKING_IMAGE_SENTENCE": (" @@SPEAKER@@ is the only person in the foreground, facing the "
-                                "camera; any crowd stays in the background."),
+                                "camera."),
     "SPEAKING_CHAINED_MOTION_SENTENCE": (
         " In this panel @@SPEAKER@@ speaks the dialogue, and the pipeline inserts it right after "
         "the first sentence about what @@SPEAKER@@ does. Write that first sentence as everything "
@@ -497,8 +497,7 @@ SILENT_CAST_MOTION_SENTENCE = (" Also in frame in this panel, and silent: @@SILE
                                "phrase, word for word, only inside the sentences that begin with "
                                "@@SPEAKER@@, and never give them a speaking verb.")
 SPEAKING_IMAGE_SILENT_SENTENCE = (" @@SPEAKER@@ is in the foreground, facing the camera; also in "
-                                  "frame, and silent: @@SILENT@@; any crowd stays in the "
-                                  "background.")
+                                  "frame, and silent: @@SILENT@@.")
 
 
 def test_pt1_writer_constants_and_and_list():

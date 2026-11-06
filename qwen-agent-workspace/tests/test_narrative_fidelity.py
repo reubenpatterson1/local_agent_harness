@@ -656,8 +656,8 @@ CAST_LINE = ("cast: a list with one object per individual character who acts or 
              "fans, spectators, a team) is never a cast entry, and belongs in the setting sentence "
              "of its place. id is c1, c2, c3 and so on, in order. phrase is the character's "
              "referring phrase:")
-SETTING_LINE = ("names the period, the place, the ground, the light and any crowd or other group "
-                "of people in the background.\n")
+SETTING_LINE = ("names the period, the place, the ground and the light, and a crowd or other group "
+                "of people in the background only when the narrative mentions one.\n")
 SPEAKER_RULE = (" speaker is the id of the one character who says something aloud on screen "
                 "during the beat, or an empty string when nobody speaks; give a speaker only where "
                 "a spoken line moves the story. A beat with a speaker shows only that character "
@@ -717,8 +717,7 @@ SPEAKING_ACTION = (" In this panel @@SPEAKER@@ speaks the dialogue: they may mov
                    "and lit while they speak -- a speaker who approaches the camera speaks once "
                    "close -- and do not write the spoken words or a speaking verb here; the "
                    "pipeline adds them.")
-SPEAKING_IMAGE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; any crowd "
-                  "stays in the background.")
+SPEAKING_IMAGE = " @@SPEAKER@@ is the only person in the foreground, facing the camera."
 SPEECH_FRAMING = (" Characters speak on screen in this movie: keep each character within medium "
                   "to close-up range of the camera while they speak, and never have a character "
                   "shrink into the distance or leave the frame before their line ends.")

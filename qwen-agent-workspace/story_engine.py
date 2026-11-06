@@ -349,8 +349,8 @@ PLAN_PROMPT_TEMPLATE = (
     "accessories.@@CAST_FIXED@@\n"
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
     'so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names '
-    "the period, the place, the ground, the light and any crowd or other group of people in the "
-    "background.@@LOCATION_FIXED@@\n"
+    "the period, the place, the ground and the light, and a crowd or other group of people in the "
+    "background only when the narrative mentions one.@@LOCATION_FIXED@@\n"
     "props: a list with one object per object that matters to the story, with the keys id and "
     "name. id is p1, p2 and so on; name is a short noun phrase for the object. Use an empty list "
     "when no object matters.\n"
@@ -3022,12 +3022,10 @@ SILENT_CAST_MOTION_SENTENCE = (" Also in frame in this panel, and silent: @@SILE
                                "phrase, word for word, only inside the sentences that begin with "
                                "@@SPEAKER@@, and never give them a speaking verb.")
 SPEAKING_IMAGE_SILENT_SENTENCE = (" @@SPEAKER@@ is in the foreground, facing the camera; also in "
-                                  "frame, and silent: @@SILENT@@; any crowd stays in the "
-                                  "background.")
+                                  "frame, and silent: @@SILENT@@.")
 SPEAKING_PROMPT_SENTENCE = (" Do not write the spoken words or a speaking verb here; the pipeline "
                             "adds them.")
-SPEAKING_IMAGE_SENTENCE = (" @@SPEAKER@@ is the only person in the foreground, facing the camera; "
-                           "any crowd stays in the background.")
+SPEAKING_IMAGE_SENTENCE = " @@SPEAKER@@ is the only person in the foreground, facing the camera."
 SPEAKING_SENTENCES = {"image": SPEAKING_IMAGE_SENTENCE, "motion": SPEAKING_ACTION_SENTENCE,
                       "prompt": SPEAKING_PROMPT_SENTENCE}
 # Shot prompt format spec SF7, D4: the writer writes the panel's one camera sentence, with the

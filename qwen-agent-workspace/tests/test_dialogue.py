@@ -772,7 +772,7 @@ def test_dlg13_writer_keys_and_speaking_key_lines(ws):
                                       replies={2: {"dialogue": LINE}})
     prompt = se.build_panel_prompt(ctx, plan, parts, 2)
     assert ('Never name a person who is not in this shot. "the courier" is the only person in the '
-            "foreground, facing the camera; any crowd stays in the background.\n") in prompt
+            "foreground, facing the camera.\n") in prompt
     assert ('and never use a semicolon. In this panel "the courier" speaks the dialogue:'
             in prompt)
     ctx, plan, parts, _t, _p = _story(ws, "chained", 3, plan_mut=_speaking(2),
