@@ -106,14 +106,16 @@ def test_rst5_agent_cmd(ws):
     ctx = seu.make_ctx(se, ws)
     head = [sys.executable, os.path.join(ws, "bin", "qwen-agent"), "--workspace", ws,
             "--max-tokens", "4096", "--max-rounds", "1", "--request-timeout", "600"]
-    assert se.agent_cmd(ctx, "P", max_tokens=4096) == head + ["--user-prompt", "P"]
+    assert se.agent_cmd(ctx, "P", max_tokens=4096) == head + ["--tools", "none", "--user-prompt", "P"]
     tuned = ctx._replace(story_model="andrevp/Qwen", context_window=262144)
     assert se.agent_cmd(tuned, "P", max_tokens=4096) == head + [
-        "--model", "andrevp/Qwen", "--context-window", "262144", "--user-prompt", "P"]
+        "--model", "andrevp/Qwen", "--context-window", "262144", "--tools", "none", "--user-prompt",
+        "P"]
     assert se.agent_cmd(ctx, "P", max_tokens=4096, image="/s/seed.png") == head + [
-        "--image", "/s/seed.png", "--user-prompt", "P"]
+        "--image", "/s/seed.png", "--tools", "none", "--user-prompt", "P"]
     assert se.agent_cmd(ctx, "P", max_tokens=4096, skill="analyst") == head + [
         "--skill=analyst", "--user-prompt", "P"]
+    assert "--tools" not in se.agent_cmd(ctx, "P", max_tokens=4096, skill="analyst")
     for cmd in (se.agent_cmd(tuned, "P", max_tokens=1, image="/i", skill="analyst"),):
         assert "--danger-auto-approve" not in cmd
 
@@ -2346,7 +2348,8 @@ def test_rst40_legacy_phase1_is_byte_identical(movie, monkeypatch, tmp_path, sto
     seed = str(tmp_path / "seed.png")
     Image.new("RGB", (704, 448), (10, 20, 30)).save(seed)
     head = [sys.executable, os.path.join(movie, "bin", "qwen-agent"), "--workspace", movie,
-            "--max-tokens", "4096", "--max-rounds", "4", "--request-timeout", "600"]
+            "--max-tokens", "4096", "--max-rounds", "4", "--request-timeout", "600", "--tools",
+            "write_file"]
     cases = [
         ("l1", [], [], False),
         ("l2", ["--force-story"], ["--danger-auto-approve"], False),
@@ -2629,6 +2632,7 @@ def test_rst47_robust_dry_run(tmp_path, story_env, monkeypatch):
         argv = shlex.split(proc.stdout.split("Command (subprocess timeout 600s): ", 1)[1]
                            .split("\n\nRendered plan prompt:\n", 1)[0])
         assert argv[argv.index("--max-rounds") + 1] == "1"
+        assert argv[-4:-2] == ["--tools", "none"]
         assert argv[argv.index("--max-tokens") + 1] == "4096"
         assert ("--image" in argv) == seeded
         if seeded:
@@ -3022,3 +3026,69 @@ def test_pacing_panel1_prompt_and_no_slowly(ws):
               for k, v in se.CAMERA_WRITER_FORMS.items()]
     for name, text in texts:
         assert "slowly" not in text.lower(), name
+
+
+# --- ATT12-ATT14 and Review Focus 5 (story agent tool restriction spec AT11-AT13; plan ruling R5) ---
+
+def test_att12_robust_plan_and_panel_calls_advertise_no_tools(movie, tmp_path, monkeypatch):
+    rc, log = _main_run(tmp_path, monkeypatch,
+                        [NARRATIVE, "--story-id", "e1", "--panels", "3", "--story-only",
+                         "--no-review", "--force-story"],
+                        plan=[seu.answer(seu.plan_json("chained", 3))],
+                        panel=_panel_script("chained", 3))
+    assert rc == 0
+    assert [r["stage"] for r in log] == ["plan", "plan", "panel", "panel", "panel"]
+    for r in log:
+        assert r["argv"][-4:-2] == ["--tools", "none"], r["stage"]
+        assert "--skill=analyst" not in r["argv"]
+        assert "--danger-auto-approve" not in r["argv"]
+
+
+def test_att13_the_local_critic_call_keeps_skill_analyst(tmp_path, monkeypatch):
+    prompt = "You are the critic for a test"
+    ctx, log = _critic_ws(tmp_path, monkeypatch, critic=[{"answer": "L1"}])
+    local = seu.FakeFleet(seu.fleet_view(True, ["a"]))
+    monkeypatch.setattr(se, "_load_fleet", lambda ws: local)
+    assert se.run_critic(ctx, prompt) == ("ok", "L1", "local")
+    argv = seu.agent_log(log)[0]["argv"]
+    assert "--skill=analyst" in argv
+    assert "--tools" not in argv
+    assert argv[-2:] == ["--user-prompt", prompt]
+
+
+def test_att14_the_legacy_command_and_its_dry_run_copy(movie, monkeypatch, capsys):
+    # Spec conflict SC4: no story-model auto-detect, so nothing reaches port 8177.
+    monkeypatch.setattr(ltx_movie, "_resolve_story_model", lambda *args, **kwargs: None)
+    _LegacyPopen.calls = []
+    monkeypatch.setattr(ltx_movie.subprocess, "Popen", _LegacyPopen)
+    prompt = ltx_movie.build_story_prompt(NARRATIVE, "t1", 3, False, False, seconds="6")
+    expected = [sys.executable, os.path.join(ltx_movie.WS, "bin", "qwen-agent"),
+                "--workspace", ltx_movie.WS, "--max-tokens", "4096", "--max-rounds", "4",
+                "--request-timeout", "600", "--tools", "write_file", "--user-prompt", prompt]
+    capsys.readouterr()
+    assert ltx_movie.main([NARRATIVE, "--story-id", "t1", "--panels", "3", "--story-legacy",
+                           "--dry-run", "--no-review"]) == 0
+    out = capsys.readouterr().out
+    command = out.split("Command (subprocess timeout ", 1)[1].split("): ", 1)[1]
+    assert shlex.split(command.split("\n\nRendered story prompt:\n", 1)[0]) == expected
+    assert _LegacyPopen.calls == []
+    assert ltx_movie.main([NARRATIVE, "--story-id", "t1", "--panels", "3", "--story-legacy",
+                           "--story-only", "--no-review"]) == 0
+    assert _LegacyPopen.calls[-1] == expected
+
+
+def test_at_review_focus_5_a_critic_round_keeps_both_argv_shapes(ws, tmp_path, monkeypatch):
+    rc, _a, _ctx, log = _run(ws, tmp_path, monkeypatch, panel=_panel_script(
+        "chained", 3, p2=[_busy("chained", 2), seu.answer(seu.panel_json("chained", 2))]),
+        critic=[{"answer": "garbage"}, {"answer": "{}"}])
+    assert rc == 0
+    assert [(r["stage"], r["panel"]) for r in log] == [
+        ("plan", None), ("plan", None), ("panel", 1), ("panel", 2), ("panel", 3),
+        ("critic", None), ("critic", None), ("panel", 2)]
+    for r in log:
+        if r["stage"] == "critic":
+            assert "--skill=analyst" in r["argv"] and "--tools" not in r["argv"]
+            assert r["argv"][-2] == "--user-prompt"
+        else:
+            assert r["argv"][-4:-2] == ["--tools", "none"], (r["stage"], r["panel"])
+            assert "--skill=analyst" not in r["argv"]

@@ -1540,10 +1540,11 @@ def phase1_story(args):
             f.write(prompt)
         max_tokens = _phase1_max_tokens(args.panels)
         timeout = _phase1_timeout(args.panels)
+        # Story agent tool restriction spec AT12: the legacy prompt needs exactly one write_file call.
         cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
                "--workspace", WS,
                "--max-tokens", str(max_tokens), "--max-rounds", "4",
-               "--request-timeout", "600"]
+               "--request-timeout", "600", "--tools", "write_file"]
         if args.story_model:  # resolved at the top of phase1_story
             cmd += ["--model", args.story_model]
         if args.story_context_window:
@@ -2807,7 +2808,7 @@ def _print_legacy_phase1(args, paths, prompt, max_tokens, timeout):
     phase1_cmd = [sys.executable, os.path.join(WS, "bin", "qwen-agent"),
                   "--workspace", WS,
                   "--max-tokens", str(max_tokens), "--max-rounds", "4",
-                  "--request-timeout", "600"]
+                  "--request-timeout", "600", "--tools", "write_file"]
     if args.story_model:
         phase1_cmd += ["--model", args.story_model]
     if args.story_context_window:
