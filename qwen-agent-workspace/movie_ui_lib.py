@@ -1562,7 +1562,16 @@ def validate_fields(fields, ws_real, state):
     elif seed is not None and mode == "no_stills":
         errors.append("a seed image cannot be used with no-stills mode")
     elif seed is not None and mode == "shots":
-        errors.append("a seed image cannot be used with shots mode")
+        # Shots seed edits SE23: every panel's still is a Qwen edit of the seed.
+        if fields.get("seed_edit_model") in (None, "as-is"):
+            errors.append("a seed image in shots mode needs a Qwen edit model: every panel's still is an edit of "
+                          "the seed, so the seed cannot be used as-is")
+        if fields.get("story_legacy") is True:
+            errors.append("a seed image in shots mode needs the default story engine; it cannot be combined with "
+                          "--story-legacy")
+        if isinstance(fields.get("stills_loras"), list) and fields["stills_loras"]:
+            errors.append("stills LoRAs do not apply in shots mode with a seed image: every panel's still is a "
+                          "Qwen edit of the seed")
     errors += _rule_models(fields)                                           # 9
     errors += _rule_loras(fields, "video") + _rule_loras(fields, "stills")  # 11
     chars = fields.get("characters")                                         # 12
@@ -2292,7 +2301,7 @@ def job_phases(kind, fields):
     seed = ["0"] if fields.get("seed_upload") else []
     if kind == "story":
         return seed + ["1"]
-    edit = (["1c"] if kind == "movie" and fields.get("seed_upload")
+    edit = (["1c"] if kind == "movie" and fields.get("seed_upload") and fields.get("mode") != "shots"
             and fields.get("seed_edit_model") not in (None, "as-is") else [])
     return (seed + ["1", "1b"] + edit + (["redo"] if fields.get("action") == "redo" else [])
             + ([] if fields.get("mode") == "no_stills" else ["2"]) + ["3", "4"])

@@ -73,7 +73,9 @@ def test_mut4_every_v1_error_alone(env):
         ({"seed_upload": "b" * 64 + ".png"}, "seed image upload %s not found" % ("b" * 64 + ".png")),
         ({"mode": "fast"}, "mode must be chained, shots or no_stills"),
         ({"seed_upload": seed, "mode": "no_stills"}, "a seed image cannot be used with no-stills mode"),
-        ({"seed_upload": seed, "mode": "shots"}, "a seed image cannot be used with shots mode"),
+        ({"seed_upload": seed, "mode": "shots"},
+         "a seed image in shots mode needs a Qwen edit model: every panel's still is an edit of the seed, so the "
+         "seed cannot be used as-is"),
         ({"model": "-x"}, "model must be a model name or an absolute path"),
         ({"gemma": ""}, "gemma must be a model name or an absolute path"),
         ({"story_model": "a\tb"}, "story_model must be a model name or an absolute path"),

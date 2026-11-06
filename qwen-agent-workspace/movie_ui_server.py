@@ -846,7 +846,7 @@ def _h_job_create(self, groups, query, body):
     checks = lib.run_checks(fields, fields["ws"], self.server.state)
     if not lib.checks_pass(checks):
         raise ApiError(409, "validation failed", checks=checks)
-    if (fields["action"] == "movie" and fields["seed_upload"]
+    if (fields["action"] in ("movie", "redo") and fields["seed_upload"]
             and fields["seed_edit_model"] not in (None, "as-is")):
         text = edit_availability(fields["ws"], fields["seed_edit_model"], fields["seed_edit_loras"])
         if text is not None:

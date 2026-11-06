@@ -89,10 +89,11 @@
       <ul id="c-folder-list" class="muted" hidden></ul>
       <div data-field="seed_edit" class="wide">
         <div id="c-sq-qwen-box" hidden>
-          <label>Panel 1 from the seed <select id="c-sq-qwen-model"></select></label>
+          <label><span id="c-sq-label">Panel 1 from the seed</span> <select id="c-sq-qwen-model"></select></label>
           <span id="c-sq-steps" class="muted"></span>
           <div id="c-sq-loras" class="se-loras"></div>
           <p id="c-sq-qwen-note" class="muted"></p>
+          <p id="c-sq-shots-note" class="muted" hidden>Every panel's still is a Qwen edit of the seed, prompted by that panel's own Image: text. Z-Image is not used: stills LoRAs, and the stills LoRAs of characters and locations, do not apply (characters and locations still shape the story and the video).</p>
           <span id="c-sq-reason" class="muted"></span>
         </div>
       </div>
