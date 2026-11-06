@@ -232,6 +232,10 @@ def agent_cmd(ctx, prompt, *, max_tokens, image=None, skill=None):
         cmd += ["--image", image]
     if skill == "analyst":
         cmd += ["--skill=analyst"]
+    elif skill is None:
+        # Story agent tool restriction spec AT11: the engine reads only the answer and writes every
+        # file itself, so its plan and panel calls advertise no tools.
+        cmd += ["--tools", "none"]
     return cmd + ["--user-prompt", prompt]
 
 

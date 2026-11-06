@@ -2,7 +2,7 @@
 
 --- Phase 1: story ---
 Would skip if <WS>/generated/stories/casting-baseline-dry/story.md already exists (pass --force-story to regenerate).
-Command (subprocess timeout 1350s): <PY> <WS>/bin/qwen-agent --workspace <WS> --max-tokens 8250 --max-rounds 4 --request-timeout 600 --user-prompt 'You are authoring the shot list for a short narrated movie (story-id "casting-baseline-dry").
+Command (subprocess timeout 1350s): <PY> <WS>/bin/qwen-agent --workspace <WS> --max-tokens 8250 --max-rounds 4 --request-timeout 600 --tools write_file --user-prompt 'You are authoring the shot list for a short narrated movie (story-id "casting-baseline-dry").
 
 Narrative to adapt:
 a test narrative
