@@ -110,7 +110,7 @@ def test_ls2_the_location_constants():
         "or describes one of them, it means that place:")
     assert se.LOCATION_FIXED_LINE == '\n- id l%d, name "%s", setting "%s"'
     assert se.FIXED_SETTING == "The setting is %s."
-    assert "background.@@LOCATION_FIXED@@\n" in se.PLAN_PROMPT_TEMPLATE
+    assert "background only when the narrative mentions one.@@LOCATION_FIXED@@\n" in se.PLAN_PROMPT_TEMPLATE
     assert se.PLAN_PROMPT_TEMPLATE.count("@@LOCATION_FIXED@@") == 1
 
 
@@ -119,15 +119,16 @@ def test_ls3_the_plan_prompt_lists_the_pinned_places(ws):
     fixed = (se.LOCATION_FIXED_INTRO
              + '\n- id l1, name "harbour-street", setting "The setting is %s."' % lt.HARBOUR_DESC
              + '\n- id l2, name "temple-gate", setting "The setting is %s."' % lt.TEMPLE_DESC)
-    assert ("any crowd or other group of people in the background." + fixed + "\nprops: ") in prompt
+    assert ("a crowd or other group of people in the background only when the narrative mentions "
+            "one." + fixed + "\nprops: ") in prompt
     assert prompt.count(se.LOCATION_FIXED_INTRO) == 1
     one = se.build_plan_prompt(seu.make_ctx(se, ws, locations=[TEMPLE]), [], [])
-    assert ('background.' + se.LOCATION_FIXED_INTRO
+    assert ('mentions one.' + se.LOCATION_FIXED_INTRO
             + '\n- id l1, name "temple-gate", setting "The setting is %s."\nprops: '
             % lt.TEMPLE_DESC) in one
     plain = se.build_plan_prompt(seu.make_ctx(se, ws), [], [])
     assert "@@LOCATION_FIXED@@" not in plain and se.LOCATION_FIXED_INTRO not in plain
-    assert "in the background.\nprops: " in plain
+    assert "only when the narrative mentions one.\nprops: " in plain
 
 
 def test_ls13_story_context_defaults(ws):
