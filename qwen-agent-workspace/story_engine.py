@@ -2246,12 +2246,21 @@ def panel_camera(ctx, plan, k):
     return beat["camera"]
 
 
+def seed_omits_identities(ctx):
+    """True when a seed image is attached in chained or shots mode (seeded no identity spec SI1):
+    the Image: of chained panel 1 and of every shots panel then leaves out the cast identity
+    sentences, because the seed already shows the people. ctx.seed_image, set whenever
+    --seed-image is given, decides; ctx.seed_agent_image does not."""
+    return bool(ctx.seed_image) and ctx.mode in ("chained", "shots")
+
+
 def pasted_pieces(ctx, plan, k):
     """{field: [pasted sentences in assembly order]} for panel k (RS14; dialogue spec SP4): the
     pieces of each assembled field that the writer does not write. A speaking panel adds the
     facing sentence; every panel, chained k >= 2 included, lists its panel_camera sentence
     (shot prompt format spec SF6). The planned camera sentence is always listed, even when
-    CM4 leaves it out of the assembled field."""
+    CM4 leaves it out of the assembled field. When seed_omits_identities(ctx), the image pieces
+    have no identity sentences (seeded no identity spec SI1); the no_stills prompt keeps them."""
     beat = plan["beats"][k - 1]
     by_cast = {c["id"]: c for c in plan["cast"]}
     by_location = {l["id"]: l for l in plan["locations"]}
@@ -2260,7 +2269,7 @@ def pasted_pieces(ctx, plan, k):
     shot = shot_sentence(beat) if beat["shot"] in SHOT_TYPES else ""
     camera = dict(CAMERA_SENTENCES).get(panel_camera(ctx, plan, k), "")
     facing = _facing(ctx, plan, k)
-    pieces = [setting] + identities + facing + [shot]
+    pieces = [setting] + ([] if seed_omits_identities(ctx) else identities) + facing + [shot]
     if ctx.mode == "chained":
         if k == 1:
             return {"image": pieces, "motion": facing + [camera], "narration": []}
@@ -3429,7 +3438,7 @@ def _field_checks(ctx, lib, plan, k, title, fields, writers, ids, undeclared, ge
                                 "contains %s's setting sentence; beat %d is at %s"
                                 % (other["id"], k, own["id"]))
                             break
-            if "N6" in ids:
+            if "N6" in ids and not seed_omits_identities(ctx):   # seeded no identity spec SI3
                 for cid in beat["cast"]:
                     entry = by_cast.get(cid)
                     if entry is None or (ctx.mode == "shots" and entry["cast_name"]):
@@ -4011,7 +4020,7 @@ def panel_checks(ctx, plan, parts, text, story_md_path):
         panels = _story_manifest(ctx.ws)._parse_prompts_md(story_md_path)[1]
         shots_hard, shots_other = split_shots(lib.shots_violations(
             text, panels, ctx.panels, ctx.members, ctx.narration is True, ignore_facing=True,
-            speaking_actions=2))
+            speaking_actions=2), ctx)
         hard += shots_hard
         advisory += shots_other + lib.shots_advisories(
             panels, ctx.members, motion_words=WORD_RANGES["shots"]["motion"])
@@ -4028,11 +4037,15 @@ def _order_by_panel(lines):
 SHOTS_HARD_RULES = ("S1", "S3")
 
 
-def split_shots(violations):
+def split_shots(violations, ctx=None):
     """(the S1/S3 violations, the other S rules) of a character_lib.shots_violations list: in the
-    robust engine only S1 and S3 are hard (dialogue spec 6.3)."""
+    robust engine only S1 and S3 are hard (dialogue spec 6.3). With a ctx for which
+    seed_omits_identities holds, every S9 is left out, because a seeded Image: has no identity
+    sentence (seeded no identity spec SI4)."""
+    left_out = SHOTS_HARD_RULES + (("S9",) if ctx is not None and seed_omits_identities(ctx)
+                                   else ())
     return ([v for v in violations if parse_violation(v)["id"] in SHOTS_HARD_RULES],
-            [v for v in violations if parse_violation(v)["id"] not in SHOTS_HARD_RULES])
+            [v for v in violations if parse_violation(v)["id"] not in left_out])
 
 
 def _and_list(items):
@@ -5420,7 +5433,7 @@ def recheck(ctx, legacy_validate):
             if ctx.mode == "shots":
                 shots_hard, shots_other = split_shots(lib.shots_violations(
                     text, parsed, ctx.panels, ctx.members, ctx.narration is True,
-                    ignore_facing=True))
+                    ignore_facing=True), ctx)
                 hard += shots_hard
                 advisory += shots_other + lib.shots_advisories(parsed, ctx.members)
             if ctx.auto_lora:
@@ -5467,7 +5480,7 @@ def recheck(ctx, legacy_validate):
         text, parsed = _read_story(ctx, story_md)
         violations, others = split_shots(lib.shots_violations(text, parsed, ctx.panels,
                                                               ctx.members, ctx.narration is True,
-                                                              ignore_facing=True))
+                                                              ignore_facing=True), ctx)
         advisories = others + lib.shots_advisories(parsed, ctx.members)
     except OSError as e:
         violations, advisories = ["story: cannot read story.md: %s" % e], []
