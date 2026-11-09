@@ -114,6 +114,12 @@ Seed edit (docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md): --seed
 the --seed-image into panel 1 with a Qwen registry edit model in Phase 1c (after the story, before
 the stills), prompted by panel 1's Image: text; the edit is screened, recorded in seed_edit.json and
 passed to Phase 2 as its --seed-image. Absent, or as-is, the seed is used unchanged.
+
+Cast references (docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md), a test option: in
+shots mode without --seed-image, --cast-refs-model ID renders every panel whose Image: names two cast characters
+as one Qwen edit with both characters' reference stills as Picture 1 and Picture 2, instead of Z-Image with both
+stills LoRAs (which blends the two people); one child for all of them, screened, recorded in cast_ref_edits.json
+and reused on a rerun when nothing changed. Every other panel is unchanged. Absent, Phase 2 is unchanged.
 """
 
 import argparse
@@ -150,6 +156,33 @@ SHOTS_SEED_EDIT_PREFIX = (
     "leave out anyone the new shot does not describe. The new shot: ")
 SHOTS_SEED_LORA_NOTE = ("note: Z-Image stills LoRAs (character, location and catalog stills LoRAs) do not apply "
                         "to Qwen edits; every panel's still is edited without them")
+# Cast references (docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md, CR5), a test option: in
+# shots mode without a seed image, a panel whose Image: names two cast characters is one Qwen edit with both
+# characters' reference stills as Picture 1 and Picture 2.
+CAST_REFS_SKILL = "ltx_movie_cast_ref_edit"
+CAST_REFS_SCHEMA = "ltx-movie.cast-ref-edits.v1"
+CAST_REFS_EDIT_PREFIX = (
+    "Make one new film still that shows two different people together. Picture 1, the first input image, shows "
+    "%(a)s, and Picture 2, the second input image, shows %(b)s. %(A)s keeps exactly the face, hair, skin tone, "
+    "build and clothing from Picture 1, and %(b)s keeps exactly the face, hair, skin tone, build and clothing "
+    "from Picture 2; never swap or mix their faces, colours or clothing. Take only these two people from the "
+    "pictures, not their pose, background, lighting or framing. %(position)sThe new shot: ")
+CAST_REFS_POSITION = "In the new shot %s is on the %s of the frame and %s is on the %s. "
+CAST_REFS_SIDE_PATTERN = (r"\b(?:on|at|in) the (left|right)\b|\b(left|right) (?:of|side|edge|half)\b"
+                          r"|\bcent(?:er|re)[- ](left|right)\b")
+CAST_REFS_STOP_PATTERN = r"[.!?;]"
+CAST_REFS_FULL_STILL = "char_09.png"
+CAST_REFS_FULL_WORDS = ("medium shot", "standing with arms relaxed")
+CAST_REFS_NOOP_NOTE = ("note: --cast-refs-model has no effect: it needs at least two cast characters (--character or "
+                       "--cast), and this run casts %d; every still is a Z-Image still")
+CAST_REFS_FALLBACK_NOTE = ("note: --cast-refs-model: character %s has no kept medium-shot dataset still (%s); its "
+                           "reference still %s is used, which may show only the head and shoulders, so its clothing "
+                           "rests on the Image: text")
+CAST_REFS_NONE_NOTE = ("note: cast refs: no panel's Image: names two cast characters; every still is a Z-Image "
+                       "still")
+CAST_REFS_LORA_NOTE = ("note: Z-Image stills LoRAs (character, location, catalog and --stills-lora) do not apply to "
+                       "the cast-reference panels %s: they are Qwen edits of the two characters' reference stills; "
+                       "every other panel keeps its Z-Image stills LoRAs")
 
 STORY_PROMPT_TEMPLATE = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
@@ -434,6 +467,18 @@ def build_parser():
                               "stills and clips (and movie.mp4) aside into "
                               "<story>/redo/<stamp>-<pid>/ and re-render only those panels; "
                               "every other panel is reused")
+    parser.add_argument("--cast-refs-model", dest="cast_refs_model", default=None, metavar="ID",
+                         help="a test option for --shots without --seed-image: every panel whose Image: names two "
+                              "cast characters (--character/--cast) is rendered by this Qwen registry edit model "
+                              "(qwen21-q4, qwen21-q8, qwen21-bf16, qwen2511-bf16; qwen2511-q4 is refused) with the "
+                              "two characters' reference stills as Picture 1 and Picture 2, instead of Z-Image with "
+                              "both stills LoRAs; screened with content safety and recorded in cast_ref_edits.json. "
+                              "Every other panel is unchanged. See docs/superpowers/specs/"
+                              "2026-11-09-shots-multi-reference-stills-design.md.")
+    parser.add_argument("--cast-refs-lora", dest="cast_refs_loras", action="append", default=None,
+                         metavar="ID=SCALE",
+                         help="with --cast-refs-model ID: a registry LoRA of that model's family, 0 < SCALE <= 2 "
+                              "(repeatable); none listed means no LoRA")
     parser.add_argument("--story-model", dest="story_model", default=None,
                          help="model name to declare to bin/qwen-agent's --model for "
                               "Phase 1 story generation; must match whatever the "
@@ -1048,6 +1093,97 @@ def _resolve_seed_edit(args):
             print("Error: --seed-edit-model %s: %s" % (model_id, problem), file=sys.stderr)
             return 2
     args.seed_edit = {"qwen_model": model_id, "loras": clean}
+    return 0
+
+
+def _cast_ref_still(member):
+    """(path, error) of a cast member's reference picture for --cast-refs-model (cast refs spec CR6), derived from
+    its character directory, never from the absolute paths inside character.json: dataset/stills/char_09.png (the
+    medium shot standing with arms relaxed, which shows the clothing) when dataset/manifest.json lists still 9 as
+    kept with a generation prompt naming both CAST_REFS_FULL_WORDS; else the dataset reference still
+    dataset/stills/<dataset.reference>.png (char_00, the seed cropped around the face, or char_01, a close-up), after
+    CAST_REFS_FALLBACK_NOTE. error is the text of an Error: line when neither file exists, else None."""
+    lib = _character_lib()
+    stills_dir = os.path.join(lib.character_dir(member.name), "dataset", "stills")
+    full = os.path.join(stills_dir, CAST_REFS_FULL_STILL)
+    try:
+        with open(os.path.join(os.path.dirname(stills_dir), "manifest.json"), encoding="utf-8") as f:
+            items = json.load(f).get("items")
+    except (OSError, ValueError, AttributeError):
+        items = None
+    for item in items if isinstance(items, list) else []:
+        if (isinstance(item, dict) and item.get("n") == 9 and item.get("kept") is True
+                and all(w in str(item.get("gen_prompt") or "").lower() for w in CAST_REFS_FULL_WORDS)
+                and os.path.isfile(full)):
+            return full, None
+    path = os.path.join(stills_dir, "%s.png" % lib.load_character(member.name)["dataset"]["reference"])
+    if not os.path.isfile(path):
+        return None, ("character %s has no reference still (looked for %s); rebuild its dataset with bin/character "
+                      "create %s --regenerate" % (member.name, path, member.name))
+    print(CAST_REFS_FALLBACK_NOTE % (member.name, CAST_REFS_FULL_STILL, path))
+    return path, None
+
+
+def _resolve_cast_refs(args):
+    """--cast-refs-model/--cast-refs-lora (cast refs spec CR4): sets args.cast_refs to None (off, or a no-op with fewer
+    than two cast characters) or {"qwen_model": ID, "loras": [{"id", "scale"}], "stills": {name: path}}. Returns 0,
+    or 2 after one Error: line. A dry run and --story-only read no weights."""
+    model, loras = args.cast_refs_model, args.cast_refs_loras
+    args.cast_refs = None
+    if model is None:
+        if loras is not None:
+            print("Error: --cast-refs-lora needs --cast-refs-model", file=sys.stderr)
+            return 2
+        return 0
+    if not args.shots:
+        print("Error: --cast-refs-model needs --shots: it renders the shots stills that show two cast characters",
+              file=sys.stderr)
+        return 2
+    if getattr(args, "seed_image", None):
+        print("Error: --cast-refs-model cannot be combined with --seed-image: with a seed image every shots still "
+              "is already a Qwen edit of the seed", file=sys.stderr)
+        return 2
+    path = os.path.join(WS, "qwen_edit.py")
+    if not os.path.isfile(path):
+        print("Error: --cast-refs-model needs %s, which this workspace does not have" % path, file=sys.stderr)
+        return 2
+    qe = _qwen_edit()
+    if model not in qe.MODEL_IDS:
+        print("Error: --cast-refs-model must be one of %s" % ", ".join(qe.MULTI_REFERENCE_MODEL_IDS),
+              file=sys.stderr)
+        return 2
+    if qe.multi_reference_problem(model) is not None:
+        print("Error: --cast-refs-model %s is refused: %s" % (model, qe.multi_reference_problem(model)),
+              file=sys.stderr)
+        return 2
+    try:
+        model_id, clean = qe.cli_selection(model, loras, "--cast-refs-model", "--cast-refs-lora")
+    except qe.SelectionError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    members = getattr(args, "cast_members", None) or []
+    if len(members) < 2:
+        print(CAST_REFS_NOOP_NOTE % len(members))
+        return 0
+    stills, seen = {}, {}
+    for m in members:
+        still, error = _cast_ref_still(m)
+        if error is not None:
+            print("Error: --cast-refs-model: %s" % error, file=sys.stderr)
+            return 2
+        digest = _sha256_file(still)
+        if digest in seen:
+            print("Error: --cast-refs-model: characters %s and %s have the same reference still bytes (%s); each "
+                  "picture must show a different person" % (seen[digest], m.name, still), file=sys.stderr)
+            return 2
+        seen[digest] = m.name
+        stills[m.name] = still
+    if not args.dry_run and not args.story_only:
+        problem = qe.selection_problem(model_id, clean)
+        if problem is not None:
+            print("Error: --cast-refs-model %s: %s" % (model_id, problem), file=sys.stderr)
+            return 2
+    args.cast_refs = {"qwen_model": model_id, "loras": clean, "stills": stills}
     return 0
 
 
@@ -2142,6 +2278,8 @@ def phase2_stills(args):
     cmd += _cast_flags(args)
     cmd += _location_flags(args)
     if getattr(args, "shots", False):
+        if getattr(args, "cast_refs", None):
+            return _phase2_shots_cast_refs(args, cmd)   # cast refs CR10: two-character panels are Qwen edits
         return _phase2_shots(args, cmd)
     panel_01 = os.path.join(paths["images_dir"], "panel_01.png")
     if (getattr(args, "cast_members", None) and not getattr(args, "seed_image", None)
@@ -2202,15 +2340,25 @@ def _shots_missing_stills(args, panels):
             or not os.path.exists(os.path.join(images_dir, "panel_%02d.png" % i))]
 
 
-def _phase2_shots(args, cmd):
+def _exclude_groups(groups, exclude):
+    """groups without the panels in exclude, leaving out a group that has none left (cast refs spec CR11); groups
+    itself when exclude is empty."""
+    if not exclude:
+        return groups
+    kept = [(names, [i for i in panels if i not in exclude]) for names, panels in groups]
+    return [(names, panels) for names, panels in kept if panels]
+
+
+def _phase2_shots(args, cmd, exclude=()):
     """Phase 2 in shots mode (shots spec 5.5): one bin/ltx-story-images run per stills-LoRA group,
     each the Phase 2 cmd with --only <the group's panels> and --shots appended, teed to
     images/stills-group-KK.log. A group with no missing still is skipped. A failing group does
     not stop the rest: every group runs, then one error lists each failed group and Phase 2
-    returns 1. Stills already written are kept."""
+    returns 1. Stills already written are kept. The panels in exclude (the cast-reference
+    panels, cast refs spec CR11) are left out of every group."""
     paths = _story_paths(args.story_id)
-    groups = _shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [],
-                                  getattr(args, "location_pins", None) or [])
+    groups = _exclude_groups(_shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [],
+                                                  getattr(args, "location_pins", None) or []), exclude)
     os.makedirs(paths["images_dir"], exist_ok=True)
     failed = []
     for k, (names, panels) in enumerate(groups, start=1):
@@ -2396,24 +2544,25 @@ def _shots_seed_prompts(story_md):
             for n, p in enumerate(panels, start=1)]
 
 
-def _shots_seed_entries(record_path):
+def _shots_seed_entries(record_path, schema=SHOTS_SEED_EDITS_SCHEMA):
     """{n: entry} of seed_edits.json (shots seed edits spec SE12), or {} when it is missing, unreadable or not
-    this schema."""
+    this schema (cast_ref_edits.json with CAST_REFS_SCHEMA, cast refs spec CR9)."""
     try:
         with open(record_path, encoding="utf-8") as f:
             record = json.load(f)
     except (OSError, ValueError):
         return {}
-    if not (isinstance(record, dict) and record.get("schema") == SHOTS_SEED_EDITS_SCHEMA
+    if not (isinstance(record, dict) and record.get("schema") == schema
             and isinstance(record.get("panels"), list)):
         return {}
     return dict((e["n"], e) for e in record["panels"]
                 if isinstance(e, dict) and isinstance(e.get("n"), int) and not isinstance(e.get("n"), bool))
 
 
-def _write_shots_seed_record(path, entries, total):
-    """seed_edits.json with the entries of panels 1..total in panel order, written atomically (SE12)."""
-    _write_seed_edit_record(path, {"schema": SHOTS_SEED_EDITS_SCHEMA,
+def _write_shots_seed_record(path, entries, total, schema=SHOTS_SEED_EDITS_SCHEMA):
+    """seed_edits.json (or, with CAST_REFS_SCHEMA, cast_ref_edits.json) with the entries of panels 1..total in panel
+    order, written atomically (SE12; cast refs spec CR9)."""
+    _write_seed_edit_record(path, {"schema": schema,
                                    "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                    "panels": [entries[n] for n in sorted(entries) if 1 <= n <= total]})
 
@@ -2575,6 +2724,228 @@ def _phase2_shots_seed(args):
     if failure is not None or blocked:
         return 1
     print("seed edits: %d panel stills written" % len(ok))
+    return 0
+
+
+def _cast_refs_paths(story_dir):
+    """The cast-reference edits' files in the story directory (cast refs spec CR9)."""
+    return {"record": os.path.join(story_dir, "cast_ref_edits.json"),
+            "work": os.path.join(story_dir, "cast_ref_edits")}
+
+
+def _cast_refs_side(lib, text, phrase, other):
+    """"left" or "right" when text puts phrase on one side of the frame, else None (cast refs spec CR8): the first
+    occurrence of phrase whose words, up to the next mention of either phrase or the next . ! ? or ;, name screen
+    positions (CAST_REFS_SIDE_PATTERN) of exactly one side."""
+    import re
+    mine, theirs, stop = lib._phrase_regex(phrase), lib._phrase_regex(other), re.compile(CAST_REFS_STOP_PATTERN)
+    for match in mine.finditer(text):
+        ends = [m.start() for m in (mine.search(text, match.end()), theirs.search(text, match.end()),
+                                     stop.search(text, match.end())) if m]
+        segment = text[match.end():min(ends) if ends else len(text)]
+        sides = set(next(g for g in m.groups() if g).lower()
+                    for m in re.finditer(CAST_REFS_SIDE_PATTERN, segment, re.IGNORECASE))
+        if len(sides) == 1:
+            return sides.pop()
+    return None
+
+
+def _cast_refs_prompt(lib, pair, text):
+    """A cast-reference panel's edit prompt (cast refs spec CR8): CAST_REFS_EDIT_PREFIX with pair[0] as Picture 1 and
+    pair[1] as Picture 2, plus CAST_REFS_POSITION when text puts them on different sides, then text (the panel's
+    Image: text joined with the Style: text). No LoRA trigger word is inserted."""
+    a, b = pair[0].phrase, pair[1].phrase
+    sides = (_cast_refs_side(lib, text, a, b), _cast_refs_side(lib, text, b, a))
+    position = CAST_REFS_POSITION % (a, sides[0], b, sides[1]) if None not in sides and sides[0] != sides[1] else ""
+    return CAST_REFS_EDIT_PREFIX % {"a": a, "b": b, "A": a[:1].upper() + a[1:], "position": position} + text
+
+
+def _cast_refs_plan(args, qe):
+    """Phase 2's cast-reference plan, read-only (cast refs spec CR9): (error, plan). error is the text of an Error:
+    line or None. A cast-reference panel is one whose Image: text, joined with the Style: text, names exactly two
+    cast characters (character_lib.cast_text); its pair lists them in cast order. A panel naming three or more is an
+    error. plan is {"pairs": {n: [member, member]}, "prompts": {n: prompt}, "size": (W, H), "still": (SW, SH),
+    "keys": {n: key}, "entries": {n: entry}, "reuse": [n], "todo": [n], "total": the panel count}. A panel is reused
+    iff it is not a --redo panel, its entry is ok with every key item equal, and images/panel_NN.png exists with the
+    entry's still_sha256."""
+    paths = _story_paths(args.story_id)
+    model_id, loras = args.cast_refs["qwen_model"], args.cast_refs["loras"]
+    panels = _load_story_panels(paths["story_md"])
+    if not panels:
+        return "%s has no panels" % paths["story_md"], None
+    lib = _character_lib()
+    images = importlib.machinery.SourceFileLoader(
+        "ltx_story_images_for_movie", os.path.join(WS, "bin", "ltx-story-images")).load_module()
+    style = images._style_text(panels)
+    members = args.cast_members
+    pairs, prompts = {}, {}
+    for n, p in enumerate(panels, start=1):
+        text = images._compose_prompt(p["image"], style)
+        names = lib.cast_text(text, members)[1]
+        if len(names) > 2:
+            return ("panel %d of %s names %d cast characters (%s); --cast-refs-model takes exactly two per panel"
+                    % (n, paths["story_md"], len(names), ", ".join(names))), None
+        if len(names) == 2:
+            pairs[n] = [m for m in members if m.name in names]
+            prompts[n] = _cast_refs_prompt(lib, pairs[n], text)
+    still = _still_size(args)
+    multiple = qe.multiple(model_id)
+    size = (still[0] // multiple * multiple, still[1] // multiple * multiple)
+    stills = args.cast_refs["stills"]
+    digests = dict((name, _sha256_file(path)) for name, path in stills.items())
+    settings = qe.settings(model_id, loras)
+    entries = _shots_seed_entries(_cast_refs_paths(paths["story_dir"])["record"], CAST_REFS_SCHEMA)
+    redo = set(getattr(args, "redo_panels", None) or [])
+    keys, reuse, todo = {}, [], []
+    for n in sorted(pairs):
+        sources = [{"name": m.name, "still": os.path.basename(stills[m.name]), "sha256": digests[m.name]}
+                   for m in pairs[n]]
+        keys[n] = dict(settings, sources=sources, prompt=prompts[n], seed=args.image_seed, width=size[0],
+                       height=size[1], still_width=still[0], still_height=still[1])
+        entry = entries.get(n)
+        path = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
+        if (n not in redo and isinstance(entry, dict) and entry.get("status") == "ok"
+                and all(k in entry and entry[k] == v for k, v in keys[n].items())
+                and os.path.isfile(path) and entry.get("still_sha256") == _sha256_file(path)):
+            reuse.append(n)
+        else:
+            todo.append(n)
+    return None, {"pairs": pairs, "prompts": prompts, "size": size, "still": still, "keys": keys,
+                  "entries": entries, "reuse": reuse, "todo": todo, "total": len(panels)}
+
+
+def _phase2_cast_refs_batch(args, qe, plan):
+    """The cast-reference edits of plan["todo"] in one qwen_edit.run_jobs batch (cast refs spec CR10): each job's
+    sources are its pair's reference stills in cast order; every output is screened with content safety, fitted into
+    images/panel_NN.png at the still size and recorded in cast_ref_edits.json. A todo panel's existing still is moved
+    aside first. Returns 0 or 1; a blocked or failed panel returns 1 after the batch, with no fallback to Z-Image."""
+    paths = _story_paths(args.story_id)
+    files = _cast_refs_paths(paths["story_dir"])
+    model_id, loras = args.cast_refs["qwen_model"], args.cast_refs["loras"]
+    label = qe.label(model_id)
+    stills = args.cast_refs["stills"]
+    entries, todo, total = plan["entries"], plan["todo"], plan["total"]
+    if plan["reuse"]:
+        print("cast refs: reusing the stills of panels %s (recorded edits of the same pictures, prompt, seed and "
+              "settings)" % _panel_list(plan["reuse"]))
+    if not todo:
+        print("cast refs: every cast-reference panel's still is a recorded edit of the same pictures, prompt, seed "
+              "and settings; nothing to edit")
+        return 0
+    os.makedirs(paths["images_dir"], exist_ok=True)
+    os.makedirs(files["work"], exist_ok=True)
+    archive = os.path.join(paths["story_dir"], "redo", "%s-%d" % (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()), "images")
+    for n in todo:
+        still = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
+        if os.path.lexists(still):
+            os.makedirs(archive, exist_ok=True)
+            moved = os.path.join(archive, os.path.basename(still))
+            os.replace(still, moved)
+            print("cast refs: moved %s -> %s (not a recorded cast-reference edit of these pictures, prompt, seed "
+                  "and settings)" % (still, moved))
+        for name in ("panel_%02d.png" % n, "panel_%02d.pending.png" % n):
+            if os.path.lexists(os.path.join(files["work"], name)):
+                os.remove(os.path.join(files["work"], name))
+        entries.pop(n, None)
+    _write_shots_seed_record(files["record"], entries, total, CAST_REFS_SCHEMA)
+    fit = _image_fit()
+    (width, height), (still_w, still_h) = plan["size"], plan["still"]
+    print("cast refs: %s; %dx%d, fitted into %dx%d stills; seed %d; panels %s, each with its two characters' "
+          "reference stills as Picture 1 and Picture 2" % (qe.generator_text(model_id, loras), width, height,
+                                                           still_w, still_h, args.image_seed, _panel_list(todo)))
+    for n in todo:
+        print("cast refs: panel %d: Picture 1 %s (%s), Picture 2 %s (%s)"
+              % (n, plan["pairs"][n][0].name, stills[plan["pairs"][n][0].name], plan["pairs"][n][1].name,
+                 stills[plan["pairs"][n][1].name]))
+
+    def record_entry(n, status, seconds, error_text):
+        key = plan["keys"][n]
+        ok = status == "ok"
+        return {"n": n, "status": status, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "label": label, "sources": key["sources"],
+                "source_paths": [os.path.abspath(stills[m.name]) for m in plan["pairs"][n]],
+                "prompt": key["prompt"], "seed": key["seed"], "width": key["width"], "height": key["height"],
+                "still_width": key["still_width"], "still_height": key["still_height"],
+                "qwen_model": key["qwen_model"], "loras": key["loras"], "steps": key["steps"],
+                "scheduler": key["scheduler"],
+                "output": "cast_ref_edits/panel_%02d.png" % n if ok else None,
+                "still": "images/panel_%02d.png" % n if ok else None,
+                "still_sha256": (_sha256_file(os.path.join(paths["images_dir"], "panel_%02d.png" % n))
+                                 if ok else None),
+                "seconds": seconds, "error": error_text}
+
+    def on_result(result):
+        n = result["n"]
+        if result["status"] == "ok":
+            still = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
+            fit.fit_letterbox(fit.load_oriented_rgb(result["output_path"]), still_w, still_h).save(
+                still + ".tmp", format="PNG")
+            os.replace(still + ".tmp", still)
+            print("panel %d -> %s (cast-reference Qwen edit, %.1fs)" % (n, still, result["seconds"]))
+        else:
+            print("panel %d BLOCKED: the content screen blocked the cast-reference Qwen edit" % n)
+        entries[n] = record_entry(n, result["status"], result["seconds"], None)
+        _write_shots_seed_record(files["record"], entries, total, CAST_REFS_SCHEMA)
+
+    jobs = []
+    for n in todo:
+        sources = [stills[m.name] for m in plan["pairs"][n]]
+        jobs.append({"n": n, "seed": args.image_seed, "prompt": plan["prompts"][n], "source": sources[0],
+                     "sources": sources, "stage_path": os.path.join(files["work"], "panel_%02d.pending.png" % n),
+                     "output_path": os.path.join(files["work"], "panel_%02d.png" % n)})
+    try:
+        qe.wait_for_memory(qe.memory_floor(model_id), label, tag="ltx-movie")
+        results, failure = qe.run_jobs(model_id, loras, jobs, width, height, CAST_REFS_SKILL, files["work"],
+                                       log_path=os.path.join(files["work"], "child.log"), on_result=on_result,
+                                       noun="panel")
+    except qe.Unavailable as e:
+        results, failure = None, str(e)
+    status = dict((r["n"], r["status"]) for r in results or [])
+    ok = [n for n in todo if status.get(n) == "ok"]
+    blocked = [n for n in todo if status.get(n) == "blocked"]
+    failed = [n for n in todo if n not in ok and n not in blocked]
+    if failed and failure is None:
+        failure = "%s reported no result for panels %s" % (label, _panel_list(failed))
+    if failed:
+        for n in failed:
+            entries[n] = record_entry(n, "failed", None, failure)
+        _write_shots_seed_record(files["record"], entries, total, CAST_REFS_SCHEMA)
+    if failure is not None:
+        print("Error: the cast-reference edits failed: %s (kept: %s; edited on the next run: %s)"
+              % (failure, _panel_list(sorted(plan["reuse"] + ok)) or "none", _panel_list(sorted(failed + blocked))),
+              file=sys.stderr)
+    if blocked:
+        print("Error: the content screen blocked the cast-reference Qwen edit (%s) of panels %s of story %s; the "
+              "movie stops here rather than use an unscreened or Z-Image still. Change those panels' Image: lines in "
+              "%s, then rerun: every other panel's still is reused"
+              % (label, _panel_list(blocked), args.story_id, paths["story_md"]), file=sys.stderr)
+    if failure is not None or blocked:
+        return 1
+    print("cast refs: %d panel stills written" % len(ok))
+    return 0
+
+
+def _phase2_shots_cast_refs(args, cmd):
+    """Phase 2 in shots mode with --cast-refs-model (cast refs spec CR10): the cast-reference panels are Qwen edits
+    of their two characters' reference stills (_phase2_cast_refs_batch); every other panel runs the unchanged
+    Z-Image stills groups (_phase2_shots without those panels). Both run, the Z-Image groups first; returns 1 when
+    either failed. With no cast-reference panel, Phase 2 is exactly _phase2_shots after one note."""
+    qe = _qwen_edit()
+    error, plan = _cast_refs_plan(args, qe)
+    if error is not None:
+        print("Error: %s" % error, file=sys.stderr)
+        return 1
+    if not plan["pairs"]:
+        print(CAST_REFS_NONE_NOTE)
+        return _phase2_shots(args, cmd)
+    multi = sorted(plan["pairs"])
+    if (_shots_seed_lora_note(args) or getattr(args, "global_stills_loras", None)
+            or getattr(args, "stills_lora_path", None)):
+        print(CAST_REFS_LORA_NOTE % _panel_list(multi))
+    rc = _phase2_shots(args, cmd, exclude=multi)
+    if _phase2_cast_refs_batch(args, qe, plan) != 0 or rc != 0:
+        return 1
     return 0
 
 
@@ -2871,8 +3242,9 @@ def _print_robust_phase1(args, paths):
     print()
 
 
-def _print_shots_stills_plan(args, cmd):
-    """Phase 2's dry-run lines in shots mode (shots spec 5.8). Touches nothing."""
+def _print_shots_stills_plan(args, cmd, exclude=()):
+    """Phase 2's dry-run lines in shots mode (shots spec 5.8). Touches nothing. The panels in exclude (the
+    cast-reference panels, cast refs spec CR12) are left out of every group."""
     story_md = _story_paths(args.story_id)["story_md"]
     if args.force_story or not os.path.exists(story_md):
         group_cmd = list(cmd)
@@ -2882,8 +3254,8 @@ def _print_shots_stills_plan(args, cmd):
               "cast stills LoRAs, each with --only <PANELS> (that group's panels):")
         print("Command: %s" % shlex.join(group_cmd))
         return
-    groups = _shots_stills_groups(story_md, getattr(args, "cast_members", None) or [],
-                                  getattr(args, "location_pins", None) or [])
+    groups = _exclude_groups(_shots_stills_groups(story_md, getattr(args, "cast_members", None) or [],
+                                                  getattr(args, "location_pins", None) or []), exclude)
     for k, (names, panels) in enumerate(groups, start=1):
         group_cmd = list(cmd)
         group_cmd[group_cmd.index("--only") + 1] = _panel_list(panels)
@@ -2919,6 +3291,37 @@ def _print_shots_seed_plan(args):
         return
     print("Panels to edit: %s; reused: %s"
           % (_panel_list(plan["todo"]) or "none", _panel_list(plan["reuse"]) or "none"))
+
+
+def _print_cast_refs_plan(args, cmd):
+    """Phase 2's dry-run lines in shots mode with --cast-refs-model (cast refs spec CR12). Reads; never writes."""
+    qe = _qwen_edit()
+    paths = _story_paths(args.story_id)
+    model_id, loras = args.cast_refs["qwen_model"], args.cast_refs["loras"]
+    still = _still_size(args)
+    multiple = qe.multiple(model_id)
+    print("Would edit every panel whose Image: names two cast characters with %s at %dx%d, seed %d, in one Qwen "
+          "child: Picture 1 and Picture 2 are the two characters' reference stills in cast order (%s); each panel is "
+          "prompted by the cast-reference instruction and its own Image: text (and the Style: text), screened with "
+          "content safety (skill %s) and recorded in %s. No Z-Image stills LoRA applies to those panels; a blocked "
+          "or failed one stops the run after the batch. Every other panel is a Z-Image still:"
+          % (qe.generator_text(model_id, loras), still[0] // multiple * multiple, still[1] // multiple * multiple,
+             args.image_seed, "; ".join("%s %s" % (m.name, args.cast_refs["stills"][m.name])
+                                        for m in args.cast_members),
+             CAST_REFS_SKILL, _cast_refs_paths(paths["story_dir"])["record"]))
+    if args.force_story or not os.path.exists(paths["story_md"]):
+        print("Cast-reference panels: decided at Phase 2, from story.md after Phase 1")
+        _print_shots_stills_plan(args, cmd)
+        return
+    error, plan = _cast_refs_plan(args, qe)
+    if error is not None:
+        print("Cast-reference panels: Phase 2 would stop: %s" % error)
+        return
+    multi = sorted(plan["pairs"])
+    print("Cast-reference panels: %s; to edit: %s; reused: %s"
+          % ("; ".join("%d (%s)" % (n, ", ".join(m.name for m in plan["pairs"][n])) for n in multi) or "none",
+             _panel_list(plan["todo"]) or "none", _panel_list(plan["reuse"]) or "none"))
+    _print_shots_stills_plan(args, cmd, exclude=multi)
 
 
 def _print_dry_run_plan(args):
@@ -3048,7 +3451,9 @@ def _print_dry_run_plan(args):
         phase2_cmd += catalog_flags
         phase2_cmd += _cast_flags(args)
         phase2_cmd += _location_flags(args)
-        if getattr(args, "shots", False):
+        if getattr(args, "shots", False) and getattr(args, "cast_refs", None):
+            _print_cast_refs_plan(args, phase2_cmd)
+        elif getattr(args, "shots", False):
             _print_shots_stills_plan(args, phase2_cmd)
         else:
             print("Command: %s" % shlex.join(phase2_cmd))
@@ -3199,6 +3604,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_seed_edit(args)
+    if rc:
+        return rc
+    rc = _resolve_cast_refs(args)
     if rc:
         return rc
 

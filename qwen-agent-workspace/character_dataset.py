@@ -1909,8 +1909,7 @@ def child_qwenedit(spec_path):
     """The child side of run_edit_child: load the editor and its Lightning LoRA from the local
     cache, edit each job's images (job["images"], the cast refs spec's reference list, else
     job["image"], else spec["image"]; location library spec L1.8) into every job, screen each
-    result with spec["skill"] (default "character_edit"), write the
-    report."""
+    result with spec["skill"] (default "character_edit"), write the report."""
     exit_with_parent()
     import torch
     from diffusers import QwenImageEditPlusPipeline
