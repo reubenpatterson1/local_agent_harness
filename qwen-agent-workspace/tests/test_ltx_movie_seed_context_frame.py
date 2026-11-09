@@ -138,12 +138,11 @@ def test_cxt12_the_flag_the_phases_and_the_helpers(ctx_env, monkeypatch, capsys)
     assert names(story_only=True) == ["phase0_seed", "phase1_story"]
     assert "phase2_stills" in names(seed_context={"mode": "still", "order": "seed-first"})
     fargs = _frame_args(tmp)
-    flags = movie._seed_context_frame_flags(fargs)
-    phase4 = movie._phase4_flags(fargs)
-    assert phase4[phase4.index("--on-panel-failure") + 1] == "skip"
-    assert flags == phase4[:phase4.index("--on-panel-failure") + 1] + ["stop"] + phase4[
-        phase4.index("--on-panel-failure") + 2:]
-    assert "--resume" in flags and movie._phase4_flags(fargs) == phase4
+    flags = movie._phase4_flags(fargs)
+    assert flags == movie._phase4_flags(fargs)
+    assert flags[flags.index("--on-panel-failure") + 1] == "skip"
+    assert flags[flags.index("--retry-failed") + 1] == "1"
+    assert "--resume" in flags
     assert movie._render_tool() == os.path.join(WS, "bin", "ltx-mlx-render")
     _story(tmp)
     rc, cmd = movie._phase3_manifest_cmd(fargs)
@@ -159,7 +158,7 @@ def test_cxt12_the_flag_the_phases_and_the_helpers(ctx_env, monkeypatch, capsys)
     assert movie.phase4_render(fargs) == 0
     story_dir = os.path.join(tmp, "stories", "s1")
     assert seen == [([sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
-                      os.path.join(story_dir, "manifest.json"), os.path.join(story_dir, "movie.mp4")] + phase4,
+                      os.path.join(story_dir, "manifest.json"), os.path.join(story_dir, "movie.mp4")] + movie._phase4_flags(fargs),
                      os.path.join(story_dir, "movie.log"))]
 
 
@@ -189,7 +188,7 @@ def test_cxt13_the_interleaved_order(frame_env, capsys):
     upto_json, upto_mp4 = _work(tmp, "manifest_upto.json"), _work(tmp, "upto.mp4")
     assert [(c, log) for c, log in renders] == [
         ([sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"), upto_json, upto_mp4]
-         + movie._seed_context_frame_flags(args), _work(tmp, "render-%02d.log" % k)) for k in (1, 2, 3, 4)]
+         + movie._phase4_flags(args), _work(tmp, "render-%02d.log" % k)) for k in (1, 2, 3, 4)]
     with open(os.path.join(story_dir, "manifest.json"), encoding="utf-8") as f:
         built = json.load(f)["panels"]
     for k, upto in enumerate(frame_env["uptos"], start=1):
@@ -407,8 +406,8 @@ def test_cxt17_the_real_render_tool(ctx_env, monkeypatch, capsys):
             summaries.append(json.load(f))
     assert [(s["requested_units"], s["completed_units"], s["intended_total_frames"], s["actual_total_frames"],
              [u["resumed"] for u in s["units"]], s["on_panel_failure"], s["stopped_reason"]) for s in summaries] == [
-        (1, 1, 145, 145, [False], "stop", None), (2, 2, 290, 290, [True, False], "stop", None),
-        (3, 3, 435, 435, [True, True, False], "stop", None)]
+        (1, 1, 145, 145, [False], "skip", None), (2, 2, 290, 290, [True, False], "skip", None),
+        (3, 3, 435, 435, [True, True, False], "skip", None)]
     assert [e["context"]["kind"] for e in _record(story_dir)["panels"]] == ["none", "frame", "frame"]
     final = _work(tmp, "manifest_upto.json")
     assert render.main([final, os.path.join(story_dir, "movie.mp4")] + movie._phase4_flags(args)) == 0
@@ -420,6 +419,72 @@ def test_cxt17_the_real_render_tool(ctx_env, monkeypatch, capsys):
     assert generated == [] and _edited(fake)[3:] == []
     with open(os.path.join(story_dir, "clips", "panel_02.mp4.provenance.json"), encoding="utf-8") as f:
         assert json.load(f)["image_sha256"] == _sha(os.path.join(story_dir, "images", "panel_02.png"))
+
+
+# --- CXT20 (CX17): a transient clip failure is retried once by the real bin/ltx-mlx-render --------------------------
+
+def test_cxt20_a_failed_clip_is_retried_once(ctx_env, monkeypatch, capsys):
+    tmp = ctx_env["tmp"]
+    render = _load_render()
+    model = os.path.join(tmp, "model-fixture")
+    os.makedirs(model)
+    with open(os.path.join(model, "split_model.json"), "w") as f:
+        json.dump({"recipe": "ltx-2.5"}, f)
+    fake_bin = os.path.join(tmp, "fake-ltx")
+    with open(fake_bin, "w") as f:
+        f.write("#!/bin/sh\nexit 0\n")
+    os.chmod(fake_bin, 0o755)
+    calls = []
+
+    def generate_video(prompt, output_path, image_path=None, **kw):
+        calls.append(output_path)
+        if len(calls) == 1:
+            raise render.SKILL.Ltx2MlxError("transient failure", returncode=1)
+        with open(output_path, "wb") as f:
+            f.write(b"clip " + prompt.encode())
+        return os.path.abspath(output_path)
+
+    monkeypatch.setattr(render.SKILL, "generate_video", generate_video)
+    monkeypatch.setattr(render.SKILL, "LTX2_MLX_BIN", fake_bin)
+    monkeypatch.setattr(render, "shutil", types.SimpleNamespace(which=lambda tool: "/usr/bin/" + tool))
+    monkeypatch.setattr(render, "probe_streams", lambda p: {"streams": []})
+    monkeypatch.setattr(render, "assert_clips_uniform", lambda pairs, w, h, fr: None)
+    monkeypatch.setattr(render, "build_concat_command", lambda lp, out: [
+        sys.executable, "-c", "import sys; open(sys.argv[1], 'wb').write(b'MOVIE')", out])
+    monkeypatch.setattr(render, "clip_frame_count", lambda p: 145)
+    monkeypatch.setattr(render, "ffprobe_image_size", lambda p: ((1408, 896), None))
+    monkeypatch.setattr(render, "run_input_content_screen", lambda paths: 0)
+    monkeypatch.setattr(render, "story_dir_for", lambda story_id: os.path.join(tmp, "stories", story_id))
+    monkeypatch.setattr(render, "extract_last_frame", lambda clip, out_png, n: [])
+    monkeypatch.setattr(render, "check_chain_seed", lambda png, w, h, source: [])
+    story_dir = os.path.join(tmp, "stories", "s1")
+
+    def stream(cmd, log_path):
+        if os.path.basename(cmd[1]) == "ltx-story-manifest":
+            images = [cmd[i + 1] for i, word in enumerate(cmd) if word == "--image"]
+            panels = [{"index": i, "image_path": image, "conditioning": "still", "panel_text": "panel %d" % i,
+                       "motion_prompt": "motion %d" % i, "num_frames": 145} for i, image in enumerate(images, 1)]
+            with open(os.path.join(story_dir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump({"schema_version": 3, "story_id": "s1", "fps": 24, "panels": panels}, f)
+            return 0
+        argv = list(cmd[2:])
+        argv[argv.index("--retry-idle") + 1] = "0"
+        return render.main(argv)
+
+    monkeypatch.setattr(movie, "_stream_and_tee", stream)
+    monkeypatch.setattr(movie, "_ltx_render", lambda: render)
+    monkeypatch.setattr(movie, "_wait_for_avail", lambda gib, timeout: True)
+    _story(tmp, IMAGES[:1])
+    args = _frame_args(tmp, panels=1, model=model)
+    assert movie.phase_seed_context_frames(args) == 0
+    assert len(calls) == 2
+    paths = glob.glob(os.path.join(story_dir, "runs", "*", "story_summary.json"))
+    assert len(paths) == 1
+    with open(paths[0], encoding="utf-8") as f:
+        summary = json.load(f)
+    assert (summary["completed_units"], summary["on_panel_failure"], summary["stopped_reason"]) == (1, "skip", None)
+    unit = summary["units"][0]
+    assert (unit["status"], unit["attempts"], unit["first_failure"]) == ("ok", 2, "error")
 
 
 # --- CXT18 (CX20): the frame mode's dry run ----------------------------------------------------------------------
@@ -443,8 +508,8 @@ def test_cxt18_the_dry_run(frame_env, capsys):
                                                                           "panel's clip")
     assert frame[i + 2] == (
         "Frame mode: Phase 2 also renders each panel's clip right after its still, with bin/ltx-mlx-render --resume "
-        "on a manifest of the panels so far (%s; --on-panel-failure stop; logs %s), and the exact last frame of clip "
-        "k is panel k+1's context picture. A failed clip stops the run. Phases 3 and 4 then build the final manifest "
+        "on a manifest of the panels so far (%s; Phase 4's flags: skip plus one retry; logs %s), and the exact last frame "
+        "of clip k is panel k+1's context picture. A clip still failing after the retry stops the run. Phases 3 and 4 then build the final manifest "
         "and reuse every clip." % (os.path.join(work, "manifest_upto.json"), os.path.join(work, "render-NN.log")))
     assert frame[i + 3] == "Panels: decided at Phase 2, from story.md after Phase 1"
     assert frame[i + 4:] == still[i + 3:]

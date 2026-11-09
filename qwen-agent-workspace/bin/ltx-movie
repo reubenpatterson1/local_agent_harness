@@ -3080,14 +3080,6 @@ def _ltx_render():
     return importlib.machinery.SourceFileLoader("ltx_mlx_render_for_movie", _render_tool()).load_module()
 
 
-def _seed_context_frame_flags(args):
-    """Phase 4's bin/ltx-mlx-render flags with --on-panel-failure stop (seed context spec CX17): in frame mode a clip
-    is the next panel's context, so a failed clip stops the run."""
-    flags = _phase4_flags(args)
-    flags[flags.index("--on-panel-failure") + 1] = "stop"
-    return flags
-
-
 def phase_seed_context_frames(args):
     """Phase 2 in seeded shots mode with --seed-context frame (seed context spec CX15-CX19), in place of
     phase2_stills: the manifest is built once with a placeholder still for every panel; then, for each panel k in
@@ -3095,7 +3087,9 @@ def phase_seed_context_frames(args):
     k-1), a manifest of panels 1..k with their real stills is written to seed_context_edits/manifest_upto.json and
     bin/ltx-movie runs bin/ltx-mlx-render --resume on it (clips 1..k-1 are reused, clip k renders), and clip k's last
     frame is extracted and checked when panel k+1 needs it. Phase 3 and Phase 4 then rebuild the manifest and reuse
-    every clip. The first blocked or failed still, failed clip or bad frame stops the run, with no fallback."""
+    every clip. Each partial render uses Phase 4's flags (skip plus one retry); a clip still failing after the retry
+    makes bin/ltx-mlx-render exit non-zero, which stops the run. The first blocked or failed still, failed clip or
+    bad frame stops the run, with no fallback."""
     print("=== Phase 2: stills and clips, panel by panel (seed context frame) ===")
     qe = _qwen_edit()
     paths = _story_paths(args.story_id)
@@ -3178,7 +3172,7 @@ def phase_seed_context_frames(args):
             os.remove(upto_mp4)
         if not _wait_for_avail(args.min_avail_gib, args.avail_timeout):
             return 1
-        cmd = [sys.executable, _render_tool(), upto_json, upto_mp4] + _seed_context_frame_flags(args)
+        cmd = [sys.executable, _render_tool(), upto_json, upto_mp4] + _phase4_flags(args)
         log = os.path.join(files["work"], "render-%02d.log" % k)
         print("seed context: panel %d: its clip (bin/ltx-mlx-render --resume on panels 1-%d); log: %s" % (k, k, log))
         print("Running: %s" % shlex.join(cmd))
@@ -3808,8 +3802,8 @@ def _print_seed_context_plan(args):
     if args.seed_context["mode"] == "frame":
         work = _seed_context_paths(paths["story_dir"])["work"]
         print("Frame mode: Phase 2 also renders each panel's clip right after its still, with bin/ltx-mlx-render "
-              "--resume on a manifest of the panels so far (%s; --on-panel-failure stop; logs %s), and the exact last "
-              "frame of clip k is panel k+1's context picture. A failed clip stops the run. Phases 3 and 4 then build "
+              "--resume on a manifest of the panels so far (%s; Phase 4's flags: skip plus one retry; logs %s), and the exact last "
+              "frame of clip k is panel k+1's context picture. A clip still failing after the retry stops the run. Phases 3 and 4 then build "
               "the final manifest and reuse every clip."
               % (os.path.join(work, "manifest_upto.json"), os.path.join(work, "render-NN.log")))
     if args.force_story or not known or not os.path.exists(paths["story_md"]):
