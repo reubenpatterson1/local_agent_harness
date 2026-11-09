@@ -8,11 +8,11 @@ Repository `/Users/reubenpatterson/local_agent_harness` (never touched by this p
 
 Builds on **[SE]** `docs/superpowers/specs/2026-11-05-compose-shots-seed-edit-design.md`, **[CR]** `2026-11-09-shots-multi-reference-stills-design.md`, **[QE]** `2026-11-03-qwen-edit-models-design.md`, **[SI]** `2026-11-07-seeded-no-identity-sentence-design.md`, **[SHOTS]** `2026-10-06-shots-mode-design.md` and **[CE]** `2026-10-30-chained-end-frames-design.md`. Every requirement of those specs stays in force except where Section 10 names it as amended.
 
-Requirement IDs are **CX1-CX21**, tests **CXT1-CXT19**, KPIs **CXK1-CXK12**, live checks **L1-L6**. At `29e3a89`, `git grep -nE "\bCX[0-9]+\b|\bCXT[0-9]+\b|\bCXK[0-9]+\b"` finds nothing.
+Requirement IDs are **CX1-CX21**, tests **CXT1-CXT20**, KPIs **CXK1-CXK12**, live checks **L1-L6**. At `29e3a89`, `git grep -nE "\bCX[0-9]+\b|\bCXT[0-9]+\b|\bCXK[0-9]+\b"` finds nothing.
 
 Terms: a **context picture** is the second reference image of a panel's edit: the previous panel's fitted still (`still` mode) or the exact last frame of the previous panel's clip (`frame` mode). A panel's **kind** is `none` (a single-image edit of the seed, exactly as seeded shots prompts it today) or the mode (`still` or `frame`, a two-image edit). A **location change** is a panel after panel 1 whose setting sentence differs from the previous panel's (CX4). A panel's **cascade** is the run of later panels whose context picture comes, directly or through each other, from its still (CX7).
 
-The plan is split so that the controller can ship still mode alone: **Task 1** (still mode, one commit) is complete and gated by itself; **Task 2** (frame mode, one commit) builds on it; **Task 3** is the `test_mut26` re-baseline (a test-only commit after the last code commit). Shipping still mode only = Task 1, then Task 3.
+The plan is split so that the controller can ship still mode alone: **Task 1** (still mode, one commit) is complete and gated by itself; **Task 2** (frame mode, one commit) builds on it; the whole-branch review's fix is one more code commit after Task 2 (Amendment A1, Section 13); **Task 3** is the `test_mut26` re-baseline (a test-only commit after the last code commit). Shipping still mode only = Task 1, then Task 3.
 
 ---
 
@@ -75,8 +75,8 @@ The plan is split so that the controller can ship still mode alone: **Task 1** (
 |---|---|---|---|---|
 | D1 | `bin/ltx-movie` | **yes** | 1 | flags, resolver, constants, plan, reuse, per-panel edit, still-mode Phase 2, dry run, docstring (CX1-CX13; edits M1-M9) |
 | D2 | `tests/test_ltx_movie_seed_context.py` | — | 1 (2 edits it) | new, CXT1-CXT11 |
-| D3 | `bin/ltx-movie` | **yes** | 2 | frame mode, `_render_tool`, `_phase3_manifest_cmd`, the phase tuple, dry-run lines (CX14-CX20; edits F1-F10) |
-| D4 | `tests/test_ltx_movie_seed_context_frame.py` | — | 2 | new, CXT12-CXT19 |
+| D3 | `bin/ltx-movie` | **yes** | 2 | frame mode, `_render_tool`, `_phase3_manifest_cmd`, the phase tuple, dry-run lines (CX14-CX20; edits F1-F10); the A1 fix commit then deletes `_seed_context_frame_flags` (Section 13) |
+| D4 | `tests/test_ltx_movie_seed_context_frame.py` | — | 2 | new, CXT12-CXT19; the A1 fix commit edits CXT12, CXT13, CXT17 and CXT18 and adds CXT20 (Section 13) |
 | D5 | `tests/test_movie_ui_builder.py` | — | 3 | only `test_mut26`'s BASELINE and comment chain (CX21) |
 
 Untouched: `qwen_edit.py`, `seed_edit_mflux_child.py`, `character_dataset.py`, `character_lib.py`, `story_engine.py`, `bin/ltx-story-images`, `bin/ltx-story-manifest`, `bin/ltx-mlx-render`, `content_safety.py`, `movie_ui_*.py`, `static/movie-ui/*`, every other test. **PR #15's code is not changed:** no PR #15 line is edited; M1, M2, M3, M6, M7 and M9 only anchor on PR #15 text (the Cast references docstring word, `CAST_REFS_LORA_NOTE`, the `--cast-refs-lora` help, `def _cast_refs_paths`, `def _print_cast_refs_plan`, the `_resolve_cast_refs` call) and insert next to it. Existing non-PR #15 code that changes: `phase2_stills` (2 lines added), `_print_dry_run_plan` (the seeded-shots Phase 2 call becomes an if/else), `main` (one resolver call), and in Task 2 `phase3_manifest` (its command building moves into `_phase3_manifest_cmd`, unchanged behaviour), `phase4_render` (its render path comes from `_render_tool()`, same argv) and `_phase_sequence` (3 lines).
@@ -95,20 +95,20 @@ Untouched: `qwen_edit.py`, `seed_edit_mflux_child.py`, `character_dataset.py`, `
 
 | ID | Criterion | Verified by |
 |---|---|---|
-| CXK1 | The full suite has no failure beyond the baseline recorded at `29e3a89`. Final run (Tasks 1-3) `2 failed, P0+19 passed, 2 skipped` (P0 = the baseline PASSED count, expected 2698); still mode only (Tasks 1 and 3) `2 failed, P0+11 passed, 2 skipped` | gate, V1 |
-| CXK2 | Between `29e3a89` and the final commit the only pinned file changed is `bin/ltx-movie`: numstat `381 1` after Task 1, `200 30` for Task 2 alone, `575 25` overall; the only other non-docs files are the two new test files and `test_mut26`'s two lines | V1 |
+| CXK1 | The full suite has no failure beyond the baseline recorded at `29e3a89`. Final run (Tasks 1, 2, the A1 fix commit and Task 3) `2 failed, P0+20 passed, 2 skipped` (P0 = the baseline PASSED count, expected 2698); still mode only (Tasks 1 and 3) `2 failed, P0+11 passed, 2 skipped` | gate, V1 |
+| CXK2 | Between `29e3a89` and the final commit the only pinned file changed is `bin/ltx-movie`: numstat `381 1` after Task 1, `200 30` for Task 2 alone, `6 12` for the A1 fix commit alone, `569 25` overall; the only other non-docs files are the two new test files and `test_mut26`'s two lines | V1 |
 | CXK3 | Without `--seed-context` nothing changes: `phase2_stills` calls `_phase2_shots_seed(args)`, no `seed_context_edits*` file appears, the phase tuples are unchanged, Phase 3's and Phase 4's commands are unchanged, and no existing test is edited except `test_mut26`'s BASELINE | CXT7, CXT12, the unchanged suites |
 | CXK4 | Still mode: one `run_jobs` call (one child) per edited panel, in panel order; each context panel's job has `sources` [seed, previous panel's still] (swapped with `context-first`), and that still is the one written in this run | CXT3, CXT4, CXT10, CXT11 |
 | CXK5 | Frame mode: for every panel k the order is edit k (child exited), memory gate, render on panels 1..k, last frame of clip k (when panel k+1 needs it), then edit k+1 with that frame as its context | CXT13 |
-| CXK6 | Every blocked or failed still, failed clip, bad frame, unloadable tool or failed manifest stops the run with one `Error:` line and exit 1 (2 for an existing `movie.mp4`); no exception other than KeyboardInterrupt/SystemExit escapes as a traceback | CXT6, CXT14, CXT15 |
+| CXK6 | Every blocked or failed still, failed clip (after its one retry, A1), bad frame, unloadable tool or failed manifest stops the run with one `Error:` line and exit 1 (2 for an existing `movie.mp4`); no exception other than KeyboardInterrupt/SystemExit escapes as a traceback | CXT6, CXT14, CXT15 |
 | CXK7 | L2 (B1, `qwen21-q4`): judge-stills `visual_continuity` at least A0's + 2 | L2, report |
 | CXK8 | L2: the manual "same person as the seed" mean at least A0's - 0.5, and its per-panel slope at least -0.1 | L2, report |
 | CXK9 | L2: judge-stills `rendering_quality` at least A0's - 1 | L2, report |
 | CXK10 | Wall clock: B1's Phase 2 at most 2.5 x A0's Phase 2; F1's total at most 1.5 x A0's total | L2, L4, report |
 | CXK11 | Frame mode counts as worth it only if F1's judge-clips `seam_continuity` is at least B1's + 1.5 | L4, report |
-| CXK12 | No child timed out in any arm (the entries' `error` fields); seconds per edit and mlx peak GiB recorded for every arm; the `qwen2511-bf16` rows recorded or "not run: <reason>" | L1-L6, report |
+| CXK12 | No child timed out in any arm (the entries' `error` fields and `arm.log`'s `child timed out after` lines); seconds per edit and mlx peak GiB recorded for every arm; the `qwen2511-bf16` rows recorded or "not run: <reason>" | L1-L6, report |
 
-Every CX requirement and CXT test is a must-have. CXK7-CXK11 are the user's decision inputs for B1, B2 and F1 on `qwen21-q4` and for the `-bf16` arms; there are no nice-to-haves.
+Every CX requirement and CXT test is a must-have. CXK7-CXK12 are read only from complete arms (Section 7's completion gate, A2): a KPI reading an incomplete arm prints `n/a (incomplete)`, never PASS. CXK7-CXK11 are the user's decision inputs for B1, B2 and F1 on `qwen21-q4` and for the `-bf16` arms; there are no nice-to-haves.
 
 ---
 
@@ -122,8 +122,8 @@ Every CX requirement and CXT test is a must-have. CXK7-CXK11 are the user's deci
 6. **Serial children (CX10).** One `qwen_edit.run_jobs([job])` call per edited panel: a running child cannot be handed an output produced after it started, and the parent screens and renames each output only after the child's done line. Each child's log is its own `seed_context_edits/child-NN.log`, removed before the call (the runner appends), so its "mlx peak memory" line is that panel's peak (PR #15 review lesson). Cost: one model load per edited panel (Risk R1).
 7. **Errors, not fallbacks (CX8, CX19).** The first blocked or failed panel stops Phase 2: a later panel would otherwise see a missing or stale context. Every `Exception` from the memory wait or the batch (including `on_result`'s fit) becomes a `failed` entry and one `Error:` line (PR #15 review lesson); `KeyboardInterrupt` and `SystemExit` propagate as today.
 8. **Frame mode as Phase 2 (CX15)** **[spec choice]**. The interleaved loop runs where Phase 2 runs; Phase 3 then rebuilds `manifest.json` with every real still and shows its unchanged dry-run gate, and Phase 4 renders with `--resume` (every clip reused) and concatenates: that is the controller's "final full render". So the manifest builder, the render tool and the summary report are reused, not duplicated.
-9. **Frame mode details (CX16-CX19)** **[spec choice]**. The manifest is built once, before any edit, with `seed_context_edits/placeholder.png` (the seed fitted into 2W x 2H) as every panel's still, so a broken story fails before GPU time. For each k, `seed_context_edits/manifest_upto.json` is that manifest's panels 1..k with their real stills; the partial render writes `seed_context_edits/upto.mp4` (deleted before and after) and logs to `seed_context_edits/render-KK.log`; its flags are Phase 4's with `--on-panel-failure stop` (`_seed_context_frame_flags`), so `--resume` and the retry settings match Phase 4. `_wait_for_avail` runs before every partial render (the Qwen child has exited). The last frame of clip k is extracted to `seed_context_edits/frame_KK.png` and checked only when panel k+1 is a frame panel. An existing `movie.mp4` without `--force` is refused up front (Phase 4 would refuse it after hours of work). Unless `--no-review`, one gate prompt precedes the first edit, because the frame loop spends GPU time before Phase 3's gate.
-10. **No failure-policy refusal** (controller decision 9's last item). `bin/ltx-movie` has no failure-policy option: `_phase4_flags` hard-codes `skip` for `--shots`. Frame mode passes `--on-panel-failure stop` itself, so there is nothing to refuse; CXT12 pins the flag.
+9. **Frame mode details (CX16-CX19)** **[spec choice]**. The manifest is built once, before any edit, with `seed_context_edits/placeholder.png` (the seed fitted into 2W x 2H) as every panel's still, so a broken story fails before GPU time. For each k, `seed_context_edits/manifest_upto.json` is that manifest's panels 1..k with their real stills; the partial render writes `seed_context_edits/upto.mp4` (deleted before and after) and logs to `seed_context_edits/render-KK.log`; its flags are Phase 4's, unchanged (`_phase4_flags(args)`: `--on-panel-failure skip` for `--shots`, `--retry-failed 1`, `--retry-idle 120`; Amendment A1), so `--resume` and the retry settings match Phase 4. With skip only clip k renders in the partial render (clips 1..k-1 are reused), `bin/ltx-mlx-render`'s end-of-run retry pass retries it once, and a clip still failing makes the render exit non-zero, which stops the run. (A `stop` policy would set `stopped_reason`, and the retry pass runs only when `stopped_reason` is `None`, so it would silently disable the retry.) `_wait_for_avail` runs before every partial render (the Qwen child has exited). The last frame of clip k is extracted to `seed_context_edits/frame_KK.png` and checked only when panel k+1 is a frame panel. An existing `movie.mp4` without `--force` is refused up front (Phase 4 would refuse it after hours of work). Unless `--no-review`, one gate prompt precedes the first edit, because the frame loop spends GPU time before Phase 3's gate.
+10. **No failure-policy refusal** (controller decision 9's last item). `bin/ltx-movie` has no failure-policy option: `_phase4_flags` hard-codes `skip` for `--shots`. Frame mode passes Phase 4's flags unchanged (skip plus one retry, Amendment A1); a clip that still fails after the retry makes the partial render exit non-zero, which stops the run, so there is nothing to refuse; CXT12 pins the flags and CXT20 the retry.
 11. **Size (CX5).** The edit size is `_seed_edit_size` (the video size floored to the model's multiple) and every output is fitted into the 2W x 2H still, exactly as A0. Picture 1 is the oriented original seed (`seed-original.png`, its own aspect); the still-mode context is a 2W x 2H still and the frame-mode context a W x H frame. Phase 0 derives W x H from the seed's aspect (snapped to multiples of 64), so the three aspects differ only by that snap (Risk R4).
 12. **Timeout.** `jobs_timeout([job])`: a two-image job counts 6, so its child gets max(3600, 600 x 6) = 3600 s, the same as a one-image job's floor. No change to `qwen_edit.py`.
 13. **CLI only for v1** **[spec choice]**, as [CR] decision 9 (a Compose control touches at least six files and several pins).
@@ -148,7 +148,7 @@ bin/ltx-movie --shots --seed-image SEED --seed-edit-model ID --seed-context stil
            -> load bin/ltx-mlx-render -> [gate]
            for k = 1..N: still k (context = seed_context_edits/frame_{k-1}.png) as above
                          -> manifest_upto.json (panels 1..k, real stills) -> _wait_for_avail
-                         -> bin/ltx-mlx-render manifest_upto.json upto.mp4 <Phase 4 flags, stop> (clips 1..k-1 reused)
+                         -> bin/ltx-mlx-render manifest_upto.json upto.mp4 <Phase 4's flags> (clips 1..k-1 reused)
                          -> if panel k+1 is a frame panel: extract_last_frame(clip k) + check_chain_seed
          Phase 3 (rebuilds manifest.json with the real stills; its gate) -> Phase 4 (reuses every clip, concatenates)
 ```
@@ -185,7 +185,7 @@ bin/ltx-movie --shots --seed-image SEED --seed-edit-model ID --seed-context stil
 - **CX14. Flag and texts** (F1-F3): `--seed-context frame` accepted; help and docstring extended (pinned by CXT19 and the edited CXT9); `SEED_CONTEXT_KINDS["frame"]`, `SEED_CONTEXT_PICTURES["frame"]`, `SEED_CONTEXT_FRAME_GATE`.
 - **CX15. Phase tuple and the render tool** (F4, F7, F10): `_phase_sequence` replaces `phase2_stills` with `phase_seed_context_frames` when `args.seed_context["mode"] == "frame"` (after every other insertion, so `[Redo]` stays before it); `_render_tool()` returns `os.path.join(WS, "bin", "ltx-mlx-render")` and is used by `phase4_render` (same argv), the partial renders and `_ltx_render()` (the module, loaded by path with `SourceFileLoader(...).load_module()` like every other loader in `bin/ltx-movie`).
 - **CX16. The manifest** (F5, F6, F4): `_phase3_manifest_cmd(args, image_flags=None)` holds Phase 3's command building verbatim (returns `(0, cmd)` or `(2, None)` after the catalog error) and is defined after `phase3_manifest`; frame mode calls it with `["--image", placeholder] * N`, runs it through `_stream_and_tee` (log `seed_context_edits/manifest.log`), reads `manifest.json` and refuses one whose panel count differs from story.md's. `manifest_upto.json` is written with `_write_seed_edit_record`.
-- **CX17. The partial render** (F4): `[sys.executable, _render_tool(), manifest_upto.json, upto.mp4] + _seed_context_frame_flags(args)` through `_stream_and_tee` (log `render-KK.log`), after `_wait_for_avail(args.min_avail_gib, args.avail_timeout)`. A nonzero exit stops the run (exit 1).
+- **CX17. The partial render** (F4; Amendment A1): `[sys.executable, _render_tool(), manifest_upto.json, upto.mp4] + _phase4_flags(args)` through `_stream_and_tee` (log `render-KK.log`), after `_wait_for_avail(args.min_avail_gib, args.avail_timeout)`: Phase 4's flags unchanged (`--on-panel-failure skip`, `--retry-failed 1`, `--retry-idle 120`), so a failed clip k is retried once by the render tool's retry pass. A nonzero exit (clip k still failing after the retry) stops the run (exit 1). There is no `_seed_context_frame_flags`.
 - **CX18. The context frame** (F4): when panel k+1 is a frame panel, `render.extract_last_frame(clips/panel_KK.mp4, seed_context_edits/frame_KK.png, args.frames)` then `render.check_chain_seed(frame, args.video_width, args.video_height, k)`; any violation stops the run.
 - **CX19. Guards and failures** (F4): the `movie.mp4` guard (exit 2), a failed manifest build, an unreadable manifest, an unloadable render tool, a blocked or failed still, a failed render, a bad frame and a failed memory gate each stop with one `Error:` line and exit 1; exceptions from the tool load and the frame extraction become `"<Type>: <message>"`. The review gate (`SEED_CONTEXT_FRAME_GATE`) precedes the first edit unless `--no-review`.
 - **CX20. Frame dry run** (F8, F9): the CX11 sentence (with the frame kind), the `Frame mode: ...` line, and after the location-change line `Panels to edit: decided panel by panel during the run: ...` (a context picture depends on clips this run renders).
@@ -262,20 +262,21 @@ Two new files; their full text is in the Plan (Task 1 Step 1, Task 2 Step 1). Th
 
 | ID | Covers | Asserts |
 |---|---|---|
-| CXT12 | CX14, CX15, CX17 | `--seed-context frame` resolves; the frame phase tuples (with release, with `--redo`, `--story-only`) and still mode's unchanged tuple; `_seed_context_frame_flags` = Phase 4's flags with `stop` (Phase 4 keeps `skip`); `_render_tool`; `_phase3_manifest_cmd` with and without placeholders; `phase4_render`'s argv unchanged |
+| CXT12 | CX14, CX15, CX17 | `--seed-context frame` resolves; the frame phase tuples (with release, with `--redo`, `--story-only`) and still mode's unchanged tuple; the partial-render flags are Phase 4's (`_phase4_flags`: `--on-panel-failure skip`, `--retry-failed 1`, `--resume`; A1); `_render_tool`; `_phase3_manifest_cmd` with and without placeholders; `phase4_render`'s argv unchanged |
 | CXT13 | CX15-CX18 | the exact event list of a four-panel run (manifest build; edit 1; memory gate; render 1; frame 1 and its check; edit 2 with frame 1's pixel; ...; no frame for the location change or the last panel); the placeholder; the build command and log; every partial render command and log; each `manifest_upto.json`'s panels; the record's frame context items; the stdout lines |
 | CXT14 | CX19 | an existing `movie.mp4` (exit 2, nothing run), a failed manifest build and an unloadable render tool (exit 1, no edit) |
 | CXT15 | CX18, CX19 | a blocked still stops before its clip; a failed render, a bad frame and an extraction exception give the exact `Error:` lines; a failed memory gate renders nothing; the review gate's exact prompt |
 | CXT16 | CX16, CX18 | reruns: everything reused (renders and frames still run, no edit); a changed clip 1 re-renders it and re-edits panel 2 only; a changed panel 1 re-edits 1 and 2; `--redo 3` re-edits 3 and 4 with the frame note |
-| CXT17 | CX16, CX17 | the real `bin/ltx-mlx-render` `main()` in-process: partial run k renders only clip k (seeds 1, 2, 3); the summaries' `requested_units`, `completed_units`, `intended_total_frames` and `actual_total_frames` are 1/2/3, 145/290/435, `on_panel_failure` `stop`; a full render of all panels and a frame-mode rerun with `--force` generate nothing; the clip provenance's `image_sha256` is the real still's |
+| CXT17 | CX16, CX17 | the real `bin/ltx-mlx-render` `main()` in-process: partial run k renders only clip k (seeds 1, 2, 3); the summaries' `requested_units`, `completed_units`, `intended_total_frames` and `actual_total_frames` are 1/2/3, 145/290/435, `on_panel_failure` `skip` and `stopped_reason` `None` (A1); a full render of all panels and a frame-mode rerun with `--force` generate nothing; the clip provenance's `image_sha256` is the real still's |
 | CXT18 | CX20 | the frame dry run: the sentence, the `Frame mode:` line, the later lines equal still mode's; with a story, the location-change line and the "decided panel by panel" line; nothing written or run |
 | CXT19 | CX14 | the frame help text, the choices and the docstring sentence |
+| CXT20 | CX17 | (A1) the real `bin/ltx-mlx-render` `main()` in a one-panel frame run: the generator fails once, then succeeds on the retry pass (`--retry-idle` 0 in the test); `phase_seed_context_frames` returns 0, the generator ran twice, the one summary has `completed_units` 1, `on_panel_failure` `skip`, `stopped_reason` `None`, and its unit is `ok` with `attempts` 2 and `first_failure` set (`error`) |
 
-Before any code change: Task 1's file gives `10 failed, 1 passed` (CXT7 pins today's behaviour and passes before and after). With Task 1 in place, Task 2's file gives `3 failed, 5 errors` (the five tests using the `frame_env` fixture error at setup because `_ltx_render` does not exist yet). After both: 19 passed.
+Before any code change: Task 1's file gives `10 failed, 1 passed` (CXT7 pins today's behaviour and passes before and after). With Task 1 in place, Task 2's file gives `3 failed, 5 errors` (the five tests using the `frame_env` fixture error at setup because `_ltx_render` does not exist yet). After both: 19 passed; after the A1 fix commit: 20 passed.
 
-**Mutation check** (scratch replay, `$S/sc-tools/mutate.py`): each mutation of the final `bin/ltx-movie` made at least one new test fail: dropping the forced cascade 1, the `except Exception` of the edit 1, the child-log removal 1, the location-change rule 8, the cascade entry clearing 1, the picture order 1, the `context` key item 1, the still-mode dispatch 1, the frame `stop` policy 2, the frame memory gate 2, the frame extraction's `except Exception` 1, the real stills in `manifest_upto.json` 2, the `movie.mp4` guard 2, the frame phase tuple 1.
+**Mutation check** (scratch replay, `$S/sc-tools/mutate.py`): each mutation of the final `bin/ltx-movie` made at least one new test fail: dropping the forced cascade 1, the `except Exception` of the edit 1, the child-log removal 1, the location-change rule 8, the cascade entry clearing 1, the picture order 1, the `context` key item 1, the still-mode dispatch 1, the frame `stop` policy 2 (void since A1 removed that policy; not re-run), the frame memory gate 2, the frame extraction's `except Exception` 1, the real stills in `manifest_upto.json` 2, the `movie.mp4` guard 2, the frame phase tuple 1.
 
-No existing test is edited except `test_mut26`'s BASELINE (Task 3). No fixture is regenerated.
+No existing test is edited except `test_mut26`'s BASELINE (Task 3); the A1 fix commit edits only this spec's own new file `tests/test_ltx_movie_seed_context_frame.py`. No fixture is regenerated.
 
 ---
 
@@ -294,18 +295,22 @@ EXTRA=(<the source run's other flags: --model, --gemma, --story-model, --fps, --
 Q4=(--seed-edit-model qwen21-q4 --seed-edit-lora uncensored=1.0); BF=(--seed-edit-model qwen2511-bf16)
 copy() { mkdir -p generated/stories/$2 && cp generated/stories/$1/story.md generated/stories/$1/plan.json generated/stories/$2/; }
 narr() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["narrative"])' generated/stories/$1/plan.json; }
-stamp() { python3 -u -c 'import sys, time
-for line in sys.stdin:
+stamp() { python3 -u -c 'import io, sys, time
+for line in io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace"):
     sys.stdout.write("%.1f %s" % (time.time(), line))
     sys.stdout.flush()'; }
 arm() { local id=$1; shift; copy $SRC $id
   PYTHONUNBUFFERED=1 bin/ltx-movie "$(narr $SRC)" --story-id $id --shots --seed-image $SEED --panels $N --no-review \
     "${EXTRA[@]}" "$@" < /dev/null 2>&1 | stamp > generated/stories/$id/arm.log; }
 copy $SRC sc_dry; bin/ltx-movie "$(narr $SRC)" --story-id sc_dry --shots --seed-image $SEED --panels $N "${EXTRA[@]}" \
-  "${Q4[@]}" --seed-context still --dry-run | grep -E '^(Location changes|Panels to edit)'
+  "${Q4[@]}" --seed-context still --dry-run > generated/stories/sc_dry/dry-run.txt
+grep -E '^(Location changes|Panels to edit)' generated/stories/sc_dry/dry-run.txt
+awk -v n=$N -F': ' '/^Location changes \(single-image edits\): /{k=($2=="none")?0:split($2,c,","); r=0; p=1
+  for(i=1;i<=k;i++){if(c[i]-p>r)r=c[i]-p; p=c[i]}; if(n+1-p>r)r=n+1-p
+  printf "context panels: %d of %d; longest same-place run: %d panels\n", n-1-k, n, r}' generated/stories/sc_dry/dry-run.txt
 ```
 
-The last command must show at least one location change; otherwise pick another SRC. Every arm writes `generated/stories/<id>/arm.log`, each line prefixed with its epoch time; `PYTHONUNBUFFERED=1` keeps the times exact. `--no-review` with `< /dev/null` runs unattended.
+**Precondition (A3).** The dry run prints no per-panel kinds; its `Location changes (single-image edits): <list or none>` line is the source. The `awk` line derives `context panels: <K> of <N>; longest same-place run: <R> panels`, where K = N - 1 - (the number of location changes) is the number of panels 2..N whose kind is `still` (or `frame`), and R is the longest run of consecutive panels between location changes (panel 1 and each change start a run). The live checks need at least one location change, K >= 3, and ideally R >= 3 (two context panels in a row, so the chain is exercised); otherwise pick another SRC. With K < 3, B1 and B2 edit nearly every panel with A0's prompt (a kind `none` prompt is A0's byte for byte), so CXK7 and the other B1/B2 comparisons would differ from A0 for a non-model reason. If the `awk` line prints nothing, the dry run printed `Panels: decided at Phase 2 ...` or `Panels: Phase 2 would stop: ...` instead; fix that first. Every arm writes `generated/stories/<id>/arm.log`, each line prefixed with its epoch time; `PYTHONUNBUFFERED=1` keeps the times exact. `--no-review` with `< /dev/null` runs unattended.
 
 The arms (run them in this order; each is a full run through Phase 4):
 
@@ -339,17 +344,20 @@ for id in sc_a0_q4 sc_b1_q4 sc_b2_q4 sc_f1_q4 sc_a0_bf16 sc_b1_bf16 sc_ch_q4; do
 
 Then, per arm, score every panel 1-10 for "the same person as the seed" (open `$SEED` beside `images/panel_NN.png`; for Ch, beside `images/panel_01.png` and `clips/panel_02.chainseed.png` .. `clips/panel_NN.chainseed.png`) and write the scores, one per line in panel order, to `generated/stories/<id>/identity.txt`. `bin/judge-clips` has no identity score; its per-clip `temporal_stability` (identity drift inside a clip) is reported as a secondary number.
 
-**Report script.** Run it in `qwen-agent-workspace` with the arms as `NAME=story-id` (`A0`, `B1`, `B2`, `F1`, `Ch`, and the `-bf16` names; an arm named `X-bf16` is compared with `A0-bf16`):
+**Report script.** Run it in `qwen-agent-workspace` with `$N` (the panel count every arm ran with) first, then the arms as `NAME=story-id` (`A0`, `B1`, `B2`, `F1`, `Ch`, and the `-bf16` names; an arm named `X-bf16` is compared with `A0-bf16`):
 
 ```bash
-python3 - A0=sc_a0_q4 B1=sc_b1_q4 B2=sc_b2_q4 F1=sc_f1_q4 Ch=sc_ch_q4 A0-bf16=sc_a0_bf16 B1-bf16=sc_b1_bf16 <<'EOF'
+python3 - $N A0=sc_a0_q4 B1=sc_b1_q4 B2=sc_b2_q4 F1=sc_f1_q4 Ch=sc_ch_q4 A0-bf16=sc_a0_bf16 B1-bf16=sc_b1_bf16 <<'EOF'
 import json
 import os
 import re
 import sys
 
 ROOT = os.path.join("generated", "stories")
-ARMS = dict(a.split("=", 1) for a in sys.argv[1:])     # e.g. A0=sc_a0_q4 B1=sc_b1_q4 ... A0-bf16=sc_a0_bf16
+N = int(sys.argv[1])                                    # the panel count every arm ran with (--panels $N)
+ARMS = dict(a.split("=", 1) for a in sys.argv[2:])     # e.g. A0=sc_a0_q4 B1=sc_b1_q4 ... A0-bf16=sc_a0_bf16
+DONE_RE = re.compile(r"^DONE: all (\d+) panels completed -> (.*)$")     # bin/ltx-mlx-render, echoed by Phase 4
+TIMEOUT_TEXT = "child timed out after"                                    # qwen_edit.run_jobs's failure text
 
 
 def load(story, name):
@@ -385,6 +393,29 @@ def edits(story):
     return ("seed_edit.json", [record]) if isinstance(record, dict) else (None, [])
 
 
+def incomplete(story, name, entries, lines):
+    """Why the arm did not finish ([] when it did): movie.mp4 must exist, arm.log must hold Phase 4's
+    "DONE: all <N> panels completed -> <story>/movie.mp4" (a frame-mode partial render's DONE line names upto.mp4 and
+    does not count), and the record must hold one ok entry per panel 1..N (Ch: its one Phase 1c entry)."""
+    reasons = []
+    if not os.path.isfile(os.path.join(ROOT, story, "movie.mp4")):
+        reasons.append("no movie.mp4")
+    movie = os.sep + os.path.join(ROOT, story, "movie.mp4")
+    if not any(m and int(m.group(1)) == N and m.group(2).endswith(movie)
+               for m in (DONE_RE.match(text) for _t, text in lines)):
+        reasons.append("no 'DONE: all %d panels completed -> ...%s' line in arm.log" % (N, movie))
+    if name is None:
+        reasons.append("no record")
+    else:
+        want = 1 if name == "seed_edit.json" else N
+        numbers = sorted(e.get("n") or 0 for e in entries) if name != "seed_edit.json" else None
+        if (len(entries) != want or any(e.get("status") != "ok" for e in entries)
+                or numbers not in (None, list(range(1, N + 1)))):
+            reasons.append("%s: %d entries, statuses %s (want %d, all ok)"
+                           % (name, len(entries), ",".join(str(e.get("status")) for e in entries), want))
+    return reasons
+
+
 def identity(story):
     """(mean, least-squares slope per panel) of identity.txt: the user's 1-10 'same person as the seed' score of
     every panel, one number per line in panel order."""
@@ -412,6 +443,7 @@ def row(arm, story):
             if key not in stamps and text.startswith(head):
                 stamps[key] = t
     name, entries = edits(story)
+    reasons = incomplete(story, name, entries, lines)
     seconds = [e["seconds"] for e in entries if isinstance(e.get("seconds"), (int, float))]
     peaks = [float(x) for _t, text in lines for x in re.findall(r"seed-edit-child: mlx peak memory ([0-9.]+) GiB", text)]
     stills = (load(story, "stills_judgment.json") or {}).get("scores") or {}
@@ -419,12 +451,13 @@ def row(arm, story):
     stability = [c["temporal_stability"] for c in clips.get("clips") or [] if "temporal_stability" in c]
     mean, slope = identity(story)
     return {
-        "arm": arm, "story": story, "record": name,
+        "arm": arm, "story": story, "record": name, "complete": not reasons, "incomplete": reasons,
         "status": [e.get("status") for e in entries],
         "context": [((e.get("context") or {}).get("kind") or "-") for e in entries],
         "edit_s_total": round(sum(seconds), 1) if seconds else None,
         "edit_s_mean": round(sum(seconds) / len(seconds), 1) if seconds else None,
-        "timed_out": [e.get("n") for e in entries if "timed out" in str(e.get("error") or "")],
+        "timed_out": [e.get("n") for e in entries if TIMEOUT_TEXT in str(e.get("error") or "")],
+        "timed_out_log_lines": sum(1 for _t, text in lines if TIMEOUT_TEXT in text),
         "peak_gib_max": max(peaks) if peaks else None,
         "peak_kind": (None if not peaks else "per-panel child" if name == "seed_context_edits.json"
                       else "cumulative peak of one child"),
@@ -443,8 +476,14 @@ for r in rows.values():
     print(json.dumps(r))
 
 
-def check(label, ok, *values):
-    if any(v is None for v in values):
+def check(label, arms, ok, *values):
+    """One KPI line. n/a (incomplete) when any arm it reads did not finish, n/a (missing) when a value is absent;
+    only then PASS or FAIL."""
+    unfinished = [a for a in arms if not rows[a]["complete"]]
+    if unfinished:
+        print("%-48s n/a (incomplete) %s" % (label, "; ".join("%s: %s" % (a, ", ".join(rows[a]["incomplete"]))
+                                                               for a in unfinished)))
+    elif any(v is None for v in values):
         print("%-48s n/a (missing: %s)" % (label, ", ".join(str(v) for v in values)))
     else:
         print("%-48s %s %s" % (label, "PASS" if ok() else "FAIL", values))
@@ -452,38 +491,50 @@ def check(label, ok, *values):
 
 for arm, r in rows.items():
     base_arm = "A0" + arm[2:] if arm[:2] in ("B1", "B2", "F1") else None
-    if base_arm is None or base_arm not in rows:
+    if base_arm is None:
+        continue
+    if base_arm not in rows:
+        print("%-48s n/a (missing arm %s)" % ("%s against %s" % (arm, base_arm), base_arm))
         continue
     a = rows[base_arm]
-    check("%s visual_continuity >= %s + 2" % (arm, base_arm),
+    check("%s visual_continuity >= %s + 2" % (arm, base_arm), [arm, base_arm],
           lambda: r["visual_continuity"] >= a["visual_continuity"] + 2, r["visual_continuity"],
           a["visual_continuity"])
-    check("%s identity mean >= %s - 0.5" % (arm, base_arm),
+    check("%s identity mean >= %s - 0.5" % (arm, base_arm), [arm, base_arm],
           lambda: r["identity_mean"] >= a["identity_mean"] - 0.5, r["identity_mean"], a["identity_mean"])
-    check("%s identity slope >= -0.1 per panel" % arm, lambda: r["identity_slope"] >= -0.1, r["identity_slope"])
-    check("%s rendering_quality >= %s - 1" % (arm, base_arm),
+    check("%s identity slope >= -0.1 per panel" % arm, [arm], lambda: r["identity_slope"] >= -0.1,
+          r["identity_slope"])
+    check("%s rendering_quality >= %s - 1" % (arm, base_arm), [arm, base_arm],
           lambda: r["rendering_quality"] >= a["rendering_quality"] - 1, r["rendering_quality"],
           a["rendering_quality"])
     if arm.startswith("F1"):
-        check("%s total wall clock <= 1.5 x %s" % (arm, base_arm), lambda: r["total_s"] <= 1.5 * a["total_s"],
-              r["total_s"], a["total_s"])
+        check("%s total wall clock <= 1.5 x %s" % (arm, base_arm), [arm, base_arm],
+              lambda: r["total_s"] <= 1.5 * a["total_s"], r["total_s"], a["total_s"])
         still_arm = "B1" + arm[2:]
         if still_arm in rows:
             b = rows[still_arm]
-            check("%s seam_continuity >= %s + 1.5 (frame worth it)" % (arm, still_arm),
+            check("%s seam_continuity >= %s + 1.5 (frame worth it)" % (arm, still_arm), [arm, still_arm],
                   lambda: r["seam_continuity"] >= b["seam_continuity"] + 1.5, r["seam_continuity"],
                   b["seam_continuity"])
     else:
-        check("%s Phase 2 wall clock <= 2.5 x %s" % (arm, base_arm), lambda: r["phase2_s"] <= 2.5 * a["phase2_s"],
-              r["phase2_s"], a["phase2_s"])
+        check("%s Phase 2 wall clock <= 2.5 x %s" % (arm, base_arm), [arm, base_arm],
+              lambda: r["phase2_s"] <= 2.5 * a["phase2_s"], r["phase2_s"], a["phase2_s"])
 
 
 for arm, r in rows.items():
-    check("%s no child timed out" % arm, lambda: not r["timed_out"], r["record"], r["timed_out"])
+    if r["timed_out"] or r["timed_out_log_lines"]:      # a recorded timeout fails CXK12 whether or not the arm finished
+        print("%-48s FAIL %s" % ("%s no child timed out" % arm,
+                                 (r["record"], r["timed_out"], r["timed_out_log_lines"])))
+    else:
+        check("%s no child timed out" % arm, [arm], lambda: True, r["record"])
 EOF
 ```
 
-It prints one JSON row per arm, then one PASS/FAIL/n-a line per KPI. Fixes of the PR #15 L4 script's faults, each tested on synthetic arms during the replay: the timeout check reads the record entries' `error` fields (`"timed out"`), never a log grep; peak memory comes from `arm.log`'s `seed-edit-child: mlx peak memory` lines and is labelled `per-panel child` for B and F arms (one child per panel, each log removed before its child) and `cumulative peak of one child` for A0 (one child for all panels, so each line is a running maximum); only the mflux children print that line, so the `-bf16` rows show `null` peaks; the wall clock comes from the timestamps (`=== Phase 2` to `=== Phase 3`, and first to last line), never from the edit seconds alone; a missing arm or file prints `n/a`, never PASS.
+It prints one JSON row per arm, then one PASS/FAIL/n-a line per KPI.
+
+**Completion gate (A2).** An arm's row has `complete` true only when all three hold, and `incomplete` lists the ones that fail: (1) `generated/stories/<id>/movie.mp4` exists; (2) `arm.log` holds Phase 4's completion line `DONE: all <N> panels completed -> <...>/generated/stories/<id>/movie.mp4`, which `bin/ltx-mlx-render` prints (`:1184`) only when every panel completed and the movie was written, and which `phase4_render`'s `_stream_and_tee` echoes into `bin/ltx-movie`'s stdout (`bin/ltx-movie` prints no completion line of its own; with skip, a run that lost a panel prints `STOPPED EARLY: <c>/<N> panels completed` and may still write a shorter `movie.mp4`, and a frame-mode partial render prints the same `DONE:` words for `seed_context_edits/upto.mp4`, which does not count); (3) the record holds exactly one `ok` entry for each panel 1..N (`seed_context_edits.json`, `seed_edits.json`; Ch's `seed_edit.json` is one Phase 1c entry, which must be `ok`). Every KPI line that reads an incomplete arm, whether the arm itself, its base arm (`A0` or `A0-bf16`) or, for CXK11, `B1`, prints `n/a (incomplete) <arm>: <reasons>`, never PASS or FAIL: an arm that stopped early has a short wall clock and was judged on a partial movie, which would PASS CXK10 and CXK11 falsely. The one exception is CXK12: `timed_out` (the record entries whose `error` holds `child timed out after`, from `qwen_edit.run_jobs`'s failure text `<label> child timed out after <s> s`, `qwen_edit.py:579`) and `timed_out_log_lines` (the `arm.log` lines holding it: the parent prints that failure in its `Error:` line, so a timeout whose entry a later step cleared or overwrote still counts) make CXK12 FAIL whether or not the arm finished, because a child timeout always stops the run and would otherwise never show; an arm with neither prints PASS when complete and `n/a (incomplete)` otherwise. A missing base arm prints `n/a (missing arm A0)`.
+
+Fixes of the PR #15 L4 script's faults, each tested on synthetic arms during the replay (and the completion gate on synthetic arms by Amendment A2, Section 13): the timeout check matches the exact text `child timed out after` in the record entries' `error` fields and in `arm.log`, never a looser `timed out` (`bin/ltx-movie`'s Phase 1 `Error: qwen-agent timed out after <s>s writing story.md` is not a Qwen edit child); peak memory comes from `arm.log`'s `seed-edit-child: mlx peak memory` lines and is labelled `per-panel child` for B and F arms (one child per panel, each log removed before its child) and `cumulative peak of one child` for A0 (one child for all panels, so each line is a running maximum); only the mflux children print that line, so the `-bf16` rows show `null` peaks; the wall clock comes from the timestamps (`=== Phase 2` to `=== Phase 3`, and first to last line), never from the edit seconds alone; a missing arm or file prints `n/a`, never PASS.
 
 **Last, L6** (after the report: the redo changes B1's stills and record):
 
@@ -508,7 +559,7 @@ rerun sc_f1_q4 rerun.log "${Q4[@]}" --seed-context frame --force
 4. **Exceptions (CX8, CX19).** `on_result` runs inside `run_jobs`, so a fit error is caught as a failed panel; the move into `redo/` and the record writes happen outside the `try`, as in SE15 (an `OSError` there is a traceback, as today).
 5. **`--redo` messages.** `phase_redo_shots` still prints "every other panel's still and clip is reused"; Phase 2's note then lists the cascade. In frame mode the cascade's clips re-render (their stills change) and `bin/ltx-mlx-render` overwrites them without archiving, as it does for any changed still today.
 6. **Frame mode's manifest and render path (CX15-CX17).** One manifest build with placeholders (a broken story fails before any GPU time); partial manifests verified against the real tool (CXT17); `upto.mp4` deleted around each render; the `movie.mp4` guard up front; two review gates (the frame gate, then Phase 3's unchanged gate, where every clip is reused).
-7. **The literal-count pins (Section 0.4).** `_render_tool()` takes `phase4_render`'s render-path literal so that L17f, L46f and RST50 keep counting 4, although frame mode adds a render invocation; `_seed_context_frame_flags` builds on `_phase4_flags` so `_render_flags(args)` stays at 4; `_phase3_manifest_cmd` sits after `phase3_manifest` for L17b. The pins are kept, not edited; judge whether that honours their intent (every render goes to `bin/ltx-mlx-render`; Phase 3 and 4 flags come from one helper).
+7. **The literal-count pins (Section 0.4).** `_render_tool()` takes `phase4_render`'s render-path literal so that L17f, L46f and RST50 keep counting 4, although frame mode adds a render invocation; the partial render calls `_phase4_flags(args)` (A1; `_seed_context_frame_flags` is gone) so `_render_flags(args)` stays at 4; `_phase3_manifest_cmd` sits after `phase3_manifest` for L17b. The pins are kept, not edited; judge whether that honours their intent (every render goes to `bin/ltx-mlx-render`; Phase 3 and 4 flags come from one helper).
 8. **Memory and ordering (CXK5).** The Qwen child has exited before each render (`run_child` waits); `qe.wait_for_memory` before each edit; `_wait_for_avail` before each partial render.
 9. **Overhead of the partial renders.** Every partial render starts a Python process, re-screens its k input stills in one content-screen subprocess and re-verifies clips 1..k-1 (ffprobe, sha256): N(N+1)/2 still screens per run. Its render progress lines (`panel <n>: reusing ...`) appear during Phase 2; movie-ui never runs this mode.
 10. **Child logs and peak memory (CX8).** One log per panel child, removed before the child; the mflux child prints one peak line per job.
@@ -521,7 +572,7 @@ rerun sc_f1_q4 rerun.log "${Q4[@]}" --seed-context frame --force
 - **R2 Drift along the chain.** Each still is conditioned on the previous one, so blur, grain, colour shift or identity drift can accumulate panel by panel within a scene. The prompt asks for the people from the seed only and nothing but the scene from Picture 2; the identity slope (CXK8) measures it. A location change resets the chain to the seed.
 - **R3 Picture binding.** The model may take faces or clothing from the context picture (which shows the same people, edited earlier) or ignore it. B2 measures the order.
 - **R4 Aspect.** Picture 1 is the original seed at its own aspect; the still-mode context is 2W x 2H and the frame-mode context W x H, both from Phase 0's seed-derived geometry (snapped to multiples of 64), so the aspects differ by that snap only; each pipeline resizes references by area (inferred, [CR] Section 0.3). The edit canvas is the video size floored to the model's multiple, as A0.
-- **R5 The frame is a video frame.** W x H only (e.g. 576 x 320 for a 16:9 seed), possibly motion-blurred and mid-action; the prompt says not to take blur or grain. Frame mode also needs every clip before the next still, so a single slow or failed clip blocks the rest of the run.
+- **R5 The frame is a video frame.** W x H only (e.g. 576 x 320 for a 16:9 seed), possibly motion-blurred and mid-action; the prompt says not to take blur or grain. Frame mode also needs every clip before the next still, so a single slow clip, or a clip that still fails after its one retry (A1), blocks the rest of the run.
 - **R6 Location detection.** Only the setting sentence decides; a story whose writer varied the sentence for the same place reads as a change (single-image edit, safe), and one place written with another place's sentence reads as no change (a context picture from the wrong place).
 - **R7 Content screen.** A blocked panel stops the run (by design); with the pinned `--image-seed` an unchanged rerun reproduces the block.
 - **R8 Memory.** Qwen and LTX alternate per panel in frame mode; `_wait_for_avail` gates each render at `--min-avail-gib` (default 25 GiB) and waits up to `--avail-timeout`.
@@ -544,12 +595,44 @@ rerun sc_f1_q4 rerun.log "${Q4[@]}" --seed-context frame --force
 - F4 An anchor context (the scene's first still instead of panel N-1) if R2 shows drift.
 - F5 Seed plus cast references in one edit ([CR] F2).
 - F6 Make the better picture order, and still mode itself, the default after the live checks.
+- F7 (review) Task 1's ok-result-plus-failure case: when `run_jobs` returns an `ok` result for the panel and a failure string (the child finished the panel, then exited non-zero or timed out), `_seed_context_edit` records the entry `ok` but the phase reports the panel failed and stops; a rerun reuses that entry. Decide whether such an entry is `failed` or the phase continues.
+- F8 (review) Frame-panel reuse is keyed on the extracted `frame_KK.png`'s sha256; key it on the clip's bytes plus the frame index instead, as `build_clip_provenance` keys a clip, so a re-extraction cannot change the key by itself.
+- F9 (review) An interrupted frame run leaves `manifest.json` built with `placeholder.png` stills; anything reading it before Phase 3 rebuilds it sees placeholders. Remove or mark it on interruption.
+- F10 (review) The extracted frame enters Qwen as Picture 2 without its own content screen (its clip's input still was screened, the frame itself is not): a consistency gap with every other picture this mode feeds a model.
+- F11 (review) Test gaps: CXT17 fakes `ltx-story-manifest` rather than running it; CXT15's memory-gate failure is silent (no `Error:` line asserted); CXT16 has no case where clip 2 re-renders.
+- F12 (review) A partial render that exits 0 without making clip k goes unnoticed when panel k+1 is a location change (no frame is extracted, so nothing reads clip k until Phase 4): check that `clips/panel_KK.mp4` exists after every partial render.
 
 ## 12. Open questions (for after the live checks; none blocks implementation)
 
 1. Confirm Review Focus 1: the cascade stops at the next location change (this spec) rather than running to the last panel.
 2. If B1 passes CXK7-CXK10, should `--seed-context still` become the default for seeded shots?
 3. If F1 is not worth it (CXK11), keep frame mode as an option or remove it?
+
+---
+
+## 13. Amendments (after the whole-branch review)
+
+The Plan's Old/New blocks and test text below stay as the historical Task 1 and Task 2 commits (`114f801`, `96b51e9`); these amendments override them where they differ, and Sections 0-12 already state the amended behaviour.
+
+### Amendment A1 (post-review fix commit)
+
+- **Finding (must-fix).** Task 2's partial render passed `--on-panel-failure stop` (`_seed_context_frame_flags`). With `stop`, `bin/ltx-mlx-render` sets `stopped_reason = "panel_failure"` on the first failed panel (`:1473-1475`), and `finish_run`'s retry pass runs only when `stopped_reason is None` (`:1098`), so `--retry-failed 1` was silently off in every partial render: one transient failure stopped hours of work without the retry Phase 4 gives every other shots clip.
+- **Code.** One code commit after Task 2 (`755d4c4`, "ltx-movie: --seed-context frame renders each clip with Phase 4's flags (skip plus one retry), a failed clip still stops the run (seed context review fix)"), touching only `bin/ltx-movie` and `tests/test_ltx_movie_seed_context_frame.py`. In `bin/ltx-movie`: `_seed_context_frame_flags` is deleted; the partial render's command is `[sys.executable, _render_tool(), upto_json, upto_mp4] + _phase4_flags(args)` (CX17); `phase_seed_context_frames`'s docstring says each partial render uses Phase 4's flags (skip plus one retry) and a clip still failing after the retry makes `bin/ltx-mlx-render` exit non-zero, which stops the run; the dry-run `Frame mode:` line (CX20) reads `... (<manifest_upto.json>; Phase 4's flags: skip plus one retry; logs <render-NN.log>) ... A clip still failing after the retry stops the run. ...` in place of `--on-panel-failure stop` and `A failed clip stops the run.` With skip, only clip k renders per partial render (clips 1..k-1 are reused), the retry pass retries it once, and a clip still failing leaves `completed < len(units)`, so the tool prints `STOPPED EARLY` and exits 1 and frame mode stops with the CX19 render error, exactly as before.
+- **Tests.** CXT12 pins `_phase4_flags(fargs)` (`skip`, `--retry-failed 1`, `--resume`) and Phase 4's unchanged argv; CXT13 expects `_phase4_flags(args)` in every partial render command; CXT17 expects `on_panel_failure` `skip` with `stopped_reason` `None` in the three partial summaries; CXT18 pins the new `Frame mode:` line; new CXT20 (Section 6). The new-test count is 20 (CXT1-CXT20: 11 in `tests/test_ltx_movie_seed_context.py`, 9 in `tests/test_ltx_movie_seed_context_frame.py`).
+- **Numstat.** The fix commit alone: `bin/ltx-movie` `6 12`, `tests/test_ltx_movie_seed_context_frame.py` `77 12`. `bin/ltx-movie` from `29e3a89`: `569 25` (was `575 25`); from Task 1's commit: `194 30` (Task 2 alone stays `200 30`).
+- **Task 3 and the gate.** Task 3 runs after the fix commit and re-baselines `test_mut26` to THAT commit (the last commit touching `bin/ltx-movie`), not to Task 2's. Its gate expects `2 failed, P0+20 passed, 2 skipped` with P0 = 2698 (both test files included) and `new tests 20, not passing 0`. The mutation "frame `stop` policy" (Section 6) no longer applies; this amendment did not re-run `$S/sc-tools/mutate.py`.
+
+### Amendment A2 (the report script's completion gate)
+
+Section 7's report script takes `$N` first and gates every arm on completion (Section 7, "Completion gate"): `movie.mp4` exists, `arm.log` holds Phase 4's `DONE: all <N> panels completed -> .../<id>/movie.mp4` line, and the record holds N `ok` entries (Ch: its one `ok` Phase 1c entry). A KPI reading an incomplete arm prints `n/a (incomplete)`; CXK12 also counts `arm.log` lines holding `child timed out after` and FAILs on any timeout. Proved on synthetic arms (N = 4) in `$S/sc-report` (`make_arms.py` writes them, `report_from_spec.py` is the script extracted from this spec): a complete A0 and B1 give PASS lines; F1 stopped at panel 3's clip with a short total, two partial `DONE: all 1/2 panels completed -> .../upto.mp4` lines and no `movie.mp4` (the old script printed PASS for its wall clock and seam KPIs) prints `n/a (incomplete)` on every KPI; B2 with a timed-out panel-2 child prints `n/a (incomplete)` on its comparisons and FAIL on CXK12; B1-bf16 with every entry `ok` but an `Error: ... failed` line and no `DONE` line (the old script printed PASS on four KPIs) prints `n/a (incomplete)`; with an A0 that printed `STOPPED EARLY: 3/4` and wrote a short `movie.mp4`, every KPI of the complete B1 prints `n/a (incomplete) A0: ...`.
+
+### Amendment A3 (the live-check precondition)
+
+Section 7's dry run is saved to `generated/stories/sc_dry/dry-run.txt`, and an `awk` line derives the number of context panels and the longest same-place run from its `Location changes (single-image edits):` line (no code change: the dry run prints no per-panel kinds). The live checks need at least one location change, at least 3 context panels and ideally a same-place run of at least 3 panels.
+
+### Amendment A9 (`stamp()`)
+
+`stamp()` reads stdin through `io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")`, so one non-UTF-8 byte from a child becomes U+FFFD instead of a `UnicodeDecodeError` that kills the pipe (and with it `bin/ltx-movie`, on its next write, by `SIGPIPE`).
 
 ---
 
@@ -570,6 +653,7 @@ rerun sc_f1_q4 rerun.log "${Q4[@]}" --seed-context frame --force
 - Every Old/New block below was applied by script, in order, to a fresh copy (`$S/sc-check2`) with each Old occurring exactly once (also with its trailing newline removed), and the result was byte-identical to the replayed files.
 - `git diff --no-index --numstat` gave `bin/ltx-movie` `381 1` (Task 1), `200 30` (Task 2 alone), `575 25` (both), and `8 4` for Task 2's edits to `tests/test_ltx_movie_seed_context.py`.
 - Both Pythons compiled `bin/ltx-movie`, both test files and the report script. The full-suite replay is in "Replay result" at the end.
+- These replay results are Tasks 1 and 2 as written; Section 13 records the post-review fix commit (A1), its counts and the re-proved report script (A2).
 
 ### Before Task 1: the snapshot, the baseline and the gate files (controller)
 
@@ -2375,7 +2459,7 @@ New:
                               "docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md.")
 ```
 
-**F4** (`bin/ltx-movie`, the render tool, the frame flags and the frame-mode Phase 2, CX15-CX19). Old:
+**F4** (`bin/ltx-movie`, the render tool, the frame flags and the frame-mode Phase 2, CX15-CX19; the frame flags are deleted again by Amendment A1). Old:
 ```python
 def _cast_refs_paths(story_dir):
 ```
@@ -2681,6 +2765,8 @@ New:
 
 No other line of `bin/ltx-movie` changes.
 
+**Superseded by Amendment A1 (Section 13).** The blocks above are the Task 2 commit as made (`96b51e9`). Its `--on-panel-failure stop` (F4's `_seed_context_frame_flags` and its call, F4's docstring sentence, F9's `--on-panel-failure stop; ...` and `A failed clip stops the run.`) and Step 1's pins of it (CXT12, CXT13, CXT17, CXT18) are replaced by the A1 fix commit, which uses Phase 4's flags unchanged and adds CXT20. Task 2's own expected counts below (`19 passed`, `P0+18`) are those of the Task 2 commit.
+
 **T1** (`tests/test_ltx_movie_seed_context.py`, CXT9's --seed-context help text). Old:
 ```python
         "previous panel's stay single-image edits of the seed. Needs a --seed-edit-model that edits with several "
@@ -2749,7 +2835,7 @@ git commit -m "ltx-movie: --seed-context frame: each seeded shots still also see
 
 ### Task 3: the `test_mut26` re-baseline (a test-only commit; never amend)
 
-The baseline chain moves from `c537fed` (shots-multiref) to the last code commit (Task 2's, or Task 1's when still mode ships alone).
+The baseline chain moves from `c537fed` (shots-multiref) to the last code commit: the A1 fix commit after Task 2 (Amendment A1; not Task 2's commit), or Task 1's when still mode ships alone.
 
 - [ ] **Step 1:**
 ```bash
@@ -2778,12 +2864,12 @@ git add tests/test_movie_ui_builder.py
 git diff --cached --name-only    # exactly qwen-agent-workspace/tests/test_movie_ui_builder.py
 git commit -m "tests/test_movie_ui_builder.py: test_mut26 BASELINE moves to the seeded-shots-context commit" -m "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 ```
-Expected gate output: the summary `2 failed, P0+19 passed, 2 skipped` (still mode alone: `P0+11`); `lost 0 (listed 0, unexpected 0); new tests 19, not passing 0` (still mode alone: `11`); `baseline failures still failing 2 of 2`; `GATE PASS`, `3 passed` and `ATK2 OK lines unchanged`; `grep -c '^PASSED tests/test_movie_ui_builder.py::test_mut26_pipeline_files_are_unchanged$' $S/sc-baseline/task-3-pytest.txt` prints `1`.
+Expected gate output: the summary `2 failed, P0+20 passed, 2 skipped` (P0 = 2698; still mode alone: `P0+11`); `lost 0 (listed 0, unexpected 0); new tests 20, not passing 0` (still mode alone: `11`); `baseline failures still failing 2 of 2`; `GATE PASS`, `3 passed` and `ATK2 OK lines unchanged`; `grep -c '^PASSED tests/test_movie_ui_builder.py::test_mut26_pipeline_files_are_unchanged$' $S/sc-baseline/task-3-pytest.txt` prints `1`.
 
 ### Verification (controller)
 
 - **V1:** confirm CXK1 and CXK2 from Task 3's gate output and:
-  - `git diff --numstat 29e3a89 HEAD -- bin/ltx-movie`: `575 25` (still mode alone: `381 1`)
+  - `git diff --numstat 29e3a89 HEAD -- bin/ltx-movie`: `569 25` with the A1 fix commit (Task 2 without it: `575 25`; still mode alone: `381 1`)
   - `git diff --name-only 29e3a89 HEAD | grep -v '^qwen-agent-workspace/docs/' | wc -l`: `4` (`bin/ltx-movie`, the two new test files, `tests/test_movie_ui_builder.py`; still mode alone: `3`)
   - `git diff 29e3a89 HEAD -- qwen_edit.py seed_edit_mflux_child.py character_dataset.py character_lib.py story_engine.py bin/ltx-story-images bin/ltx-story-manifest bin/ltx-mlx-render movie_ui_lib.py static | wc -l`: `0`
 - **V2:** an Opus design review (the `design-reviewer` agent) of the commits against this spec, with Section 8 as the focus. A finding is fixed in a new commit. If that commit touches a pinned file, another Task 3-style baseline commit follows, and V1 runs again.
@@ -2809,4 +2895,4 @@ Test by test, with this plan's `gate.py` and `expected-failures.txt` run on the 
 1. With the forced cascade alone, a run interrupted after re-editing panel 3 left panel 4's old `ok` entry; when the re-edit reproduced panel 3's bytes, the rerun reused panel 4. `_seed_context_edit` now clears its cascade's entries before the edit (CXT6's last assertion; mutation "cascade entry pop").
 2. `character_lib`'s sentence split does not end a sentence at a closing quote, so a quoted setting sentence swallows the next sentence (Review Focus 2); CXT2 pins the unquoted and the lower-case forms instead.
 3. A frame-mode rerun after Phase 4 meets the `movie.mp4` guard; CXT17 asserts the exit 2 and reruns with `--force`.
-4. Before the replay, reading the pins showed that a fifth `os.path.join(WS, "bin", "ltx-mlx-render")` (L17f, L46f, RST50), a fifth `_render_flags(args)` (L17d, L46e, RST50) or a `no_stills` between `phase2_stills` and `phase3_manifest` (L17b) would fail existing tests: `_render_tool()`, `_seed_context_frame_flags` (built on `_phase4_flags`) and the placement of `_phase3_manifest_cmd` keep them true, and the final copy passes them.
+4. Before the replay, reading the pins showed that a fifth `os.path.join(WS, "bin", "ltx-mlx-render")` (L17f, L46f, RST50), a fifth `_render_flags(args)` (L17d, L46e, RST50) or a `no_stills` between `phase2_stills` and `phase3_manifest` (L17b) would fail existing tests: `_render_tool()`, `_seed_context_frame_flags` (built on `_phase4_flags`) and the placement of `_phase3_manifest_cmd` keep them true, and the final copy passes them. (After Amendment A1 the partial render calls `_phase4_flags(args)` directly, which keeps the `_render_flags(args)` count at 4 as well.)
