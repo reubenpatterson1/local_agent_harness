@@ -568,22 +568,26 @@ HELP = {
         "a test option for --shots with --seed-image: every panel after the first is a two-image Qwen edit of the "
         "seed (the people) and the previous panel's still (the scene), one Qwen child per panel in panel order, "
         "recorded in seed_context_edits.json; panel 1 and every panel whose Image: setting sentence differs from the "
-        "previous panel's stay single-image edits of the seed. Needs a --seed-edit-model that edits with several "
-        "pictures (qwen2511-q4 is refused). See docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md."),
+        "previous panel's stay single-image edits of the seed. frame uses the exact last frame of the previous "
+        "panel's clip instead, rendering each clip right after its still; a failed still or clip stops the run. "
+        "Needs a --seed-edit-model that edits with several pictures (qwen2511-q4 is refused). See "
+        "docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md."),
     "--seed-context-order": ("with --seed-context: seed-first (the default) makes the seed Picture 1 and the context "
                              "picture Picture 2; context-first swaps them")}
 DOC = ("Seed context (docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md), a test option: in shots mode "
        "with --seed-image, --seed-context still makes every panel after the first a two-image Qwen edit of the seed "
        "(the people) and the previous panel's still (the scene), one Qwen child per panel in panel order, recorded in "
        "seed_context_edits.json; panel 1 and every panel whose Image: setting sentence differs from the previous "
-       "panel's stay single-image edits of the seed. Absent, Phase 2 is unchanged. Cast references")
+       "panel's stay single-image edits of the seed. --seed-context frame uses the exact last frame of the previous "
+       "panel's clip instead: Phase 2 then renders each clip right after its still (bin/ltx-mlx-render --resume on "
+       "the panels so far), and Phases 3 and 4 reuse every clip. Absent, Phase 2 is unchanged. Cast references")
 
 
 def test_cxt9_the_help_texts_and_the_docstring():
     actions = dict((a.option_strings[0], a) for a in movie.build_parser()._actions if a.option_strings)
     for flag, text in HELP.items():
         assert actions[flag].help == text, flag
-    assert actions["--seed-context"].choices == ["still"]
+    assert actions["--seed-context"].choices == ["still", "frame"]
     assert actions["--seed-context-order"].choices == ["seed-first", "context-first"]
     assert DOC in " ".join(movie.__doc__.split())
     with open(os.path.join(WS, "bin", "ltx-movie"), encoding="utf-8") as f:

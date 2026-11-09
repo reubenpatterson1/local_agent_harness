@@ -119,7 +119,9 @@ Seed context (docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md),
 --seed-image, --seed-context still makes every panel after the first a two-image Qwen edit of the seed (the people)
 and the previous panel's still (the scene), one Qwen child per panel in panel order, recorded in
 seed_context_edits.json; panel 1 and every panel whose Image: setting sentence differs from the previous panel's
-stay single-image edits of the seed. Absent, Phase 2 is unchanged.
+stay single-image edits of the seed. --seed-context frame uses the exact last frame of the previous panel's clip
+instead: Phase 2 then renders each clip right after its still (bin/ltx-mlx-render --resume on the panels so far),
+and Phases 3 and 4 reuse every clip. Absent, Phase 2 is unchanged.
 
 Cast references (docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md), a test option: in
 shots mode without --seed-image, --cast-refs-model ID renders every panel whose Image: names two cast characters
@@ -202,8 +204,11 @@ SEED_CONTEXT_PREFIX = (
     "of the frame, and take nothing else from it: not the faces, the clothing, any blur or the grain. Change the "
     "pose, the action, the framing and the camera angle to match the new shot, and leave out anyone the new shot "
     "does not describe. The new shot: ")
-SEED_CONTEXT_KINDS = {"still": "the previous panel's still"}
-SEED_CONTEXT_PICTURES = {"still": "panel %d's still"}
+SEED_CONTEXT_KINDS = {"still": "the previous panel's still",
+                      "frame": "the last frame of the previous panel's clip"}
+SEED_CONTEXT_PICTURES = {"still": "panel %d's still", "frame": "the last frame of panel %d's clip"}
+SEED_CONTEXT_FRAME_GATE = ("Frame mode renders every panel's clip right after its still, before the next still is "
+                           "edited. Enter to start, Ctrl-C to abort: ")
 SEED_CONTEXT_CHANGE_NOTE = ("seed context: location changes at panels %s (the Image: setting sentence differs from "
                             "the previous panel's): each of them is a single-image edit of the seed, like panel 1")
 SEED_CONTEXT_REDO_NOTE = ("note: seed context: --redo %s also re-edits panels %s: their context picture is %s, so "
@@ -504,13 +509,15 @@ def build_parser():
                          metavar="ID=SCALE",
                          help="with --cast-refs-model ID: a registry LoRA of that model's family, 0 < SCALE <= 2 "
                               "(repeatable); none listed means no LoRA")
-    parser.add_argument("--seed-context", dest="seed_context_mode", choices=["still"], default=None,
+    parser.add_argument("--seed-context", dest="seed_context_mode", choices=["still", "frame"], default=None,
                          help="a test option for --shots with --seed-image: every panel after the first is a "
                               "two-image Qwen edit of the seed (the people) and the previous panel's still (the "
                               "scene), one Qwen child per panel in panel order, recorded in "
                               "seed_context_edits.json; panel 1 and every panel whose Image: setting sentence "
-                              "differs from the previous panel's stay single-image edits of the seed. Needs a "
-                              "--seed-edit-model that edits with several pictures (qwen2511-q4 is refused). See "
+                              "differs from the previous panel's stay single-image edits of the seed. frame uses the "
+                              "exact last frame of the previous panel's clip instead, rendering each clip right "
+                              "after its still; a failed still or clip stops the run. Needs a --seed-edit-model "
+                              "that edits with several pictures (qwen2511-q4 is refused). See "
                               "docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md.")
     parser.add_argument("--seed-context-order", dest="seed_context_order", choices=["seed-first", "context-first"],
                          default=None,
@@ -3062,6 +3069,145 @@ def _phase2_seed_context(args):
     return 0
 
 
+def _render_tool():
+    """bin/ltx-mlx-render's path: Phase 4 renders with it, and --seed-context frame renders with it and loads it for
+    extract_last_frame and check_chain_seed (seed context spec CX15)."""
+    return os.path.join(WS, "bin", "ltx-mlx-render")
+
+
+def _ltx_render():
+    """bin/ltx-mlx-render, loaded by path and only by --seed-context frame (seed context spec CX15)."""
+    return importlib.machinery.SourceFileLoader("ltx_mlx_render_for_movie", _render_tool()).load_module()
+
+
+def _seed_context_frame_flags(args):
+    """Phase 4's bin/ltx-mlx-render flags with --on-panel-failure stop (seed context spec CX17): in frame mode a clip
+    is the next panel's context, so a failed clip stops the run."""
+    flags = _phase4_flags(args)
+    flags[flags.index("--on-panel-failure") + 1] = "stop"
+    return flags
+
+
+def phase_seed_context_frames(args):
+    """Phase 2 in seeded shots mode with --seed-context frame (seed context spec CX15-CX19), in place of
+    phase2_stills: the manifest is built once with a placeholder still for every panel; then, for each panel k in
+    order, still k is reused or edited (the context picture of a kind "frame" panel is the exact last frame of clip
+    k-1), a manifest of panels 1..k with their real stills is written to seed_context_edits/manifest_upto.json and
+    bin/ltx-movie runs bin/ltx-mlx-render --resume on it (clips 1..k-1 are reused, clip k renders), and clip k's last
+    frame is extracted and checked when panel k+1 needs it. Phase 3 and Phase 4 then rebuild the manifest and reuse
+    every clip. The first blocked or failed still, failed clip or bad frame stops the run, with no fallback."""
+    print("=== Phase 2: stills and clips, panel by panel (seed context frame) ===")
+    qe = _qwen_edit()
+    paths = _story_paths(args.story_id)
+    files = _seed_context_paths(paths["story_dir"])
+    model_id, loras = args.seed_edit["qwen_model"], args.seed_edit["loras"]
+    if os.path.exists(paths["movie_path"]) and not args.force:
+        print("Error: %s already exists; pass --force to overwrite" % paths["movie_path"], file=sys.stderr)
+        return 2
+    error, plan = _seed_context_plan(args, qe)
+    if error is not None:
+        print("Error: %s" % error, file=sys.stderr)
+        return 1
+    if _shots_seed_lora_note(args):
+        print(SHOTS_SEED_LORA_NOTE)
+    _seed_context_notes(args, plan)
+    (width, height), (still_w, still_h) = plan["size"], plan["still"]
+    picture = 2 if args.seed_context["order"] == "seed-first" else 1
+    total = plan["total"]
+    print("seed context: %s; %dx%d, fitted into %dx%d stills; seed %d; %d panels in order, one Qwen child per edited "
+          "panel; the seed is Picture %d and %s is Picture %d" % (
+              qe.generator_text(model_id, loras), width, height, still_w, still_h, args.image_seed, total,
+              3 - picture, SEED_CONTEXT_KINDS["frame"], picture))
+    os.makedirs(paths["images_dir"], exist_ok=True)
+    os.makedirs(files["work"], exist_ok=True)
+    fit = _image_fit()
+    fit.load_oriented_rgb(args.seed_image).save(files["original"], format="PNG")
+    placeholder = os.path.join(files["work"], "placeholder.png")
+    fit.fit_letterbox(fit.load_oriented_rgb(args.seed_image), still_w, still_h).save(placeholder, format="PNG")
+    rc, cmd = _phase3_manifest_cmd(args, ["--image", placeholder] * total)
+    if rc:
+        return rc
+    log = os.path.join(files["work"], "manifest.log")
+    print("seed context: the manifest, built once with %s as every panel's still until it is made; log: %s"
+          % (placeholder, log))
+    print("Running: %s" % shlex.join(cmd))
+    rc = _stream_and_tee(cmd, log)
+    if rc != 0:
+        print("Error: ltx-story-manifest exited %d; see %s" % (rc, log), file=sys.stderr)
+        return 1
+    try:
+        with open(paths["manifest_path"], encoding="utf-8") as f:
+            manifest = json.load(f)
+        panels = list(manifest["panels"])
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print("Error: cannot read %s: %s" % (paths["manifest_path"], e), file=sys.stderr)
+        return 1
+    if len(panels) != total:
+        print("Error: %s has %d panels and %s has %d" % (paths["manifest_path"], len(panels), paths["story_md"], total),
+              file=sys.stderr)
+        return 1
+    try:
+        render = _ltx_render()
+    except Exception as e:      # seed context CX19: an Error: line, never a traceback
+        print("Error: cannot load %s: %s: %s" % (_render_tool(), type(e).__name__, e), file=sys.stderr)
+        return 1
+    if not args.no_review:
+        input(SEED_CONTEXT_FRAME_GATE)
+    archive = os.path.join(paths["story_dir"], "redo", "%s-%d" % (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()), "images")
+    upto_json = os.path.join(files["work"], "manifest_upto.json")
+    upto_mp4 = os.path.join(files["work"], "upto.mp4")
+    changed, reused = set(), []
+    for k in range(1, total + 1):
+        path = os.path.join(files["work"], "frame_%02d.png" % (k - 1))
+        context = _seed_context_context(args, plan, k, path)
+        if _seed_context_reusable(args, plan, k, context, changed):
+            reused.append(k)
+            print("seed context: panel %d: reusing %s (a recorded edit of the same seed image, context picture, "
+                  "prompt, seed and settings)" % (k, os.path.join(paths["images_dir"], "panel_%02d.png" % k)))
+        else:
+            status, failure = _seed_context_edit(args, qe, plan, k, path, context, archive)
+            changed.add(k)
+            if failure is not None or status != "ok":
+                _seed_context_stop(args, plan, k, status, failure, qe.label(model_id))
+                return 1
+        _write_seed_edit_record(upto_json, dict(manifest, panels=[
+            dict(p, image_path=os.path.abspath(os.path.join(paths["images_dir"], "panel_%02d.png" % j)))
+            for j, p in enumerate(panels[:k], start=1)]))
+        if os.path.lexists(upto_mp4):
+            os.remove(upto_mp4)
+        if not _wait_for_avail(args.min_avail_gib, args.avail_timeout):
+            return 1
+        cmd = [sys.executable, _render_tool(), upto_json, upto_mp4] + _seed_context_frame_flags(args)
+        log = os.path.join(files["work"], "render-%02d.log" % k)
+        print("seed context: panel %d: its clip (bin/ltx-mlx-render --resume on panels 1-%d); log: %s" % (k, k, log))
+        print("Running: %s" % shlex.join(cmd))
+        rc = _stream_and_tee(cmd, log)
+        if rc != 0:
+            print("Error: ltx-mlx-render exited %d on panels 1-%d, so panel %d's clip is not made; frame mode stops "
+                  "here (see %s); a rerun reuses every recorded still and finished clip" % (rc, k, k, log),
+                  file=sys.stderr)
+            return 1
+        if os.path.lexists(upto_mp4):
+            os.remove(upto_mp4)
+        if k < total and plan["kinds"][k + 1] == "frame":
+            frame = os.path.join(files["work"], "frame_%02d.png" % k)
+            clip = os.path.join(paths["story_dir"], "clips", "panel_%02d.mp4" % k)
+            try:
+                problems = (render.extract_last_frame(clip, frame, args.frames)
+                            or render.check_chain_seed(frame, args.video_width, args.video_height, k))
+            except Exception as e:      # seed context CX19: an Error: line, never a traceback
+                problems = ["%s: %s" % (type(e).__name__, e)]
+            if problems:
+                print("Error: panel %d's context frame (the last frame of %s): %s" % (k + 1, clip, "; ".join(problems)),
+                      file=sys.stderr)
+                return 1
+            print("seed context: panel %d: the last frame of %s -> %s" % (k + 1, clip, frame))
+    print("seed context: %d panel stills written, %d reused; every clip is made, so Phase 4 reuses them all"
+          % (len(changed), len(reused)))
+    return 0
+
+
 def _cast_refs_paths(story_dir):
     """The cast-reference edits' files in the story directory (cast refs spec CR9)."""
     return {"record": os.path.join(story_dir, "cast_ref_edits.json"),
@@ -3343,33 +3489,9 @@ def phase3_manifest(args):
     paths = _story_paths(args.story_id)
     print("=== Phase 3: manifest + dry-run ===")
 
-    cmd_manifest = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
-                     "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
-    if args.no_stills:
-        cmd_manifest += ["--no-images"]
-    elif getattr(args, "shots", False):
-        cmd_manifest += ["--shots"] + _shots_image_flags(args)
-    else:
-        cmd_manifest += ["--chain", "--image", os.path.join(paths["images_dir"], "panel_01.png")]
-    cmd_manifest += ["--fps", str(args.fps),
-                     "--target-seconds", str(_target_seconds(args)),
-                     "--min-frames", str(args.frames),
-                     "--max-frames", str(args.frames),
-                     "--force"]
-    if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
-        cmd_manifest += ["--pace", "equal"]
-    if getattr(args, "speech_delivery", "beats") != "beats":
-        cmd_manifest += ["--speech-delivery", args.speech_delivery]
-    cmd_manifest += _cast_flags(args)
-    cmd_manifest += _location_flags(args, video=True)
-    error, catalog_lists = _catalog_panel_loras(args)
-    if error:
-        print(error, file=sys.stderr)
-        return 2
-    if catalog_lists is not None:
-        catalog_path = os.path.join(paths["story_dir"], "catalog_loras.json")
-        _write_catalog_loras(args, catalog_path, catalog_lists)
-        cmd_manifest += ["--catalog-loras", catalog_path]
+    rc, cmd_manifest = _phase3_manifest_cmd(args)
+    if rc:
+        return rc
     print("Running: %s" % shlex.join(cmd_manifest))
     proc = subprocess.run(cmd_manifest, cwd=WS)
     if proc.returncode != 0:
@@ -3390,6 +3512,41 @@ def phase3_manifest(args):
               "Ctrl-C to abort: ")
 
     return 0
+
+
+def _phase3_manifest_cmd(args, image_flags=None):
+    """(rc, cmd): Phase 3's bin/ltx-story-manifest command with rc 0, or (2, None) after printing the catalog error.
+    In shots mode its --image flags are image_flags when given (--seed-context frame's placeholders, seed context
+    spec CX16), else _shots_image_flags(args). Writes catalog_loras.json when the plan picks catalog LoRAs."""
+    paths = _story_paths(args.story_id)
+    cmd_manifest = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
+                     "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
+    if args.no_stills:
+        cmd_manifest += ["--no-images"]
+    elif getattr(args, "shots", False):
+        cmd_manifest += ["--shots"] + (_shots_image_flags(args) if image_flags is None else list(image_flags))
+    else:
+        cmd_manifest += ["--chain", "--image", os.path.join(paths["images_dir"], "panel_01.png")]
+    cmd_manifest += ["--fps", str(args.fps),
+                     "--target-seconds", str(_target_seconds(args)),
+                     "--min-frames", str(args.frames),
+                     "--max-frames", str(args.frames),
+                     "--force"]
+    if getattr(args, "no_narration", False) or getattr(args, "speech_only", False):
+        cmd_manifest += ["--pace", "equal"]
+    if getattr(args, "speech_delivery", "beats") != "beats":
+        cmd_manifest += ["--speech-delivery", args.speech_delivery]
+    cmd_manifest += _cast_flags(args)
+    cmd_manifest += _location_flags(args, video=True)
+    error, catalog_lists = _catalog_panel_loras(args)
+    if error:
+        print(error, file=sys.stderr)
+        return 2, None
+    if catalog_lists is not None:
+        catalog_path = os.path.join(paths["story_dir"], "catalog_loras.json")
+        _write_catalog_loras(args, catalog_path, catalog_lists)
+        cmd_manifest += ["--catalog-loras", catalog_path]
+    return 0, cmd_manifest
 
 
 # ---------------------------------------------------------------------------
@@ -3491,8 +3648,7 @@ def phase4_render(args):
     if not _wait_for_avail(args.min_avail_gib, args.avail_timeout):
         return 1
 
-    cmd = [sys.executable, os.path.join(WS, "bin", "ltx-mlx-render"),
-           paths["manifest_path"], movie_path] + _phase4_flags(args)
+    cmd = [sys.executable, _render_tool(), paths["manifest_path"], movie_path] + _phase4_flags(args)
     print("Running: %s" % shlex.join(cmd))
 
     rc = _stream_and_tee(cmd, paths["movie_log_path"])
@@ -3649,6 +3805,13 @@ def _print_seed_context_plan(args):
              SEED_CONTEXT_KINDS[args.seed_context["mode"]], picture, SEED_CONTEXT_SKILL,
              os.path.join(paths["images_dir"], "panel_NN.png"), still,
              _seed_context_paths(paths["story_dir"])["record"]))
+    if args.seed_context["mode"] == "frame":
+        work = _seed_context_paths(paths["story_dir"])["work"]
+        print("Frame mode: Phase 2 also renders each panel's clip right after its still, with bin/ltx-mlx-render "
+              "--resume on a manifest of the panels so far (%s; --on-panel-failure stop; logs %s), and the exact last "
+              "frame of clip k is panel k+1's context picture. A failed clip stops the run. Phases 3 and 4 then build "
+              "the final manifest and reuse every clip."
+              % (os.path.join(work, "manifest_upto.json"), os.path.join(work, "render-NN.log")))
     if args.force_story or not known or not os.path.exists(paths["story_md"]):
         print("Panels: decided at Phase 2, from story.md after Phase 1")
         return
@@ -3657,6 +3820,10 @@ def _print_seed_context_plan(args):
         print("Panels: Phase 2 would stop: %s" % error)
         return
     print("Location changes (single-image edits): %s" % (_panel_list(plan["changes"]) or "none"))
+    if args.seed_context["mode"] == "frame":
+        print("Panels to edit: decided panel by panel during the run: a context picture is the last frame of a clip "
+              "this run renders or reuses")
+        return
     changed, reused = set(), []
     for n in range(1, plan["total"] + 1):
         path = os.path.join(paths["images_dir"], "panel_%02d.png" % (n - 1))
@@ -3904,6 +4071,9 @@ def _phase_sequence(args):
         phases = phases[:cut] + (phase_seed_edit,) + phases[cut:]
     if getattr(args, "seed_image", None):
         phases = (phase0_seed,) + phases
+    if (getattr(args, "seed_context", None) or {}).get("mode") == "frame":
+        # Seed context CX15: the frame mode's Phase 2 renders every clip as it goes; Phases 3 and 4 reuse them.
+        phases = tuple(phase_seed_context_frames if p is phase2_stills else p for p in phases)
     return phases
 
 
