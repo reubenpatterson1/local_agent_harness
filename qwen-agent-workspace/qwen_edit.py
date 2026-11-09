@@ -6,8 +6,10 @@ path, and only when --seed-edit-model names a registry model.
 
 The mflux registry models run seed_edit_mflux_child.py under the mflux venv's Python, offline and with no
 Hugging Face token in its environment, and this process screens every output before it gets its final
-name; qwen2511-bf16 runs the unchanged character_dataset.py qwenedit child, which screens each output
-itself. The child timeout is max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S x jobs) seconds.
+name; qwen2511-bf16 runs the character_dataset.py qwenedit child, which screens each output itself. The
+child timeout is max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S x jobs) seconds, where a job with several reference images
+(its "sources" list, docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md) counts
+MULTI_REFERENCE_TIMEOUT_FACTOR jobs.
 
 Environment: SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python), SEED_EDIT_QWENEDIT_SCRIPT
 (default <ws>/character_dataset.py), HF_HUB_CACHE and HF_HOME (the default hub), Z_IMAGE_HF_HOME (the
@@ -46,6 +48,13 @@ DEFAULT_MFLUX_PYTHON = "~/mflux-edit/.venv/bin/python"   # expanded at use
 AVAIL_WAIT_S = 600               # character_dataset.AVAIL_WAIT_S
 CHILD_TIMEOUT_S = 3600           # the timeout floor (bin/seed-edit's former fixed timeout)
 JOB_TIMEOUT_S = 600              # the budget per job above the floor
+MULTI_REFERENCE_TIMEOUT_FACTOR = 6   # a job with several reference images counts as this many jobs (cast refs CR2)
+MULTI_REFERENCE_REFUSED = {          # registry models that cannot edit with several reference images (cast refs CR1)
+    "qwen2511-q4": ("mflux's Qwen-Image-Edit-2511 pipeline reads only the first input image (its edit tokenizer is "
+                    "built without picture prefixes), so the second character's reference would be silently "
+                    "ignored; use qwen2511-bf16 or a qwen21 model"),
+}
+MULTI_REFERENCE_MODEL_IDS = tuple(m for m in MODEL_IDS if m not in MULTI_REFERENCE_REFUSED)
 MFLUX_LINE_RE = re.compile(r"^seed-edit-child done (\d+) ([0-9]+\.[0-9])$")
 QWENEDIT_LINE_RE = re.compile(r"^(\S+) (ok|blocked) ([0-9]+\.[0-9])s$")
 CHILD = None    # the running Qwen child's Popen, or None
@@ -412,6 +421,18 @@ def child_timeout(n_jobs):
     return max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S * n_jobs)
 
 
+def multi_reference_problem(model_id):
+    """Why model_id cannot edit with several reference images in one job, or None (cast refs spec CR1)."""
+    return MULTI_REFERENCE_REFUSED.get(model_id)
+
+
+def jobs_timeout(jobs):
+    """The child timeout for jobs (cast refs spec CR2): child_timeout(len(jobs)) when no job lists more than one
+    source; a job whose "sources" lists two or more images counts MULTI_REFERENCE_TIMEOUT_FACTOR jobs."""
+    weight = sum(MULTI_REFERENCE_TIMEOUT_FACTOR if len(job.get("sources") or ()) > 1 else 1 for job in jobs)
+    return max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S * weight)
+
+
 def generator_text(model_id, loras):
     """The manifest "generator" string of a selection; the legacy model keeps today's exact text."""
     if model_id == LEGACY_EDIT_MODEL:
@@ -454,8 +475,13 @@ def selection_problem(model_id, loras):
 # ---------------------------------------------------------------------------
 
 def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None, noun="job"):
-    """Run one Qwen edit child over jobs and screen every output (qwen edit models spec QE13-QE16)."""
+    """Run one Qwen edit child over jobs and screen every output (qwen edit models spec QE13-QE16). A job may also
+    carry "sources", the list of its reference images in order, whose first item is its "source" (cast refs spec
+    CR3); the child then edits with every listed image."""
     entry = seedgen.qwen_model(model_id)
+    refused = multi_reference_problem(model_id)
+    if refused is not None and any(len(job.get("sources") or ()) > 1 for job in jobs):
+        raise Unavailable("%s cannot edit with several reference images: %s" % (entry["label"], refused))
     problem, paths = install_problem(model_id, loras)
     if problem is not None:
         raise Unavailable(problem)
@@ -477,6 +503,8 @@ def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=Non
                     "width": width, "height": height}
             if job["source"] != first:
                 item["image"] = job["source"]
+            if "sources" in job:
+                item["images"] = list(job["sources"])     # cast refs CR3
             spec_jobs.append(item)
         spec_path = os.path.join(work_dir, "qwenedit_spec.json")
         lib.write_json_atomic(spec_path, {
@@ -502,14 +530,21 @@ def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=Non
         builtin = entry["builtin_lora"]
         ordered = seedgen.registry_order(loras)
         spec_path = os.path.join(work_dir, "mflux_spec.json")
+
+        def spec_job(job):
+            item = {"n": job["n"], "seed": job["seed"], "prompt": job["prompt"], "source": job["source"],
+                    "output_path": job["stage_path"]}
+            if "sources" in job:
+                item["sources"] = list(job["sources"])    # cast refs CR3
+            return item
+
         lib.write_json_atomic(spec_path, {
             "family": entry["family"], "model_path": paths["model_path"],
             "lora_paths": ([paths["builtin_lora"]] if builtin is not None else []) + paths["lora_paths"],
             "lora_scales": ([builtin["scale"]] if builtin is not None else []) + [item["scale"] for item in ordered],
             "width": width, "height": height, "steps": chosen["steps"], "guidance": MFLUX_GUIDANCE,
             "scheduler": chosen["scheduler"],
-            "jobs": [{"n": job["n"], "seed": job["seed"], "prompt": job["prompt"], "source": job["source"],
-                      "output_path": job["stage_path"]} for job in jobs]})
+            "jobs": [spec_job(job) for job in jobs]})
         argv = [mflux_python(), os.path.join(WS, "seed_edit_mflux_child.py"), "--spec", spec_path]
         env = seedgen.hf_child_env(os.environ, PYTHONUNBUFFERED="1", HF_HUB_OFFLINE="1")
 
@@ -537,7 +572,7 @@ def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=Non
             last[0] = line.strip()
         handle(line)
 
-    timeout = child_timeout(len(jobs))
+    timeout = jobs_timeout(jobs)
     code, timed_out = run_child(argv, env, on_line, timeout, log_path)
     failure = None
     if timed_out:

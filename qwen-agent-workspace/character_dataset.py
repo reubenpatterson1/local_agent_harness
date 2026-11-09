@@ -1907,9 +1907,9 @@ def exit_with_parent(poll_s=2.0):
 
 def child_qwenedit(spec_path):
     """The child side of run_edit_child: load the editor and its Lightning LoRA from the local
-    cache, edit each job's image (job["image"], else spec["image"]; location library spec L1.8)
-    into every job, screen each result with spec["skill"] (default "character_edit"), write the
-    report."""
+    cache, edit each job's images (job["images"], the cast refs spec's reference list, else
+    job["image"], else spec["image"]; location library spec L1.8) into every job, screen each
+    result with spec["skill"] (default "character_edit"), write the report."""
     exit_with_parent()
     import torch
     from diffusers import QwenImageEditPlusPipeline
@@ -1927,13 +1927,13 @@ def child_qwenedit(spec_path):
     sources = {}
     jobs = []
     for job in spec["jobs"]:
-        path = job.get("image", spec["image"])
-        if path not in sources:
-            with Image.open(path) as img:
-                sources[path] = img.convert("RGB")
-        source = sources[path]
+        paths = job.get("images") or [job.get("image", spec["image"])]
+        for path in paths:
+            if path not in sources:
+                with Image.open(path) as img:
+                    sources[path] = img.convert("RGB")
         started = time.monotonic()
-        image = pipe(image=[source], prompt=job["prompt"], negative_prompt=" ",
+        image = pipe(image=[sources[path] for path in paths], prompt=job["prompt"], negative_prompt=" ",
                      true_cfg_scale=spec["true_cfg"], guidance_scale=1.0,
                      num_inference_steps=spec["steps"], width=job["width"], height=job["height"],
                      generator=torch.Generator("cpu").manual_seed(job["seed"])).images[0]
