@@ -581,15 +581,40 @@ ARC_COUNT_CLAUSES = {
 }
 LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, each empty: global "
                         "and stills are empty lists and per_beat is an empty object.")
+# LoRA scope spec LS4 (docs/superpowers/specs/2026-11-10-lora-scope-design.md): the catalog
+# below the paragraph lists each video LoRA under the places its scope allows (catalog_groups).
 LORA_PICK_PARAGRAPH = (
     "an object with the keys global, per_beat and stills. Each pick is an object with the keys "
     "id and strength, taken from the LoRA catalog below; strength must lie inside that entry's "
-    "range. global is a list of picks applied to every panel: at most one style LoRA, plus "
-    "motion or physics LoRAs that suit the whole movie. per_beat maps each beat number to a list "
-    "of motion or physics picks for that beat only, and each key is the beat number alone in "
-    'double quotes: the key of beat 1 is "1"; every beat may have at '
-    "most one motion or physics LoRA in total, counting global. stills is a list of at most one "
-    "stills LoRA.")
+    "range. The catalog lists each LoRA under the places where it may go. global is a list of "
+    "picks applied to every panel, taken only from the LoRAs that may be global picks: at most "
+    "one style LoRA, plus motion or physics LoRAs that suit the whole movie. per_beat maps each "
+    "beat number to a list of picks for that beat only, taken only from the LoRAs that may be "
+    "per-beat picks, and each key is the beat number alone in double quotes: the key of beat 1 "
+    'is "1"; a LoRA in global is never also in per_beat, and every beat may have at most one '
+    "motion or physics LoRA in total, counting global. stills is a list of at most one stills "
+    "LoRA.")
+LORA_GLOBAL_GROUP = "May be global picks (applied to every panel):"
+LORA_GLOBAL_NONE = "- none, so global stays empty"
+LORA_BEAT_GROUP = "May be per-beat picks (applied to their beat only):"
+LORA_BEAT_NONE = "- none, so per_beat stays empty"
+LORA_STILLS_GROUP = "Stills LoRAs (only for the stills pick):"
+# LS5: a pick placed where its catalog scope does not allow it (hard, so the critic repairs it).
+LORA_SCOPE_GLOBAL = ("plan: L8 scope: %s may only be a per-beat pick (its catalog scope is "
+                     "beat), but it is a global pick; remove it from global and pick it for the "
+                     "beats that need it")
+LORA_SCOPE_BEAT = ("beat %d: L8 scope: %s may only be a global pick (its catalog scope is "
+                   "global), but it is a pick for this beat; remove it from this beat, or move it "
+                   "to global if it suits the whole movie")
+# LS6: normalize_plan keeps one copy of a LoRA picked both globally and for some beats.
+LORA_DUPLICATE_BEATS = ("plan: L6 duplicate: %s was picked both globally and for beat(s) %s; the "
+                        "pipeline kept the global pick and dropped the per-beat copies")
+LORA_DUPLICATE_GLOBAL = ("plan: L6 duplicate: %s was picked both globally and for beat(s) %s; its "
+                         "catalog scope is beat, so the pipeline kept the per-beat picks and "
+                         "dropped the global pick")
+RECHECK_SCOPE_HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: "
+                      "set the LoRA's scope to either with bin/lora-catalog scope ID either (or "
+                      "in the movie UI's LoRA catalog), or pass --force-story to regenerate.")
 
 
 def _fill(template, fragments, scalars, narrative):
@@ -1047,6 +1072,23 @@ def catalog_line(entry):
         _sentence(entry["avoid_when"]) if entry["avoid_when"] else "nothing listed.")
 
 
+def catalog_groups(ctx, entries):
+    """The catalog lines of the plan prompt and the critic prompt (LoRA scope spec LS4): every
+    video entry whose scope allows global under LORA_GLOBAL_GROUP, every one whose scope allows a
+    beat under LORA_BEAT_GROUP (an either entry is in both; an empty group says so), then the
+    stills entries, when there are any, under LORA_STILLS_GROUP. Entries keep their order."""
+    scope_of = _lora_catalog(ctx.ws).entry_scope
+    video = [e for e in entries if e["target"] == "video"]
+    stills = [catalog_line(e) for e in entries if e["target"] != "video"]
+    lines = [LORA_GLOBAL_GROUP]
+    lines += ([catalog_line(e) for e in video if scope_of(e) in ("global", "either")]
+              or [LORA_GLOBAL_NONE])
+    lines.append(LORA_BEAT_GROUP)
+    lines += ([catalog_line(e) for e in video if scope_of(e) in ("beat", "either")]
+              or [LORA_BEAT_NONE])
+    return lines + ([LORA_STILLS_GROUP] + stills if stills else [])
+
+
 def _pins_block(pins):
     if not pins:
         return ""
@@ -1236,7 +1278,7 @@ def build_plan_prompt(ctx, compatible, pins):
         lora += (" Pick a LoRA only when its use-when text fits and its avoid-when text does "
                  "not; leave the lists empty when nothing fits.")
         lora += "\n\nLoRA catalog (pick only from these):\n"
-        lora += "\n".join(catalog_line(e) for e in compatible) + _pins_block(pins)
+        lora += "\n".join(catalog_groups(ctx, compatible)) + _pins_block(pins)
     said = ""
     if lines and ctx.members:
         items = ["line %d to %s" % (n, cid) for n, cid
@@ -1388,6 +1430,41 @@ def _normalize_picks(picks, by_id):
     return out
 
 
+def drop_duplicate_picks(ctx, picks, by_id, n):
+    """LoRA scope spec LS6: for each catalog video LoRA that picks["global"] and the per_beat
+    picks of beats 1 to n both hold, keep one copy, in place: drop the global copies when the
+    entry's scope is beat, else the per-beat copies (a beat key left empty is removed). Returns
+    one LORA_DUPLICATE_BEATS or LORA_DUPLICATE_GLOBAL note per such LoRA, in global order."""
+    scope_of = _lora_catalog(ctx.ws).entry_scope
+    keys = [str(k) for k in range(1, n + 1)]
+    notes, seen = [], set()
+    for pick in list(picks["global"]):
+        entry = by_id.get(pick.get("id")) if _is_pick(pick) else None
+        if entry is None or entry["target"] != "video" or entry["id"] in seen:
+            continue
+        seen.add(entry["id"])
+
+        def same(p):
+            return _is_pick(p) and p["id"] == entry["id"]
+
+        beats = [int(key) for key in keys if isinstance(picks["per_beat"].get(key), list)
+                 and any(same(p) for p in picks["per_beat"][key])]
+        if not beats:
+            continue
+        if scope_of(entry) == "beat":
+            picks["global"] = [p for p in picks["global"] if not same(p)]
+            notes.append(LORA_DUPLICATE_GLOBAL % (_q(entry["id"]), _nums(beats)))
+            continue
+        for k in beats:
+            kept = [p for p in picks["per_beat"][str(k)] if not same(p)]
+            if kept:
+                picks["per_beat"][str(k)] = kept
+            else:
+                del picks["per_beat"][str(k)]
+        notes.append(LORA_DUPLICATE_BEATS % (_q(entry["id"]), _nums(beats)))
+    return notes
+
+
 def normalize_plan(ctx, raw):
     """(plan, shape): the Section 2.2 plan built from a parsed plan-writer reply (RS9), and the
     P2 violations for container shapes that normalization had to repair (a missing or non-list
@@ -1466,6 +1543,7 @@ def normalize_plan(ctx, raw):
     plan["beats"] = beats
     plan["panels"] = len(beats)
     loras = raw.get("loras")
+    notes = []
     if not ctx.auto_lora or not isinstance(loras, dict):
         picks = _empty_loras()
     else:
@@ -1476,8 +1554,11 @@ def normalize_plan(ctx, raw):
                               for key, value in (per_beat.items()
                                                  if isinstance(per_beat, dict) else [])},
                  "stills": _normalize_picks(loras.get("stills"), by_id)}
+        notes = drop_duplicate_picks(ctx, picks, by_id, len(beats))
     picks["pinned"] = [dict(pin) for pin in ctx.pinned]
     plan["loras"] = picks
+    if notes:
+        plan["lora_notes"] = notes
     plan["spoken_lines"] = required_lines(ctx)
     groups = [entry for entry in plan["cast"] if is_group_entry(entry)]
     plan["cast_notes"] = drop_groups(plan)
@@ -2642,8 +2723,9 @@ def _is_pick(pick):
 
 def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     """(hard, advisory) LoRA violations of a plan (RS11, LC12). Not run without auto LoRA. Hard:
-    L1, L6, L7 and a strength outside (0, 2], which the renderer refuses; L2-L4 and a strength
-    outside the entry's own range are advisory (dialogue spec 6.3, Q4)."""
+    L1, L6, L7, L8 (LoRA scope spec LS5) and a strength outside (0, 2], which the renderer
+    refuses; L2-L4, a strength outside the entry's own range and normalize_plan's duplicate
+    notes (LS6) are advisory (dialogue spec 6.3, Q4)."""
     hard, advisory = [], []
     if not ctx.auto_lora:
         return hard, advisory
@@ -2700,6 +2782,16 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     stills = [e for e in (check_pick(p, "plan", "stills") for p in loras["stills"]) if e]
     pins = loras.get("pinned", [])
 
+    # LoRA scope spec LS5: L8 for a pick its catalog scope does not allow; LS6's notes.
+    for e in global_picks:
+        if lora_catalog.entry_scope(e) == "beat":
+            hard.append(LORA_SCOPE_GLOBAL % _q(e["id"]))
+    for k in sorted(per_beat):
+        for e in per_beat[k]:
+            if lora_catalog.entry_scope(e) == "global":
+                hard.append(LORA_SCOPE_BEAT % (k, _q(e["id"])))
+    advisory += plan.get("lora_notes", [])
+
     def pin_label(pin):
         return pin["catalog_id"] or "pinned LoRA"
 
@@ -2708,11 +2800,6 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
     if len(styles) > 1:
         advisory.append("plan: L2 style: %d style LoRAs for every panel (%s); at most 1"
                     % (len(styles), ", ".join(styles)))
-    for k in sorted(per_beat):
-        for e in per_beat[k]:
-            if e["kind"] == "style":
-                advisory.append("beat %d: L2 style: style LoRA %s can only be a global pick"
-                            % (k, _q(e["id"])))
     by_cast = {c["id"]: c for c in plan["cast"]}
     reported_dupes = set()
     pin_paths = {os.path.realpath(p["path"]) for p in pins}
@@ -4942,7 +5029,8 @@ class _Run(object):
         compatible = compatible_entries(ctx)
         self.compatible_by_id = dict((e["id"], e) for e in compatible)
         self.catalog_by_id = dict((e["id"], e) for e in ctx.catalog.get("entries", []))
-        self.catalog_lines = ([catalog_line(e) for e in compatible if e["target"] == "video"]
+        self.catalog_lines = (catalog_groups(ctx, [e for e in compatible
+                                                   if e["target"] == "video"])
                               if lora_patches_allowed(ctx) else None)
         self.compatible = compatible
 
@@ -5099,7 +5187,7 @@ class _Run(object):
         prev = self.states[judged]
         rdir = os.path.join(self.rounds_dir, "round_%d" % k)
         lora_allowed = bool(self.catalog_lines) and any(
-            parse_violation(m)["id"] in ("L1", "L5", "L6", "L7") for m in prev["hard"])
+            parse_violation(m)["id"] in ("L1", "L5", "L6", "L7", "L8") for m in prev["hard"])
         base = build_critic_prompt(prev["plan"], prev["text"], (prev["hard"], prev["advisory"]),
                                    self.catalog_lines if lora_allowed else None,
                                    narration=self.ctx.narration)
@@ -5580,6 +5668,8 @@ def recheck(ctx, legacy_validate):
                           "story.md: restore or re-add the LoRA files (bin/lora-catalog verify), "
                           "rerun with --no-auto-lora, or pass --force-story to regenerate.",
                           file=sys.stderr)
+                if any(parse_violation(m)["id"] == "L8" for m in blocking_list):
+                    print(RECHECK_SCOPE_HINT, file=sys.stderr)
                 return 2, advisory
             for message in unresolved_list:
                 print("Warning: unresolved: %s" % message)

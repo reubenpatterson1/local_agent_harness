@@ -1401,8 +1401,9 @@ def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
     files = str(tmp_path / "files")
     entries = [seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
                seu.catalog_entry(seu.lora_file(files, "big"), "big-style", kind="style"),
-               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
-               seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics")]
+               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
+               seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics",
+                                 scope="either")]
     lctx = seu.make_ctx(se, ws, catalog={"schema_version": 1, "entries": entries})
 
     def lora(loras, ctx=lctx):
@@ -1422,7 +1423,6 @@ def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
         "plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"])
     for loras, rule, ctx in (
             ({"global": [pick("film-grain"), pick("big-style")]}, "L2", lctx),
-            ({"per_beat": {"2": [pick("film-grain")]}}, "L2", lctx),
             ({"global": [pick("fast-motion")], "per_beat": {"2": [pick("rain-physics")]}}, "L3",
              lctx),
             ({"global": [pick("film-grain")], "per_beat": {"2": [pick("fast-motion")]}}, "L4",
@@ -1437,6 +1437,7 @@ def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
         {"path": rain, "strength": 1.0, "catalog_id": "rain-physics", "kind": "physics"}]))
     assert _only(hard, "L6")
     assert _only(lora({"stills": [pick("nope"), pick("nope-two")]})[0], "L7")
+    assert _only(lora({"per_beat": {"2": [pick("film-grain")]}})[0], "L8")
 
 
 def test_dlg21_an_advisory_only_round_0_passes_untouched(tmp_path, monkeypatch, capsys):

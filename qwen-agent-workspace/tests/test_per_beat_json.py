@@ -27,9 +27,9 @@ se = importlib.machinery.SourceFileLoader(
     "story_engine_for_per_beat_json", os.path.join(WS, "story_engine.py")).load_module()
 
 PICK = {"id": "fast-motion", "strength": 0.8}
-CLAUSE = ("per_beat maps each beat number to a list of motion or physics picks for that beat "
-          "only, and each key is the beat number alone in double quotes: the key of beat 1 is "
-          '"1";')
+CLAUSE = ("per_beat maps each beat number to a list of picks for that beat only, taken only "
+          "from the LoRAs that may be per-beat picks, and each key is the beat number alone in "
+          'double quotes: the key of beat 1 is "1";')
 QUOTED = 'the old prompt made it write "string": "1": [ before every pick'
 
 
@@ -94,10 +94,12 @@ def test_pjt1_the_lora_paragraph_names_the_per_beat_key(ws, tmp_path):
     assert se.LORA_PICK_PARAGRAPH == (
         "an object with the keys global, per_beat and stills. Each pick is an object with the "
         "keys id and strength, taken from the LoRA catalog below; strength must lie inside that "
-        "entry's range. global is a list of picks applied to every panel: at most one style "
-        "LoRA, plus motion or physics LoRAs that suit the whole movie. " + CLAUSE + " every beat "
-        "may have at most one motion or physics LoRA in total, counting global. stills is a "
-        "list of at most one stills LoRA.")
+        "entry's range. The catalog lists each LoRA under the places where it may go. global "
+        "is a list of picks applied to every panel, taken only from the LoRAs that may be global "
+        "picks: at most one style LoRA, plus motion or physics LoRAs that suit the whole movie. "
+        + CLAUSE + " a LoRA in global is never also in per_beat, and every beat may have at "
+        "most one motion or physics LoRA in total, counting global. stills is a list of at most "
+        "one stills LoRA.")
     assert old not in se.LORA_PICK_PARAGRAPH
     assert "{" not in se.LORA_PICK_PARAGRAPH and "}" not in se.LORA_PICK_PARAGRAPH
     assert se.LORA_EMPTY_PARAGRAPH == (

@@ -1991,7 +1991,7 @@ def _catalog_plan_error(args, plan, picks, dry_run=False):
 
 
 def _catalog_checks_error(args, plan, dry_run=False):
-    """The LC13 Error line when the plan's LoRA picks fail the engine's catalog checks (L1-L7)."""
+    """The LC13 Error line when the plan's LoRA picks fail the engine's catalog checks (L1-L8)."""
     engine = _story_engine()
     ctx = _story_context(args, dry_run)
     compatible = dict((e["id"], e) for e in engine.compatible_entries(ctx))
