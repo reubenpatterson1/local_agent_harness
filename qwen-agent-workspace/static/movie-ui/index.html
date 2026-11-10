@@ -415,7 +415,7 @@
     <label>ID <input id="l-id" type="text" size="20"></label>
     <label>Kind <select id="l-kind"><option>style</option><option>motion</option><option>physics</option></select></label>
     <label>Target <select id="l-target"><option>video</option><option>stills</option></select></label>
-    <label>Scope <select id="l-scope"><option value="">default for the kind</option><option>global</option><option>beat</option><option>either</option></select></label> <span class="muted">Where the story planner may put a video LoRA: global applies it to every panel, beat only to the beats it suits, either lets the planner choose. The default is global for style and beat for motion and physics. A stills LoRA has no scope.</span>
+    <label>Scope <select id="l-scope"><option value="">default for the kind</option><option>global</option><option>beat</option><option>either</option></select></label> <span class="muted">Where the story planner may put a motion or physics video LoRA: global applies it to every panel, beat only to the beats it suits, either lets the planner choose; the default is beat. A style LoRA is always global, and a stills LoRA has no scope, so the select is off for both.</span>
     <label class="wide">Base models <select id="l-base-models" multiple size="3"></select> <span class="muted">(hosted models; filtered by target)</span></label>
     <label>Triggers <input id="l-triggers" type="text" size="30" placeholder="comma separated"></label>
     <label class="wide">Description <input id="l-description" type="text" size="60"></label>

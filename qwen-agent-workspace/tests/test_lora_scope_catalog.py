@@ -73,7 +73,7 @@ def test_lst1_the_scope_field_and_its_defaults(tmp_path, story_env):
     assert [lora_catalog.entry_scope(e) for e in (grain, fast, rain, ink)] == [
         "global", "beat", "beat", None]
     for scope in lora_catalog.SCOPES:
-        for entry in (grain, fast, ink):
+        for entry in ((grain, fast, ink) if scope == "global" else (fast, ink)):
             lora_catalog.validate_entry(dict(entry, scope=scope))
         assert lora_catalog.entry_scope(dict(fast, scope=scope)) == scope
     assert lora_catalog.entry_scope(dict(ink, scope="beat")) is None

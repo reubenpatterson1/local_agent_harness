@@ -12,9 +12,10 @@
   bin/lora-catalog verify [ID ...]
 
 bin/ltx-movie's story planner may pick catalog entries for the whole movie or for one beat, as
-each video entry's scope allows (global, beat or either; without a scope, style LoRAs are global
-and motion and physics LoRAs are per-beat: LoRA scope spec LS1); trained library characters are
-listed and verified here but are cast only with bin/ltx-movie --character. `add` runs
+each video entry's scope allows (a motion or physics LoRA's scope is global, beat or either, by
+default beat; a style LoRA's scope is always global: LoRA scope spec LS1 and its fix round A1);
+trained library characters are listed and verified here but are cast only with
+bin/ltx-movie --character. `add` runs
 bin/lora-check's architecture gate against each declared
 --base-model found on disk and refuses a LoRA whose tensors don't match (override with
 --no-arch-check; an unlocatable base is a warning, not a refusal). The catalog lives in
@@ -100,9 +101,9 @@ def build_parser():
     add.add_argument("--rank", type=int, default=None)
     add.add_argument("--alpha", type=int, default=None)
     add.add_argument("--scope", choices=lora_catalog.SCOPES, default=None,
-                     help="where the story planner may place this video LoRA: global (every "
-                          "panel), beat (one beat) or either; default: global for style, beat "
-                          "for motion and physics")
+                     help="where the story planner may place this motion or physics video "
+                          "LoRA: global (every panel), beat (one beat) or either; default: "
+                          "beat. A style LoRA is always global")
     add.add_argument("--no-arch-check", dest="arch_check", action="store_false", default=True,
                      help="skip the architecture-match gate (bin/lora-check) against the "
                           "declared base model(s)")
@@ -112,7 +113,8 @@ def build_parser():
     rm = sub.add_parser("remove", help="remove a catalog entry (the file is not touched)")
     rm.add_argument("entry_id", metavar="ID")
     scope = sub.add_parser("scope", help="set where the story planner may place a catalog video "
-                                         "LoRA (default: the default for its kind)")
+                                         "LoRA (default: the default for its kind; a style LoRA "
+                                         "may only be global)")
     scope.add_argument("entry_id", metavar="ID")
     scope.add_argument("scope", choices=lora_catalog.SCOPES + ("default",))
     ver = sub.add_parser("verify", help="check catalog entries against their files")
@@ -145,6 +147,9 @@ def cmd_add(args):
     if args.scope is not None and args.target != "video":
         return _error("--scope applies only to video LoRAs; a stills LoRA is only ever the "
                       "stills pick")
+    if args.kind == "style" and args.scope in ("beat", "either"):
+        return _error("--scope %s applies only to motion and physics LoRAs; a style LoRA is only "
+                      "ever a global pick" % args.scope)
     with lora_catalog.catalog_lock(path):
         if not os.path.isfile(args.path) or not os.access(args.path, os.R_OK):
             return _error("%s is not a readable file" % args.path)
@@ -312,6 +317,9 @@ def cmd_scope(args):
         entry = dict(found[0])
         if entry["target"] != "video":
             return _error("%s is a stills LoRA; scope applies only to video LoRAs" % entry["id"])
+        if entry["kind"] == "style" and args.scope in ("beat", "either"):
+            return _error("%s is a style LoRA; a style LoRA is only ever a global pick, so its "
+                          "scope is global or default" % entry["id"])
         entry.pop("scope", None)
         if args.scope != "default":
             entry["scope"] = args.scope

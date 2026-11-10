@@ -1246,6 +1246,8 @@ def _h_lora_add(self, groups, query, body):
     scope = body.get("scope")
     if scope is not None and scope not in LORA_SCOPES:
         raise ApiError(400, "scope must be global, beat, either or null")
+    if kind == "style" and scope in ("beat", "either"):
+        raise ApiError(400, "scope must be global or null for a style LoRA")
     no_arch_check = body.get("no_arch_check", False)
     if not isinstance(no_arch_check, bool):
         raise ApiError(400, "no_arch_check must be true or false")

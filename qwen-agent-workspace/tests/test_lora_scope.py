@@ -35,9 +35,11 @@ GLOBAL_L8 = ("plan: L8 scope: 'fast-motion' may only be a per-beat pick (its cat
 BEAT_L8 = ("beat %d: L8 scope: 'film-grain' may only be a global pick (its catalog scope is "
            "global), but it is a pick for this beat; remove it from this beat, or move it to "
            "global if it suits the whole movie")
-HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: set the LoRA's "
-        "scope to either with bin/lora-catalog scope ID either (or in the movie UI's LoRA "
-        "catalog), or pass --force-story to regenerate.")
+HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: give a motion "
+        "or physics LoRA the scope either with bin/lora-catalog scope ID either (or the Scope "
+        "select of its row in the movie UI's LoRAs tab), or pass --force-story to regenerate; a "
+        "style LoRA is only ever a global pick, so a style LoRA picked for a beat needs "
+        "--force-story.")
 
 
 @pytest.fixture(autouse=True)
@@ -153,14 +155,13 @@ def test_lst5_a_pick_its_scope_does_not_allow_is_l8(ws, tmp_path):
     assert [se.parse_violation(m) for m in (GLOBAL_L8, BEAT_L8 % 3)] == [
         {"id": "L8", "name": "scope", "scope": "plan", "index": None, "message": GLOBAL_L8},
         {"id": "L8", "name": "scope", "scope": "beat", "index": 3, "message": BEAT_L8 % 3}]
-    either = _ctx(ws, tmp_path, entries=_entries(tmp_path, film="either", fast="either"))
-    assert _checks(either, {"global": [_pick("fast-motion")],
-                            "per_beat": {"2": [_pick("film-grain")]}}) == ([], [])
-    swapped = _ctx(ws, tmp_path, entries=_entries(tmp_path, film="beat", fast="global"))
-    assert _checks(swapped, {"global": [_pick("fast-motion")],
-                             "per_beat": {"2": [_pick("film-grain")]}}) == ([], [])
-    assert _checks(swapped, {"global": [_pick("film-grain")]})[0] == [
-        GLOBAL_L8.replace("fast-motion", "film-grain")]
+    either = _ctx(ws, tmp_path, entries=_entries(tmp_path, fast="either"))
+    assert _checks(either, {"global": [_pick("fast-motion")]}) == ([], [])
+    assert _checks(either, {"per_beat": {"2": [_pick("fast-motion")]}}) == ([], [])
+    swapped = _ctx(ws, tmp_path, entries=_entries(tmp_path, fast="global"))
+    assert _checks(swapped, {"global": [_pick("fast-motion")]}) == ([], [])
+    assert _checks(swapped, {"per_beat": {"2": [_pick("fast-motion")]}})[0] == [
+        (BEAT_L8 % 2).replace("film-grain", "fast-motion")]
     fast = dict((e["id"], e) for e in ctx.catalog["entries"])["fast-motion"]
     pinned = ctx._replace(pinned=[{"path": fast["path"], "strength": 0.8,
                                    "catalog_id": "fast-motion", "kind": "motion"}])
@@ -173,7 +174,7 @@ def test_lst5_a_pick_its_scope_does_not_allow_is_l8(ws, tmp_path):
 # --- LST6 (LS6): one copy of a LoRA picked both globally and for some beats ---------------------
 
 def test_lst6_a_global_and_per_beat_duplicate_keeps_one_copy(ws, tmp_path):
-    for scope in (None, "either"):
+    for scope in (None, "global"):
         ctx = _ctx(ws, tmp_path, entries=_entries(tmp_path, film=scope, fast="either"))
         plan = _plan(ctx, {"global": [_pick("film-grain"), _pick("fast-motion")],
                            "per_beat": {"1": [_pick("film-grain", 0.6)],

@@ -2888,9 +2888,11 @@
     });
   }
 
-  // LoRA scope spec LS7: a video entry's scope is chosen in its row; "default" clears it.
+  // LoRA scope spec LS7: a video entry's scope is chosen in its row; "default" clears it. A style
+  // LoRA's scope is always global (fix round A1), so its row has no select.
   function scopeCell(e) {
     if (e.target !== "video") { return el("td", {text: "-"}); }
+    if (e.kind === "style") { return el("td", {text: "global"}); }
     const select = el("select", {cls: "l-row-scope"}, [el("option", {value: "default", text: "default (" + LORA_SCOPE_DEFAULTS[e.kind] + ")"}),
       el("option", {value: "global", text: "global"}), el("option", {value: "beat", text: "beat"}),
       el("option", {value: "either", text: "either"})]);
@@ -2904,6 +2906,12 @@
     return el("td", {}, [select]);
   }
 
+  // Fix round A1: a stills LoRA has no scope and a style LoRA's is always global, so the add
+  // form's Scope select is off for both.
+  function syncLoraScope() {
+    $("#l-scope").disabled = $("#l-target").value !== "video" || $("#l-kind").value === "style";
+  }
+
   function splitList(selector) {
     return $(selector).value.split(",").map(function (v) { return v.trim(); }).filter(Boolean);
   }
@@ -2913,7 +2921,9 @@
       downloadModel($("#m-dl-repo").value, $("#m-dl-hub").value, $("#m-dl-status"));
     });
     $("#l-target").addEventListener("change", fillLoraBaseModels);
-    $("#l-target").addEventListener("change", function () { $("#l-scope").disabled = $("#l-target").value !== "video"; });
+    $("#l-target").addEventListener("change", syncLoraScope);
+    $("#l-kind").addEventListener("change", syncLoraScope);
+    syncLoraScope();
     $("#l-verify-all").addEventListener("click", async function () {
       const res = await api("POST", "/api/loras/verify", {ws: S.ws, ids: []});
       if (res.data && res.data.run) {
@@ -2932,7 +2942,7 @@
         default_strength: Number($("#l-default-strength").value),
         strength_range: [Number($("#l-range-lo").value), Number($("#l-range-hi").value)],
         rank: numberOrNull("#l-rank"), alpha: numberOrNull("#l-alpha"),
-        scope: $("#l-target").value === "video" && $("#l-scope").value ? $("#l-scope").value : null,
+        scope: !$("#l-scope").disabled && $("#l-scope").value ? $("#l-scope").value : null,
         no_arch_check: $("#l-no-arch-check").checked};
       const res = await api("POST", "/api/loras", body);
       $("#l-output").textContent = res.data && res.data.run ? runText(res.data.run) : (res.data && res.data.error);

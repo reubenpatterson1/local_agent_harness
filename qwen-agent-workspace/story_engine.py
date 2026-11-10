@@ -612,9 +612,13 @@ LORA_DUPLICATE_BEATS = ("plan: L6 duplicate: %s was picked both globally and for
 LORA_DUPLICATE_GLOBAL = ("plan: L6 duplicate: %s was picked both globally and for beat(s) %s; its "
                          "catalog scope is beat, so the pipeline kept the per-beat picks and "
                          "dropped the global pick")
+# Fix round A1, A3: a style LoRA's scope is always global, so only a motion or physics LoRA's
+# scope can make its pick allowed; bin/ltx-movie's Phase 2 and 3 errors print this hint too.
 RECHECK_SCOPE_HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: "
-                      "set the LoRA's scope to either with bin/lora-catalog scope ID either (or "
-                      "in the movie UI's LoRA catalog), or pass --force-story to regenerate.")
+                      "give a motion or physics LoRA the scope either with bin/lora-catalog "
+                      "scope ID either (or the Scope select of its row in the movie UI's LoRAs "
+                      "tab), or pass --force-story to regenerate; a style LoRA is only ever a "
+                      "global pick, so a style LoRA picked for a beat needs --force-story.")
 
 
 def _fill(template, fragments, scalars, narrative):
@@ -2790,7 +2794,9 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
         for e in per_beat[k]:
             if lora_catalog.entry_scope(e) == "global":
                 hard.append(LORA_SCOPE_BEAT % (k, _q(e["id"])))
-    advisory += plan.get("lora_notes", [])
+    # Fix round A4: a hand-edited plan.json's lora_notes may be anything; only its strings count.
+    notes = plan.get("lora_notes")
+    advisory += [m for m in notes if isinstance(m, str)] if isinstance(notes, list) else []
 
     def pin_label(pin):
         return pin["catalog_id"] or "pinned LoRA"
@@ -4747,25 +4753,34 @@ def apply_patches(ctx, state, patches, lora_allowed=None, repairable=None):
             accepted.append(patch)
     compatible_by_id = {e["id"]: e for e in compatible_entries(ctx)}
     catalog_by_id = {e["id"]: e for e in ctx.catalog.get("entries", [])}
-    for patch in accepted:
-        if patch["target"] != "plan":
-            continue
-        index = patch["index"]
-        before = sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
-        saved = copy.deepcopy(plan["loras"])
-        if index == 0:
-            plan["loras"]["global"] = patch["replacement"]
-        elif patch["replacement"]:
-            plan["loras"]["per_beat"][str(index)] = patch["replacement"]
-        else:
-            plan["loras"]["per_beat"].pop(str(index), None)
-        broken = [h for h in sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
-                  if h not in before]
-        if broken:
-            plan["loras"] = saved
-            rejected.append({"patch": patch, "reason": "would break " + broken[0]})
-            continue
-        applied.append(patch)
+    # LoRA scope fix round A2: moving a LoRA between global and a beat takes two patches, and the
+    # order that adds the new copy first breaks L6 until the old copy goes. So a lora patch that
+    # would break the plan is tried again after the others; the ones still breaking it after a
+    # pass that applies none are rejected, each with the reason of its last try.
+    pending = [patch for patch in accepted if patch["target"] == "plan"]
+    while pending:
+        failed = []
+        for patch in pending:
+            index = patch["index"]
+            before = sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
+            saved = copy.deepcopy(plan["loras"])
+            if index == 0:
+                plan["loras"]["global"] = patch["replacement"]
+            elif patch["replacement"]:
+                plan["loras"]["per_beat"][str(index)] = patch["replacement"]
+            else:
+                plan["loras"]["per_beat"].pop(str(index), None)
+            broken = [h for h in sum(lora_checks(ctx, plan, compatible_by_id, catalog_by_id), [])
+                      if h not in before]
+            if broken:
+                plan["loras"] = saved
+                failed.append({"patch": patch, "reason": "would break " + broken[0]})
+                continue
+            applied.append(patch)
+        if len(failed) == len(pending):
+            rejected += failed
+            break
+        pending = [item["patch"] for item in failed]
     q1 = bool(plan.get("spoken_lines")) and (repairable is None
                                              or "Q1" in repairable.get("story", set()))
     for patch in accepted:

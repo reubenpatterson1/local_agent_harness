@@ -88,12 +88,17 @@ def test_lst11_the_static_page_sets_the_scope():
                          r"physics: \"(\w+)\"\};", js)
     assert defaults and dict(zip(("style", "motion", "physics"), defaults.groups())) == (
         lora_catalog.DEFAULT_SCOPES)
-    for text in ('scope: $("#l-target").value === "video" && $("#l-scope").value ? '
-                 '$("#l-scope").value : null,',
+    for text in ('scope: !$("#l-scope").disabled && $("#l-scope").value ? $("#l-scope").value : '
+                 'null,',
                  'api("POST", "/api/loras/scope", {ws: S.ws, id: e.id, scope: select.value})',
                  'select.value = e.scope || "default";',
                  'scopeCell(e), el("td", {text: strength}),',
-                 '$("#l-scope").disabled = $("#l-target").value !== "video";'):
+                 '$("#l-scope").disabled = $("#l-target").value !== "video" || '
+                 '$("#l-kind").value === "style";',
+                 'if (e.kind === "style") { return el("td", {text: "global"}); }',
+                 '$("#l-target").addEventListener("change", syncLoraScope);',
+                 '$("#l-kind").addEventListener("change", syncLoraScope);',
+                 '\n    syncLoraScope();\n'):
         assert js.count(text) == 1, text
     node = shutil.which("node")
     if node:
