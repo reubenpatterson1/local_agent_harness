@@ -221,9 +221,10 @@ def test_pbt7_complete_and_non_ok_replies_keep_todays_path(ws, tmp_path, monkeyp
                         critic=[seu.answer(seu.critic_json())])
     assert rc == 0
     assert _budgets(log) == ["4096", "4096"]
-    assert ("\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- the reply is not one JSON object\n"
-            "Previous reply:\n{not json}\n\nReply with the complete corrected JSON object only."
-            ) in log[1]["argv"][-1]
+    assert ("\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n- the reply is not one JSON object"
+            " (the JSON parser stopped at line 1, column 2 of the previous reply: Expecting "
+            "property name enclosed in double quotes)\nPrevious reply:\n{not json}\n\nReply "
+            "with the complete corrected JSON object only.") in log[1]["argv"][-1]
     assert not [c for c in _plan_calls(ctx) if "cut_off_at_tokens" in c]
     assert "was cut off" not in capsys.readouterr().out
     cut = dict(_cut("chained", 3), status="max_rounds")
