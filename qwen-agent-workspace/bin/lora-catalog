@@ -5,18 +5,21 @@
                    --base-model M [--base-model M ...] [--trigger T ...]
                    --description TEXT --use-when TEXT [--avoid-when TEXT]
                    [--default-strength S] [--strength-range LO,HI] [--rank N] [--alpha N]
-                   [--no-arch-check]
+                   [--scope {global,beat,either}] [--no-arch-check]
   bin/lora-catalog list [--model M] [--json]
   bin/lora-catalog remove ID
+  bin/lora-catalog scope ID {global,beat,either,default}
   bin/lora-catalog verify [ID ...]
 
-bin/ltx-movie's story planner may pick catalog entries per panel (style LoRAs only for the
-whole movie); trained library characters are listed and verified here but are cast only with
-bin/ltx-movie --character. `add` runs bin/lora-check's architecture gate against each declared
+bin/ltx-movie's story planner may pick catalog entries for the whole movie or for one beat, as
+each video entry's scope allows (global, beat or either; without a scope, style LoRAs are global
+and motion and physics LoRAs are per-beat: LoRA scope spec LS1); trained library characters are
+listed and verified here but are cast only with bin/ltx-movie --character. `add` runs
+bin/lora-check's architecture gate against each declared
 --base-model found on disk and refuses a LoRA whose tensors don't match (override with
 --no-arch-check; an unlocatable base is a warning, not a refusal). The catalog lives in
 $LORA_CATALOG_DIR when set (tests only), else
-generated/loras/. add and remove hold the catalog lock for their whole read-modify-write.
+generated/loras/. add, remove and scope hold the catalog lock for their whole read-modify-write.
 Exit codes: 0 success, 1 verify found problems, 2 usage or validation error. See
 docs/superpowers/specs/2026-10-17-robust-story-lora-catalog-design.md, Section 4.
 """
@@ -31,7 +34,7 @@ WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, WS)
 import lora_catalog  # noqa: E402
 
-ROW_FORMAT = "%-24s %-9s %-7s %-14s %-24s %s"
+ROW_FORMAT = "%-24s %-9s %-7s %-7s %-14s %-24s %s"
 
 
 def _load_checker():
@@ -96,6 +99,10 @@ def build_parser():
                      metavar="LO,HI")
     add.add_argument("--rank", type=int, default=None)
     add.add_argument("--alpha", type=int, default=None)
+    add.add_argument("--scope", choices=lora_catalog.SCOPES, default=None,
+                     help="where the story planner may place this video LoRA: global (every "
+                          "panel), beat (one beat) or either; default: global for style, beat "
+                          "for motion and physics")
     add.add_argument("--no-arch-check", dest="arch_check", action="store_false", default=True,
                      help="skip the architecture-match gate (bin/lora-check) against the "
                           "declared base model(s)")
@@ -104,6 +111,10 @@ def build_parser():
     lst.add_argument("--json", dest="as_json", action="store_true", default=False)
     rm = sub.add_parser("remove", help="remove a catalog entry (the file is not touched)")
     rm.add_argument("entry_id", metavar="ID")
+    scope = sub.add_parser("scope", help="set where the story planner may place a catalog video "
+                                         "LoRA (default: the default for its kind)")
+    scope.add_argument("entry_id", metavar="ID")
+    scope.add_argument("scope", choices=lora_catalog.SCOPES + ("default",))
     ver = sub.add_parser("verify", help="check catalog entries against their files")
     ver.add_argument("entry_ids", metavar="ID", nargs="*")
     return parser
@@ -131,6 +142,9 @@ def cmd_add(args):
         span = _parse_range(args.strength_range)
     except ValueError:
         return _error("--strength-range must be LO,HI, got %r" % args.strength_range)
+    if args.scope is not None and args.target != "video":
+        return _error("--scope applies only to video LoRAs; a stills LoRA is only ever the "
+                      "stills pick")
     with lora_catalog.catalog_lock(path):
         if not os.path.isfile(args.path) or not os.access(args.path, os.R_OK):
             return _error("%s is not a readable file" % args.path)
@@ -197,6 +211,8 @@ def cmd_add(args):
                  "strength_range": span, "description": args.description,
                  "use_when": args.use_when, "avoid_when": args.avoid_when,
                  "added_at": lora_catalog.utc_now()}
+        if args.scope is not None:
+            entry["scope"] = args.scope
         try:
             lora_catalog.validate_entry(entry)
             lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
@@ -219,7 +235,8 @@ def _strength_text(entry):
 
 
 def _row(entry):
-    return ROW_FORMAT % (entry["id"], entry["kind"], entry["target"], _strength_text(entry),
+    return ROW_FORMAT % (entry["id"], entry["kind"], entry["target"],
+                         lora_catalog.entry_scope(entry) or "-", _strength_text(entry),
                          ",".join(entry["triggers"]), ",".join(entry["base_models"]))
 
 
@@ -237,7 +254,7 @@ def cmd_list(args):
         print(json.dumps({"catalog": path, "entries": entries, "characters": characters},
                          indent=2, ensure_ascii=False))
         return 0
-    header = ROW_FORMAT % ("ID", "KIND", "TARGET", "STRENGTH", "TRIGGERS", "BASE_MODELS")
+    header = ROW_FORMAT % ("ID", "KIND", "TARGET", "SCOPE", "STRENGTH", "TRIGGERS", "BASE_MODELS")
     if not entries:
         print("no LoRAs in %s" % path)
         if characters:
@@ -273,6 +290,44 @@ def cmd_remove(args):
         except OSError as e:
             return _error("cannot write %s: %s" % (path, e.strerror or e))
     print("removed %s from %s" % (args.entry_id, path))
+    return 0
+
+
+def cmd_scope(args):
+    """Set or clear one video entry's scope (LoRA scope spec LS3) under the catalog lock."""
+    path = lora_catalog.catalog_path(WS)
+    if args.entry_id.startswith("char:"):
+        return _error("%s is a library character; it is cast with bin/ltx-movie --character and "
+                      "has no scope" % args.entry_id)
+    if not os.path.isdir(os.path.dirname(path)):
+        return _error("no catalog entry %s" % args.entry_id)
+    with lora_catalog.catalog_lock(path):
+        try:
+            catalog = lora_catalog.load_catalog(path)
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+        found = [e for e in catalog["entries"] if e["id"] == args.entry_id]
+        if not found:
+            return _error("no catalog entry %s" % args.entry_id)
+        entry = dict(found[0])
+        if entry["target"] != "video":
+            return _error("%s is a stills LoRA; scope applies only to video LoRAs" % entry["id"])
+        entry.pop("scope", None)
+        if args.scope != "default":
+            entry["scope"] = args.scope
+        entries = [entry if e["id"] == entry["id"] else e for e in catalog["entries"]]
+        try:
+            lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
+                                             "entries": entries})
+        except lora_catalog.CatalogError as e:
+            return _error(str(e))
+        except OSError as e:
+            return _error("cannot write %s: %s" % (path, e.strerror or e))
+    if args.scope == "default":
+        print("%s: scope %s (the default for a %s LoRA) in %s"
+              % (entry["id"], lora_catalog.entry_scope(entry), entry["kind"], path))
+    else:
+        print("%s: scope %s in %s" % (entry["id"], args.scope, path))
     return 0
 
 
@@ -322,7 +377,7 @@ def cmd_verify(args):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    return {"add": cmd_add, "list": cmd_list, "remove": cmd_remove,
+    return {"add": cmd_add, "list": cmd_list, "remove": cmd_remove, "scope": cmd_scope,
             "verify": cmd_verify}[args.command](args)
 
 

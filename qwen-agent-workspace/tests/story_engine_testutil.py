@@ -96,14 +96,18 @@ def sha256_file(path):
 
 def catalog_entry(path, entry_id, kind="motion", target="video", triggers=(), rank=16,
                   base_models=(VIDEO_MODEL,), default_strength=0.8, strength_range=(0.5, 1.0),
-                  description="a test LoRA", use_when="a test fits", avoid_when=""):
-    """A valid catalog entry for the existing file at path (sha256 and bytes from the file)."""
-    return {"id": entry_id, "kind": kind, "path": os.path.abspath(path),
-            "sha256": sha256_file(path), "bytes": os.path.getsize(path),
-            "base_models": list(base_models), "target": target, "triggers": list(triggers),
-            "rank": rank, "alpha": rank, "default_strength": default_strength,
-            "strength_range": list(strength_range), "description": description,
-            "use_when": use_when, "avoid_when": avoid_when, "added_at": "2026-10-17T12:00:00Z"}
+                  description="a test LoRA", use_when="a test fits", avoid_when="", scope=None):
+    """A valid catalog entry for the existing file at path (sha256 and bytes from the file); a
+    scope other than None is written as the entry's scope (LoRA scope spec LS1)."""
+    entry = {"id": entry_id, "kind": kind, "path": os.path.abspath(path),
+             "sha256": sha256_file(path), "bytes": os.path.getsize(path),
+             "base_models": list(base_models), "target": target, "triggers": list(triggers),
+             "rank": rank, "alpha": rank, "default_strength": default_strength,
+             "strength_range": list(strength_range), "description": description,
+             "use_when": use_when, "avoid_when": avoid_when, "added_at": "2026-10-17T12:00:00Z"}
+    if scope is not None:
+        entry["scope"] = scope
+    return entry
 
 
 def make_catalog(directory, entries):
