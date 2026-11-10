@@ -408,13 +408,14 @@
 
 <section id="panel-loras" class="panel" hidden>
   <h3>Catalog <button id="l-verify-all" type="button">Verify all</button></h3>
-  <table id="l-table" class="list"><thead><tr><th>ID</th><th>Kind</th><th>Target</th><th>Strength</th><th>Triggers</th><th>Base models</th><th>Verify</th><th></th></tr></thead><tbody></tbody></table>
+  <table id="l-table" class="list"><thead><tr><th>ID</th><th>Kind</th><th>Target</th><th>Scope</th><th>Strength</th><th>Triggers</th><th>Base models</th><th>Verify</th><th></th></tr></thead><tbody></tbody></table>
   <h3>Add a LoRA</h3>
   <div class="grid">
     <label class="wide">Path <input id="l-path" type="text" size="60" placeholder="/absolute/path/to/file.safetensors"></label>
     <label>ID <input id="l-id" type="text" size="20"></label>
     <label>Kind <select id="l-kind"><option>style</option><option>motion</option><option>physics</option></select></label>
     <label>Target <select id="l-target"><option>video</option><option>stills</option></select></label>
+    <label>Scope <select id="l-scope"><option value="">default for the kind</option><option>global</option><option>beat</option><option>either</option></select></label> <span class="muted">Where the story planner may put a video LoRA: global applies it to every panel, beat only to the beats it suits, either lets the planner choose. The default is global for style and beat for motion and physics. A stills LoRA has no scope.</span>
     <label class="wide">Base models <select id="l-base-models" multiple size="3"></select> <span class="muted">(hosted models; filtered by target)</span></label>
     <label>Triggers <input id="l-triggers" type="text" size="30" placeholder="comma separated"></label>
     <label class="wide">Description <input id="l-description" type="text" size="60"></label>
