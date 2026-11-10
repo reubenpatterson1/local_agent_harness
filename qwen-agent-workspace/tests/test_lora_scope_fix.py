@@ -102,7 +102,8 @@ def test_lst12_a_style_lora_is_only_ever_global(tmp_path, story_env):
         with pytest.raises(lora_catalog.CatalogError) as exc:
             lora_catalog.validate_entry(dict(grain, scope=scope))
         assert str(exc.value) == ("entry film-grain: scope must be global for a style LoRA, "
-                                  "which applies to every panel, got %r" % scope)
+                                  "which applies to every panel, got %r; edit catalog.json by "
+                                  "hand: remove the scope key or set it to global" % scope)
         assert lora_catalog.entry_scope(dict(grain, scope=scope)) == "global"
     lora_catalog.validate_entry(dict(grain, scope="global"))
     lora_catalog.validate_entry(dict(grain, target="stills", base_models=[seu.STILLS_MODEL],
@@ -111,7 +112,8 @@ def test_lst12_a_style_lora_is_only_ever_global(tmp_path, story_env):
     with pytest.raises(lora_catalog.CatalogError) as exc:
         lora_catalog.load_catalog(path)
     assert str(exc.value) == ("%s: entry film-grain: scope must be global for a style LoRA, "
-                              "which applies to every panel, got 'either'" % path)
+                              "which applies to every panel, got 'either'; edit catalog.json by "
+                              "hand: remove the scope key or set it to global" % path)
     seu.make_catalog(story_env["catalog"], [grain, fast])
     before = _read_bytes(path)
     ink = seu.lora_file(str(tmp_path / "files"), "ink")

@@ -119,7 +119,8 @@ def validate_entry(entry):
         fail("scope", "must be one of %s, got %r" % (", ".join(SCOPES), entry["scope"]))
     if (entry["target"] == "video" and entry["kind"] == "style"
             and entry.get("scope", "global") != "global"):
-        fail("scope", "must be global for a style LoRA, which applies to every panel, got %r"
+        fail("scope", "must be global for a style LoRA, which applies to every panel, got %r; "
+                      "edit catalog.json by hand: remove the scope key or set it to global"
              % (entry["scope"],))
     triggers = entry["triggers"]
     if not isinstance(triggers, list) or len(triggers) > MAX_TRIGGERS:
