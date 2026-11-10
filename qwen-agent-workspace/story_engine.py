@@ -174,8 +174,38 @@ def _story_manifest(ws):
         "ltx_story_manifest_for_movie", os.path.join(ws, "bin", "ltx-story-manifest")).load_module()
 
 
-def plan_max_tokens(n):
-    return max(4096, n * 250)
+# Plan token budget spec PB1, PB2 (docs/superpowers/specs/2026-11-10-plan-budget-truncation-
+# design.md): a plan that picks catalog LoRAs also writes the loras object, so it gets
+# PLAN_CATALOG_TOKENS_PER_BEAT tokens per beat instead of 250. PB5: the call after a reply cut off
+# at its budget gets half as much again, at most PLAN_MAX_TOKENS_CAP and never less than before.
+PLAN_CATALOG_TOKENS_PER_BEAT = 400
+PLAN_MAX_TOKENS_CAP = 16384
+PLAN_CUT_OFF_NOTE = "plan: reply %d was cut off at %d tokens before its JSON object closed"
+PLAN_CUT_OFF_NEXT = "; call %d gets %d tokens"
+PLAN_CUT_OFF_PROBLEM = ("the reply was cut off at %d tokens, the token budget of call %d, before "
+                        "its JSON object closed; fewer panels (--panels or --length)%s make the "
+                        "plan shorter")
+PLAN_CUT_OFF_RETRY = ("\n\nYOUR PREVIOUS REPLY WAS CUT OFF: it reached its limit of %d tokens "
+                      "before the JSON object closed, so it was discarded. This reply may use up "
+                      "to %d tokens. Write the complete JSON object compactly, with no "
+                      "indentation and no line breaks, so that it fits, and reply with the JSON "
+                      "object only.")
+
+
+def plan_max_tokens(n, catalog=False):
+    return max(4096, n * (PLAN_CATALOG_TOKENS_PER_BEAT if catalog else 250))
+
+
+def plan_tokens(ctx, compatible):
+    """The first plan call's max_tokens (PB1, PB2): the catalog budget exactly when the plan
+    prompt asks for LoRA picks, that is auto LoRA is on and the compatible set is not empty (the
+    test build_plan_prompt makes)."""
+    return plan_max_tokens(most_panels(ctx), catalog=bool(ctx.auto_lora and compatible))
+
+
+def escalated_plan_tokens(budget):
+    """The max_tokens of the plan call after a reply cut off at budget (PB5)."""
+    return max(budget, min(PLAN_MAX_TOKENS_CAP, budget * 3 // 2))
 
 
 def plan_timeout(n):
@@ -305,6 +335,32 @@ def extract_json(text):
     except Exception:
         return None
     return value if isinstance(value, dict) else None
+
+
+def cut_off_json(text):
+    """True when text holds a JSON object that never closes (plan token budget spec PB3): from
+    the first {, counting { [ against } ] outside JSON strings (with backslash escapes), the
+    depth never returns to 0. False for None, for text without a { and for any closed object."""
+    if not text or "{" not in text:
+        return False
+    depth, in_string, escaped = 0, False, False
+    for ch in text[text.index("{"):]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return False
+    return True
 
 
 def parse_violation(text):
@@ -4897,17 +4953,33 @@ class _Run(object):
         # Chained end frames spec CE7: fallback is the latest chained reply that go can use
         # once its end frames are dropped; a fatal last reply or a timeout falls back to it.
         text, found, fallback, problems = prompt, None, None, []
+        # Plan token budget spec PB2-PB7: budget is this call's max_tokens; plan_cut_off is the
+        # problem of the last call when its reply was cut off at its budget, else None.
+        budget = plan_tokens(ctx, self.compatible)
         for attempt in range(1, PLAN_MAX_CALLS + 1):
             if self.expired():
                 return (fallback, None) if fallback else (None, "timeout")
             print("plan: call %d of %d" % (attempt, PLAN_MAX_CALLS))
             started = _now()
-            status, answer = self.agent(text, plan_max_tokens(most_panels(ctx)),
+            status, answer = self.agent(text, budget,
                                         plan_timeout(most_panels(ctx)), image=ctx.seed_agent_image)
             self.record("plan", None, 0, attempt, None, status, started)
             _write_text(os.path.join(rdir, "plan_reply_%d.txt" % attempt),
                         _reply_text(status, answer))
             raw = extract_json(answer)
+            self.plan_cut_off = None
+            if raw is None and status == "ok" and cut_off_json(answer):
+                following = escalated_plan_tokens(budget)
+                self.plan_cut_off = PLAN_CUT_OFF_PROBLEM % (
+                    budget, attempt, " or --no-auto-lora" if ctx.auto_lora and self.compatible
+                    else "")
+                self.doc["calls"][-1]["cut_off_at_tokens"] = budget
+                self.write_run()
+                print(PLAN_CUT_OFF_NOTE % (attempt, budget)
+                      + (PLAN_CUT_OFF_NEXT % (attempt + 1, following)
+                         if attempt < PLAN_MAX_CALLS else ""))
+                text, budget = prompt + PLAN_CUT_OFF_RETRY % (budget, following), following
+                continue
             if raw is None:
                 problems = ["the reply is not one JSON object"]
             else:
@@ -5122,7 +5194,8 @@ class _Run(object):
         # character or gives a spoken line to the wrong speaker, or sets no beat at a library
         # location (location library spec L3.5), is not usable; chained end frames spec CE7: a P24
         # copy outside the end frames too.
-        fatal = self.plan_fatal(found) if found else ["the reply is not one JSON object"]
+        fatal = (self.plan_fatal(found) if found
+                 else [self.plan_cut_off or "the reply is not one JSON object"])
         if fatal:
             calls = len([c for c in self.doc["calls"] if c["stage"] == "plan"])
             print("Error: the story model did not return a usable plan after %d call(s)" % calls,
