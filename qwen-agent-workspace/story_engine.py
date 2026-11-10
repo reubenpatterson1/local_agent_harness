@@ -190,6 +190,9 @@ PLAN_CUT_OFF_RETRY = ("\n\nYOUR PREVIOUS REPLY WAS CUT OFF: it reached its limit
                       "to %d tokens. Write the complete JSON object compactly, with no "
                       "indentation and no line breaks, so that it fits, and reply with the JSON "
                       "object only.")
+# Per-beat JSON spec PJ5 (docs/superpowers/specs/2026-11-10-per-beat-json-design.md): the retry
+# after a reply that is not one JSON object says where the JSON parser stopped (json_error).
+PLAN_JSON_ERROR = " (the JSON parser stopped at line %d, column %d of the previous reply: %s)"
 
 
 def plan_max_tokens(n, catalog=False):
@@ -311,30 +314,72 @@ def run_agent(ctx, prompt, *, max_tokens, timeout, image=None, skill=None, prefl
     return str(envelope.get("status")), answer
 
 
+# Per-beat JSON spec PJ2: a key written "string": "N": (or "string": N:), which a model copied
+# from the old per_beat wording. It never matches valid JSON or the text of a JSON string.
+_STRING_KEY_RE = re.compile(r'"string"[ \t\r\n]*:[ \t\r\n]*(?:"([0-9]+)"|([0-9]+))[ \t\r\n]*:')
+
+
+def repair_string_keys(span):
+    """span with every "string": "N": key rewritten as "N": (per-beat JSON spec PJ2)."""
+    return _STRING_KEY_RE.sub(r'"\1\2":', span)
+
+
+def _json_span(text):
+    """(offset, span) of the JSON object in a model reply, or None (RS6): span runs from the
+    first { to the last } of the body of the first ``` fence when there is one, else of the
+    whole text, and offset is where span starts in text (per-beat JSON spec PJ4)."""
+    start, end = 0, len(text)
+    if "```" in text:
+        start = text.index("```") + 3
+        newline = text.find("\n", start)
+        if newline == -1:
+            if text.startswith("json", start):
+                start += 4
+        else:
+            start = newline + 1
+        fence = text.find("```", start)
+        if fence != -1:
+            end = fence
+    first, last = text.find("{", start, end), text.rfind("}", start, end)
+    if first == -1 or last < first:
+        return None
+    return first, text[first:last + 1]
+
+
 def extract_json(text):
     """The JSON object in a model reply, or None (RS6): the body of the first ``` fence when
-    there is one, then the span from the first { to the last }."""
+    there is one, then the span from the first { to the last }. Per-beat JSON spec PJ3: only a
+    span that json.loads rejects is parsed once more, after repair_string_keys."""
     if text is None:
         return None
     try:
-        if "```" in text:
-            start = text.index("```") + 3
-            newline = text.find("\n", start)
-            if newline == -1:
-                body = text[start:]
-                if body.startswith("json"):
-                    body = body[4:]
-            else:
-                body = text[newline + 1:]
-            end = body.find("```")
-            text = body if end == -1 else body[:end]
-        first, last = text.find("{"), text.rfind("}")
-        if first == -1 or last < first:
+        found = _json_span(text)
+        if found is None:
             return None
-        value = json.loads(text[first:last + 1])
+        try:
+            value = json.loads(found[1])
+        except ValueError:
+            value = json.loads(repair_string_keys(found[1]))
     except Exception:
         return None
     return value if isinstance(value, dict) else None
+
+
+def json_error(text):
+    """(line, column, message) of json.loads' complaint about the span of a reply, with line
+    and column counted from 1 in text itself; None when text is None or has no span, when the
+    span parses and when it nests too deeply for json (per-beat JSON spec PJ4)."""
+    found = None if text is None else _json_span(text)
+    if found is None:
+        return None
+    try:
+        json.loads(found[1])
+    except json.JSONDecodeError as exc:
+        at = found[0] + exc.pos
+        return text.count("\n", 0, at) + 1, at - text.rfind("\n", 0, at), exc.msg
+    except RecursionError:
+        return None
+    return None
 
 
 def cut_off_json(text):
@@ -540,8 +585,9 @@ LORA_PICK_PARAGRAPH = (
     "an object with the keys global, per_beat and stills. Each pick is an object with the keys "
     "id and strength, taken from the LoRA catalog below; strength must lie inside that entry's "
     "range. global is a list of picks applied to every panel: at most one style LoRA, plus "
-    "motion or physics LoRAs that suit the whole movie. per_beat maps a beat index, written as a "
-    "string, to a list of motion or physics picks for that beat only; every beat may have at "
+    "motion or physics LoRAs that suit the whole movie. per_beat maps each beat number to a list "
+    "of motion or physics picks for that beat only, and each key is the beat number alone in "
+    'double quotes: the key of beat 1 is "1"; every beat may have at '
     "most one motion or physics LoRA in total, counting global. stills is a list of at most one "
     "stills LoRA.")
 
@@ -4981,7 +5027,10 @@ class _Run(object):
                 text, budget = prompt + PLAN_CUT_OFF_RETRY % (budget, following), following
                 continue
             if raw is None:
-                problems = ["the reply is not one JSON object"]
+                # Per-beat JSON spec PJ5: name the parser's complaint when the reply has a span.
+                error = json_error(answer)
+                problems = ["the reply is not one JSON object"
+                            + (PLAN_JSON_ERROR % error if error else "")]
             else:
                 plan, shape = normalize_plan(ctx, raw)
                 hard = (plan_checks(ctx, plan, shape)[0]
