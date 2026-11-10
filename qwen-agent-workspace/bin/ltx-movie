@@ -3703,7 +3703,7 @@ def _print_robust_phase1(args, paths):
     if args.judge:
         print("Judge gate: bin/judge-story --patches after the critic rounds (report only).")
     prompt = engine.build_plan_prompt(ctx, compatible, ctx.pinned)
-    argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_max_tokens(engine.most_panels(ctx)),
+    argv = engine.agent_cmd(ctx, prompt, max_tokens=engine.plan_tokens(ctx, compatible),
                             image=ctx.seed_agent_image)
     print("Command (subprocess timeout %ds): %s"
           % (engine.plan_timeout(engine.most_panels(ctx)), shlex.join(argv)))
