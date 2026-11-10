@@ -6,6 +6,7 @@
 (function () {
   const TOKEN_KEY = "movie-ui-token";
   const STILLS_MODEL = "Tongyi-MAI/Z-Image-Turbo";
+  const LORA_SCOPE_DEFAULTS = {style: "global", motion: "beat", physics: "beat"};  // lora_catalog.DEFAULT_SCOPES (LoRA scope spec LS7)
   const BATCH_POLL_MS = 2000;   // batch forks spec 1.1: the jobs poll interval
   const LEVEL_LABELS = {render: "Render", stills: "New stills", replan: "Re-plan"};
   const SEEDS_MAX = 100;   // seed-folder spec 1.1: the most seeds in one run
@@ -2881,10 +2882,34 @@
       });
       const strength = e.default_strength + (e.strength_range ? " (" + e.strength_range.join("-") + ")" : "");
       body.appendChild(el("tr", {}, [el("td", {text: e.id}), el("td", {text: e.kind}), el("td", {text: e.target}),
-        el("td", {text: strength}), el("td", {text: (e.triggers || []).join(", ")}),
+        scopeCell(e), el("td", {text: strength}), el("td", {text: (e.triggers || []).join(", ")}),
         el("td", {text: (e.base_models || []).join(", ")}), el("td", {text: verdicts[e.id] || ""}),
         el("td", {}, [remove])]));
     });
+  }
+
+  // LoRA scope spec LS7: a video entry's scope is chosen in its row; "default" clears it. A style
+  // LoRA's scope is always global (fix round A1), so its row has no select.
+  function scopeCell(e) {
+    if (e.target !== "video") { return el("td", {text: "-"}); }
+    if (e.kind === "style") { return el("td", {text: "global"}); }
+    const select = el("select", {cls: "l-row-scope"}, [el("option", {value: "default", text: "default (" + LORA_SCOPE_DEFAULTS[e.kind] + ")"}),
+      el("option", {value: "global", text: "global"}), el("option", {value: "beat", text: "beat"}),
+      el("option", {value: "either", text: "either"})]);
+    select.value = e.scope || "default";
+    select.addEventListener("change", async function () {
+      const out = await api("POST", "/api/loras/scope", {ws: S.ws, id: e.id, scope: select.value});
+      $("#l-output").textContent = out.data && out.data.run ? runText(out.data.run) : (out.data && out.data.error);
+      loadCatalogTable();
+      loadCatalog();
+    });
+    return el("td", {}, [select]);
+  }
+
+  // Fix round A1: a stills LoRA has no scope and a style LoRA's is always global, so the add
+  // form's Scope select is off for both.
+  function syncLoraScope() {
+    $("#l-scope").disabled = $("#l-target").value !== "video" || $("#l-kind").value === "style";
   }
 
   function splitList(selector) {
@@ -2896,6 +2921,9 @@
       downloadModel($("#m-dl-repo").value, $("#m-dl-hub").value, $("#m-dl-status"));
     });
     $("#l-target").addEventListener("change", fillLoraBaseModels);
+    $("#l-target").addEventListener("change", syncLoraScope);
+    $("#l-kind").addEventListener("change", syncLoraScope);
+    syncLoraScope();
     $("#l-verify-all").addEventListener("click", async function () {
       const res = await api("POST", "/api/loras/verify", {ws: S.ws, ids: []});
       if (res.data && res.data.run) {
@@ -2914,6 +2942,7 @@
         default_strength: Number($("#l-default-strength").value),
         strength_range: [Number($("#l-range-lo").value), Number($("#l-range-hi").value)],
         rank: numberOrNull("#l-rank"), alpha: numberOrNull("#l-alpha"),
+        scope: !$("#l-scope").disabled && $("#l-scope").value ? $("#l-scope").value : null,
         no_arch_check: $("#l-no-arch-check").checked};
       const res = await api("POST", "/api/loras", body);
       $("#l-output").textContent = res.data && res.data.run ? runText(res.data.run) : (res.data && res.data.error);

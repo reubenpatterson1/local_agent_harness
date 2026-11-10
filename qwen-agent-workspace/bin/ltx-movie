@@ -1991,7 +1991,7 @@ def _catalog_plan_error(args, plan, picks, dry_run=False):
 
 
 def _catalog_checks_error(args, plan, dry_run=False):
-    """The LC13 Error line when the plan's LoRA picks fail the engine's catalog checks (L1-L7)."""
+    """The LC13 Error line when the plan's LoRA picks fail the engine's catalog checks (L1-L8)."""
     engine = _story_engine()
     ctx = _story_context(args, dry_run)
     compatible = dict((e["id"], e) for e in engine.compatible_entries(ctx))
@@ -2002,8 +2002,12 @@ def _catalog_checks_error(args, plan, dry_run=False):
         return ("Error: plan.json has malformed LoRA picks; rerun with --force-story or "
                 "--no-auto-lora")
     if hard:
+        # LoRA scope fix round A3: an L8 line is followed by the re-check's hint, on a line of its
+        # own.
+        hint = ("\n" + engine.RECHECK_SCOPE_HINT
+                if engine.parse_violation(hard[0])["id"] == "L8" else "")
         return ("Error: plan.json LoRA picks fail the catalog checks (%s); rerun with "
-                "--force-story or --no-auto-lora" % hard[0])
+                "--force-story or --no-auto-lora%s" % (hard[0], hint))
     return None
 
 

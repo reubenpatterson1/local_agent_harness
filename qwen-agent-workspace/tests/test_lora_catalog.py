@@ -340,8 +340,9 @@ def test_lct9_list(tmp_path, story_env):
     empty = _cli("list")
     assert (empty.returncode, empty.stdout) == (0, "no LoRAs in %s\n" % path)
     seu.kyra(story_env["lib"])
-    header = lora_catalog_row("ID", "KIND", "TARGET", "STRENGTH", "TRIGGERS", "BASE_MODELS")
-    kyra_row = lora_catalog_row("char:kyra", "character", "video", "0.8", "kyrawmn",
+    header = lora_catalog_row("ID", "KIND", "TARGET", "SCOPE", "STRENGTH", "TRIGGERS",
+                              "BASE_MODELS")
+    kyra_row = lora_catalog_row("char:kyra", "character", "video", "-", "0.8", "kyrawmn",
                                 seu.CHARACTER_BASE_MODEL)
     only_chars = _cli("list")
     assert only_chars.stdout == "no LoRAs in %s\n%s\n%s\n" % (path, header, kyra_row)
@@ -355,14 +356,14 @@ def test_lct9_list(tmp_path, story_env):
     assert table.returncode == 0
     assert table.stdout.splitlines() == [
         header,
-        lora_catalog_row("fast-motion", "motion", "video", "0.8 (0.5-1.0)", "fastmo",
+        lora_catalog_row("fast-motion", "motion", "video", "beat", "0.8 (0.5-1.0)", "fastmo",
                          seu.VIDEO_MODEL),
-        lora_catalog_row("ink-stills", "style", "stills", "0.9 (0.6-1.2)", "",
+        lora_catalog_row("ink-stills", "style", "stills", "-", "0.9 (0.6-1.2)", "",
                          seu.STILLS_MODEL),
         kyra_row]
     filtered = _cli("list", "--model", seu.STILLS_MODEL)
     assert filtered.stdout.splitlines() == [
-        header, lora_catalog_row("ink-stills", "style", "stills", "0.9 (0.6-1.2)", "",
+        header, lora_catalog_row("ink-stills", "style", "stills", "-", "0.9 (0.6-1.2)", "",
                                  seu.STILLS_MODEL)]
     as_json = json.loads(_cli("list", "--json").stdout)
     assert list(as_json) == ["catalog", "entries", "characters"]
@@ -376,7 +377,7 @@ def test_lct9_list(tmp_path, story_env):
 
 
 def lora_catalog_row(*cells):
-    return "%-24s %-9s %-7s %-14s %-24s %s" % cells
+    return "%-24s %-9s %-7s %-7s %-14s %-24s %s" % cells
 
 
 def test_lct10_remove(tmp_path, story_env):

@@ -79,6 +79,7 @@ ROUTES = [
     ("POST", r"/api/loras", "h_lora_add", "/api/loras"),
     ("POST", r"/api/loras/remove", "h_lora_remove", "/api/loras/remove"),
     ("POST", r"/api/loras/verify", "h_lora_verify", "/api/loras/verify"),
+    ("POST", r"/api/loras/scope", "h_lora_scope", "/api/loras/scope"),
     ("GET", r"/api/models", "h_models", "/api/models"),
     ("POST", r"/api/models/download", "h_model_download", "/api/models/download"),
     ("GET", r"/api/characters", "h_characters", "/api/characters"),
@@ -1242,6 +1243,11 @@ def _h_lora_add(self, groups, query, body):
     lo, hi = _typed(body, "strength_range", "pair", "a list of two numbers")
     rank = _typed(body, "rank", "int", "an integer or null", optional=True)
     alpha = _typed(body, "alpha", "int", "an integer or null", optional=True)
+    scope = body.get("scope")
+    if scope is not None and scope not in LORA_SCOPES:
+        raise ApiError(400, "scope must be global, beat, either or null")
+    if kind == "style" and scope in ("beat", "either"):
+        raise ApiError(400, "scope must be global or null for a style LoRA")
     no_arch_check = body.get("no_arch_check", False)
     if not isinstance(no_arch_check, bool):
         raise ApiError(400, "no_arch_check must be true or false")
@@ -1271,9 +1277,25 @@ def _h_lora_add(self, groups, query, body):
         args += ["--rank", str(rank)]
     if alpha is not None:
         args += ["--alpha", str(alpha)]
+    if scope is not None:
+        args += ["--scope", scope]
     if no_arch_check:
         args.append("--no-arch-check")
     return 200, {"run": _lora_action(real, args, timeout=lib.VERIFY_TIMEOUT)}
+
+
+# LoRA scope spec LS7 (docs/superpowers/specs/2026-11-10-lora-scope-design.md): lora_catalog.SCOPES.
+LORA_SCOPES = ("global", "beat", "either")
+
+
+def _h_lora_scope(self, groups, query, body):
+    real = self.ws(body.get("ws"))
+    entry_id = _typed(body, "id", "str", "a string")
+    _check_arg("id", entry_id)
+    scope = body.get("scope")
+    if scope not in LORA_SCOPES + ("default",):
+        raise ApiError(400, "scope must be global, beat, either or default")
+    return 200, {"run": _lora_action(real, ["scope", entry_id, scope])}
 
 
 def _h_lora_remove(self, groups, query, body):
@@ -1671,6 +1693,7 @@ MovieUIHandler.h_loras = _h_loras
 MovieUIHandler.h_lora_add = _h_lora_add
 MovieUIHandler.h_lora_remove = _h_lora_remove
 MovieUIHandler.h_lora_verify = _h_lora_verify
+MovieUIHandler.h_lora_scope = _h_lora_scope
 MovieUIHandler.h_models = _h_models
 MovieUIHandler.h_model_download = _h_model_download
 MovieUIHandler.h_characters = _h_characters

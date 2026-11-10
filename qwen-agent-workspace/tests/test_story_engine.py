@@ -444,8 +444,9 @@ def _lora_ctx(ws, tmp_path, **overrides):
     entries = [
         seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
         seu.catalog_entry(seu.lora_file(files, "big"), "big-style", kind="style"),
-        seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
-        seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics"),
+        seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
+        seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics",
+                          scope="either"),
         seu.catalog_entry(seu.lora_file(files, "ink"), "ink-stills", kind="style",
                           target="stills", base_models=[seu.STILLS_MODEL]),
         seu.catalog_entry(seu.lora_file(files, "other"), "other-model",
@@ -472,7 +473,7 @@ def _pins(*specs):
 
 
 def test_rst15_lora_checks(ws, tmp_path, story_env):
-    # L1, L6, L7 and an L5 strength outside (0, 2] are hard; L2-L4 and an L5 strength outside
+    # L1, L6, L7, L8 and an L5 strength outside (0, 2] are hard; L2-L4 and an L5 strength outside
     # the entry's range are advisory (dialogue spec 6.3, Q4).
     ctx = _lora_ctx(ws, tmp_path)
     paths = {e["id"]: e["path"] for e in ctx.catalog["entries"]}
@@ -507,8 +508,10 @@ def test_rst15_lora_checks(ws, tmp_path, story_env):
           'object with an id and a numeric strength'], []),
         ({"global": [pick("film-grain"), pick("big-style")]}, [],
          ["plan: L2 style: 2 style LoRAs for every panel (film-grain, big-style); at most 1"]),
-        ({"per_beat": {"2": [pick("film-grain")]}}, [],
-         ["beat 2: L2 style: style LoRA 'film-grain' can only be a global pick"]),
+        ({"per_beat": {"2": [pick("film-grain")]}},
+         ["beat 2: L8 scope: 'film-grain' may only be a global pick (its catalog scope is "
+          "global), but it is a pick for this beat; remove it from this beat, or move it to "
+          "global if it suits the whole movie"], []),
         ({"global": [pick("fast-motion", 1.4)]}, [],
          ["plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"]),
         ({"global": [pick("fast-motion", 2.5)]},
@@ -1451,7 +1454,7 @@ def test_rst30_shot_and_camera_reassemble_without_agent_calls(ws, monkeypatch):
 def _lora_state(ws, tmp_path, story_env, cast_kyra=False):
     files = str(tmp_path / "files")
     entries = [seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
-               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
                seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics")]
     kw = {"catalog": {"schema_version": 1, "entries": entries}}
     plan_mut = None

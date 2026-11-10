@@ -36,6 +36,14 @@ TEXT_MAX = 300
 ENTRY_KEYS = ("id", "kind", "path", "sha256", "bytes", "base_models", "target", "triggers",
               "rank", "alpha", "default_strength", "strength_range", "description", "use_when",
               "avoid_when", "added_at")
+# LoRA scope spec LS1 (docs/superpowers/specs/2026-11-10-lora-scope-design.md): an entry may also
+# have a scope, where the story planner may place it: global (every panel), beat (one beat's own
+# picks) or either. An entry without one gets the default for its kind. Only video LoRAs have a
+# scope; a stills entry's scope is accepted and ignored. A style video entry's scope may only be
+# global (fix round A1): Phase 3 applies a style LoRA to every panel, never to one beat.
+OPTIONAL_ENTRY_KEYS = ("scope",)
+SCOPES = ("global", "beat", "either")
+DEFAULT_SCOPES = {"style": "global", "motion": "beat", "physics": "beat"}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 UTC_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 HEADER_MAX_BYTES = 100 * 1024 * 1024
@@ -88,7 +96,7 @@ def validate_entry(entry):
     missing = [key for key in ENTRY_KEYS if key not in entry]
     if missing:
         raise CatalogError("entry %s: missing keys %s" % (label, ", ".join(missing)))
-    extra = sorted(set(entry) - set(ENTRY_KEYS))
+    extra = sorted(set(entry) - set(ENTRY_KEYS) - set(OPTIONAL_ENTRY_KEYS))
     if extra:
         raise CatalogError("entry %s: unexpected keys %s" % (label, ", ".join(extra)))
     if not isinstance(entry["id"], str) or not ID_RE.fullmatch(entry["id"]):
@@ -107,6 +115,13 @@ def validate_entry(entry):
         fail("base_models", "must be a non-empty list of non-empty strings, got %r" % (models,))
     if entry["target"] not in TARGETS:
         fail("target", "must be one of %s, got %r" % (", ".join(TARGETS), entry["target"]))
+    if "scope" in entry and entry["scope"] not in SCOPES:
+        fail("scope", "must be one of %s, got %r" % (", ".join(SCOPES), entry["scope"]))
+    if (entry["target"] == "video" and entry["kind"] == "style"
+            and entry.get("scope", "global") != "global"):
+        fail("scope", "must be global for a style LoRA, which applies to every panel, got %r; "
+                      "edit catalog.json by hand: remove the scope key or set it to global"
+             % (entry["scope"],))
     triggers = entry["triggers"]
     if not isinstance(triggers, list) or len(triggers) > MAX_TRIGGERS:
         fail("triggers", "must be a list of at most %d strings, got %r" % (MAX_TRIGGERS, triggers))
@@ -137,6 +152,18 @@ def validate_entry(entry):
     if not isinstance(entry["added_at"], str) or not UTC_RE.fullmatch(entry["added_at"]):
         fail("added_at", "must be a UTC timestamp YYYY-MM-DDTHH:MM:SSZ, got %r"
              % (entry["added_at"],))
+
+
+def entry_scope(entry):
+    """Where the story planner may place a catalog entry (LoRA scope spec LS2): its scope, else
+    DEFAULT_SCOPES of its kind; always global for a style LoRA (fix round A1, also for an entry
+    that never went through validate_entry); None for a stills LoRA and for a library
+    character."""
+    if entry.get("target") != "video" or entry.get("kind") not in DEFAULT_SCOPES:
+        return None
+    if entry["kind"] == "style":
+        return "global"
+    return entry.get("scope") or DEFAULT_SCOPES[entry["kind"]]
 
 
 def validate_catalog(data):

@@ -622,7 +622,7 @@ def test_sgt20_the_routes(env):
     routes = list(srv.ROUTES)
     i = routes.index(("POST", r"/api/uploads", "h_upload", "/api/uploads"))
     assert routes[i + 1:i + 7] == SEED_ROUTES
-    assert len(srv.ROUTES) == 63
+    assert len(srv.ROUTES) == 64
     for method, regex, name, sample in SEED_ROUTES:
         assert re.fullmatch(regex, sample), sample
         assert getattr(srv.MovieUIHandler, name) is getattr(srv, "_" + name), name

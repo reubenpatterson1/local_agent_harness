@@ -919,7 +919,7 @@ def test_sdt11_the_route_and_its_token(env):
     routes = list(srv.ROUTES)
     i = routes.index(("POST", r"/api/jobs", "h_job_create", "/api/jobs"))
     assert routes[i + 1] == ("POST", r"/api/jobs/seed-folder", "h_seed_folder", "/api/jobs/seed-folder")
-    assert len(srv.ROUTES) == 63
+    assert len(srv.ROUTES) == 64
     assert srv.MovieUIHandler.h_seed_folder is srv._h_seed_folder
     for token in (None, "wrong-token"):
         assert mt.api(s, "POST", "/api/jobs/seed-folder", body={}, token=token)[::2] == (
@@ -956,7 +956,7 @@ def test_sdt29_the_characters_route_and_its_token(env):
     i = routes.index(("POST", r"/api/characters", "h_character_create", "/api/characters"))
     assert routes[i + 1] == ("POST", r"/api/characters/seed-folder", "h_character_seed_folder",
                              "/api/characters/seed-folder")
-    assert len(srv.ROUTES) == 63
+    assert len(srv.ROUTES) == 64
     assert srv.MovieUIHandler.h_character_seed_folder is srv._h_character_seed_folder
     for token in (None, "wrong-token"):
         assert mt.api(s, "POST", "/api/characters/seed-folder", body={}, token=token)[::2] == (
