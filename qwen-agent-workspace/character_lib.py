@@ -790,6 +790,7 @@ SPEECH_DELIVERIES = ("beats", "plain", "beats-no-acoustic")
 DEFAULT_SPEECH_DELIVERY = "beats"
 SPEECH_BEATS = ("After a breath", "After a short pause")   # before fragment 2, before fragment 3
 ACOUSTIC_SENTENCE = ("The audio is clear close-mic dialogue with a subtle natural room tone; "
+                     "only the quoted words are spoken, and only once; "
                      "the dialogue takes priority over the quiet ambience, and there is no music.")
 NO_KNOWN_PHRASES = "none (no --cast, no ## Characters section and no plan.json cast)"
 
@@ -876,7 +877,8 @@ def speech_text(phrase, line, delivery=DEFAULT_SPEECH_DELIVERY):
 
 # Shot prompt format spec SF15, D6: a speech movie's chained or shots video prompt, in the fixed
 # order framing, first action, facing, line, other actions, camera, audio.
-AMBIENCE_SENTENCE = "The audio is the natural ambient sound of the place, with no music."
+AMBIENCE_SENTENCE = ("The audio is the natural ambient sound of the place; "
+                     "nobody speaks, and there is no music.")
 SHOT_SENTENCE_RE = re.compile(r"The shot is an? (?:extreme wide shot|wide shot|medium shot|"
                               r"medium close-up|close-up|extreme close-up)\.")
 
