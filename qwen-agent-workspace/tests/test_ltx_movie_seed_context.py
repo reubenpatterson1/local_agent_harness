@@ -220,11 +220,11 @@ def test_cxt1_the_option_rules(ctx_env, capsys):
             (["--shots", "--no-stills"],
              "Error: --shots needs Phase 2's per-panel stills; it cannot be combined with --no-stills\n"),
             (["--shots", "--seed-image", seed],
-             "Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen edit of the "
-             "seed, so the seed cannot be used as-is\n"),
+             "Error: --shots with --seed-image needs --seed-edit-model: a Qwen model ID makes every panel's still an "
+             "edit of the seed; as-is keeps the seed as panel 1 and renders every other panel's still with Z-Image\n"),
             (["--shots", "--seed-image", seed, "--seed-edit-model", "as-is"],
-             "Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen edit of the "
-             "seed, so the seed cannot be used as-is\n"),
+             "Error: --seed-context needs --seed-edit-model ID, a Qwen registry edit model (as-is is refused): every "
+             "shots still is a Qwen edit of the seed\n"),
             (["--shots", "--seed-image", seed, "--seed-edit-model", "qwen2511-q4"],
              "Error: --seed-context needs a --seed-edit-model that edits with several pictures; qwen2511-q4 is "
              "refused: " + qwen_edit.MULTI_REFERENCE_REFUSED["qwen2511-q4"] + "\n"),

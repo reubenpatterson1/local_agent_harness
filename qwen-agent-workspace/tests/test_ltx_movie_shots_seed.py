@@ -223,8 +223,9 @@ def _parse(*extra):
     return movie.build_parser().parse_args(["a narrative", "--story-id", "s1"] + list(extra))
 
 
-MODEL_RULE = ("Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen edit of the "
-              "seed, so the seed cannot be used as-is\n")
+MODEL_RULE = ("Error: --shots with --seed-image needs --seed-edit-model: a Qwen model ID makes every panel's still "
+              "an edit of the seed; as-is keeps the seed as panel 1 and renders every other panel's still with "
+              "Z-Image\n")
 ENGINE_RULE = ("Error: --shots with --seed-image needs the default story engine; it cannot be combined with %s\n")
 STILLS_RULE = ("Error: --stills-lora cannot be combined with --shots and --seed-image: every panel's still is a Qwen "
                "edit of the seed, and Z-Image stills LoRAs do not apply to it\n")
@@ -237,7 +238,7 @@ def test_set1_the_shots_seed_option_rules(clean_env, capsys):
     with open(override, "w", encoding="utf-8") as f:
         f.write("x")
     shots = ["--shots", "--seed-image", seed]
-    cases = [((), MODEL_RULE), (("--seed-edit-model", "as-is"), MODEL_RULE),
+    cases = [((), MODEL_RULE),
              (("--seed-edit-model", "qwen21-q4", "--story-legacy"), ENGINE_RULE % "--story-legacy"),
              (("--seed-edit-model", "qwen21-q4", "--story-prompt-override", override),
               ENGINE_RULE % "--story-prompt-override"),
@@ -248,6 +249,7 @@ def test_set1_the_shots_seed_option_rules(clean_env, capsys):
         assert capsys.readouterr().err == text, extra
     args = _parse(*(shots + ["--seed-edit-model", "qwen21-q4"]))
     assert movie._resolve_shots(args) == 0 and args.redo_panels == []
+    assert movie._resolve_shots(_parse(*(shots + ["--seed-edit-model", "as-is"]))) == 0
     _write_story(tmp)
     args = _parse(*(shots + ["--seed-edit-model", "qwen21-q4", "--redo", "2"]))
     assert movie._resolve_shots(args) == 0 and args.redo_panels == [2]
@@ -308,15 +310,18 @@ HELP = {
         "with --seed-image: edit the seed into panel 1 with a Qwen registry edit model (qwen21-q4, qwen21-q8, "
         "qwen21-bf16, qwen2511-q4, qwen2511-bf16), prompted by panel 1's Image: text after Phase 1 and screened "
         "with content safety; as-is, like leaving the flag out, uses the seed unchanged. With --shots it is "
-        "required and as-is is refused: every panel's still is an edit of the seed, each prompted by its own "
-        "Image: text. See docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md and "
-        "2026-11-05-compose-shots-seed-edit-design.md."),
+        "required and chooses the stills engine: an ID makes every panel's still an edit of the seed, each prompted "
+        "by its own Image: text; as-is keeps the seed as panel 1 and renders every other panel's still with Z-Image "
+        "and its stills LoRAs, as --shots does without a seed. See "
+        "docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md, 2026-11-05-compose-shots-seed-edit-design.md "
+        "and 2026-11-11-shots-zimage-engine-design.md."),
     "--shots": (
         "shots mode: every panel is its own shot with its own Image: still and is rendered from that still (no "
         "chaining; cuts between panels). Phase 1 uses the shots story template and enforces the shot rules (one "
         "action per Motion:, at most two cast characters per shot), Phase 2 renders a still for every panel, and "
-        "every cast character LoRA defaults to 0.8. With --seed-image, every panel's still is instead a Qwen edit "
-        "of the seed (--seed-edit-model ID, required). See docs/superpowers/specs/2026-10-06-shots-mode-design.md.")}
+        "every cast character LoRA defaults to 0.8. With --seed-image, --seed-edit-model (required) chooses the "
+        "stills engine: an ID makes every panel's still a Qwen edit of the seed; as-is keeps the seed as panel 1 and "
+        "renders every other panel's still with Z-Image. See docs/superpowers/specs/2026-10-06-shots-mode-design.md.")}
 DOC_SENTENCE = (
     "so that only they re-render. With --seed-image (docs/superpowers/specs/2026-11-05-compose-shots-seed-edit-"
     "design.md), Phase 2 instead edits the seed into every panel's still with the Qwen model of --seed-edit-model "
