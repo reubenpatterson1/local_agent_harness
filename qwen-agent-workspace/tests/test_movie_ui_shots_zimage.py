@@ -238,3 +238,67 @@ def test_sz_review_focus_5_the_engine_select_follows_the_cell():
                              ["zimage", True, ["zimage"], False],
                              ["none", True, ["none"], False],
                              ["zimage", False, ["qwen", "zimage"], True]]
+
+
+# --- SZ17 / SZ18: the real composeFields override and fillCompose restore, run in node ----------------------
+
+FAKE_COMPOSE = (
+    'const E = {};\n'
+    'function $(selector) {\n'
+    '  if (!E[selector]) { E[selector] = {value: "", checked: false, options: [], selectedOptions: []}; }\n'
+    '  return E[selector];\n'
+    '}\n'
+    'const S = {ws: "w", seedUpload: null, composeEngine: "qwen"};\n'
+    'const PICKED = {model: "qwen-edit-x", loras: [{id: "l"}]};\n'
+    'const COMPOSE_PICKER = {selection: function () { return PICKED; }, select: function () {}};\n'
+    'function composeSeedEditActive() { return true; }\n'
+    'function textOrNull() { return null; }\n'
+    'function numberOrNull() { return null; }\n'
+    'function collectLoras() { return []; }\n'
+    'function clear(x) { return x; }\n'
+    'function syncResPreset() {}\n'
+    'function fillModelSelect() {}\n'
+    'function loraRow() {}\n'
+    'function updateComposeButtons() {}\n'
+    'function preview() {}\n')
+
+
+def _compose_page_code():
+    js = _page()[1]
+    return (FAKE_COMPOSE + _function(js, "  function composeFields(action) {")
+            + _function(js, "  function fillCompose(fields) {"))
+
+
+def test_sz17_compose_fields_sends_as_is_for_zimage_shots_only():
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    script = _compose_page_code() + (
+        'function run(mode, engine) {\n'
+        '  $("#c-mode").value = mode;\n'
+        '  $("#c-res-seed").checked = true;\n'
+        '  S.seedUpload = "up1";\n'
+        '  S.composeEngine = engine;\n'
+        '  const out = composeFields("story");\n'
+        '  return [out.mode, out.seed_upload, out.seed_edit_model, out.seed_edit_loras];\n'
+        '}\n'
+        'console.log(JSON.stringify([run("shots", "zimage"), run("chained", "zimage"), run("shots", "qwen")]));')
+    assert _node(script) == [["shots", "up1", "as-is", None],
+                             ["chained", "up1", "qwen-edit-x", [{"id": "l"}]],
+                             ["shots", "up1", "qwen-edit-x", [{"id": "l"}]]]
+
+
+def test_sz18_fill_compose_restores_zimage_only_for_shots_with_seed():
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    script = _compose_page_code() + (
+        'function run(fields) {\n'
+        '  S.composeEngine = "qwen";\n'
+        '  fillCompose(fields);\n'
+        '  return S.composeEngine;\n'
+        '}\n'
+        'console.log(JSON.stringify([\n'
+        '  run({mode: "shots", seed_upload: "up1", seed_edit_model: "as-is"}),\n'
+        '  run({mode: "chained", seed_upload: "up1", seed_edit_model: "as-is"}),\n'
+        '  run({mode: "shots", seed_upload: null, seed_edit_model: "as-is"}),\n'
+        '  run({mode: "shots", seed_upload: "up1", seed_edit_model: "qwen-edit-x"})]));')
+    assert _node(script) == ["zimage", "qwen", "qwen", "qwen"]
