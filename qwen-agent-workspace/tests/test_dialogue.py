@@ -38,8 +38,9 @@ ltx_movie = _load("ltx_movie_for_dialogue", "bin/ltx-movie")
 # A valid 1x1 PNG: bin/ltx-story-manifest only checks that each panel still opens.
 PNG_1X1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
                            "60e6kgAAAABJRU5ErkJggg==")
-AC = ("The audio is clear close-mic dialogue with a subtle natural room tone; the dialogue takes "
-      "priority over the quiet ambience, and there is no music.")
+AC = ("The audio is clear close-mic dialogue with a subtle natural room tone; only the quoted "
+      "words are spoken, and only once; the dialogue takes priority over the quiet ambience, and "
+      "there is no music.")
 SPLIT = (", and a line has at most 3 sentences; shorten the line, or split it across alternating "
          "close-up panels (the speaker, then the listener, then the speaker again)")
 

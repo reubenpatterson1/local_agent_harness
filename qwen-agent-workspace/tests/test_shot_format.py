@@ -485,7 +485,7 @@ SPEAKING_CHAINED_MOTION_SENTENCE = (
     "write nothing about anyone else before the first one. Never put an action from before the "
     "dialogue and one from after it in the same sentence, and do not write the spoken words or a "
     "speaking verb; the pipeline adds them.")
-FORMAT_REFERENCE_SHA256 = "fec731a3cedadf6578a511e10d93698039ad075729b208bed2903061faa8b12b"
+FORMAT_REFERENCE_SHA256 = "3ee8f85bbe4c129a22339ae746ada2775115793aa18041ce7c1361bbe21d568c"
 
 
 def test_sft1b_writer_constants():
@@ -506,7 +506,7 @@ def test_sft1b_writer_constants():
     assert se.SPEAKING_CHAINED_MOTION_SENTENCE == SPEAKING_CHAINED_MOTION_SENTENCE
     reference = se.FORMAT_REFERENCE
     assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == FORMAT_REFERENCE_SHA256
-    assert (len(reference), len(reference.split())) == (3538, 618)
+    assert (len(reference), len(reference.split())) == (3633, 635)
     assert "@@" not in reference
     for text in ([reference, se.CAMERA_WRITER_SENTENCE, se.SPEAKING_REACTION_SENTENCE,
                   se.SPEAKING_NO_REACTION_SENTENCE, se.SPEAKING_STAY_SENTENCE,
@@ -638,7 +638,7 @@ def test_sft21_the_reference_adds_exactly_its_own_length(ws, monkeypatch):
     full = se.build_panel_prompt(ctx, plan, parts, 2)
     monkeypatch.setattr(se, "FORMAT_REFERENCE", "")
     bare = se.build_panel_prompt(ctx, plan, parts, 2)
-    assert len(full) - len(bare) == len(reference) == 3538
+    assert len(full) - len(bare) == len(reference) == 3633
     assert len(full) < 9000
 
 
@@ -1342,8 +1342,10 @@ def test_sft25_p19_end_to_end(ws, tmp_path, monkeypatch, capsys):
 # --- SFT1 (Task 6 part): the audio sentences (SF15a, SF15b) -------------------------------------
 
 ACOUSTIC_SENTENCE = ("The audio is clear close-mic dialogue with a subtle natural room tone; "
+                     "only the quoted words are spoken, and only once; "
                      "the dialogue takes priority over the quiet ambience, and there is no music.")
-AMBIENCE_SENTENCE = "The audio is the natural ambient sound of the place, with no music."
+AMBIENCE_SENTENCE = ("The audio is the natural ambient sound of the place; "
+                     "nobody speaks, and there is no music.")
 
 
 def test_sft1e_audio_constants():

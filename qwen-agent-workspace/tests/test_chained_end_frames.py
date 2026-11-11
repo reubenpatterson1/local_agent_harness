@@ -1126,8 +1126,8 @@ def ref_shots():
 def test_ct14_the_format_reference_is_pinned(ws):
     reference = se.FORMAT_REFERENCE
     assert hashlib.sha256(reference.encode("utf-8")).hexdigest() == (
-        "fec731a3cedadf6578a511e10d93698039ad075729b208bed2903061faa8b12b")
-    assert (len(reference), len(reference.split())) == (3538, 618)
+        "3ee8f85bbe4c129a22339ae746ada2775115793aa18041ce7c1361bbe21d568c")
+    assert (len(reference), len(reference.split())) == (3633, 635)
     assert re.findall(r'"[^"]*"', reference) == ['"Forty years of mornings."', '"Not one more."']
     assert "@@" not in reference and "{" not in reference
     shots = ref_shots()

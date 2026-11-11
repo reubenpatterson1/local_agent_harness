@@ -2917,7 +2917,8 @@ FORMAT_REFERENCE = (
     "that hold the first glow from the harbour doors. The camera tracks right alongside her — "
     "as the move completes, the old fishmonger stands beside the half-open shutter at frame "
     "centre, facing left toward the hall, seen from the knees up, the empty crates at her "
-    "feet. The audio is the natural ambient sound of the place, with no music.\n"
+    "feet. The audio is the natural ambient sound of the place; nobody speaks, and there is no "
+    "music.\n"
     "Shot 2 (speaking; the camera pushes in; opens on: The old fishmonger stands beside the "
     "half-open shutter at frame centre, facing left toward the hall, seen from the knees up, "
     "the empty crates at her feet; ends on: The old fishmonger stands behind the zinc counter "
@@ -2929,8 +2930,8 @@ FORMAT_REFERENCE = (
     "presses both palms flat on the folded cloth, her shoulders sinking. The camera pushes in "
     "— as the move completes, the old fishmonger stands behind the zinc counter at frame "
     "centre, facing forward, her face filling the frame from chin to brow. The audio is clear "
-    "close-mic dialogue with a subtle natural room tone; the dialogue takes priority over the "
-    "quiet ambience, and there is no music.\n"
+    "close-mic dialogue with a subtle natural room tone; only the quoted words are spoken, and "
+    "only once; the dialogue takes priority over the quiet ambience, and there is no music.\n"
     "Shot 3 (silent; the movie's one deliberate static hold; opens on: The old fishmonger "
     "stands behind the zinc counter at frame centre, facing forward, her face filling the "
     "frame from chin to brow; ends on: The old fishmonger rests her forehead on her folded "
@@ -2940,7 +2941,7 @@ FORMAT_REFERENCE = (
     "of meltwater runs past her knuckles and drips to the wet floor. The camera stays static, "
     "holding the old fishmonger as she rests her forehead on her folded hands at frame centre, "
     "eyes closed, her head and hands filling the frame. The audio is the natural ambient sound "
-    "of the place, with no music.\n"
+    "of the place; nobody speaks, and there is no music.\n"
     "\n")
 # Shot prompt format spec SF12, D11: the reference's own names, props and wording.
 REFERENCE_TERMS = ("fishmonger", "fishmongers", "herring", "herrings", "zinc", "ice trays",
