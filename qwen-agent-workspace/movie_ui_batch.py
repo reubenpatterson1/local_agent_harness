@@ -211,6 +211,8 @@ def merge(last_fields, variant, story_id, fork_id, ws_real):
             fork["width"] = fork["height"] = None
         elif key == "seed_upload" and value is None:
             fork["seed_edit_model"] = fork["seed_edit_loras"] = None      # rule 12d: no edit without a seed
+    if fork["mode"] == "shots" and orig["mode"] != "shots" and fork["seed_edit_model"] == "as-is":
+        fork["seed_edit_model"] = None      # Z-Image is chosen in Compose only, never by a fork
     fork["narrative"], warnings = edit_prompt(orig["narrative"], variant["prompt"], story_id)
     return orig, fork, warnings
 
