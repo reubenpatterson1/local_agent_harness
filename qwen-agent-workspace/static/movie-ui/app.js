@@ -22,7 +22,7 @@
   const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", "mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, seedOrigin: null, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
+    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, seedOrigin: null, composeEngine: "qwen", composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
   // Seed-folder spec SD27: one state box per folder mode (Compose and Characters); part(box, name)
@@ -421,9 +421,45 @@
   // Qwen edit models spec QE67: a Seeds-tab "Use" seed defaults to as-is, an upload or a seed folder to the
   // registry default (qwen21-q4 + its default LoRAs). The origin is kept in S.seedOrigin.
   function composeSeedDefault(origin) {
+    S.composeEngine = "qwen";
     S.seedOrigin = origin;
     if (origin === "seeds") { COMPOSE_PICKER.select("as-is", []); }
     else { COMPOSE_PICKER.select(null, null); }
+  }
+
+  // Shots Z-Image engine spec ZE12: the stills engines of each Compose cell (mode x seed), the default first.
+  const ZIMAGE_SEED_NOTE = "Panel 1 is the seed. Every other panel is a Z-Image still from its own Image: text, " +
+    "with the stills LoRAs of the characters, the locations, the catalog pick and the stills LoRA rows.";
+  function composeEngines(mode, seeded) {
+    if (mode === "no_stills") { return [["none", "None: every clip is text-to-video"]]; }
+    if (mode === "chained") {
+      return [seeded ? ["seed", "The seed: panel 1 is the seed, as-is or a Qwen edit (below)"]
+        : ["zimage", "Z-Image: panel 1's still from its Image: text"]];
+    }
+    return seeded ? [["qwen", "Qwen edit of the seed: every panel's still"],
+      ["zimage", "Z-Image: panel 1 is the seed, every other panel from its Image: text"]]
+      : [["zimage", "Z-Image: every panel's still from its Image: text"]];
+  }
+
+  function composeEngineUpdate(mode) {
+    const seeded = ($("#c-res-seed").checked && Boolean(S.seedUpload)) || $("#c-res-folder").checked;
+    const options = composeEngines(mode, seeded);
+    const values = options.map(function (o) { return o[0]; });
+    const select = $("#c-engine");
+    if (Array.prototype.map.call(select.options, function (o) { return o.value; }).join(",") !== values.join(",")) {
+      select.textContent = "";
+      options.forEach(function (o) {
+        const option = document.createElement("option");
+        option.value = o[0];
+        option.textContent = o[1];
+        select.appendChild(option);
+      });
+    }
+    const zimageSeed = mode === "shots" && seeded && S.composeEngine === "zimage";
+    select.value = zimageSeed ? "zimage" : values[0];
+    select.disabled = options.length === 1;
+    $("#c-engine-note").textContent = zimageSeed ? ZIMAGE_SEED_NOTE : "";
+    return select.value;
   }
 
   function composeFields(action) {
@@ -433,7 +469,7 @@
     const supported = (S.options && S.options.supported) || {};
     const goal = textOrNull("#c-goal");
     const seedEdit = composeSeedEditActive() ? COMPOSE_PICKER.selection() : null;
-    return {
+    const out = {
       ws: S.ws, action: action || "story",
       story_id: $("#c-story-id").value.trim(), narrative: $("#c-narrative").value,
       goal: supported.goal === false ? null : goal,
@@ -461,6 +497,12 @@
       no_low_ram: $("#c-no-low-ram").checked, panel_timeout: numberOrNull("#c-panel-timeout"),
       overwrite_movie: $("#c-overwrite").checked, redo: []
     };
+    // Shots Z-Image engine spec ZE13: a seeded shots movie's Z-Image engine is sent as the seed as-is.
+    if (seedEdit && out.mode === "shots" && S.composeEngine === "zimage") {
+      out.seed_edit_model = "as-is";
+      out.seed_edit_loras = null;
+    }
+    return out;
   }
 
   function updateFrameHints() {
@@ -544,6 +586,7 @@
     gate($("#c-write-story"), $("#c-write-story-reason"), []);
     gate($("#c-smoke"), $("#c-smoke-reason"), ["render"]);
     show($("#c-check-seams-box"), mode === "chained");
+    const engine = composeEngineUpdate(mode);
     COMPOSE_PICKER.update();
     const seedEditOn = composeSeedEditActive();
     // Shots seed edits spec SE31: in shots mode every panel is an edit of the seed, so "Seed as-is" is not offered.
@@ -559,8 +602,9 @@
     }
     $("#c-sq-label").textContent = mode === "shots" ? "Every panel from the seed" : "Panel 1 from the seed";
     show($("#c-sq-shots-note"), shotsSeed);
-    show($("#c-sq-qwen-box"), seedEditOn);
-    const seedEditReason = seedEditOn ? COMPOSE_PICKER.reason() : "";
+    const zimageSeed = shotsSeed && engine === "zimage";
+    show($("#c-sq-qwen-box"), seedEditOn && !zimageSeed);
+    const seedEditReason = seedEditOn && !zimageSeed ? COMPOSE_PICKER.reason() : "";
     $("#c-sq-reason").textContent = seedEditReason;
     if (seedEditReason) {
       $("#c-run-all").disabled = true;
@@ -842,6 +886,7 @@
     $("#c-res-seed").checked = Boolean(S.seedUpload);
     $("#c-res-size").checked = !S.seedUpload;
     S.seedOrigin = "job";
+    S.composeEngine = f.mode === "shots" && f.seed_upload && f.seed_edit_model === "as-is" ? "zimage" : "qwen";
     COMPOSE_PICKER.select(f.seed_edit_model || "as-is", f.seed_edit_loras || []);
     $("#c-mode").value = f.mode || "chained";
     fillModelSelect(f.model || "");
@@ -884,6 +929,7 @@
       if (!event.target.classList.contains("lora-strength")) { preview(); }
     });
     panel.addEventListener("change", function () { updateComposeButtons(); preview(); });
+    $("#c-engine").addEventListener("change", function () { S.composeEngine = $("#c-engine").value; });
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);

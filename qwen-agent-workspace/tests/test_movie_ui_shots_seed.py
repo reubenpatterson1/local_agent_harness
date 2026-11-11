@@ -30,8 +30,8 @@ from test_movie_ui_qwen_edit import _clean_env, _compose, _function, _job, _prob
 WS = mt.WS
 UP = "a" * 64 + ".png"
 UNC = [{"id": "uncensored", "scale": 1.0}]
-NEEDS_MODEL = ("a seed image in shots mode needs a Qwen edit model: every panel's still is an edit of the seed, so "
-               "the seed cannot be used as-is")
+NEEDS_MODEL = ("a seed image in shots mode needs a stills engine: a Qwen edit model (every panel's still is an edit of "
+               "the seed) or as-is (panel 1 is the seed and Z-Image renders every other panel)")
 NEEDS_ENGINE = "a seed image in shots mode needs the default story engine; it cannot be combined with --story-legacy"
 NO_STILLS_LORAS = ("stills LoRAs do not apply in shots mode with a seed image: every panel's still is a Qwen edit "
                    "of the seed")
@@ -62,8 +62,9 @@ def _errors(v1_env, **overrides):
 
 def test_set16_v1_rule_8_in_shots_mode(v1_env):
     shots = dict(seed_upload=UP, mode="shots")
-    for model in (None, "as-is"):
+    for model in (None,):
         assert _errors(v1_env, seed_edit_model=model, **shots) == [NEEDS_MODEL], model
+    assert _errors(v1_env, seed_edit_model="as-is", **shots) == []
     assert _errors(v1_env, seed_edit_model="qwen21-q4", **shots) == []
     assert _errors(v1_env, seed_edit_model="qwen21-q4", seed_edit_loras=UNC, **shots) == []
     assert _errors(v1_env, seed_edit_model="qwen21-q4", story_legacy=True, **shots) == [NEEDS_ENGINE]
@@ -224,7 +225,8 @@ def test_set20_the_page(v1_env):
     buttons = _function(js, "  function updateComposeButtons() {")
     assert ('    COMPOSE_PICKER.update();\n    const seedEditOn = composeSeedEditActive();\n'
             '    // Shots seed edits spec SE31: in shots mode every panel is an edit of the seed, so "Seed as-is" is '
-            'not offered.\n' + SE31 + '    show($("#c-sq-qwen-box"), seedEditOn);\n') in buttons
+            'not offered.\n' + SE31 + '    const zimageSeed = shotsSeed && engine === "zimage";\n'
+            '    show($("#c-sq-qwen-box"), seedEditOn && !zimageSeed);\n') in buttons
     for name, text in (("index.html", html), ("app.js", js)):
         for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
                         r"\beval\(", r"new Function"):
