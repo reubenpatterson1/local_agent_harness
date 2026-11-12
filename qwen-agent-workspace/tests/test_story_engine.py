@@ -444,7 +444,8 @@ def _lora_ctx(ws, tmp_path, **overrides):
     entries = [
         seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
         seu.catalog_entry(seu.lora_file(files, "big"), "big-style", kind="style"),
-        seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
+        seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+        seu.catalog_entry(seu.lora_file(files, "slow"), "slow-motion"),
         seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics",
                           scope="either"),
         seu.catalog_entry(seu.lora_file(files, "ink"), "ink-stills", kind="style",
@@ -485,10 +486,12 @@ def test_rst15_lora_checks(ws, tmp_path, story_env):
     def lv(loras, **kw):
         return _lora_violations(kw.pop("ctx", ctx), loras, **kw)
 
-    assert lv({"global": [pick("film-grain"), pick("fast-motion")],
-               "per_beat": {"2": [pick("rain-physics")]}, "stills": [pick("ink-stills")]}) == (
-        [], ["beat 2: L3 motion: 2 motion or physics LoRAs on this panel (fast-motion, "
-             "rain-physics); at most 1"])
+    assert lv({"global": [pick("film-grain"), pick("rain-physics")],
+               "per_beat": {"2": [pick("fast-motion")]}, "stills": [pick("ink-stills")]}) == ([], [])
+    assert lv({"global": [], "per_beat": {"2": [pick("fast-motion"), pick("slow-motion")]},
+               "stills": []}) == (
+        [], ["beat 2: L3 motion: 2 motion LoRAs on this panel (fast-motion, slow-motion); at "
+             "most 1"])
     assert lv({"global": [pick("film-grain")], "per_beat": {"2": [pick("rain-physics")]},
                "stills": [pick("ink-stills")]}) == ([], [])
     cases = [
@@ -512,10 +515,10 @@ def test_rst15_lora_checks(ws, tmp_path, story_env):
          ["beat 2: L8 scope: 'film-grain' may only be a global pick (its catalog scope is "
           "global), but it is a pick for this beat; remove it from this beat, or move it to "
           "global if it suits the whole movie"], []),
-        ({"global": [pick("fast-motion", 1.4)]}, [],
-         ["plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"]),
-        ({"global": [pick("fast-motion", 2.5)]},
-         ["plan: L5 strength: 'fast-motion' strength 2.5 is outside (0, 2], which the renderer "
+        ({"global": [pick("rain-physics", 1.4)]}, [],
+         ["plan: L5 strength: 'rain-physics' strength 1.4 is outside its range 0.5 to 1.0"]),
+        ({"global": [pick("rain-physics", 2.5)]},
+         ["plan: L5 strength: 'rain-physics' strength 2.5 is outside (0, 2], which the renderer "
           "refuses"], []),
         ({"stills": [pick("ink-stills"), pick("ink-stills")]},
          ["plan: L7 stills: 2 stills LoRAs; at most 1"], []),
@@ -1454,8 +1457,10 @@ def test_rst30_shot_and_camera_reassemble_without_agent_calls(ws, monkeypatch):
 def _lora_state(ws, tmp_path, story_env, cast_kyra=False):
     files = str(tmp_path / "files")
     entries = [seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
-               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
-               seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics")]
+               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+               seu.catalog_entry(seu.lora_file(files, "slow"), "slow-motion"),
+               seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics",
+                                 scope="either")]
     kw = {"catalog": {"schema_version": 1, "entries": entries}}
     plan_mut = None
     if cast_kyra:
@@ -1473,13 +1478,14 @@ def _lora_state(ws, tmp_path, story_env, cast_kyra=False):
 def test_rst31_lora_patch(ws, tmp_path, story_env):
     ctx, state = _lora_state(ws, tmp_path, story_env)
     new, applied, rejected = se.apply_patches(ctx, state, [
-        _patch("plan", 0, "lora", [{"id": "fast-motion", "strength": 0.7}]),
-        _patch("plan", 2, "lora", [{"id": "rain-physics", "strength": 0.9}])])
+        _patch("plan", 0, "lora", [{"id": "rain-physics", "strength": 0.9}]),
+        _patch("plan", 2, "lora", [{"id": "fast-motion", "strength": 0.7},
+                                   {"id": "slow-motion", "strength": 0.7}])])
     assert len(applied) == 1
-    assert new["plan"]["loras"]["global"] == [{"id": "fast-motion", "strength": 0.7}]
+    assert new["plan"]["loras"]["global"] == [{"id": "rain-physics", "strength": 0.9}]
     assert new["plan"]["loras"]["per_beat"] == {}
-    assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion or physics LoRAs on "
-                                  "this panel (fast-motion, rain-physics); at most 1"]
+    assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion LoRAs on this panel "
+                                  "(fast-motion, slow-motion); at most 1"]
     cleared, applied, _rj = se.apply_patches(ctx, new, [_patch("plan", 0, "lora", [])])
     assert cleared["plan"]["loras"]["global"] == [] and len(applied) == 1
 
@@ -1513,10 +1519,10 @@ def test_lct28_lora_limits_with_a_cast_character(ws, tmp_path, story_env):
     assert se.lora_checks(ctx, plan, compatible, catalog) == ([], [])
     _new, applied, rejected = se.apply_patches(ctx, state, [
         _patch("plan", 2, "lora", [{"id": "fast-motion", "strength": 0.7},
-                                   {"id": "rain-physics", "strength": 0.6}])])
+                                   {"id": "slow-motion", "strength": 0.6}])])
     assert applied == []
-    assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion or physics LoRAs on "
-                                  "this panel (fast-motion, rain-physics); at most 1"]
+    assert _reasons(rejected) == ["would break beat 2: L3 motion: 2 motion LoRAs on this panel "
+                                  "(fast-motion, slow-motion); at most 1"]
 
 
 # --- RST10, RST11, RST17b, RST26b, RST33-RST39, RST43, RST55b, RST58: the run (RS8, RS13,

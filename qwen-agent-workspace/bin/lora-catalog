@@ -12,8 +12,9 @@
   bin/lora-catalog verify [ID ...]
 
 bin/ltx-movie's story planner may pick catalog entries for the whole movie or for one beat, as
-each video entry's scope allows (a motion or physics LoRA's scope is global, beat or either, by
-default beat; a style LoRA's scope is always global: LoRA scope spec LS1 and its fix round A1);
+each video entry's scope allows (a physics LoRA's scope is global, beat or either, by default
+beat; a style LoRA's scope is always global and a motion LoRA's always beat: LoRA scope spec LS1,
+its fix round A1 and motion-beat-only spec MB1);
 trained library characters are listed and verified here but are cast only with
 bin/ltx-movie --character. `add` runs
 bin/lora-check's architecture gate against each declared
@@ -101,9 +102,9 @@ def build_parser():
     add.add_argument("--rank", type=int, default=None)
     add.add_argument("--alpha", type=int, default=None)
     add.add_argument("--scope", choices=lora_catalog.SCOPES, default=None,
-                     help="where the story planner may place this motion or physics video "
-                          "LoRA: global (every panel), beat (one beat) or either; default: "
-                          "beat. A style LoRA is always global")
+                     help="where the story planner may place this physics video LoRA: global "
+                          "(every panel), beat (one beat) or either; default: beat. A style "
+                          "LoRA is always global and a motion LoRA always beat")
     add.add_argument("--no-arch-check", dest="arch_check", action="store_false", default=True,
                      help="skip the architecture-match gate (bin/lora-check) against the "
                           "declared base model(s)")
@@ -114,7 +115,7 @@ def build_parser():
     rm.add_argument("entry_id", metavar="ID")
     scope = sub.add_parser("scope", help="set where the story planner may place a catalog video "
                                          "LoRA (default: the default for its kind; a style LoRA "
-                                         "may only be global)")
+                                         "may only be global and a motion LoRA only beat)")
     scope.add_argument("entry_id", metavar="ID")
     scope.add_argument("scope", choices=lora_catalog.SCOPES + ("default",))
     ver = sub.add_parser("verify", help="check catalog entries against their files")
@@ -219,7 +220,7 @@ def cmd_add(args):
         if args.scope is not None:
             entry["scope"] = args.scope
         try:
-            lora_catalog.validate_entry(entry)
+            lora_catalog.validate_entry(entry, for_write=True)
             lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
                                              "entries": entries + [entry]})
         except lora_catalog.CatalogError as e:
@@ -251,6 +252,8 @@ def cmd_list(args):
         entries = lora_catalog.load_catalog(path)["entries"]
     except lora_catalog.CatalogError as e:
         return _error(str(e))
+    for warning in lora_catalog.scope_warnings(entries):
+        print("warning: %s" % warning, file=sys.stderr)
     characters = lora_catalog.fold_characters(WS)
     if args.model is not None:
         entries = [e for e in entries if lora_catalog.compatible(e, args.model)]
@@ -325,6 +328,7 @@ def cmd_scope(args):
             entry["scope"] = args.scope
         entries = [entry if e["id"] == entry["id"] else e for e in catalog["entries"]]
         try:
+            lora_catalog.validate_entry(entry, for_write=True)
             lora_catalog.save_catalog(path, {"schema_version": lora_catalog.SCHEMA_VERSION,
                                              "entries": entries})
         except lora_catalog.CatalogError as e:
@@ -345,6 +349,8 @@ def cmd_verify(args):
         entries = lora_catalog.load_catalog(path)["entries"]
     except lora_catalog.CatalogError as e:
         return _error(str(e))
+    for warning in lora_catalog.scope_warnings(entries):
+        print("warning: %s" % warning, file=sys.stderr)
     by_id = {e["id"]: e for e in entries}
     for entry_id in args.entry_ids:
         if entry_id not in by_id:

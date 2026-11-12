@@ -39,7 +39,7 @@ def test_lst10_the_scope_endpoints(ui):
     s, ws = ui["srv"], ui["ws"]
     assert ("POST", r"/api/loras/scope", "h_lora_scope", "/api/loras/scope") in srv.ROUTES
     assert srv.LORA_SCOPES == lora_catalog.SCOPES
-    add = {"ws": ws, "path": "/l/fight.safetensors", "id": "fight", "kind": "motion",
+    add = {"ws": ws, "path": "/l/fight.safetensors", "id": "fight", "kind": "physics",
            "target": "video", "base_models": ["M1"], "triggers": [], "description": "a fight",
            "use_when": "fights", "avoid_when": "", "default_strength": 0.8,
            "strength_range": [0.5, 1], "rank": 16, "alpha": None}
@@ -48,7 +48,7 @@ def test_lst10_the_scope_endpoints(ui):
         status, _h, payload = mt.api(s, "POST", "/api/loras", body=dict(add, scope=scope))
         assert status == 200, payload
         assert mt.stub_calls(ws)[-1]["argv"] == [
-            "add", "/l/fight.safetensors", "--id", "fight", "--kind", "motion", "--target",
+            "add", "/l/fight.safetensors", "--id", "fight", "--kind", "physics", "--target",
             "video", "--base-model", "M1", "--description", "a fight", "--use-when", "fights",
             "--default-strength", "0.8", "--strength-range", "0.5,1.0"] + tail
     for scope in ("default", "anywhere", 3, ["beat"]):
@@ -94,8 +94,9 @@ def test_lst11_the_static_page_sets_the_scope():
                  'select.value = e.scope || "default";',
                  'scopeCell(e), el("td", {text: strength}),',
                  '$("#l-scope").disabled = $("#l-target").value !== "video" || '
-                 '$("#l-kind").value === "style";',
+                 '$("#l-kind").value !== "physics";',
                  'if (e.kind === "style") { return el("td", {text: "global"}); }',
+                 'if (e.kind === "motion") { return el("td", {text: "beat"}); }',
                  '$("#l-target").addEventListener("change", syncLoraScope);',
                  '$("#l-kind").addEventListener("change", syncLoraScope);',
                  '\n    syncLoraScope();\n'):

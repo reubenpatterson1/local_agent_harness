@@ -41,6 +41,9 @@ ENTRY_KEYS = ("id", "kind", "path", "sha256", "bytes", "base_models", "target", 
 # picks) or either. An entry without one gets the default for its kind. Only video LoRAs have a
 # scope; a stills entry's scope is accepted and ignored. A style video entry's scope may only be
 # global (fix round A1): Phase 3 applies a style LoRA to every panel, never to one beat.
+# A motion video entry's scope is always beat (motion-beat-only spec MB1,
+# docs/superpowers/specs/2026-11-12-motion-lora-beat-only-design.md): a saved global or either
+# still loads, is read as beat and is named by scope_warnings; a new write of one is refused.
 OPTIONAL_ENTRY_KEYS = ("scope",)
 SCOPES = ("global", "beat", "either")
 DEFAULT_SCOPES = {"style": "global", "motion": "beat", "physics": "beat"}
@@ -83,9 +86,12 @@ def empty_catalog():
     return {"schema_version": SCHEMA_VERSION, "entries": []}
 
 
-def validate_entry(entry):
+def validate_entry(entry, for_write=False):
     """LC3 entry rules. Raises CatalogError("entry <id>: <field> <reason>"). File existence is
-    not checked here (verify_entry does that)."""
+    not checked here (verify_entry does that). for_write (motion-beat-only spec MB3) is for an
+    entry that bin/lora-catalog add or scope is about to write: it also refuses a motion video
+    entry whose scope is not beat. A loaded or saved catalog keeps such an entry, which
+    entry_scope reads as beat and scope_warnings names."""
     if not isinstance(entry, dict):
         raise CatalogError("entry: must be an object, got %s" % type(entry).__name__)
     label = entry.get("id") if isinstance(entry.get("id"), str) else "?"
@@ -122,6 +128,10 @@ def validate_entry(entry):
         fail("scope", "must be global for a style LoRA, which applies to every panel, got %r; "
                       "edit catalog.json by hand: remove the scope key or set it to global"
              % (entry["scope"],))
+    if (for_write and entry["target"] == "video" and entry["kind"] == "motion"
+            and entry.get("scope", "beat") != "beat"):
+        fail("scope", "must be beat for a motion LoRA, which is only ever a per-beat pick, got %r"
+             % (entry["scope"],))
     triggers = entry["triggers"]
     if not isinstance(triggers, list) or len(triggers) > MAX_TRIGGERS:
         fail("triggers", "must be a list of at most %d strings, got %r" % (MAX_TRIGGERS, triggers))
@@ -156,14 +166,32 @@ def validate_entry(entry):
 
 def entry_scope(entry):
     """Where the story planner may place a catalog entry (LoRA scope spec LS2): its scope, else
-    DEFAULT_SCOPES of its kind; always global for a style LoRA (fix round A1, also for an entry
-    that never went through validate_entry); None for a stills LoRA and for a library
-    character."""
+    DEFAULT_SCOPES of its kind; always global for a style LoRA (fix round A1) and always beat for
+    a motion LoRA (motion-beat-only spec MB2), also for an entry that never went through
+    validate_entry; None for a stills LoRA and for a library character."""
     if entry.get("target") != "video" or entry.get("kind") not in DEFAULT_SCOPES:
         return None
     if entry["kind"] == "style":
         return "global"
+    if entry["kind"] == "motion":
+        return "beat"
     return entry.get("scope") or DEFAULT_SCOPES[entry["kind"]]
+
+
+# Motion-beat-only spec MB4: a motion video entry saved with the scope global or either (before
+# MB1) still loads; it is read as beat, and bin/ltx-movie, bin/lora-catalog list and verify, and
+# the movie UI's LoRAs tab (app.js motionScopeWarning) name it.
+MOTION_SCOPE_WARNING = ("catalog entry %s has the scope %s, but a motion LoRA is only ever a "
+                        "per-beat pick, so it is read as beat; clear it with bin/lora-catalog "
+                        "scope %s default")
+
+
+def scope_warnings(entries):
+    """MOTION_SCOPE_WARNING for each motion video entry of entries whose scope is set and is not
+    beat, in entries order (motion-beat-only spec MB4)."""
+    return [MOTION_SCOPE_WARNING % (e["id"], e["scope"], e["id"]) for e in entries
+            if e.get("target") == "video" and e.get("kind") == "motion"
+            and e.get("scope", "beat") != "beat"]
 
 
 def validate_catalog(data):

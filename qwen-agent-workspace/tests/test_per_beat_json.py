@@ -96,10 +96,10 @@ def test_pjt1_the_lora_paragraph_names_the_per_beat_key(ws, tmp_path):
         "keys id and strength, taken from the LoRA catalog below; strength must lie inside that "
         "entry's range. The catalog lists each LoRA under the places where it may go. global "
         "is a list of picks applied to every panel, taken only from the LoRAs that may be global "
-        "picks: at most one style LoRA, plus motion or physics LoRAs that suit the whole movie. "
+        "picks: at most one style LoRA, plus at most one physics LoRA that suits the whole movie. "
         + CLAUSE + " a LoRA in global is never also in per_beat, and every beat may have at "
-        "most one motion or physics LoRA in total, counting global. stills is a list of at most "
-        "one stills LoRA.")
+        "most one motion LoRA and at most one physics LoRA, counting global. stills is a list of "
+        "at most one stills LoRA.")
     assert old not in se.LORA_PICK_PARAGRAPH
     assert "{" not in se.LORA_PICK_PARAGRAPH and "}" not in se.LORA_PICK_PARAGRAPH
     assert se.LORA_EMPTY_PARAGRAPH == (

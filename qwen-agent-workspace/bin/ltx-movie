@@ -1484,6 +1484,10 @@ def _resolve_story_engine(args):
             print("Error: invalid LoRA catalog %s: %s; run bin/lora-catalog verify" % (path, reason),
                   file=sys.stderr)
             return 2
+        # Motion-beat-only spec MB4: a motion LoRA saved with the scope global or either is read
+        # as beat; say so once per run.
+        for warning in catalog.scope_warnings(args.story_catalog["entries"]):
+            print("Warning: %s" % warning, file=sys.stderr)
     args.story_engine = "robust"
     return 0
 

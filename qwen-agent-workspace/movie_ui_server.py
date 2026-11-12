@@ -1248,6 +1248,8 @@ def _h_lora_add(self, groups, query, body):
         raise ApiError(400, "scope must be global, beat, either or null")
     if kind == "style" and scope in ("beat", "either"):
         raise ApiError(400, "scope must be global or null for a style LoRA")
+    if kind == "motion" and scope in ("global", "either"):
+        raise ApiError(400, "scope must be beat or null for a motion LoRA")
     no_arch_check = body.get("no_arch_check", False)
     if not isinstance(no_arch_check, bool):
         raise ApiError(400, "no_arch_check must be true or false")
