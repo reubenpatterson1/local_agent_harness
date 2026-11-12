@@ -2909,10 +2909,19 @@
     if (!S.ws) { return; }
     const res = await api("GET", "/api/loras" + wsQuery());
     const body = clear($("#l-table tbody"));
+    const warnings = clear($("#l-scope-warnings"));
+    warnings.hidden = true;
     if (res.status !== 200) {
       $("#l-output").textContent = (res.data && res.data.error) || ("http " + res.status);
       return;
     }
+    // Motion-beat-only spec MB4: a motion LoRA saved with the scope global or either is read as beat.
+    res.data.entries.forEach(function (e) {
+      if (e.target === "video" && e.kind === "motion" && e.scope && e.scope !== "beat") {
+        warnings.appendChild(el("div", {text: "Warning: " + motionScopeWarning(e)}));
+        warnings.hidden = false;
+      }
+    });
     const verdicts = {};
     (results || []).forEach(function (r) {
       verdicts[r.id] = (r.ok ? "ok" : r.problems.join("; ")) + (r.warnings && r.warnings.length ? " | warning: " + r.warnings.join("; ") : "");
@@ -2934,11 +2943,18 @@
     });
   }
 
+  // lora_catalog.MOTION_SCOPE_WARNING (motion-beat-only spec MB4).
+  function motionScopeWarning(e) {
+    return "catalog entry " + e.id + " has the scope " + e.scope + ", but a motion LoRA is only ever a per-beat pick, so it is read as beat; clear it with bin/lora-catalog scope " + e.id + " default";
+  }
+
   // LoRA scope spec LS7: a video entry's scope is chosen in its row; "default" clears it. A style
-  // LoRA's scope is always global (fix round A1), so its row has no select.
+  // LoRA's scope is always global (fix round A1) and a motion LoRA's always beat (motion-beat-only
+  // spec MB8), so their rows have no select.
   function scopeCell(e) {
     if (e.target !== "video") { return el("td", {text: "-"}); }
     if (e.kind === "style") { return el("td", {text: "global"}); }
+    if (e.kind === "motion") { return el("td", {text: "beat"}); }
     const select = el("select", {cls: "l-row-scope"}, [el("option", {value: "default", text: "default (" + LORA_SCOPE_DEFAULTS[e.kind] + ")"}),
       el("option", {value: "global", text: "global"}), el("option", {value: "beat", text: "beat"}),
       el("option", {value: "either", text: "either"})]);
@@ -2952,10 +2968,11 @@
     return el("td", {}, [select]);
   }
 
-  // Fix round A1: a stills LoRA has no scope and a style LoRA's is always global, so the add
-  // form's Scope select is off for both.
+  // Fix round A1 and motion-beat-only spec MB8: a stills LoRA has no scope, a style LoRA's is
+  // always global and a motion LoRA's always beat, so the add form's Scope select is on only for
+  // a physics video LoRA.
   function syncLoraScope() {
-    $("#l-scope").disabled = $("#l-target").value !== "video" || $("#l-kind").value === "style";
+    $("#l-scope").disabled = $("#l-target").value !== "video" || $("#l-kind").value !== "physics";
   }
 
   function splitList(selector) {

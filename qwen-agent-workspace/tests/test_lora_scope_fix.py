@@ -170,10 +170,10 @@ def test_lst13_the_movie_ui_gives_a_style_lora_no_per_beat_scope(ui):
     assert "--scope" not in mt.stub_calls(ws)[1]["argv"]
     with open(os.path.join(WS, "static", "movie-ui", "index.html"), encoding="utf-8") as f:
         html = f.read()
-    assert ("Where the story planner may put a motion or physics video LoRA: global applies it to "
+    assert ("Where the story planner may put a physics video LoRA: global applies it to "
             "every panel, beat only to the beats it suits, either lets the planner choose; the "
-            "default is beat. A style LoRA is always global, and a stills LoRA has no scope, so "
-            "the select is off for both.</span>") in html
+            "default is beat. A style LoRA is always global, a motion LoRA is always per-beat, "
+            "and a stills LoRA has no scope, so the select is off for all three.</span>") in html
 
 
 # --- LST14 (A2): a LoRA the critic moves keeps one copy, in either patch order -------------------
