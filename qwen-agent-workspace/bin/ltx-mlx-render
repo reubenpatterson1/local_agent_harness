@@ -291,10 +291,11 @@ def load_manifest(path):
             ids = [entry["id"] for entry in entries]
             if len(set(ids)) != len(ids):
                 raise ValueError("panel %d: catalog_loras lists a LoRA twice" % index)
-            if (sum(1 for e in entries if e["kind"] == "style") > 1
-                    or sum(1 for e in entries if e["kind"] != "style") > 1):
-                raise ValueError("panel %d: catalog_loras has more than one style or "
-                                 "motion/physics LoRA" % index)
+            # Motion-beat-only spec MB7: at most one LoRA of each kind per panel.
+            if any(sum(1 for e in entries if e["kind"] == kind) > 1
+                   for kind in ("style", "motion", "physics")):
+                raise ValueError("panel %d: catalog_loras has more than one LoRA of the same "
+                                 "kind (style, motion or physics)" % index)
 
         panel_text = panel.get("panel_text")
         if not isinstance(panel_text, str) or not panel_text.strip():

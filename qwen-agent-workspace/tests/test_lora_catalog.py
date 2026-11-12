@@ -839,6 +839,7 @@ def _entry(tmp_path, entry_id, kind, strength, triggers):
 def test_lct16_manifest_catalog_loras(tmp_path, monkeypatch, capsys):
     fast = _entry(tmp_path, "fast-motion", "motion", 0.7, ["fastmo"])
     grain = _entry(tmp_path, "film-grain", "style", 0.8, ["grainfilm"])
+    rain = _entry(tmp_path, "rain-physics", "physics", 0.6, [])
     ws, argv, catalog_path = _manifest_inputs(tmp_path, monkeypatch, [[grain], [fast, grain], [fast]])
     assert story_manifest.main(argv) == 0
     out = capsys.readouterr().out
@@ -858,7 +859,11 @@ def test_lct16_manifest_catalog_loras(tmp_path, monkeypatch, capsys):
         ([[dict(grain, path="rel.safetensors")], [], []],
          "panel 1 entry 1: path must be an absolute path to a readable file, got 'rel.safetensors'"),
         ([[grain, dict(grain, id="other-grain")], [], []],
-         "panel 1 has more than one style or motion/physics LoRA"),
+         "panel 1 has more than one LoRA of the same kind (style, motion or physics)"),
+        ([[fast, dict(fast, id="slow-motion")], [], []],
+         "panel 1 has more than one LoRA of the same kind (style, motion or physics)"),
+        ([[rain, dict(rain, id="mist-physics")], [], []],
+         "panel 1 has more than one LoRA of the same kind (style, motion or physics)"),
         ([[grain, grain], [], []], "panel 1 lists a LoRA twice"),
         ([[dict(grain, strength=True)], [], []],
          "panel 1 entry 1: strength must be a number in (0, 2], got True"),
@@ -871,6 +876,11 @@ def test_lct16_manifest_catalog_loras(tmp_path, monkeypatch, capsys):
             json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": "m1", "panels": lists}, f)
         assert story_manifest.main(argv) == 2
         assert capsys.readouterr().err == "Error: --catalog-loras %s: %s\n" % (catalog_path, reason)
+    with open(catalog_path, "w", encoding="utf-8") as f:
+        json.dump({"schema": "ltx-movie.catalog-loras.v1", "story_id": "m1",
+                   "panels": [[rain, fast], [], []]}, f)
+    assert story_manifest.main(argv) == 0
+    capsys.readouterr()
     with open(catalog_path, "w", encoding="utf-8") as f:
         json.dump({"schema": "other"}, f)
     assert story_manifest.main(argv) == 2
@@ -1009,8 +1019,15 @@ def _render_entries(tmp_path):
 
 def test_lct19_load_manifest_validates_catalog_loras(tmp_path):
     fast, grain = _render_entries(tmp_path)
+    rain = _entry(tmp_path, "rain-physics", "physics", 0.6, [])
     good = _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[fast, grain], [], [fast]]))
     assert render.load_manifest(good)["panels"][0]["catalog_loras"] == [fast, grain]
+    both = _write_render_manifest(tmp_path, _chain_panels(tmp_path, [[rain, fast, grain], [], []]))
+    both_panels = render.load_manifest(both)["panels"]
+    assert both_panels[0]["catalog_loras"] == [rain, fast, grain]
+    units = render.build_units(both_panels, 0, str(tmp_path / "clips"))
+    assert [lora["name"] for lora in units[0]["loras"]] == [
+        "rain-physics", "fast-motion", "film-grain"]
     cases = [
         ({"x": 1}, "panel 1: catalog_loras must be a list"),
         ([dict(fast, extra=1)], "panel 1: catalog_loras entry must have exactly the keys id, "
@@ -1022,8 +1039,15 @@ def test_lct19_load_manifest_validates_catalog_loras(tmp_path):
         ([dict(fast, strength=3)], "panel 1: catalog_loras fast-motion: strength must be a number "
                                    "in (0, 2], got 3"),
         ([fast, fast], "panel 1: catalog_loras lists a LoRA twice"),
-        ([grain, dict(grain, id="big-style")], "panel 1: catalog_loras has more than one style or "
-                                               "motion/physics LoRA"),
+        ([grain, dict(grain, id="big-style")],
+         "panel 1: catalog_loras has more than one LoRA of the same kind (style, motion or "
+         "physics)"),
+        ([fast, dict(fast, id="slow-motion")],
+         "panel 1: catalog_loras has more than one LoRA of the same kind (style, motion or "
+         "physics)"),
+        ([rain, dict(rain, id="mist-physics")],
+         "panel 1: catalog_loras has more than one LoRA of the same kind (style, motion or "
+         "physics)"),
     ]
     for entries, message in cases:
         path = _write_render_manifest(tmp_path, _chain_panels(tmp_path, [entries, [], []]))

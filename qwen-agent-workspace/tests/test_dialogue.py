@@ -1402,7 +1402,8 @@ def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
     files = str(tmp_path / "files")
     entries = [seu.catalog_entry(seu.lora_file(files, "grain"), "film-grain", kind="style"),
                seu.catalog_entry(seu.lora_file(files, "big"), "big-style", kind="style"),
-               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion", scope="either"),
+               seu.catalog_entry(seu.lora_file(files, "fast"), "fast-motion"),
+               seu.catalog_entry(seu.lora_file(files, "slow"), "slow-motion"),
                seu.catalog_entry(seu.lora_file(files, "rain"), "rain-physics", kind="physics",
                                  scope="either")]
     lctx = seu.make_ctx(se, ws, catalog={"schema_version": 1, "entries": entries})
@@ -1417,15 +1418,14 @@ def test_dlg18_reclassification(ws, tmp_path, monkeypatch, capsys, story_env):
     def pick(entry_id, strength=0.8):
         return {"id": entry_id, "strength": strength}
 
-    assert lora({"global": [pick("fast-motion", 2.5)]}) == ([
-        "plan: L5 strength: 'fast-motion' strength 2.5 is outside (0, 2], which the renderer "
+    assert lora({"global": [pick("rain-physics", 2.5)]}) == ([
+        "plan: L5 strength: 'rain-physics' strength 2.5 is outside (0, 2], which the renderer "
         "refuses"], [])
-    assert lora({"global": [pick("fast-motion", 1.4)]}) == ([], [
-        "plan: L5 strength: 'fast-motion' strength 1.4 is outside its range 0.5 to 1.0"])
+    assert lora({"global": [pick("rain-physics", 1.4)]}) == ([], [
+        "plan: L5 strength: 'rain-physics' strength 1.4 is outside its range 0.5 to 1.0"])
     for loras, rule, ctx in (
             ({"global": [pick("film-grain"), pick("big-style")]}, "L2", lctx),
-            ({"global": [pick("fast-motion")], "per_beat": {"2": [pick("rain-physics")]}}, "L3",
-             lctx),
+            ({"per_beat": {"2": [pick("fast-motion"), pick("slow-motion")]}}, "L3", lctx),
             ({"global": [pick("film-grain")], "per_beat": {"2": [pick("fast-motion")]}}, "L4",
              lctx._replace(pinned=[{"path": "/p/%d.safetensors" % i, "strength": 1.0,
                                     "catalog_id": None, "kind": None} for i in (1, 2, 3)]))):

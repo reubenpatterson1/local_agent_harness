@@ -583,17 +583,18 @@ LORA_EMPTY_PARAGRAPH = ("an object with the keys global, per_beat and stills, ea
                         "and stills are empty lists and per_beat is an empty object.")
 # LoRA scope spec LS4 (docs/superpowers/specs/2026-11-10-lora-scope-design.md): the catalog
 # below the paragraph lists each video LoRA under the places its scope allows (catalog_groups).
+# Motion-beat-only spec MB5: no motion LoRA in global; one motion and one physics LoRA per beat.
 LORA_PICK_PARAGRAPH = (
     "an object with the keys global, per_beat and stills. Each pick is an object with the keys "
     "id and strength, taken from the LoRA catalog below; strength must lie inside that entry's "
     "range. The catalog lists each LoRA under the places where it may go. global is a list of "
     "picks applied to every panel, taken only from the LoRAs that may be global picks: at most "
-    "one style LoRA, plus motion or physics LoRAs that suit the whole movie. per_beat maps each "
-    "beat number to a list of picks for that beat only, taken only from the LoRAs that may be "
-    "per-beat picks, and each key is the beat number alone in double quotes: the key of beat 1 "
-    'is "1"; a LoRA in global is never also in per_beat, and every beat may have at most one '
-    "motion or physics LoRA in total, counting global. stills is a list of at most one stills "
-    "LoRA.")
+    "one style LoRA, plus at most one physics LoRA that suits the whole movie. per_beat maps "
+    "each beat number to a list of picks for that beat only, taken only from the LoRAs that may "
+    "be per-beat picks, and each key is the beat number alone in double quotes: the key of beat "
+    '1 is "1"; a LoRA in global is never also in per_beat, and every beat may have at most one '
+    "motion LoRA and at most one physics LoRA, counting global. stills is a list of at most one "
+    "stills LoRA.")
 LORA_GLOBAL_GROUP = "May be global picks (applied to every panel):"
 LORA_GLOBAL_NONE = "- none, so global stays empty"
 LORA_BEAT_GROUP = "May be per-beat picks (applied to their beat only):"
@@ -612,13 +613,15 @@ LORA_DUPLICATE_BEATS = ("plan: L6 duplicate: %s was picked both globally and for
 LORA_DUPLICATE_GLOBAL = ("plan: L6 duplicate: %s was picked both globally and for beat(s) %s; its "
                          "catalog scope is beat, so the pipeline kept the per-beat picks and "
                          "dropped the global pick")
-# Fix round A1, A3: a style LoRA's scope is always global, so only a motion or physics LoRA's
-# scope can make its pick allowed; bin/ltx-movie's Phase 2 and 3 errors print this hint too.
+# Fix round A1, A3 and motion-beat-only spec MB5: a style LoRA's scope is always global and a
+# motion LoRA's always beat, so only a physics LoRA's scope can make its pick allowed;
+# bin/ltx-movie's Phase 2 and 3 errors print this hint too.
 RECHECK_SCOPE_HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: "
-                      "give a motion or physics LoRA the scope either with bin/lora-catalog "
-                      "scope ID either (or the Scope select of its row in the movie UI's LoRAs "
-                      "tab), or pass --force-story to regenerate; a style LoRA is only ever a "
-                      "global pick, so a style LoRA picked for a beat needs --force-story.")
+                      "give a physics LoRA the scope either with bin/lora-catalog scope ID either "
+                      "(or the Scope select of its row in the movie UI's LoRAs tab), or pass "
+                      "--force-story to regenerate; a style LoRA is only ever a global pick and a "
+                      "motion LoRA only ever a per-beat pick, so a style LoRA picked for a beat or "
+                      "a motion LoRA picked globally needs --force-story.")
 
 
 def _fill(template, fragments, scalars, narrative):
@@ -2821,10 +2824,13 @@ def lora_checks(ctx, plan, compatible_by_id, catalog_by_id):
                    + ([("location " + loc, "location", None, None)] if loc in attached else [])
                    + [("character " + by_cast[c]["cast_name"], "character", None, None)
                       for c in beat["cast"] if c in by_cast and by_cast[c]["cast_name"]])
-        motion = [label for label, kind, _i, _p in loras_k if kind in ("motion", "physics")]
-        if len(motion) > 1:
-            advisory.append("beat %d: L3 motion: %d motion or physics LoRAs on this panel (%s); at "
-                        "most 1" % (k, len(motion), ", ".join(motion)))
+        # Motion-beat-only spec MB6: one motion LoRA and one physics LoRA per panel, counted
+        # apart, so a global physics LoRA and a per-beat motion LoRA may share a panel.
+        for counted in ("motion", "physics"):
+            labels = [label for label, kind, _i, _p in loras_k if kind == counted]
+            if len(labels) > 1:
+                advisory.append("beat %d: L3 %s: %d %s LoRAs on this panel (%s); at most 1"
+                                % (k, counted, len(labels), counted, ", ".join(labels)))
         if len(loras_k) > LORA_PANEL_LIMIT:
             message = ("beat %d: L4 LoRA count: %d LoRAs on this panel (%s); at most %d"
                        % (k, len(loras_k), ", ".join(l[0] for l in loras_k), LORA_PANEL_LIMIT))

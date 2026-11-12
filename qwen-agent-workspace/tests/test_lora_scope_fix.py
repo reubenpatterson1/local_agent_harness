@@ -262,10 +262,13 @@ def test_lst15_phase_3_and_the_dry_run_name_the_l8_fix(tmp_path, monkeypatch, st
     assert ltx_movie.main(P3 + ["--dry-run"]) == 2
     assert capsys.readouterr().err == CHECKS_ERROR % GLOBAL_L8 + se.RECHECK_SCOPE_HINT + "\n"
     assert not os.path.exists(path)
-    seu.make_catalog(story_env["catalog"], [grain, dict(fast, scope="either")])
+    rain = seu.catalog_entry(seu.lora_file(str(tmp_path / "files"), "rain"), "rain-physics",
+                             kind="physics", scope="either")
+    seu.make_catalog(story_env["catalog"], [grain, fast, rain])
+    _write_plan(story_dir, {"global": [_pick("rain-physics", 0.7)]})
     assert ltx_movie.phase3_manifest(_movie_args(*P3)) == 0
-    item = {"id": "fast-motion", "kind": "motion", "path": fast["path"],
-            "sha256": fast["sha256"], "strength": 0.7, "triggers": []}
+    item = {"id": "rain-physics", "kind": "physics", "path": rain["path"],
+            "sha256": rain["sha256"], "strength": 0.7, "triggers": []}
     with open(path) as f:
         assert json.load(f)["panels"] == [[item], [item], [item]]
     os.remove(path)

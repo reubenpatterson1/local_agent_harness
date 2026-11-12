@@ -73,9 +73,10 @@ def test_lst1_the_scope_field_and_its_defaults(tmp_path, story_env):
     assert [lora_catalog.entry_scope(e) for e in (grain, fast, rain, ink)] == [
         "global", "beat", "beat", None]
     for scope in lora_catalog.SCOPES:
-        for entry in ((grain, fast, ink) if scope == "global" else (fast, ink)):
+        for entry in ((grain, fast, rain, ink) if scope == "global" else (fast, rain, ink)):
             lora_catalog.validate_entry(dict(entry, scope=scope))
-        assert lora_catalog.entry_scope(dict(fast, scope=scope)) == scope
+        assert lora_catalog.entry_scope(dict(rain, scope=scope)) == scope
+        assert lora_catalog.entry_scope(dict(fast, scope=scope)) == "beat"
     assert lora_catalog.entry_scope(dict(ink, scope="beat")) is None
     for character in (dict(fast, id="char:kyra", kind="character"),):
         assert lora_catalog.entry_scope(character) is None
@@ -108,7 +109,7 @@ def test_lst2_add_scope_and_the_list_column(tmp_path, story_env):
     base = ["--base-model", seu.VIDEO_MODEL, "--description", "a test LoRA",
             "--use-when", "a chase"]
     fight = seu.lora_file(files, "fight")
-    result = _cli("add", fight, "--id", "fight-motion", "--kind", "motion", "--target", "video",
+    result = _cli("add", fight, "--id", "fight-physics", "--kind", "physics", "--target", "video",
                   "--scope", "either", *base)
     assert (result.returncode, result.stderr) == (0, ARCH_UNVERIFIED), result.stderr
     entry = lora_catalog.load_catalog(path)["entries"][0]
@@ -138,7 +139,8 @@ def test_lst2_add_scope_and_the_list_column(tmp_path, story_env):
     row = "%-24s %-9s %-7s %-7s %-14s %-24s %s"
     assert _cli("list").stdout.splitlines() == [
         row % ("ID", "KIND", "TARGET", "SCOPE", "STRENGTH", "TRIGGERS", "BASE_MODELS"),
-        row % ("fight-motion", "motion", "video", "either", "1.0 (0.5-1.0)", "", seu.VIDEO_MODEL),
+        row % ("fight-physics", "physics", "video", "either", "1.0 (0.5-1.0)", "",
+               seu.VIDEO_MODEL),
         row % ("film-grain", "style", "video", "global", "1.0 (0.5-1.0)", "", seu.VIDEO_MODEL),
         row % ("ink-stills", "style", "stills", "-", "1.0 (0.5-1.0)", "", seu.STILLS_MODEL),
         row % ("plain-motion", "motion", "video", "beat", "1.0 (0.5-1.0)", "", seu.VIDEO_MODEL)]
@@ -153,16 +155,16 @@ def test_lst3_the_scope_subcommand(tmp_path, story_env):
     assert _cli("scope", "fast-motion", "beat").stderr == "Error: no catalog entry fast-motion\n"
     grain, fast, rain, ink = _entries(tmp_path)
     seu.make_catalog(story_env["catalog"], [grain, fast, rain, ink])
-    result = _cli("scope", "fast-motion", "global")
+    result = _cli("scope", "rain-physics", "global")
     assert (result.returncode, result.stdout, result.stderr) == (
-        0, "fast-motion: scope global in %s\n" % path, "")
+        0, "rain-physics: scope global in %s\n" % path, "")
     entries = lora_catalog.load_catalog(path)["entries"]
-    assert entries == [dict(fast, scope="global"), grain, ink, rain]
-    assert _cli("scope", "fast-motion", "either").returncode == 0
-    assert lora_catalog.load_catalog(path)["entries"][0] == dict(fast, scope="either")
-    result = _cli("scope", "fast-motion", "default")
+    assert entries == [fast, grain, ink, dict(rain, scope="global")]
+    assert _cli("scope", "rain-physics", "either").returncode == 0
+    assert lora_catalog.load_catalog(path)["entries"][3] == dict(rain, scope="either")
+    result = _cli("scope", "rain-physics", "default")
     assert (result.returncode, result.stdout) == (
-        0, "fast-motion: scope beat (the default for a motion LoRA) in %s\n" % path)
+        0, "rain-physics: scope beat (the default for a physics LoRA) in %s\n" % path)
     assert lora_catalog.load_catalog(path)["entries"] == [fast, grain, ink, rain]
     before = _read_bytes(path)
     for argv, stderr in (

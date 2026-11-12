@@ -269,9 +269,12 @@ def _read_catalog_loras(path, n_panels):
         ids = [e["id"] for e in entries]
         if len(set(ids)) != len(ids):
             return None, "panel %d lists a LoRA twice" % i
-        if (sum(1 for e in entries if e["kind"] == "style") > 1
-                or sum(1 for e in entries if e["kind"] != "style") > 1):
-            return None, "panel %d has more than one style or motion/physics LoRA" % i
+        # Motion-beat-only spec MB7: at most one LoRA of each kind per panel, so a global physics
+        # LoRA and a per-beat motion LoRA may share one.
+        if any(sum(1 for e in entries if e["kind"] == kind) > 1
+               for kind in ("style", "motion", "physics")):
+            return None, ("panel %d has more than one LoRA of the same kind (style, motion or "
+                          "physics)" % i)
     return lists, None
 
 

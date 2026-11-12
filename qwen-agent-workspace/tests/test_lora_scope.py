@@ -35,10 +35,11 @@ GLOBAL_L8 = ("plan: L8 scope: 'fast-motion' may only be a per-beat pick (its cat
 BEAT_L8 = ("beat %d: L8 scope: 'film-grain' may only be a global pick (its catalog scope is "
            "global), but it is a pick for this beat; remove it from this beat, or move it to "
            "global if it suits the whole movie")
-HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: give a motion "
-        "or physics LoRA the scope either with bin/lora-catalog scope ID either (or the Scope "
-        "select of its row in the movie UI's LoRAs tab), or pass --force-story to regenerate; a "
-        "style LoRA is only ever a global pick, so a style LoRA picked for a beat needs "
+HINT = ("An L8 violation is a pick placed where its catalog scope does not allow: give a "
+        "physics LoRA the scope either with bin/lora-catalog scope ID either (or the Scope "
+        "select of its row in the movie UI's LoRAs tab), or pass --force-story to regenerate; "
+        "a style LoRA is only ever a global pick and a motion LoRA only ever a per-beat pick, "
+        "so a style LoRA picked for a beat or a motion LoRA picked globally needs "
         "--force-story.")
 
 
@@ -102,12 +103,12 @@ def test_lst4_the_plan_prompt_groups_the_catalog(ws, tmp_path):
         "keys id and strength, taken from the LoRA catalog below; strength must lie inside that "
         "entry's range. The catalog lists each LoRA under the places where it may go. global is "
         "a list of picks applied to every panel, taken only from the LoRAs that may be global "
-        "picks: at most one style LoRA, plus motion or physics LoRAs that suit the whole movie. "
-        "per_beat maps each beat number to a list of picks for that beat only, taken only from "
-        "the LoRAs that may be per-beat picks, and each key is the beat number alone in double "
-        'quotes: the key of beat 1 is "1"; a LoRA in global is never also in per_beat, and '
-        "every beat may have at most one motion or physics LoRA in total, counting global. "
-        "stills is a list of at most one stills LoRA.")
+        "picks: at most one style LoRA, plus at most one physics LoRA that suits the whole "
+        "movie. per_beat maps each beat number to a list of picks for that beat only, taken "
+        "only from the LoRAs that may be per-beat picks, and each key is the beat number alone "
+        'in double quotes: the key of beat 1 is "1"; a LoRA in global is never also in '
+        "per_beat, and every beat may have at most one motion LoRA and at most one physics "
+        "LoRA, counting global. stills is a list of at most one stills LoRA.")
     ctx = _ctx(ws, tmp_path, entries=_entries(tmp_path, rain="either"))
     prompt = se.build_plan_prompt(ctx, se.compatible_entries(ctx), [])
     block = ("\n\nLoRA catalog (pick only from these):\n"
@@ -155,13 +156,13 @@ def test_lst5_a_pick_its_scope_does_not_allow_is_l8(ws, tmp_path):
     assert [se.parse_violation(m) for m in (GLOBAL_L8, BEAT_L8 % 3)] == [
         {"id": "L8", "name": "scope", "scope": "plan", "index": None, "message": GLOBAL_L8},
         {"id": "L8", "name": "scope", "scope": "beat", "index": 3, "message": BEAT_L8 % 3}]
-    either = _ctx(ws, tmp_path, entries=_entries(tmp_path, fast="either"))
-    assert _checks(either, {"global": [_pick("fast-motion")]}) == ([], [])
-    assert _checks(either, {"per_beat": {"2": [_pick("fast-motion")]}}) == ([], [])
-    swapped = _ctx(ws, tmp_path, entries=_entries(tmp_path, fast="global"))
-    assert _checks(swapped, {"global": [_pick("fast-motion")]}) == ([], [])
-    assert _checks(swapped, {"per_beat": {"2": [_pick("fast-motion")]}})[0] == [
-        (BEAT_L8 % 2).replace("film-grain", "fast-motion")]
+    either = _ctx(ws, tmp_path, entries=_entries(tmp_path, rain="either"))
+    assert _checks(either, {"global": [_pick("rain-physics")]}) == ([], [])
+    assert _checks(either, {"per_beat": {"2": [_pick("rain-physics")]}}) == ([], [])
+    swapped = _ctx(ws, tmp_path, entries=_entries(tmp_path, rain="global"))
+    assert _checks(swapped, {"global": [_pick("rain-physics")]}) == ([], [])
+    assert _checks(swapped, {"per_beat": {"2": [_pick("rain-physics")]}})[0] == [
+        (BEAT_L8 % 2).replace("film-grain", "rain-physics")]
     fast = dict((e["id"], e) for e in ctx.catalog["entries"])["fast-motion"]
     pinned = ctx._replace(pinned=[{"path": fast["path"], "strength": 0.8,
                                    "catalog_id": "fast-motion", "kind": "motion"}])
@@ -259,10 +260,10 @@ def test_lst7_the_critic_moves_a_per_beat_lora_out_of_global(ws, tmp_path, monke
 
 def test_lst8_recheck_names_l8_and_either_restores_a_saved_plan(ws, tmp_path, monkeypatch,
                                                                 capsys):
-    entries = _entries(tmp_path, fast="either")
+    entries = _entries(tmp_path, rain="either")
     ctx = _ctx(ws, tmp_path, entries=entries, mode="shots")
     raw = seu.plan_json("shots", 3)
-    raw["loras"] = {"global": [_pick("fast-motion")], "per_beat": {}, "stills": []}
+    raw["loras"] = {"global": [_pick("rain-physics")], "per_beat": {}, "stills": []}
     seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(raw)],
                      panel=_panel_script("shots", 3))
     assert se.run(ctx)[0] == 0
@@ -274,7 +275,7 @@ def test_lst8_recheck_names_l8_and_either_restores_a_saved_plan(ws, tmp_path, mo
     default = ctx._replace(catalog={"schema_version": 1, "entries": _entries(tmp_path)})
     assert se.recheck(default, never)[0] == 2
     err = capsys.readouterr().err
-    assert "  - " + GLOBAL_L8 + "\n" in err
+    assert "  - " + GLOBAL_L8.replace("fast-motion", "rain-physics") + "\n" in err
     assert err.endswith("rerun with --no-auto-lora, or pass --force-story to regenerate.\n"
                         + HINT + "\n")
     with open(os.path.join(ctx.story_dir, "story_checks.json"), encoding="utf-8") as f:
