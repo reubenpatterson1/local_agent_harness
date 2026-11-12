@@ -113,7 +113,10 @@ story.md. --judge adds bin/judge-story --patches as a final report;
 Seed edit (docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md): --seed-edit-model ID turns
 the --seed-image into panel 1 with a Qwen registry edit model in Phase 1c (after the story, before
 the stills), prompted by panel 1's Image: text; the edit is screened, recorded in seed_edit.json and
-passed to Phase 2 as its --seed-image. Absent, or as-is, the seed is used unchanged.
+passed to Phase 2 as its --seed-image. Absent, or as-is, the seed is used unchanged. With --shots
+(docs/superpowers/specs/2026-11-11-shots-zimage-engine-design.md) the flag is required: as-is keeps
+the seed as panel 1 and renders every other panel's still with Z-Image and its stills LoRAs, as
+--shots does without a seed.
 
 Seed context (docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md), a test option: in shots mode with
 --seed-image, --seed-context still makes every panel after the first a two-image Qwen edit of the seed (the people)
@@ -164,6 +167,12 @@ SHOTS_SEED_EDIT_PREFIX = (
     "leave out anyone the new shot does not describe. The new shot: ")
 SHOTS_SEED_LORA_NOTE = ("note: Z-Image stills LoRAs (character, location and catalog stills LoRAs) do not apply "
                         "to Qwen edits; every panel's still is edited without them")
+# Shots Z-Image engine (docs/superpowers/specs/2026-11-11-shots-zimage-engine-design.md, ZE1): with --shots, --seed-image
+# and --seed-edit-model as-is, panel 1 is the seed and every other panel is a Z-Image still, as shots mode without a seed.
+SHOTS_ZIMAGE_MOVE_WHY = "(a Qwen edit of the seed; the Z-Image engine renders this panel again)"
+SHOTS_ZIMAGE_PLAN_WARNING = ("Warning: %s was planned for the Qwen engine (plan.json records the seed image), so its "
+                             "Image: lines leave out the cast descriptions that Z-Image draws from; rerun with "
+                             "--force-story to plan the story for Z-Image")
 # Cast references (docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md, CR5), a test option: in
 # shots mode without a seed image, a panel whose Image: names two cast characters is one Qwen edit with both
 # characters' reference stills as Picture 1 and Picture 2.
@@ -397,10 +406,13 @@ def build_parser():
                          help="with --seed-image: edit the seed into panel 1 with a Qwen registry edit model "
                               "(qwen21-q4, qwen21-q8, qwen21-bf16, qwen2511-q4, qwen2511-bf16), prompted by panel 1's "
                               "Image: text after Phase 1 and screened with content safety; as-is, like leaving the "
-                              "flag out, uses the seed unchanged. With --shots it is required and as-is is refused: "
-                              "every panel's still is an edit of the seed, each prompted by its own Image: text. See "
-                              "docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md and "
-                              "2026-11-05-compose-shots-seed-edit-design.md.")
+                              "flag out, uses the seed unchanged. With --shots it is required and chooses the stills "
+                              "engine: an ID makes every panel's still an edit of the seed, each prompted by its own "
+                              "Image: text; as-is keeps the seed as panel 1 and renders every other panel's still "
+                              "with Z-Image and its stills LoRAs, as --shots does without a seed. See "
+                              "docs/superpowers/specs/2026-11-03-qwen-edit-models-design.md, "
+                              "2026-11-05-compose-shots-seed-edit-design.md and "
+                              "2026-11-11-shots-zimage-engine-design.md.")
     parser.add_argument("--seed-edit-lora", dest="seed_edit_loras", action="append", default=None,
                          metavar="ID=SCALE",
                          help="with --seed-edit-model ID: a registry LoRA of that model's family, 0 < SCALE <= 2 "
@@ -488,9 +500,11 @@ def build_parser():
                               "panels). Phase 1 uses the shots story template and enforces the "
                               "shot rules (one action per Motion:, at most two cast characters "
                               "per shot), Phase 2 renders a still for every panel, and every "
-                              "cast character LoRA defaults to 0.8. With --seed-image, every "
-                              "panel's still is instead a Qwen edit of the seed (--seed-edit-model "
-                              "ID, required). See docs/superpowers/specs/"
+                              "cast character LoRA defaults to 0.8. With --seed-image, "
+                              "--seed-edit-model (required) chooses the stills engine: an ID makes "
+                              "every panel's still a Qwen edit of the seed; as-is keeps the seed as "
+                              "panel 1 and renders every other panel's still with Z-Image. See "
+                              "docs/superpowers/specs/"
                               "2026-10-06-shots-mode-design.md.")
     parser.add_argument("--redo", dest="redo", default=None, metavar="N[,M...]",
                          help="with --shots and an existing story.md: move panels N,M...'s "
@@ -1488,17 +1502,19 @@ def _resolve_shots(args):
               "--no-stills", file=sys.stderr)
         return 2
     if getattr(args, "seed_image", None):
-        # Shots seed edits SE2: every panel's still is a Qwen edit of the seed.
+        # Shots seed edits SE2, amended by the shots Z-Image engine spec ZE2: an ID makes every panel's still a Qwen
+        # edit of the seed; as-is keeps the seed as panel 1 and every other panel is a Z-Image still.
         if args.story_legacy or args.story_prompt_override is not None:
             print("Error: --shots with --seed-image needs the default story engine; it cannot be combined "
                   "with %s" % ("--story-legacy" if args.story_legacy else "--story-prompt-override"),
                   file=sys.stderr)
             return 2
-        if args.seed_edit_model in (None, "as-is"):
-            print("Error: --shots with --seed-image needs --seed-edit-model ID: every panel's still is a Qwen "
-                  "edit of the seed, so the seed cannot be used as-is", file=sys.stderr)
+        if args.seed_edit_model is None:
+            print("Error: --shots with --seed-image needs --seed-edit-model: a Qwen model ID makes every panel's "
+                  "still an edit of the seed; as-is keeps the seed as panel 1 and renders every other panel's still "
+                  "with Z-Image", file=sys.stderr)
             return 2
-        if getattr(args, "stills_lora_path_specs", None):
+        if args.seed_edit_model != "as-is" and getattr(args, "stills_lora_path_specs", None):
             print("Error: --stills-lora cannot be combined with --shots and --seed-image: every panel's still "
                   "is a Qwen edit of the seed, and Z-Image stills LoRAs do not apply to it", file=sys.stderr)
             return 2
@@ -1934,11 +1950,12 @@ def _story_context(args, dry_run=False):
         agent_image = paths["seed_downscaled"]
     else:
         agent_image = getattr(args, "seed_downscaled_path", None)
+    # Shots Z-Image engine ZE3: Z-Image never sees the seed, so its Image: lines keep every cast description.
     return engine.StoryContext(
         ws=WS, story_id=args.story_id, story_dir=paths["story_dir"], mode=_story_mode(args),
         panels=args.panels, seconds=_clip_seconds(args), narrative=args.narrative,
         goal=args.goal, members=list(getattr(args, "cast_members", None) or []),
-        seed_image=os.path.abspath(args.seed_image) if seeded else None,
+        seed_image=os.path.abspath(args.seed_image) if seeded and not _shots_zimage_seed(args) else None,
         seed_agent_image=agent_image, story_model=args.story_model,
         context_window=args.story_context_window, video_model=args.model,
         auto_lora=not args.no_auto_lora, catalog=catalog, pinned=_story_pins(args, catalog),
@@ -2339,7 +2356,8 @@ def _still_size(args):
 def phase2_stills(args):
     paths = _story_paths(args.story_id)
     print("=== Phase 2: stills ===")
-    if getattr(args, "shots", False) and getattr(args, "seed_image", None):
+    # Shots Z-Image engine ZE4: with --seed-edit-model as-is the shots branch below runs, panel 1 being the seed.
+    if getattr(args, "shots", False) and getattr(args, "seed_image", None) and not _shots_zimage_seed(args):
         if getattr(args, "seed_context", None):
             return _phase2_seed_context(args)     # seed context CX10: each still also sees the previous panel's
         return _phase2_shots_seed(args)       # shots seed edits SE8: every still is a Qwen edit of the seed
@@ -2418,12 +2436,64 @@ def _shots_stills_groups(story_md_path, members, locations=()):
     return sorted(groups.items(), key=lambda g: (len(g[0]), g[0]))
 
 
+def _shots_zimage_seed(args):
+    """True on the shots Z-Image seed path (shots Z-Image engine spec ZE1): --shots, --seed-image and --seed-edit-model
+    as-is. Panel 1 is then the seed and every other panel a Z-Image still, as in shots mode without a seed."""
+    return bool(getattr(args, "shots", False) and getattr(args, "seed_image", None)
+                and getattr(args, "seed_edit_model", None) == "as-is")
+
+
+def _shots_qwen_stills(args):
+    """{n: path} of every images/panel_NN.png that seed_edits.json or seed_context_edits.json records as an ok Qwen
+    edit with the same sha256 (shots Z-Image engine spec ZE6). Reads; never writes."""
+    paths = _story_paths(args.story_id)
+    found = {}
+    for record, schema in ((_shots_seed_paths(paths["story_dir"])["record"], SHOTS_SEED_EDITS_SCHEMA),
+                           (_seed_context_paths(paths["story_dir"])["record"], SEED_CONTEXT_SCHEMA)):
+        for n, entry in _shots_seed_entries(record, schema).items():
+            still = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
+            if (entry.get("status") == "ok" and os.path.isfile(still)
+                    and entry.get("still_sha256") == _sha256_file(still)):
+                found[n] = still
+    return found
+
+
+def _shots_zimage_prepare(args, dry_run=False):
+    """Phase 2's first step on the shots Z-Image seed path (shots Z-Image engine spec ZE6, ZE7): the warning when
+    plan.json was planned for the Qwen engine, then every recorded Qwen still moved aside into
+    <story>/redo/<stamp>-<pid>/images/. With dry_run it prints the moves and moves nothing."""
+    paths = _story_paths(args.story_id)
+    try:
+        with open(os.path.join(paths["story_dir"], "plan.json"), encoding="utf-8") as f:
+            plan = json.load(f)
+    except (OSError, ValueError):
+        plan = None
+    if (isinstance(plan, dict) and isinstance(plan.get("seed_image"), str) and plan["seed_image"]
+            and not (dry_run and getattr(args, "force_story", False))):
+        print(SHOTS_ZIMAGE_PLAN_WARNING % paths["story_md"])
+    stale = _shots_qwen_stills(args)
+    archive = os.path.join(paths["story_dir"], "redo", "<UTC stamp>-<pid>" if dry_run else "%s-%d" % (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()), "images")
+    for n in sorted(stale):
+        moved = os.path.join(archive, os.path.basename(stale[n]))
+        if dry_run:
+            print("Would move %s -> %s %s" % (stale[n], moved, SHOTS_ZIMAGE_MOVE_WHY))
+            continue
+        os.makedirs(archive, exist_ok=True)
+        os.replace(stale[n], moved)
+        print("stills: moved %s -> %s %s" % (stale[n], moved, SHOTS_ZIMAGE_MOVE_WHY))
+
+
 def _shots_missing_stills(args, panels):
     """The panels of one group whose still must be generated: those being redone, and those
-    with no images/panel_NN.png."""
+    with no images/panel_NN.png. On the shots Z-Image seed path (shots Z-Image engine spec ZE6)
+    also panel 1, which bin/ltx-story-images writes again from the seed, and every panel whose
+    still is a recorded Qwen edit."""
     images_dir = _story_paths(args.story_id)["images_dir"]
     redo = set(getattr(args, "redo_panels", None) or [])
-    return [i for i in panels if i in redo
+    zimage = _shots_zimage_seed(args)
+    qwen = _shots_qwen_stills(args) if zimage else {}
+    return [i for i in panels if i in redo or i in qwen or (zimage and i == 1)
             or not os.path.exists(os.path.join(images_dir, "panel_%02d.png" % i))]
 
 
@@ -2444,6 +2514,8 @@ def _phase2_shots(args, cmd, exclude=()):
     returns 1. Stills already written are kept. The panels in exclude (the cast-reference
     panels, cast refs spec CR11) are left out of every group."""
     paths = _story_paths(args.story_id)
+    if _shots_zimage_seed(args):
+        _shots_zimage_prepare(args)        # shots Z-Image engine ZE6: the plan warning; Qwen stills moved aside
     groups = _exclude_groups(_shots_stills_groups(paths["story_md"], getattr(args, "cast_members", None) or [],
                                                   getattr(args, "location_pins", None) or []), exclude)
     os.makedirs(paths["images_dir"], exist_ok=True)
@@ -3920,6 +3992,8 @@ def _print_dry_run_plan(args):
               "derive the video geometry from it, and write a scaled story-model copy "
               "(long edge %dpx) to %s. %s"
               % (args.seed_image, SEED_MIN_EDGE, SEED_DOWNSCALE_MAX_EDGE, paths["seed_downscaled"],
+                 "Phase 2 fits the ORIGINAL into panel_01.png at twice the video size and renders every other "
+                 "panel's still with Z-Image; nothing is cropped." if _shots_zimage_seed(args) else
                  "Phase 2 edits the ORIGINAL into every panel's still with the Qwen edit model; nothing is cropped."
                  if getattr(args, "shots", False) else
                  "Phase 2 fits the ORIGINAL into panel_01.png at twice the video size; nothing is cropped."))
@@ -3960,7 +4034,7 @@ def _print_dry_run_plan(args):
                  files["original"], files["edited"], files["record"]))
         print()
 
-    if getattr(args, "shots", False) and getattr(args, "seed_image", None):
+    if getattr(args, "shots", False) and getattr(args, "seed_image", None) and not _shots_zimage_seed(args):
         print("--- Phase 2: stills ---")
         if getattr(args, "seed_context", None):
             _print_seed_context_plan(args)
@@ -3996,6 +4070,8 @@ def _print_dry_run_plan(args):
         if getattr(args, "shots", False) and getattr(args, "cast_refs", None):
             _print_cast_refs_plan(args, phase2_cmd)
         elif getattr(args, "shots", False):
+            if _shots_zimage_seed(args):
+                _shots_zimage_prepare(args, dry_run=True)   # shots Z-Image engine ZE9
             _print_shots_stills_plan(args, phase2_cmd)
         else:
             print("Command: %s" % shlex.join(phase2_cmd))

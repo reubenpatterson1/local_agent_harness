@@ -1562,14 +1562,16 @@ def validate_fields(fields, ws_real, state):
     elif seed is not None and mode == "no_stills":
         errors.append("a seed image cannot be used with no-stills mode")
     elif seed is not None and mode == "shots":
-        # Shots seed edits SE23: every panel's still is a Qwen edit of the seed.
-        if fields.get("seed_edit_model") in (None, "as-is"):
-            errors.append("a seed image in shots mode needs a Qwen edit model: every panel's still is an edit of "
-                          "the seed, so the seed cannot be used as-is")
+        # Shots seed edits SE23, amended by the shots Z-Image engine spec ZE11: as-is is the Z-Image engine.
+        if fields.get("seed_edit_model") is None:
+            errors.append("a seed image in shots mode needs a stills engine: a Qwen edit model (every panel's still "
+                          "is an edit of the seed) or as-is (panel 1 is the seed and Z-Image renders every other "
+                          "panel)")
         if fields.get("story_legacy") is True:
             errors.append("a seed image in shots mode needs the default story engine; it cannot be combined with "
                           "--story-legacy")
-        if isinstance(fields.get("stills_loras"), list) and fields["stills_loras"]:
+        if (fields.get("seed_edit_model") != "as-is" and isinstance(fields.get("stills_loras"), list)
+                and fields["stills_loras"]):
             errors.append("stills LoRAs do not apply in shots mode with a seed image: every panel's still is a "
                           "Qwen edit of the seed")
     errors += _rule_models(fields)                                           # 9
