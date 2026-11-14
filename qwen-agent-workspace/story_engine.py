@@ -444,9 +444,12 @@ PLAN_PROMPT_TEMPLATE = (
     "spectators, a team) is never a cast entry, and belongs in the setting sentence of its "
     "place. id is c1, c2, c3 and so on, in order. phrase is the character's referring "
     "phrase: at most four words, built only from details in their descriptor or stated by the "
-    "narrative; the movie names them by this exact phrase everywhere. descriptor is their full "
-    'visual description in 8 to 60 words that starts with "a " or "an " and does not end with a '
-    "full stop: apparent age group, build, skin tone, hair colour, length and style, clothing and "
+    "narrative; the movie names them by this exact phrase everywhere. A phrase uses only "
+    "letters, digits, apostrophes and hyphens and never holds spoken words. descriptor is their "
+    'full visual description in 8 to 60 words that starts with "a " or "an ", does not end with '
+    "a full stop and never holds spoken words or double quotes. Describe how they look, and when "
+    "the narrative does not say how a character looks, invent a plausible look of your own: "
+    "apparent age group, build, skin tone, hair colour, length and style, clothing and "
     "accessories.@@CAST_FIXED@@\n"
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
     'so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names '
@@ -1682,6 +1685,27 @@ def line_assignment_problems(plan):
             "lines of the beat whose action surrounds it in the narrative, and give that beat a "
             "speaker" % (n, line, n)
             for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
+
+
+# Cast quote check: a cast entry never holds a spoken line. P25 makes the plan call retry and never
+# enters a state or blocks a story.
+P25_MESSAGE = ("plan: P25 cast quote: %s holds a double quote, so it holds spoken words; write only "
+               "how this character looks (apparent age group, build, skin tone, hair, clothing and "
+               "accessories) and keep every spoken line out of the cast")
+
+
+def cast_quote_problems(plan):
+    """The P25 messages of a plan (cast quote check): one for each model-written phrase or
+    descriptor of a non-library cast entry (cast_name null) that holds a double quote (" or a
+    curly one), in cast order, phrase before descriptor. [] when none does."""
+    out = []
+    for c in plan["cast"]:
+        if c.get("cast_name"):
+            continue
+        for key in ("phrase", "descriptor"):
+            if any(q in (c.get(key) or "") for q in '"\u201c\u201d'):
+                out.append(P25_MESSAGE % ("%s's %s" % (c["id"], key)))
+    return out
 
 
 # Chained end frames spec CE6, D3, D4: the end frame checks. P22 and P24 make the plan call
@@ -5149,7 +5173,8 @@ class _Run(object):
                 if ctx.mode == "chained" and not self.plan_fatal(found):
                     fallback = found
                 problems = (hard + plan_end_frame_problems(ctx, plan)
-                            + plan_copy_problems(ctx, plan) + line_assignment_problems(plan))
+                            + plan_copy_problems(ctx, plan) + line_assignment_problems(plan)
+                            + cast_quote_problems(plan))
             if not problems:
                 break
             text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
