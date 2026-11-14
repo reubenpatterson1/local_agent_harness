@@ -1,4 +1,4 @@
-"""Tests for the cast quote check (CQ-T1..CQ-T9): spoken words stay out of a cast entry's phrase
+"""Tests for the cast quote check (CQ-T1..CQ-T12): spoken words stay out of a cast entry's phrase
 and descriptor. The planner prompt says so and P25 makes the plan call retry; P25 never enters a
 state and never blocks a story.
 
@@ -96,6 +96,9 @@ def test_cq_t6_apostrophes_and_punctuation_are_not_quotes(ws):
     _set(plan, 1, descriptor="a man in his father's coat, with a flat cap, grey hair, and "
                              "boots, worn.")
     assert se.cast_quote_problems(plan) == []
+    _set(plan, 1, descriptor="a man in his father\u2019s coat, with a flat cap, grey hair, and "
+                             "boots, worn.")
+    assert se.cast_quote_problems(plan) == []
 
 
 def test_cq_t7_the_plan_call_retries_and_never_blocks(ws, tmp_path, monkeypatch):
@@ -134,16 +137,54 @@ def test_cq_t9_the_plan_prompt_wording(ws, story_env):
         for cast in ([], members):
             ctx = seu.make_ctx(se, ws, mode=mode, members=cast)
             prompt = se.build_plan_prompt(ctx, [], [])
-            assert ("the movie names them by this exact phrase everywhere. A phrase uses only "
-                    "letters, digits, apostrophes and hyphens and never holds spoken words."
-                    ) in prompt
+            assert ("the movie names them by this exact phrase everywhere. Each word of a "
+                    "phrase uses only unaccented letters, digits, apostrophes and hyphens, and a "
+                    "phrase never holds spoken words.") in prompt
             assert ('starts with "a " or "an ", does not end with a full stop and never holds '
                     "spoken words or double quotes.") in prompt
-            assert "invent a plausible look of your own" in prompt
+            assert ("when nothing you are given (the narrative or an attached image) says how "
+                    "a character looks, make up a plausible look of your own:") in prompt
             assert "accessories." in prompt
             if cast:
                 assert "accessories. Never use these names" in prompt
+                assert "The following characters are already cast;" in prompt
             rest = prompt
             for lines in (True, False):
                 rest = rest.replace(se.plan_reference(lines), "")
             assert "{" not in rest and "}" not in rest
+
+
+def _undefined_cast(mode):
+    raw = _raw(mode, CLEAN)
+    raw["beats"][0]["cast"] = ["c9"]
+    return raw
+
+
+@pytest.mark.parametrize("mode", ["shots", "chained"])
+def test_cq_t10_t11_a_fatal_retry_keeps_the_first_p25_plan(ws, tmp_path, monkeypatch, mode):
+    first = seu.answer(_raw(mode, QUOTED))
+    second = seu.answer(_undefined_cast(mode))
+    ctx = seu.make_ctx(se, ws, mode=mode, panels=2)
+    expected, _shape = se.normalize_plan(ctx, _raw(mode, QUOTED))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[first, second])
+    found, why = se._Run(ctx, "").plan_round()
+    assert why is None and len(seu.agent_log(log)) == 2
+    assert found[0] == expected
+    assert se.cast_quote_problems(found[0])
+
+
+def test_cq_t12_a_timeout_before_call_2_keeps_the_first_p25_plan(ws, tmp_path, monkeypatch):
+    checks = []
+
+    def expired(self):
+        checks.append(1)
+        return len(checks) == 2
+
+    monkeypatch.setattr(se._Run, "expired", expired)
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2)
+    expected, _shape = se.normalize_plan(ctx, _raw("shots", QUOTED))
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[seu.answer(_raw("shots", QUOTED)),
+                                                        seu.answer(_raw("shots", CLEAN))])
+    found, why = se._Run(ctx, "").plan_round()
+    assert why is None and len(seu.agent_log(log)) == 1
+    assert found[0] == expected

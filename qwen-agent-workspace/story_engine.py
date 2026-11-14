@@ -444,11 +444,13 @@ PLAN_PROMPT_TEMPLATE = (
     "spectators, a team) is never a cast entry, and belongs in the setting sentence of its "
     "place. id is c1, c2, c3 and so on, in order. phrase is the character's referring "
     "phrase: at most four words, built only from details in their descriptor or stated by the "
-    "narrative; the movie names them by this exact phrase everywhere. A phrase uses only "
-    "letters, digits, apostrophes and hyphens and never holds spoken words. descriptor is their "
+    "narrative; the movie names them by this exact phrase everywhere. Each word of a phrase "
+    "uses only unaccented letters, digits, apostrophes and hyphens, and a phrase never holds "
+    "spoken words. descriptor is their "
     'full visual description in 8 to 60 words that starts with "a " or "an ", does not end with '
     "a full stop and never holds spoken words or double quotes. Describe how they look, and when "
-    "the narrative does not say how a character looks, invent a plausible look of your own: "
+    "nothing you are given (the narrative or an attached image) says how a character looks, make "
+    "up a plausible look of your own: "
     "apparent age group, build, skin tone, hair colour, length and style, clothing and "
     "accessories.@@CAST_FIXED@@\n"
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
@@ -1688,10 +1690,12 @@ def line_assignment_problems(plan):
 
 
 # Cast quote check: a cast entry never holds a spoken line. P25 makes the plan call retry and never
-# enters a state or blocks a story.
-P25_MESSAGE = ("plan: P25 cast quote: %s holds a double quote, so it holds spoken words; write only "
-               "how this character looks (apparent age group, build, skin tone, hair, clothing and "
-               "accessories) and keep every spoken line out of the cast")
+# enters a state; a usable reply stays the fallback if the retry is fatal or times out, so P25
+# never blocks a story.
+P25_MESSAGE = ("plan: P25 cast quote: %s holds a double quote, so it holds spoken words; keep "
+               "every spoken line out of the cast (a phrase only names the character; a descriptor "
+               "says only how they look: apparent age group, build, skin tone, hair, clothing and "
+               "accessories)")
 
 
 def cast_quote_problems(plan):
@@ -5130,8 +5134,9 @@ class _Run(object):
         rdir = self.round_dir(0)
         prompt = build_plan_prompt(ctx, self.compatible, ctx.pinned)
         _write_text(os.path.join(rdir, "plan_prompt.txt"), prompt)
-        # Chained end frames spec CE7: fallback is the latest chained reply that go can use
-        # once its end frames are dropped; a fatal last reply or a timeout falls back to it.
+        # Chained end frames spec CE7: fallback is the latest reply that go can use (in chained
+        # mode once its end frames are dropped) in every mode; a fatal last reply or a timeout
+        # falls back to it.
         text, found, fallback, problems = prompt, None, None, []
         # Plan token budget spec PB2-PB7: budget is this call's max_tokens; plan_cut_off is the
         # problem of the last call when its reply was cut off at its budget, else None.
@@ -5170,7 +5175,7 @@ class _Run(object):
                 hard = (plan_checks(ctx, plan, shape)[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
-                if ctx.mode == "chained" and not self.plan_fatal(found):
+                if not self.plan_fatal(found):
                     fallback = found
                 problems = (hard + plan_end_frame_problems(ctx, plan)
                             + plan_copy_problems(ctx, plan) + line_assignment_problems(plan)
