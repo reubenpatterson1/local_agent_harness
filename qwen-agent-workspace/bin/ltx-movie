@@ -118,6 +118,12 @@ passed to Phase 2 as its --seed-image. Absent, or as-is, the seed is used unchan
 the seed as panel 1 and renders every other panel's still with Z-Image and its stills LoRAs, as
 --shots does without a seed.
 
+Extra references (docs/superpowers/specs/2026-11-13-extra-reference-images-design.md): --extra-ref PATH[:CAPTION]
+(repeatable, at most 9) adds the user's pictures (a location, a prop, a style) to every Qwen edit of the run, after
+the edit's own pictures (the seed, the context picture or the two cast stills), each named in the edit prompt by its
+picture number and caption. It needs --no-low-ram (QWEN_LTX_AUTOTUNE=1 sets it on a host with at least 96 GiB) and
+at most the edit model's max_references pictures per edit; a changed extra re-edits every still that used it.
+
 Seed context (docs/superpowers/specs/2026-11-10-seeded-shots-context-design.md), a test option: in shots mode with
 --seed-image, --seed-context still makes every panel after the first a two-image Qwen edit of the seed (the people)
 and the previous panel's still (the scene), one Qwen child per panel in panel order, recorded in
@@ -222,6 +228,31 @@ SEED_CONTEXT_CHANGE_NOTE = ("seed context: location changes at panels %s (the Im
                             "the previous panel's): each of them is a single-image edit of the seed, like panel 1")
 SEED_CONTEXT_REDO_NOTE = ("note: seed context: --redo %s also re-edits panels %s: their context picture is %s, so "
                           "it changes with it, up to the next location change")
+# Extra references (docs/superpowers/specs/2026-11-13-extra-reference-images-design.md, XR5): the user's pictures
+# added to every Qwen edit of the run after its own pictures, named in the prompt just before "The new shot: ".
+EXTRA_REFS_MAX = 9
+EXTRA_REFS_WARN_ABOVE = 4
+EXTRA_REFS_CAPTION_MAX = 60
+EXTRA_REFS_DIR = "extra_refs"
+EXTRA_REFS_ANCHOR = "The new shot: "
+EXTRA_REFS_ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+EXTRA_REFS_NO_CAPTION = "is one more reference picture"
+EXTRA_REFS_USE_ONE = ". Use it only where the shot below calls for it, and take from it whatever it is named for, even if that is not a person. "
+EXTRA_REFS_USE_MANY = ". Use each of them only where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. "
+EXTRA_REFS_AS_IS_ERROR = ("Error: --extra-ref cannot be combined with --seed-edit-model as-is: the seed is used unedited "
+                          "(with --shots, the Z-Image engine renders every other still), so no Qwen edit would see "
+                          "the extra references; choose a Qwen --seed-edit-model ID")
+EXTRA_REFS_NO_EDIT_ERROR = ("Error: --extra-ref needs a Qwen edit in this run: --seed-image with --seed-edit-model ID "
+                            "(panel 1 in chained mode, every still with --shots), or --shots with --cast-refs-model ID "
+                            "and at least two cast characters")
+EXTRA_REFS_LOW_RAM_ERROR = ("Error: --extra-ref needs --no-low-ram: in low-RAM mode (the default) a Qwen edit takes at "
+                            "most 2 reference images, so extra references are off; on a host with at least 96 GiB of "
+                            "memory pass --no-low-ram, or set QWEN_LTX_AUTOTUNE=1 to turn it on there automatically")
+EXTRA_REFS_MANY_WARNING = ("Warning: --extra-ref: each Qwen edit of this run takes up to %d reference images (%s, then %d "
+                           "extra references); above 4 the edit models are past the 1 to 3 input images they are tuned "
+                           "for, so faces, clothing and props can blend or drift: check every still")
+EXTRA_REFS_UNUSED_NOTE = ("note: --extra-ref: no panel is a cast-reference Qwen edit, so the extra references are not "
+                          "used")
 
 STORY_PROMPT_TEMPLATE = """You are authoring the shot list for a short narrated movie (story-id "{story_id}").
 
@@ -537,6 +568,15 @@ def build_parser():
                          default=None,
                          help="with --seed-context: seed-first (the default) makes the seed Picture 1 and the "
                               "context picture Picture 2; context-first swaps them")
+    parser.add_argument("--extra-ref", dest="extra_ref_specs", action="append", default=None,
+                         metavar="PATH[:CAPTION]",
+                         help="an extra reference picture (a location, a prop, a style) for every Qwen edit of the "
+                              "run, after the edit's own pictures (the seed, the context picture or the two cast "
+                              "stills); repeatable, at most 9, in picture order. CAPTION (at most 60 characters, no "
+                              "':') names what it shows, e.g. 'the sword', in the edit prompt. Needs a Qwen edit "
+                              "(--seed-edit-model ID, or --cast-refs-model) and --no-low-ram, and at most the edit "
+                              "model's max_references pictures per edit (10 for qwen21, 3 for qwen2511-bf16, 1 for "
+                              "qwen2511-q4). See docs/superpowers/specs/2026-11-13-extra-reference-images-design.md.")
     parser.add_argument("--story-model", dest="story_model", default=None,
                          help="model name to declare to bin/qwen-agent's --model for "
                               "Phase 1 story generation; must match whatever the "
@@ -1280,6 +1320,168 @@ def _resolve_seed_context(args):
         return 2
     args.seed_context = {"mode": mode, "order": order or "seed-first"}
     return 0
+
+
+def _extra_refs_edit(args):
+    """(model ID, the number of its own pictures, their words) of the run's Qwen edit that extra references join
+    (extra references spec XR3), or None when the run has no Qwen edit: the cast-reference edits, else the
+    seed-context edits, else the seed edit (Phase 1c in chained mode, every shots still with --shots)."""
+    if getattr(args, "cast_refs", None):
+        return args.cast_refs["qwen_model"], 2, "the two characters' reference stills"
+    if getattr(args, "seed_context", None):
+        return args.seed_edit["qwen_model"], 2, "the seed and the context picture"
+    if getattr(args, "seed_edit", None):
+        return args.seed_edit["qwen_model"], 1, "the seed"
+    return None
+
+
+def _resolve_extra_refs(args):
+    """--extra-ref (extra references spec XR1-XR4, XR8, XR9, XR23): sets args.extra_refs to [] (none) or one
+    {"path", "caption", "sha256", "file"} per value, in order. main calls it after autotune and after the seed edit,
+    cast refs and seed context resolvers, so the low-RAM mode and the run's Qwen edit are final. Returns 0, or 2
+    after one Error: line, before the lockfile and any phase. A dry run and --story-only check no host memory."""
+    specs = getattr(args, "extra_ref_specs", None) or []
+    args.extra_refs = []
+    if not specs:
+        return 0
+    if getattr(args, "seed_edit_model", None) == "as-is":
+        print(EXTRA_REFS_AS_IS_ERROR, file=sys.stderr)
+        return 2
+    edit = _extra_refs_edit(args)
+    if edit is None:
+        print(EXTRA_REFS_NO_EDIT_ERROR, file=sys.stderr)
+        return 2
+    if not args.no_low_ram:
+        print(EXTRA_REFS_LOW_RAM_ERROR, file=sys.stderr)
+        return 2
+    if len(specs) > EXTRA_REFS_MAX:
+        print("Error: --extra-ref is given %d times; at most %d extra references are allowed"
+              % (len(specs), EXTRA_REFS_MAX), file=sys.stderr)
+        return 2
+    fit = _image_fit()
+    extras, seen = [], {}
+    for k, value in enumerate(specs, start=1):
+        path, caption = value, None
+        if not os.path.isfile(value) and ":" in value:
+            path, caption = value.rsplit(":", 1)
+        if not os.path.isfile(path):
+            print("Error: --extra-ref %s: no such image file (the form is PATH or PATH:CAPTION, and a caption cannot "
+                  "contain ':')" % value, file=sys.stderr)
+            return 2
+        if caption is not None:
+            caption = caption.strip().rstrip(".").strip() or None
+        if caption is not None and (len(caption) > EXTRA_REFS_CAPTION_MAX
+                                    or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in caption)):
+            print("Error: --extra-ref %s: the caption must be at most %d characters with no control characters"
+                  % (value, EXTRA_REFS_CAPTION_MAX), file=sys.stderr)
+            return 2
+        try:
+            fit.load_oriented_rgb(path)
+        except Exception as e:      # extra references XR2: an Error: line, never a traceback
+            print("Error: --extra-ref %s: cannot read it as an image (%s: %s)" % (value, type(e).__name__, e),
+                  file=sys.stderr)
+            return 2
+        digest = _sha256_file(path)
+        if digest in seen:
+            print("Error: --extra-ref %s and %s are the same image bytes; give each extra reference once"
+                  % (seen[digest], value), file=sys.stderr)
+            return 2
+        seen[digest] = value
+        extras.append({"path": os.path.abspath(path), "caption": caption, "sha256": digest,
+                       "file": os.path.join(EXTRA_REFS_DIR, "extra_%02d.png" % k)})
+    qe = _qwen_edit()
+    model_id, own, words = edit
+    cap, total = qe.max_references(model_id), own + len(extras)
+    if cap == 1:
+        print("Error: --extra-ref: %s reads only the first input image, so it takes no extra references; choose a "
+              "qwen21 model (up to 9) or qwen2511-bf16 (up to 2)" % qe.label(model_id), file=sys.stderr)
+        return 2
+    if total > cap:
+        print("Error: --extra-ref: %s takes at most %d reference images per edit, and each edit of this run would "
+              "take %d (%s, then %d extra references); give at most %d --extra-ref"
+              % (qe.label(model_id), cap, total, words, len(extras), cap - own), file=sys.stderr)
+        return 2
+    if total > EXTRA_REFS_WARN_ABOVE:
+        print(EXTRA_REFS_MANY_WARNING % (total, words, len(extras)))
+    if not args.dry_run and not args.story_only:
+        problem = qe.reference_memory_problem(model_id, total)
+        if problem is not None:
+            print("Error: --extra-ref: %s" % problem, file=sys.stderr)
+            return 2
+    args.extra_refs = extras
+    return 0
+
+
+def _extra_refs_paths(args):
+    """The absolute paths of the story's copies of the extra references, in picture order (extra references XR6)."""
+    story_dir = _story_paths(args.story_id)["story_dir"]
+    return [os.path.join(story_dir, extra["file"]) for extra in getattr(args, "extra_refs", None) or []]
+
+
+def _extra_refs_write(args):
+    """Write every extra reference, oriented, as a PNG at its _extra_refs_paths path, after removing every other
+    extra_*.png of <story>/extra_refs/ (extra references XR6). Does nothing without extra references."""
+    extras = getattr(args, "extra_refs", None) or []
+    if not extras:
+        return
+    fit = _image_fit()
+    paths = _extra_refs_paths(args)
+    folder = os.path.dirname(paths[0])
+    os.makedirs(folder, exist_ok=True)
+    for old in glob.glob(os.path.join(folder, "extra_*.png")):
+        if old not in paths:
+            os.remove(old)
+    for extra, path in zip(extras, paths):
+        fit.load_oriented_rgb(extra["path"]).save(path + ".tmp", format="PNG")
+        os.replace(path + ".tmp", path)
+
+
+def _extra_refs_item(args):
+    """{"extras": [{"file", "caption", "sha256"}, ...]}, the item every edit key and record entry of a run with extra
+    references carries (extra references XR7), or {} without them."""
+    extras = getattr(args, "extra_refs", None) or []
+    if not extras:
+        return {}
+    return {"extras": [{"file": e["file"], "caption": e["caption"], "sha256": e["sha256"]} for e in extras]}
+
+
+def _extra_refs_prompt(args, prompt, first):
+    """prompt with the extra references' sentence (extra references XR11) inserted just before its first
+    EXTRA_REFS_ANCHOR, or in front when it has none (Phase 1c); first is the number of the edit's own pictures.
+    prompt itself without extra references."""
+    extras = getattr(args, "extra_refs", None) or []
+    if not extras:
+        return prompt
+    items = []
+    for k, extra in enumerate(extras, start=first + 1):
+        items.append("Picture %d, the %s input image, %s" % (
+            k, EXTRA_REFS_ORDINALS[k - 1], "shows " + extra["caption"] if extra["caption"] else EXTRA_REFS_NO_CAPTION))
+    sentence = "; ".join(items) + (EXTRA_REFS_USE_ONE if len(extras) == 1 else EXTRA_REFS_USE_MANY)
+    at = prompt.find(EXTRA_REFS_ANCHOR)
+    return prompt[:at] + sentence + prompt[at:] if at >= 0 else sentence + prompt
+
+
+def _extra_refs_job(args, job):
+    """job, with the extra references' copies appended to its "sources" (its own pictures, else [its source]) when
+    the run has any (extra references XR12); job itself otherwise."""
+    paths = _extra_refs_paths(args)
+    if paths:
+        job["sources"] = list(job.get("sources") or [job["source"]]) + paths
+    return job
+
+
+def _edit_references(jobs):
+    """The most reference images any of jobs edits with: its "sources", else 1 (extra references XR9)."""
+    return max(len(job.get("sources") or [job["source"]]) for job in jobs)
+
+
+def _extra_refs_note(args):
+    """Print an edit phase's extra references line (extra references XR13); nothing without extra references."""
+    extras = getattr(args, "extra_refs", None) or []
+    if extras:
+        print("extra refs: every Qwen edit here also gets %d extra reference pictures after its own: %s" % (
+            len(extras), "; ".join("%s (%s)" % (path, '"%s"' % e["caption"] if e["caption"] else "no caption")
+                                   for e, path in zip(extras, _extra_refs_paths(args)))))
 
 
 def _check_story_locations(args, names):
@@ -2623,18 +2825,20 @@ def phase_seed_edit(args):
         print("Error: panel 1 of %s has no Image: description to edit the seed with" % paths["story_md"],
               file=sys.stderr)
         return 1
+    prompt = _extra_refs_prompt(args, prompt, 1)          # extra references XR11
     width, height = _seed_edit_size(args, qe.multiple(model_id))
     with open(args.seed_image, "rb") as f:
         source_sha256 = hashlib.sha256(f.read()).hexdigest()
     key = dict(qe.settings(model_id, loras), source_sha256=source_sha256, prompt=prompt,
-               seed=args.image_seed, width=width, height=height)
+               seed=args.image_seed, width=width, height=height, **_extra_refs_item(args))
     try:
         with open(files["record"], encoding="utf-8") as f:
             old = json.load(f)
     except (OSError, ValueError):
         old = None
     if (isinstance(old, dict) and old.get("status") == "ok" and os.path.isfile(files["edited"])
-            and all(k in old and old[k] == v for k, v in key.items())):
+            and all(k in old and old[k] == v for k, v in key.items())
+            and old.get("extras") == key.get("extras")):
         print("seed edit: reusing %s (same seed image, prompt, seed and settings)" % files["edited"])
         args.seed_edited_path = files["edited"]
         return 0
@@ -2644,10 +2848,12 @@ def phase_seed_edit(args):
             os.remove(path)
     print("seed edit: %s; %dx%d; seed %d; prompt: panel 1's Image: text (%d characters)"
           % (qe.generator_text(model_id, loras), width, height, args.image_seed, len(prompt)))
-    job = {"n": 1, "seed": args.image_seed, "prompt": prompt, "source": files["original"],
-           "stage_path": files["stage"], "output_path": files["edited"]}
+    _extra_refs_note(args)
+    _extra_refs_write(args)
+    job = _extra_refs_job(args, {"n": 1, "seed": args.image_seed, "prompt": prompt, "source": files["original"],
+                                 "stage_path": files["stage"], "output_path": files["edited"]})
     try:
-        qe.wait_for_memory(qe.memory_floor(model_id), label, tag="ltx-movie")
+        qe.wait_for_memory(qe.memory_floor(model_id, _edit_references([job])), label, tag="ltx-movie")
         results, failure = qe.run_jobs(model_id, loras, [job], width, height, SEED_EDIT_SKILL, files["work"])
     except qe.Unavailable as e:
         results, failure = None, str(e)
@@ -2661,7 +2867,7 @@ def phase_seed_edit(args):
         "output": os.path.basename(files["edited"]) if status == "ok" else None, "prompt": prompt,
         "seed": args.image_seed, "width": width, "height": height, "qwen_model": settings["qwen_model"],
         "loras": settings["loras"], "steps": settings["steps"], "scheduler": settings["scheduler"],
-        "seconds": result["seconds"] if result is not None else None, "error": failure})
+        "seconds": result["seconds"] if result is not None else None, "error": failure, **_extra_refs_item(args)})
     if failure is not None:
         print("Error: the seed edit failed: %s" % failure, file=sys.stderr)
         return 1
@@ -2744,6 +2950,7 @@ def _shots_seed_plan(args, qe):
     for n, prompt in prompts:
         if not prompt:
             return "panel %d of %s has no Image: description to edit the seed with" % (n, paths["story_md"]), None
+    prompts = [(n, _extra_refs_prompt(args, prompt, 1)) for n, prompt in prompts]     # extra references XR11
     size = _seed_edit_size(args, qe.multiple(model_id))
     still = _still_size(args)
     source_sha256 = _sha256_file(args.seed_image)
@@ -2753,11 +2960,13 @@ def _shots_seed_plan(args, qe):
     keys, reuse, todo = {}, [], []
     for n, prompt in prompts:
         keys[n] = dict(settings, source_sha256=source_sha256, prompt=prompt, seed=args.image_seed,
-                       width=size[0], height=size[1], still_width=still[0], still_height=still[1])
+                       width=size[0], height=size[1], still_width=still[0], still_height=still[1],
+                       **_extra_refs_item(args))
         entry = entries.get(n)
         path = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
         if (n not in redo and isinstance(entry, dict) and entry.get("status") == "ok"
                 and all(k in entry and entry[k] == v for k, v in keys[n].items())
+                and entry.get("extras") == keys[n].get("extras")
                 and os.path.isfile(path) and entry.get("still_sha256") == _sha256_file(path)):
             reuse.append(n)
         else:
@@ -2841,7 +3050,7 @@ def _phase2_shots_seed(args):
                 "still": "images/panel_%02d.png" % n if ok else None,
                 "still_sha256": (_sha256_file(os.path.join(paths["images_dir"], "panel_%02d.png" % n))
                                  if ok else None),
-                "seconds": seconds, "error": error_text}
+                "seconds": seconds, "error": error_text, **_extra_refs_item(args)}
 
     def on_result(result):
         n = result["n"]
@@ -2856,11 +3065,13 @@ def _phase2_shots_seed(args):
         entries[n] = record_entry(n, result["status"], result["seconds"], None)
         _write_shots_seed_record(files["record"], entries, total)
 
-    jobs = [{"n": n, "seed": args.image_seed, "prompt": prompts[n], "source": files["original"],
-             "stage_path": os.path.join(files["work"], "panel_%02d.pending.png" % n),
-             "output_path": os.path.join(files["work"], "panel_%02d.png" % n)} for n in todo]
+    _extra_refs_note(args)
+    _extra_refs_write(args)
+    jobs = [_extra_refs_job(args, {"n": n, "seed": args.image_seed, "prompt": prompts[n], "source": files["original"],
+                                   "stage_path": os.path.join(files["work"], "panel_%02d.pending.png" % n),
+                                   "output_path": os.path.join(files["work"], "panel_%02d.png" % n)}) for n in todo]
     try:
-        qe.wait_for_memory(qe.memory_floor(model_id), label, tag="ltx-movie")
+        qe.wait_for_memory(qe.memory_floor(model_id, _edit_references(jobs)), label, tag="ltx-movie")
         results, failure = qe.run_jobs(model_id, loras, jobs, width, height, SHOTS_SEED_EDIT_SKILL, files["work"],
                                        on_result=on_result, noun="panel")
     except qe.Unavailable as e:
@@ -2947,8 +3158,10 @@ def _seed_context_plan(args, qe):
         text = images._compose_prompt(p["image"], style)
         kinds[n] = "none" if n == 1 or settings_of[n - 1] != settings_of[n - 2] else mode
         prompts[n] = SHOTS_SEED_EDIT_PREFIX + text if kinds[n] == "none" else _seed_context_prompt(order, text)
+        prompts[n] = _extra_refs_prompt(args, prompts[n], 1 if kinds[n] == "none" else 2)   # extra references XR11
         base[n] = dict(settings, source_sha256=source_sha256, prompt=prompts[n], seed=args.image_seed,
-                       width=size[0], height=size[1], still_width=still[0], still_height=still[1])
+                       width=size[0], height=size[1], still_width=still[0], still_height=still[1],
+                       **_extra_refs_item(args))
     return None, {"prompts": prompts, "kinds": kinds, "changes": [n for n in sorted(kinds) if n > 1
                                                                   and kinds[n] == "none"],
                   "size": size, "still": still, "base": base,
@@ -2979,6 +3192,7 @@ def _seed_context_reusable(args, plan, n, context, changed):
             and (context["kind"] == "none" or n - 1 not in changed)
             and isinstance(entry, dict) and entry.get("status") == "ok"
             and all(k in entry and entry[k] == v for k, v in key.items())
+            and entry.get("extras") == key.get("extras")
             and os.path.isfile(path) and entry.get("still_sha256") == _sha256_file(path))
 
 
@@ -3044,6 +3258,7 @@ def _seed_context_edit(args, qe, plan, n, path, context, archive):
         print("seed context: panel %d: Picture %d is the seed (%s), Picture %d is %s (%s)"
               % (n, 3 - context["picture"], files["original"], context["picture"],
                  SEED_CONTEXT_PICTURES[context["kind"]] % (n - 1), path))
+    _extra_refs_job(args, job)
     fit = _image_fit()
 
     def record_entry(status, seconds, error_text):
@@ -3058,7 +3273,8 @@ def _seed_context_edit(args, qe, plan, n, path, context, archive):
                 "scheduler": key["scheduler"],
                 "output": "seed_context_edits/panel_%02d.png" % n if ok else None,
                 "still": "images/panel_%02d.png" % n if ok else None,
-                "still_sha256": _sha256_file(still) if ok else None, "seconds": seconds, "error": error_text}
+                "still_sha256": _sha256_file(still) if ok else None, "seconds": seconds, "error": error_text,
+                **_extra_refs_item(args)}
 
     def on_result(result):
         if result["status"] == "ok":
@@ -3072,7 +3288,7 @@ def _seed_context_edit(args, qe, plan, n, path, context, archive):
         _write_shots_seed_record(files["record"], entries, total, SEED_CONTEXT_SCHEMA)
 
     try:
-        qe.wait_for_memory(qe.memory_floor(model_id), label, tag="ltx-movie")
+        qe.wait_for_memory(qe.memory_floor(model_id, _edit_references([job])), label, tag="ltx-movie")
         results, failure = qe.run_jobs(model_id, loras, [job], width, height, SEED_CONTEXT_SKILL, files["work"],
                                        log_path=log_path, on_result=on_result, noun="panel")
     except qe.Unavailable as e:
@@ -3129,6 +3345,8 @@ def _phase2_seed_context(args):
     os.makedirs(paths["images_dir"], exist_ok=True)
     os.makedirs(files["work"], exist_ok=True)
     _image_fit().load_oriented_rgb(args.seed_image).save(files["original"], format="PNG")
+    _extra_refs_note(args)
+    _extra_refs_write(args)
     archive = os.path.join(paths["story_dir"], "redo", "%s-%d" % (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()), os.getpid()), "images")
     changed, reused = set(), []
@@ -3196,6 +3414,8 @@ def phase_seed_context_frames(args):
     os.makedirs(files["work"], exist_ok=True)
     fit = _image_fit()
     fit.load_oriented_rgb(args.seed_image).save(files["original"], format="PNG")
+    _extra_refs_note(args)
+    _extra_refs_write(args)
     placeholder = os.path.join(files["work"], "placeholder.png")
     fit.fit_letterbox(fit.load_oriented_rgb(args.seed_image), still_w, still_h).save(placeholder, format="PNG")
     rc, cmd = _phase3_manifest_cmd(args, ["--image", placeholder] * total)
@@ -3342,7 +3562,7 @@ def _cast_refs_plan(args, qe):
                     % (n, paths["story_md"], len(names), ", ".join(names))), None
         if len(names) == 2:
             pairs[n] = [m for m in members if m.name in names]
-            prompts[n] = _cast_refs_prompt(lib, pairs[n], text)
+            prompts[n] = _extra_refs_prompt(args, _cast_refs_prompt(lib, pairs[n], text), 2)
     still = _still_size(args)
     multiple = qe.multiple(model_id)
     size = (still[0] // multiple * multiple, still[1] // multiple * multiple)
@@ -3356,11 +3576,12 @@ def _cast_refs_plan(args, qe):
         sources = [{"name": m.name, "still": os.path.basename(stills[m.name]), "sha256": digests[m.name]}
                    for m in pairs[n]]
         keys[n] = dict(settings, sources=sources, prompt=prompts[n], seed=args.image_seed, width=size[0],
-                       height=size[1], still_width=still[0], still_height=still[1])
+                       height=size[1], still_width=still[0], still_height=still[1], **_extra_refs_item(args))
         entry = entries.get(n)
         path = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
         if (n not in redo and isinstance(entry, dict) and entry.get("status") == "ok"
                 and all(k in entry and entry[k] == v for k, v in keys[n].items())
+                and entry.get("extras") == keys[n].get("extras")
                 and os.path.isfile(path) and entry.get("still_sha256") == _sha256_file(path)):
             reuse.append(n)
         else:
@@ -3428,7 +3649,7 @@ def _phase2_cast_refs_batch(args, qe, plan):
                 "still": "images/panel_%02d.png" % n if ok else None,
                 "still_sha256": (_sha256_file(os.path.join(paths["images_dir"], "panel_%02d.png" % n))
                                  if ok else None),
-                "seconds": seconds, "error": error_text}
+                "seconds": seconds, "error": error_text, **_extra_refs_item(args)}
 
     def on_result(result):
         n = result["n"]
@@ -3443,14 +3664,17 @@ def _phase2_cast_refs_batch(args, qe, plan):
         entries[n] = record_entry(n, result["status"], result["seconds"], None)
         _write_shots_seed_record(files["record"], entries, total, CAST_REFS_SCHEMA)
 
+    _extra_refs_note(args)
+    _extra_refs_write(args)
     jobs = []
     for n in todo:
         sources = [stills[m.name] for m in plan["pairs"][n]]
-        jobs.append({"n": n, "seed": args.image_seed, "prompt": plan["prompts"][n], "source": sources[0],
-                     "sources": sources, "stage_path": os.path.join(files["work"], "panel_%02d.pending.png" % n),
-                     "output_path": os.path.join(files["work"], "panel_%02d.png" % n)})
+        jobs.append(_extra_refs_job(args, {
+            "n": n, "seed": args.image_seed, "prompt": plan["prompts"][n], "source": sources[0], "sources": sources,
+            "stage_path": os.path.join(files["work"], "panel_%02d.pending.png" % n),
+            "output_path": os.path.join(files["work"], "panel_%02d.png" % n)}))
     try:
-        qe.wait_for_memory(qe.memory_floor(model_id), label, tag="ltx-movie")
+        qe.wait_for_memory(qe.memory_floor(model_id, _edit_references(jobs)), label, tag="ltx-movie")
         results, failure = qe.run_jobs(model_id, loras, jobs, width, height, CAST_REFS_SKILL, files["work"],
                                        log_path=os.path.join(files["work"], "child.log"), on_result=on_result,
                                        noun="panel")
@@ -3493,6 +3717,8 @@ def _phase2_shots_cast_refs(args, cmd):
         return 1
     if not plan["pairs"]:
         print(CAST_REFS_NONE_NOTE)
+        if getattr(args, "extra_refs", None):
+            print(EXTRA_REFS_UNUSED_NOTE)
         return _phase2_shots(args, cmd)
     multi = sorted(plan["pairs"])
     if (_shots_seed_lora_note(args) or getattr(args, "global_stills_loras", None)
@@ -3939,6 +4165,23 @@ def _print_cast_refs_plan(args, cmd):
     _print_shots_stills_plan(args, cmd, exclude=multi)
 
 
+def _print_extra_refs_plan(args):
+    """The dry run's extra references block (extra references spec XR14). Reads; never writes."""
+    qe = _qwen_edit()
+    model_id, own, words = _extra_refs_edit(args)
+    extras = args.extra_refs
+    print("--- Extra references ---")
+    print("Would add %d extra reference pictures to every Qwen edit of this run with %s, after the edit's own pictures "
+          "(%s), each named in the edit prompt by its picture number and caption; each edit takes up to %d of the "
+          "model's %d reference images. They are copied into %s when the edits run; a changed picture, caption, order "
+          "or count re-edits every still that used it."
+          % (len(extras), qe.label(model_id), words, own + len(extras), qe.max_references(model_id),
+             os.path.join(_story_paths(args.story_id)["story_dir"], EXTRA_REFS_DIR)))
+    for k, extra in enumerate(extras, start=1):
+        print("  extra %d: %s (%s)" % (k, extra["path"],
+                                       '"%s"' % extra["caption"] if extra["caption"] else "no caption"))
+
+
 def _print_dry_run_plan(args):
     paths = _story_paths(args.story_id)
     geometry_line = None
@@ -4081,6 +4324,9 @@ def _print_dry_run_plan(args):
             print("Command: %s" % shlex.join(phase2_cmd))
         print()
 
+    if getattr(args, "extra_refs", None):
+        _print_extra_refs_plan(args)
+        print()
     print("--- Phase 3: manifest + dry-run ---")
     phase3_manifest_cmd = [sys.executable, os.path.join(WS, "bin", "ltx-story-manifest"),
                             "--story-id", args.story_id, "--prompts-md", paths["story_md"]]
@@ -4235,6 +4481,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_seed_context(args)
+    if rc:
+        return rc
+    rc = _resolve_extra_refs(args)       # extra references XR4: after autotune and every edit resolver
     if rc:
         return rc
 

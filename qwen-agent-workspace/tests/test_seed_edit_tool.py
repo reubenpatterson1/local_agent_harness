@@ -1140,7 +1140,7 @@ def test_sqt10_the_registry_pins():
     tool = load_tool()
     assert seedgen.QWEN_MODEL_IDS == ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4", "qwen2511-bf16")
     assert seedgen.QWEN_LORA_IDS == ("uncensored", "viggle-turbo")
-    assert [dict(m) for m in seedgen.QWEN_MODELS] == REGISTRY
+    assert [dict(m) for m in seedgen.QWEN_MODELS] == [dict(r, max_references=k, reference_gib=g) for r, (k, g) in zip(REGISTRY, ((10, 2.0), (10, 2.0), (10, 2.0), (1, 3.0), (3, 3.0)))]   # extra references XR8
     assert [dict(lora) for lora in seedgen.QWEN_LORAS] == LORA_REGISTRY
     assert (seedgen.DEFAULT_QWEN_MODEL, seedgen.LEGACY_QWEN_MODEL, seedgen.SCALE_MAX) == ("qwen21-q4", "qwen2511-q4", 2.0)
     assert seedgen.QWEN_FAMILIES == {"qwen21": "Qwen-Image-2.1", "qwen2511": "Qwen-Image-Edit-2511"}

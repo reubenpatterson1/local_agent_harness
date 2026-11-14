@@ -113,7 +113,7 @@ def test_qet33_fields_flags_argv_rule_12d_and_phases(tmp_path, monkeypatch):
     assert keys[keys.index("seed_upload") + 1:keys.index("seed_upload") + 3] == ["seed_edit_model", "seed_edit_loras"]
     assert (lib.DEFAULT_FIELDS["seed_edit_model"], lib.DEFAULT_FIELDS["seed_edit_loras"]) == (None, None)
     assert lib.FIELD_FLAGS[-1] == ("seed_edit", ("--seed-edit-model", "--seed-edit-lora"))
-    assert len(lib.FIELD_FLAGS) == 31
+    assert len(lib.FIELD_FLAGS) == 32
     seed_path = os.path.join(state, "uploads", UP)
     base = mt.fields(WS, seed_upload=UP, action="movie")
     argv = lib.build_argv(dict(base, seed_edit_model="qwen21-q4", seed_edit_loras=[{"id": "uncensored", "scale": 1}]),
@@ -349,10 +349,10 @@ def test_qet36_characters(env):
 
 def test_qet37_the_batch_levels_groups_and_merge():
     assert set(batch.FIELD_LEVELS) | set(batch.FIXED_KEYS) == set(lib.DEFAULT_FIELDS)
-    assert (len(batch.FIELD_LEVELS), len(batch.FIXED_KEYS), len(lib.DEFAULT_FIELDS)) == (27, 5, 32)
+    assert (len(batch.FIELD_LEVELS), len(batch.FIXED_KEYS), len(lib.DEFAULT_FIELDS)) == (28, 5, 33)
     assert (batch.FIELD_LEVELS["seed_edit_model"], batch.FIELD_LEVELS["seed_edit_loras"]) == ("stills", "stills")
     assert batch.GROUPS == (("panels", "length"),
-                            ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras"))
+                            ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs"))
     seeded = lib.compose_fields({"ws": "/ws", "action": "movie", "story_id": "s1", "narrative": "N", "seed_upload": UP,
                                  "seed_edit_model": "qwen21-q4", "seed_edit_loras": [{"id": "uncensored", "scale": 1.0}]})
 

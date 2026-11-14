@@ -22,7 +22,7 @@
   const SEED_BACKEND_LABELS = {"zimage": "Z-Image img2img", "mflux": "mflux", "diffusers": "diffusers", "mflux-q4": "mflux q4", "diffusers-bf16": "diffusers bf16"};
   const S = {
     token: null, host: null, ws: null, workspaces: [], options: null, catalog: {video: [], stills: []},
-    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, seedOrigin: null, composeEngine: "qwen", composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
+    characters: [], locations: [], location: null, locationPick: [], seedUpload: null, seedOrigin: null, composeEngine: "qwen", extraRefs: [], extraKey: "", extrasOn: false, composeAction: "story", story: null, character: null, action: null, selectedJob: null, logOffset: 0,
     logBuffer: "", logLines: [], bannerKind: null, stopped: false, recentSeq: 0, trace: null, traceAgent: null, agents: [], recent: [], timers: {}
   };
   // Seed-folder spec SD27: one state box per folder mode (Compose and Characters); part(box, name)
@@ -462,6 +462,77 @@
     return select.value;
   }
 
+  // Extra references spec XR19: up to the model's max_references - 1 extra pictures after the seed, only for a
+  // Qwen edit of the seed in No low-RAM mode; otherwise the control is disabled and the note says why.
+  // composeExtrasUpdate sets S.extrasOn, which composeFields reads.
+  const XR_LOW_RAM_NOTE = "Extra references need No low-RAM mode (under Advanced): in low-RAM mode every Qwen edit " +
+    "takes at most 2 pictures. Tick it only on a host with at least 96 GiB of memory.";
+  const XR_AS_IS_NOTE = "Extra references need a Qwen edit of the seed; the seed as-is is not edited.";
+  function composeExtrasModel() {
+    const model = COMPOSE_PICKER.state ? COMPOSE_PICKER.state.model : null;
+    return model && model !== "as-is" ? seedQwenEntry(model) : null;
+  }
+
+  function composeExtrasUpdate() {
+    const supported = (S.options && S.options.supported) || {};
+    const entry = composeExtrasModel();
+    const max = entry ? entry.max_references - 1 : 0;
+    const lowRam = !$("#c-no-low-ram").checked;
+    const zimage = $("#c-mode").value === "shots" && S.composeEngine === "zimage";
+    S.extrasOn = supported.extra_refs !== false && composeSeedEditActive() && !lowRam && !zimage && max > 0;
+    let note;
+    if (lowRam) { note = XR_LOW_RAM_NOTE; }
+    else if (!entry) { note = COMPOSE_PICKER.state ? XR_AS_IS_NOTE : "checking models…"; }
+    else if (max < 1) { note = entry.label + " reads only the first picture, so it takes no extra references."; }
+    else if (S.extraRefs.length > max) {
+      note = entry.label + " takes at most " + max + " extra references; remove " + (S.extraRefs.length - max) + ".";
+    } else {
+      note = "Each Qwen edit gets the seed as Picture 1, then these pictures in order (up to " + max + " with " +
+        entry.label + "). A caption names what a picture shows, e.g. the sword. More than 4 pictures in all can " +
+        "blend faces, clothing and props.";
+    }
+    $("#c-xr-note").textContent = note;
+    $("#c-xr-add").disabled = !S.extrasOn || S.extraRefs.length >= max;
+    const key = JSON.stringify([S.extrasOn, S.extraRefs.map(function (x) { return x.upload_id; })]);
+    if (key === S.extraKey) { return; }
+    S.extraKey = key;
+    const list = clear($("#c-xr-list"));
+    S.extraRefs.forEach(function (x, i) {
+      const caption = el("input", {type: "text", maxlength: "60", size: "24", placeholder: "caption, e.g. the sword"});
+      caption.value = x.caption;
+      caption.disabled = !S.extrasOn;
+      caption.addEventListener("input", function () { x.caption = caption.value; });
+      const remove = el("button", {type: "button", text: "Remove"});
+      remove.addEventListener("click", function () {
+        S.extraRefs.splice(i, 1);
+        updateComposeButtons();
+        preview();
+      });
+      list.appendChild(el("li", {}, ["Picture " + (i + 2) + ": upload " + x.upload_id.slice(0, 12) + " ", caption, " ",
+        remove]));
+    });
+  }
+
+  async function onExtraFile() {
+    const file = $("#c-xr-file").files[0];
+    $("#c-xr-file").value = "";
+    if (!file) { return; }
+    $("#c-xr-status").textContent = "uploading...";
+    try {
+      const id = await uploadFile(file);
+      if (S.extraRefs.some(function (x) { return x.upload_id === id; })) {
+        $("#c-xr-status").textContent = "that image is already an extra reference";
+      } else {
+        S.extraRefs.push({upload_id: id, caption: ""});
+        $("#c-xr-status").textContent = "uploaded " + id.slice(0, 12);
+      }
+    } catch (err) {
+      $("#c-xr-status").textContent = String(err.message);
+    }
+    updateComposeButtons();
+    preview();
+  }
+
   function composeFields(action) {
     const byLength = $("#c-size-length").checked;
     const bySeed = $("#c-res-seed").checked;
@@ -480,6 +551,7 @@
       height: bySeed || byFolder ? null : numberOrNull("#c-height"),
       seed_upload: bySeed ? S.seedUpload : null,
       seed_edit_model: seedEdit ? seedEdit.model : null, seed_edit_loras: seedEdit && seedEdit.model !== "as-is" ? seedEdit.loras : null,
+      extra_refs: S.extrasOn ? S.extraRefs.map(function (x) { return {upload_id: x.upload_id, caption: x.caption.trim() || null}; }) : [],
       mode: $("#c-mode").value,
       model: $("#c-model").value === "__download__" ? null : textOrNull("#c-model"),
       gemma: supported.gemma === false ? null : textOrNull("#c-gemma"),
@@ -611,6 +683,7 @@
       const runReason = $("#c-run-all-reason");
       runReason.textContent = runReason.textContent ? runReason.textContent + "; " + seedEditReason : seedEditReason;
     }
+    composeExtrasUpdate();
     // Seed-folder spec SD29: the folder mode of the Compose buttons.
     const box = FOLDER_BOXES.compose;
     const folder = folderMode();
@@ -888,6 +961,8 @@
     S.seedOrigin = "job";
     S.composeEngine = f.mode === "shots" && f.seed_upload && f.seed_edit_model === "as-is" ? "zimage" : "qwen";
     COMPOSE_PICKER.select(f.seed_edit_model || "as-is", f.seed_edit_loras || []);
+    S.extraRefs = (f.extra_refs || []).map(function (x) { return {upload_id: x.upload_id, caption: x.caption || ""}; });
+    S.extraKey = "";
     $("#c-mode").value = f.mode || "chained";
     fillModelSelect(f.model || "");
     $("#c-gemma").value = f.gemma || "";
@@ -933,6 +1008,8 @@
     $("#c-add-video-lora").addEventListener("click", function () { loraRow("video"); });
     $("#c-add-stills-lora").addEventListener("click", function () { loraRow("stills"); });
     $("#c-seed-file").addEventListener("change", onSeedFile);
+    $("#c-xr-add").addEventListener("click", function () { $("#c-xr-file").click(); });
+    $("#c-xr-file").addEventListener("change", onExtraFile);
     COMPOSE_PICKER.listen(function () { updateComposeButtons(); preview(); });
     const composeBox = FOLDER_BOXES.compose;
     part(composeBox, "choose").addEventListener("click", function () { part(composeBox, "file").click(); });

@@ -944,6 +944,7 @@ DEFAULT_FIELDS = {
     "story_id": "", "narrative": "", "goal": None,
     "panels": 15, "length": None, "fps": 24, "frames": 145,
     "width": None, "height": None, "seed_upload": None, "seed_edit_model": None, "seed_edit_loras": None,
+    "extra_refs": [],
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
@@ -970,7 +971,8 @@ FIELD_FLAGS = (
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
-    ("no_review", ("--no-review",)), ("seed_edit", ("--seed-edit-model", "--seed-edit-lora")),
+    ("no_review", ("--no-review",)), ("extra_refs", ("--extra-ref",)),
+    ("seed_edit", ("--seed-edit-model", "--seed-edit-lora")),
 )
 
 
@@ -1037,6 +1039,8 @@ def build_argv(fields, ws_real, state, py=sys.executable):
         if fields.get("seed_edit_model") is not None:
             argv += qwen_edit_flags("--seed-edit-model", "--seed-edit-lora", fields["seed_edit_model"],
                                     fields.get("seed_edit_loras"))
+        for item in fields.get("extra_refs") or []:        # extra references spec XR16
+            argv += ["--extra-ref", extra_ref_arg(state, item)]
     elif fields["width"] is not None and fields["height"] is not None:
         argv += ["--video-width", str(fields["width"]), "--video-height", str(fields["height"])]
     for key, flag in (("model", "--model"), ("gemma", "--gemma"), ("story_model", "--story-model")):
@@ -1145,6 +1149,47 @@ def _rule_seed_edit(fields):
         errors.append("a seed edit model needs a seed image")
     if loras is not None and model in (None, "as-is"):
         errors.append("seed edit LoRAs need a seed edit model other than as-is")
+    return errors
+
+
+EXTRA_REFS_MAX = 9                     # bin/ltx-movie EXTRA_REFS_MAX
+EXTRA_REFS_CAPTION_MAX = 60            # bin/ltx-movie EXTRA_REFS_CAPTION_MAX
+
+
+def extra_ref_arg(state, item):
+    """--extra-ref's value for one extra_refs item (extra references spec XR16): <state>/uploads/<upload_id>, then
+    ":" and the stripped caption when it has one."""
+    path = os.path.join(state, "uploads", item["upload_id"])
+    caption = (item.get("caption") or "").strip()
+    return path + ":" + caption if caption else path
+
+
+def _rule_extra_refs(fields, state):
+    """V1 rule 12e (extra references spec XR17): the Compose extra references' shape and what they need."""
+    items = fields.get("extra_refs")
+    if not (isinstance(items, list) and len(items) <= EXTRA_REFS_MAX
+            and all(isinstance(i, dict) and set(i) == {"upload_id", "caption"} for i in items)):
+        return ["extra references must be a list of at most 9 {upload_id, caption} items"]
+    errors = []
+    for k, item in enumerate(items, start=1):
+        upload, caption = item["upload_id"], item["caption"]
+        if not (isinstance(upload, str) and UPLOAD_ID_RE.fullmatch(upload)
+                and os.path.isfile(os.path.join(state, "uploads", upload))):
+            errors.append("extra reference %d: upload %s not found" % (k, upload))
+        if caption is not None and not (isinstance(caption, str) and _argv_safe(caption)
+                                        and 1 <= len(caption.strip()) <= EXTRA_REFS_CAPTION_MAX
+                                        and ":" not in caption
+                                        and all(ord(ch) >= 0x20 and ord(ch) != 0x7f for ch in caption)):
+            errors.append("extra reference %d: caption must be 1 to 60 characters with no ':' and no control "
+                          "characters" % k)
+    uploads = [repr(i["upload_id"]) for i in items]
+    if len(set(uploads)) != len(uploads):
+        errors.append("extra references must be distinct images")
+    if items and (fields.get("seed_upload") is None or fields.get("seed_edit_model") in (None, "as-is")):
+        errors.append("extra references need a seed image and a Qwen seed edit model (not as-is)")
+    if items and fields.get("no_low_ram") is not True:
+        errors.append("extra references need No low-RAM mode (--no-low-ram): in low-RAM mode a Qwen edit takes at "
+                      "most 2 pictures")
     return errors
 
 
@@ -1583,6 +1628,7 @@ def validate_fields(fields, ws_real, state):
     errors += _rule_actions(fields)                                          # 12b
     errors += _rule_locations(fields)                                        # 12c
     errors += _rule_seed_edit(fields)                                        # 12d
+    errors += _rule_extra_refs(fields, state)                                # 12e
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False

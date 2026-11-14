@@ -40,7 +40,7 @@ FLAGS = {"--story-id", "--panels", "--length", "--fps", "--frames", "--video-wid
          "--stills-lora", "--character", "--location", "--location-strength", "--action", "--no-auto-lora",
          "--no-narration", "--speech-only", "--story-legacy", "--judge", "--no-low-ram", "--panel-timeout",
          "--force", "--force-story", "--redo", "--story-only", "--no-review", "--seed-edit-model",
-         "--seed-edit-lora"}
+         "--seed-edit-lora", "--extra-ref"}
 
 
 @pytest.fixture
@@ -154,7 +154,7 @@ def test_set19_a_render_fork_copies_seed_edits_json(v1_env):
 # --- SET21 (SE28): no new field flag ---------------------------------------------------------------------------
 
 def test_set21_no_new_field_flag(v1_env):
-    assert len(lib.FIELD_FLAGS) == 31
+    assert len(lib.FIELD_FLAGS) == 32
     assert lib.FIELD_FLAGS[-1] == ("seed_edit", ("--seed-edit-model", "--seed-edit-lora"))
     assert set(flag for _key, flags in lib.FIELD_FLAGS for flag in flags) == FLAGS
 

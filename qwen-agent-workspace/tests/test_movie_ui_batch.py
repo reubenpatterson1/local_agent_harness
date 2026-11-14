@@ -30,7 +30,7 @@ EXPECTED_LEVELS = {
     "model": "render", "gemma": "render", "video_loras": "render", "action_loras": "render",
     "frames": "render", "fps": "render", "no_low_ram": "render", "panel_timeout": "render",
     "width": "stills", "height": "stills", "stills_loras": "stills", "location_strength": "stills",
-    "seed_edit_model": "stills", "seed_edit_loras": "stills",
+    "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills",
     "narrative": "replan", "goal": "replan", "panels": "replan", "length": "replan",
     "seed_upload": "replan", "mode": "replan", "characters": "replan", "locations": "replan",
     "narration": "replan", "story_legacy": "replan", "story_model": "replan", "judge": "replan",
@@ -76,7 +76,7 @@ def one(settings=None, base=None, **kw):
 def test_bt1_every_default_field_is_classified():
     assert set(batch.FIELD_LEVELS) | set(batch.FIXED_KEYS) == set(lib.DEFAULT_FIELDS)
     assert not set(batch.FIELD_LEVELS) & set(batch.FIXED_KEYS)
-    assert (len(batch.FIELD_LEVELS), len(batch.FIXED_KEYS), len(lib.DEFAULT_FIELDS)) == (27, 5, 32)
+    assert (len(batch.FIELD_LEVELS), len(batch.FIXED_KEYS), len(lib.DEFAULT_FIELDS)) == (28, 5, 33)
     assert batch.FIELD_LEVELS == EXPECTED_LEVELS
     assert batch.LEVELS == ("render", "stills", "replan")
     assert batch.LEVEL_LABELS == {"render": "Render", "stills": "New stills", "replan": "Re-plan"}
