@@ -55,6 +55,9 @@ options:
                         with --seed-edit-model ID: a registry LoRA of that
                         model's family, 0 < SCALE <= 2 (repeatable); none
                         listed means no LoRA
+  --extra-ref PATH[:CAPTION]
+                        an extra reference picture for every Qwen edit of the
+                        run (repeatable)
   --panels PANELS       number of chained clips; panel 1 also gets the movie's
                         one still image; mutually exclusive with --length
   --length LENGTH       total movie length in seconds; mutually exclusive with

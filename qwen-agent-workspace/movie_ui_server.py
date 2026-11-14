@@ -767,6 +767,13 @@ def _fields_body(body):
         if error is not None:
             raise ApiError(400, error)
         fields["seed_edit_model"], fields["seed_edit_loras"] = model_id, loras
+        extras, entry = fields.get("extra_refs"), seedgen.qwen_model(model_id)
+        if isinstance(extras, list) and extras and entry["max_references"] == 1:     # extra references XR18
+            raise ApiError(400, "%s reads only the first picture, so it takes no extra references" % entry["label"])
+        if isinstance(extras, list) and 1 + len(extras) > entry["max_references"]:
+            raise ApiError(400, "%s takes at most %d reference images per edit (the seed and %d extra references); "
+                                "this request has %d extra references"
+                           % (entry["label"], entry["max_references"], entry["max_references"] - 1, len(extras)))
     return fields
 
 
