@@ -36,6 +36,7 @@ from test_ltx_movie_cast_refs import _story as cr_story
 from test_ltx_movie_cast_refs import cast_env  # noqa: F401
 from test_ltx_movie_cast_refs import movie as cr_movie
 from test_ltx_movie_seed_context import _args as cx_args
+from test_ltx_movie_seed_context import _edited as cx_edited
 from test_ltx_movie_seed_context import _prompt as cx_prompt
 from test_ltx_movie_seed_context import _story as cx_story
 from test_ltx_movie_seed_context import ctx_env  # noqa: F401
@@ -62,7 +63,7 @@ LOW_RAM = ("Error: --extra-ref needs --no-low-ram: in low-RAM mode (the default)
            "images, so extra references are off; on a host with at least 96 GiB of memory pass --no-low-ram, or set "
            "QWEN_LTX_AUTOTUNE=1 to turn it on there automatically\n")
 SENT1 = ("Picture 2, the second input image, shows the sword; Picture 3, the third input image, is one more "
-         "reference picture. Use each of them only where the shot below calls for it. ")
+         "reference picture. Use each of them only where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. ")
 M3_HELP = ("an extra reference picture (a location, a prop, a style) for every Qwen edit of the run, after the edit's "
            "own pictures (the seed, the context picture or the two cast stills); repeatable, at most 9, in picture "
            "order. CAPTION (at most 60 characters, no ':') names what it shows, e.g. 'the sword', in the edit prompt. "
@@ -290,8 +291,8 @@ def test_xrt9_the_prompt_sentence():
     assert movie.EXTRA_REFS_ORDINALS == ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
                                          "ninth", "tenth")
     assert movie.EXTRA_REFS_NO_CAPTION == "is one more reference picture"
-    assert movie.EXTRA_REFS_USE_ONE == ". Use it only where the shot below calls for it. "
-    assert movie.EXTRA_REFS_USE_MANY == ". Use each of them only where the shot below calls for it. "
+    assert movie.EXTRA_REFS_USE_ONE == ". Use it only where the shot below calls for it, and take from it whatever it is named for, even if that is not a person. "
+    assert movie.EXTRA_REFS_USE_MANY == ". Use each of them only where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. "
     assert (movie.EXTRA_REFS_MAX, movie.EXTRA_REFS_WARN_ABOVE, movie.EXTRA_REFS_CAPTION_MAX,
             movie.EXTRA_REFS_DIR) == (9, 4, 60, "extra_refs")
 
@@ -307,14 +308,14 @@ def test_xrt9_the_prompt_sentence():
     second = movie._extra_refs_prompt(two, PREFIX + "x", 2)
     assert "Picture 3, the third input image, shows the sword; Picture 4, the fourth input image, " in second
     assert movie._extra_refs_prompt(ns("the throne room"), P, 1) == _with(
-        P, "Picture 2, the second input image, shows the throne room. Use it only where the shot below calls for it. ")
+        P, "Picture 2, the second input image, shows the throne room. Use it only where the shot below calls for it, and take from it whatever it is named for, even if that is not a person. ")
     cast = cr_prompt(2)
     sentence = ("Picture 3, the third input image, shows the sword; Picture 4, the fourth input image, is one more "
-                "reference picture. Use each of them only where the shot below calls for it. ")
+                "reference picture. Use each of them only where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. ")
     assert "is on the right. " + sentence + "The new shot: " in movie._extra_refs_prompt(two, cast, 2)
     nine = movie._extra_refs_prompt(ns(*([None] * 9)), "The new shot: y", 1)
     assert nine.endswith("Picture 10, the tenth input image, is one more reference picture. Use each of them only "
-                         "where the shot below calls for it. The new shot: y")
+                         "where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. The new shot: y")
 
 
 # --- XR-T10 (XR6, XR7, XR11-XR13): seeded shots with extras -----------------------------------------------------
@@ -415,7 +416,7 @@ def test_xrt12_phase_1c_with_extras(qe_fake, tmp_path):
     assert call["jobs"] == [{
         "n": 1, "seed": 3,
         "prompt": "Picture 2, the second input image, shows the throne room. Use it only where the shot below calls "
-                  "for it. " + se_PROMPT,
+                  "for it, and take from it whatever it is named for, even if that is not a person. " + se_PROMPT,
         "source": files["original"], "sources": [files["original"], os.path.join(story_dir, "extra_refs",
                                                                                  "extra_01.png")],
         "stage_path": files["stage"], "output_path": files["edited"]}]
@@ -489,7 +490,7 @@ def test_xrt14_cast_refs_with_extras(cast_env, monkeypatch, capsys):
     assert sorted(cmd[cmd.index("--only") + 1] for cmd in groups) == ["1", "3"]
     (call,) = fake.calls["run_jobs"]
     sentence = ("Picture 3, the third input image, shows the throne room. Use it only where the shot below calls for "
-                "it. ")
+                "it, and take from it whatever it is named for, even if that is not a person. ")
     assert [(j["n"], j["prompt"], j["sources"], j["source"]) for j in call["jobs"]] == [
         (n, _with(cr_prompt(n), sentence), [k00, r00, e1], k00) for n in (2, 4)]
     assert fake.calls["wait_for_memory"][0][0] == 22.0
@@ -504,6 +505,72 @@ def test_xrt14_cast_refs_with_extras(cast_env, monkeypatch, capsys):
     assert out[i + 1] == ("note: --extra-ref: no panel is a cast-reference Qwen edit, so the extra references are not "
                           "used")
     assert len(fake.calls["run_jobs"]) == 1 and not os.path.exists(os.path.join(story_two, "extra_refs"))
+
+
+# --- XR-T24 (review fix): cast refs reuse an unchanged extra ---------------------------------------------------------
+
+def test_xrt24_cast_refs_reuse_with_an_extra(cast_env, monkeypatch, capsys):
+    tmp, lib = cast_env["tmp"], cast_env["lib"]
+    fake = _xr(cast_env["fake"])
+    monkeypatch.setattr(cr_movie, "_catalog_stills_flags", lambda args, dry_run=False: (None, []))
+    members = cr_cast(lib)
+    x = _pic(tmp, "x", (200, 0, 0))
+    cr_story(tmp)
+    args = cr_args(tmp, members, extra_refs=_extras(tmp, x + ":the throne room", mod=cr_movie))
+    assert cr_movie.phase2_stills(args) == 0
+    assert len(fake.calls["run_jobs"]) == 1
+    waits = len(fake.calls["wait_for_memory"])
+    capsys.readouterr()
+    again = cr_args(tmp, members, extra_refs=_extras(tmp, x + ":the throne room", mod=cr_movie))
+    assert cr_movie.phase2_stills(again) == 0
+    assert len(fake.calls["run_jobs"]) == 1 and len(fake.calls["wait_for_memory"]) == waits
+
+
+# --- XR-T25 (review fix): cast refs re-render when the extra's caption or content changes -------------------------
+
+def test_xrt25_cast_refs_rerender_on_a_changed_extra(cast_env, monkeypatch, capsys):
+    tmp, lib = cast_env["tmp"], cast_env["lib"]
+    fake = _xr(cast_env["fake"])
+    monkeypatch.setattr(cr_movie, "_catalog_stills_flags", lambda args, dry_run=False: (None, []))
+    members = cr_cast(lib)
+    x = _pic(tmp, "x", (200, 0, 0))
+    cr_story(tmp)
+
+    def run(caption):
+        before = len(fake.calls["run_jobs"])
+        args = cr_args(tmp, members, extra_refs=_extras(tmp, x + ":" + caption, mod=cr_movie))
+        assert cr_movie.phase2_stills(args) == 0
+        return fake.calls["run_jobs"][before:]
+
+    assert len(run("the throne room")) == 1
+    (call,) = run("the great hall")
+    assert [j["n"] for j in call["jobs"]] == [2, 4]
+    assert all("shows the great hall." in j["prompt"] for j in call["jobs"])
+    assert run("the great hall") == []
+    _pic(tmp, "x", (0, 200, 0))
+    (call,) = run("the great hall")
+    assert [j["n"] for j in call["jobs"]] == [2, 4]
+    assert run("the great hall") == []
+
+
+# --- XR-T26 (review fix): seed context re-renders from panel 1 when an extra's content changes ------------------------
+
+def test_xrt26_seed_context_rerender_on_a_changed_extra(ctx_env):
+    tmp, fake = ctx_env["tmp"], _xr(ctx_env["fake"])
+    x1, x2 = _x_pictures(tmp)
+    cx_story(tmp)
+
+    def run():
+        before = len(fake.calls["run_jobs"])
+        args = cx_args(tmp, extra_refs=_extras(tmp, x1 + ":the sword", x2, mod=cx_movie))
+        assert cx_movie._phase2_seed_context(args) == 0
+        return cx_edited(fake, before)
+
+    assert run() == [1, 2, 3, 4]
+    assert run() == []
+    _pic(tmp, "x2", (0, 0, 250))
+    assert run() == [1, 2, 3, 4]
+    assert run() == []
 
 
 # --- XR-T15 (XR6): frame mode writes the copies before its loop -------------------------------------------------

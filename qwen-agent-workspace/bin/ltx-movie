@@ -237,8 +237,8 @@ EXTRA_REFS_DIR = "extra_refs"
 EXTRA_REFS_ANCHOR = "The new shot: "
 EXTRA_REFS_ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
 EXTRA_REFS_NO_CAPTION = "is one more reference picture"
-EXTRA_REFS_USE_ONE = ". Use it only where the shot below calls for it. "
-EXTRA_REFS_USE_MANY = ". Use each of them only where the shot below calls for it. "
+EXTRA_REFS_USE_ONE = ". Use it only where the shot below calls for it, and take from it whatever it is named for, even if that is not a person. "
+EXTRA_REFS_USE_MANY = ". Use each of them only where the shot below calls for it, and take from each whatever it is named for, even if that is not a person. "
 EXTRA_REFS_AS_IS_ERROR = ("Error: --extra-ref cannot be combined with --seed-edit-model as-is: the seed is used unedited "
                           "(with --shots, the Z-Image engine renders every other still), so no Qwen edit would see "
                           "the extra references; choose a Qwen --seed-edit-model ID")
