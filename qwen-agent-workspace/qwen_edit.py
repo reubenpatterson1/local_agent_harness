@@ -7,9 +7,11 @@ path, and only when --seed-edit-model names a registry model.
 The mflux registry models run seed_edit_mflux_child.py under the mflux venv's Python, offline and with no
 Hugging Face token in its environment, and this process screens every output before it gets its final
 name; qwen2511-bf16 runs the character_dataset.py qwenedit child, which screens each output itself. The
-child timeout is max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S x jobs) seconds, where a job with several reference images
+child timeout is max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S x jobs) seconds, where a job with n >= 2 reference images
 (its "sources" list, docs/superpowers/specs/2026-11-09-shots-multi-reference-stills-design.md) counts
-MULTI_REFERENCE_TIMEOUT_FACTOR jobs.
+MULTI_REFERENCE_TIMEOUT_FACTOR x n / 2 jobs; a job may list at most its model's max_references images, and the
+memory floor grows by reference_gib for every image above two
+(docs/superpowers/specs/2026-11-13-extra-reference-images-design.md).
 
 Environment: SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python), SEED_EDIT_QWENEDIT_SCRIPT
 (default <ws>/character_dataset.py), HF_HUB_CACHE and HF_HOME (the default hub), Z_IMAGE_HF_HOME (the
@@ -263,13 +265,21 @@ def qwen_model_problem(entry):
     return None, {"model_path": model_path, "builtin_lora": builtin_lora}
 
 
-def memory_problem(entry):
-    """Seed models SQ16: None when this host's total memory reaches the entry's floor, else why not."""
+def entry_floor(entry, references=1):
+    """The memory floor in GiB of a registry entry editing with references images (extra references spec XR9):
+    memory_gib, plus reference_gib for every reference image above two."""
+    return entry["memory_gib"] + entry["reference_gib"] * max(0, references - 2)
+
+
+def memory_problem(entry, references=1):
+    """Seed models SQ16: None when this host's total memory reaches the entry's floor (with references images,
+    extra references spec XR9), else why not."""
     t = total_gib()
     if t is None:
         return "cannot read this host's memory size"
-    if t < entry["memory_gib"]:
-        return "needs a host with at least %g GiB of memory (this host has %.1f GiB)" % (entry["memory_gib"], t)
+    floor = entry_floor(entry, references)
+    if t < floor:
+        return "needs a host with at least %g GiB of memory (this host has %.1f GiB)" % (floor, t)
     return None
 
 
@@ -413,8 +423,23 @@ def multiple(model_id):
     return seedgen.qwen_model(model_id)["multiple"]
 
 
-def memory_floor(model_id):
-    return seedgen.qwen_model(model_id)["memory_gib"]
+def memory_floor(model_id, references=1):
+    return entry_floor(seedgen.qwen_model(model_id), references)
+
+
+def max_references(model_id):
+    """The most reference images one edit job of model_id may list (extra references spec XR8)."""
+    return seedgen.qwen_model(model_id)["max_references"]
+
+
+def reference_memory_problem(model_id, references):
+    """None when this host's total memory reaches model_id's floor with references images (extra references spec
+    XR9), else the refusal text."""
+    entry = seedgen.qwen_model(model_id)
+    problem = memory_problem(entry, references)
+    if problem is None:
+        return None
+    return "%s with %d reference images is unavailable: %s" % (entry["label"], references, problem)
 
 
 def child_timeout(n_jobs):
@@ -428,8 +453,12 @@ def multi_reference_problem(model_id):
 
 def jobs_timeout(jobs):
     """The child timeout for jobs (cast refs spec CR2): child_timeout(len(jobs)) when no job lists more than one
-    source; a job whose "sources" lists two or more images counts MULTI_REFERENCE_TIMEOUT_FACTOR jobs."""
-    weight = sum(MULTI_REFERENCE_TIMEOUT_FACTOR if len(job.get("sources") or ()) > 1 else 1 for job in jobs)
+    source; a job whose "sources" lists n >= 2 images counts MULTI_REFERENCE_TIMEOUT_FACTOR x n / 2 jobs (6 for two,
+    as before, and 30 for ten; extra references spec XR10)."""
+    weight = 0
+    for job in jobs:
+        n = len(job.get("sources") or ())
+        weight += MULTI_REFERENCE_TIMEOUT_FACTOR * n // 2 if n > 1 else 1
     return max(CHILD_TIMEOUT_S, JOB_TIMEOUT_S * weight)
 
 
@@ -482,6 +511,10 @@ def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=Non
     refused = multi_reference_problem(model_id)
     if refused is not None and any(len(job.get("sources") or ()) > 1 for job in jobs):
         raise Unavailable("%s cannot edit with several reference images: %s" % (entry["label"], refused))
+    for job in jobs:
+        if len(job.get("sources") or ()) > entry["max_references"]:      # extra references XR8
+            raise Unavailable("%s takes at most %d reference images per edit; job %d lists %d"
+                              % (entry["label"], entry["max_references"], job["n"], len(job["sources"])))
     problem, paths = install_problem(model_id, loras)
     if problem is not None:
         raise Unavailable(problem)

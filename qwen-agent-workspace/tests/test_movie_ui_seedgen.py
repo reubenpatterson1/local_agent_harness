@@ -336,7 +336,9 @@ def test_sqt16_the_registry_view():
 
     def model(model_id, label, family, backend, steps, scheduler, multiple, memory, license, setup):
         return {"id": model_id, "label": label, "family": family, "backend": backend, "steps": steps,
-                "scheduler": scheduler, "multiple": multiple, "memory_gib": memory, "license": license,
+                "scheduler": scheduler, "multiple": multiple, "memory_gib": memory,
+                "max_references": {"qwen21-q4": 10, "qwen21-q8": 10, "qwen21-bf16": 10, "qwen2511-q4": 1,
+                                   "qwen2511-bf16": 3}[model_id], "license": license,
                 "setup": "bin/seed-edit-setup --model %s" % model_id if setup else None}
 
     assert seedgen.registry_view() == {
