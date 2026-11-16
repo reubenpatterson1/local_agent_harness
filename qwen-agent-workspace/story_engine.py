@@ -1689,26 +1689,61 @@ def line_assignment_problems(plan):
             for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
 
 
-# Cast quote check: a cast entry never holds a spoken line. P25 makes the plan call retry and never
-# enters a state; a usable reply stays the fallback if the retry is fatal or times out, so P25
-# never blocks a story.
+# Cast quote check: a cast entry never holds a spoken line (a quote or copied spoken words). P25
+# makes the plan call retry and never enters a state; a usable reply stays the fallback if the
+# retry is fatal or times out, so P25 never blocks a story.
 P25_MESSAGE = ("plan: P25 cast quote: %s holds a double quote, so it holds spoken words; keep "
                "every spoken line out of the cast (a phrase only names the character; a descriptor "
                "says only how they look: apparent age group, build, skin tone, hair, clothing and "
                "accessories)")
+P25_COPY_MESSAGE = ("plan: P25 cast quote: %s copies the words of spoken line %d (\"%s\"); keep "
+                    "every spoken word out of the cast (a phrase only names the character, a "
+                    "descriptor says only how they look)")
 
 
-def cast_quote_problems(plan):
+def _word_runs(words, n):
+    """The set of n-word tuples of words, in order."""
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def cast_quote_problems(plan, narrative=""):
     """The P25 messages of a plan (cast quote check): one for each model-written phrase or
     descriptor of a non-library cast entry (cast_name null) that holds a double quote (" or a
-    curly one), in cast order, phrase before descriptor. [] when none does."""
+    curly one) or copies the words of a spoken line (a phrase of 3+ words inside a line, or a
+    descriptor sharing a 4-word run with a line, unless the narrative uses those words outside
+    its quotes), in cast order, phrase before descriptor. [] when none does."""
     out = []
+    lines = plan.get("spoken_lines") or []
+    line_words_of = [line_words(line) for line in lines]
+    outside = line_words(QUOTE_RE.sub(" ", narrative or ""))
+    outside_line = " " + " ".join(outside) + " "
     for c in plan["cast"]:
         if c.get("cast_name"):
             continue
         for key in ("phrase", "descriptor"):
-            if any(q in (c.get(key) or "") for q in '"\u201c\u201d'):
+            text = c.get(key) or ""
+            if any(q in text for q in '"\u201c\u201d'):
                 out.append(P25_MESSAGE % ("%s's %s" % (c["id"], key)))
+                continue
+            words = line_words(text)
+            found = None
+            if key == "phrase":
+                joined = " " + " ".join(words) + " "
+                if len(words) >= 3 and joined not in outside_line:
+                    for n, lw in enumerate(line_words_of, start=1):
+                        if joined in " " + " ".join(lw) + " ":
+                            found = n
+                            break
+            else:
+                runs = {r for r in _word_runs(words, 4)
+                        if " " + " ".join(r) + " " not in outside_line}
+                for n, lw in enumerate(line_words_of, start=1):
+                    if runs & _word_runs(lw, 4):
+                        found = n
+                        break
+            if found:
+                out.append(P25_COPY_MESSAGE % ("%s's %s" % (c["id"], key), found,
+                                               lines[found - 1]))
     return out
 
 
@@ -5179,7 +5214,7 @@ class _Run(object):
                     fallback = found
                 problems = (hard + plan_end_frame_problems(ctx, plan)
                             + plan_copy_problems(ctx, plan) + line_assignment_problems(plan)
-                            + cast_quote_problems(plan))
+                            + cast_quote_problems(plan, ctx.narrative))
             if not problems:
                 break
             text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
