@@ -1701,6 +1701,9 @@ P25_COPY_MESSAGE = ("plan: P25 cast quote: %s copies the words of spoken line %d
                     "descriptor says only how they look)")
 
 
+COPY_FILLER_WORDS = frozenset("a an the in on with of her his at to is was".split())
+
+
 def _word_runs(words, n):
     """The set of n-word tuples of words, in order."""
     return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
@@ -1715,7 +1718,8 @@ def cast_quote_problems(plan, narrative=""):
     out = []
     lines = plan.get("spoken_lines") or []
     line_words_of = [line_words(line) for line in lines]
-    outside = line_words(QUOTE_RE.sub(" ", narrative or ""))
+    outside = line_words(QUOTE_RE.sub(" ", (narrative or "").replace("\u201c", '"')
+                                      .replace("\u201d", '"')))
     outside_line = " " + " ".join(outside) + " "
     for c in plan["cast"]:
         if c.get("cast_name"):
@@ -1729,14 +1733,17 @@ def cast_quote_problems(plan, narrative=""):
             found = None
             if key == "phrase":
                 joined = " " + " ".join(words) + " "
-                if len(words) >= 3 and joined not in outside_line:
+                bare = words[1:] if words and words[0] in ("a", "an", "the") else words
+                if (len(words) >= 3 and joined not in outside_line
+                        and " " + " ".join(bare) + " " not in outside_line):
                     for n, lw in enumerate(line_words_of, start=1):
                         if joined in " " + " ".join(lw) + " ":
                             found = n
                             break
             else:
                 runs = {r for r in _word_runs(words, 4)
-                        if " " + " ".join(r) + " " not in outside_line}
+                        if " " + " ".join(r) + " " not in outside_line
+                        and sum(w not in COPY_FILLER_WORDS for w in r) >= 3}
                 for n, lw in enumerate(line_words_of, start=1):
                     if runs & _word_runs(lw, 4):
                         found = n

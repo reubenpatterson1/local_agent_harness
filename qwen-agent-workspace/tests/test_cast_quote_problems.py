@@ -1,4 +1,4 @@
-"""Tests for the cast quote check (CQ-T1..CQ-T19): spoken words stay out of a cast entry's phrase
+"""Tests for the cast quote check (CQ-T1..CQ-T26): spoken words stay out of a cast entry's phrase
 and descriptor. The planner prompt says so and P25 makes the plan call retry; P25 never enters a
 state and never blocks a story.
 
@@ -258,3 +258,87 @@ def test_cq_t19_the_plan_call_retries_on_a_copy_and_never_blocks(ws, tmp_path, m
     assert why is None and len(seu.agent_log(log)) == 2
     assert found[0]["cast"][1]["phrase"] == "Stop right there"
     assert se._Run(ctx, "").plan_fatal(found) == []
+
+
+def test_cq_t20_curly_quotes_in_the_narrative(ws):
+    for narrative in ('He shouts “Stop right there, you thief!”',
+                      'He shouts "Stop right there, you thief!"'):
+        plan = _copy_plan(ws, phrase="Stop right there", narrative=narrative)
+        plan["spoken_lines"] = se.spoken_lines(narrative)
+        assert se.cast_quote_problems(plan, narrative) == [
+            se.P25_COPY_MESSAGE % ("c2's phrase", 1, STOP)]
+
+
+def test_cq_t21_a_leading_article_on_a_phrase(ws):
+    narrative = 'A woman in grey waits by the door. "You, the woman in grey, come here!"'
+    plan = _copy_plan(ws, phrase="the woman in grey", line="You, the woman in grey, come here!",
+                      narrative=narrative)
+    assert se.cast_quote_problems(plan, narrative) == []
+    narrative = 'An old man sits on the bench. "Leave the old man alone."'
+    plan = _copy_plan(ws, phrase="the old man", line="Leave the old man alone.",
+                      narrative=narrative)
+    assert se.cast_quote_problems(plan, narrative) == []
+
+
+def test_cq_t22_filler_runs_are_not_copies(ws):
+    cases = [("a woman in her thirties with a red scarf", "I saw a woman in her car"),
+             ("a man in a black suit", "There is a man in a hurry"),
+             ("a man with the red hat", "the one with the red hat")]
+    for descriptor, line in cases:
+        plan = _copy_plan(ws, descriptor=descriptor, line=line)
+        assert se.cast_quote_problems(plan, STOP_NARRATIVE) == []
+    plan = _copy_plan(ws, descriptor="a tall man who snarls stop right there you thief")
+    assert se.cast_quote_problems(plan, STOP_NARRATIVE) == [
+        se.P25_COPY_MESSAGE % ("c2's descriptor", 1, STOP)]
+
+
+def test_cq_t23_a_descriptor_run_the_narrative_uses_outside_quotes(ws):
+    line = "Take the grey wool coat torn sleeve"
+    descriptor = "a man in a grey wool coat torn sleeve"
+    said = 'The guard wears a grey wool coat torn sleeve. The courier says "%s".' % line
+    silent = 'The guard wears a coat. The courier says "%s".' % line
+    plan = _copy_plan(ws, descriptor=descriptor, line=line, narrative=said)
+    assert se.cast_quote_problems(plan, said) == []
+    plan = _copy_plan(ws, descriptor=descriptor, line=line, narrative=silent)
+    assert se.cast_quote_problems(plan, silent) == [
+        se.P25_COPY_MESSAGE % ("c2's descriptor", 1, line)]
+
+
+def test_cq_t24_the_first_line_wins(ws):
+    plan = _copy_plan(ws, phrase="Stop right there")
+    plan["spoken_lines"] = [STOP, "Stop right there, now!"]
+    assert se.cast_quote_problems(plan, STOP_NARRATIVE) == [
+        se.P25_COPY_MESSAGE % ("c2's phrase", 1, STOP)]
+
+
+def test_cq_t25_the_run_needs_three_non_filler_words(ws):
+    line = "He walks with the red hat now"
+    plan = _copy_plan(ws, descriptor="a man with the red hat", line=line)
+    assert se.cast_quote_problems(plan, STOP_NARRATIVE) == []
+    line = "He walks with the red felt hat now"
+    plan = _copy_plan(ws, descriptor="a man in a red felt hat", line=line)
+    assert se.cast_quote_problems(plan, STOP_NARRATIVE) == []
+    line = "He wears the red felt hat now"
+    plan = _copy_plan(ws, descriptor="a man in the red felt hat", line=line)
+    assert se.cast_quote_problems(plan, STOP_NARRATIVE) == [
+        se.P25_COPY_MESSAGE % ("c2's descriptor", 1, line)]
+
+
+def test_cq_t26_the_plan_loop_wiring(ws, tmp_path, monkeypatch):
+    line = "Ask the old fishmonger about it"
+    said = 'The old fishmonger sells fish. The courier says "%s" and leaves.' % line
+    silent = 'A fishmonger sells fish. The courier says "%s" and leaves.' % line
+    def reply(phrase):
+        raw = _raw("shots", CLEAN, phrase=phrase)
+        raw["beats"][0].update(lines=[1], speaker="c1")
+        return seu.answer(raw)
+
+    copied, clean = reply("the old fishmonger"), reply("the guard")
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2, narrative=said)
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[copied, clean])
+    found, why = se._Run(ctx, "").plan_round()
+    assert why is None and len(seu.agent_log(log)) == 1
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=2, narrative=silent)
+    log = seu.script_agent(monkeypatch, tmp_path, plan=[copied, clean])
+    found, why = se._Run(ctx, "").plan_round()
+    assert why is None and len(seu.agent_log(log)) == 2
