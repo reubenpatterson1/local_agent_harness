@@ -444,9 +444,14 @@ PLAN_PROMPT_TEMPLATE = (
     "spectators, a team) is never a cast entry, and belongs in the setting sentence of its "
     "place. id is c1, c2, c3 and so on, in order. phrase is the character's referring "
     "phrase: at most four words, built only from details in their descriptor or stated by the "
-    "narrative; the movie names them by this exact phrase everywhere. descriptor is their full "
-    'visual description in 8 to 60 words that starts with "a " or "an " and does not end with a '
-    "full stop: apparent age group, build, skin tone, hair colour, length and style, clothing and "
+    "narrative; the movie names them by this exact phrase everywhere. Each word of a phrase "
+    "uses only unaccented letters, digits, apostrophes and hyphens, and a phrase never holds "
+    "spoken words. descriptor is their "
+    'full visual description in 8 to 60 words that starts with "a " or "an ", does not end with '
+    "a full stop and never holds spoken words or double quotes. Describe how they look, and when "
+    "nothing you are given (the narrative or an attached image) says how a character looks, make "
+    "up a plausible look of your own: "
+    "apparent age group, build, skin tone, hair colour, length and style, clothing and "
     "accessories.@@CAST_FIXED@@\n"
     "locations: a list with one object per place, with the keys id and setting. id is l1, l2 and "
     'so on. setting is one sentence of 12 to 45 words that starts with "The setting is" and names '
@@ -1682,6 +1687,71 @@ def line_assignment_problems(plan):
             "lines of the beat whose action surrounds it in the narrative, and give that beat a "
             "speaker" % (n, line, n)
             for n, line in enumerate(plan.get("spoken_lines", []), start=1) if n not in held]
+
+
+# Cast quote check: a cast entry never holds a spoken line (a quote or copied spoken words). P25
+# makes the plan call retry and never enters a state; a usable reply stays the fallback if the
+# retry is fatal or times out, so P25 never blocks a story.
+P25_MESSAGE = ("plan: P25 cast quote: %s holds a double quote, so it holds spoken words; keep "
+               "every spoken line out of the cast (a phrase only names the character; a descriptor "
+               "says only how they look: apparent age group, build, skin tone, hair, clothing and "
+               "accessories)")
+P25_COPY_MESSAGE = ("plan: P25 cast quote: %s copies the words of spoken line %d (\"%s\"); keep "
+                    "every spoken word out of the cast (a phrase only names the character, a "
+                    "descriptor says only how they look)")
+
+
+COPY_FILLER_WORDS = frozenset("a an the in on with of her his at to is was".split())
+
+
+def _word_runs(words, n):
+    """The set of n-word tuples of words, in order."""
+    return {tuple(words[i:i + n]) for i in range(len(words) - n + 1)}
+
+
+def cast_quote_problems(plan, narrative=""):
+    """The P25 messages of a plan (cast quote check): one for each model-written phrase or
+    descriptor of a non-library cast entry (cast_name null) that holds a double quote (" or a
+    curly one) or copies the words of a spoken line (a phrase of 3+ words inside a line, or a
+    descriptor sharing a 4-word run with a line, unless the narrative uses those words outside
+    its quotes), in cast order, phrase before descriptor. [] when none does."""
+    out = []
+    lines = plan.get("spoken_lines") or []
+    line_words_of = [line_words(line) for line in lines]
+    outside = line_words(QUOTE_RE.sub(" ", (narrative or "").replace("\u201c", '"')
+                                      .replace("\u201d", '"')))
+    outside_line = " " + " ".join(outside) + " "
+    for c in plan["cast"]:
+        if c.get("cast_name"):
+            continue
+        for key in ("phrase", "descriptor"):
+            text = c.get(key) or ""
+            if any(q in text for q in '"\u201c\u201d'):
+                out.append(P25_MESSAGE % ("%s's %s" % (c["id"], key)))
+                continue
+            words = line_words(text)
+            found = None
+            if key == "phrase":
+                joined = " " + " ".join(words) + " "
+                bare = words[1:] if words and words[0] in ("a", "an", "the") else words
+                if (len(words) >= 3 and joined not in outside_line
+                        and " " + " ".join(bare) + " " not in outside_line):
+                    for n, lw in enumerate(line_words_of, start=1):
+                        if joined in " " + " ".join(lw) + " ":
+                            found = n
+                            break
+            else:
+                runs = {r for r in _word_runs(words, 4)
+                        if " " + " ".join(r) + " " not in outside_line
+                        and sum(w not in COPY_FILLER_WORDS for w in r) >= 3}
+                for n, lw in enumerate(line_words_of, start=1):
+                    if runs & _word_runs(lw, 4):
+                        found = n
+                        break
+            if found:
+                out.append(P25_COPY_MESSAGE % ("%s's %s" % (c["id"], key), found,
+                                               lines[found - 1]))
+    return out
 
 
 # Chained end frames spec CE6, D3, D4: the end frame checks. P22 and P24 make the plan call
@@ -5106,8 +5176,9 @@ class _Run(object):
         rdir = self.round_dir(0)
         prompt = build_plan_prompt(ctx, self.compatible, ctx.pinned)
         _write_text(os.path.join(rdir, "plan_prompt.txt"), prompt)
-        # Chained end frames spec CE7: fallback is the latest chained reply that go can use
-        # once its end frames are dropped; a fatal last reply or a timeout falls back to it.
+        # Chained end frames spec CE7: fallback is the latest reply that go can use (in chained
+        # mode once its end frames are dropped) in every mode; a fatal last reply or a timeout
+        # falls back to it.
         text, found, fallback, problems = prompt, None, None, []
         # Plan token budget spec PB2-PB7: budget is this call's max_tokens; plan_cut_off is the
         # problem of the last call when its reply was cut off at its budget, else None.
@@ -5146,10 +5217,11 @@ class _Run(object):
                 hard = (plan_checks(ctx, plan, shape)[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
-                if ctx.mode == "chained" and not self.plan_fatal(found):
+                if not self.plan_fatal(found):
                     fallback = found
                 problems = (hard + plan_end_frame_problems(ctx, plan)
-                            + plan_copy_problems(ctx, plan) + line_assignment_problems(plan))
+                            + plan_copy_problems(ctx, plan) + line_assignment_problems(plan)
+                            + cast_quote_problems(plan, ctx.narrative))
             if not problems:
                 break
             text = (prompt + "\n\nYOUR PREVIOUS REPLY WAS REJECTED. Problems:\n"
