@@ -31,7 +31,11 @@ SEED = dict(seed_image="/s/seed.png", seed_agent_image="/s/seed-agent.png")
 MOMENT = "first what each character is doing at the moment this panel's beat begins"
 OLD_TAIL = "the lighting and colour palette; the camera viewpoint; and the rendering style"
 SEEDED_HEAD = "written as a change to the movie's reference picture"
-SEEDED_TAIL = "only the background, lighting or colour palette that this beat changes"
+SEEDED_TAIL = "only where this beat's setting or time of day differs from the movie's opening"
+UNSEEN = "which you do not see here"
+HARDEN = "Use no speaking verb, and give a character who is about to speak a neutral face."
+NEVER = "Never name a person who is not in this shot."
+MARKER = "Write this panel as one JSON object"
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +82,7 @@ def test_sib_t1_unseeded_shots_asks_for_the_beat_moment(ws):
     assert MOMENT in prompt
     assert OLD_TAIL in prompt
     assert "as a change to the movie's reference picture" not in prompt
+    assert HARDEN in prompt
 
 
 def test_sib_t2_seeded_shots_asks_for_a_change_only_image(ws):
@@ -85,6 +90,9 @@ def test_sib_t2_seeded_shots_asks_for_a_change_only_image(ws):
     prompt = _prompt(ctx, _plan(ctx), 1)
     assert SEEDED_HEAD in prompt
     assert SEEDED_TAIL in prompt
+    assert UNSEEN in prompt
+    assert HARDEN in prompt
+    assert "Do not restate what the reference picture already shows" not in prompt
     assert "the rendering style" not in prompt
 
 
@@ -103,6 +111,7 @@ def test_sib_t3_chained_and_no_stills_are_unchanged(ws):
 
 
 def test_sib_t4_placeholders_are_replaced_for_speaking_and_silent_panels(ws):
+    extra = se.SPEAKING_SENTENCES.get("image", "")
     for seeded in (False, True):
         ctx = _ctx(ws, "shots", seeded)
         plan = _plan(ctx, speaker_beat=2)
@@ -112,6 +121,19 @@ def test_sib_t4_placeholders_are_replaced_for_speaking_and_silent_panels(ws):
             assert len(line) == 1, (seeded, k)
             assert re.match(r"image: \d+ to \d+ words ", line[0]), line[0][:40]
             assert "@@" not in prompt and "W1" not in prompt and "W2" not in prompt
+        speaking = [ln for ln in _prompt(ctx, plan, 2).split("\n") if ln.startswith("image: ")][0]
+        assert NEVER in speaking
+        assert speaking.index(NEVER) < len(speaking)
+        if extra:
+            tail = extra.replace("@@SPEAKER@@", '"%s"' % plan["cast"][0]["phrase"])
+            assert speaking.endswith(NEVER + tail), (seeded, speaking[-120:])
+        else:
+            assert speaking.endswith(NEVER)
+    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, narration="speech", **SEED)
+    plan = _plan(ctx, speaker_beat=2)
+    for k in (1, 2):
+        line = [ln for ln in _prompt(ctx, plan, k).split("\n") if ln.startswith("image: ")][0]
+        assert se.SPEECH_FRAMING_SENTENCE.strip() in line, k
 
 
 def test_sib_t5_each_panel_prompt_shows_its_own_beat(ws):
@@ -124,11 +146,20 @@ def test_sib_t5_each_panel_prompt_shows_its_own_beat(ws):
     assert "This panel's beat: the courier slides the letter under the temple door" in p2
     assert "This panel's beat: the courier lifts" not in p2
     assert SEEDED_HEAD in p1 and SEEDED_HEAD in p2
+    k1 = p1[p1.index(MARKER):]
+    k2 = p2[p2.index(MARKER):]
+    if se.panel_camera(ctx, plan, 1) == se.panel_camera(ctx, plan, 2):
+        assert k1 == k2
+    else:
+        img = lambda t: [ln for ln in t.split("\n") if ln.startswith("image: ")]
+        assert img(k1) == img(k2)
 
 
-def test_sib_t6_zimage_unseeded_path_uses_the_unseeded_wording(ws):
-    ctx = seu.make_ctx(se, ws, mode="shots", panels=3, seed_image=None)
-    assert not se.seed_omits_identities(ctx)
+def test_sib_t6_seeded_shots_selects_the_seeded_wording(ws):
+    # story_engine's StoryContext does not carry --seed-context; seeded selection hangs on seed_image alone.
+    ctx = _ctx(ws, "shots", True)
+    assert se.seed_omits_identities(ctx)
     prompt = _prompt(ctx, _plan(ctx), 1)
-    assert MOMENT in prompt and OLD_TAIL in prompt
-    assert SEEDED_HEAD not in prompt
+    assert SEEDED_HEAD in prompt and UNSEEN in prompt and SEEDED_TAIL in prompt
+    assert MOMENT not in prompt
+    assert OLD_TAIL not in prompt

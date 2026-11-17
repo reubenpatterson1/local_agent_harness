@@ -3246,19 +3246,24 @@ KEY_LINE_TEMPLATES = {
         "the rendering style. Do not describe any character's appearance or clothing, do not "
         "write a sentence about the place itself and do not name the shot type: the pipeline "
         "adds each character's description, the place's setting sentence and the shot type to "
-        "this field itself. Never name a person who is not in this shot."),
+        "this field itself. Use no speaking verb, "
+        "and give a character who is about to speak a neutral face. Use left and right only for "
+        "screen direction, never for a hand, arm or foot. Never name a person who is not in this "
+        "shot."),
     "shots_image_seeded": (
         "image: W1 to W2 words describing this shot's first frame as one still picture, written "
-        "as a change to the movie's reference picture, which already supplies every person's "
-        "appearance and the starting place: what each character is doing at the moment this "
-        "panel's beat begins (their pose, gesture and expression, taken from the beat above and "
-        "not from a later moment); where each character stands and which way they face, using "
-        "fixed left and right screen direction; the camera viewpoint; and only the background, "
-        "lighting or colour palette that this beat changes. Do not restate what the reference "
-        "picture already shows, do not describe any character's appearance or clothing, do not "
-        "write a sentence about the place itself and do not name the shot type: the pipeline "
-        "adds the place's setting sentence and the shot type to this field itself. Never name a "
-        "person who is not in this shot."),
+        "as a change to the movie's reference picture, which you do not see here and which already "
+        "supplies every person's appearance and the movie's opening place: what each character is "
+        "doing at the moment this panel's beat begins (their pose, gesture and expression, taken "
+        "from the beat above and not from a later moment); where each character stands and which "
+        "way they face, using fixed left and right screen direction; the camera viewpoint; and the "
+        "background, lighting or colour palette only where this beat's setting or time of day "
+        "differs from the movie's opening. Do not describe any character's appearance or "
+        "clothing, do not write a sentence about the place itself and do not name the shot type: "
+        "the pipeline adds the place's setting sentence and the shot type to this field itself. "
+        "Use no speaking verb, and give a character who is about to speak a neutral face. Use left "
+        "and right only for screen direction, never for a hand, arm or foot. Never name a person "
+        "who is not in this shot."),
     "shots_motion": (
         "motion: W1 to W2 words: ONE sentence naming ONE character by their referring phrase and "
         "the ONE physical action they perform during these @@SECONDS@@ seconds, told in concrete "
