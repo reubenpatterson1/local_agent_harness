@@ -3238,13 +3238,27 @@ KEY_LINE_TEMPLATES = {
         "camera movement itself. Describe only what is physically observable, with no mood words, "
         "no spoken words and no markdown."),
     "shots_image": (
-        "image: W1 to W2 words describing this shot's first frame as one still picture: where "
-        "each character stands and which way they face, using fixed left and right screen "
+        "image: W1 to W2 words describing this shot's first frame as one still picture: first "
+        "what each character is doing at the moment this panel's beat begins (their pose, "
+        "gesture and expression, taken from the beat above and not from a later moment); then "
+        "where each character stands and which way they face, using fixed left and right screen "
         "direction; the background; the lighting and colour palette; the camera viewpoint; and "
         "the rendering style. Do not describe any character's appearance or clothing, do not "
         "write a sentence about the place itself and do not name the shot type: the pipeline "
         "adds each character's description, the place's setting sentence and the shot type to "
         "this field itself. Never name a person who is not in this shot."),
+    "shots_image_seeded": (
+        "image: W1 to W2 words describing this shot's first frame as one still picture, written "
+        "as a change to the movie's reference picture, which already supplies every person's "
+        "appearance and the starting place: what each character is doing at the moment this "
+        "panel's beat begins (their pose, gesture and expression, taken from the beat above and "
+        "not from a later moment); where each character stands and which way they face, using "
+        "fixed left and right screen direction; the camera viewpoint; and only the background, "
+        "lighting or colour palette that this beat changes. Do not restate what the reference "
+        "picture already shows, do not describe any character's appearance or clothing, do not "
+        "write a sentence about the place itself and do not name the shot type: the pipeline "
+        "adds the place's setting sentence and the shot type to this field itself. Never name a "
+        "person who is not in this shot."),
     "shots_motion": (
         "motion: W1 to W2 words: ONE sentence naming ONE character by their referring phrase and "
         "the ONE physical action they perform during these @@SECONDS@@ seconds, told in concrete "
@@ -4379,6 +4393,8 @@ def build_panel_prompt(ctx, plan, parts, k, fix=None, no_stills_rules=""):
                                       "chained_motion1" if k == 1 else "chained_motion"]
         elif key == "prompt" and speaks:
             line = KEY_LINE_TEMPLATES["no_stills_prompt_speaking"]
+        elif ctx.mode == "shots" and key == "image" and seed_omits_identities(ctx):
+            line = KEY_LINE_TEMPLATES["shots_image_seeded"]
         else:
             line = KEY_LINE_TEMPLATES["%s_%s" % (ctx.mode, key)]
         if key in ("image", "motion", "prompt") and ctx.narration == "speech":
