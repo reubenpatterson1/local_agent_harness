@@ -9,7 +9,11 @@ Run by the user (or the controller on the user's go); tests call main only with 
 download and disk check replaced. With no option the selection is --model qwen21-q4 --lora
 uncensored; otherwise it is exactly the options given (repeats dropped; --lora alone installs the
 venv and those LoRAs only). --model takes qwen21-q4, qwen21-q8, qwen21-bf16 or qwen2511-q4;
-qwen2511-bf16 is refused (it runs the diffusers weights of the default Hugging Face cache).
+qwen2511-bf16 is refused (it runs the diffusers weights of the default Hugging Face cache). --lora
+also accepts the custom user-* IDs of bin/seed-edit-lora
+(docs/superpowers/specs/2026-11-17-custom-edit-loras-design.md): a Hugging Face one is downloaded
+like a built-in and its safetensors header is checked after the download; a local one is only
+reported.
 
 Items: each model is one snapshot of its repo at the registry's pinned revision (qwen21-bf16 only
 the nine mflux file patterns of Qwen/Qwen-Image-2.1); qwen2511-q4 also gets its Lightning LoRA as
@@ -31,9 +35,10 @@ blocks a pinned snapshot after the download (an earlier download at another revi
 delete it by hand); print the sizes and bin/seed-edit --probe's verdict for each selected model and
 LoRA.
 
-Exit codes: 0 done or nothing to do; 1 a step failed, or an orphan partial blob still blocks a
-pinned snapshot; 2 a precondition failed.
-Standard library plus movie_ui_lib and movie_ui_seedgen. Python 3.9 and 3.13.
+Exit codes: 0 done or nothing to do; 1 a step failed, an orphan partial blob still blocks a pinned
+snapshot, or a downloaded custom LoRA file failed the safetensors check; 2 a precondition failed.
+Standard library plus movie_ui_lib and movie_ui_seedgen (seed_lora_registry inside the functions
+that use it). Python 3.9 and 3.13.
 """
 
 import argparse
@@ -57,6 +62,8 @@ MFLUX_VERSION = "0.24.0"
 DEFAULT_BASE_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
 VENV_GIB = 3.0
 HEADROOM_GIB = 1.0
+UNUSABLE_MSG = ("%d custom LoRA file(s) failed the safetensors check (listed above); remove them with "
+                "bin/seed-edit-lora remove ID")
 DOWNLOAD = ("import json\n"
             "import sys\n"
             "from huggingface_hub import hf_hub_download, snapshot_download\n"
@@ -273,9 +280,10 @@ def selection(args):
             return None, ("%s is not installed by seed-edit-setup: it runs the diffusers weights of %s and %s from "
                           "the default Hugging Face cache (%s)" % (model_id, entry["repo"], entry["builtin_lora"]["repo"],
                                                                     default_hub()))
+    known = seedgen.qwen_lora_ids()
     for lora_id in loras:
-        if lora_id not in seedgen.QWEN_LORA_IDS:
-            return None, "unknown --lora %s; known: %s" % (lora_id, ", ".join(seedgen.QWEN_LORA_IDS))
+        if lora_id not in known:
+            return None, "unknown --lora %s; known: %s" % (lora_id, ", ".join(known))
     return (models, loras), None
 
 
@@ -294,8 +302,13 @@ def items_of(models, loras):
                           "license": "Apache-2.0"})
     for lora_id in loras:
         lora = seedgen.qwen_lora(lora_id)
-        items.append({"kind": "file", "name": lora_id, "repo": lora["repo"], "revision": lora["revision"],
-                      "file": lora["file"], "bytes": lora["bytes"], "license": lora["license"]})
+        if lora.get("source") == "local":
+            continue                      # custom edit LoRAs spec CL32: a local LoRA has nothing to download
+        item = {"kind": "file", "name": lora_id, "repo": lora["repo"], "revision": lora["revision"],
+                "file": lora["file"], "bytes": lora["bytes"], "license": lora["license"]}
+        if lora.get("user"):
+            item["user"] = True
+        items.append(item)
     return items
 
 
@@ -334,6 +347,16 @@ def report(venv, hub, models, loras, items):
             say("LoRA %s %s: %.2f GiB" % (item["name"], path, os.path.getsize(os.path.realpath(path)) / 2 ** 30))
         else:
             say("LoRA %s (%s) is not in %s" % (item["name"], item["file"], hub))
+    import seed_lora_registry
+    for lora_id in loras:
+        lora = seedgen.qwen_lora(lora_id)
+        if lora.get("source") != "local":
+            continue
+        problem = seed_lora_registry.local_problem(lora)
+        if problem is None:
+            say("LoRA %s (local) %s: %.2f GiB" % (lora_id, lora["path"], lora["bytes"] / 2 ** 30))
+        else:
+            say("LoRA %s (local): %s" % (lora_id, problem))
     ancestor = existing_ancestor(hub)
     say("free on %s: %.1f GiB" % (ancestor, free_gib(ancestor)))
     proc = subprocess.run([sys.executable, os.path.join(WS, "bin", "seed-edit"), "--probe"],
@@ -347,6 +370,34 @@ def report(venv, hub, models, loras, items):
         lines = ["probe: unavailable: bin/seed-edit --probe printed unparsable output"]
     for line in lines:
         say(line)
+
+
+def unusable(items, hub):
+    """Custom edit LoRAs spec CL33: [(name, problem)] of the downloaded custom Hugging Face LoRA files that fail
+    seed_lora_registry.downloaded_problem."""
+    import seed_lora_registry
+    out = []
+    for item in items:
+        if not item.get("user"):
+            continue
+        path = pinned_file(item["repo"], item["revision"], item["file"], [hub])
+        if path is None:
+            continue
+        problem = seed_lora_registry.downloaded_problem(seedgen.qwen_lora(item["name"]), path)
+        if problem is not None:
+            out.append((item["name"], problem))
+    return out
+
+
+def finish(items, hub):
+    """Custom edit LoRAs spec CL33: name every unusable custom LoRA file; 1 (UNUSABLE_MSG) when there is one,
+    else 0."""
+    bad = unusable(items, hub)
+    for name, problem in bad:
+        say("LoRA %s is unusable: %s" % (name, problem))
+    if bad:
+        return fail(1, UNUSABLE_MSG % len(bad))
+    return 0
 
 
 def main(argv=None):
@@ -372,7 +423,7 @@ def main(argv=None):
     if venv_ok and not needed:
         say("nothing to do")
         report(venv, hub, models, loras, items)
-        return 0
+        return finish(items, hub)
     total = sum(item["bytes"] for item in needed) / 2 ** 30 + (0.0 if venv_ok else VENV_GIB) + HEADROOM_GIB
     present = present_gib(hub, needed)
     if not venv_ok and os.path.isdir(venv):
@@ -420,7 +471,7 @@ def main(argv=None):
     if orphans:
         return fail(1, "%d orphan partial blob(s) left by an earlier download block the pinned snapshot; delete the "
                        "file(s) listed above, then re-run bin/seed-edit-setup" % len(orphans))
-    return 0
+    return finish(items, hub)
 
 
 if __name__ == "__main__":

@@ -15,11 +15,14 @@ memory floor grows by reference_gib for every image above two
 
 Environment: SEED_EDIT_MFLUX_PYTHON (default ~/mflux-edit/.venv/bin/python), SEED_EDIT_QWENEDIT_SCRIPT
 (default <ws>/character_dataset.py), HF_HUB_CACHE and HF_HOME (the default hub), Z_IMAGE_HF_HOME (the
-Z-Image hub, through movie_ui_lib.zimage_hub) and HOME. The mflux weights and LoRAs are looked up only at
-their pinned revisions, in the Z-Image hub and then the default hub.
+Z-Image hub, through movie_ui_lib.zimage_hub) and HOME. The LoRAs come from movie_ui_seedgen.qwen_loras():
+the built-ins plus the custom LoRAs of bin/seed-edit-lora
+(docs/superpowers/specs/2026-11-17-custom-edit-loras-design.md). The mflux weights, the built-in LoRAs and
+the Hugging Face custom LoRAs are looked up only at their pinned revisions, in the Z-Image hub and then the
+default hub; a local custom LoRA is used at its recorded path.
 
 Python 3.9 and 3.13. The top level imports only the standard library, movie_ui_lib and movie_ui_seedgen;
-PIL, psutil and content_safety are imported inside the functions that use them.
+PIL, psutil, content_safety and seed_lora_registry are imported inside the functions that use them.
 """
 
 import glob
@@ -240,11 +243,22 @@ def mflux_env_problem(entry):
 
 
 def lora_problem(lora, hubs):
-    """Seed models SQ16: (None, snapshot path) of a registry LoRA's pinned file, else (problem, None)."""
+    """Seed models SQ16 (custom edit LoRAs spec CL25): (None, path) of a registry LoRA's file, else (problem,
+    None). A local custom LoRA is its recorded path once seed_lora_registry.local_problem passes; any other LoRA
+    is its pinned snapshot file, which for a custom one must also pass seed_lora_registry.downloaded_problem."""
+    if lora.get("source") == "local":
+        import seed_lora_registry
+        problem = seed_lora_registry.local_problem(lora)
+        return (problem, None) if problem is not None else (None, lora["path"])
     path = pinned_file(lora["repo"], lora["revision"], lora["file"], hubs)
     if path is None:
         return ("%s is not in %s (run bin/seed-edit-setup --lora %s)" % (lora["file"], " or ".join(hubs), lora["id"]),
                 None)
+    if lora.get("user"):
+        import seed_lora_registry
+        problem = seed_lora_registry.downloaded_problem(lora, path)
+        if problem is not None:
+            return problem, None
     return None, path
 
 
@@ -377,14 +391,17 @@ def check_lora_args(values, entry, flag="--lora"):
         if not match:
             raise SelectionError("%s must be ID=SCALE (got %s)" % (flag, value))
         lora_id, text = match.group(1), match.group(2)
-        if lora_id not in seedgen.QWEN_LORA_IDS:
-            raise SelectionError("%s: unknown LoRA %s; known: %s" % (flag, lora_id, ", ".join(seedgen.QWEN_LORA_IDS)))
+        known = seedgen.qwen_lora_ids()
+        if lora_id not in known:
+            raise SelectionError("%s: unknown LoRA %s; known: %s" % (flag, lora_id, ", ".join(known)))
         if any(item["id"] == lora_id for item in loras):
             raise SelectionError("%s %s is given twice" % (flag, lora_id))
         lora = seedgen.qwen_lora(lora_id)
         if lora["family"] != entry["family"]:
             raise SelectionError("%s %s is for %s, not %s" % (flag, lora_id, seedgen.QWEN_FAMILIES[lora["family"]],
                                                               entry["label"]))
+        if entry["backend"] == "diffusers":
+            raise SelectionError("%s %s: " % (flag, lora_id) + seedgen.NO_LORAS_MSG % entry["id"])
         try:
             scale = float(text)
         except ValueError:
@@ -479,9 +496,13 @@ def install_problem(model_id, loras):
     problem, paths = qwen_model_problem(entry)
     if problem is not None:
         return "%s is unavailable: %s" % (entry["label"], problem), {}
+    if loras and entry["backend"] == "diffusers":
+        return seedgen.NO_LORAS_MSG % entry["id"], {}          # custom edit LoRAs spec CL27
     lora_paths = []
     for item in seedgen.registry_order(loras):
         lora = seedgen.qwen_lora(item["id"])
+        if lora is None:
+            return "LoRA %s is unavailable: %s" % (item["id"], seedgen.REMOVED_MSG), {}
         problem, path = lora_problem(lora, qwen_hubs())
         if problem is not None:
             return "LoRA %s is unavailable: %s" % (lora["label"], problem), {}
@@ -506,8 +527,11 @@ def selection_problem(model_id, loras):
 def run_jobs(model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None, noun="job"):
     """Run one Qwen edit child over jobs and screen every output (qwen edit models spec QE13-QE16). A job may also
     carry "sources", the list of its reference images in order, whose first item is its "source" (cast refs spec
-    CR3); the child then edits with every listed image."""
+    CR3); the child then edits with every listed image. Every job's prompt first gets the triggers of the
+    selected LoRAs in front (movie_ui_seedgen.trigger_prompt, custom edit LoRAs spec CL28), so the child, content
+    safety and mflux_spec.json see the triggered text; the callers' job dicts are not changed."""
     entry = seedgen.qwen_model(model_id)
+    jobs = [dict(job, prompt=seedgen.trigger_prompt(job["prompt"], loras)) for job in jobs]
     refused = multi_reference_problem(model_id)
     if refused is not None and any(len(job.get("sources") or ()) > 1 for job in jobs):
         raise Unavailable("%s cannot edit with several reference images: %s" % (entry["label"], refused))

@@ -117,7 +117,7 @@ def env(monkeypatch, tmp_path):
     os.makedirs(home)
     monkeypatch.setenv("HOME", home)
     for key in list(os.environ):
-        if key.startswith("SEED_EDIT_"):
+        if key.startswith("SEED_EDIT_") and key != "SEED_EDIT_USER_LORAS":
             monkeypatch.delenv(key)
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", os.path.join(tmp, "hf"))
@@ -1139,16 +1139,17 @@ def test_sqt10_the_registry_pins():
     import character_dataset
     tool = load_tool()
     assert seedgen.QWEN_MODEL_IDS == ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4", "qwen2511-bf16")
-    assert seedgen.QWEN_LORA_IDS == ("uncensored", "viggle-turbo")
+    assert seedgen.qwen_lora_ids() == ("uncensored", "viggle-turbo")
+    assert seedgen.BUILTIN_QWEN_LORA_IDS == ("uncensored", "viggle-turbo")
     assert [dict(m) for m in seedgen.QWEN_MODELS] == [dict(r, max_references=k, reference_gib=g) for r, (k, g) in zip(REGISTRY, ((10, 2.0), (10, 2.0), (10, 2.0), (1, 3.0), (3, 3.0)))]   # extra references XR8
-    assert [dict(lora) for lora in seedgen.QWEN_LORAS] == LORA_REGISTRY
+    assert [dict(lora) for lora in seedgen.BUILTIN_QWEN_LORAS] == LORA_REGISTRY
     assert (seedgen.DEFAULT_QWEN_MODEL, seedgen.LEGACY_QWEN_MODEL, seedgen.SCALE_MAX) == ("qwen21-q4", "qwen2511-q4", 2.0)
     assert seedgen.QWEN_FAMILIES == {"qwen21": "Qwen-Image-2.1", "qwen2511": "Qwen-Image-Edit-2511"}
     assert seedgen.QWEN21_PATTERNS == MFLUX_PATTERNS
     assert seedgen.QWEN21_REQUIRED == ("vae/config.json", "transformer/config.json", "text_encoder/config.json")
-    for entry in seedgen.QWEN_MODELS + seedgen.QWEN_LORAS:
+    for entry in seedgen.QWEN_MODELS + seedgen.BUILTIN_QWEN_LORAS:
         assert entry["revision"] is None or re.fullmatch(r"[0-9a-f]{40}", entry["revision"]), entry["id"]
-    assert all("allow_patterns" not in lora for lora in seedgen.QWEN_LORAS)
+    assert all("allow_patterns" not in lora for lora in seedgen.BUILTIN_QWEN_LORAS)
     for model_id in ("qwen2511-q4", "qwen2511-bf16"):
         entry = seedgen.qwen_model(model_id)
         assert entry["steps"] == tool.qe.EDIT_STEPS
@@ -1548,7 +1549,7 @@ def test_sqt11_the_setup_items(setup_env, capsys):
         assert setup.main(argv) == 0, argv
         assert downloads(rec) == [want], argv
         assert [c["argv"][1] for c in rec["call"]] == ["-c"], argv
-    lora_repos = set(lora["repo"] for lora in seedgen.QWEN_LORAS) | {"lightx2v/Qwen-Image-Edit-2511-Lightning"}
+    lora_repos = set(lora["repo"] for lora in seedgen.BUILTIN_QWEN_LORAS) | {"lightx2v/Qwen-Image-Edit-2511-Lightning"}
     for model_id in ("qwen21-q4", "qwen21-q8", "qwen21-bf16", "qwen2511-q4"):
         for loras in ([], ["uncensored"], ["viggle-turbo"], ["uncensored", "viggle-turbo"]):
             rec["call"] = []

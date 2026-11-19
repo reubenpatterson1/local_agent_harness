@@ -226,7 +226,7 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
         and store the results."""
         results = {"render": lib.render_check(), "stills": lib.stills_check(self.probe_ws, self.stills_py),
                    "story_server": lib.story_server_check(self.probe_ws)}
-        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
+        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws, seedgen.QWEN_MODEL_IDS, seedgen.qwen_lora_ids())
         checked = lib.utc_now()
         with self.cap_lock:
             for key, (ok, detail) in results.items():
@@ -784,7 +784,7 @@ def _edit_given(body):
 
 def edit_availability(real, model_id, loras):
     """The 409 text of a Qwen edit selection (seed models SQ31 rules through bin/seed-edit --probe), or None."""
-    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
+    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.qwen_lora_ids())
     return seedgen.availability_error(models, detail, {"model": "qwen", "qwen_model": model_id, "loras": loras})
 
 
@@ -1848,7 +1848,7 @@ def _h_seed_run_create(self, groups, query, body):
     if error is not None:
         raise ApiError(400, error)
     source, ext = _seed_source(server, real, clean["source"])
-    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS)
+    models, detail = lib.seed_edit_check(real, seedgen.QWEN_MODEL_IDS, seedgen.qwen_lora_ids())
     error = seedgen.availability_error(models, detail, clean)
     if error is not None:
         raise ApiError(409, error)

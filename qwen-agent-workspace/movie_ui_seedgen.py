@@ -1,17 +1,24 @@
 """movie_ui_seedgen -- the seed generator's pure core: the Seeds tab's request rules, the seed
 folder rule, the run ID, Keep's file names and the seed_edit capability shape
 (docs/superpowers/specs/2026-11-02-seed-generator-design.md, deliverable G4, Section 5.1), and the
-fixed Qwen model and LoRA registry with its selection rules
-(docs/superpowers/specs/2026-11-02-seed-models-design.md, Sections 2 and 5.1). bin/seed-edit and
-bin/seed-edit-setup import the registry from here; the page gets it through the capability.
+Qwen model and LoRA registry with its selection rules
+(docs/superpowers/specs/2026-11-02-seed-models-design.md, Sections 2 and 5.1). The registry is the
+fixed models, the built-in LoRAs and the custom LoRAs read from user_loras_path()
+(docs/superpowers/specs/2026-11-17-custom-edit-loras-design.md); bin/seed-edit and
+bin/seed-edit-setup import it from here; the page gets it through the capability.
 
 Standard library plus movie_ui_lib only (SG1). Valid on Python 3.9 and 3.13. This module never
 writes and never starts a process. Every function is pure except new_run_id, which reads the
-clock and draws random digits.
+clock and draws random digits, and the registry lookups, which read the custom LoRA file through
+user_loras (cached by its stat; an unusable file is warned about once on stderr).
 """
 
+import json
+import os
 import re
 import secrets
+import sys
+import threading
 import time
 
 import movie_ui_lib as lib
@@ -75,7 +82,7 @@ QWEN_MODELS = (
      "steps": 8, "guidance": 1.0, "scheduler": None, "multiple": 16, "builtin_lora": dict(LIGHTNING, revision=None),
      "memory_gib": 64.0, "max_references": 3, "reference_gib": 3.0, "license": "Apache-2.0", "setup": False},
 )
-QWEN_LORAS = (
+BUILTIN_QWEN_LORAS = (
     {"id": "uncensored", "label": "Uncensored (abenzerps)", "family": "qwen21",
      "repo": "abenzerps/Qwen-Image-2.1-Uncensored-Quantized", "revision": "7959e658915f52274897fb573ffeda49de8dc16b",
      "file": "qwen-image-2.1-uncensored-lora.safetensors", "bytes": 33586704,
@@ -86,12 +93,36 @@ QWEN_LORAS = (
      "default_on": False, "default_scale": 1.0, "steps": 6, "scheduler": "viggle_turbo", "license": QWEN_RESEARCH},
 )
 QWEN_MODEL_IDS = tuple(m["id"] for m in QWEN_MODELS)
-QWEN_LORA_IDS = tuple(l["id"] for l in QWEN_LORAS)
+BUILTIN_QWEN_LORA_IDS = tuple(l["id"] for l in BUILTIN_QWEN_LORAS)
 DEFAULT_QWEN_MODEL = "qwen21-q4"
 LEGACY_QWEN_MODEL = "qwen2511-q4"
 SCALE_MAX = 2.0
 LORAS_MSG = "loras must be a list of {id, scale}"
 HF_TOKEN_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+# Custom edit LoRAs spec CL1: the registry file of the custom (user-added) Qwen edit LoRAs.
+USER_LORAS_ENV = "SEED_EDIT_USER_LORAS"
+USER_LORAS_SCHEMA = "seed-edit.user-loras.v1"
+USER_ID_RE = re.compile(r"^user-[a-z0-9-]{1,24}$")
+USER_LORA_MAX_BYTES = 8 * 2 ** 30
+LABEL_MAX = 80
+LICENSE_MAX = 200
+STEPS_MAX = 100
+TRIGGER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ,.;:'!?()&/-]{0,199}$")
+HF_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
+HF_FILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_. +()-]{0,199}(/[A-Za-z0-9_][A-Za-z0-9_. +()-]{0,199})*$")
+HF_KEYS = ("id", "label", "family", "source", "repo", "revision", "file", "bytes", "default_on",
+           "default_scale", "license", "steps", "scheduler", "trigger", "user")
+LOCAL_KEYS = ("id", "label", "family", "source", "path", "file", "sha256", "bytes", "default_on",
+              "default_scale", "license", "steps", "scheduler", "trigger", "user")
+NO_LORAS_MSG = ("%s runs without LoRAs (its diffusers child loads only the built-in Lightning LoRA); "
+                "use qwen2511-q4")
+REMOVED_MSG = ("it is not in the Qwen edit LoRA registry (removed?); add it again with bin/seed-edit-lora "
+               "add, or choose other LoRAs")
+USER_LORAS_WARNING = "seed-edit: ignoring %s: %s; only the built-in Qwen edit LoRAs are available"
+_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_USER_LOCK = threading.Lock()
+_USER_CACHE = {"key": None, "loras": ()}     # CL5: the last file state read and its entries
 
 
 def _absent(body, key):
@@ -139,7 +170,7 @@ def qwen_selection(model_id, loras, model_key="qwen_model", loras_key="loras"):
         if not (isinstance(item, dict) and set(item) == {"id", "scale"}):
             return None, None, lists
         lora_id, scale = item["id"], item["scale"]
-        if not (isinstance(lora_id, str) and lora_id in QWEN_LORA_IDS):
+        if not (isinstance(lora_id, str) and lora_id in qwen_lora_ids()):
             return None, None, "unknown LoRA %s" % (lora_id,)
         if lora_id in seen:
             return None, None, "LoRA %s is listed twice" % lora_id
@@ -147,6 +178,8 @@ def qwen_selection(model_id, loras, model_key="qwen_model", loras_key="loras"):
         lora = qwen_lora(lora_id)
         if lora["family"] != entry["family"]:
             return None, None, "LoRA %s is for %s, not %s" % (lora_id, QWEN_FAMILIES[lora["family"]], entry["label"])
+        if entry["backend"] == "diffusers":
+            return None, None, "LoRA %s: " % lora_id + NO_LORAS_MSG % entry["id"]
         if not (lib._is_number(scale) and 0 < scale <= SCALE_MAX):
             return None, None, "LoRA %s scale must be a number above 0 and at most 2" % lora_id
         clean.append({"id": lora_id, "scale": float(scale)})
@@ -231,42 +264,219 @@ def qwen_model(model_id):
     return None
 
 
+def user_loras_path():
+    """Custom edit LoRAs spec CL2 (D8): $SEED_EDIT_USER_LORAS when set and non-empty, else this workspace's
+    generated/seed_loras/user_loras.json."""
+    return os.environ.get(USER_LORAS_ENV) or os.path.join(os.path.dirname(os.path.realpath(__file__)), "generated",
+                                                          "seed_loras", "user_loras.json")
+
+
+def valid_trigger(text):
+    """Custom edit LoRAs spec CL3 (D1): a str of TRIGGER_RE with no double and no trailing space."""
+    return (isinstance(text, str) and TRIGGER_RE.fullmatch(text) is not None and "  " not in text
+            and not text.endswith(" "))
+
+
+def _plain_text(value, most):
+    """A str of 1 to most characters with no character below a space and no DEL."""
+    return (isinstance(value, str) and 1 <= len(value) <= most
+            and not any(c < "\x20" or c == "\x7f" for c in value))
+
+
+def _entry_problem(i, entry, seen):
+    """Custom edit LoRAs spec CL4 rule 4: why entry i (1-based) of a registry file is invalid, or None. seen
+    collects the ids of the entries before it."""
+    source = entry.get("source") if isinstance(entry, dict) else None
+    keys = {"hf": HF_KEYS, "local": LOCAL_KEYS}.get(source) if isinstance(source, str) else None
+    if keys is None or set(entry) != set(keys):
+        return "entry %d: keys or source are invalid" % i
+    bad = "entry %d: %s is invalid"
+    lora_id = entry["id"]
+    if not (isinstance(lora_id, str) and USER_ID_RE.fullmatch(lora_id) and lora_id not in BUILTIN_QWEN_LORA_IDS):
+        return bad % (i, "id")
+    if lora_id in seen:
+        return "entry %d: id %s is listed twice" % (i, lora_id)
+    seen.add(lora_id)
+    if not _plain_text(entry["label"], LABEL_MAX):
+        return bad % (i, "label")
+    if not (isinstance(entry["family"], str) and entry["family"] in QWEN_FAMILIES):
+        return bad % (i, "family")
+    if source == "hf":
+        repo, revision, name = entry["repo"], entry["revision"], entry["file"]
+        if not (isinstance(repo, str) and HF_REPO_RE.fullmatch(repo) and ".." not in repo and "--" not in repo):
+            return bad % (i, "repo")
+        if not (isinstance(revision, str) and _REVISION_RE.fullmatch(revision)):
+            return bad % (i, "revision")
+        if not (isinstance(name, str) and HF_FILE_RE.fullmatch(name) and ".." not in name.split("/")
+                and name.lower().endswith(".safetensors")):
+            return bad % (i, "file")
+    else:
+        path = entry["path"]
+        if not (isinstance(path, str) and os.path.isabs(path) and not any(c < "\x20" for c in path)
+                and path.lower().endswith(".safetensors")):
+            return bad % (i, "path")
+        if entry["file"] != os.path.basename(path):
+            return bad % (i, "file")
+        if not (isinstance(entry["sha256"], str) and _SHA256_RE.fullmatch(entry["sha256"])):
+            return bad % (i, "sha256")
+    if not (lib._is_int(entry["bytes"]) and 1 <= entry["bytes"] <= USER_LORA_MAX_BYTES):
+        return bad % (i, "bytes")
+    if entry["default_on"] is not False:
+        return bad % (i, "default_on")
+    if not (lib._is_number(entry["default_scale"]) and 0 < entry["default_scale"] <= SCALE_MAX):
+        return bad % (i, "default_scale")
+    if not (isinstance(entry["license"], str) and 1 <= len(entry["license"]) <= LICENSE_MAX):
+        return bad % (i, "license")
+    steps = entry["steps"]
+    if not (steps is None or (lib._is_int(steps) and 1 <= steps <= STEPS_MAX)):
+        return bad % (i, "steps")
+    if entry["scheduler"] is not None:
+        return bad % (i, "scheduler")
+    if not (entry["trigger"] is None or valid_trigger(entry["trigger"])):
+        return bad % (i, "trigger")
+    if entry["user"] is not True:
+        return bad % (i, "user")
+    return None
+
+
+def user_loras_problem(data):
+    """Custom edit LoRAs spec CL4: None when data is a valid registry file, else the first failing rule's reason."""
+    if not (isinstance(data, dict) and set(data) == {"schema", "loras"}):
+        return "top level must be {schema, loras}"
+    if data["schema"] != USER_LORAS_SCHEMA:
+        return "schema must be seed-edit.user-loras.v1"
+    if not isinstance(data["loras"], list):
+        return "loras must be a list"
+    seen = set()
+    for i, entry in enumerate(data["loras"], 1):
+        problem = _entry_problem(i, entry, seen)
+        if problem is not None:
+            return problem
+    return None
+
+
+def _ignored(key, path, reason):
+    """Custom edit LoRAs spec CL5: warn once for this file state, remember it, and give no custom LoRA."""
+    sys.stderr.write(USER_LORAS_WARNING % (path, reason) + "\n")
+    sys.stderr.flush()
+    _USER_CACHE["key"], _USER_CACHE["loras"] = key, ()
+    return ()
+
+
+def user_loras():
+    """Custom edit LoRAs spec CL5: the entries of the registry file as a tuple; () when it is missing (no warning)
+    or unusable (one warning per file state). Cached by (path, mtime_ns, size, inode); thread-safe; never raises."""
+    path = user_loras_path()
+    with _USER_LOCK:
+        try:
+            info = os.stat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return ()
+        except OSError as e:
+            key = (path, "stat", str(e))
+            if _USER_CACHE["key"] == key:
+                return ()
+            return _ignored(key, path, "cannot read: %s" % e)
+        key = (path, info.st_mtime_ns, info.st_size, info.st_ino)
+        if _USER_CACHE["key"] == key:
+            return _USER_CACHE["loras"]
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            return _ignored(key, path, "cannot read: %s" % e)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return _ignored(key, path, "not valid JSON")
+        reason = user_loras_problem(data)
+        if reason is not None:
+            return _ignored(key, path, reason)
+        _USER_CACHE["key"], _USER_CACHE["loras"] = key, tuple(data["loras"])
+        return _USER_CACHE["loras"]
+
+
+def qwen_loras():
+    """Custom edit LoRAs spec CL6: the registry's LoRAs: BUILTIN_QWEN_LORAS, then the custom LoRAs in file order."""
+    return BUILTIN_QWEN_LORAS + user_loras()
+
+
+def qwen_lora_ids():
+    """Custom edit LoRAs spec CL6: the ids of qwen_loras(), in order."""
+    return tuple(l["id"] for l in qwen_loras())
+
+
 def qwen_lora(lora_id):
-    """Seed models SQ5: the QWEN_LORAS entry whose id is lora_id, else None."""
-    for entry in QWEN_LORAS:
+    """Seed models SQ5 (custom edit LoRAs spec CL7): the registry LoRA whose id is lora_id, else None."""
+    for entry in qwen_loras():
         if entry["id"] == lora_id:
             return entry
     return None
 
 
 def registry_order(loras):
-    """Seed models SQ5: a [{"id", "scale"}] list sorted by each id's place in QWEN_LORA_IDS."""
-    return sorted(loras, key=lambda item: QWEN_LORA_IDS.index(item["id"]))
+    """Seed models SQ5 (custom edit LoRAs spec CL8): a list of {"id", ...} items sorted by each id's place in
+    qwen_lora_ids(); an id that is no longer in the registry sorts after every known id."""
+    ids = qwen_lora_ids()
+    return sorted(loras, key=lambda item: ids.index(item["id"]) if item["id"] in ids else len(ids))
 
 
 def default_loras(model_id):
-    """Seed models SQ6: the default-on LoRAs of model_id's family, [{"id", "scale"}]."""
+    """Seed models SQ6: the default-on LoRAs of model_id's family, [{"id", "scale"}] (a custom LoRA is never
+    default-on)."""
     family = qwen_model(model_id)["family"]
-    return [{"id": lora["id"], "scale": lora["default_scale"]} for lora in QWEN_LORAS
+    return [{"id": lora["id"], "scale": lora["default_scale"]} for lora in qwen_loras()
             if lora["default_on"] and lora["family"] == family]
 
 
+def settings_item(lora, scale):
+    """Custom edit LoRAs spec CL10 (D4): the recorded item of one selected registry LoRA."""
+    if not lora.get("user"):
+        return {"id": lora["id"], "repo": lora["repo"], "file": lora["file"], "scale": scale}
+    if lora["source"] == "local":
+        return {"id": lora["id"], "source": "local", "file": lora["file"], "sha256": lora["sha256"],
+                "scale": scale, "trigger": lora["trigger"]}
+    return {"id": lora["id"], "repo": lora["repo"], "revision": lora["revision"], "file": lora["file"],
+            "scale": scale, "trigger": lora["trigger"]}
+
+
 def qwen_settings(model_id, loras):
-    """Seed models SQ7: {"qwen_model", "loras", "steps", "scheduler"} of a selection (model_id None
-    for Z-Image). A LoRA with its own steps (the first in registry order) sets steps and scheduler."""
+    """Seed models SQ7 (custom edit LoRAs spec CL10): {"qwen_model", "loras", "steps", "scheduler"} of a
+    selection (model_id None for Z-Image). Each item is settings_item's; an id no longer in the registry is
+    {"id", "scale", "removed": True} (D5). The first LoRA in registry order with its own steps sets steps and
+    its scheduler, or keeps the model's scheduler when its own is None (D13)."""
     if model_id is None:
         return {"qwen_model": None, "loras": [], "steps": None, "scheduler": None}
     entry = qwen_model(model_id)
     steps, scheduler, turbo, out = entry["steps"], entry["scheduler"], None, []
     for item in registry_order(loras):
         lora = qwen_lora(item["id"])
-        out.append({"id": lora["id"], "repo": lora["repo"], "file": lora["file"], "scale": float(item["scale"])})
+        if lora is None:
+            out.append({"id": item["id"], "scale": float(item["scale"]), "removed": True})
+            continue
+        out.append(settings_item(lora, float(item["scale"])))
         if turbo is None and lora["steps"] is not None:
             turbo = lora
     if turbo is not None:
-        steps, scheduler = turbo["steps"], turbo["scheduler"]
+        steps = turbo["steps"]
+        scheduler = turbo["scheduler"] if turbo["scheduler"] is not None else entry["scheduler"]
     return {"qwen_model": {"id": entry["id"], "repo": entry["repo"]}, "loras": out, "steps": steps,
             "scheduler": scheduler}
+
+
+def trigger_prompt(prompt, loras):
+    """prompt with the triggers of the selected registry LoRAs in front (custom edit LoRAs spec CL11)."""
+    missing = []
+    for item in registry_order(loras):
+        lora = qwen_lora(item["id"])
+        trigger = lora.get("trigger") if lora is not None else None
+        if (trigger and trigger.lower() not in prompt.lower()
+                and trigger.lower() not in [m.lower() for m in missing]):
+            missing.append(trigger)
+    if not missing:
+        return prompt
+    prefix = " ".join(missing)
+    return prefix if not prompt.strip() else prefix + " " + prompt
 
 
 def record_settings(record):
@@ -294,7 +504,10 @@ def registry_view():
                "setup": "bin/seed-edit-setup --model %s" % m["id"] if m["setup"] else None} for m in QWEN_MODELS]
     loras = [{"id": lora["id"], "label": lora["label"], "family": lora["family"], "default_on": lora["default_on"],
               "default_scale": lora["default_scale"], "steps": lora["steps"], "scheduler": lora["scheduler"],
-              "license": lora["license"], "setup": "bin/seed-edit-setup --lora %s" % lora["id"]} for lora in QWEN_LORAS]
+              "license": lora["license"], "user": bool(lora.get("user")), "source": lora.get("source", "builtin"),
+              "trigger": lora.get("trigger"),
+              "setup": None if lora.get("source") == "local" else "bin/seed-edit-setup --lora %s" % lora["id"]}
+             for lora in qwen_loras()]
     return {"default_model": DEFAULT_QWEN_MODEL, "families": dict(QWEN_FAMILIES), "models": models, "loras": loras}
 
 

@@ -13,6 +13,14 @@ def lora_catalog_isolation(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def seed_lora_isolation(monkeypatch, tmp_path):
+    """Custom edit LoRAs spec CL52: every test sees no custom Qwen edit LoRA unless it writes one."""
+    path = str(tmp_path / "seed_lora_isolation" / "user_loras.json")
+    monkeypatch.setenv("SEED_EDIT_USER_LORAS", path)
+    return path
+
+
+@pytest.fixture(autouse=True)
 def ltx_autotune_isolation(monkeypatch):
     """The host-aware LTX autotune (ltx2_mlx_video_skill, QWEN_LTX_AUTOTUNE) is off in every test
     unless the test turns it on itself, whatever the developer's shell exports."""

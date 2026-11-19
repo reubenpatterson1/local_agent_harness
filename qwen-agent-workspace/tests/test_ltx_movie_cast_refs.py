@@ -97,7 +97,7 @@ def cast_env(monkeypatch, tmp_path):
     tmp = str(tmp_path)
     story_env = seu.set_story_env(monkeypatch, tmp_path)
     for key in list(os.environ):
-        if key.startswith("SEED_EDIT_"):
+        if key.startswith("SEED_EDIT_") and key != "SEED_EDIT_USER_LORAS":
             monkeypatch.delenv(key)
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", os.path.join(tmp, "hf"))
