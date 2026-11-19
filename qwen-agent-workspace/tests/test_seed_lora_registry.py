@@ -520,3 +520,40 @@ def test_cl_review_focus_1_a_moved_local_lora_refuses_before_the_child(env, regi
         "was added: re-run bin/seed-edit-lora add after bin/seed-edit-lora remove user-local)"
         % (local, size, entry["bytes"]))
     assert st.stub_calls(py) == []
+
+
+# --- Fix round 1: a custom LoRA removed mid-operation is a refusal, never a crash ---------------------------------
+
+def test_cl_fix1_availability_error_with_a_removed_lora(registry_path):
+    write_registry(registry_path, [hf_entry("user-x")])
+    model, loras, error = seedgen.qwen_selection("qwen2511-q4", [{"id": "user-x", "scale": 1}])
+    assert error is None
+    ok = {"ok": True, "reason": None}
+    models = {"qwen": {"models": dict((i, ok) for i in seedgen.QWEN_MODEL_IDS), "loras": {"user-x": ok}}}
+    clean = {"model": "qwen", "qwen_model": model, "loras": loras}
+    assert seedgen.availability_error(models, None, clean) is None
+    os.remove(registry_path)
+    assert seedgen.availability_error(models, None, clean) == "LoRA user-x is unavailable: " + seedgen.REMOVED_MSG
+    write_registry(registry_path, [hf_entry("user-x")])
+    models["qwen"]["loras"] = {}
+    assert seedgen.availability_error(models, None, clean) == (
+        "LoRA %s is unavailable: %s" % (REPO, lib.PROBE_NOT_REPORTED))
+
+
+def test_cl_fix1_setup_report_and_unusable_with_a_removed_lora(setup_env, registry_path, capsys):
+    e = setup_env
+    setup = e["setup"]
+    local = safetensors(os.path.join(e["tmp"], "loras", "local.safetensors"))
+    write_registry(registry_path, [hf_entry(), local_entry(local)])
+    data = st_bytes(pairs("transformer_blocks.0.attn.to_q"))
+    pinned = os.path.join(st.pinned_cache(os.path.join(e["tmp"], "zi"), REPO, SHA, {FILE: data}), FILE)
+    assert os.path.isfile(pinned)
+    item = {"kind": "file", "name": "user-hf", "repo": REPO, "revision": SHA, "file": FILE, "bytes": len(data),
+            "license": "apache-2.0", "user": True}
+    os.remove(registry_path)
+    setup.report(e["venv"], e["hub"], [], ["user-local", "user-hf"], [item])
+    assert setup.unusable([item], e["hub"]) == []
+    assert setup.finish([item], e["hub"]) == 0
+    assert setup.unusable([dict(item, bytes=len(data) + 1)], e["hub"]) == [
+        ("user-hf", "%s is %d bytes; the registry recorded %d (delete it and run bin/seed-edit-setup --lora user-hf "
+                    "again)" % (pinned, len(data), len(data) + 1))]

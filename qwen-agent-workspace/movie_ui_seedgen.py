@@ -536,7 +536,11 @@ def availability_error(models, detail, clean):
         return "%s is unavailable: %s" % (entry["label"], found["reason"])
     for item in clean["loras"]:
         lora = qwen_lora(item["id"])
-        found = models["qwen"]["loras"][lora["id"]]
+        if lora is None:
+            return "LoRA %s is unavailable: %s" % (item["id"], REMOVED_MSG)
+        found = models["qwen"]["loras"].get(lora["id"])
+        if found is None:
+            return "LoRA %s is unavailable: %s" % (lora["label"], lib.PROBE_NOT_REPORTED)
         if not found["ok"]:
             return "LoRA %s is unavailable: %s" % (lora["label"], found["reason"])
     return None

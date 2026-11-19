@@ -350,7 +350,7 @@ def report(venv, hub, models, loras, items):
     import seed_lora_registry
     for lora_id in loras:
         lora = seedgen.qwen_lora(lora_id)
-        if lora.get("source") != "local":
+        if lora is None or lora.get("source") != "local":
             continue
         problem = seed_lora_registry.local_problem(lora)
         if problem is None:
@@ -383,7 +383,7 @@ def unusable(items, hub):
         path = pinned_file(item["repo"], item["revision"], item["file"], [hub])
         if path is None:
             continue
-        problem = seed_lora_registry.downloaded_problem(seedgen.qwen_lora(item["name"]), path)
+        problem = seed_lora_registry.downloaded_problem({"id": item["name"], "bytes": item["bytes"]}, path)
         if problem is not None:
             out.append((item["name"], problem))
     return out
