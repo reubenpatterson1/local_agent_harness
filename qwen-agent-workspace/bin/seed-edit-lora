@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""seed-edit-lora -- register a custom Qwen edit LoRA (a public Hugging Face repo pinned at its current
+commit, or a local .safetensors file used in place), list the registry, or remove a custom LoRA
+(docs/superpowers/specs/2026-11-17-custom-edit-loras-design.md, Section 2.3).
+
+  bin/seed-edit-lora add (--repo OWNER/NAME [--file F] | --path P) [--family qwen21|qwen2511] [--id ID]
+                         [--label TEXT] [--trigger TEXT] [--scale S] [--steps N]
+  bin/seed-edit-lora list
+  bin/seed-edit-lora remove ID
+
+add makes one unauthenticated call to the Hugging Face model API for --repo and never downloads weights
+(bin/seed-edit-setup --lora ID does); for --path it reads the file's header and sha256, and a relative
+path or one starting with ~ is resolved against the current directory or HOME. remove deletes the registry
+entry only, never a file. The registry is $SEED_EDIT_USER_LORAS, else <ws>/generated/seed_loras/user_loras.json.
+Every stdout line starts "seed-edit-lora: " except the list table; errors go to stderr as "Error: <message>".
+
+Exit codes: 0 done; 1 the Hugging Face API failed; 2 a refused request (a bad option or value, an unknown or
+built-in ID, a duplicate, an unreadable or unwritable registry) or an argparse usage error.
+Standard library plus movie_ui_seedgen and seed_lora_registry (qwen_edit inside list). Python 3.9 and 3.13.
+"""
+
+import argparse
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import movie_ui_seedgen as seedgen  # noqa: E402
+import seed_lora_registry as registry  # noqa: E402
+
+
+def say(text):
+    print("seed-edit-lora: " + text, flush=True)
+
+
+def error(text, code):
+    sys.stderr.write("Error: %s\n" % text)
+    sys.stderr.flush()
+    return code
+
+
+def add(args):
+    """CL23, CL24: convert --scale and --steps, add the LoRA, then print the notes and the added line."""
+    import re
+    request = dict((name, getattr(args, name)) for name in registry.FIELDS)
+    if request["scale"] is not None:
+        try:
+            request["scale"] = float(request["scale"])
+        except ValueError:
+            return error(registry.M_SCALE, 2)
+    if request["steps"] is not None:
+        if not re.fullmatch(r"[0-9]+", request["steps"]):
+            return error(registry.M_STEPS, 2)
+        request["steps"] = int(request["steps"])
+    entry, notes = registry.add(request, os.getcwd())
+    for note in notes:
+        say(note)
+    gib = entry["bytes"] / 2 ** 30
+    if entry["source"] == "hf":
+        say("added %s: %s@%s %s (%.2f GiB, %s)" % (entry["id"], entry["repo"], entry["revision"][:12], entry["file"],
+                                                   gib, entry["license"]))
+    else:
+        say("added %s: %s (%.2f GiB, sha256 %s)" % (entry["id"], entry["path"], gib, entry["sha256"][:12]))
+    return 0
+
+
+def show_list():
+    """CL24: every registry LoRA as one tab-separated line, then the registry line."""
+    import qwen_edit
+    hubs = qwen_edit.qwen_hubs()
+    print("ID\tFAMILY\tSOURCE\tWHERE\tSCALE\tTRIGGER\tINSTALLED", flush=True)
+    custom = 0
+    for lora in seedgen.qwen_loras():
+        source = lora.get("source", "builtin")
+        if source == "local":
+            where = lora["path"]
+        else:
+            where = "%s@%s %s" % (lora["repo"], lora["revision"][:12], lora["file"])
+        problem = qwen_edit.lora_problem(lora, hubs)[0]
+        print("\t".join([lora["id"], lora["family"], source, where, "%g" % lora["default_scale"],
+                         lora.get("trigger") or "-", "yes" if problem is None else "no: " + problem]), flush=True)
+        if lora.get("user"):
+            custom += 1
+    say("registry %s (%d custom)" % (seedgen.user_loras_path(), custom))
+    return 0
+
+
+def remove(lora_id):
+    """CL24: remove the entry, then say where its file stays."""
+    entry, kept = registry.remove(lora_id)
+    if entry["source"] == "local":
+        tail = "the file stays at %s" % kept
+    elif kept is not None:
+        tail = "its downloaded file stays at %s" % kept
+    else:
+        tail = "it was never downloaded"
+    say("removed %s from %s; %s" % (entry["id"], seedgen.user_loras_path(), tail))
+    return 0
+
+
+def main(argv=None):
+    """bin/seed-edit-lora (custom edit LoRAs spec CL23, CL24). Returns the exit code."""
+    parser = argparse.ArgumentParser(prog="seed-edit-lora", description="Register, list or remove the custom Qwen "
+                                     "edit LoRAs of Seeds, Locations, Characters, Compose and --seed-edit-lora.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    add_parser = commands.add_parser("add", help="register a public Hugging Face LoRA or a local .safetensors file")
+    for name in ("--repo", "--file", "--path", "--family", "--id", "--label", "--trigger", "--scale", "--steps"):
+        add_parser.add_argument(name, type=str, default=None)
+    commands.add_parser("list", help="show every registry LoRA and whether it is installed")
+    remove_parser = commands.add_parser("remove", help="drop a custom LoRA from the registry (never a file)")
+    remove_parser.add_argument("id", type=str)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "add":
+            return add(args)
+        if args.command == "list":
+            return show_list()
+        return remove(args.id)
+    except registry.RegistryError as e:
+        return error(str(e), 1 if e.status == 502 else 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

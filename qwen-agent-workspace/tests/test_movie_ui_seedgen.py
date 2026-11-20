@@ -137,7 +137,7 @@ def qwen_probe(models=None, loras=None):
     models and loras map to their reasons; ok and reason follow SQ18's aggregate rule."""
     models, loras = models or {}, loras or {}
     per_model = dict((i, {"ok": i not in models, "reason": models.get(i)}) for i in seedgen.QWEN_MODEL_IDS)
-    per_lora = dict((i, {"ok": i not in loras, "reason": loras.get(i)}) for i in seedgen.QWEN_LORA_IDS)
+    per_lora = dict((i, {"ok": i not in loras, "reason": loras.get(i)}) for i in seedgen.BUILTIN_QWEN_LORA_IDS)
     ok = any(e["ok"] for e in per_model.values())
     reason = None if ok else "; ".join("%s: %s" % (i, per_model[i]["reason"]) for i in seedgen.QWEN_MODEL_IDS)
     return {"ok": ok, "reason": reason, "models": per_model, "loras": per_lora}
@@ -206,7 +206,7 @@ def test_sgt17_the_module_imports():
     with open(os.path.join(WS, "movie_ui_seedgen.py"), encoding="utf-8") as f:
         source = f.read()
     assert sorted(re.findall(r"^(?:import|from)\s+([A-Za-z_][\w.]*)", source, re.M)) == [
-        "movie_ui_lib", "re", "secrets", "time"]
+        "json", "movie_ui_lib", "os", "re", "secrets", "sys", "threading", "time"]
 
 
 # --- SQT15 (seed models SQ30): the Qwen model and LoRA request rows ---------------------------------
@@ -354,9 +354,11 @@ def test_sqt16_the_registry_view():
                          "diffusers", 8, None, 16, 64.0, "Apache-2.0", False)],
         "loras": [{"id": "uncensored", "label": "Uncensored (abenzerps)", "family": "qwen21", "default_on": True,
                    "default_scale": 1.0, "steps": None, "scheduler": None, "license": research,
+                   "user": False, "source": "builtin", "trigger": None,
                    "setup": "bin/seed-edit-setup --lora uncensored"},
                   {"id": "viggle-turbo", "label": "Viggle turbo 6-step", "family": "qwen21", "default_on": False,
                    "default_scale": 1.0, "steps": 6, "scheduler": "viggle_turbo", "license": research,
+                   "user": False, "source": "builtin", "trigger": None,
                    "setup": "bin/seed-edit-setup --lora viggle-turbo"}]}
     json.dumps(seedgen.registry_view())
     view = seedgen.registry_view()
@@ -367,7 +369,7 @@ def test_sqt16_the_registry_view():
 # --- The probe stub and the environment (spec 9 rules) -----------------------------------------------
 
 OK_MODELS = {"zimage": {"ok": True, "reason": None, "backend": "zimage"}, "qwen": qwen_probe()}
-IDS, LIDS = seedgen.QWEN_MODEL_IDS, seedgen.QWEN_LORA_IDS
+IDS, LIDS = seedgen.QWEN_MODEL_IDS, seedgen.BUILTIN_QWEN_LORA_IDS
 
 
 def stub_seed_edit(ws, models, exit=0, stderr="", sleep=0):
@@ -386,7 +388,7 @@ def stub_seed_edit(ws, models, exit=0, stderr="", sleep=0):
 def clean_env(monkeypatch, tmp_path):
     """Spec 9: no HF_HUB_CACHE and no SEED_EDIT_* variable; HF_HOME and Z_IMAGE_HF_HOME under tmp_path."""
     for key in list(os.environ):
-        if key.startswith("SEED_EDIT_"):
+        if key.startswith("SEED_EDIT_") and key != "SEED_EDIT_USER_LORAS":
             monkeypatch.delenv(key)
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", os.path.join(str(tmp_path), "hf"))

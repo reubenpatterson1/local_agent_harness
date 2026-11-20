@@ -13,10 +13,11 @@ The movie-ui runs it as a queued GPU job of kind seed-edit; it also runs by hand
 --qwen-model is one of movie_ui_seedgen's registry IDs: qwen21-q4, qwen21-q8, qwen21-bf16
 (Qwen-Image-2.1 through mflux), qwen2511-q4 (Qwen-Image-Edit-2511 q4 through mflux, Lightning
 built in) or qwen2511-bf16 (the unchanged character_dataset.py qwenedit child); without it
---model qwen runs qwen2511-q4, as a job queued before the registry did. Each --lora ID=SCALE
-(uncensored, viggle-turbo; 0 < SCALE <= 2) must be of the model's family; viggle-turbo sets 6
-steps and scheduler viggle_turbo. Every candidate of every model is screened with content
-safety before it gets its final name. --probe prints one JSON line {"qwen": {"ok", "reason",
+--model qwen runs qwen2511-q4, as a job queued before the registry did. Each --lora ID=SCALE (a
+registry LoRA: uncensored, viggle-turbo or a custom user-* LoRA of bin/seed-edit-lora; 0 < SCALE
+<= 2) must be of the model's family; viggle-turbo sets 6 steps and scheduler viggle_turbo; a
+custom LoRA's trigger is prepended to the prompt. Every candidate of every model is screened with
+content safety before it gets its final name. --probe prints one JSON line {"qwen": {"ok", "reason",
 "models": {ID: {"ok", "reason"}}, "loras": {ID: {"ok", "reason"}}}, "zimage": {"backend", "ok",
 "reason"}} and loads nothing.
 
@@ -256,7 +257,7 @@ def probe():
         reason = qe.memory_problem(entry) or qe.qwen_model_problem(entry)[0]
         models[entry["id"]] = {"ok": reason is None, "reason": reason}
     loras = {}
-    for lora in seedgen.QWEN_LORAS:
+    for lora in seedgen.qwen_loras():
         reason = qe.lora_problem(lora, hubs)[0]
         loras[lora["id"]] = {"ok": reason is None, "reason": reason}
     ok = any(m["ok"] for m in models.values())
@@ -314,7 +315,8 @@ def new_record(run_dir, opts):
     else:
         created, origin, job = lib.utc_now(), None, None
     return {"schema": "seed-edit.run.v1", "run": os.path.basename(run_dir), "created": created,
-            "state": "running", "prompt": opts["prompt"], "model": opts["model"], "backend": None,
+            "state": "running", "prompt": seedgen.trigger_prompt(opts["prompt"], opts["loras"]),
+            "model": opts["model"], "backend": None,
             "strength": opts["strength"], "seed": opts["seed"],
             **seedgen.qwen_settings(opts["qwen_model"], opts["loras"]), "size": None, "source_size": None,
             "source": None, "source_origin": origin, "job": job, "error": None,

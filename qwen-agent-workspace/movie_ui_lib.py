@@ -1748,6 +1748,10 @@ def story_server_record(ws_real):
     return _from_pair("V2", "story server", _story_server_pair(kind, value))
 
 
+USER_LORA_PREFIX = "user-"          # custom edit LoRAs spec CL34: the id prefix of a custom Qwen edit LoRA
+PROBE_NOT_REPORTED = "not reported by this workspace's bin/seed-edit --probe (it may predate custom LoRAs)"
+
+
 def _probe_model(value):
     """One model entry of bin/seed-edit --probe's output with exactly its three keys, or None."""
     if not (isinstance(value, dict) and isinstance(value.get("ok"), bool) and "reason" in value
@@ -1760,8 +1764,10 @@ def _probe_model(value):
 
 def _probe_qwen(value, model_ids, lora_ids):
     """The qwen entry of bin/seed-edit --probe's output (seed models SQ35): {"ok", "reason", "models",
-    "loras"} with exactly those keys, models and loras keyed by exactly model_ids and lora_ids and each
-    entry {"ok", "reason"}; extra keys are dropped. None when the shape is wrong."""
+    "loras"} with exactly those keys, models keyed by exactly model_ids, loras by lora_ids, and each entry
+    {"ok", "reason"}; extra keys are dropped. None when the shape is wrong. Custom edit LoRAs spec CL34 (D9): a
+    user- LoRA id the probe did not report reads {"ok": False, "reason": PROBE_NOT_REPORTED}, and a user- key
+    the caller does not know is dropped; every other LoRA id must be reported and no other key may appear."""
     def entry(item):
         if not (isinstance(item, dict) and isinstance(item.get("ok"), bool) and "reason" in item
                 and (item["reason"] is None or isinstance(item["reason"], str))):
@@ -1771,14 +1777,25 @@ def _probe_qwen(value, model_ids, lora_ids):
     top = entry(value)
     if top is None:
         return None
-    for key, ids in (("models", model_ids), ("loras", lora_ids)):
-        found = value.get(key)
-        if not (isinstance(found, dict) and set(found) == set(ids)):
-            return None
-        parsed = dict((i, entry(found[i])) for i in ids)
-        if None in parsed.values():
-            return None
-        top[key] = parsed
+    found = value.get("models")
+    if not (isinstance(found, dict) and set(found) == set(model_ids)):
+        return None
+    parsed = dict((i, entry(found[i])) for i in model_ids)
+    if None in parsed.values():
+        return None
+    top["models"] = parsed
+    found = value.get("loras")
+    if not isinstance(found, dict):
+        return None
+    if any(i not in found for i in lora_ids if not i.startswith(USER_LORA_PREFIX)):
+        return None
+    if any(k not in lora_ids and not k.startswith(USER_LORA_PREFIX) for k in found):
+        return None
+    parsed = dict((i, entry(found[i]) if i in found else {"ok": False, "reason": PROBE_NOT_REPORTED})
+                  for i in lora_ids)
+    if None in parsed.values():
+        return None
+    top["loras"] = parsed
     return top
 
 

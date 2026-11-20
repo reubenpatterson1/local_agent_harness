@@ -43,7 +43,7 @@ def _probe(models=None, loras=None):
     """lib.seed_edit_check's models answer: every registry model and LoRA ok unless given."""
     found_models = dict((i, {"ok": True, "reason": None}) for i in seedgen.QWEN_MODEL_IDS)
     found_models.update(models or {})
-    found_loras = dict((i, {"ok": True, "reason": None}) for i in seedgen.QWEN_LORA_IDS)
+    found_loras = dict((i, {"ok": True, "reason": None}) for i in seedgen.BUILTIN_QWEN_LORA_IDS)
     found_loras.update(loras or {})
     return {"zimage": {"ok": True, "reason": None, "backend": "zimage"},
             "qwen": {"ok": True, "reason": None, "models": found_models, "loras": found_loras}}
@@ -52,7 +52,7 @@ def _probe(models=None, loras=None):
 def _clean_env(monkeypatch, tmp_path):
     """Spec 11.1: no HF_HUB_CACHE and no SEED_EDIT_* variable; HF_HOME and Z_IMAGE_HF_HOME under tmp_path."""
     for key in list(os.environ):
-        if key.startswith("SEED_EDIT_"):
+        if key.startswith("SEED_EDIT_") and key != "SEED_EDIT_USER_LORAS":
             monkeypatch.delenv(key)
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", os.path.join(str(tmp_path), "hf"))

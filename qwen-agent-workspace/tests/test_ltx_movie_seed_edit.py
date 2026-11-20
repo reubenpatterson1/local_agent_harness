@@ -96,7 +96,7 @@ def qe_fake(monkeypatch, tmp_path):
     monkeypatch.setattr(movie, "_story_dir", lambda story_id: os.path.join(str(tmp_path), "stories", story_id))
     monkeypatch.setenv("HOME", os.path.join(str(tmp_path), "home"))
     for key in list(os.environ):
-        if key.startswith("SEED_EDIT_"):
+        if key.startswith("SEED_EDIT_") and key != "SEED_EDIT_USER_LORAS":
             monkeypatch.delenv(key)
     monkeypatch.delenv("HF_HUB_CACHE", raising=False)
     monkeypatch.setenv("HF_HOME", os.path.join(str(tmp_path), "hf"))
