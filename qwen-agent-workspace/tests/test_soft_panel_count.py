@@ -540,11 +540,16 @@ def test_spt6_p1_and_the_beat_range_checks(ws, tmp_path):
         hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", n)))
         assert [m for m in hard + advisory if " P1 " in m or " P5 " in m or " P6 " in m] == [], n
     for n in (2, 6):
-        hard = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", n)))[0]
-        assert "plan: P1 beat count: expected 3 to 5 beats, found %d" % n in hard, n
+        hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", n)))
+        assert "plan: P1 beat count: expected 3 to 5 beats, found %d" % n in advisory, n
+        assert _p1(hard) == [], n
     eight = seu.make_ctx(se, ws, panels=2, narrative=EIGHT)
-    hard = se.plan_checks(eight, _normalized(eight, seu.plan_json("chained", 3)))[0]
-    assert "plan: P1 beat count: expected exactly 4 beats, found 3" in hard
+    hard, advisory = se.plan_checks(eight, _normalized(eight, seu.plan_json("chained", 3)))
+    assert "plan: P1 beat count: expected exactly 4 beats, found 3" in advisory
+    assert _p1(hard) == []
+    hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", 5, beats=[])))
+    assert "plan: P1 beat count: expected 3 to 5 beats, found 0" in hard
+    assert _p1(advisory) == []
     raw = seu.plan_json("chained", 4)
     raw["beats"][3]["index"] = 7
     hard = se.plan_checks(ctx, _normalized(ctx, raw))[0]
@@ -645,12 +650,44 @@ def test_spt9_e2e_the_target_met(ws, tmp_path, monkeypatch, capsys):
 def test_spt10_e2e_out_of_range(ws, tmp_path, monkeypatch, capsys):
     six = seu.answer(seu.plan_json("chained", 6))
     capsys.readouterr()
-    rc, _advisories, _ctx, log = _run_story(ws, tmp_path, monkeypatch, [six, six], {},
-                                            story_id="spt10", panels=3)
+    rc, _advisories, ctx, log = _run_story(ws, tmp_path, monkeypatch, [six, six],
+                                           panel_script("chained", 6), story_id="spt10",
+                                           panels=3)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert ("Warning: plan: P1 beat count: expected 3 to 5 beats, found 6; continuing with 6 "
+            "beats") in captured.out.splitlines()
+    assert "P1 beat count" not in captured.err
+    assert "plan: P1 beat count: expected 3 to 5 beats, found 6" in log[1]["argv"][-1]
+    assert [r["stage"] for r in log][:3] == ["plan", "plan", "panel"]
+    assert len(_read_json(ctx.story_dir, "plan.json")["beats"]) == 6
+
+
+def test_p1_count_is_advisory_and_the_run_continues(ws, tmp_path, monkeypatch, capsys):
+    short = seu.answer(seu.plan_json("chained", 29))
+    capsys.readouterr()
+    rc, _advisories, ctx, log = _run_story(ws, tmp_path, monkeypatch, [short, short],
+                                           panel_script("chained", 29), story_id="p1adv",
+                                           panels=30)
+    captured = capsys.readouterr()
+    assert rc != 1
+    assert ("Warning: plan: P1 beat count: expected 30 to 32 beats, found 29; continuing with "
+            "29 beats") in captured.out.splitlines()
+    assert "P1 beat count" not in captured.err
+    assert [r["stage"] for r in log][:3] == ["plan", "plan", "panel"]
+    assert "- plan: P1 beat count: expected 30 to 32 beats, found 29\n" in log[1]["argv"][-1]
+    assert len(_read_json(ctx.story_dir, "plan.json")["beats"]) == 29
+
+
+def test_p1_zero_beats_is_still_fatal(ws, tmp_path, monkeypatch, capsys):
+    empty = seu.answer(seu.plan_json("chained", 5, beats=[]))
+    capsys.readouterr()
+    rc, _advisories, ctx, log = _run_story(ws, tmp_path, monkeypatch, [empty, empty], {},
+                                           story_id="p1zero", panels=3)
     assert rc == 1
-    line = "  - plan: P1 beat count: expected 3 to 5 beats, found 6"
-    assert capsys.readouterr().err.splitlines()[1] == line
-    assert line.strip()[2:] in log[1]["argv"][-1]
+    assert [r["stage"] for r in log] == ["plan", "plan"]
+    assert ("  - plan: P1 beat count: expected 3 to 5 beats, found 0"
+            in capsys.readouterr().err.splitlines())
 
 
 # --- SPT11: the hockey exit gets its beat, or P19 says how to keep it ------------------------
@@ -779,12 +816,16 @@ def test_spt24_e2e_the_range_with_speakers(ws, tmp_path, monkeypatch, capsys, st
 
     phrases = ("the woman in grey", "the ronin")
     capsys.readouterr()
-    rc, _a, _ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw(3))] * 2, {},
+    panel3 = dict((str(k), [seu.answer(seu.panel_json("shots", k, phrases[(k - 1) % 2]))])
+                  for k in range(1, 4))
+    rc, _a, _ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw(3))] * 2, panel3,
                                     story_id="spt24a", mode="shots", panels=2, members=members,
                                     narrative=TURNS)
-    assert rc == 1
-    assert "  - plan: P1 beat count: expected exactly 4 beats, found 3" in (
-        capsys.readouterr().err.splitlines())
+    captured = capsys.readouterr()
+    assert rc != 1
+    assert ("Warning: plan: P1 beat count: expected exactly 4 beats, found 3; continuing with 3 "
+            "beats") in captured.out.splitlines()
+    assert "P1 beat count" not in captured.err
     panel = dict((str(k), [seu.answer(seu.panel_json("shots", k, phrases[(k - 1) % 2]))])
                  for k in range(1, 5))
     rc, advisories, _ctx, _log = _run_story(ws, tmp_path, monkeypatch, [seu.answer(raw(4))],

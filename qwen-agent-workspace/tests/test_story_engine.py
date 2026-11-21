@@ -1625,14 +1625,15 @@ def test_rst10_plan_retry_and_fatal_plan(ws, tmp_path, monkeypatch, capsys):
     assert [r["stage"] for r in log] == ["plan", "plan"]
 
 
-def test_rst11_short_plan_is_fatal(ws, tmp_path, monkeypatch, capsys):
+def test_rst11_short_plan_is_advisory(ws, tmp_path, monkeypatch, capsys):
     short = seu.plan_json("chained", 5)
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, n=6,
                             plan=[seu.answer(short), seu.answer(short)])
-    assert rc == 1 and len(log) == 2
-    assert capsys.readouterr().err.splitlines()[:2] == [
-        "Error: the story model did not return a usable plan after 2 call(s)",
-        "  - plan: P1 beat count: expected 6 to 8 beats, found 5"]
+    captured = capsys.readouterr()
+    assert [r["stage"] for r in log][:2] == ["plan", "plan"]
+    assert ("Warning: plan: P1 beat count: expected 6 to 8 beats, found 5; continuing with 5 "
+            "beats") in captured.out.splitlines()
+    assert "P1 beat count" not in captured.err
     assert "plan: P1 beat count: expected 6 to 8 beats, found 5" in log[1]["argv"][-1]
 
 
