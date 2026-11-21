@@ -125,6 +125,8 @@ def engine_seconds(ctx):
 
 # Soft panel count spec SPC1, D2: the planner may add up to PANELS_EXTRA beats to the target.
 PANELS_EXTRA = 2
+# a plan with more than this multiple of the most beats is a runaway, not a miscount
+PANELS_RUNAWAY = 2
 
 
 def target_panels(ctx):
@@ -2585,14 +2587,15 @@ def plan_checks(ctx, plan, shape=()):
     presence spec PC1), P17 (a spoken line given to a speaker other than the one the narrative
     names; speaker attribution spec SA2) and P21 (a library location that is the location of no
     beat; location library spec L3.5); every other P message is advisory (dialogue spec
-    6.3). P1's count is advisory (the numbering is hard) unless the plan has no beat at all;
-    it accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
+    6.3). P1's numbering is hard; its count is advisory except for the two extremes, a plan
+    with no beat and a plan with more than PANELS_RUNAWAY * hi beats, which are hard; it
+    accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
     hard, advisory = list(shape), []
     beats = plan["beats"]
     n = len(beats)
     lo, hi = panel_range(ctx)
     if not lo <= n <= hi:
-        (hard if n == 0 else advisory).append(
+        (hard if n == 0 or n > PANELS_RUNAWAY * hi else advisory).append(
             "plan: P1 beat count: expected exactly %d beats, found %d" % (lo, n)
             if lo == hi else
             "plan: P1 beat count: expected %d to %d beats, found %d" % (lo, hi, n))
@@ -5462,11 +5465,9 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
-        lo, hi = panel_range(ctx)
-        if not lo <= len(plan["beats"]) <= hi:
-            print("Warning: plan: P1 beat count: expected %s beats, found %d; continuing with %d "
-                  "beats" % (("exactly %d" % lo) if lo == hi else "%d to %d" % (lo, hi),
-                             len(plan["beats"]), len(plan["beats"])))
+        for message in plan_checks(ctx, plan)[1]:
+            if message.startswith("plan: P1 beat count: expected"):
+                print("Warning: %s; continuing with %d beats" % (message, len(plan["beats"])))
         # Chained end frames spec CE7, D3: end frames that still fail after the last plan call
         # are dropped; the story never fails because of them.
         if plan_end_frame_problems(ctx, plan) or plan_copy_problems(ctx, plan):
@@ -5605,14 +5606,17 @@ _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras"
 
 
 def _count_in_range(panels, target):
-    """True when panels is an int (not a bool) from target to target + PANELS_EXTRA (SPC10)."""
+    """True when panels is an int (not a bool) from 1 to PANELS_RUNAWAY * (target + PANELS_EXTRA):
+    any beat count the plan check accepts as advisory, not only target to target + PANELS_EXTRA
+    (SPC10)."""
     return (isinstance(panels, int) and not isinstance(panels, bool)
-            and target <= panels <= target + PANELS_EXTRA)
+            and 1 <= panels <= PANELS_RUNAWAY * (target + PANELS_EXTRA))
 
 
 def load_plan(ctx):
-    """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels lie in the
-    target's range (soft panel count spec SPC10), else None."""
+    """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels pass
+    _count_in_range for the target (1 to PANELS_RUNAWAY * (target + PANELS_EXTRA); soft panel
+    count spec SPC10), else None."""
     try:
         with open(os.path.join(ctx.story_dir, "plan.json"), encoding="utf-8") as f:
             plan = json.load(f)

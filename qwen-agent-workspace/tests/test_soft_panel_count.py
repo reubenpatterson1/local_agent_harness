@@ -670,7 +670,7 @@ def test_p1_count_is_advisory_and_the_run_continues(ws, tmp_path, monkeypatch, c
                                            panel_script("chained", 29), story_id="p1adv",
                                            panels=30)
     captured = capsys.readouterr()
-    assert rc != 1
+    assert rc == 0
     assert ("Warning: plan: P1 beat count: expected 30 to 32 beats, found 29; continuing with "
             "29 beats") in captured.out.splitlines()
     assert "P1 beat count" not in captured.err
@@ -822,7 +822,7 @@ def test_spt24_e2e_the_range_with_speakers(ws, tmp_path, monkeypatch, capsys, st
                                     story_id="spt24a", mode="shots", panels=2, members=members,
                                     narrative=TURNS)
     captured = capsys.readouterr()
-    assert rc != 1
+    assert rc == 2
     assert ("Warning: plan: P1 beat count: expected exactly 4 beats, found 3; continuing with 3 "
             "beats") in captured.out.splitlines()
     assert "P1 beat count" not in captured.err
@@ -889,7 +889,7 @@ def _write_json(story_dir, name, doc):
 
 def test_spt14_load_plan_and_recheck(ws, tmp_path, monkeypatch):
     saved = save_story(ws, tmp_path, monkeypatch, "s1", "chained", 3, 4)
-    for panels, loads in ((2, True), (3, True), (4, True), (1, False), (5, False)):
+    for panels, loads in ((2, True), (3, True), (4, True), (1, True), (5, True)):
         found = se.load_plan(seu.make_ctx(se, ws, story_id="s1", panels=panels))
         assert (found is not None) == loads, panels
     plan = _read_json(saved.story_dir, "plan.json")
@@ -915,7 +915,7 @@ def test_spt14_load_plan_and_recheck(ws, tmp_path, monkeypatch):
     assert (checks["panels"], checks["panels_target"], checks["source"]) == (4, 3, "recheck")
     del seen[:]
     rc, _advisories = se.recheck(seu.make_ctx(se, ws, story_id="s1", panels=1), spy)
-    assert seen and set(seen) == {1}
+    assert seen == [4]
 
 
 # --- Review Focus 2, plan ruling SPR4: a stale plan.json beside a story.md of another count ---
@@ -994,7 +994,7 @@ def test_spt15_the_resolver(movie, tmp_path, monkeypatch, capsys):
         ltx_movie._resolve_story_panels(args)
         return args.panels, args.panels_target
 
-    rows = ((3, (), (4, 3)), (2, (), (4, 2)), (4, (), (4, 4)), (1, (), (1, 1)),
+    rows = ((3, (), (4, 3)), (2, (), (4, 2)), (4, (), (4, 4)), (1, (), (4, 1)),
             (3, ("--force-story",), (3, 3)), (3, ("--story-legacy",), (3, 3)),
             (3, ("--shots",), (3, 3)))
     for panels, flags, want in rows:
@@ -1476,6 +1476,52 @@ def test_fw_e_a_bool_panels_never_loads_at_a_target_of_1(movie, tmp_path, monkey
     _write_json(saved.story_dir, "plan.json", dict(plan, panels=True))
     assert se.load_plan(seu.make_ctx(se, movie, story_id="fwe3", panels=1)) is None
     assert ltx_movie._plan_panels(args) is None
+
+
+# --- Fix 1: a short plan's beat count carries through ltx-movie and the engine ----------------
+
+def test_fix1_short_plan_is_adopted_by_ltx_movie(movie, tmp_path, monkeypatch):
+    save_story(movie, tmp_path, monkeypatch, "f1a", "chained", 30, 29)
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "f1a", "--panels", "30"])
+    args.panels_target = 30
+    found = ltx_movie._plan_panels(args)
+    assert found is not None and found[0] == 29
+    args = ltx_movie.build_parser().parse_args([NARRATIVE, "--story-id", "f1a", "--panels", "30"])
+    ltx_movie._resolve_story_panels(args)
+    assert (args.panels, args.panels_target) == (29, 30)
+
+
+def test_fix1_load_plan_and_recheck_accept_a_short_plan(movie, tmp_path, monkeypatch, capsys):
+    save_story(movie, tmp_path, monkeypatch, "f1b", "chained", 30, 29)
+    ctx = seu.make_ctx(se, movie, story_id="f1b", panels=30)
+    plan = se.load_plan(ctx)
+    assert plan is not None and plan["panels"] == 29
+    capsys.readouterr()
+    rc, advisories = se.recheck(ctx, _spy([]))
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "expected exactly 30 panels" not in captured.out + captured.err + " ".join(advisories)
+
+
+def test_fix1_catalog_plan_returns_a_short_plan(movie, tmp_path, monkeypatch):
+    save_story(movie, tmp_path, monkeypatch, "f1c", "chained", 30, 29)
+    args = _args(NARRATIVE, "--story-id", "f1c", "--panels", "30")
+    assert (args.panels, args.panels_target) == (29, 30)
+    plan = ltx_movie._catalog_plan(args)
+    assert plan is not None and plan["panels"] == 29
+    args.panels = 29
+    assert ltx_movie._catalog_plan(args)["panels"] == 29
+
+
+def test_fix1_runaway_plan_is_fatal_and_twice_the_most_is_advisory(ws):
+    ctx = seu.make_ctx(se, ws, panels=3)
+    hi = se.most_panels(ctx)
+    hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", 2 * hi)))
+    assert _p1(hard) == []
+    assert "plan: P1 beat count: expected 3 to 5 beats, found %d" % (2 * hi) in advisory
+    hard, advisory = se.plan_checks(ctx, _normalized(ctx, seu.plan_json("chained", 2 * hi + 1)))
+    assert "plan: P1 beat count: expected 3 to 5 beats, found %d" % (2 * hi + 1) in hard
+    assert _p1(advisory) == []
 
 
 def test_fw_f_the_movie_ui_counts_panels_like_the_manifest(ws, tmp_path, monkeypatch):

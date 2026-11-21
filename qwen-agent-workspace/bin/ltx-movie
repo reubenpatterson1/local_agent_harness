@@ -2100,7 +2100,7 @@ def _plan_panels(args):
     if (not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1"
             or plan.get("mode") != _story_mode(args) or not isinstance(panels, int)
             or isinstance(panels, bool)
-            or not target <= panels <= target + _story_engine().PANELS_EXTRA
+            or not _story_engine()._count_in_range(panels, target)
             or len(_load_story_panels(paths["story_md"])) != panels):
         return None
     notes = plan.get("speech_notes") if isinstance(plan.get("speech_notes"), list) else []
