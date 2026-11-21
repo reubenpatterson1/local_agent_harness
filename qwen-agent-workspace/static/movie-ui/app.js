@@ -1977,6 +1977,74 @@
     return text;
   }
 
+  // Custom edit LoRAs spec CL41: the POST /api/seed-loras body of the form's eight values (all strings).
+  function customLoraBody(v) {
+    const body = v.source === "local" ? {path: v.path.trim()} : {repo: v.repo.trim()};
+    if (v.source !== "local" && v.file.trim()) { body.file = v.file.trim(); }
+    if (v.family) { body.family = v.family; }
+    if (v.trigger.trim()) { body.trigger = v.trigger.trim(); }
+    ["scale", "steps"].forEach(function (key) {
+      if (v[key].trim()) { body[key] = Number.isFinite(Number(v[key])) ? Number(v[key]) : v[key]; }
+    });
+    return body;
+  }
+
+  // Custom edit LoRAs spec CL40, CL41: the "Add custom LoRA" form of one Qwen picker, <prefix>-custom and its
+  // -custom-source, -repo, -file, -path, -family, -trigger, -scale, -steps, -add and -status elements.
+  function customLoraForm(prefix) {
+    function id(suffix) { return prefix + "-custom-" + suffix; }
+    function field(label, input) { return el("label", {}, [label + " ", input]); }
+    const source = el("select", {id: id("source")}, [el("option", {value: "hf", text: "Hugging Face repo"}),
+      el("option", {value: "local", text: "Local file"})]);
+    const repo = el("input", {id: id("repo"), type: "text", size: "40", placeholder: "OWNER/NAME"});
+    const file = el("input", {id: id("file"), type: "text", size: "40",
+                              placeholder: "only when the repo has several .safetensors files"});
+    const path = el("input", {id: id("path"), type: "text", size: "50", placeholder: "/absolute/path/lora.safetensors"});
+    const family = el("select", {id: id("family")}, [el("option", {value: "", text: "from the model card"}),
+      el("option", {value: "qwen2511", text: "Qwen-Image-Edit-2511"}), el("option", {value: "qwen21", text: "Qwen-Image-2.1"})]);
+    const trigger = el("input", {id: id("trigger"), type: "text", size: "40", maxlength: "200"});
+    const scale = el("input", {id: id("scale"), type: "number", min: "0", max: "2", step: "0.05", value: "1"});
+    const steps = el("input", {id: id("steps"), type: "number", min: "1", max: "100", step: "1", placeholder: "model default"});
+    const add = el("button", {id: id("add"), type: "button", text: "Add"});
+    const status = el("span", {id: id("status"), cls: "muted"});
+    const repoLabel = field("Repo", repo);
+    const fileLabel = field("File", file);
+    const pathLabel = field("Path", path);
+    const form = el("details", {id: prefix + "-custom", cls: "se-custom"}, [el("summary", {text: "Add custom LoRA"}),
+      field("Source", source), repoLabel, fileLabel, pathLabel, field("Family", family), field("Trigger", trigger),
+      field("Strength", scale), field("Steps", steps), add, status]);
+    function sourceShown() {
+      const local = source.value === "local";
+      show(repoLabel, !local);
+      show(fileLabel, !local);
+      show(pathLabel, local);
+    }
+    ["input", "change"].forEach(function (type) {
+      form.addEventListener(type, function (event) { event.stopPropagation(); });
+    });
+    source.addEventListener("change", sourceShown);
+    add.addEventListener("click", async function () {
+      const v = {source: source.value, repo: repo.value, file: file.value, path: path.value, family: family.value,
+                 trigger: trigger.value, scale: scale.value, steps: steps.value};
+      add.disabled = true;
+      status.textContent = v.source === "local" ? "adding… (hashing a large local file can take minutes)" : "adding…";
+      try {
+        const res = await api("POST", "/api/seed-loras", customLoraBody(v));
+        if (res.status === 201) {
+          if (S.host) { S.host.capabilities.seed_edit = res.data.seed_edit; }
+          renderBadges();
+          status.textContent = ["added " + res.data.lora.id].concat(res.data.notes).join("; ");
+        } else {
+          status.textContent = (res.data && res.data.error) || "request failed (HTTP " + res.status + ")";
+        }
+      } finally {
+        add.disabled = false;
+      }
+    });
+    sourceShown();
+    return form;
+  }
+
   // Qwen edit models spec QE61: one Qwen edit model + LoRA picker. prefix names its elements:
   // <prefix>-qwen-box, -qwen-model, -steps, -loras, -qwen-note, -lora-<id>, -lora-scale-<id>, -lora-note-<id>.
   // asIs puts "Seed as-is (no edit)" first (Compose). Nothing touches the DOM before update().
@@ -1989,6 +2057,23 @@
       return models && models.qwen.models[id];
     }
     function enabled(id) { return id === "as-is" || (Boolean(seedQwenEntry(id)) && !(probe(id) && probe(id).ok === false)); }
+    // Custom edit LoRAs spec CL42: the Remove button of a custom LoRA's row.
+    function removeButton(l) {
+      const button = el("button", {type: "button", cls: "se-lora-remove", text: "Remove"});
+      button.addEventListener("click", async function () {
+        if (!(await askConfirm("Remove custom LoRA " + l.label + " (" + l.id + ") from the registry? Its file is not deleted."))) { return; }
+        const res = await api("DELETE", "/api/seed-loras/" + enc(l.id));
+        const status = node("-custom-status");
+        if (res.status === 200) {
+          if (S.host) { S.host.capabilities.seed_edit = res.data.seed_edit; }
+          renderBadges();
+          status.textContent = "removed " + res.data.removed + (res.data.kept ? "; the file stays at " + res.data.kept : "");
+        } else {
+          status.textContent = (res.data && res.data.error) || "request failed (HTTP " + res.status + ")";
+        }
+      });
+      return button;
+    }
     function fresh(wanted) {
       const registry = seedRegistry();
       const loras = {};
@@ -2032,6 +2117,7 @@
         node("-steps").textContent = "checking models…";
         return;
       }
+      if (!node("-custom")) { node("-qwen-box").appendChild(customLoraForm(prefix)); }
       const cap = capability("seed_edit");
       const models = cap.models;
       const state = p.state;
@@ -2068,20 +2154,27 @@
       const loras = registry.loras.filter(function (l) { return l.family === entry.family; });
       function loraOk(id) { return loraProbe(id) ? loraProbe(id).ok === true : false; }
       function loraNote(l) {
-        if (loraOk(l.id)) { return l.license + (l.steps ? "; " + l.steps + " steps, scheduler " + l.scheduler : ""); }
+        if (loraOk(l.id)) {
+          return l.license + (l.steps ? "; " + l.steps + " steps" + (l.scheduler ? ", scheduler " + l.scheduler : "") : "")
+            + (l.trigger ? "; trigger: " + l.trigger : "");
+        }
         const found = loraProbe(l.id);
         return "unavailable — " + (found ? found.reason : ((cap.ok === false && cap.reason) || "probing"));
       }
-      const key = entry.family + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id), loraNote(l)]; }));
+      const key = entry.family + "|" + entry.backend + "|" + JSON.stringify(loras.map(function (l) { return [l.id, loraOk(l.id), loraNote(l)]; }));
       if (key !== p.key) {
         p.key = key;
         const box = clear(node("-loras"));
         if (entry.family === "qwen2511") {
           box.appendChild(el("span", {cls: "muted", text: "Lightning 8-step LoRA built in (not selectable)"}));
         }
+        if (entry.backend === "diffusers" && loras.length) {
+          box.appendChild(el("span", {cls: "muted", text: "qwen2511-bf16 runs without LoRAs; choose qwen2511-q4 to use a Qwen-Image-Edit-2511 LoRA"}));
+        }
         else {
           loras.forEach(function (l) {
             const ok = loraOk(l.id);
+            if (!state.loras[l.id]) { state.loras[l.id] = {checked: false, scale: String(l.default_scale)}; }
             const saved = state.loras[l.id];
             const checkbox = el("input", {type: "checkbox", id: prefix + "-lora-" + l.id});
             checkbox.checked = saved.checked && ok;
@@ -2089,8 +2182,11 @@
             const scale = el("input", {type: "number", id: prefix + "-lora-scale-" + l.id, min: "0", max: "2", step: "0.05", value: saved.scale});
             scale.disabled = !ok;
             const note = el("span", {cls: "muted", id: prefix + "-lora-note-" + l.id, text: loraNote(l)});
-            box.appendChild(el("div", {cls: "se-lora", data: {lora: l.id}}, [el("label", {}, [checkbox, " " + l.label]),
-              el("label", {}, ["strength ", scale]), note]));
+            const row = el("div", {cls: "se-lora", data: {lora: l.id}}, [
+              el("label", {}, [checkbox, " " + l.label].concat(l.user ? [" ", el("span", {cls: "chip", text: "custom"})] : [])),
+              el("label", {}, ["strength ", scale]), note]);
+            if (l.user) { row.appendChild(removeButton(l)); }
+            box.appendChild(row);
           });
         }
       }
@@ -2098,7 +2194,7 @@
         const box = node("-lora-" + l.id);
         return l.steps && box && !box.disabled && box.checked;
       })[0];
-      node("-steps").textContent = turbo ? turbo.steps + " steps (turbo)"
+      node("-steps").textContent = turbo ? turbo.steps + (turbo.user ? " steps (set by " + turbo.label + ")" : " steps (turbo)")
         : entry.steps + " steps" + (entry.family === "qwen2511" ? " (Lightning)" : "");
     };
     p.selection = function () {
