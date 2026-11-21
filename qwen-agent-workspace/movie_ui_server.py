@@ -108,6 +108,8 @@ ROUTES = [
     ("POST", r"/api/seeds/runs/" + _RUN + r"/keep", "h_seed_keep", "/api/seeds/runs/" + _SAMPLE_RUN + "/keep"),
     ("POST", r"/api/seeds/runs/" + _RUN + r"/use", "h_seed_use", "/api/seeds/runs/" + _SAMPLE_RUN + "/use"),
     ("GET", r"/api/seeds/folders", "h_seed_folders", "/api/seeds/folders"),
+    ("POST", r"/api/seed-loras", "h_seed_lora_add", "/api/seed-loras"),
+    ("DELETE", r"/api/seed-loras/(user-[a-z0-9-]{1,24})", "h_seed_lora_remove", "/api/seed-loras/user-anything-to-real"),
     ("POST", r"/api/preview", "h_preview", "/api/preview"),
     ("POST", r"/api/validate", "h_validate", "/api/validate"),
     ("GET", r"/api/jobs", "h_jobs", "/api/jobs"),
@@ -232,6 +234,14 @@ class MovieUIServer(http.server.ThreadingHTTPServer):
             for key, (ok, detail) in results.items():
                 reason = detail if (key == "story_server" or not ok) else None
                 self.capabilities[key] = {"ok": ok, "reason": reason, "checked": checked}
+            self.capabilities["seed_edit"] = seedgen.capability(seed_models, seed_detail, checked)
+
+    def refresh_seed_edit(self):
+        """Custom edit LoRAs spec CL38: re-run only the seed_edit probe against probe_ws (after a custom LoRA add or
+        remove) and store it."""
+        seed_models, seed_detail = lib.seed_edit_check(self.probe_ws, seedgen.QWEN_MODEL_IDS, seedgen.qwen_lora_ids())
+        checked = lib.utc_now()
+        with self.cap_lock:
             self.capabilities["seed_edit"] = seedgen.capability(seed_models, seed_detail, checked)
 
     def capability_snapshot(self):
@@ -717,6 +727,7 @@ def main(argv):
     with STORE_LOCK:
         lib.startup_recovery(state)
     batch_recovery(state)
+    os.environ[seedgen.USER_LORAS_ENV] = os.path.abspath(seedgen.user_loras_path())   # custom edit LoRAs spec CL39 (D8): every child
     stop = start_threads(server)
     signal.signal(signal.SIGTERM, _raise_interrupt)
     sys.stdout.write("movie-ui: http://127.0.0.1:%d/?t=%s\n" % (server.port, token))
@@ -1874,7 +1885,8 @@ def _h_seed_run_create(self, groups, query, body):
     with STORE_LOCK:
         job_id = lib.new_job_id(server.state)
         record = {"schema": "seed-edit.run.v1", "run": run, "created": lib.utc_now(), "state": "queued",
-                  "prompt": clean["prompt"], "model": clean["model"], "backend": None,
+                  "prompt": seedgen.trigger_prompt(clean["prompt"], clean["loras"]), "model": clean["model"],
+                  "backend": None,
                   "strength": clean["strength"], "seed": seed,
                   **seedgen.qwen_settings(clean["qwen_model"], clean["loras"]), "size": None, "source_size": None,
                   "source": source_file, "source_origin": origin, "job": job_id, "error": None,
@@ -2013,12 +2025,44 @@ def _h_seed_folders(self, groups, query, body):
     return 200, {"root": root, "folders": folders}
 
 
+SEED_LORA_DELETE_BODY = "DELETE /api/seed-loras/<id> takes no body"    # custom edit LoRAs spec Section 3.1
+
+
+def _h_seed_lora_add(self, groups, query, body):
+    """Custom edit LoRAs spec CL38: register a custom Qwen edit LoRA, then re-probe."""
+    import seed_lora_registry as registry
+    if not isinstance(body, dict):
+        raise ApiError(400, "the request body must be a JSON object")
+    try:
+        entry, notes = registry.add(body, None)
+    except registry.RegistryError as e:
+        raise ApiError(e.status, str(e))
+    self.server.refresh_seed_edit()
+    view = [l for l in seedgen.registry_view()["loras"] if l["id"] == entry["id"]][0]
+    return 201, {"lora": view, "notes": notes, "seed_edit": self.server.capability_snapshot()["seed_edit"]}
+
+
+def _h_seed_lora_remove(self, groups, query, body):
+    """Custom edit LoRAs spec CL38: drop a custom LoRA from the registry (never a file), then re-probe."""
+    import seed_lora_registry as registry
+    if body not in (None, {}):
+        raise ApiError(400, SEED_LORA_DELETE_BODY)
+    try:
+        entry, kept = registry.remove(groups[0])
+    except registry.RegistryError as e:
+        raise ApiError(e.status, str(e))
+    self.server.refresh_seed_edit()
+    return 200, {"removed": entry["id"], "kept": kept, "seed_edit": self.server.capability_snapshot()["seed_edit"]}
+
+
 MovieUIHandler.h_seed_run_create = _h_seed_run_create
 MovieUIHandler.h_seed_runs = _h_seed_runs
 MovieUIHandler.h_seed_run = _h_seed_run
 MovieUIHandler.h_seed_keep = _h_seed_keep
 MovieUIHandler.h_seed_use = _h_seed_use
 MovieUIHandler.h_seed_folders = _h_seed_folders
+MovieUIHandler.h_seed_lora_add = _h_seed_lora_add
+MovieUIHandler.h_seed_lora_remove = _h_seed_lora_remove
 
 
 # ---------------------------------------------------------------------------

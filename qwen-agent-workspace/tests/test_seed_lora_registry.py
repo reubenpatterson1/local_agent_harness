@@ -1056,8 +1056,9 @@ def test_cl_t22_the_lock_and_the_file(env, registry_path):
 
 COMPILED = ("seed_lora_registry.py", "bin/seed-edit-lora", "movie_ui_seedgen.py", "qwen_edit.py", "bin/seed-edit",
             "bin/seed-edit-setup", "movie_ui_lib.py", "movie_ui_server.py", "tests/test_seed_lora_registry.py",
-            "tests/conftest.py")
-SCANNED = ("seed_lora_registry.py", "bin/seed-edit-lora", "tests/test_seed_lora_registry.py")
+            "tests/conftest.py", "tests/test_movie_ui_seed_loras.py")
+SCANNED = ("seed_lora_registry.py", "bin/seed-edit-lora", "tests/test_seed_lora_registry.py",
+           "tests/test_movie_ui_seed_loras.py")
 
 
 @pytest.mark.parametrize("python", ["/usr/bin/python3", sys.executable])
