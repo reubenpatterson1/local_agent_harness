@@ -392,8 +392,7 @@ def test_review_focus_1_an_exhausted_plan_lists_every_fatal_problem(ws, tmp_path
     assert rc == 1
     assert [r["stage"] for r in seu.agent_log(log)] == ["plan", "plan"]
     assert capsys.readouterr().err == _fatal_err(
-        ["plan: P1 beat count: expected 3 to 5 beats, found 2",
-         P16("c2", RONIN, "ronin", "chained", True)], ctx)
+        [P16("c2", RONIN, "ronin", "chained", True)], ctx)
     for name in ("story.md", "plan.json"):
         assert not os.path.exists(os.path.join(ctx.story_dir, name)), name
 

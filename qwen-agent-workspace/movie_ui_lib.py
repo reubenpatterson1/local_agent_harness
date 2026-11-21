@@ -1437,6 +1437,7 @@ def resolved_panels(fields):
 # _PANEL_HEADER_RE (this module never loads a pipeline module, so both are repeated here and
 # pinned equal by a test).
 PANELS_EXTRA = 2
+PANELS_RUNAWAY = 2
 STORY_PANEL_RE = re.compile(r"^##\s*Panel\s*(\d+)\s*[—–-]\s*(.*)$")
 
 
@@ -1460,12 +1461,19 @@ def plan_panels(sdir, mode):
 
 def effective_panels(fields, sdir):
     """The story's panel count for fields (SPC14): plan_panels(sdir, fields["mode"]) when it lies
-    in [resolved_panels(fields), resolved_panels(fields) + PANELS_EXTRA], else
-    resolved_panels(fields). sdir None means no story directory."""
+    in [1, PANELS_RUNAWAY * (target + PANELS_EXTRA)] and plan.json's int panels_target equals the
+    target (target = resolved_panels(fields)), else when it lies in [target, target +
+    PANELS_EXTRA], else the target. sdir None means no story directory."""
     target = resolved_panels(fields)
     planned = (plan_panels(sdir, fields.get("mode"))
                if sdir is not None and fields.get("story_legacy") is not True else None)
-    if target is not None and planned is not None and target <= planned <= target + PANELS_EXTRA:
+    if target is None or planned is None:
+        return target
+    saved = read_json(os.path.join(sdir, "plan.json")).get("panels_target")
+    if _is_int(saved) and saved == target:
+        if 1 <= planned <= PANELS_RUNAWAY * (target + PANELS_EXTRA):
+            return planned
+    elif target <= planned <= target + PANELS_EXTRA:
         return planned
     return target
 

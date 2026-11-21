@@ -2082,8 +2082,10 @@ DRY_PANELS_STOP = "Panel count: Phase 1 would stop: %s"
 def _plan_panels(args):
     """(panels, reason, target) of plan.json when it is the plan of this story.md (soft panel
     count spec SPC13, D6): a JSON object with schema ltx-movie.plan.v1, this run's mode, an int
-    panels from the target (args.panels_target, else args.panels) to the target plus
-    story_engine.PANELS_EXTRA, and story.md parsing to exactly that many panels; else None.
+    panels that pass story_engine._count_in_range for the target (args.panels_target, else
+    args.panels) and the plan's saved panels_target (1 to PANELS_RUNAWAY * (target +
+    PANELS_EXTRA) when that target is unchanged, else the target to the target plus
+    story_engine.PANELS_EXTRA), and story.md parsing to exactly that many panels; else None.
     reason is "because <the text after 'because '>" of the first speech_notes entry that starts
     "plan: P20 panel count: ", else PANEL_COUNT_NO_REASON. target is plan.json's int
     panels_target when it has one, else this run's target (fix FW-b: the note names the target
@@ -2100,7 +2102,7 @@ def _plan_panels(args):
     if (not isinstance(plan, dict) or plan.get("schema") != "ltx-movie.plan.v1"
             or plan.get("mode") != _story_mode(args) or not isinstance(panels, int)
             or isinstance(panels, bool)
-            or not target <= panels <= target + _story_engine().PANELS_EXTRA
+            or not _story_engine()._count_in_range(panels, target, plan.get("panels_target"))
             or len(_load_story_panels(paths["story_md"])) != panels):
         return None
     notes = plan.get("speech_notes") if isinstance(plan.get("speech_notes"), list) else []

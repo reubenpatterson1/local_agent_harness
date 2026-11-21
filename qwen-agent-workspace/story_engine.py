@@ -125,6 +125,8 @@ def engine_seconds(ctx):
 
 # Soft panel count spec SPC1, D2: the planner may add up to PANELS_EXTRA beats to the target.
 PANELS_EXTRA = 2
+# a plan with more than this multiple of the most beats is a runaway, not a miscount
+PANELS_RUNAWAY = 2
 
 
 def target_panels(ctx):
@@ -2585,15 +2587,18 @@ def plan_checks(ctx, plan, shape=()):
     presence spec PC1), P17 (a spoken line given to a speaker other than the one the narrative
     names; speaker attribution spec SA2) and P21 (a library location that is the location of no
     beat; location library spec L3.5); every other P message is advisory (dialogue spec
-    6.3). P1 accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
+    6.3). P1's numbering is hard; its count is advisory except for the two extremes, a plan
+    with no beat and a plan with more than PANELS_RUNAWAY * hi beats, which are hard; it
+    accepts lo to hi beats of panel_range (soft panel count spec SPC7)."""
     hard, advisory = list(shape), []
     beats = plan["beats"]
     n = len(beats)
     lo, hi = panel_range(ctx)
     if not lo <= n <= hi:
-        hard.append("plan: P1 beat count: expected exactly %d beats, found %d" % (lo, n)
-                    if lo == hi else
-                    "plan: P1 beat count: expected %d to %d beats, found %d" % (lo, hi, n))
+        (hard if n == 0 or n > PANELS_RUNAWAY * hi else advisory).append(
+            "plan: P1 beat count: expected exactly %d beats, found %d" % (lo, n)
+            if lo == hi else
+            "plan: P1 beat count: expected %d to %d beats, found %d" % (lo, hi, n))
     for i, beat in enumerate(beats):
         if beat["index"] != i + 1:
             hard.append("plan: P1 beat count: beat %d has index %r; beats must be numbered 1 to %d "
@@ -5235,12 +5240,14 @@ class _Run(object):
                             + (PLAN_JSON_ERROR % error if error else "")]
             else:
                 plan, shape = normalize_plan(ctx, raw)
-                hard = (plan_checks(ctx, plan, shape)[0]
+                checks = plan_checks(ctx, plan, shape)
+                hard = (checks[0]
                         + lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)[0])
                 found = (plan, shape, hard)
                 if not self.plan_fatal(found):
                     fallback = found
-                problems = (hard + plan_end_frame_problems(ctx, plan)
+                counts = [m for m in checks[1] if parse_violation(m)["id"] == "P1"]
+                problems = (hard + counts + plan_end_frame_problems(ctx, plan)
                             + plan_copy_problems(ctx, plan) + line_assignment_problems(plan)
                             + cast_quote_problems(plan, ctx.narrative))
             if not problems:
@@ -5282,6 +5289,8 @@ class _Run(object):
         ph, pa = plan_checks(ctx, plan, self.shape)
         lh, la = lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)
         nh, na = panel_checks(ctx, plan, parts, text, story_md)
+        # The P1 count advisory is reported once, by go()'s Warning line, not in each round.
+        pa = [m for m in pa if not m.startswith("plan: P1 beat count: expected")]
         state = {"round": rnd, "plan": plan, "parts": parts, "text": text, "hard": ph + lh + nh,
                  "advisory": pa + la + na, "scores": None, "verdict": None, "dir": rdir}
         _write_json(os.path.join(rdir, "plan.json"), plan)
@@ -5458,6 +5467,9 @@ class _Run(object):
                   % self.round_dir(0), file=sys.stderr)
             return self.finish(1)
         plan, self.shape, _hard = found
+        for message in plan_checks(ctx, plan)[1]:
+            if message.startswith("plan: P1 beat count: expected"):
+                print("Warning: %s; continuing with %d beats" % (message, len(plan["beats"])))
         # Chained end frames spec CE7, D3: end frames that still fail after the last plan call
         # are dropped; the story never fails because of them.
         if plan_end_frame_problems(ctx, plan) or plan_copy_problems(ctx, plan):
@@ -5595,15 +5607,24 @@ PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
 
-def _count_in_range(panels, target):
-    """True when panels is an int (not a bool) from target to target + PANELS_EXTRA (SPC10)."""
-    return (isinstance(panels, int) and not isinstance(panels, bool)
-            and target <= panels <= target + PANELS_EXTRA)
+def _count_in_range(panels, target, planned=None):
+    """True when panels is an int (not a bool) in the window for target. planned is the plan's
+    saved panels_target: when it is an int (not a bool) equal to target, the wide window 1 to
+    PANELS_RUNAWAY * (target + PANELS_EXTRA) applies (any beat count the plan check accepts as
+    advisory, for a run whose target is unchanged); otherwise (an old plan with no panels_target,
+    or a rerun with another target) target to target + PANELS_EXTRA applies (SPC10)."""
+    if not isinstance(panels, int) or isinstance(panels, bool):
+        return False
+    if isinstance(planned, int) and not isinstance(planned, bool) and planned == target:
+        return 1 <= panels <= PANELS_RUNAWAY * (target + PANELS_EXTRA)
+    return target <= panels <= target + PANELS_EXTRA
 
 
 def load_plan(ctx):
-    """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels lie in the
-    target's range (soft panel count spec SPC10), else None."""
+    """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels pass
+    _count_in_range for the target and the plan's saved panels_target (1 to PANELS_RUNAWAY *
+    (target + PANELS_EXTRA) when that target is unchanged, else target to target + PANELS_EXTRA;
+    soft panel count spec SPC10), else None."""
     try:
         with open(os.path.join(ctx.story_dir, "plan.json"), encoding="utf-8") as f:
             plan = json.load(f)
@@ -5611,7 +5632,8 @@ def load_plan(ctx):
         return None
     if (not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA
             or plan.get("mode") != ctx.mode
-            or not _count_in_range(plan.get("panels"), target_panels(ctx))
+            or not _count_in_range(plan.get("panels"), target_panels(ctx),
+                                   plan.get("panels_target"))
             or not all(k in plan for k in _PLAN_KEYS)):
         return None
     for beat in plan["beats"] if isinstance(plan["beats"], list) else []:
