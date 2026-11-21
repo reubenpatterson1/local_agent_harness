@@ -5289,6 +5289,8 @@ class _Run(object):
         ph, pa = plan_checks(ctx, plan, self.shape)
         lh, la = lora_checks(ctx, plan, self.compatible_by_id, self.catalog_by_id)
         nh, na = panel_checks(ctx, plan, parts, text, story_md)
+        # The P1 count advisory is reported once, by go()'s Warning line, not in each round.
+        pa = [m for m in pa if not m.startswith("plan: P1 beat count: expected")]
         state = {"round": rnd, "plan": plan, "parts": parts, "text": text, "hard": ph + lh + nh,
                  "advisory": pa + la + na, "scores": None, "verdict": None, "dir": rdir}
         _write_json(os.path.join(rdir, "plan.json"), plan)
@@ -5605,18 +5607,24 @@ PLAN_FREE_IDS = ("N1", "N7", "N8", "N9", "N10", "N11", "N15")
 _PLAN_KEYS = ("title", "logline", "cast", "locations", "props", "beats", "loras")
 
 
-def _count_in_range(panels, target):
-    """True when panels is an int (not a bool) from 1 to PANELS_RUNAWAY * (target + PANELS_EXTRA):
-    any beat count the plan check accepts as advisory, not only target to target + PANELS_EXTRA
-    (SPC10)."""
-    return (isinstance(panels, int) and not isinstance(panels, bool)
-            and 1 <= panels <= PANELS_RUNAWAY * (target + PANELS_EXTRA))
+def _count_in_range(panels, target, planned=None):
+    """True when panels is an int (not a bool) in the window for target. planned is the plan's
+    saved panels_target: when it is an int (not a bool) equal to target, the wide window 1 to
+    PANELS_RUNAWAY * (target + PANELS_EXTRA) applies (any beat count the plan check accepts as
+    advisory, for a run whose target is unchanged); otherwise (an old plan with no panels_target,
+    or a rerun with another target) target to target + PANELS_EXTRA applies (SPC10)."""
+    if not isinstance(panels, int) or isinstance(panels, bool):
+        return False
+    if isinstance(planned, int) and not isinstance(planned, bool) and planned == target:
+        return 1 <= panels <= PANELS_RUNAWAY * (target + PANELS_EXTRA)
+    return target <= panels <= target + PANELS_EXTRA
 
 
 def load_plan(ctx):
     """<story_dir>/plan.json when it is a valid plan for ctx's mode whose panels pass
-    _count_in_range for the target (1 to PANELS_RUNAWAY * (target + PANELS_EXTRA); soft panel
-    count spec SPC10), else None."""
+    _count_in_range for the target and the plan's saved panels_target (1 to PANELS_RUNAWAY *
+    (target + PANELS_EXTRA) when that target is unchanged, else target to target + PANELS_EXTRA;
+    soft panel count spec SPC10), else None."""
     try:
         with open(os.path.join(ctx.story_dir, "plan.json"), encoding="utf-8") as f:
             plan = json.load(f)
@@ -5624,7 +5632,8 @@ def load_plan(ctx):
         return None
     if (not isinstance(plan, dict) or plan.get("schema") != PLAN_SCHEMA
             or plan.get("mode") != ctx.mode
-            or not _count_in_range(plan.get("panels"), target_panels(ctx))
+            or not _count_in_range(plan.get("panels"), target_panels(ctx),
+                                   plan.get("panels_target"))
             or not all(k in plan for k in _PLAN_KEYS)):
         return None
     for beat in plan["beats"] if isinstance(plan["beats"], list) else []:

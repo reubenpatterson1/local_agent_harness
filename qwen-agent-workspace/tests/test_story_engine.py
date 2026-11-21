@@ -1630,6 +1630,7 @@ def test_rst11_short_plan_is_advisory(ws, tmp_path, monkeypatch, capsys):
     rc, _a, ctx, log = _run(ws, tmp_path, monkeypatch, n=6,
                             plan=[seu.answer(short), seu.answer(short)])
     captured = capsys.readouterr()
+    assert rc == 0
     assert [r["stage"] for r in log][:2] == ["plan", "plan"]
     assert ("Warning: plan: P1 beat count: expected 6 to 8 beats, found 5; continuing with 5 "
             "beats") in captured.out.splitlines()
