@@ -293,7 +293,7 @@ def test_cl_t31_main_exports_the_registry_path_before_the_threads(monkeypatch, t
 
 # --- CL-T32, CL-T33 (CL40-CL43): the page ------------------------------------------------------------------------------
 
-APP_JS_PINS = ("  function customLoraForm(prefix) {", "  function customLoraBody(v) {", '"/api/seed-loras"',
+APP_JS_PINS = ("  function customLoraForm(prefix, onAdded) {", "  function customLoraBody(v) {", '"/api/seed-loras"',
                '"Add custom LoRA"', '"qwen2511-bf16 runs without LoRAs; choose qwen2511-q4 to use a Qwen-Image-Edit-2511 LoRA"',
                '" steps (set by "', 'el("span", {cls: "chip", text: "custom"})', 'askConfirm("Remove custom LoRA "',
                'entry.family + "|" + entry.backend + "|"', "event.stopPropagation()",
@@ -316,10 +316,32 @@ def test_cl_t32_the_page_texts():
     static, html, js = _page()
     for text in APP_JS_PINS:
         assert text in js, text
-    assert js.count("function customLoraForm(prefix) {") == 1 and js.count("function customLoraBody(v) {") == 1
+    assert js.count("function customLoraForm(prefix, onAdded) {") == 1 and js.count("function customLoraBody(v) {") == 1
     for name, text in (("index.html", html), ("app.js", js)):
         for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\balert\(", r"\bconfirm\(", r"\bprompt\(",
                         r"\beval\(", r"new Function"):
+            assert not re.search(pattern, text), (name, pattern)
+    node = shutil.which("node")
+    if node:
+        proc = subprocess.run([node, "--check", os.path.join(static, "app.js")], capture_output=True, text=True,
+                              timeout=60)
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_the_loras_tab_lists_the_qwen_stills_bases():
+    static, html, js = _page()
+    for text in ('["qwen:qwen2511", "Qwen-Image-Edit-2511 (Qwen stills)"]', '["qwen:qwen21", "Qwen-Image-2.1 (Qwen stills)"]',
+                 "Pick one base: the Z-Image model or one Qwen model, not both.",
+                 'customLoraForm("l", function () { loadCatalogTable(); })',
+                 "if (typeof onAdded === \"function\") { onAdded(); }", "function syncQwenBase() {",
+                 '"stills (Qwen)"', 'api("DELETE", "/api/seed-loras/" + enc(l.id))'):
+        assert text in js, text
+    assert js.count('customLoraForm("l"') == 1
+    assert html.count('<div id="l-qwen-box" hidden></div>') == 1
+    assert html.index('id="l-add"') < html.index('id="l-qwen-box"')
+    assert 'id="l-custom' not in html
+    for name, text in (("index.html", html), ("app.js", js)):
+        for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\bconfirm\(", r"innerHTML"):
             assert not re.search(pattern, text), (name, pattern)
     node = shutil.which("node")
     if node:

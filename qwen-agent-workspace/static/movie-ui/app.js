@@ -1991,7 +1991,7 @@
 
   // Custom edit LoRAs spec CL40, CL41: the "Add custom LoRA" form of one Qwen picker, <prefix>-custom and its
   // -custom-source, -repo, -file, -path, -family, -trigger, -scale, -steps, -add and -status elements.
-  function customLoraForm(prefix) {
+  function customLoraForm(prefix, onAdded) {
     function id(suffix) { return prefix + "-custom-" + suffix; }
     function field(label, input) { return el("label", {}, [label + " ", input]); }
     const source = el("select", {id: id("source")}, [el("option", {value: "hf", text: "Hugging Face repo"}),
@@ -2034,6 +2034,7 @@
           if (S.host) { S.host.capabilities.seed_edit = res.data.seed_edit; }
           renderBadges();
           status.textContent = ["added " + res.data.lora.id].concat(res.data.notes).join("; ");
+          if (typeof onAdded === "function") { onAdded(); }
         } else {
           status.textContent = (res.data && res.data.error) || "request failed (HTTP " + res.status + ")";
         }
@@ -3074,9 +3075,42 @@
       if (prev.indexOf(repo) >= 0) { opt.selected = true; }
       sel.appendChild(opt);
     });
+    // Qwen stills models: choosing one routes the form to the seed-LoRA registry (syncQwenBase).
+    if (target === "stills") {
+      [["qwen:qwen2511", "Qwen-Image-Edit-2511 (Qwen stills)"], ["qwen:qwen21", "Qwen-Image-2.1 (Qwen stills)"]]
+        .forEach(function (q) {
+          const opt = el("option", {value: q[0], text: q[1]});
+          if (prev.indexOf(q[0]) >= 0) { opt.selected = true; }
+          sel.appendChild(opt);
+        });
+    }
     // default to selecting the first hosted base when nothing carried over
     if (sel.selectedOptions.length === 0 && sel.options.length) { sel.options[0].selected = true; }
+    syncQwenBase();
   }
+
+  // A Qwen base adds to the seed-LoRA registry (the custom form below the button) instead of the
+  // Z-Image catalog; mixing a Qwen base with any other base is refused.
+  function syncQwenBase() {
+    const picked = Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; });
+    const qwen = picked.filter(function (v) { return v.indexOf("qwen:") === 0; });
+    if (qwen.length === 1 && picked.length === 1) {
+      show($("#l-add"), false);
+      show($("#l-qwen-box"), true);
+      $("#l-custom-family").value = qwen[0].slice("qwen:".length);
+      $("#l-custom").open = true;
+    } else if (qwen.length) {
+      show($("#l-qwen-box"), false);
+      $("#l-add").disabled = true;
+      $("#l-output").textContent = QWEN_MIX_MESSAGE;
+    } else {
+      show($("#l-add"), true);
+      $("#l-add").disabled = false;
+      show($("#l-qwen-box"), false);
+    }
+  }
+
+  const QWEN_MIX_MESSAGE = "Pick one base: the Z-Image model or one Qwen model, not both.";
 
   async function loadCatalogTable(results) {
     if (!S.ws) { return; }
@@ -3113,6 +3147,25 @@
         scopeCell(e), el("td", {text: strength}), el("td", {text: (e.triggers || []).join(", ")}),
         el("td", {text: (e.base_models || []).join(", ")}), el("td", {text: verdicts[e.id] || ""}),
         el("td", {}, [remove])]));
+    });
+    // User-added Qwen LoRAs live in the seed-LoRA registry, not the catalog.
+    const registry = seedRegistry();
+    ((registry && registry.loras) || []).filter(function (l) { return l.user === true; }).forEach(function (l) {
+      const remove = el("button", {type: "button", text: "Remove"});
+      remove.addEventListener("click", async function () {
+        if (!(await askConfirm("Remove " + l.id + " from the Qwen LoRAs? The file is not touched."))) { return; }
+        const out = await api("DELETE", "/api/seed-loras/" + enc(l.id));
+        if (out.status === 200) {
+          if (S.host) { S.host.capabilities.seed_edit = out.data.seed_edit; }
+          renderBadges();
+          loadCatalogTable();
+        } else {
+          $("#l-output").textContent = (out.data && out.data.error) || "request failed (HTTP " + out.status + ")";
+        }
+      });
+      body.appendChild(el("tr", {}, [el("td", {text: l.id}), el("td", {text: "lora"}), el("td", {text: "stills (Qwen)"}),
+        el("td", {text: "-"}), el("td", {text: String(l.default_scale)}), el("td", {text: l.trigger || ""}),
+        el("td", {text: l.family}), el("td", {text: ""}), el("td", {}, [remove])]));
     });
   }
 
@@ -3158,6 +3211,9 @@
     });
     $("#l-target").addEventListener("change", fillLoraBaseModels);
     $("#l-target").addEventListener("change", syncLoraScope);
+    $("#l-qwen-box").appendChild(customLoraForm("l", function () { loadCatalogTable(); }));
+    $("#l-target").addEventListener("change", syncQwenBase);
+    $("#l-base-models").addEventListener("change", syncQwenBase);
     $("#l-kind").addEventListener("change", syncLoraScope);
     syncLoraScope();
     $("#l-verify-all").addEventListener("click", async function () {
@@ -3170,9 +3226,14 @@
       }
     });
     $("#l-add").addEventListener("click", async function () {
+      const baseModels = Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; });
+      if (baseModels.some(function (v) { return v.indexOf("qwen:") === 0; })) {
+        $("#l-output").textContent = QWEN_MIX_MESSAGE;
+        return;
+      }
       const body = {ws: S.ws, path: $("#l-path").value.trim(), id: $("#l-id").value.trim(),
         kind: $("#l-kind").value, target: $("#l-target").value,
-        base_models: Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; }),
+        base_models: baseModels,
         triggers: splitList("#l-triggers"), description: $("#l-description").value.trim(),
         use_when: $("#l-use-when").value.trim(), avoid_when: $("#l-avoid-when").value.trim(),
         default_strength: Number($("#l-default-strength").value),
