@@ -3094,23 +3094,38 @@
   function syncQwenBase() {
     const picked = Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; });
     const qwen = picked.filter(function (v) { return v.indexOf("qwen:") === 0; });
-    if (qwen.length === 1 && picked.length === 1) {
-      show($("#l-add"), false);
-      show($("#l-qwen-box"), true);
-      if ($("#l-output").textContent === QWEN_MIX_MESSAGE) { $("#l-output").textContent = ""; }
-      $("#l-custom-family").value = qwen[0].slice("qwen:".length);
-      $("#l-custom").open = true;
-    } else if (qwen.length) {
-      show($("#l-qwen-box"), false);
-      show($("#l-add"), true);
+    show($("#l-add"), true);
+    if (qwen.length && picked.length > 1) {
       $("#l-add").disabled = true;
       $("#l-output").textContent = QWEN_MIX_MESSAGE;
     } else {
-      show($("#l-add"), true);
       $("#l-add").disabled = false;
-      show($("#l-qwen-box"), false);
       if ($("#l-output").textContent === QWEN_MIX_MESSAGE) { $("#l-output").textContent = ""; }
     }
+  }
+
+  // The POST /api/seed-loras body of the catalog form's fields, for a Qwen base; null (after writing the
+  // reason to #l-output) when the Path field is neither an absolute file path nor an OWNER/NAME repo.
+  function qwenCatalogBody(value) {
+    const src = $("#l-path").value.trim();
+    let source = "";
+    let repo = "";
+    let path = "";
+    if (src.indexOf("/") === 0) {
+      source = "local";
+      path = src;
+    } else if (/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(src)) {
+      source = "hf";
+      repo = src;
+    } else {
+      $("#l-output").textContent = "Path must be an absolute file path or an OWNER/NAME Hugging Face repo.";
+      return null;
+    }
+    const triggers = splitList("#l-triggers");
+    const scale = Number($("#l-default-strength").value);
+    return customLoraBody({source: source, repo: repo, file: "", path: path, family: value.slice("qwen:".length),
+                           trigger: triggers.length ? triggers[0] : "",
+                           scale: Number.isFinite(scale) ? String(scale) : "", steps: ""});
   }
 
   const QWEN_MIX_MESSAGE = "Pick one base: the Z-Image model or one Qwen model, not both.";
@@ -3224,7 +3239,6 @@
     });
     $("#l-target").addEventListener("change", fillLoraBaseModels);
     $("#l-target").addEventListener("change", syncLoraScope);
-    $("#l-qwen-box").appendChild(customLoraForm("l", function () { loadCatalogTable(); }));
     $("#l-base-models").addEventListener("change", syncQwenBase);
     $("#l-kind").addEventListener("change", syncLoraScope);
     syncLoraScope();
@@ -3239,6 +3253,25 @@
     });
     $("#l-add").addEventListener("click", async function () {
       const baseModels = Array.prototype.map.call($("#l-base-models").selectedOptions, function (o) { return o.value; });
+      if (baseModels.length === 1 && baseModels[0].indexOf("qwen:") === 0) {
+        const qwenBody = qwenCatalogBody(baseModels[0]);
+        if (!qwenBody) { return; }
+        $("#l-add").disabled = true;
+        try {
+          const added = await api("POST", "/api/seed-loras", qwenBody);
+          if (added.status === 201) {
+            if (S.host) { S.host.capabilities.seed_edit = added.data.seed_edit; }
+            renderBadges();
+            $("#l-output").textContent = ["added " + added.data.lora.id].concat(added.data.notes).join("; ");
+            loadCatalogTable();
+          } else {
+            $("#l-output").textContent = (added.data && added.data.error) || "request failed (HTTP " + added.status + ")";
+          }
+        } finally {
+          $("#l-add").disabled = false;
+        }
+        return;
+      }
       if (baseModels.some(function (v) { return v.indexOf("qwen:") === 0; })) {
         $("#l-output").textContent = QWEN_MIX_MESSAGE;
         return;
