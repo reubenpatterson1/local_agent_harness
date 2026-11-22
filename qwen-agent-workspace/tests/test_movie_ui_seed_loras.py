@@ -332,13 +332,12 @@ def test_the_loras_tab_lists_the_qwen_stills_bases():
     static, html, js = _page()
     for text in ('["qwen:qwen2511", "Qwen-Image-Edit-2511 (Qwen stills)"]', '["qwen:qwen21", "Qwen-Image-2.1 (Qwen stills)"]',
                  "Pick one base: the Z-Image model or one Qwen model, not both.",
-                 'customLoraForm("l", function () { loadCatalogTable(); })',
                  "if (typeof onAdded === \"function\") { onAdded(); }", "function syncQwenBase() {",
                  '"stills (Qwen)"', 'api("DELETE", "/api/seed-loras/" + enc(l.id))'):
         assert text in js, text
-    assert js.count('customLoraForm("l"') == 1
-    assert html.count('<div id="l-qwen-box" hidden></div>') == 1
-    assert html.index('id="l-add"') < html.index('id="l-qwen-box"')
+    assert 'customLoraForm("l"' not in js
+    assert "l-qwen-box" not in html and "l-qwen-box" not in js
+    assert "l-custom-family" not in js
     assert 'id="l-custom' not in html
     for name, text in (("index.html", html), ("app.js", js)):
         for pattern in (r"https?://", r"\son[a-z]+=", r"style=", r"\bconfirm\(", r"innerHTML"):
@@ -353,9 +352,11 @@ def test_the_loras_tab_lists_the_qwen_stills_bases():
 def test_the_qwen_base_fixes_are_pinned():
     _static, _html, js = _page()
     sync = js[js.index("function syncQwenBase() {"):js.index("const QWEN_MIX_MESSAGE")]
-    mixed = sync[sync.index("} else if (qwen.length) {"):sync.index("} else {\n      show($(\"#l-add\"), true);")]
-    assert 'show($("#l-add"), true)' in mixed
-    assert sync.count('$("#l-output").textContent === QWEN_MIX_MESSAGE') == 2
+    assert 'show($("#l-add"), true)' in sync
+    assert 'show($("#l-add"), false)' not in js
+    handler = js[js.index('$("#l-add").addEventListener("click"'):js.index("// --- jobs (MU84)")]
+    assert '"/api/seed-loras"' in handler
+    assert sync.count('$("#l-output").textContent === QWEN_MIX_MESSAGE') == 1
     load = js[js.index("async function loadCatalogTable("):js.index("// lora_catalog.MOTION_SCOPE_WARNING")]
     assert load.count("function appendQwenRows(body) {") == 1
     assert js.count("function appendQwenRows(") == 1
