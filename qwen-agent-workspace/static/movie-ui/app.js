@@ -3097,29 +3097,60 @@
     if (qwen.length === 1 && picked.length === 1) {
       show($("#l-add"), false);
       show($("#l-qwen-box"), true);
+      if ($("#l-output").textContent === QWEN_MIX_MESSAGE) { $("#l-output").textContent = ""; }
       $("#l-custom-family").value = qwen[0].slice("qwen:".length);
       $("#l-custom").open = true;
     } else if (qwen.length) {
       show($("#l-qwen-box"), false);
+      show($("#l-add"), true);
       $("#l-add").disabled = true;
       $("#l-output").textContent = QWEN_MIX_MESSAGE;
     } else {
       show($("#l-add"), true);
       $("#l-add").disabled = false;
       show($("#l-qwen-box"), false);
+      if ($("#l-output").textContent === QWEN_MIX_MESSAGE) { $("#l-output").textContent = ""; }
     }
   }
 
   const QWEN_MIX_MESSAGE = "Pick one base: the Z-Image model or one Qwen model, not both.";
 
   async function loadCatalogTable(results) {
-    if (!S.ws) { return; }
+    // User-added Qwen LoRAs live in the seed-LoRA registry, not the catalog.
+    function appendQwenRows(body) {
+      const registry = seedRegistry();
+      ((registry && registry.loras) || []).filter(function (l) { return l.user === true; }).forEach(function (l) {
+        const remove = el("button", {type: "button", text: "Remove"});
+        remove.addEventListener("click", async function () {
+          if (!(await askConfirm("Remove " + l.id + " from the Qwen LoRAs? The file is not touched."))) { return; }
+          remove.disabled = true;
+          try {
+            const out = await api("DELETE", "/api/seed-loras/" + enc(l.id));
+            if (out.status === 200) {
+              if (S.host) { S.host.capabilities.seed_edit = out.data.seed_edit; }
+              renderBadges();
+              loadCatalogTable();
+            } else {
+              $("#l-output").textContent = (out.data && out.data.error) || "request failed (HTTP " + out.status + ")";
+            }
+          } finally {
+            remove.disabled = false;
+          }
+        });
+        body.appendChild(el("tr", {}, [el("td", {text: l.id}), el("td", {text: "lora"}), el("td", {text: "stills (Qwen)"}),
+          el("td", {text: "-"}), el("td", {text: String(l.default_scale)}), el("td", {text: l.trigger || ""}),
+          el("td", {text: l.family}), el("td", {text: ""}), el("td", {}, [remove])]));
+      });
+    }
+    const firstBody = clear($("#l-table tbody"));
+    if (!S.ws) { appendQwenRows(firstBody); return; }
     const res = await api("GET", "/api/loras" + wsQuery());
     const body = clear($("#l-table tbody"));
     const warnings = clear($("#l-scope-warnings"));
     warnings.hidden = true;
     if (res.status !== 200) {
       $("#l-output").textContent = (res.data && res.data.error) || ("http " + res.status);
+      appendQwenRows(body);
       return;
     }
     // Motion-beat-only spec MB4: a motion LoRA saved with the scope global or either is read as beat.
@@ -3148,25 +3179,7 @@
         el("td", {text: (e.base_models || []).join(", ")}), el("td", {text: verdicts[e.id] || ""}),
         el("td", {}, [remove])]));
     });
-    // User-added Qwen LoRAs live in the seed-LoRA registry, not the catalog.
-    const registry = seedRegistry();
-    ((registry && registry.loras) || []).filter(function (l) { return l.user === true; }).forEach(function (l) {
-      const remove = el("button", {type: "button", text: "Remove"});
-      remove.addEventListener("click", async function () {
-        if (!(await askConfirm("Remove " + l.id + " from the Qwen LoRAs? The file is not touched."))) { return; }
-        const out = await api("DELETE", "/api/seed-loras/" + enc(l.id));
-        if (out.status === 200) {
-          if (S.host) { S.host.capabilities.seed_edit = out.data.seed_edit; }
-          renderBadges();
-          loadCatalogTable();
-        } else {
-          $("#l-output").textContent = (out.data && out.data.error) || "request failed (HTTP " + out.status + ")";
-        }
-      });
-      body.appendChild(el("tr", {}, [el("td", {text: l.id}), el("td", {text: "lora"}), el("td", {text: "stills (Qwen)"}),
-        el("td", {text: "-"}), el("td", {text: String(l.default_scale)}), el("td", {text: l.trigger || ""}),
-        el("td", {text: l.family}), el("td", {text: ""}), el("td", {}, [remove])]));
-    });
+    appendQwenRows(body);
   }
 
   // lora_catalog.MOTION_SCOPE_WARNING (motion-beat-only spec MB4).
@@ -3212,7 +3225,6 @@
     $("#l-target").addEventListener("change", fillLoraBaseModels);
     $("#l-target").addEventListener("change", syncLoraScope);
     $("#l-qwen-box").appendChild(customLoraForm("l", function () { loadCatalogTable(); }));
-    $("#l-target").addEventListener("change", syncQwenBase);
     $("#l-base-models").addEventListener("change", syncQwenBase);
     $("#l-kind").addEventListener("change", syncLoraScope);
     syncLoraScope();

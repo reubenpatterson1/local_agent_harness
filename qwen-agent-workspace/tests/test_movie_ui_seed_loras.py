@@ -350,6 +350,22 @@ def test_the_loras_tab_lists_the_qwen_stills_bases():
         assert proc.returncode == 0, proc.stderr
 
 
+def test_the_qwen_base_fixes_are_pinned():
+    _static, _html, js = _page()
+    sync = js[js.index("function syncQwenBase() {"):js.index("const QWEN_MIX_MESSAGE")]
+    mixed = sync[sync.index("} else if (qwen.length) {"):sync.index("} else {\n      show($(\"#l-add\"), true);")]
+    assert 'show($("#l-add"), true)' in mixed
+    assert sync.count('$("#l-output").textContent === QWEN_MIX_MESSAGE') == 2
+    load = js[js.index("async function loadCatalogTable("):js.index("// lora_catalog.MOTION_SCOPE_WARNING")]
+    assert load.count("function appendQwenRows(body) {") == 1
+    assert js.count("function appendQwenRows(") == 1
+    assert load.count("appendQwenRows(") == 4
+    assert load.index("appendQwenRows(firstBody)") < load.index('api("GET", "/api/loras"')
+    assert "appendQwenRows(body);\n      return;" in load
+    assert load.rstrip().endswith("appendQwenRows(body);\n  }")
+    assert "remove.disabled = true;" in load and "} finally {" in load
+
+
 BODY_CASES = [
     ({"source": "hf", "repo": " " + slr.REPO + " ", "file": " ", "path": "/left/over.safetensors", "family": "",
       "trigger": "  ", "scale": "", "steps": ""}, {"repo": slr.REPO}),
