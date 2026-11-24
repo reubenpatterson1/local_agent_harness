@@ -99,6 +99,7 @@ ROUTES = [
      "/api/locations/harbour-street/regenerate"),
     ("GET", r"/api/actions", "h_actions", "/api/actions"),
     ("POST", r"/api/actions", "h_action_create", "/api/actions"),
+    ("POST", r"/api/actions/preview", "h_action_preview", "/api/actions/preview"),
     ("GET", r"/api/actions/" + _ACTION, "h_action", "/api/actions/roundhouse-kick"),
     ("POST", r"/api/actions/" + _ACTION + r"/train", "h_action_train", "/api/actions/roundhouse-kick/train"),
     ("POST", r"/api/uploads", "h_upload", "/api/uploads"),
@@ -2354,7 +2355,8 @@ def _h_action(self, groups, query, body):
     if isinstance(sheet, str):
         clips_dir = os.path.join(os.path.dirname(sheet), "clips")
         try:
-            clips = sorted(os.path.join(clips_dir, n) for n in os.listdir(clips_dir) if n.endswith(".mp4"))
+            clips = [os.path.join(clips_dir, n) for n in sorted((n for n in os.listdir(clips_dir) if n.endswith(".mp4")),
+                                                                key=lambda n: (len(n), n))]
         except OSError:
             clips = []
     job = newest_job(self.server, ("action-create",), real, "character", name)
@@ -2375,7 +2377,13 @@ def action_create_errors(body):
         errors.append("descriptor must be 8 to 60 words")
     elif not lib._argv_safe(descriptor) or descriptor.strip().startswith("-") or "\n" in descriptor:
         errors.append("descriptor contains invalid characters")
-    if not (isinstance(clips, list) and 1 <= len(clips) <= ACTION_MAX_CLIPS):
+    folder = body.get("dir")
+    if folder is not None:
+        if clips is not None:
+            errors.append("give either clip paths or a folder, not both")
+        else:
+            errors += action_dir_errors(folder)
+    elif not (isinstance(clips, list) and 1 <= len(clips) <= ACTION_MAX_CLIPS):
         errors.append("give 1 to %d clip paths" % ACTION_MAX_CLIPS)
     else:
         for path in clips:
@@ -2393,6 +2401,20 @@ def action_create_errors(body):
     return errors
 
 
+def action_dir_errors(path):
+    """The folder rule of POST /api/actions and POST /api/actions/preview (bulk action clips spec
+    2.7.2): [] when it passes, else a one-element list with the first failure."""
+    if not (isinstance(path, str) and os.path.isabs(path) and lib._argv_safe(path)):
+        return ["folder must be an absolute path"]
+    if ".." in path.split("/"):
+        return ["folder must not contain '..'"]
+    if not os.path.isdir(path):
+        return ["folder %s not found" % _fs_text(path)]
+    if not os.access(path, os.R_OK | os.X_OK):
+        return ["folder %s is not readable" % _fs_text(path)]
+    return []
+
+
 def create_action_job(server, kind, real, fields):
     with STORE_LOCK:
         job_id = lib.new_job_id(server.state)
@@ -2407,10 +2429,40 @@ def _h_action_create(self, groups, query, body):
     if errors:
         raise ApiError(400, "invalid fields", errors=errors)
     fields = {"ws": real, "name": body["name"], "trigger": " ".join(body["trigger"].split()),
-              "descriptor": " ".join(body["descriptor"].split()), "clips": list(body["clips"]),
-              "performers": body["performers"], "force": body.get("force", False),
-              "regenerate": body.get("regenerate", False)}
+              "descriptor": " ".join(body["descriptor"].split())}
+    if body.get("dir") is not None:
+        fields["dir"] = body["dir"]
+    else:
+        fields["clips"] = list(body["clips"])
+    fields["performers"] = body["performers"]
+    fields["force"] = body.get("force", False)
+    fields["regenerate"] = body.get("regenerate", False)
     return create_action_job(self.server, "action-create", real, fields)
+
+
+def _h_action_preview(self, groups, query, body):
+    """A folder's clips, captions and skipped files from bin/action scan; creates no job and writes
+    nothing (bulk action clips spec 2.7.6)."""
+    real = self.ws(body.get("ws"))
+    errors = action_dir_errors(body.get("dir"))
+    trigger = body.get("trigger")
+    if trigger is not None and not isinstance(trigger, str):
+        errors.append("trigger must be a string")
+    elif isinstance(trigger, str) and trigger.strip() and not ACTION_TRIGGER_RE.fullmatch(trigger.strip()):
+        errors.append("trigger must be a Motion: phrase of 1-40 letters, digits, spaces, _ ' or -")
+    if errors:
+        raise ApiError(400, "invalid fields", errors=errors)
+    args = ["scan", body["dir"]]
+    if isinstance(trigger, str) and trigger.strip():
+        args += ["--trigger", " ".join(trigger.split())]
+    run = tool_result("action", lib.run_light(lib.tool_argv(real, "action", *args), real))
+    try:
+        data = json.loads(run["stdout"])
+    except ValueError:
+        raise ApiError(502, "action printed unparsable output", run=run)
+    if not (isinstance(data, dict) and {"dir", "matched", "max", "clips", "skipped"} <= set(data)):
+        raise ApiError(502, "action printed unparsable output", run=run)
+    return 200, {k: data[k] for k in ("dir", "matched", "max", "clips", "skipped")}
 
 
 def _h_action_train(self, groups, query, body):
@@ -2421,6 +2473,7 @@ def _h_action_train(self, groups, query, body):
 MovieUIHandler.h_actions = _h_actions
 MovieUIHandler.h_action = _h_action
 MovieUIHandler.h_action_create = _h_action_create
+MovieUIHandler.h_action_preview = _h_action_preview
 MovieUIHandler.h_action_train = _h_action_train
 
 

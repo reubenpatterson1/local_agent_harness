@@ -40,6 +40,14 @@ SOURCE_TYPES = ("clips",)
 MIN_CLIPS = 8                   # fewer than the character MIN_KEEP: clips carry many frames
 MIN_PERFORMERS = 3              # identity-agnostic: varied performers (spec 3.2)
 DEFAULT_ACTION_STRENGTH = 0.7
+# Folder ingestion (docs/superpowers/specs/2026-11-23-bulk-action-clips-design.md, 2.1)
+CLIP_EXTS = (".mp4", ".mov", ".m4v", ".webm", ".mkv")     # = movie_ui_server.ACTION_CLIP_EXTS
+CLIP_NAME_RE = re.compile(r"([0-9]+)_([0-9]+)_([A-Za-z0-9_-]+)\.([A-Za-z0-9]+)")
+MOVE_RE = re.compile(r"[a-z][a-z0-9]*(?: [a-z0-9]+)*")
+MAX_MOVES = 8
+MAX_MOVE_CHARS = 40
+MAX_DIR_CLIPS = 1000            # = ACTION_STEPS at batch size 1: past it some clips are never seen
+CLIP_NAME_HINT = "<n>_<n>_<moves>.<ext>"
 
 _TOP_LEVEL_KEYS = {"schema_version", "name", "kind", "trigger", "descriptor",
                    "default_strength", "strength_range", "source", "identity_agnostic",
@@ -256,3 +264,77 @@ def registered_triggers():
         if data["status"] == "trained":
             triggers[data["trigger"]] = name
     return triggers
+
+
+# ---------------------------------------------------------------------------
+# Folder ingestion: one action from a folder of clips named <n>_<n>_<moves>.<ext>
+# (docs/superpowers/specs/2026-11-23-bulk-action-clips-design.md, 2.1)
+# ---------------------------------------------------------------------------
+
+def parse_clip_name(name):
+    """(moves, None) for a clip file name <n>_<n>_<moves>.<ext>, else (None, reason). Moves are
+    split on "-"; "_" inside a move is a space; moves are lowercased and duplicates are kept. The
+    first failing check gives the reason (spec 2.1)."""
+    if name.startswith("."):
+        return None, "hidden file"
+    if os.path.splitext(name)[1].lower() not in CLIP_EXTS:
+        return None, "not a video (%s)" % ", ".join(CLIP_EXTS)
+    m = CLIP_NAME_RE.fullmatch(name)
+    if m is None:
+        return None, "name does not match %s" % CLIP_NAME_HINT
+    moves = []
+    for raw in m.group(3).lower().split("-"):
+        move = " ".join(raw.replace("_", " ").split())
+        if move == "":
+            return None, "empty move"
+        if len(move) > MAX_MOVE_CHARS:
+            return None, "move longer than %d characters" % MAX_MOVE_CHARS
+        if not MOVE_RE.fullmatch(move):
+            return None, "move '%s' must start with a letter" % move
+        moves.append(move)
+    if len(moves) > MAX_MOVES:
+        return None, "more than %d moves" % MAX_MOVES
+    return moves, None
+
+
+def scan_clip_dir(path):
+    """One folder's clips, not recursive: {"dir": <abs>, "clips": [{"name", "path", "moves"}],
+    "skipped": [{"name", "reason"}]}. clips sort by the two numbers, then the name; skipped stay
+    in name order. It lists the folder and stats its entries; it opens no file. Raises
+    ActionError when the folder cannot be listed (spec 2.1.1)."""
+    d = os.path.abspath(path)
+    unreadable = "folder %s is not a readable directory" % d
+    if not (os.path.isdir(d) and os.access(d, os.R_OK | os.X_OK)):
+        raise ActionError(unreadable)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        raise ActionError(unreadable)
+    found, skipped = [], []
+    for name in sorted(names):
+        full = os.path.join(d, name)
+        moves = None
+        if name.startswith("."):
+            reason = "hidden file"
+        elif os.path.isdir(full):
+            reason = "folder (not scanned)"
+        elif not os.path.isfile(full):
+            reason = "not a regular file"
+        else:
+            moves, reason = parse_clip_name(name)
+            if reason is None and not os.access(full, os.R_OK):
+                reason = "not readable"
+        if reason is not None:
+            text = name.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+            skipped.append({"name": text, "reason": reason})
+            continue
+        m = CLIP_NAME_RE.fullmatch(name)
+        found.append(((int(m.group(1)), int(m.group(2)), name), {"name": name, "path": full, "moves": moves}))
+    found.sort(key=lambda item: item[0])
+    return {"dir": d, "clips": [clip for _key, clip in found], "skipped": skipped}
+
+
+def clip_caption(trigger, moves):
+    """A folder clip's caption, "<trigger>: <m1>, then <m2>, ..." (spec 2.1.2). The caller has
+    validated the trigger; TRIGGER_RE has no ":", so the separator is unambiguous."""
+    return trigger + ": " + ", then ".join(moves)

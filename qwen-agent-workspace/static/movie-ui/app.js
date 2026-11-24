@@ -10,6 +10,7 @@
   const BATCH_POLL_MS = 2000;   // batch forks spec 1.1: the jobs poll interval
   const LEVEL_LABELS = {render: "Render", stills: "New stills", replan: "Re-plan"};
   const SEEDS_MAX = 100;   // seed-folder spec 1.1: the most seeds in one run
+  const ACTION_GALLERY_MAX = 24;   // bulk action clips spec 2.8: dataset clips shown as videos
   const SEED_TYPES = ["image/png", "image/jpeg", "image/webp"];
   const SEED_COLLATOR = new Intl.Collator("en", {numeric: true});
   // Seed generator spec 1.1: the Seeds tab.
@@ -2992,7 +2993,10 @@
     if (res.data.contact_sheet) {
       gallery.appendChild(el("img", {src: fileUrl(res.data.contact_sheet), alt: "contact sheet", cls: "sheet"}));
     }
-    res.data.clips.forEach(function (p) { gallery.appendChild(el("video", {src: fileUrl(p), controls: "", preload: "metadata"})); });
+    res.data.clips.slice(0, ACTION_GALLERY_MAX).forEach(function (p) { gallery.appendChild(el("video", {src: fileUrl(p), controls: "", preload: "metadata"})); });
+    if (res.data.clips.length > ACTION_GALLERY_MAX) {
+      gallery.appendChild(el("p", {cls: "muted", text: "and " + (res.data.clips.length - ACTION_GALLERY_MAX) + " more clips in the dataset"}));
+    }
     $("#a-status").textContent = "";
     show($("#a-regenerate"), Boolean(res.data.last_create_fields) && a.status !== "trained");
     gate($("#a-train"), $("#a-train-reason"), ["render"]);
@@ -3016,14 +3020,48 @@
     }
   }
 
+  function actionPreviewSummary(data) {
+    const parts = [data.matched + " clip(s) match in " + data.dir, data.skipped.length + " skipped"];
+    if (data.matched > data.max) { parts.push("too many: an action takes at most " + data.max + " clips"); }
+    else if (data.matched < 8) { parts.push("training needs at least 8 clips"); }
+    return parts.join("; ");
+  }
+
+  function renderActionPreview(data) {
+    $("#a-preview-summary").textContent = actionPreviewSummary(data);
+    const clips = clear($("#a-preview-clips tbody"));
+    data.clips.forEach(function (c) {
+      clips.appendChild(el("tr", {}, [el("td", {text: c.name}), el("td", {text: c.moves.join(", ")}),
+        el("td", {text: c.caption === null ? "(enter a trigger to see the caption)" : c.caption})]));
+    });
+    const skipped = clear($("#a-preview-skipped tbody"));
+    data.skipped.forEach(function (s) {
+      skipped.appendChild(el("tr", {}, [el("td", {text: s.name}), el("td", {text: s.reason})]));
+    });
+    show($("#a-preview-skipped"), data.skipped.length > 0);
+    show($("#a-preview-out"), true);
+  }
+
   function setupActions() {
     $("#a-create").addEventListener("click", function () {
       const clips = $("#a-clips").value.split("\n").map(function (l) { return l.trim(); })
         .filter(function (l) { return l; });
-      submitAction({name: $("#a-name").value.trim(), trigger: $("#a-trigger").value.trim(),
-                    descriptor: $("#a-descriptor").value.trim(), clips: clips,
+      const dir = $("#a-dir").value.trim();
+      if (dir && clips.length) { $("#a-create-status").textContent = "give either clip paths or a folder, not both"; return; }
+      const body = {name: $("#a-name").value.trim(), trigger: $("#a-trigger").value.trim(),
+                    descriptor: $("#a-descriptor").value.trim(),
                     performers: numberOrNull("#a-performers") || 0, force: $("#a-force").checked,
-                    regenerate: false}, $("#a-create-status"));
+                    regenerate: false};
+      if (dir) { body.dir = dir; } else { body.clips = clips; }
+      submitAction(body, $("#a-create-status"));
+    });
+    $("#a-preview").addEventListener("click", async function () {
+      const dir = $("#a-dir").value.trim();
+      if (!dir) { show($("#a-preview-out"), false); $("#a-create-status").textContent = "enter a folder path to preview"; return; }
+      $("#a-create-status").textContent = "";
+      const res = await api("POST", "/api/actions/preview", {ws: S.ws, dir: dir, trigger: $("#a-trigger").value.trim()});
+      if (res.status !== 200) { show($("#a-preview-out"), false); $("#a-create-status").textContent = errorText(res); return; }
+      renderActionPreview(res.data);
     });
     $("#a-regenerate").addEventListener("click", async function () {
       const name = S.action.action.name;
