@@ -532,6 +532,7 @@ def test_bk_interrupted_regenerate_is_not_trainable(tmp_path, monkeypatch, capsy
     on_disk = len([f for f in os.listdir(os.path.join(al.action_dir("combo-set"), "dataset", "clips"))
                    if f.endswith(".mp4")])
     assert on_disk >= al.MIN_CLIPS
+    _install_stub(tmp_path, monkeypatch)
     with pytest.raises(ad.DatasetError) as exc:
         ad.train_action("combo-set")
     assert "incomplete" in str(exc.value)
