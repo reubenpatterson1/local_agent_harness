@@ -3,13 +3,17 @@
 
   bin/action create NAME --trigger PHRASE --descriptor TEXT --clip PATH [--clip PATH ...]
                    [--performers N] [--width W] [--height H] [--frames F] [--force] [--regenerate]
+  bin/action create NAME --trigger PHRASE --descriptor TEXT --dir DIR [--performers N] ...
   bin/action train NAME
   bin/action list
   bin/action show NAME
+  bin/action scan DIR [--trigger PHRASE]
 
 create normalizes operator-supplied reference clips of one action (by varied
 performers) into a training dataset and stops for review (dataset/contact_sheet.jpg);
-it needs ffmpeg. train trains the motion LoRA from that dataset with ltx-2-mlx; it
+it needs ffmpeg. --dir replaces --clip: every file named <n>_<n>_<moves>.<ext> in DIR
+(not recursive) becomes a clip captioned '<trigger>: <move>, then <move>'; scan
+previews that without writing anything. train trains the motion LoRA from that dataset with ltx-2-mlx; it
 refuses while a render or training runs or the story server is up. list/show read
 the library only (stdlib). An action LoRA is cast into a movie with
 bin/ltx-movie --action NAME.
@@ -40,6 +44,7 @@ def build_parser():
     c.add_argument("--trigger", required=True, help='Motion: phrase, e.g. "performs a roundhouse kick"')
     c.add_argument("--descriptor", required=True, help="appearance-free noun phrase, 8-60 words")
     c.add_argument("--clip", dest="clips", action="append", default=[], metavar="PATH")
+    c.add_argument("--dir", dest="dir", default=None, metavar="DIR", help="a folder of clips named <n>_<n>_<moves>.<ext>; each is captioned from its name")
     c.add_argument("--performers", type=int, default=0, help="distinct performers across the clips (>=3)")
     c.add_argument("--width", type=int, default=None)
     c.add_argument("--height", type=int, default=None)
@@ -52,6 +57,9 @@ def build_parser():
     sub.add_parser("list", help="list every action")
     s = sub.add_parser("show", help="print one action's record")
     s.add_argument("name")
+    s = sub.add_parser("scan", help="list a folder's clips and the captions their names give (read-only)")
+    s.add_argument("dir")
+    s.add_argument("--trigger", default=None)
     return parser
 
 
@@ -83,12 +91,34 @@ def cmd_show(name):
     return 0
 
 
+def cmd_scan(path, trigger):
+    """A folder's clips and the captions their names give, as JSON (read-only; bulk action
+    clips spec 2.6.3). Exit 0 even with no match."""
+    import json
+    try:
+        if trigger is not None:
+            action_lib.validate_trigger(trigger)
+        scan = action_lib.scan_clip_dir(path)
+    except action_lib.ActionError as e:
+        print("Error: %s" % e, file=sys.stderr)
+        return 2
+    out = {"dir": scan["dir"], "matched": len(scan["clips"]), "max": action_lib.MAX_DIR_CLIPS,
+           "clips": [{"name": c["name"], "path": c["path"], "moves": c["moves"],
+                      "caption": action_lib.clip_caption(trigger, c["moves"]) if trigger is not None else None}
+                     for c in scan["clips"]],
+           "skipped": scan["skipped"]}
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.command == "list":
         return cmd_list()
     if args.command == "show":
         return cmd_show(args.name)
+    if args.command == "scan":
+        return cmd_scan(args.dir, args.trigger)
     # create / train -> action_dataset (heavy: PIL + ffmpeg / ltx-2-mlx)
     import action_dataset
     if args.command == "train":

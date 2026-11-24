@@ -36,7 +36,9 @@ DEFAULT_HEIGHT = 768
 DEFAULT_FRAMES = 97          # 8*12 + 1 = 97; 96/24 = 4.0 s
 DEFAULT_FPS = 24
 CONTACT_COLS = 4
+CONTACT_MAX = 48             # bulk action clips spec 2.4.8: the most clips on the contact sheet
 CREATE_MIN_FREE_GIB = 2.0
+CREATE_PER_CLIP_GIB = 0.005  # bulk action clips spec 2.4.5: 5 MiB more per clip
 
 
 def _load_action_lib():
@@ -151,16 +153,39 @@ def _free_gib(path):
         return 0.0
 
 
+def create_min_free_gib(n_clips):
+    """The free space create needs for n_clips clips (bulk action clips spec 2.4.5)."""
+    return CREATE_MIN_FREE_GIB + CREATE_PER_CLIP_GIB * n_clips
+
+
+def contact_sample(n, limit=CONTACT_MAX):
+    """The clip indices whose mid frame goes on the contact sheet: all of them up to limit,
+    else limit evenly spaced indices from 0 to n - 1 (distinct because n - 1 >= limit)."""
+    if n <= limit:
+        return list(range(n))
+    return [(k * (n - 1)) // (limit - 1) for k in range(limit)]
+
+
 def build_dataset(name, trigger, descriptor, clip_paths, performers, *,
                   width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, frames=DEFAULT_FRAMES,
-                  fps=DEFAULT_FPS, force=False):
+                  fps=DEFAULT_FPS, force=False, captions=None, source_dir=None, skipped=None):
     """Normalize clips, caption, contact-sheet, and write action.json. Returns the
-    action.json dict. Raises DatasetError. Does not train."""
+    action.json dict. Raises DatasetError. Does not train. captions (one line per clip)
+    replaces the trigger-only caption; source_dir and skipped are recorded in manifest.json
+    (bulk action clips spec 2.4)."""
     lib = _load_action_lib()
     lib.validate_name(name)
     lib.validate_trigger(trigger)
     lib.validate_descriptor(descriptor)
     validate_geometry(width, height, frames)
+    if captions is not None:
+        if not (isinstance(captions, list) and len(captions) == len(clip_paths)):
+            n_given = len(captions) if isinstance(captions, (list, tuple)) else -1
+            raise DatasetError("captions: %d given for %d clips" % (n_given, len(clip_paths)))
+        for k, c in enumerate(captions):
+            if not (isinstance(c, str) and c.strip() and "\n" not in c and "\r" not in c):
+                raise DatasetError("captions: caption %d must be one non-empty line" % k)
+    texts = list(captions) if captions is not None else [trigger] * len(clip_paths)
 
     missing = [p for p in clip_paths if not (os.path.isfile(p) and os.access(p, os.R_OK))]
     if missing:
@@ -178,24 +203,33 @@ def build_dataset(name, trigger, descriptor, clip_paths, performers, *,
     captions_dir = os.path.join(dataset_dir, "captions")
     for d in (clips_dir, captions_dir, os.path.join(adir, "loras", "video"), os.path.join(adir, "logs")):
         os.makedirs(d, exist_ok=True)
-    if _free_gib(adir) < CREATE_MIN_FREE_GIB:
-        raise DatasetError("less than %.0f GiB free at %s" % (CREATE_MIN_FREE_GIB, adir))
+    need = create_min_free_gib(len(clip_paths))
+    if _free_gib(adir) < need:
+        raise DatasetError("less than %.1f GiB free at %s (needed for %d clips)"
+                           % (need, adir, len(clip_paths)))
+    # A rebuild with fewer clips must not train on the old ones (bulk action clips spec 2.4.6).
+    for stale in (glob.glob(os.path.join(clips_dir, "clip_*.mp4"))
+                  + glob.glob(os.path.join(captions_dir, "clip_*.txt"))):
+        os.unlink(stale)
 
+    sample = set(contact_sample(len(clip_paths)))
     frame_pngs = []
     kept = 0
     for i, src in enumerate(clip_paths):
+        print("clip %d/%d: %s" % (i + 1, len(clip_paths), os.path.basename(src)), flush=True)
         w, h, nb, dur = probe_clip(src)
         clip_frames = min(frames, snap_frames(nb)) if nb else frames
         dst = os.path.join(clips_dir, "clip_%02d.mp4" % i)
         normalize_clip(src, dst, width, height, clip_frames, fps)
         with open(os.path.join(captions_dir, "clip_%02d.txt" % i), "w", encoding="utf-8") as f:
-            f.write(trigger)                      # appearance-free: the motion phrase only
-        png = os.path.join(dataset_dir, "_frame_%02d.png" % i)
-        try:
-            extract_frame(dst, png)
-            frame_pngs.append(png)
-        except DatasetError:
-            pass
+            f.write(texts[i])                     # appearance-free: the motion phrase (and the moves)
+        if i in sample:
+            png = os.path.join(dataset_dir, "_frame_%02d.png" % i)
+            try:
+                extract_frame(dst, png)
+                frame_pngs.append(png)
+            except DatasetError:
+                pass
         kept += 1
 
     sheet = os.path.join(dataset_dir, "contact_sheet.jpg")
@@ -216,7 +250,12 @@ def build_dataset(name, trigger, descriptor, clip_paths, performers, *,
     manifest = {"name": name, "trigger": trigger, "descriptor": descriptor,
                 "clips": kept, "performers": performers, "identity_agnostic": identity_agnostic,
                 "width": width, "height": height, "frames": frames, "fps": fps,
-                "sources": [os.path.abspath(p) for p in clip_paths]}
+                "sources": [os.path.abspath(p) for p in clip_paths],
+                "items": [{"clip": "clip_%02d.mp4" % i, "source": os.path.abspath(p), "caption": texts[i]}
+                          for i, p in enumerate(clip_paths)],
+                "source_dir": source_dir,
+                "skipped": list(skipped or []),
+                "contact_sheet_clips": contact_sample(len(clip_paths))}
     with open(os.path.join(dataset_dir, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
     return data
@@ -240,6 +279,11 @@ ACTION_RANK = int(os.environ.get("ACTION_TRAIN_RANK", "32"))
 ACTION_STEPS = int(os.environ.get("ACTION_TRAIN_STEPS", "1000"))
 PREPROCESS_TIMEOUT_S = 1800
 TRAIN_TIMEOUT_S = 14400
+
+
+def preprocess_timeout_s(n_clips):
+    """PREPROCESS_TIMEOUT_S for up to 80 clips, then 15 s more for each clip."""
+    return max(PREPROCESS_TIMEOUT_S, 600 + 15 * n_clips)
 
 
 def _character_dataset():
@@ -397,7 +441,7 @@ def train_action(name):
 
     pre_out = os.path.join(tdir, "preprocessed")
     rc = _run_logged(preprocess_argv(clips_dir, captions_dir, pre_out, width, height, frames),
-                     os.path.join(adir, "logs", "preprocess.log"), LTX2_MLX_DIR, env, PREPROCESS_TIMEOUT_S)
+                     os.path.join(adir, "logs", "preprocess.log"), LTX2_MLX_DIR, env, preprocess_timeout_s(n_vid))
     if rc != 0:
         raise DatasetError("preprocess failed (rc %d); log: %s"
                            % (rc, os.path.join(adir, "logs", "preprocess.log")))
@@ -457,12 +501,34 @@ def create(args):
         return _error(str(e))
     if not args.regenerate and os.path.exists(lib.action_json_path(args.name)):
         return _error("action %s already exists; use --regenerate to rebuild" % args.name)
-    if not args.clips or not args.trigger or not args.descriptor:
-        return _error("create needs --trigger, --descriptor and at least one --clip")
+    if args.clips and args.dir:
+        return _error("give either --dir or --clip, not both")
+    if not (args.clips or args.dir) or not args.trigger or not args.descriptor:
+        return _error("create needs --trigger, --descriptor and --dir or at least one --clip")
+    clips, captions, source_dir, skipped = args.clips, None, None, None
+    if args.dir:
+        try:
+            lib.validate_trigger(args.trigger)
+            scan = lib.scan_clip_dir(args.dir)
+        except lib.ActionError as e:
+            return _error(str(e))
+        for s in scan["skipped"]:
+            print("skipped: %s (%s)" % (s["name"], s["reason"]))
+        print("folder: %d clip(s) matched, %d skipped in %s"
+              % (len(scan["clips"]), len(scan["skipped"]), scan["dir"]))
+        if not scan["clips"]:
+            return _error("no file in %s matches %s" % (scan["dir"], lib.CLIP_NAME_HINT))
+        if len(scan["clips"]) > lib.MAX_DIR_CLIPS:
+            return _error("%s has %d matching clips; an action takes at most %d"
+                          % (scan["dir"], len(scan["clips"]), lib.MAX_DIR_CLIPS))
+        clips = [c["path"] for c in scan["clips"]]
+        captions = [lib.clip_caption(args.trigger, c["moves"]) for c in scan["clips"]]
+        source_dir, skipped = scan["dir"], scan["skipped"]
     try:
-        data = build_dataset(args.name, args.trigger, args.descriptor, args.clips,
+        data = build_dataset(args.name, args.trigger, args.descriptor, clips,
                              args.performers, width=args.width, height=args.height,
-                             frames=args.frames, force=args.force)
+                             frames=args.frames, force=args.force, captions=captions,
+                             source_dir=source_dir, skipped=skipped)
     except (DatasetError, lib.ActionError) as e:
         return _error(str(e))
     kept = data["dataset"]["clips"]
@@ -472,7 +538,7 @@ def create(args):
     print("identity_agnostic: %s (%d performers asserted)" % (data["identity_agnostic"], args.performers))
     print("contact sheet: %s" % data["dataset"]["contact_sheet"])
     if kept < lib.MIN_CLIPS:
-        print("Error: only %d clip(s); training needs >= %d. The dataset is kept; add more --clip "
+        print("Error: only %d clip(s); training needs >= %d. The dataset is kept; add more clips "
               "and run bin/action create %s --regenerate." % (kept, lib.MIN_CLIPS, args.name),
               file=sys.stderr)
         return 3
@@ -493,6 +559,7 @@ def build_parser():
     c.add_argument("--trigger", required=True, help='Motion: phrase, e.g. "performs a roundhouse kick"')
     c.add_argument("--descriptor", required=True)
     c.add_argument("--clip", dest="clips", action="append", default=[], metavar="PATH")
+    c.add_argument("--dir", dest="dir", default=None, metavar="DIR", help="a folder of clips named <n>_<n>_<moves>.<ext>; each is captioned from its name")
     c.add_argument("--performers", type=int, default=0, help="distinct performers across the clips")
     c.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     c.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
