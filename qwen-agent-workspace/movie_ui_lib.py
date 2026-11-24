@@ -1234,8 +1234,11 @@ def action_argv(kind, fields, ws_real, py=sys.executable):
         return [os.path.join(ws_real, "bin", "action-train-vlm"), py, fields["name"]]
     argv = [py, os.path.join(ws_real, "bin", "action"), "create", fields["name"],
             "--trigger", fields["trigger"], "--descriptor", fields["descriptor"]]
-    for path in fields["clips"]:
-        argv += ["--clip", path]
+    if fields.get("dir") is not None:
+        argv += ["--dir", fields["dir"]]
+    else:
+        for path in fields["clips"]:
+            argv += ["--clip", path]
     argv += ["--performers", str(fields["performers"])]
     if fields.get("force"):
         argv.append("--force")

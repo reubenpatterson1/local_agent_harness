@@ -392,16 +392,22 @@
 <section id="panel-actions" class="panel" hidden>
   <table id="a-list" class="list"><thead><tr><th>Name</th><th>Status</th><th>Clips</th><th>Trigger</th></tr></thead><tbody></tbody></table>
   <h3>New action</h3>
-  <p class="muted">One named move per action (e.g. a roundhouse kick), from at least 8 reference clips by at least 3 different performers, so the LoRA learns the motion and not a face.</p>
+  <p class="muted">One named move per action (e.g. a roundhouse kick), from at least 8 reference clips by at least 3 different performers, so the LoRA learns the motion and not a face. Or give one folder of clips named &lt;n&gt;_&lt;n&gt;_&lt;moves&gt;.mp4 (e.g. 006_00_high_kick-stance-front_kick.mp4): each clip is captioned with the trigger and its moves.</p>
   <div class="grid">
     <label>Name <input id="a-name" type="text" size="24" placeholder="roundhouse-kick"></label>
     <label>Trigger <input id="a-trigger" type="text" size="40" placeholder="performs a roundhouse kick"></label>
     <label class="wide">Descriptor <input id="a-descriptor" type="text" size="60" placeholder="8-60 words, the motion only: no gender, skin, hair or clothing"></label>
     <label class="wide">Clips <textarea id="a-clips" rows="6" cols="70" spellcheck="false" placeholder="one absolute path per line: /Users/me/clips/kick_01.mp4"></textarea></label>
+    <label class="wide">Folder <input id="a-dir" type="text" size="70" spellcheck="false" placeholder="or one absolute folder path instead of clips: /Users/me/fight_clips"></label>
     <label>Performers <input id="a-performers" type="number" min="0" value="3"></label>
     <label><input id="a-force" type="checkbox"> Force (fewer than 3 performers)</label>
   </div>
-  <div class="row"><button id="a-create" type="button">Create dataset</button> <span id="a-create-status" class="muted"></span></div>
+  <div class="row"><button id="a-preview" type="button">Preview folder</button> <button id="a-create" type="button">Create dataset</button> <span id="a-create-status" class="muted"></span></div>
+  <div id="a-preview-out" hidden>
+    <p id="a-preview-summary" class="muted"></p>
+    <table id="a-preview-clips" class="list"><thead><tr><th>File</th><th>Moves</th><th>Caption</th></tr></thead><tbody></tbody></table>
+    <table id="a-preview-skipped" class="list"><thead><tr><th>Skipped file</th><th>Reason</th></tr></thead><tbody></tbody></table>
+  </div>
   <div id="a-detail" hidden>
     <h2 id="a-title"></h2>
     <pre id="a-summary"></pre>

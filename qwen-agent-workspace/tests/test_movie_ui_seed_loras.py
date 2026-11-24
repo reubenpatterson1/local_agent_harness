@@ -126,7 +126,7 @@ def test_cl_t25_the_routes(env):
     routes = list(srv.ROUTES)
     i = routes.index(("GET", r"/api/seeds/folders", "h_seed_folders", "/api/seeds/folders"))
     assert routes[i + 1:i + 3] == NEW_ROUTES
-    assert len(srv.ROUTES) == 66
+    assert len(srv.ROUTES) == 67
     for method, regex, name, sample in NEW_ROUTES:
         assert re.fullmatch(regex, sample), sample
         assert getattr(srv.MovieUIHandler, name) is getattr(srv, "_" + name), name
