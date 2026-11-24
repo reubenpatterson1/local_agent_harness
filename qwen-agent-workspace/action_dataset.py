@@ -207,6 +207,15 @@ def build_dataset(name, trigger, descriptor, clip_paths, performers, *,
     if _free_gib(adir) < need:
         raise DatasetError("less than %.1f GiB free at %s (needed for %d clips)"
                            % (need, adir, len(clip_paths)))
+    # An interrupted rebuild must not look trainable: zero the recorded clip count first.
+    if os.path.isfile(lib.action_json_path(name)):
+        try:
+            existing = lib.load_action(name)
+        except lib.ActionError:
+            existing = None
+        if existing is not None and isinstance(existing.get("dataset"), dict):
+            existing["dataset"]["clips"] = 0
+            lib.write_action(existing)
     # A rebuild with fewer clips must not train on the old ones (bulk action clips spec 2.4.6).
     for stale in (glob.glob(os.path.join(clips_dir, "clip_*.mp4"))
                   + glob.glob(os.path.join(captions_dir, "clip_*.txt"))):
@@ -415,6 +424,11 @@ def train_action(name):
     if n_vid < lib.MIN_CLIPS:
         raise DatasetError("only %d clips in %s; training needs >= %d (bin/action create --regenerate)"
                            % (n_vid, clips_dir, lib.MIN_CLIPS))
+    recorded = (data.get("dataset") or {}).get("clips")
+    if recorded != n_vid:
+        raise DatasetError("the dataset in %s is incomplete: action.json records %s clip(s), %d are on disk "
+                           "(an interrupted create?); rebuild it with bin/action create %s --regenerate"
+                           % (clips_dir, recorded, n_vid, name))
     if not (os.path.isfile(LTX2_MLX_BIN) and os.access(LTX2_MLX_BIN, os.X_OK)):
         raise DatasetError("ltx-2-mlx not found/executable at %s (set LTX2_MLX_BIN)" % LTX2_MLX_BIN)
     if not os.path.isdir(TRAIN_MODEL):

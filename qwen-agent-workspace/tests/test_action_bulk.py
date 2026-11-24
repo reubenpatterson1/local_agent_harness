@@ -513,3 +513,36 @@ def test_bk_review_focus_2_python_39_runs_scan_and_compiles_the_files(tmp_path):
     files = [os.path.join(WS, rel) for rel in ("action_lib.py", "action_dataset.py", os.path.join("bin", "action"))]
     proc = subprocess.run([PY39, "-c", script, str(tmp_path)] + files, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
+
+
+# ---- fix 1: an interrupted rebuild must not look trainable ------------------------------------
+
+@needs_ffmpeg
+def test_bk_interrupted_regenerate_is_not_trainable(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv(al.LIBRARY_ENV, str(tmp_path / "lib"))
+    d = _folder(tmp_path, [])
+    for n in range(1, 13):
+        _make_clip(os.path.join(d, "%03d_00_kick.mp4" % n), color=("red", "green", "blue")[n % 3])
+    args = ["--dir", d, "--width", "64", "--height", "64", "--frames", "9", "--performers", "3"]
+    assert _main_create(*args) == 0, capsys.readouterr().err
+    assert al.load_action("combo-set")["dataset"]["clips"] == 12
+    _touch(os.path.join(d, "009_01_kick.mp4"))            # sorts in the middle; ffprobe rejects it
+    assert _main_create(*(args + ["--regenerate"])) == 2, capsys.readouterr().err
+    assert al.load_action("combo-set")["dataset"]["clips"] == 0
+    on_disk = len([f for f in os.listdir(os.path.join(al.action_dir("combo-set"), "dataset", "clips"))
+                   if f.endswith(".mp4")])
+    assert on_disk >= al.MIN_CLIPS
+    with pytest.raises(ad.DatasetError) as exc:
+        ad.train_action("combo-set")
+    assert "incomplete" in str(exc.value)
+
+
+def test_bk_train_refuses_a_recorded_count_that_differs_from_disk(tmp_path, monkeypatch):
+    _install_stub(tmp_path, monkeypatch)
+    name = _seed_action(tmp_path / "lib", clips=9)
+    data = al.load_action(name)
+    data["dataset"]["clips"] = 8
+    al.write_action(data)
+    with pytest.raises(ad.DatasetError) as exc:
+        ad.train_action(name)
+    assert "incomplete" in str(exc.value)
