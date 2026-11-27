@@ -572,6 +572,20 @@ def test_ict8d_a_serving_vlm_is_left_serving(env):
     assert env.block(2)["status"] == "flagged"
 
 
+def test_ict8e_an_install_is_reported_before_the_phase_ends(env):
+    jobs = env.jobs(2)
+    one, two = jobs
+    seed = ic.critic_seed(11, 1, 1)
+    env.cd.replies.update({one["output_path"]: [verdict(3)], two["output_path"]: [verdict(3)],
+                           env.attempt(one, 1): [verdict(8)], env.attempt(two, 1): [KeyboardInterrupt()]})
+    with pytest.raises(KeyboardInterrupt):
+        env.run(jobs)
+    assert env.bests == [(1, one["output_path"])]
+    assert _read(one["output_path"]) == b"img:1:%d" % seed
+    last = env.block(1)
+    assert (last["status"], last["score"], last["seed_used"]) == ("passed", 8, seed)
+
+
 # --- ICT9: blocked outputs are skipped, not judged ------------------------------------------------------------
 
 def test_ict9_blocked_outputs_are_skipped(env, capsys):

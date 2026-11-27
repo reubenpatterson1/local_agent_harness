@@ -379,13 +379,14 @@ def edit_with_critic(qe, model_id, loras, jobs, width, height, skill, work_dir, 
             att["score"], att["defects"] = v["score"], v["defects"]
             best = best_of(n)
             if best is None or v["score"] > best["score"]:
+                s["best"] = len(s["attempts"]) - 1
+                s["seed_used"] = att["seed"]
+                s["reason"] = v["reason"]
                 if r > 0:
                     install(n, r)
                     if on_best is not None:
                         on_best(n, by_n[n]["output_path"])
-                s["best"] = len(s["attempts"]) - 1
-                s["seed_used"] = att["seed"]
-                s["reason"] = v["reason"]
+                    verdicts([n])
             if v["score"] >= PASS_SCORE:
                 ok_line(n, att)
             elif r < rounds:
