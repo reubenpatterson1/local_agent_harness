@@ -532,3 +532,19 @@ def test_batch_fix_recovery_removes_an_empty_fork_folder(state, tmp_path, capsys
     assert not os.path.lexists(fdir)
     rec = lib.read_json(os.path.join(state, "batches", batch_id, "batch.json"))
     assert rec["cells"][0]["status"] == "interrupted"
+
+
+def test_qtb1_move_job_top_and_bottom(state, tmp_path):
+    ws = str(tmp_path)
+    a, b, c, d = (mt.make_job(state, ["true"], ws) for _ in range(4))
+    assert lib.move_job(state, c, "top") == [c, a, b, d]
+    assert lib.read_queue(state) == [c, a, b, d]
+    assert lib.move_job(state, c, "top") == [c, a, b, d]
+    assert lib.move_job(state, a, "bottom") == [c, b, d, a]
+    assert lib.move_job(state, a, "bottom") == [c, b, d, a]
+    assert lib.move_job(state, b, "bottom") == [c, d, a, b]
+    assert lib.read_queue(state) == [c, d, a, b]
+    assert lib.cancel_job(state, d) == "cancelled"
+    assert lib.move_job(state, d, "top") is None
+    assert lib.move_job(state, d, "bottom") is None
+    assert lib.read_queue(state) == [c, a, b]

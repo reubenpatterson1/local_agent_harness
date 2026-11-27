@@ -1097,8 +1097,8 @@ def _h_job_cancel(self, groups, query, body):
 
 def _h_queue_move(self, groups, query, body):
     job_id, direction = body.get("id"), body.get("direction")
-    if direction not in ("up", "down"):
-        raise ApiError(400, "direction must be up or down")
+    if direction not in ("up", "down", "top", "bottom"):
+        raise ApiError(400, "direction must be up, down, top or bottom")
     if not (isinstance(job_id, str) and lib.JOB_ID_RE.fullmatch(job_id)):
         raise ApiError(409, "job %s is not queued" % (job_id,))
     with STORE_LOCK:

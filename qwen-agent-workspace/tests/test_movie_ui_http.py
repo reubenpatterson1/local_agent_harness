@@ -1790,3 +1790,24 @@ def test_batch_fix_a_malformed_record_does_not_hide_the_list(env, monkeypatch):
     lib.write_json_atomic(os.path.join(state, "batches", bad, "batch.json"), {"id": bad, "workspace": ws})
     status, _h, payload = mt.api(s, "GET", "/api/batches?ws=" + ws)
     assert status == 200 and [b["id"] for b in payload["batches"]] == [good]
+
+
+def test_qtb2_queue_move_top_and_bottom_over_http(env):
+    s, state, ws = env["srv"], env["state"], env["ws"]
+    a, b, c = (mt.make_job(state, ["true"], ws) for _ in range(3))
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": c, "direction": "top"})[:3:2] == (200, {"queued": [c, a, b]})
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": c, "direction": "bottom"})[:3:2] == (200, {"queued": [a, b, c]})
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": a, "direction": "bottom"})[:3:2] == (200, {"queued": [b, c, a]})
+    assert mt.api(s, "POST", "/api/queue/move", body={"id": b, "direction": "middle"})[:3:2] == (
+        400, {"error": "direction must be up, down, top or bottom"})
+
+
+def test_qtb3_jobs_page_has_top_and_bottom_buttons():
+    with open(os.path.join(mt.WS, "static", "movie-ui", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    for label, direction in (("Top", "top"), ("Up", "up"), ("Down", "down"), ("Bottom", "bottom")):
+        call = 'button("%s", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "%s"}); })' % (label, direction)
+        assert js.count(call) == 1
+    order = [js.index('button("%s", function' % label) for label in ("Top", "Up", "Down", "Bottom")]
+    order.append(js.index('button("Cancel", async function', order[-1]))
+    assert order == sorted(order)
