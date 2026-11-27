@@ -223,3 +223,22 @@ def test_ict24_the_server_never_imports_the_critic():
     for rel in ("movie_ui_server.py", "movie_ui_lib.py", "movie_ui_seedgen.py", "movie_ui_batch.py"):
         with open(os.path.join(WS, rel), encoding="utf-8") as f:
             assert "image_critic" not in f.read(), rel
+
+
+# --- ICT21b: a batch fork never keeps a critic its settings cannot run --------------------------------------------
+
+def test_ict21b_batch_forks_drop_a_critic_they_cannot_run(v1_env):
+    state = v1_env["state"]
+    orig = mt.fields(WS, seed_upload=UP, mode="shots", seed_edit_model="qwen21-q4", critic=True, width=None,
+                     height=None)
+    assert lib._rule_critic(orig) == []
+
+    def fork_of(settings):
+        return batch.merge(orig, {"settings": settings, "prompt": {}}, "s1", None, WS)[1]
+
+    assert fork_of({"panels": 12})["critic"] is True
+    for settings in ({"width": 768, "height": 512}, {"seed_upload": None}, {"mode": "chained"}):
+        fork = fork_of(settings)
+        assert fork["critic"] is False, settings
+        assert lib._rule_critic(fork) == [], settings
+        assert "--critic" not in lib.build_argv(fork, WS, state), settings
