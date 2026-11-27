@@ -933,3 +933,10 @@ def test_ict19_without_critic_the_phase_is_unchanged(clean_env, monkeypatch, cap
     _write_story(tmp, "s2")
     assert movie._phase2_shots_seed(_phase_args(tmp, story_id="s2", critic=False, critic_rounds=None)) == 0
     assert len(fake.calls["run_jobs"]) == 2
+
+
+def test_ic_final_main_calls_resolve_critic(clean_env, capsys):
+    rc = movie.main(["a narrative", "--story-id", "s1", "--dry-run", "--no-review", "--no-auto-lora", "--critic"])
+    captured = capsys.readouterr()
+    assert rc == 2 and captured.out == ""
+    assert captured.err == CRITIC_NEEDS
