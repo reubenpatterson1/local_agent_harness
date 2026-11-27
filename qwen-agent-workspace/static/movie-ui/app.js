@@ -3507,8 +3507,10 @@
       const tag = seedTag(job);
       queue.appendChild(el("tr", {data: {jobId: job.id}}, [el("td", {text: String(job.queue_position)}),
         el("td", {text: job.id}), el("td", {text: job.kind}), el("td", {}, tag ? [jobLabel(job), " ", tag] : [jobLabel(job)]),
-        el("td", {}, [button("Up", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "up"}); }),
+        el("td", {}, [button("Top", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "top"}); }),
+                      button("Up", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "up"}); }),
                       button("Down", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "down"}); }),
+                      button("Bottom", function () { jobAction("/api/queue/move", "POST", {id: job.id, direction: "bottom"}); }),
                       button("Cancel", async function () {
                         if (await askConfirm("Cancel queued job " + job.id + "?")) { jobAction("/api/jobs/" + job.id + "/cancel"); }
                       })])]));

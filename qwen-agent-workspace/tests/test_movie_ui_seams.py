@@ -430,3 +430,17 @@ def test_review_focus_5_a_refused_run_all_queues_no_seams_job(env, monkeypatch):
         mt.fields(ws, action="movie", mode="chained"), check_seams=True))
     assert (status, refused["error"]) == (409, "validation failed")
     assert lib.read_queue(state) == [] and lib.list_job_ids(state) == []
+
+
+def test_qtb4_a_seams_job_moved_to_top_is_still_skipped_ahead_of_its_movie(env, monkeypatch):
+    ws, state = env["ws"], env["state"]
+    movie = mt.make_job(state, mt.py_argv("print('render')"), ws, story_id="ronin-rescue")
+    seams = _after_seams(state, ws, movie)
+    assert lib.read_queue(state) == [movie, seams]
+    with srv.STORE_LOCK:
+        assert lib.move_job(state, seams, "top") == [seams, movie]
+    calls = _record_vlm(monkeypatch, env["tmp"])
+    launched = _record_launches(monkeypatch)
+    assert _tick(state) == movie
+    _skipped(state, seams, "skipped: movie %s has not run yet" % movie)
+    assert launched == [movie] and not os.path.exists(calls)

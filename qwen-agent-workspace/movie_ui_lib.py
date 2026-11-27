@@ -877,15 +877,24 @@ def cancel_job(state, job_id):
 
 
 def move_job(state, job_id, direction):
-    """Swap a queued job with its neighbour ("up" or "down"; a no-op at an end). Returns the new
-    queue, or None when the job is not queued (MU68)."""
+    """Move a queued job: "up" or "down" swaps it with its neighbour, "top" or "bottom" moves it to
+    the front or the end of the queue (a no-op where it already is). Returns the new queue, or None
+    when the job is not queued (MU68)."""
     queue = read_queue(state)
     if job_id not in queue or job_state(state, job_id, queue) != "queued":
         return None
     i = queue.index(job_id)
-    j = i - 1 if direction == "up" else i + 1
-    if 0 <= j < len(queue):
-        queue[i], queue[j] = queue[j], queue[i]
+    if direction == "top":
+        j = 0
+    elif direction == "bottom":
+        j = len(queue) - 1
+    else:
+        j = i - 1 if direction == "up" else i + 1
+    if 0 <= j < len(queue) and j != i:
+        if direction in ("top", "bottom"):
+            queue.insert(j, queue.pop(i))
+        else:
+            queue[i], queue[j] = queue[j], queue[i]
         write_queue(state, queue)
     return queue
 
