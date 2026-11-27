@@ -410,7 +410,7 @@ def test_cl_t34_batch_forks_are_unchanged():
         "model": "render", "gemma": "render", "video_loras": "render", "action_loras": "render",
         "frames": "render", "fps": "render", "no_low_ram": "render", "panel_timeout": "render",
         "width": "stills", "height": "stills", "stills_loras": "stills", "location_strength": "stills",
-        "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills",
+        "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills", "critic": "stills",
         "narrative": "replan", "goal": "replan", "panels": "replan", "length": "replan",
         "seed_upload": "replan", "mode": "replan", "characters": "replan", "locations": "replan",
         "narration": "replan", "story_model": "replan", "story_legacy": "replan", "judge": "replan",
@@ -418,9 +418,9 @@ def test_cl_t34_batch_forks_are_unchanged():
     root = subprocess.run(["git", "-C", WS, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     if root.returncode != 0:
         pytest.skip("not a git checkout")
-    if subprocess.run(["git", "-C", WS, "cat-file", "-e", "20cee82^{commit}"], capture_output=True).returncode:
-        pytest.skip("20cee82 is not in this checkout")
-    proc = subprocess.run(["git", "-C", WS, "diff", "--quiet", "20cee82", "--", "movie_ui_batch.py"],
+    if subprocess.run(["git", "-C", WS, "cat-file", "-e", "acf6be3d34c367335d0a494baf627ab859bfb59d^{commit}"], capture_output=True).returncode:
+        pytest.skip("acf6be3d34c367335d0a494baf627ab859bfb59d is not in this checkout")
+    proc = subprocess.run(["git", "-C", WS, "diff", "--quiet", "acf6be3d34c367335d0a494baf627ab859bfb59d", "--", "movie_ui_batch.py"],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
