@@ -228,6 +228,11 @@ def validate_run_request(body):
     qwen_model_id, loras, error = _qwen_fields(body, model)
     if error is not None:
         return None, error
+    critic = body.get("critic")
+    if not _absent(body, "critic") and not isinstance(critic, bool):
+        return None, "critic must be true or false"
+    if critic is True and model != "qwen":
+        return None, "critic is only for qwen"
     source, error = _source(body.get("source"))
     if error is not None:
         return None, error
@@ -235,9 +240,12 @@ def validate_run_request(body):
         strength = STRENGTH_DEFAULT if strength is None else float(strength)
     else:
         strength = None
-    return {"prompt": prompt, "model": model, "strength": strength,
-            "candidates": CANDIDATES_DEFAULT if candidates is None else candidates,
-            "seed": seed, "qwen_model": qwen_model_id, "loras": loras, "source": source}, None
+    clean = {"prompt": prompt, "model": model, "strength": strength,
+             "candidates": CANDIDATES_DEFAULT if candidates is None else candidates,
+             "seed": seed, "qwen_model": qwen_model_id, "loras": loras, "source": source}
+    if critic is True:
+        clean["critic"] = True
+    return clean, None
 
 
 def valid_folder(name):

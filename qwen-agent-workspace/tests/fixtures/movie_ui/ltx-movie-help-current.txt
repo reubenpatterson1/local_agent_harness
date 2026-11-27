@@ -58,6 +58,10 @@ options:
   --extra-ref PATH[:CAPTION]
                         an extra reference picture for every Qwen edit of the
                         run (repeatable)
+  --critic              with --shots, --seed-image and a Qwen --seed-edit-model
+                        ID: the local VLM judges every panel's seed edit for
+                        broken bodies and re-edits the failures
+  --critic-rounds N     with --critic: at most N redo rounds (0 to 4, default 2)
   --panels PANELS       number of chained clips; panel 1 also gets the movie's
                         one still image; mutually exclusive with --length
   --length LENGTH       total movie length in seconds; mutually exclusive with

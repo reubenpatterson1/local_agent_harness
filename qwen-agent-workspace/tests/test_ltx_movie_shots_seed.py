@@ -12,6 +12,10 @@ to the multi-job fake _FakeShotsQwenEdit (the real qwen_edit's pure parts, and r
 wait_for_memory and run_jobs). SET15 and Review Focus 3 use the real qwen_edit instead, with test_qwen_edit's
 env fixture and the stub children of tests/test_seed_edit_tool.py. No test loads a model, renders, contacts a
 server or touches port 8177 or 8178. Stdlib, PIL and pytest.
+
+ICT17-ICT19 (docs/superpowers/specs/2026-11-27-image-critic-design.md, 6.2) pin --critic: _resolve_critic's rules,
+a shots seed run whose panel 2 the critic re-edits (the real image_critic with test_image_critic's FakeCD, so no
+VLM is reached) and the unchanged run without the flag.
 """
 
 import argparse
@@ -28,7 +32,9 @@ import pytest
 from PIL import Image
 
 import movie_ui_testutil as mt
+import image_critic
 import qwen_edit
+import test_image_critic as ict
 import test_seed_edit_tool as st
 from test_qwen_edit import _bf16_cache, _mflux_ready, env  # noqa: F401
 
@@ -733,3 +739,204 @@ def test_sse_review_focus_4_a_block_and_a_failure_in_one_batch(clean_env, capsys
     fake.reset()
     assert movie._phase2_shots_seed(_phase_args(tmp)) == 0
     assert _jobs(fake) == [[1, 2, 3], [2, 3]] and len(fake.calls["wait_for_memory"]) == 2
+
+
+# --- ICT17-ICT19 (image critic spec 2.9, 6.2): --critic in shots mode with a seed image ------------------------
+
+CRITIC_NEEDS = ("Error: --critic needs --shots with --seed-image and a Qwen --seed-edit-model ID: the image critic "
+                "judges the shots seed edits only\n")
+
+
+def test_ict17_resolve_critic(clean_env, capsys, monkeypatch):
+    tmp = clean_env["tmp"]
+    seed = st.png(os.path.join(tmp, "seed.png"), (64, 64))
+    edit = {"qwen_model": "qwen21-q4", "loras": []}
+
+    def args_of(*extra, shots=True, seed_image=True, seed_edit=edit, seed_context=None):
+        argv = (["--shots"] if shots else []) + (["--seed-image", seed] if seed_image else []) + list(extra)
+        args = _parse(*argv)
+        args.seed_edit, args.seed_context = seed_edit, seed_context
+        return args
+
+    cases = [(args_of("--critic-rounds", "1"), "Error: --critic-rounds needs --critic\n"),
+             (args_of("--critic", "--critic-rounds", "5"), "Error: --critic-rounds must be an integer from 0 to 4\n"),
+             (args_of("--critic", "--critic-rounds", "-1"), "Error: --critic-rounds must be an integer from 0 to 4\n"),
+             (args_of("--critic", seed_context={"mode": "still", "order": "seed-first"}),
+              "Error: --critic cannot be combined with --seed-context: a redone still would change every later "
+              "panel's context picture\n"),
+             (args_of("--critic", shots=False), CRITIC_NEEDS),
+             (args_of("--critic", seed_image=False), CRITIC_NEEDS),
+             (args_of("--critic", seed_edit=None), CRITIC_NEEDS)]
+    for args, text in cases:
+        assert movie._resolve_critic(args) == 2, text
+        assert capsys.readouterr().err == text
+    assert movie._resolve_critic(args_of()) == 0
+    args = args_of("--critic")
+    assert movie._resolve_critic(args) == 0 and args.critic_rounds is None
+    args = args_of("--critic", "--critic-rounds", "3")
+    assert movie._resolve_critic(args) == 0 and args.critic_rounds == 3
+    assert movie._resolve_critic(args_of("--critic", "--critic-rounds", "0")) == 0
+    assert capsys.readouterr().err == ""
+    monkeypatch.setattr(movie, "WS", tmp)
+    assert movie._resolve_critic(args_of("--critic")) == 2
+    assert capsys.readouterr().err == (
+        "Error: --critic needs %s, which this workspace does not have\n" % os.path.join(tmp, "image_critic.py"))
+    text = movie.build_parser().format_help()
+    assert "--critic" in text and "--critic-rounds" in text
+
+
+class _ColourQwenEdit(_FakeShotsQwenEdit):
+    """ICT18: run_jobs writes a 64x64 PNG of colour (seed % 256, 0, 40 * n) for every job, reports it ok and calls
+    on_result only when it is given (the critic's redo batches pass none)."""
+
+    def run_jobs(self, model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None,
+                 noun="job"):
+        self.calls["run_jobs"].append({"model_id": model_id, "loras": loras, "jobs": [dict(j) for j in jobs],
+                                       "size": (width, height), "skill": skill, "work_dir": work_dir, "noun": noun})
+        results = []
+        for job in jobs:
+            Image.new("RGB", (64, 64), (job["seed"] % 256, 0, 40 * job["n"])).save(job["output_path"])
+            result = {"n": job["n"], "output_path": job["output_path"], "status": "ok", "seconds": 12.5}
+            if on_result is not None:
+                on_result(dict(result))
+            results.append(result)
+        return results, None
+
+
+def _critic_fakes(monkeypatch, fake):
+    """movie._qwen_edit is fake and movie._image_critic the real image_critic, whose _cd is a fresh
+    test_image_critic.FakeCD; returns (cd, the argv of every detached Popen)."""
+    cd, popens = ict.FakeCD([]), []
+    monkeypatch.setattr(movie, "_qwen_edit", lambda: fake)
+    monkeypatch.setattr(image_critic, "_cd", lambda: cd)
+    monkeypatch.setattr(image_critic, "subprocess", types.SimpleNamespace(
+        Popen=lambda argv, **kw: popens.append(argv), DEVNULL=-3))
+    monkeypatch.setattr(movie, "_image_critic", lambda: image_critic)
+    return cd, popens
+
+
+def test_ict18_shots_with_the_critic_end_to_end(clean_env, monkeypatch, capsys):
+    tmp = clean_env["tmp"]
+    fake = _ColourQwenEdit()
+    cd, _popens = _critic_fakes(monkeypatch, fake)
+    story_dir = _write_story(tmp)
+    work = os.path.join(story_dir, "seed_edits")
+    redo_seed = image_critic.critic_seed(3, 1, 2)
+    cd.replies.update({os.path.join(work, "panel_01.png"): [ict.verdict(8)],
+                       os.path.join(work, "panel_02.png"): [ict.verdict(3, ["fused left hand"])],
+                       os.path.join(work, "panel_03.png"): [ict.verdict(8)],
+                       os.path.join(work, "critic", "panel_02.r1.png"): [ict.verdict(9)]})
+    assert movie._phase2_shots_seed(_phase_args(tmp, critic=True, critic_rounds=None)) == 0
+    assert _jobs(fake) == [[1, 2, 3], [2]]
+    assert fake.calls["run_jobs"][1]["jobs"][0]["seed"] == redo_seed
+    assert [call[2] for call in fake.calls["wait_for_memory"]] == ["ltx-movie", "ltx-movie"]
+    with Image.open(_still(story_dir, 2)) as img:
+        assert img.size == (1408, 896) and img.getpixel((704, 448)) == (redo_seed % 256, 0, 80)
+    with Image.open(_still(story_dir, 1)) as img:
+        assert img.getpixel((704, 448)) == (3, 0, 40)
+    entries = _record(story_dir)["panels"]
+    two = entries[1]
+    assert list(two) == ENTRY_KEYS + ["critic"]
+    assert (two["seed"], two["critic"]["seed_used"], two["critic"]["status"]) == (3, redo_seed, "passed")
+    assert two["still_sha256"] == _sha(_still(story_dir, 2))
+    assert [e["critic"]["status"] for e in entries] == ["passed"] * 3
+    assert [e["critic"]["seed_used"] for e in (entries[0], entries[2])] == [3, 3]
+    out = capsys.readouterr().out.splitlines()
+    assert "panel 2 -> %s (critic: a better attempt of the Qwen edit of the seed)" % _still(story_dir, 2) in out
+    assert "critic 2/3: redo (score 3: fused left hand)" in out and "critic 2/3: ok (score 9, attempt 2)" in out
+    assert out[-1] == "seed edits: 3 panel stills written"
+    assert movie._phase2_shots_seed(_phase_args(tmp, critic=True, critic_rounds=None)) == 0
+    assert len(fake.calls["run_jobs"]) == 2
+    assert capsys.readouterr().out.splitlines() == [
+        "seed edits: reusing the stills of panels 1,2,3 (recorded edits of the same seed image, prompt, seed and "
+        "settings)",
+        "seed edits: every panel's still is a recorded edit of the same seed image, prompt, seed and settings; "
+        "nothing to edit"]
+
+
+class _InterruptedRedoQwenEdit(_ColourQwenEdit):
+    """Review Focus 4: the critic's redo batch (the call without on_result) writes its stage file, then raises
+    KeyboardInterrupt, as a movie-ui Cancel during a redo does."""
+
+    def run_jobs(self, model_id, loras, jobs, width, height, skill, work_dir, log_path=None, on_result=None,
+                 noun="job"):
+        if on_result is None:
+            with open(jobs[0]["stage_path"], "wb") as f:
+                f.write(b"partial")
+            raise KeyboardInterrupt()
+        return _ColourQwenEdit.run_jobs(self, model_id, loras, jobs, width, height, skill, work_dir, log_path,
+                                        on_result, noun)
+
+
+def test_ic_review_focus_4_an_interrupted_shots_redo_keeps_a_consistent_record(clean_env, monkeypatch, capsys):
+    tmp = clean_env["tmp"]
+    cd, popens = _critic_fakes(monkeypatch, _InterruptedRedoQwenEdit())
+    story_dir = _write_story(tmp)
+    work = os.path.join(story_dir, "seed_edits")
+    cd.replies.update({os.path.join(work, "panel_01.png"): [ict.verdict(8)],
+                       os.path.join(work, "panel_02.png"): [ict.verdict(3, ["fused left hand"])],
+                       os.path.join(work, "panel_03.png"): [ict.verdict(8)]})
+    with pytest.raises(KeyboardInterrupt):
+        movie._phase2_shots_seed(_phase_args(tmp, critic=True, critic_rounds=None))
+    two = _record(story_dir)["panels"][1]
+    assert (two["status"], two["critic"]["status"], two["critic"]["score"]) == ("ok", "flagged", 3)
+    assert two["still_sha256"] == _sha(_still(story_dir, 2))
+    with Image.open(_still(story_dir, 2)) as img:
+        assert img.getpixel((704, 448)) == (3, 0, 80)
+    assert glob.glob(os.path.join(work, "critic", "*.pending.png")) == []
+    assert popens == []
+    capsys.readouterr()
+    monkeypatch.setattr(movie, "_qwen_edit", lambda: clean_env["fake"])
+    assert movie._phase2_shots_seed(_phase_args(tmp)) == 0
+    assert clean_env["fake"].calls["run_jobs"] == []
+
+
+def test_ic_review_focus_5_a_single_panel_redo_batch(clean_env, monkeypatch, capsys):
+    tmp = clean_env["tmp"]
+    fake = _ColourQwenEdit()
+    cd, _popens = _critic_fakes(monkeypatch, fake)
+    story_dir = _write_story(tmp)
+    assert movie._phase2_shots_seed(_phase_args(tmp)) == 0
+    work = os.path.join(story_dir, "seed_edits")
+    cd.replies.update({os.path.join(work, "panel_03.png"): [ict.verdict(2, ["extra arm"])],
+                       os.path.join(work, "critic", "panel_03.r1.png"): [ict.verdict(9)]})
+    capsys.readouterr()
+    assert movie._phase2_shots_seed(_phase_args(tmp, redo_panels=[3], critic=True, critic_rounds=None)) == 0
+    assert _jobs(fake) == [[1, 2, 3], [3], [3]]
+    (first,), (redo,) = fake.calls["run_jobs"][1]["jobs"], fake.calls["run_jobs"][2]["jobs"]
+    assert redo["seed"] == image_critic.critic_seed(3, 1, 3)
+    assert (os.path.basename(first["stage_path"]), os.path.basename(redo["stage_path"])) == (
+        "panel_03.pending.png", "panel_03.r1.pending.png")
+    assert sorted(cd.calls) == [os.path.join(work, "critic", "panel_03.r1.png"), os.path.join(work, "panel_03.png")]
+    entries = _record(story_dir)["panels"]
+    assert ["critic" in entry for entry in entries] == [False, False, True]
+    assert (entries[2]["critic"]["status"], entries[2]["critic"]["seed_used"]) == (
+        "passed", image_critic.critic_seed(3, 1, 3))
+    out = capsys.readouterr().out.splitlines()
+    assert "critic 3/3: redo (score 2: extra arm)" in out and "critic 3/3: ok (score 9, attempt 2)" in out
+    assert "critic: redo round 1 of 2: panel 3 with new seeds" in out
+
+
+def test_ict19_without_critic_the_phase_is_unchanged(clean_env, monkeypatch, capsys):
+    tmp, fake = clean_env["tmp"], clean_env["fake"]
+
+    def refuse():
+        raise AssertionError("_image_critic must not be called without --critic")
+
+    monkeypatch.setattr(movie, "_image_critic", refuse)
+    story_dir = _write_story(tmp)
+    assert movie._phase2_shots_seed(_phase_args(tmp)) == 0
+    assert len(fake.calls["run_jobs"]) == 1
+    assert all("critic" not in entry for entry in _record(story_dir)["panels"])
+    assert not [line for line in capsys.readouterr().out.splitlines() if line.startswith("critic")]
+    assert not os.path.exists(os.path.join(story_dir, "seed_edits", "critic"))
+    _write_story(tmp, "s2")
+    assert movie._phase2_shots_seed(_phase_args(tmp, story_id="s2", critic=False, critic_rounds=None)) == 0
+    assert len(fake.calls["run_jobs"]) == 2
+
+
+def test_ic_final_main_calls_resolve_critic(clean_env, capsys):
+    rc = movie.main(["a narrative", "--story-id", "s1", "--dry-run", "--no-review", "--no-auto-lora", "--critic"])
+    captured = capsys.readouterr()
+    assert rc == 2 and captured.out == ""
+    assert captured.err == CRITIC_NEEDS

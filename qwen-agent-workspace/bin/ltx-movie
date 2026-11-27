@@ -118,6 +118,11 @@ passed to Phase 2 as its --seed-image. Absent, or as-is, the seed is used unchan
 the seed as panel 1 and renders every other panel's still with Z-Image and its stills LoRAs, as
 --shots does without a seed.
 
+Image critic (docs/superpowers/specs/2026-11-27-image-critic-design.md): --critic with --shots, --seed-image and a
+Qwen --seed-edit-model ID judges every panel's seed edit with the local VLM between Qwen batches and re-edits the
+failures with new seeds (--critic-rounds, default 2); the best attempt is the still, and seed_edits.json records
+each panel's verdict. It loads image_critic.py by path, only with --critic.
+
 Extra references (docs/superpowers/specs/2026-11-13-extra-reference-images-design.md): --extra-ref PATH[:CAPTION]
 (repeatable, at most 9) adds the user's pictures (a location, a prop, a style) to every Qwen edit of the run, after
 the edit's own pictures (the seed, the context picture or the two cast stills), each named in the edit prompt by its
@@ -448,6 +453,13 @@ def build_parser():
                          metavar="ID=SCALE",
                          help="with --seed-edit-model ID: a registry LoRA of that model's family, 0 < SCALE <= 2 "
                               "(repeatable); none listed means no LoRA")
+    parser.add_argument("--critic", dest="critic", action="store_true",
+                         help="with --shots, --seed-image and a Qwen --seed-edit-model ID: the local VLM (bin/story-server "
+                              "mlx-vision) judges every panel's seed edit for broken bodies between Qwen batches and "
+                              "re-edits the failures with new seeds; the best attempt is kept and flagged when none "
+                              "passes. See docs/superpowers/specs/2026-11-27-image-critic-design.md.")
+    parser.add_argument("--critic-rounds", dest="critic_rounds", type=int, default=None, metavar="N",
+                         help="with --critic: at most N redo rounds (0 to 4, default 2; 0 judges without redoing)")
     parser.add_argument("--panels", type=int, default=15,
                          help="number of chained clips; panel 1 also gets the movie's "
                               "one still image; mutually exclusive with --length. With the "
@@ -1003,6 +1015,12 @@ def _qwen_edit():
     return importlib.machinery.SourceFileLoader("qwen_edit", os.path.join(WS, "qwen_edit.py")).load_module()
 
 
+def _image_critic():
+    """image_critic.py (image critic spec 2.9), loaded by path and only with --critic, so a run without it, a dry run
+    and the deploy package never read it."""
+    return importlib.machinery.SourceFileLoader("image_critic", os.path.join(WS, "image_critic.py")).load_module()
+
+
 def _ltx2_skill():
     """ltx2_mlx_video_skill.py, loaded by path, for the host-aware autotune helper."""
     return importlib.machinery.SourceFileLoader(
@@ -1319,6 +1337,32 @@ def _resolve_seed_context(args):
               % (edit["qwen_model"], problem), file=sys.stderr)
         return 2
     args.seed_context = {"mode": mode, "order": order or "seed-first"}
+    return 0
+
+
+def _resolve_critic(args):
+    """--critic/--critic-rounds (image critic spec 2.9): returns 0, or 2 after one Error: line. args.critic_rounds
+    stays None for the default (image_critic.DEFAULT_ROUNDS). Loads nothing: Phase 2 loads image_critic.py."""
+    if args.critic_rounds is not None and not args.critic:
+        print("Error: --critic-rounds needs --critic", file=sys.stderr)
+        return 2
+    if not args.critic:
+        return 0
+    if args.critic_rounds is not None and not 0 <= args.critic_rounds <= 4:
+        print("Error: --critic-rounds must be an integer from 0 to 4", file=sys.stderr)
+        return 2
+    if getattr(args, "seed_context", None):
+        print("Error: --critic cannot be combined with --seed-context: a redone still would change every later "
+              "panel's context picture", file=sys.stderr)
+        return 2
+    if not (args.shots and getattr(args, "seed_image", None) and getattr(args, "seed_edit", None)):
+        print("Error: --critic needs --shots with --seed-image and a Qwen --seed-edit-model ID: the image critic "
+              "judges the shots seed edits only", file=sys.stderr)
+        return 2
+    path = os.path.join(WS, "image_critic.py")
+    if not os.path.isfile(path):
+        print("Error: --critic needs %s, which this workspace does not have" % path, file=sys.stderr)
+        return 2
     return 0
 
 
@@ -3067,6 +3111,18 @@ def _phase2_shots_seed(args):
         entries[n] = record_entry(n, result["status"], result["seconds"], None)
         _write_shots_seed_record(files["record"], entries, total)
 
+    def on_verdict(n, block):
+        entries[n]["critic"] = block
+        _write_shots_seed_record(files["record"], entries, total)
+
+    def on_best(n, output_path):
+        still = os.path.join(paths["images_dir"], "panel_%02d.png" % n)
+        fit.fit_letterbox(fit.load_oriented_rgb(output_path), still_w, still_h).save(still + ".tmp", format="PNG")
+        os.replace(still + ".tmp", still)
+        entries[n]["still_sha256"] = _sha256_file(still)
+        _write_shots_seed_record(files["record"], entries, total)
+        print("panel %d -> %s (critic: a better attempt of the Qwen edit of the seed)" % (n, still))
+
     _extra_refs_note(args)
     _extra_refs_write(args)
     jobs = [_extra_refs_job(args, {"n": n, "seed": args.image_seed, "prompt": prompts[n], "source": files["original"],
@@ -3074,8 +3130,16 @@ def _phase2_shots_seed(args):
                                    "output_path": os.path.join(files["work"], "panel_%02d.png" % n)}) for n in todo]
     try:
         qe.wait_for_memory(qe.memory_floor(model_id, _edit_references(jobs)), label, tag="ltx-movie")
-        results, failure = qe.run_jobs(model_id, loras, jobs, width, height, SHOTS_SEED_EDIT_SKILL, files["work"],
-                                       on_result=on_result, noun="panel")
+        if getattr(args, "critic", False):
+            ic = _image_critic()
+            rounds = ic.DEFAULT_ROUNDS if args.critic_rounds is None else args.critic_rounds
+            results, failure = ic.edit_with_critic(qe, model_id, loras, jobs, width, height, SHOTS_SEED_EDIT_SKILL,
+                                                   files["work"], rounds=rounds, total=total, on_result=on_result,
+                                                   on_verdict=on_verdict, on_best=on_best, noun="panel",
+                                                   tag="ltx-movie")
+        else:
+            results, failure = qe.run_jobs(model_id, loras, jobs, width, height, SHOTS_SEED_EDIT_SKILL, files["work"],
+                                           on_result=on_result, noun="panel")
     except qe.Unavailable as e:
         results, failure = None, str(e)
     status = dict((r["n"], r["status"]) for r in results or [])
@@ -4483,6 +4547,9 @@ def main(argv=None):
     if rc:
         return rc
     rc = _resolve_seed_context(args)
+    if rc:
+        return rc
+    rc = _resolve_critic(args)
     if rc:
         return rc
     rc = _resolve_extra_refs(args)       # extra references XR4: after autotune and every edit resolver

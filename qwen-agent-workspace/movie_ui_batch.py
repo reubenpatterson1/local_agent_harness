@@ -32,7 +32,7 @@ LEVELS = ("render", "stills", "replan")            # rank order
 LEVEL_LABELS = {"render": "Render", "stills": "New stills", "replan": "Re-plan"}
 FIXED_KEYS = ("ws", "action", "story_id", "overwrite_movie", "redo")
 GROUPS = (("panels", "length"),
-          ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs"))
+          ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs", "critic"))
 FORK_SUFFIX_RE = re.compile(r"-b([0-9]+)-v[0-9]+$")
 
 # Spec 2.1 (BF4, BK1): the level of every editable DEFAULT_FIELDS key.
@@ -40,7 +40,7 @@ FIELD_LEVELS = {
     "model": "render", "gemma": "render", "video_loras": "render", "action_loras": "render",
     "frames": "render", "fps": "render", "no_low_ram": "render", "panel_timeout": "render",
     "width": "stills", "height": "stills", "stills_loras": "stills", "location_strength": "stills",
-    "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills",
+    "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills", "critic": "stills",
     "narrative": "replan", "goal": "replan", "panels": "replan", "length": "replan",
     "seed_upload": "replan", "mode": "replan", "characters": "replan", "locations": "replan",
     "narration": "replan", "story_model": "replan", "story_legacy": "replan", "judge": "replan",
@@ -209,14 +209,19 @@ def merge(last_fields, variant, story_id, fork_id, ws_real):
             fork["seed_upload"] = None
             fork["seed_edit_model"] = fork["seed_edit_loras"] = None
             fork["extra_refs"] = []                                       # rule 12e: no extras without an edit
+            fork["critic"] = False                                        # rule 12f: no critic without an edit
         elif key == "seed_upload" and value is not None:
             fork["width"] = fork["height"] = None
         elif key == "seed_upload" and value is None:
             fork["seed_edit_model"] = fork["seed_edit_loras"] = None      # rule 12d: no edit without a seed
             fork["extra_refs"] = []                                       # rule 12e: no extras without an edit
+            fork["critic"] = False                                        # rule 12f: no critic without an edit
     if fork["mode"] == "shots" and orig["mode"] != "shots" and fork["seed_edit_model"] == "as-is":
         fork["seed_edit_model"] = None      # Z-Image is chosen in Compose only, never by a fork
         fork["extra_refs"] = []             # rule 12e: no extras without an edit
+        fork["critic"] = False              # rule 12f: no critic without an edit
+    if fork["mode"] != "shots":
+        fork["critic"] = False              # rule 12f: the critic is for shots mode only
     fork["narrative"], warnings = edit_prompt(orig["narrative"], variant["prompt"], story_id)
     return orig, fork, warnings
 

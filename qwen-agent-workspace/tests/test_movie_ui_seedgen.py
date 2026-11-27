@@ -1404,3 +1404,39 @@ def test_sg_final_files_refuses_a_runs_work_directory(env):
     peek = os.path.join(ws, "generated", "peek.png")
     os.symlink(os.path.join(work, "cand_02.pending.png"), peek)
     assert mt.api(s, "GET", "/files?ws=%s&path=%s" % (ws, peek))[0] == 403
+
+
+# --- ICT22b (image critic spec 2.10, 6.2): a critic run over HTTP, and its verdicts in the run view ------------------
+
+def test_ict22b_a_critic_seed_run_over_http(env):
+    s, ws, state = env["srv"], env["ws"], env["state"]
+    up = _upload(s)
+    body = _body(ws, {"upload_id": up}, model="qwen", strength=None, qwen_model="qwen21-q4",
+                 loras=[{"id": "uncensored", "scale": 0.5}], critic=True)
+    status, _h, data = _create(s, body)
+    assert status == 201, data
+    run, run_dir = data["run"]["run"], data["run"]["dir"]
+    job = lib.read_job(lib.job_dir(state, data["run"]["job"]["id"]))
+    assert job["fields"]["critic"] is True and list(job["fields"])[-1] == "critic"
+    assert job["argv"] == lib.seed_edit_argv(job["fields"], ws)
+    assert job["argv"][job["argv"].index("--candidates") - 1] == "--critic"
+    record = _record(run_dir)
+    assert "critic" not in record and all("critic" not in c for c in record["candidates"])
+    assert all("critic" not in c for c in data["run"]["candidates"])
+    record["candidates"][0]["critic"] = {"status": "flagged", "score": 5, "defects": ["fused hand"], "reason": "r",
+                                         "attempts": [{}, {}]}
+    with open(os.path.join(run_dir, "run.json"), "w", encoding="utf-8") as f:
+        json.dump(record, f)
+    status, _h, view = mt.api(s, "GET", "/api/seeds/runs/%s?ws=%s" % (run, ws))
+    assert status == 200, view
+    first, second = view["candidates"]
+    assert first["critic"] == {"status": "flagged", "score": 5, "defects": ["fused hand"], "reason": "r",
+                               "attempts": 2}
+    assert "critic" not in second
+    assert _create(s, dict(body, model="zimage", strength=0.45, qwen_model=None, loras=None))[::2] == (
+        400, {"error": "critic is only for qwen"})
+    assert _create(s, dict(body, critic="yes"))[::2] == (400, {"error": "critic must be true or false"})
+    status, _h, data = _create(s, dict(body, critic=False))
+    assert status == 201, data
+    job = lib.read_job(lib.job_dir(state, data["run"]["job"]["id"]))
+    assert "critic" not in job["fields"] and "--critic" not in job["argv"]

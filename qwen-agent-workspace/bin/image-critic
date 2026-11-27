@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""image-critic -- score images for broken bodies with the local VLM, to calibrate image_critic.PASS_SCORE
+(docs/superpowers/specs/2026-11-27-image-critic-design.md, Section 2.7).
+
+  bin/image-critic score FILE [FILE ...] [--seed PATH] [--pass-score N] [--json]
+
+Needs the VLM serving (bin/story-server mlx-vision); it starts and stops nothing and writes nothing. --seed sends
+that photo first, as the edit's source. Exit 0 every file judged; 1 at least one file not judged; 2 a usage error, a
+missing file or the VLM not serving. Python 3.9 and 3.13.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+WS = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, WS)
+
+import image_critic as ic  # noqa: E402
+
+
+def _defects_text(defects):
+    return "; ".join(defects) or "no defect named"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="image-critic", description="Score images for broken bodies with the "
+                                     "local VLM, to calibrate image_critic.PASS_SCORE.")
+    sub = parser.add_subparsers(dest="cmd")
+    sub.required = True
+    score = sub.add_parser("score", help="judge each FILE and print its score, verdict and defects")
+    score.add_argument("files", nargs="+", metavar="FILE")
+    score.add_argument("--seed", default=None, metavar="PATH")
+    score.add_argument("--pass-score", dest="pass_score", type=int, default=ic.PASS_SCORE, metavar="N")
+    score.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    if not 1 <= args.pass_score <= 10:
+        print("Error: --pass-score must be an integer from 1 to 10", file=sys.stderr)
+        return 2
+    for path in ([args.seed] if args.seed is not None else []) + args.files:
+        if not os.path.isfile(path):
+            print("Error: %s is not a file" % path, file=sys.stderr)
+            return 2
+    if not ic.vlm_ready():
+        print("Error: the VLM is not serving at %s; start it with bin/story-server mlx-vision" % ic.vlm_models_url(),
+              file=sys.stderr)
+        return 2
+    rows, down = [], None
+    for path in args.files:
+        if down is not None:
+            rows.append((path, None, down))
+            continue
+        try:
+            rows.append((path, ic.judge_image(path, args.seed), None))
+        except ic.VLMUnavailable as e:
+            down = str(e)
+            rows.append((path, None, down))
+        except ic.JudgeError as e:
+            rows.append((path, None, str(e)))
+    counts = {"pass": 0, "fail": 0, "unjudged": 0}
+    for path, v, error in rows:
+        if v is None:
+            word = "unjudged"
+        else:
+            word = "pass" if v["score"] >= args.pass_score else "fail"
+        counts[word] += 1
+        if args.json:
+            print(json.dumps({"path": path, "score": v["score"] if v else None, "verdict": word,
+                              "defects": v["defects"] if v else [], "reason": v["reason"] if v else None,
+                              "error": error}, sort_keys=True))
+        elif v is None:
+            print("%s: UNJUDGED: %s" % (path, error))
+        else:
+            print("%s: score %d %s: %s -- %s" % (path, v["score"], word.upper(), _defects_text(v["defects"]),
+                                                  v["reason"] or "-"))
+    if not args.json:
+        print("pass score %d: %d pass, %d fail, %d unjudged" % (args.pass_score, counts["pass"], counts["fail"],
+                                                                 counts["unjudged"]))
+    return 1 if counts["unjudged"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

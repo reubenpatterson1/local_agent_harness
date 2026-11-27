@@ -1999,3 +1999,102 @@ def test_qe_review_focus_2_an_interrupt_kills_the_qwen_child(env, capsys):
     record = record_of(run_dir)
     assert (record["state"], record["error"]) == ("cancelled", "interrupted")
     assert capsys.readouterr().err == "seed-edit: interrupted\n"
+
+
+# --- ICT14-ICT16 (image critic spec 2.8, 6.2): --critic and --critic-rounds -----------------------------------------
+
+CRITIC_RANGE = "--critic-rounds must be an integer from 0 to 4"
+CRITIC_CASES = [
+    (BASE + ["--critic"], "--critic is only for --model qwen"),
+    (QBASE + ["--critic-rounds", "1"], "--critic-rounds needs --critic"),
+    (QBASE + ["--critic", "--critic-rounds", "5"], CRITIC_RANGE),
+    (QBASE + ["--critic", "--critic-rounds", "x"], CRITIC_RANGE),
+    (QBASE + ["--critic", "--critic-rounds", "-1"], CRITIC_RANGE),
+    (["--probe", "--critic"], "--probe takes no other options"),
+    (["--probe", "--critic-rounds", "1"], "--probe takes no other options"),
+]
+
+
+@pytest.mark.parametrize("argv,message", CRITIC_CASES, ids=["case%d" % (i + 1) for i in range(len(CRITIC_CASES))])
+def test_ict14_the_critic_option_rules(env, capsys, argv, message):
+    source = png(os.path.join(env["tmp"], "src.png"), (128, 128))
+    run_dir = os.path.join(env["tmp"], "runs", RUN)
+    argv = [source if a == "SRC" else run_dir if a == "RUNDIR" else a for a in argv]
+    assert env["tool"].main(argv) == 2
+    assert capsys.readouterr() == ("", "Error: %s\n" % message)
+    assert not os.path.exists(run_dir)
+
+
+def test_ict14_the_cleaned_critic_options(env):
+    tool = env["tool"]
+
+    def opts(*extra):
+        got = tool.check_args(tool.parse(["--source", "s", "--prompt", PROMPT, "--model", "qwen", "--run-dir", "r",
+                                          "--seed", "1"] + list(extra)))
+        return got["critic"], got["critic_rounds"]
+
+    assert opts() == (False, None)
+    assert opts("--critic") == (True, None)
+    assert opts("--critic", "--critic-rounds", "0") == (True, 0)
+    assert opts("--critic", "--critic-rounds", "4") == (True, 4)
+
+
+def test_ict15_without_critic_the_run_is_unchanged(env, capsys):
+    env["mp"].delitem(sys.modules, "image_critic", raising=False)
+    mflux_venv(env)
+    mflux_weights(env)
+    code, run_dir = run_tool(env, "--qwen-model", "qwen2511-q4", "--candidates", "2", "--seed", "100", model="qwen")
+    assert code == 0
+    record = record_of(run_dir)
+    assert "critic" not in record
+    assert [list(c) for c in record["candidates"]] == [["n", "seed", "status", "seconds"]] * 2
+    assert not [line for line in capsys.readouterr().out.splitlines() if line.startswith("critic")]
+    assert "image_critic" not in sys.modules
+    assert not os.path.exists(os.path.join(run_dir, "work", "critic"))
+
+
+def test_ict16_the_critic_wiring(env, capsys):
+    py, _venv = mflux_venv(env)
+    mflux_weights(env)
+    seen = []
+    fake = types.ModuleType("image_critic")
+    fake.DEFAULT_ROUNDS, fake.PASS_SCORE = 2, 7
+
+    def edit_with_critic(qe, model_id, loras, jobs, width, height, skill, work_dir, rounds=2, total=None,
+                         on_result=None, on_verdict=None, on_best=None, noun="job", tag="seed-edit", say=None):
+        seen.append({"qe": qe, "model_id": model_id, "loras": loras, "jobs": [dict(j) for j in jobs],
+                     "size": (width, height), "skill": skill, "work_dir": work_dir, "rounds": rounds, "total": total,
+                     "noun": noun, "tag": tag, "on_best": on_best, "say": say})
+        for job in jobs:
+            on_result({"n": job["n"], "output_path": job["output_path"], "status": "ok", "seconds": 1.0})
+        on_verdict(1, {"status": "flagged"})
+        return [], None
+
+    fake.edit_with_critic = edit_with_critic
+    env["mp"].setitem(sys.modules, "image_critic", fake)
+    code, run_dir = run_tool(env, "--qwen-model", "qwen2511-q4", "--candidates", "3", "--seed", "100", "--critic",
+                             model="qwen")
+    assert code == 0
+    work = os.path.join(run_dir, "work")
+    (call,) = seen
+    assert call["qe"] is env["qe"] and call["say"] is env["tool"].say
+    assert (call["model_id"], call["loras"], call["size"], call["skill"], call["work_dir"]) == (
+        "qwen2511-q4", [], (1024, 672), "seed_edit", work)
+    assert call["jobs"] == [{"n": n, "seed": 100 + n, "prompt": PROMPT, "source": os.path.join(work, "source.png"),
+                             "stage_path": os.path.join(work, "cand_%02d.pending.png" % n),
+                             "output_path": cand(run_dir, n)} for n in (1, 2, 3)]
+    assert (call["rounds"], call["total"], call["noun"], call["tag"], call["on_best"]) == (
+        2, 3, "candidate", "seed-edit", None)
+    record = record_of(run_dir)
+    assert record["critic"] == {"rounds": 2, "pass_score": 7}
+    assert record["candidates"][0]["critic"] == {"status": "flagged"}
+    assert ["critic" in c for c in record["candidates"]] == [True, False, False]
+    assert [c["seed"] for c in record["candidates"]] == [101, 102, 103]
+    assert statuses(run_dir) == ["ok"] * 3 and stub_calls(py) == []
+    assert plain([line for line in capsys.readouterr().out.splitlines() if line.startswith("candidate ")]) == [
+        "candidate 1/3 ok Ss", "candidate 2/3 ok Ss", "candidate 3/3 ok Ss"]
+    del seen[:]
+    code, run_dir = run_tool(env, "--qwen-model", "qwen2511-q4", "--candidates", "1", "--seed", "100", "--critic",
+                             "--critic-rounds", "0", model="qwen", run=R1)
+    assert code == 0 and seen[0]["rounds"] == 0 and seen[0]["total"] == 1
+    assert record_of(run_dir)["critic"] == {"rounds": 0, "pass_score": 7}
