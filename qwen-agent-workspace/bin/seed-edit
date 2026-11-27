@@ -4,7 +4,7 @@ registry model (docs/superpowers/specs/2026-11-02-seed-generator-design.md, Sect
 docs/superpowers/specs/2026-11-02-seed-models-design.md, Section 3).
 
   bin/seed-edit --source PATH --prompt TEXT --model zimage|qwen [--qwen-model ID] [--lora ID=SCALE ...]
-                [--strength S] [--candidates N] [--seed N] --run-dir DIR
+                [--strength S] [--candidates N] [--seed N] [--critic [--critic-rounds N]] --run-dir DIR
   bin/seed-edit --probe
 
 The movie-ui runs it as a queued GPU job of kind seed-edit; it also runs by hand. Candidate i
@@ -19,7 +19,10 @@ registry LoRA: uncensored, viggle-turbo or a custom user-* LoRA of bin/seed-edit
 custom LoRA's trigger is prepended to the prompt. Every candidate of every model is screened with
 content safety before it gets its final name. --probe prints one JSON line {"qwen": {"ok", "reason",
 "models": {ID: {"ok", "reason"}}, "loras": {ID: {"ok", "reason"}}}, "zimage": {"backend", "ok",
-"reason"}} and loads nothing.
+"reason"}} and loads nothing. --critic (Qwen models only) has the local VLM judge every ok
+candidate for broken bodies between Qwen batches and re-edit the failures with new seeds, at most
+--critic-rounds N (0 to 4, default 2) more times; the best attempt stays cand_NN.png and run.json
+records each candidate's critic verdict (docs/superpowers/specs/2026-11-27-image-critic-design.md).
 
 Exit codes: 0 every candidate ended ok or blocked; 1 the backend failed (finished candidates are
 kept, the rest are failed); 2 refused before any model loaded; 130 interrupted (SIGINT, SIGTERM
@@ -42,8 +45,8 @@ the default hub. The Qwen checks and the child run live in qwen_edit.py
 max(3600, 600 x candidates) s.
 
 Python 3.9 and 3.13. The top level imports only the standard library, movie_ui_lib,
-movie_ui_seedgen and qwen_edit; PIL, psutil, torch, z_image_skill, content_safety and
-character_dataset are imported inside the functions that use them.
+movie_ui_seedgen and qwen_edit; PIL, psutil, torch, z_image_skill, content_safety,
+character_dataset and image_critic are imported inside the functions that use them.
 """
 
 import argparse
@@ -104,6 +107,8 @@ def parse(argv):
     parser.add_argument("--qwen-model", type=str)
     parser.add_argument("--lora", type=str, action="append")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--critic", action="store_true")
+    parser.add_argument("--critic-rounds", type=str)
     return parser.parse_args(argv)
 
 
@@ -111,7 +116,7 @@ def check_args(args):
     """SG4 and seed models SQ12: the cleaned options (None for --probe), or Refusal with the first
     failing rule's text."""
     given = (args.source, args.prompt, args.model, args.strength, args.candidates, args.seed, args.run_dir,
-             args.qwen_model, args.lora)
+             args.qwen_model, args.lora, args.critic_rounds, True if args.critic else None)
     if args.probe:
         if any(value is not None for value in given):
             raise Refusal("--probe takes no other options")
@@ -163,9 +168,17 @@ def check_args(args):
         seed = int(args.seed)
     else:
         raise Refusal("--seed must be an integer from 0 to 2147483647")
+    if args.critic_rounds is not None and not args.critic:
+        raise Refusal("--critic-rounds needs --critic")
+    if args.critic and args.model != "qwen":
+        raise Refusal("--critic is only for --model qwen")
+    if args.critic_rounds is not None and not (re.fullmatch(r"[0-9]+", args.critic_rounds)
+                                               and int(args.critic_rounds) <= 4):
+        raise Refusal("--critic-rounds must be an integer from 0 to 4")
     return {"source": args.source, "prompt": args.prompt, "model": args.model, "strength": strength,
             "candidates": candidates, "seed": seed, "run_dir": os.path.abspath(args.run_dir),
-            "qwen_model": qwen_model, "loras": loras}
+            "qwen_model": qwen_model, "loras": loras, "critic": bool(args.critic),
+            "critic_rounds": None if args.critic_rounds is None else int(args.critic_rounds)}
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +376,12 @@ def finish(ctx, n, status, seconds=None):
         say("candidate %d/%d %s %.1fs" % (n, len(cands), status, cand["seconds"]))
 
 
+def critic_verdict(ctx, n, block):
+    """Image critic spec 2.8: candidate n's critic block, written to run.json whenever it changes."""
+    ctx["record"]["candidates"][n - 1]["critic"] = block
+    write_run(ctx)
+
+
 def fail_rest(ctx):
     """SG16: every candidate not yet finished gets its own failed line, in order."""
     for cand in ctx["record"]["candidates"]:
@@ -428,9 +447,20 @@ def run_qwen(ctx):
     jobs = [{"n": c["n"], "seed": c["seed"], "prompt": opts["prompt"],
              "source": os.path.join(ctx["work"], "source.png"), "stage_path": stage(ctx, c["n"]),
              "output_path": final_path(ctx, c["n"])} for c in rec["candidates"]]
-    _results, failure = qe.run_jobs(entry["id"], opts["loras"], jobs, ctx["width"], ctx["height"], SAFETY_SKILL,
-                                    ctx["work"], on_result=lambda r: finish(ctx, r["n"], r["status"], r["seconds"]),
-                                    noun="candidate")
+    if not opts["critic"]:
+        _results, failure = qe.run_jobs(entry["id"], opts["loras"], jobs, ctx["width"], ctx["height"], SAFETY_SKILL,
+                                        ctx["work"], on_result=lambda r: finish(ctx, r["n"], r["status"], r["seconds"]),
+                                        noun="candidate")
+        return failure
+    import image_critic
+    rounds = image_critic.DEFAULT_ROUNDS if opts["critic_rounds"] is None else opts["critic_rounds"]
+    rec["critic"] = {"rounds": rounds, "pass_score": image_critic.PASS_SCORE}
+    write_run(ctx)
+    _results, failure = image_critic.edit_with_critic(
+        qe, entry["id"], opts["loras"], jobs, ctx["width"], ctx["height"], SAFETY_SKILL, ctx["work"],
+        rounds=rounds, total=len(rec["candidates"]),
+        on_result=lambda r: finish(ctx, r["n"], r["status"], r["seconds"]),
+        on_verdict=lambda n, block: critic_verdict(ctx, n, block), noun="candidate", tag="seed-edit", say=say)
     return failure
 
 
