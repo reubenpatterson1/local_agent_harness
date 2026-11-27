@@ -32,7 +32,7 @@ LEVELS = ("render", "stills", "replan")            # rank order
 LEVEL_LABELS = {"render": "Render", "stills": "New stills", "replan": "Re-plan"}
 FIXED_KEYS = ("ws", "action", "story_id", "overwrite_movie", "redo")
 GROUPS = (("panels", "length"),
-          ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs"))
+          ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs", "critic"))
 FORK_SUFFIX_RE = re.compile(r"-b([0-9]+)-v[0-9]+$")
 
 # Spec 2.1 (BF4, BK1): the level of every editable DEFAULT_FIELDS key.
@@ -40,7 +40,7 @@ FIELD_LEVELS = {
     "model": "render", "gemma": "render", "video_loras": "render", "action_loras": "render",
     "frames": "render", "fps": "render", "no_low_ram": "render", "panel_timeout": "render",
     "width": "stills", "height": "stills", "stills_loras": "stills", "location_strength": "stills",
-    "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills",
+    "seed_edit_model": "stills", "seed_edit_loras": "stills", "extra_refs": "stills", "critic": "stills",
     "narrative": "replan", "goal": "replan", "panels": "replan", "length": "replan",
     "seed_upload": "replan", "mode": "replan", "characters": "replan", "locations": "replan",
     "narration": "replan", "story_model": "replan", "story_legacy": "replan", "judge": "replan",

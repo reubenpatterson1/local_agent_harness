@@ -1769,6 +1769,18 @@ def _cand_file(run_dir, entry):
     return path if entry.get("status") == "ok" and _isfile_in(run_dir, path) else None
 
 
+def _cand_critic(entry):
+    """Image critic spec 2.10: the page's view of a candidate's critic block in run.json, else None."""
+    block = entry.get("critic")
+    if not (isinstance(block, dict) and block.get("status") in ("passed", "flagged", "unjudged")):
+        return None
+    defects, reason, attempts = block.get("defects"), block.get("reason"), block.get("attempts")
+    return {"status": block["status"], "score": block.get("score") if lib._is_int(block.get("score")) else None,
+            "defects": [d for d in defects if isinstance(d, str)] if isinstance(defects, list) else [],
+            "reason": reason[:300] if isinstance(reason, str) else None,
+            "attempts": len(attempts) if isinstance(attempts, list) else 0}
+
+
 def _in_seed_work(real, ws_real):
     """True when the realpath real lies in generated/seeds/runs/<run>/work/ of ws_real, where
     bin/seed-edit keeps unscreened mflux candidates (seed generator SG20). Compared by inode, so a
@@ -1821,8 +1833,14 @@ def run_view(server, ws_real, run, run_dir, record, queue):
     for key in ("strength", "seed", "size", "source_size", "source_origin", "error"):
         view[key] = record.get(key)
     view["source"] = source_path
-    view["candidates"] = [{"n": c["n"], "seed": c.get("seed"), "status": c.get("status"),
-                           "seconds": c.get("seconds"), "path": _cand_file(run_dir, c)} for c in _candidates(record)]
+    view["candidates"] = []
+    for c in _candidates(record):
+        item = {"n": c["n"], "seed": c.get("seed"), "status": c.get("status"), "seconds": c.get("seconds"),
+                "path": _cand_file(run_dir, c)}
+        c2 = _cand_critic(c)
+        if c2 is not None:
+            item["critic"] = c2
+        view["candidates"].append(item)
     view["job"] = job_summary(server, job_id, queue) if job_id is not None else None
     return view
 
@@ -1898,6 +1916,8 @@ def _h_seed_run_create(self, groups, query, body):
                   "model": clean["model"], "strength": clean["strength"], "qwen_model": clean["qwen_model"],
                   "loras": clean["loras"], "candidates": clean["candidates"],
                   "seed": seed, "source": origin}
+        if clean.get("critic") is True:
+            fields["critic"] = True
         lib.create_job(server.state, job_id, "seed-edit", real, None, None, lib.seed_edit_argv(fields, real), fields)
     return 201, {"run": run_view(server, real, run, run_dir, record, lib.read_queue(server.state))}
 

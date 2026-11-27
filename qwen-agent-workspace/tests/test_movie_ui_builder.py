@@ -129,12 +129,13 @@ def test_mut3_help_flags_fixtures_real_help_and_cache(tmp_path, monkeypatch):
     assert {"--story-server-stop-after-story", "--no-story-server-stop-after-story", "--help"} <= current
     assert current - old == {"--story-only", "--story-legacy", "--no-auto-lora", "--judge", "--goal", "--gemma",
                              "--no-narration", "--speech-only", "--action", "--location",
-                             "--location-strength", "--seed-edit-model", "--seed-edit-lora", "--extra-ref"}
+                             "--location-strength", "--seed-edit-model", "--seed-edit-lora", "--extra-ref",
+                             "--critic", "--critic-rounds"}
     real, error = lib.help_flags(mt.WS)
     assert error is None and ALL_MU37_FLAGS <= real
     supported = lib.supported_map(old)
     assert supported["judge"] is False and supported["story_only"] is False and supported["panels"] is True
-    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 32
+    assert set(supported) == {k for k, _flags in lib.FIELD_FLAGS} and len(supported) == 33
     assert lib.supported_map(None)["panels"] is False
     ws = mt.make_stub_workspace(tmp_path)
     flags, error = lib.help_flags(ws)
@@ -218,7 +219,8 @@ NEW_PY = ("movie_ui_lib.py", "movie_ui_server.py", "bin/movie-ui", "bin/movie-ui
           "seed_edit_mflux_child.py", "tests/test_seed_edit_tool.py", "tests/test_movie_ui_seedgen.py",
           "qwen_edit.py", "tests/test_qwen_edit.py", "tests/test_ltx_movie_seed_edit.py",
           "tests/test_movie_ui_qwen_edit.py", "tests/test_ltx_movie_shots_seed.py",
-          "tests/test_movie_ui_shots_seed.py", "image_critic.py", "bin/image-critic", "tests/test_image_critic.py")
+          "tests/test_movie_ui_shots_seed.py", "image_critic.py", "bin/image-critic", "tests/test_image_critic.py",
+          "tests/test_movie_ui_critic.py")
 CHANGED_PY = ("fleet_lib.py", "bin/qwen-agentd", "tests/test_fleet_lib.py", "tests/test_fleet_self_update.py")
 PIPELINE_FILES = ("bin/ltx-movie", "bin/ltx-mlx-render", "bin/ltx-story-images", "bin/ltx-story-manifest",
                   "bin/ltx-story-video", "bin/ltx-chain", "bin/ltx-generate", "bin/ltx-host-prep",

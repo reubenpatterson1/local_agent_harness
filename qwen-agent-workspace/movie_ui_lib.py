@@ -945,6 +945,7 @@ DEFAULT_FIELDS = {
     "panels": 15, "length": None, "fps": 24, "frames": 145,
     "width": None, "height": None, "seed_upload": None, "seed_edit_model": None, "seed_edit_loras": None,
     "extra_refs": [],
+    "critic": False,
     "mode": "chained",
     "model": DEFAULT_MODEL, "gemma": DEFAULT_GEMMA,
     "story_model": None,
@@ -971,7 +972,7 @@ FIELD_FLAGS = (
     ("story_legacy", ("--story-legacy",)), ("judge", ("--judge",)), ("no_low_ram", ("--no-low-ram",)),
     ("panel_timeout", ("--panel-timeout",)), ("overwrite_movie", ("--force",)),
     ("regenerate", ("--force-story",)), ("redo", ("--redo",)), ("story_only", ("--story-only",)),
-    ("no_review", ("--no-review",)), ("extra_refs", ("--extra-ref",)),
+    ("no_review", ("--no-review",)), ("critic", ("--critic",)), ("extra_refs", ("--extra-ref",)),
     ("seed_edit", ("--seed-edit-model", "--seed-edit-lora")),
 )
 
@@ -1041,6 +1042,8 @@ def build_argv(fields, ws_real, state, py=sys.executable):
                                     fields.get("seed_edit_loras"))
         for item in fields.get("extra_refs") or []:        # extra references spec XR16
             argv += ["--extra-ref", extra_ref_arg(state, item)]
+        if fields.get("critic") is True:
+            argv.append("--critic")   # image critic spec 2.10
     elif fields["width"] is not None and fields["height"] is not None:
         argv += ["--video-width", str(fields["width"]), "--video-height", str(fields["height"])]
     for key, flag in (("model", "--model"), ("gemma", "--gemma"), ("story_model", "--story-model")):
@@ -1150,6 +1153,17 @@ def _rule_seed_edit(fields):
     if loras is not None and model in (None, "as-is"):
         errors.append("seed edit LoRAs need a seed edit model other than as-is")
     return errors
+
+
+def _rule_critic(fields):
+    """V1 rule 12f (image critic spec 2.10): critic is a bool, and true only on a shots seed edit run."""
+    critic = fields.get("critic", False)
+    if not isinstance(critic, bool):
+        return ["critic must be true or false"]
+    if critic and not (fields.get("mode") == "shots" and fields.get("seed_upload") is not None
+                       and fields.get("seed_edit_model") not in (None, "as-is")):
+        return ["the image critic needs shots mode with a seed image and a Qwen seed edit model"]
+    return []
 
 
 EXTRA_REFS_MAX = 9                     # bin/ltx-movie EXTRA_REFS_MAX
@@ -1297,6 +1311,8 @@ def seed_edit_argv(fields, ws_real, py=sys.executable):
             argv += ["--lora", "%s=%r" % (lora["id"], float(lora["scale"]))]
     if fields["model"] == "zimage":
         argv += ["--strength", repr(float(fields["strength"]))]
+    if fields.get("critic") is True:
+        argv.append("--critic")
     return argv + ["--candidates", str(fields["candidates"]), "--seed", str(fields["seed"]),
                    "--run-dir", run_dir]
 
@@ -1640,6 +1656,7 @@ def validate_fields(fields, ws_real, state):
     errors += _rule_locations(fields)                                        # 12c
     errors += _rule_seed_edit(fields)                                        # 12d
     errors += _rule_extra_refs(fields, state)                                # 12e
+    errors += _rule_critic(fields)                                           # 12f
     errors += _rule_flags(fields)                                            # 13
     errors += _rule_action(fields)                                           # 14
     if fields.get("story_legacy") is True and (fields.get("judge") is True or fields.get("auto_lora") is False
@@ -2354,6 +2371,7 @@ FACE_RE = re.compile(
     r"proceed anyway\.)$")
 STILL_NAME_RE = re.compile(r"^panel_\d{2}\.png$")
 SEED_CAND_RE = re.compile(r"^candidate (\d+)/(\d+) (ok|blocked|failed)(?: [0-9]+\.[0-9]s)?$")   # seed generator SG31
+CRITIC_RE = re.compile(r"^critic (\d+)/(\d+): (ok|redo|flagged|unjudged)(?: \((.*)\))?$")   # image critic spec 2.6
 
 
 def collapse(line):
@@ -2398,6 +2416,7 @@ class ProgressParser(object):
         self.last_line = ""
         self.candidates = {}            # seed generator SG31: {"<i>": "ok" | "blocked" | "failed"}
         self.candidates_total = None
+        self.critic = {}            # image critic: {"<n>": "ok" | "redo" | "flagged" | "unjudged"}
 
     def feed(self, data):
         self.offset += len(data)
@@ -2427,6 +2446,10 @@ class ProgressParser(object):
     def _line(self, line):
         if line.strip():
             self.last_line = line[:LINE_CLIP]
+        match = CRITIC_RE.match(line)
+        if match:
+            self.critic[match.group(1)] = match.group(3)
+            return
         if self.kind == "seed-edit":
             match = SEED_CAND_RE.match(line)
             if match:
@@ -2474,6 +2497,11 @@ class ProgressParser(object):
         if FACE_RE.match(line):
             self.face_problem = True
 
+    def critic_summary(self):
+        """{"ok", "redo", "flagged", "unjudged"}: the sorted int n of each job in its newest critic state."""
+        return dict((state, sorted(int(n) for n, s in self.critic.items() if s == state))
+                    for state in ("ok", "redo", "flagged", "unjudged"))
+
     def snapshot(self, job, status, state, now=None):
         """The MU56 progress object for job (its job.json) and status (its status.json or None)."""
         started = parse_utc((status or {}).get("started"))
@@ -2489,11 +2517,14 @@ class ProgressParser(object):
                 total = self.fields.get("candidates") if _is_int(self.fields.get("candidates")) else None
             done = len(self.candidates)
             states = list(self.candidates.values())
-            return {"kind": "seed-edit", "elapsed_s": elapsed, "last_line": self.current_last_line(),
-                    "face_problem": False,
-                    "candidates": {"total": total, "done": done, "ok": states.count("ok"),
-                                   "blocked": states.count("blocked"), "failed": states.count("failed"),
-                                   "current": done + 1 if total is not None and done < total else None}}
+            out = {"kind": "seed-edit", "elapsed_s": elapsed, "last_line": self.current_last_line(),
+                   "face_problem": False,
+                   "candidates": {"total": total, "done": done, "ok": states.count("ok"),
+                                  "blocked": states.count("blocked"), "failed": states.count("failed"),
+                                  "current": done + 1 if total is not None and done < total else None}}
+            if self.critic:
+                out["critic"] = self.critic_summary()
+            return out
         if self.kind not in ("story", "movie"):
             return {"kind": self.kind, "elapsed_s": elapsed, "last_line": self.current_last_line(),
                     "face_problem": self.face_problem}
@@ -2507,12 +2538,15 @@ class ProgressParser(object):
             expected = (effective_panels(self.fields, story_dir(job["workspace"], job["story_id"]))
                         if self.fields.get("mode") == "shots" else 1)
             stills = {"expected": expected, "count": count}
-        return {"phase": self.phase, "phase_title": self.phase_title, "rewrite": self.rewrite,
-                "phases": job_phases(self.kind, self.fields), "redo": self.redo,
-                "panels_total": self.panels_total,
-                "panels": dict((k, dict(v)) for k, v in sorted(self.panels.items(), key=lambda kv: int(kv[0]))),
-                "panels_done": sum(1 for v in self.panels.values() if v["state"] == "ok"),
-                "wrap_up": self.wrap_up, "stills": stills, "last_line": self.current_last_line()}
+        out = {"phase": self.phase, "phase_title": self.phase_title, "rewrite": self.rewrite,
+               "phases": job_phases(self.kind, self.fields), "redo": self.redo,
+               "panels_total": self.panels_total,
+               "panels": dict((k, dict(v)) for k, v in sorted(self.panels.items(), key=lambda kv: int(kv[0]))),
+               "panels_done": sum(1 for v in self.panels.values() if v["state"] == "ok"),
+               "wrap_up": self.wrap_up, "stills": stills, "last_line": self.current_last_line()}
+        if self.critic:
+            out["critic"] = self.critic_summary()
+        return out
 
 
 # ---------------------------------------------------------------------------

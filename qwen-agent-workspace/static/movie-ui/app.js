@@ -570,6 +570,7 @@
       no_low_ram: $("#c-no-low-ram").checked, panel_timeout: numberOrNull("#c-panel-timeout"),
       overwrite_movie: $("#c-overwrite").checked, redo: []
     };
+    out.critic = Boolean(seedEdit) && out.mode === "shots" && out.seed_edit_model !== "as-is" && S.composeEngine !== "zimage" && supported.critic !== false && $("#c-critic").checked;
     // Shots Z-Image engine spec ZE13: a seeded shots movie's Z-Image engine is sent as the seed as-is.
     if (seedEdit && out.mode === "shots" && S.composeEngine === "zimage") {
       out.seed_edit_model = "as-is";
@@ -679,6 +680,7 @@
     show($("#c-sq-qwen-box"), seedEditOn && !zimageSeed);
     const seedEditReason = seedEditOn && !zimageSeed ? COMPOSE_PICKER.reason() : "";
     $("#c-sq-reason").textContent = seedEditReason;
+    show($("#c-critic-box"), shotsSeed && !zimageSeed && !(S.options && S.options.supported && S.options.supported.critic === false));
     if (seedEditReason) {
       $("#c-run-all").disabled = true;
       const runReason = $("#c-run-all-reason");
@@ -965,6 +967,7 @@
     S.extraRefs = (f.extra_refs || []).map(function (x) { return {upload_id: x.upload_id, caption: x.caption || ""}; });
     S.extraKey = "";
     $("#c-mode").value = f.mode || "chained";
+    $("#c-critic").checked = f.critic === true;
     fillModelSelect(f.model || "");
     $("#c-gemma").value = f.gemma || "";
     $("#c-story-model").value = f.story_model || "";
@@ -2297,6 +2300,7 @@
     $("#se-model-note").textContent = note;
     show($("#se-strength-box"), model === "zimage");
     show($("#se-qwen-box"), model === "qwen");
+    show($("#se-critic-box"), model === "qwen");
     $("#se-prompt-count").textContent = $("#se-prompt").value.length + " / " + SEED_PROMPT_MAX + " characters";
     const natural = S.seeds.natural;
     const canvas = natural ? seedCanvas(natural.width, natural.height, seedMultiple()) : null;
@@ -2338,10 +2342,12 @@
     else { source = {character: src.character, still: src.still}; }
     const model = $("#se-model").value;
     const seedText = $("#se-seed").value.trim();
-    return {ws: S.ws, source: source, prompt: $("#se-prompt").value, model: model,
+    const body = {ws: S.ws, source: source, prompt: $("#se-prompt").value, model: model,
             strength: model === "zimage" ? Number($("#se-strength").value) : null,
             candidates: Number($("#se-candidates").value), seed: seedText === "" ? null : Number(seedText),
             qwen_model: model === "qwen" ? SEED_PICKER.selection().model : null, loras: model === "qwen" ? SEED_PICKER.selection().loras : null};
+    if (model === "qwen" && $("#se-critic").checked) { body.critic = true; }
+    return body;
   }
 
   async function generateSeeds() {
@@ -2426,10 +2432,24 @@
     view.candidates.forEach(function (cand) { seedRow(view, cand); });
   }
 
+  function criticText(c) {
+    if (c.status === "passed") { return "critic: passed (score " + c.score + (c.attempts > 1 ? ", after " + c.attempts + " attempts" : "") + ")"; }
+    if (c.status === "flagged") { return "critic: flagged — best score " + c.score + " of " + c.attempts + " attempts" + (c.defects.length ? ": " + c.defects.join("; ") : ""); }
+    return "critic: not judged" + (c.reason ? " (" + c.reason + ")" : "");
+  }
+
+  function criticProgressText(c) {
+    const parts = [c.ok.length + " ok"];
+    if (c.redo.length) { parts.push(c.redo.length + " being redone"); }
+    if (c.flagged.length) { parts.push("flagged " + c.flagged.join(", ")); }
+    if (c.unjudged.length) { parts.push("not judged " + c.unjudged.join(", ")); }
+    return "critic: " + parts.join(", ");
+  }
+
   function seedRow(view, cand) {
     const progress = view.job && view.job.progress && view.job.progress.candidates;
     const current = progress ? progress.current : null;
-    const key = cand.status + "|" + (cand.path || "") + "|" + (cand.status === "pending" && cand.n === current ? "now" : "");
+    const key = cand.status + "|" + (cand.path || "") + "|" + (cand.status === "pending" && cand.n === current ? "now" : "") + "|" + (cand.critic ? cand.critic.status + ":" + cand.critic.score + ":" + cand.critic.attempts : "");
     let row = S.seeds.rows[cand.n];
     if (!row) {
       const source = el("img", {cls: "se-img", alt: "source image"});
@@ -2448,6 +2468,7 @@
     else if (cand.status === "blocked") { cell = el("span", {cls: "muted", text: "blocked by content safety"}); }
     else { cell = el("span", {cls: "muted", text: "failed"}); }
     row.parts = [cell];
+    if (cand.critic) { row.parts.push(el("div", {cls: "muted", text: criticText(cand.critic)})); }
     if (cand.status === "ok" && cand.path) {
       const run = view.run;
       const input = el("input", {cls: "se-keep-folder", type: "text", list: "se-folder-options", placeholder: "folder name", size: "20"});
@@ -3364,6 +3385,7 @@
       if (p.redo) { parts.push("redo panels " + p.redo); }
       if (p.panels_total) { parts.push("panels " + p.panels_done + "/" + p.panels_total); }
       if (p.stills) { parts.push("stills " + p.stills.count + "/" + p.stills.expected); }
+      if (p.critic) { parts.push(criticProgressText(p.critic)); }
       if (p.wrap_up) { parts.push("wrapping up"); }
       box.appendChild(el("div", {text: parts.join(" - ")}));
       const panels = el("div", {cls: "panels"});
@@ -3380,7 +3402,7 @@
       if (c && c.current) { counted = " - candidate " + c.current + " of " + c.total; }
       else if (c) { counted = " - " + c.done + " of " + c.total + " candidates"; }
       box.appendChild(el("div", {text: job.kind + (p.elapsed_s !== null ? " - " + p.elapsed_s + " s" : "") +
-        (p.face_problem ? " - the seed face was refused" : "") + counted}));
+        (p.face_problem ? " - the seed face was refused" : "") + counted + (p.critic ? " - " + criticProgressText(p.critic) : "")}));
     }
     box.appendChild(el("div", {cls: "muted", text: p.last_line || ""}));
   }

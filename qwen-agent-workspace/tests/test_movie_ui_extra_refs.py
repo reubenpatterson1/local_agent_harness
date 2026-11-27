@@ -57,10 +57,10 @@ def test_xrt19_fields_flags_and_argv(state):
     keys = list(lib.DEFAULT_FIELDS)
     assert keys[keys.index("seed_edit_loras") + 1] == "extra_refs"
     assert lib.DEFAULT_FIELDS["extra_refs"] == []
-    assert len(lib.DEFAULT_FIELDS) == 33
+    assert len(lib.DEFAULT_FIELDS) == 34
     assert lib.FIELD_FLAGS[-2:] == (("extra_refs", ("--extra-ref",)),
                                     ("seed_edit", ("--seed-edit-model", "--seed-edit-lora")))
-    assert len(lib.FIELD_FLAGS) == 32
+    assert len(lib.FIELD_FLAGS) == 33
     base = mt.fields(WS, seed_upload=UP, action="movie", seed_edit_model="qwen21-q4", seed_edit_loras=UNC,
                      no_low_ram=True, extra_refs=[{"upload_id": U2, "caption": " the sword "},
                                                   {"upload_id": U3, "caption": None}])
@@ -129,7 +129,8 @@ def test_xrt21_the_server_cap_and_preview(env):
 
 def test_xrt22_batch_levels_groups_and_merge(state):
     assert batch.FIELD_LEVELS["extra_refs"] == "stills"
-    assert batch.GROUPS[1] == ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs")
+    assert batch.GROUPS[1] == ("width", "height", "seed_upload", "seed_edit_model", "seed_edit_loras", "extra_refs",
+                               "critic")
     seeded = lib.compose_fields({"ws": "/ws", "action": "movie", "story_id": "s1", "narrative": "N",
                                  "seed_upload": UP, "seed_edit_model": "qwen21-q4", "seed_edit_loras": UNC,
                                  "no_low_ram": True, "extra_refs": XR})
